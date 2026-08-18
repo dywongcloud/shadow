@@ -8,35 +8,36 @@
    paste it back here after dropping the woff2 files in. Declaring the faces
    without the files made every visitor's console log four font 404s. */
 
-/* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
+/* Semantic color tokens (HSL channels) — switched by the `.dark` class.
+   Green lightning developer theme - focused on automation & simplicity */
 :root {
-  --background: 0 0% 98%; /* #FAFAFA — root page background */
-  --subtle: 0 0% 98%;
-  --card: 0 0% 100%; /* cards/components stay pure white */
-  --foreground: 0 0% 4%;
-  --secondary: 0 0% 40%;
-  --muted: 0 0% 56%;
-  --border: 0 0% 92%;
-  --border-strong: 0 0% 80%;
-  --accent: 0 0% 0%;
+  --background: 120 50% 97%; /* Light green-tinted background */
+  --subtle: 120 40% 95%;
+  --card: 0 0% 100%; /* Pure white cards for clarity */
+  --foreground: 120 40% 18%; /* Deep green text */
+  --secondary: 120 20% 45%; /* Muted green-gray */
+  --muted: 120 15% 60%; /* Subtle green tones */
+  --border: 120 35% 88%; /* Light green borders */
+  --border-strong: 120 40% 75%;
+  --accent: 120 75% 42%; /* Vibrant green - electric/lightning feel */
   --accent-foreground: 0 0% 100%;
-  --link: 212 100% 47%;
-  --green: 145 80% 42%;
+  --link: 120 80% 38%; /* Green links */
+  --green: 120 85% 40%;
 }
 
 .dark {
-  --background: 0 0% 4%;
-  --subtle: 0 0% 8%;
-  --card: 0 0% 7%;
-  --foreground: 0 0% 93%;
-  --secondary: 0 0% 63%;
-  --muted: 0 0% 50%;
-  --border: 0 0% 16%;
-  --border-strong: 0 0% 28%;
-  --accent: 0 0% 100%;
-  --accent-foreground: 0 0% 4%;
-  --link: 212 100% 62%;
-  --green: 145 65% 49%;
+  --background: 120 40% 6%; /* Deep green-black */
+  --subtle: 120 35% 10%;
+  --card: 120 30% 8%; /* Very dark green cards */
+  --foreground: 120 40% 94%; /* Bright green-ish text */
+  --secondary: 120 25% 68%;
+  --muted: 120 15% 52%;
+  --border: 120 35% 20%; /* Dark green borders */
+  --border-strong: 120 40% 32%;
+  --accent: 120 90% 48%; /* Bright neon green - lightning effect */
+  --accent-foreground: 120 40% 8%;
+  --link: 120 85% 48%; /* Bright green links */
+  --green: 120 90% 50%;
 }
 
 /* High-contrast mode (bn-ui-accessibility): the OS-level `forced-colors`
@@ -53,16 +54,16 @@
 */
 @media (prefers-contrast: more) {
   :root {
-    --secondary: 0 0% 20%;
-    --muted: 0 0% 30%;
-    --border: 0 0% 60%;
-    --border-strong: 0 0% 40%;
+    --secondary: 120 30% 25%;
+    --muted: 120 25% 35%;
+    --border: 120 50% 70%;
+    --border-strong: 120 50% 50%;
   }
   .dark {
-    --secondary: 0 0% 85%;
-    --muted: 0 0% 75%;
-    --border: 0 0% 45%;
-    --border-strong: 0 0% 60%;
+    --secondary: 120 30% 85%;
+    --muted: 120 20% 75%;
+    --border: 120 50% 40%;
+    --border-strong: 120 50% 60%;
   }
 }
 
@@ -117,8 +118,8 @@ select {
 }
 
 ::selection {
-  background: hsl(var(--foreground));
-  color: hsl(var(--background));
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
 }
 
 /* Prevent theme flash + smooth the swap. */
@@ -134,7 +135,7 @@ html.dark {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: hsl(var(--border-strong));
+  background: hsl(var(--accent) / 0.5);
   border-radius: 8px;
   border: 2px solid hsl(var(--background));
 }

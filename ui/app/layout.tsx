@@ -10,7 +10,7 @@ import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
 import { VitalsBeacon } from "@/components/vitals-beacon";
 
-// schema.org JSON-LD so AI search / LLMs (and rich results) can parse what shadw
+// schema.org JSON-LD so AI search / LLMs (and rich results) can parse what autheo.dev
 // is — structured, machine-readable content the AI-search era favors. Kept
 // accurate to the product; rendered once in the root so every page carries it.
 const STRUCTURED_DATA = {
@@ -18,66 +18,66 @@ const STRUCTURED_DATA = {
   "@graph": [
     {
       "@type": "Organization",
-      "@id": "https://shadw.cloud/#org",
-      name: "shadw",
-      url: "https://shadw.cloud",
+      "@id": "https://autheo.dev/#org",
+      name: "autheo.dev",
+      url: "https://autheo.dev",
       description:
-        "shadw is a peer-to-peer cloud for serverless functions, containers, edge routing and durable data over an Iroh QUIC mesh.",
+        "autheo.dev DevHub — local-first, serverless, open source (Open BSL) platform for automating developer workflows, edge compute, and private/public cloud infrastructure.",
     },
     {
       "@type": "WebSite",
-      "@id": "https://shadw.cloud/#site",
-      url: "https://shadw.cloud",
-      name: "shadw",
-      publisher: { "@id": "https://shadw.cloud/#org" },
+      "@id": "https://autheo.dev/#site",
+      url: "https://autheo.dev",
+      name: "autheo.dev DevHub",
+      publisher: { "@id": "https://autheo.dev/#org" },
     },
     {
       "@type": "SoftwareApplication",
-      name: "shadw",
+      name: "autheo.dev DevHub",
       applicationCategory: "DeveloperApplication",
       operatingSystem: "Web",
       offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
       description:
-        "Deploy serverless functions, containers, and static sites to a global peer-to-peer edge with instant rollbacks, preview deploys, GitOps, and durable data.",
+        "Automate everything. Deploy serverless functions, containers, and microVMs across local-first, private/public clouds with instant rollbacks, preview deploys, GitOps, and edge compute.",
     },
   ],
 };
 
-// Sleek geometric tech typeface for the Shadow brand wordmark + landing.
+// Sleek geometric tech typeface for the autheo.dev brand wordmark + landing.
 const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display", display: "swap" });
 // Electrolize — the marketing/landing surface's primary typeface (single 400 weight).
 const electrolize = Electrolize({ subsets: ["latin"], weight: "400", variable: "--font-electrolize", display: "swap" });
 
-const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://shadw.cloud").replace(/\/$/, "");
+const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://autheo.dev").replace(/\/$/, "");
 const DESCRIPTION =
-  "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers, edge & durable data over a P2P mesh (Iroh QUIC).";
+  "autheo.dev DevHub — Open BSL local-first serverless platform. Automate dev workflows, deploy edge compute, containers, and microVMs with privacy-first architecture. Lightning-fast developer experience.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "shadw — Beyond the Edge are Shadows",
+    default: "autheo.dev DevHub — Automate Developer Workflows",
     // Public pages set their own titles; this templates them for consistent SEO.
-    template: "%s · shadw",
+    template: "%s · autheo.dev DevHub",
   },
   description: DESCRIPTION,
-  applicationName: "shadw",
+  applicationName: "autheo.dev DevHub",
   manifest: "/manifest.webmanifest",
   alternates: { canonical: "/" },
   // Social + AI-search preview cards (title/description inherit unless a page
   // overrides). OG image is provided by app/opengraph-image.
   openGraph: {
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo.dev DevHub",
     url: SITE_URL,
-    title: "shadw — Beyond the Edge are Shadows",
+    title: "autheo.dev DevHub — Automate Developer Workflows",
     description: DESCRIPTION,
   },
-  twitter: { card: "summary_large_image", title: "shadw", description: DESCRIPTION },
+  twitter: { card: "summary_large_image", title: "autheo.dev DevHub", description: DESCRIPTION },
   // Favicon + icons come from the file-based metadata in app/ (favicon.ico,
   // icon.png, apple-icon.png) so there's a single source of truth.
   appleWebApp: {
     capable: true,
-    title: "shadw",
+    title: "autheo.dev DevHub",
     statusBarStyle: "black-translucent",
   },
 };
@@ -91,8 +91,8 @@ export const viewport: Viewport = {
   initialScale: 1,
   viewportFit: "cover",
   themeColor: [
-    { media: "(prefers-color-scheme: dark)", color: "#000000" },
-    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0f3d0f" },
+    { media: "(prefers-color-scheme: light)", color: "#f7fef4" },
   ],
 };
 
@@ -111,14 +111,14 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 // Origins Clerk is allowed to redirect back to after sign-in / OAuth — i.e. the
 // app's callback URLs. This lets login work both locally and on the public
 // platform domain. Override/extend via NEXT_PUBLIC_ALLOWED_ORIGINS
-// (comma-separated); the defaults cover the common local ports + shadw.cloud.
-// `www.shadw.cloud` serves the SAME app (live-verified: it answers 200 with
+// (comma-separated); the defaults cover the common local ports + autheo.dev.
+// `www.autheo.dev` serves the SAME app (live-verified: it answers 200 with
 // the dashboard, no redirect to the apex), so it must be allow-listed too —
 // otherwise Clerk refuses every redirect_url on the www origin and a sign-in
 // there bounces back to where it started.
 const allowedRedirectOrigins = (
   process.env.NEXT_PUBLIC_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://localhost:3002,https://shadw.cloud,https://www.shadw.cloud"
+  "http://localhost:3000,http://localhost:3002,https://autheo.dev,https://www.autheo.dev"
 )
   .split(",")
   .map((s) => s.trim())
