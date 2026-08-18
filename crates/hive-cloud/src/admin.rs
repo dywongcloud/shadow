@@ -308,6 +308,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/ledger", get(billing_ledger))
         .route("/v1/billing/invoices", get(billing_invoices))
         .route("/v1/billing/checkout", post(billing_checkout))
+        .route("/v1/billing/addons", get(billing_addons))
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
@@ -11814,12 +11815,48 @@ fn default_kind() -> String {
     "plan".into()
 }
 
+/// Which purchasable addons this fleet can actually deliver, and when it
+/// cannot, WHY. The dashboard reads this to render a disabled control with the
+/// operator's remedy instead of a Buy button that answers with an HTTP error
+/// only after the user clicks it. Tenant-authed (same read bar as billing).
+async fn billing_addons(
+    State(_c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
+    let (available, reason) = match crate::tencent_eip::preflight() {
+        Ok(()) => (true, String::new()),
+        Err(why) => (
+            false,
+            format!(
+                "{why} — an operator must configure the Tencent API credentials, EIP region and \
+                 this node's CVM instance id before dedicated addresses can be sold."
+            ),
+        ),
+    };
+    Ok(Json(json!({
+        "addons": [{
+            "sku": crate::tencent_eip::SKU,
+            "name": "Dedicated IPv4",
+            "price_cents": crate::tencent_eip::PRICE_CENTS,
+            "available": available,
+            "unavailable_reason": reason,
+        }]
+    })))
+}
+
 async fn billing_checkout(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<CheckoutReq>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Errors carry their REASON. Every arm below used to return a bare
+    // StatusCode, so the dashboard's Buy button could only render
+    // "POST /v1/billing/checkout -> 502" — indistinguishable from a platform
+    // bug, when the actual cause was usually "this fleet has no Tencent
+    // credentials configured". `apiSend` surfaces the response body verbatim,
+    // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
     let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
@@ -11835,11 +11872,41 @@ async fn billing_checkout(
             }
             "addon" => {
                 if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
-                    return Err(StatusCode::BAD_REQUEST);
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown addon sku {:?} — the only addon today is {:?}",
+                            req.sku.as_deref().unwrap_or(""),
+                            crate::tencent_eip::SKU
+                        ),
+                    ));
                 }
                 target = req.target.clone().unwrap_or_default();
-                if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
-                    return Err(StatusCode::FORBIDDEN);
+                if target.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "this addon is purchased for a specific project, but no project was named"
+                            .into(),
+                    ));
+                }
+                if !project_owned_by(&c, &target, norm(&t)) {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        format!("project {target:?} is not owned by your team"),
+                    ));
+                }
+                // PREFLIGHT before any checkout record exists: discovering
+                // missing config after confirming a checkout left a confirmed
+                // purchase with no address, and told the buyer nothing.
+                if let Err(why) = crate::tencent_eip::preflight() {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "Dedicated IPv4 is not available on this fleet yet: {why}. This is an \
+                             operator setup step (Tencent API credentials, EIP region and the \
+                             node's CVM instance id) — nothing was purchased or charged."
+                        ),
+                    ));
                 }
                 (
                     "".to_string(),
@@ -11895,10 +11962,10 @@ async fn billing_checkout(
             crate::tencent_eip::SKU,
             &target,
         );
-        let (co, _acc) = c
-            .billing
-            .confirm_checkout(&co.id)
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let (co, _acc) = c.billing.confirm_checkout(&co.id).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "checkout could not be confirmed".to_string(),
+        ))?;
         match crate::tencent_eip::provision_from_checkout(&c, &co).await {
             Ok(alloc) => {
                 c.audit.record(
@@ -11916,7 +11983,10 @@ async fn billing_checkout(
             }
             Err(e) => {
                 tracing::error!(checkout = %co.id, tenant = %t, error = %e, "dedicated_ipv4 provisioning failed ($0 testing path)");
-                return Err(StatusCode::BAD_GATEWAY);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Dedicated IPv4 provisioning failed: {e}"),
+                ));
             }
         }
     }

@@ -90,6 +90,14 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   // CURRENT deployment (only true once a deploy after purchase attaches it).
   // Purchased-but-not-yet-attached is a real, honest "Pending" state, never
   // shown as either "none" or "active".
+  // Can the FLEET actually sell this? A capability the platform cannot perform
+  // must say so before the click, not answer with an HTTP error after it.
+  const { data: addons } = usePoll<{
+    addons: { sku: string; available: boolean; unavailable_reason: string }[];
+  }>("/v1/billing/addons", 60000);
+  const ipAddon = addons?.addons?.find((a) => a.sku === "dedicated_ipv4");
+  const ipUnavailable = ipAddon && !ipAddon.available ? ipAddon.unavailable_reason : "";
+
   const purchasedIp = pSettings?.dedicated_ipv4 ?? null;
   const activeIp = displayDep?.dedicated_ipv4 ?? null;
   const [ipBusy, setIpBusy] = useState(false);
@@ -219,9 +227,14 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
         ) : (
           <div className="flex flex-col gap-3">
             <span className="text-sm text-muted">No dedicated IPv4 purchased for this project yet.</span>
+            {ipUnavailable && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600 dark:text-amber-400">
+                <span className="font-medium">Not available on this fleet yet.</span> {ipUnavailable}
+              </div>
+            )}
             {ipErr && <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-500">{ipErr}</div>}
             <div>
-              <Button onClick={buyDedicatedIpv4} disabled={ipBusy}>
+              <Button onClick={buyDedicatedIpv4} disabled={ipBusy || !!ipUnavailable}>
                 {ipBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
                 Buy Dedicated IPv4
               </Button>

@@ -61,6 +61,27 @@ pub const PRICE_CENTS: u64 = 0;
 /// `co.target` is the project id (validated as tenant-owned by the caller at
 /// checkout-open time, `admin::project_owned_by`); `co.tenant` is the
 /// billing tenant charged.
+/// Can this node actually provision an address RIGHT NOW? Checks exactly the
+/// config `allocate_eip` requires, spending nothing and reserving nothing.
+///
+/// Exists because the purchase path used to discover missing config only
+/// AFTER opening and confirming a checkout, then answered the browser with a
+/// bare 502: the operator saw "HTTP error" on the Buy button with no way to
+/// learn that the fleet simply has no Tencent credentials configured. A
+/// capability this platform cannot perform must say so in words, before it
+/// takes a purchase.
+pub fn preflight() -> Result<(), String> {
+    for key in [
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "HIVE_TENCENT_EIP_REGION",
+        "HIVE_TENCENT_CVM_INSTANCE_ID",
+    ] {
+        non_empty_env(key)?;
+    }
+    Ok(())
+}
+
 pub async fn provision_from_checkout(
     c: &Arc<CloudState>,
     co: &crate::billing::Checkout,
