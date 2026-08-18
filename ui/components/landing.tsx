@@ -199,10 +199,10 @@ export function Landing() {
         </div>
 
         <div className="relative z-10 mx-auto max-w-5xl px-6 pb-2 pt-[3.15rem] text-center sm:pt-[4.2rem]">
-          <h1 className="text-balance text-5xl font-bold uppercase leading-[1.05] tracking-tight text-white sm:text-7xl">
-            Own the Edge.
+          <h1 className="text-balance text-5xl font-normal leading-[1.05] tracking-tight text-white sm:text-7xl">
+            <span className="font-bold">The compute market</span>
             <br />
-            <span className="italic">Run in the Shadows</span>
+            for every service on Earth
           </h1>
           <p className="mx-auto mt-7 max-w-xl text-lg leading-relaxed text-zinc-400">
             Unleash the Power of Peer-to-Peer: Seamlessly Connect, Collaborate, and Conquer with Our
