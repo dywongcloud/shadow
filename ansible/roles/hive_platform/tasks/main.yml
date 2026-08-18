@@ -64,6 +64,47 @@
   register: _bin
   failed_when: not _bin.stat.exists
 
+# The browser_db lanes (CRR exchange + browser_db_rest) hard-refuse every
+# round when the cr-sqlite loadable extension is missing — and nothing in a
+# backend-only roll ships it (the binary's baked default path points into the
+# source tree, which only full hive_platform runs sync). Witnessed
+# 2026-08-18: fleet-wide "replica open failed" while records looked healthy.
+# Build it here (top-level `make` — the `loadable` target exists only in
+# core/) and install to a stable path the drop-in names. `make` is a no-op
+# when the vendored pin hasn't moved, so this costs seconds on re-runs.
+- name: Build the cr-sqlite loadable extension (no-op when current)
+  ansible.builtin.command:
+    cmd: make
+    chdir: "{{ hive_src_dir }}/vendor/cr-sqlite"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+  async: 1800
+  poll: 15
+
+- name: Install the packaged extension when its content changed
+  ansible.builtin.shell: |
+    set -e
+    src="{{ hive_src_dir }}/vendor/cr-sqlite/core/dist/crsqlite.so"
+    dst=/var/lib/hive/crsqlite.so
+    if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+      install -m 0755 "$src" "$dst"
+      echo CHANGED
+    fi
+  args:
+    executable: /bin/bash
+  register: _crsqlite
+  changed_when: "'CHANGED' in _crsqlite.stdout"
+  notify: restart hive-node
+
+- name: Drop in HIVE_CRSQL_EXTENSION_PATH for hive-node
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hive-node.service.d/crsqlite.conf
+    mode: "0644"
+    content: |
+      [Service]
+      Environment=HIVE_CRSQL_EXTENSION_PATH=/var/lib/hive/crsqlite.so
+  notify: [reload systemd, restart hive-node]
+
 - name: Template the hive-node systemd unit
   ansible.builtin.template:
     src: hive-node.service.j2
