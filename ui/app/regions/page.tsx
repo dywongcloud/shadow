@@ -212,7 +212,7 @@ export default function RegionsPage() {
             </span>
           </div>
         </div>
-        <RegionTvStats liveRegions={regions} />
+        <RegionTvStats />
         {/* Log — real, live-derived join/leave/health transitions diffed from
             the /v1/nodes poll (see lib/node-event-log.ts); never fabricated
             lines. Matches the reference design's log panel below the map. */}

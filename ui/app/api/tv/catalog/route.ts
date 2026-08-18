@@ -4,9 +4,11 @@ import { NextResponse } from "next/server";
 // iptv-org.github.io directly — the app's CSP `connect-src` is deliberately
 // tight ('self' + a short allowlist), and iptv is not on it (nor could the
 // hundreds of arbitrary stream hosts ever be). Fetching here, same-origin,
-// keeps the CSP untouched and also sidesteps CORS. The join + region shaping
-// runs server-side too, so the client downloads only the small per-region
-// result instead of two multi-MB JSON blobs.
+// keeps the CSP untouched and also sidesteps CORS. The join runs server-side,
+// so the client downloads only the id/name/country/url rows it needs.
+//
+// Coverage is EVERY country iptv-org has a playable https HLS stream for — not
+// just the fleet's serving regions — so the world map can surface all of them.
 
 export const dynamic = "force-dynamic";
 // The catalog changes rarely; cache the joined result for an hour so repeat
@@ -15,10 +17,6 @@ export const revalidate = 3600;
 
 const CHANNELS_URL = "https://iptv-org.github.io/api/channels.json";
 const STREAMS_URL = "https://iptv-org.github.io/api/streams.json";
-
-// Serving regions → the country whose national catalog represents them. Must
-// match `lib/tv.ts`'s REGION_TV_GEO countries.
-const WANTED_COUNTRIES = new Set(["TH", "HK", "US", "BR", "DE"]);
 
 interface IptvChannel {
   id: string;
@@ -53,10 +51,14 @@ export async function GET() {
       streamByChannel.set(s.channel, s.url);
     }
 
-    // country → channels with a playable stream.
-    const byCountry: Record<string, { id: string; name: string; country: string; categories: string[]; url: string }[]> = {};
+    // country → channels with a playable stream. Every country iptv-org covers,
+    // minus NSFW/closed channels and any without an https HLS stream.
+    const byCountry: Record<
+      string,
+      { id: string; name: string; country: string; categories: string[]; url: string }[]
+    > = {};
     for (const c of channels) {
-      if (!WANTED_COUNTRIES.has(c.country) || c.is_nsfw || c.closed) continue;
+      if (!c.country || c.is_nsfw || c.closed) continue;
       const url = streamByChannel.get(c.id);
       if (!url) continue;
       (byCountry[c.country] ??= []).push({

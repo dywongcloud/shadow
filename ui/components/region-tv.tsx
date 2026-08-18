@@ -1,21 +1,24 @@
 "use client";
 
-// Region TV overlay — the dial.wtf atlas TV logic on THIS dashboard's world
-// map. Plots are green "OLED" digital text hovering over each serving
-// region: fully transparent fill with a glassmorphic edge (backdrop blur +
-// hairline border), glow from text-shadow, never a solid panel. Clicking a
-// plot opens that region's live TV (iptv-org catalog for the region's
-// country, HLS playback). A collapsible statistics strip renders below the
-// map. Alignment: plots use the SAME static projection the choropleth paints
-// with (projectGeo/MAP_VIEW), expressed as percentage offsets over the SVG
-// box — correct at any rendered size. Known limit, deliberate: the map's
-// double-click country zoom transforms only the SVG, so plots hold their
-// full-world positions until zoom-out.
+// World TV overlay — the dial.wtf atlas TV logic on THIS dashboard's world
+// map, now covering EVERY country iptv-org has a playable stream for, not just
+// the fleet's serving regions. Each country with channels gets a flag marker at
+// its geographic centroid; the serving regions keep the brighter green "OLED"
+// glassmorphic label. Clicking any marker (or a row in the searchable list
+// below the map) opens that place's live TV. Plots use the SAME static
+// projection the choropleth paints with (projectGeo/MAP_VIEW), as percentage
+// offsets over the SVG box — correct at any rendered size.
 
 import { ChevronDown, ChevronUp, Circle, HardDrive, Square, Tv, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MAP_VIEW, projectGeo } from "@/components/world-choropleth";
-import { proxiedStreamUrl, regionTv, useTvCatalog, type RegionTv } from "@/lib/tv";
+import {
+  proxiedStreamUrl,
+  regionTv,
+  useTvCatalog,
+  worldTv,
+  type TvTarget,
+} from "@/lib/tv";
 import {
   fmtBytes,
   fmtClock,
@@ -47,16 +50,43 @@ const GLASS = "bg-transparent backdrop-blur-[2px] border border-green-400/25 rou
 
 export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
   const { catalog, error } = useTvCatalog();
-  const [open, setOpen] = useState<RegionTv | null>(null);
+  const [open, setOpen] = useState<TvTarget | null>(null);
 
   const regions = useMemo(
     () => (catalog ? regionTv(catalog, liveRegions) : []),
     [catalog, liveRegions],
   );
+  // Every OTHER country (serving-region countries already have their bright
+  // label) that has a placeable centroid — a small flag marker each.
+  const world = useMemo(() => {
+    if (!catalog) return [];
+    const serving = new Set(regions.map((r) => r.country));
+    return worldTv(catalog).filter(
+      (c) => !serving.has(c.country) && Number.isFinite(c.lat) && Number.isFinite(c.lon),
+    );
+  }, [catalog, regions]);
 
   return (
     <>
-      {/* Plots: absolutely positioned inside the map's relative wrapper. */}
+      {/* World coverage: one flag per country at its centroid. Small + dim so
+          the map stays readable; hover scales it up and reveals name + count. */}
+      {world.map((c) => {
+        const p = projectGeo(c.lon, c.lat);
+        if (!p) return null;
+        const [x, y] = p;
+        return (
+          <button
+            key={c.country}
+            onClick={() => setOpen({ label: c.name, country: c.country, channels: c.channels })}
+            className="absolute z-10 -translate-x-1/2 -translate-y-1/2 text-[13px] leading-none opacity-70 transition-transform hover:z-30 hover:scale-[1.7] hover:opacity-100"
+            style={{ left: `${(x / MAP_VIEW.width) * 100}%`, top: `${(y / MAP_VIEW.height) * 100}%` }}
+            title={`${c.name} · ${c.channels.length} channel${c.channels.length === 1 ? "" : "s"}`}
+          >
+            {c.flag}
+          </button>
+        );
+      })}
+      {/* Serving-region plots: brighter OLED text, drawn above the flags. */}
       {regions.map((r) => {
         const p = projectGeo(r.lon, r.lat);
         if (!p) return null;
@@ -64,8 +94,8 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
         return (
           <button
             key={r.region}
-            onClick={() => setOpen(r)}
-            className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 px-1.5 py-1 ${GLASS} ${OLED} cursor-pointer transition-transform hover:scale-110`}
+            onClick={() => setOpen({ label: r.region, country: r.country, channels: r.channels })}
+            className={`absolute z-20 -translate-x-1/2 -translate-y-1/2 px-1.5 py-1 ${GLASS} ${OLED} cursor-pointer transition-transform hover:z-30 hover:scale-110`}
             style={{ left: `${(x / MAP_VIEW.width) * 100}%`, top: `${(y / MAP_VIEW.height) * 100}%` }}
             title={`Watch live TV near ${r.region}`}
           >
@@ -88,72 +118,85 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
         </span>
       )}
 
-      {open && <RegionTvViewer region={open} onClose={() => setOpen(null)} />}
+      {open && <RegionTvViewer target={open} onClose={() => setOpen(null)} />}
     </>
   );
 }
 
-/** Collapsible statistics strip — mounted by the page BELOW the map card.
- *  Shares the layer's catalog through the module-cached hook (one fetch). */
-export function RegionTvStats({ liveRegions }: { liveRegions: string[] }) {
+/** Collapsible statistics strip — mounted by the page BELOW the map card. A
+ *  searchable directory of EVERY country with channels; a row opens that
+ *  country's TV. Shares the layer's catalog through the module-cached hook. */
+export function RegionTvStats() {
   const { catalog } = useTvCatalog();
   const [open, setOpen] = useState(false);
-  const regions = useMemo(
-    () => (catalog ? regionTv(catalog, liveRegions) : []),
-    [catalog, liveRegions],
-  );
+  const [q, setQ] = useState("");
+  const [watch, setWatch] = useState<TvTarget | null>(null);
+  const world = useMemo(() => (catalog ? worldTv(catalog) : []), [catalog]);
   const loaded = !!catalog;
-  const total = regions.reduce((n, r) => n + r.channels.length, 0);
-  const categories = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const r of regions)
-      for (const c of r.channels) for (const cat of c.categories) m.set(cat, (m.get(cat) ?? 0) + 1);
-    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
-  }, [regions]);
+  const totalChannels = world.reduce((n, c) => n + c.channels.length, 0);
+  const filtered = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return world;
+    return world.filter(
+      (c) => c.name.toLowerCase().includes(s) || c.country.toLowerCase().includes(s),
+    );
+  }, [world, q]);
 
   return (
     <div className={`relative mt-2 ${GLASS} px-3 py-2`}>
       <button onClick={() => setOpen(!open)} className={`flex w-full items-center justify-between ${OLED}`}>
         <span>
-          TV GRID · {regions.length} REGION{regions.length === 1 ? "" : "S"} ·{" "}
-          {loaded ? `${total} LIVE CHANNELS` : "SYNCING"}
+          WORLD TV GRID · {world.length} COUNTR{world.length === 1 ? "Y" : "IES"} ·{" "}
+          {loaded ? `${totalChannels} LIVE CHANNELS` : "SYNCING"}
         </span>
         {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
       </button>
       {open && (
-        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-          <div className="flex flex-col gap-1.5">
-            {regions.map((r) => (
-              <div key={r.region} className={`flex items-center justify-between ${OLED}`}>
-                <span className="opacity-80">
-                  {r.region.toUpperCase()} [{r.country}]
+        <div className="mt-3">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="SEARCH COUNTRY…"
+            className={`mb-2 w-full ${GLASS} ${OLED} px-2 py-1 outline-none placeholder:text-green-400/40`}
+          />
+          <div className="grid max-h-64 grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto sm:grid-cols-3">
+            {filtered.map((c) => (
+              <button
+                key={c.country}
+                onClick={() => setWatch({ label: c.name, country: c.country, channels: c.channels })}
+                className={`flex items-center justify-between gap-1 ${OLED} hover:!text-green-200`}
+                title={`Watch ${c.name}`}
+              >
+                <span className="flex items-center gap-1 truncate">
+                  <span className="text-sm">{c.flag}</span>
+                  <span className="truncate opacity-85">{c.name.toUpperCase()}</span>
                 </span>
-                <span>{r.channels.length} CH</span>
-              </div>
+                <span className="shrink-0 opacity-70">{c.channels.length}</span>
+              </button>
             ))}
-            {!regions.length && <span className={`${OLED} opacity-60`}>NO REGION DATA YET</span>}
-          </div>
-          <div className="flex flex-col gap-1.5">
-            {categories.map(([cat, n]) => (
-              <div key={cat} className={`flex items-center justify-between ${OLED}`}>
-                <span className="uppercase opacity-80">{cat}</span>
-                <span>{n}</span>
-              </div>
-            ))}
+            {!filtered.length && (
+              <span className={`${OLED} opacity-60`}>{loaded ? "NO MATCH" : "SYNCING…"}</span>
+            )}
           </div>
         </div>
       )}
+      {watch && <RegionTvViewer target={watch} onClose={() => setWatch(null)} />}
     </div>
   );
 }
 
-/** The TV: full-viewport lightbox with the region's channels, hls.js playback
- *  with native-HLS fallback, prev/next channel switching. */
-function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => void }) {
+/** The TV: full-viewport lightbox with the target's channels, hls.js playback
+ *  with native-HLS fallback, fault-recovery, prev/next channel switching. */
+function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => void }) {
   const [idx, setIdx] = useState(0);
   const [err, setErr] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const channel = region.channels[idx] ?? null;
+  const channel = target.channels[idx] ?? null;
+
+  // Switching country/region resets to its first channel.
+  useEffect(() => {
+    setIdx(0);
+  }, [target]);
 
   // ---- Virtual DVR ----------------------------------------------------
   // Drive is per-PROJECT, so a recording needs a destination project. Same
@@ -189,7 +232,7 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
     const rec: DvrRecording = {
       id: `${Date.now()}`,
       project,
-      region: region.region,
+      region: target.country, // ISO code — safe as the Drive path segment (tv/<cc>/…)
       channel: channel.name,
       startAt: Date.now(),
       durationMs: mins * 60_000,
@@ -370,8 +413,8 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
   }, [channel]);
 
   const step = (d: number) => {
-    if (!region.channels.length) return;
-    setIdx((i) => (i + d + region.channels.length) % region.channels.length);
+    if (!target.channels.length) return;
+    setIdx((i) => (i + d + target.channels.length) % target.channels.length);
   };
 
   return (
@@ -379,12 +422,12 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
       onClick={onClose}
       role="dialog"
-      aria-label={`Live TV — ${region.region}`}
+      aria-label={`Live TV — ${target.label}`}
     >
       <div className={`w-full max-w-3xl ${GLASS} p-3`} onClick={(e) => e.stopPropagation()}>
         <div className={`mb-2 flex items-center justify-between ${OLED}`}>
           <span>
-            {region.region.toUpperCase()} [{region.country}] · CH {idx + 1}/{region.channels.length} ·{" "}
+            {target.label.toUpperCase()} [{target.country}] · CH {idx + 1}/{target.channels.length} ·{" "}
             {channel?.name?.toUpperCase() ?? "NO SIGNAL"}
           </span>
           <button onClick={onClose} aria-label="Close">
@@ -397,7 +440,7 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
           {channel ? (
             <video ref={videoRef} className="h-full w-full" controls playsInline muted autoPlay />
           ) : (
-            <div className={`flex h-full items-center justify-center ${OLED}`}>NO CHANNELS FOR THIS REGION</div>
+            <div className={`flex h-full items-center justify-center ${OLED}`}>NO CHANNELS HERE</div>
           )}
           {err && (
             <div className={`absolute inset-x-0 bottom-0 p-2 text-center ${OLED} !text-amber-400`}>

@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { COUNTRY_GEO } from "./country-geo";
 
 // Region TV — the atlas "TV logic" from PeerSpeak/dial.wtf mapped onto THIS
-// fleet's regions. Data source: iptv-org's public channel + stream catalog
-// (https://github.com/iptv-org/iptv, MIT — the dataset that powers
-// tv.garden). No API key; two static JSON snapshots fetched lazily in the
-// browser the first time the TV layer is opened and cached in module memory
-// for the session (they are ~MBs — never fetched on page load).
+// fleet's regions AND the whole world. Data source: iptv-org's public channel
+// + stream catalog (https://github.com/iptv-org/iptv, MIT — the dataset that
+// powers tv.garden). No API key; joined server-side by /api/tv/catalog and
+// fetched once per session (never on page load).
 
 export interface TvChannel {
   id: string;
@@ -27,6 +27,26 @@ export interface RegionTv {
   channels: TvChannel[];
 }
 
+/** A country the catalog has playable channels for, placed at its map centroid.
+ *  This is the whole-world view; `RegionTv` is the fleet-region subset. */
+export interface CountryTv {
+  country: string;
+  name: string;
+  flag: string;
+  lat: number;
+  lon: number;
+  channels: TvChannel[];
+}
+
+/** What the player is pointed at — a country or a serving region, uniformly. */
+export interface TvTarget {
+  /** Display label (country or region name). */
+  label: string;
+  /** ISO country code — also safe as a Drive path segment for recordings. */
+  country: string;
+  channels: TvChannel[];
+}
+
 /** The fleet's serving regions → geo + the country whose national catalog
  *  represents them. Static by design (regions are operator-provisioned; a
  *  region missing here simply gets no TV plot — never an error). */
@@ -38,6 +58,14 @@ export const REGION_TV_GEO: Record<string, { lat: number; lon: number; country: 
   "sao-paulo": { lat: -23.5505, lon: -46.6333, country: "BR" },
   frankfurt: { lat: 50.1109, lon: 8.6821, country: "DE" },
 };
+
+/** ISO 3166-1 alpha-2 → its flag emoji (a regional-indicator pair), computed
+ *  from the code so no flag data needs storing. */
+export function flagEmoji(cc: string): string {
+  const c = cc.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(c)) return "🏳";
+  return String.fromCodePoint(...[...c].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+}
 
 let catalogPromise: Promise<Map<string, TvChannel[]>> | null = null;
 
@@ -83,6 +111,27 @@ export function regionTv(catalog: Map<string, TvChannel[]>, liveRegions: string[
     if (!geo) continue;
     out.push({ region, ...geo, channels: catalog.get(geo.country) ?? [] });
   }
+  return out;
+}
+
+/** Every country in the loaded catalog that has channels, richest first. A
+ *  country with channels but no known centroid still appears (lat/lon NaN) so
+ *  the searchable list can show it even when the map can't place it. */
+export function worldTv(catalog: Map<string, TvChannel[]>): CountryTv[] {
+  const out: CountryTv[] = [];
+  for (const [country, channels] of catalog) {
+    if (!channels.length) continue;
+    const geo = COUNTRY_GEO[country];
+    out.push({
+      country,
+      name: geo?.name ?? country,
+      flag: flagEmoji(country),
+      lat: geo?.lat ?? NaN,
+      lon: geo?.lon ?? NaN,
+      channels,
+    });
+  }
+  out.sort((a, b) => b.channels.length - a.channels.length);
   return out;
 }
 
