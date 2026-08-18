@@ -5,8 +5,9 @@ import {
   Github, Search, GitBranch, CheckCheck, LayoutGrid, List,
   ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star, Activity, X,
 } from "lucide-react";
-import { Card, Button, Input, Triangle } from "@/components/ui";
+import { Card, Button, Input } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
+import { FrameworkLogo } from "@/components/framework-logo";
 import { ProjectMenu } from "@/components/project-menu";
 import {
   usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed,
@@ -391,7 +392,7 @@ function RecentPreviewsBox({ deps }: { deps: Deployment[] }) {
           <div className="flex flex-col gap-1">
             {previews.map((d) => (
               <Link key={d.id} href={`/projects/${encodeURIComponent(d.project)}`} className="flex items-center gap-3 rounded-md px-2 py-2 text-sm hover:bg-subtle">
-                <Triangle className="h-7 w-7 shrink-0" />
+                <FrameworkLogo framework={d.framework} kind={d.kind} className="h-7 w-7 shrink-0" />
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-medium">{d.project}</div>
                   <div className="truncate text-xs text-muted">{(() => { const a = deploymentSelfAlias(d); return a ? deploymentHost(a) : "preview URL pending"; })()}</div>
@@ -535,7 +536,7 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
       <div className="pointer-events-none relative z-10">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 items-center gap-3">
-            <Triangle />
+            <FrameworkLogo framework={p.framework} kind={p.kind} />
             <div className="min-w-0">
               <div className="truncate font-semibold">{p.project}</div>
               <div className="flex min-w-0 items-center gap-1.5">
@@ -595,7 +596,7 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChan
         className="absolute inset-0 z-0"
       />
       <div className="pointer-events-none relative z-10 flex flex-1 items-center gap-4">
-        <Triangle />
+        <FrameworkLogo framework={p.framework} kind={p.kind} />
         {/* Name + production domain (or "No Production Deployment"). */}
         <div className="min-w-0 shrink-0 basis-56 lg:basis-72">
           <div className="truncate font-semibold">{p.project}</div>

@@ -3376,6 +3376,7 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         git: d.git.clone(),
         production: d.production,
         kind: kind.to_string(),
+        framework: d.manifest.framework.clone(),
         features: fluid_core::DeploymentFeatures {
             redirects: d.manifest.redirects.len(),
             rewrites: d.manifest.rewrites.len(),

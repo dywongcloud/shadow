@@ -1657,6 +1657,13 @@ pub struct Manifest {
     /// full ownership/retention/naming contract this rides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_db: Option<BrowserDbPolicy>,
+    /// The detected/build-config framework SLUG (nextjs, vite, astro, remix,
+    /// docker, …), stamped at build time so the dashboard can show each
+    /// project's real framework logo. Empty = unknown → the UI falls back to
+    /// the default mark; absent on pre-upgrade builds, which is the same
+    /// unknown state.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub framework: String,
 }
 
 /// Strict deploy-time protocol validation for raw `fluid.json` text: walk
@@ -2320,6 +2327,11 @@ pub struct DeploymentInfo {
     /// Type label for the UI: "static" | "function" | "fullstack".
     #[serde(default)]
     pub kind: String,
+    /// The build's framework slug (nextjs/vite/astro/docker/…) — carried from
+    /// the manifest so the dashboard shows each project's real framework logo,
+    /// with a default fallback. Empty/absent = unknown.
+    #[serde(default)]
+    pub framework: String,
     /// Framework features mapped onto this deployment (redirects, middleware…).
     #[serde(default)]
     pub features: DeploymentFeatures,

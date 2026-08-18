@@ -861,6 +861,9 @@ export interface Deployment {
   git: GitSource | null;
   production: boolean;
   kind: string;
+  /** Build framework slug (nextjs/vite/astro/docker/…) for the project-grid
+   *  logo. Empty/absent = unknown → the card falls back to the default mark. */
+  framework?: string;
   features?: DeploymentFeatures;
   /** Placement region (e.g. "san-jose") — the project's primary region, else default. */
   region?: string;

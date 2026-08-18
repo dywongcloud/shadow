@@ -2146,6 +2146,19 @@ async fn run_build(
         "preview"
     };
 
+    // Stamp the framework slug onto the manifest so the deployment record
+    // (and the dashboard's project grid) carries the real framework for its
+    // logo — the build already detected it into BuildConfig.framework
+    // (auto-detect saves it there), empty stays empty (UI falls back).
+    if manifest.framework.is_empty() {
+        if let Some(bc) = cloud.projects.get_if_set(&project).map(|s| s.build) {
+            let fw = bc.framework.trim();
+            if !fw.is_empty() {
+                manifest.framework = fw.to_string();
+            }
+        }
+    }
+
     // Inject project env vars + function settings. FILTERED BY ENVIRONMENT:
     // the classification above must happen BEFORE this, because a preview
     // deployment launching with the project's production secrets is exactly
