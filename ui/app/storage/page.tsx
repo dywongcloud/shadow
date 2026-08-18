@@ -27,6 +27,7 @@ import { BrowserDbConfigForm, emptyPolicy, saveBrowserDb } from "./browser-db-pa
 // in a section of its own: it is a database, created the same way as the rest.
 const NATIVE: { kind: UnifiedKind; name: string; desc: string }[] = [
   { kind: "postgres", name: "Postgres", desc: "Managed Postgres — instant, branchable." },
+  { kind: "supabase", name: "Supabase", desc: "Supabase Studio + Postgres — dashboard URL, sign-in and DSN included." },
   { kind: "sqlite", name: "SQLite", desc: "Managed SQLite over libsql/Hrana — real libsql:// DSN, pooled." },
   { kind: "browser_sqlite", name: "SQLite (browser)", desc: "Replicated cr-sqlite — a live copy in every admitted browser." },
   { kind: "redis", name: "Redis", desc: "Durable key-value, TCP + REST." },
@@ -48,7 +49,7 @@ const MARKETPLACE: Provider[] = [
   { id: "upstash", name: "Upstash", desc: "Serverless DB (Redis, Vector, Queue, Search)", kind: "redis", color: "#00c98d" },
   { id: "redis", name: "Redis", desc: "Official Redis", kind: "redis", color: "#d82c20" },
   { id: "aws", name: "AWS", desc: "Serverless, reliable, secure AWS services", kind: "blob", color: "#ff9900" },
-  { id: "supabase", name: "Supabase", desc: "Postgres backend", kind: "postgres", color: "#3ecf8e" },
+  { id: "supabase", name: "Supabase", desc: "Postgres backend", kind: "supabase", color: "#3ecf8e" },
   { id: "nile", name: "Nile", desc: "Postgres re-engineered for B2B", kind: "postgres", color: "#5b8def" },
   { id: "motherduck", name: "MotherDuck", desc: "Analytics database", kind: "postgres", color: "#ff7a45" },
   { id: "convex", name: "Convex", desc: "Reactive database", kind: "postgres", color: "#f3336b" },
@@ -90,7 +91,7 @@ function useDatabases() {
   // different failure modes, so the backend now answers the whole lane at once
   // (`browser_db::browser_db_projects_http`, tenant-filtered server-side).
   const { data: browserDb, refresh: refreshBrowserDb } =
-    usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy }[] }>(
+    usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy; rest?: { libsql_url: string; sql_url: string } }[] }>(
       "/v1/browser-db/projects",
       15000,
     );
@@ -99,11 +100,16 @@ function useDatabases() {
     for (const entry of browserDb?.projects ?? []) out[entry.project] = entry.browser_db;
     return out;
   }, [browserDb]);
+  const restUrls = useMemo(() => {
+    const out: Record<string, { libsql_url: string; sql_url: string }> = {};
+    for (const entry of browserDb?.projects ?? []) if (entry.rest) out[entry.project] = entry.rest;
+    return out;
+  }, [browserDb]);
   // Identity is the project, but the lane is fetched whole — so re-reading it
   // after a save is one refresh, not a per-project one.
   const refreshProject = useCallback(async (_project?: string) => { await refreshBrowserDb(); }, [refreshBrowserDb]);
 
-  const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings), [deployments, settings]);
+  const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings, restUrls), [deployments, settings, restUrls]);
   const rows = useMemo(() => unifiedDatabases(managed ?? [], sqlite), [managed, sqlite]);
 
   // `managed` null AND no sqlite row = still loading / genuinely nothing. The
@@ -257,8 +263,14 @@ function ConnectionCell({ row }: { row: UnifiedDb }) {
     e.preventDefault();
     e.stopPropagation();
     try {
-      const full = await apiGet<Database>(`/v1/databases/${row.id}/credentials`, { fresh: true });
-      const value = full.connection?.[endpoint.key] ?? "";
+      // browser_sqlite has no credentials endpoint — its address IS the full
+      // value (the libsql base URL is not secret; the minted token is).
+      const value = row.source === "sqlite"
+        ? row.sqlite?.restUrls?.libsql_url ?? ""
+        : await (async () => {
+            const full = await apiGet<Database>(`/v1/databases/${row.id}/credentials`, { fresh: true });
+            return full.connection?.[endpoint.key] ?? "";
+          })();
       if (!value) {
         toast(`No ${endpoint.key} available yet`, {});
         return;

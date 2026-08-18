@@ -109,10 +109,7 @@ pub fn mark_cold(node: &str) -> bool {
 /// Is this peer inside its local routing penalty window? Node-local and
 /// advisory: it may only DEPRIORITIZE a candidate, never remove the last one.
 pub fn is_cold(node: &str) -> bool {
-    cold()
-        .read()
-        .get(node)
-        .is_some_and(|exp| *exp > now_ms())
+    cold().read().get(node).is_some_and(|exp| *exp > now_ms())
 }
 
 /// Clear the penalty — call after any SUCCESSFUL exchange with the peer, so a
@@ -159,8 +156,7 @@ pub fn demote(
     }
     let newly_cold = mark_cold(node);
     let last_seen = observed_last_seen_ms.or(known);
-    let alive_by_gossip =
-        last_seen.is_some_and(|ms| now_ms().saturating_sub(ms) < GOSSIP_ALIVE_MS);
+    let alive_by_gossip = last_seen.is_some_and(|ms| now_ms().saturating_sub(ms) < GOSSIP_ALIVE_MS);
     if alive_by_gossip {
         REFUSED_GOSSIP_ALIVE.fetch_add(1, Ordering::Relaxed);
         if newly_cold {

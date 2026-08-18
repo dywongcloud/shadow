@@ -52,3 +52,12 @@
   ansible.builtin.file:
     path: /tmp/hive-cloud.new.gz
     state: absent
+
+# The cr-sqlite extension (browser_db lanes refuse every round without it —
+# see build.yml's note). Small enough to push uncompressed.
+- name: Push the group's cr-sqlite extension
+  ansible.builtin.copy:
+    src: "{{ hive_artifact_root }}/crsqlite-{{ hive_glibc_group }}.so"
+    dest: /tmp/crsqlite.so.new
+    mode: "0755"
+  throttle: "{{ hive_push_throttle | default(4) }}"

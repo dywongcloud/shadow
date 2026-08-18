@@ -40,9 +40,9 @@ const ServiceGraph = dynamic(
   }
 );
 import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview } from "@/lib/api";
-import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
+import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
-import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
+import { deploymentUrl, deploymentHost, openDeployment, zkEnabled, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RawPortConnections } from "@/components/raw-port-connections";
 
 // The project sub-tabs now live in the TOP NAV (breadcrumb-tabs model, issue 3);
@@ -87,9 +87,14 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // PERSISTENT store (localStorage) so they survive navigating away + reload — the
   // global PendingBuildsProvider polls each build and removes it on completion, at
   // which point the REAL deployment row (a different id from the build id) appears.
-  const pendingRows = usePendingBuilds({ project: name });
+  const rawPending = usePendingBuilds({ project: name });
 
   const mine = (deps ?? []).filter((d) => d.project === name);
+  // MERGE, never replace: a pending row is dropped only once the real deployment
+  // record for it is actually present in `mine`. Removing it the instant the build
+  // reported ready left a visible gap, because the record is created on whichever
+  // node ran the build while this page polls through round-robin DNS.
+  const pendingRows = mergePending(rawPending, mine);
 
   // When a pending build completes (dropped from the store), pull the finished
   // deployment in immediately instead of waiting for the next poll tick.
@@ -98,6 +103,11 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     refresh();
   }, [pendingCount, refresh]);
   const prod = mine.find((d) => d.production) ?? mine[0];
+  // The overview card's URL. When no production exists and `prod` fell back to
+  // a PREVIEW record, its own alias is the honest URL — `prod.alias` is the
+  // project's production host, which that preview may or may not be claiming.
+  // For a real production record deploymentSelfAlias returns d.alias verbatim.
+  const prodAlias = prod ? (deploymentSelfAlias(prod) || prod.alias) : undefined;
   const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
 
   async function promote(id: string) {
@@ -167,8 +177,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               <h1 className="text-xl font-semibold">{name}</h1>
             </div>
             {prod && (
-              <a className="text-sm text-link hover:underline" href={deploymentUrl(prod.alias, prod.region_code)} target="_blank" rel="noreferrer">
-                {deploymentHost(prod.alias, prod.region_code)} <ExternalLink className="inline h-3 w-3" />
+              <a className="text-sm text-link hover:underline" href={deploymentUrl(prodAlias, prod.region_code)} target="_blank" rel="noreferrer">
+                {deploymentHost(prodAlias, prod.region_code)} <ExternalLink className="inline h-3 w-3" />
               </a>
             )}
           </div>
@@ -184,7 +194,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
           <a
-            href={deploymentUrl(prod?.alias, prod?.region_code)}
+            href={deploymentUrl(prodAlias, prod?.region_code)}
             target="_blank"
             rel="noreferrer"
             onClick={(e) => {
@@ -192,7 +202,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               // the preview instead of a plain open. Otherwise the link proceeds.
               if (zkEnabled && prod) {
                 e.preventDefault();
-                openDeployment(prod.alias, name, prod.region_code);
+                openDeployment(prodAlias || prod.alias, name, prod.region_code);
               }
             }}
           >
@@ -239,8 +249,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 </div>
                 <div>
                   <div className="text-muted">Domains</div>
-                  <a className="text-link hover:underline" href={deploymentUrl(prod?.alias, prod?.region_code)} target="_blank" rel="noreferrer">
-                    {prod ? deploymentHost(prod.alias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
+                  <a className="text-link hover:underline" href={deploymentUrl(prodAlias, prod?.region_code)} target="_blank" rel="noreferrer">
+                    {prod ? deploymentHost(prodAlias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
                   </a>
                 </div>
                 {prod && prod.raw_ports && prod.raw_ports.length > 0 && (
@@ -508,7 +518,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
 
   if (pv.kind === "image" && pv.url && !imgError) {
     return (
-      <a href={deploymentUrl(prod?.alias, prod?.region_code)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
+      <a href={deploymentUrl(deploymentSelfAlias(prod) || prod.alias, prod.region_code)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
         <Image
           src={`/cloud${pv.url}`}
           alt={`${project} preview`}

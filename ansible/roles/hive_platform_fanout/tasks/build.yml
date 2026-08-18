@@ -135,3 +135,31 @@
     src: "{{ hive_binary_path }}.gz"
     dest: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}.gz"
     flat: true
+
+# The cr-sqlite loadable extension rides the same fan-out: the browser_db
+# lanes (CRR exchange + browser_db_rest) hard-refuse every round without it,
+# and a backend-only roll otherwise ships no extension at all (witnessed
+# fleet-wide 2026-08-18: "replica open failed" on every node while records
+# looked healthy). Built from the vendored pin with the TOP-LEVEL `make`
+# (the `loadable` target exists only in core/) — a no-op when the pin is
+# unchanged. Per-glibc-group like the binary, for the same reason.
+- name: Build the cr-sqlite loadable extension on the group's build host
+  ansible.builtin.command:
+    cmd: make
+    chdir: "{{ hive_src_dir }}/vendor/cr-sqlite"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+  async: 1800
+  poll: 15
+
+- name: Confirm the extension was produced
+  ansible.builtin.stat:
+    path: "{{ hive_src_dir }}/vendor/cr-sqlite/core/dist/crsqlite.so"
+  register: _crsqlite_so
+  failed_when: not _crsqlite_so.stat.exists
+
+- name: Fetch the extension to the control host
+  ansible.builtin.fetch:
+    src: "{{ hive_src_dir }}/vendor/cr-sqlite/core/dist/crsqlite.so"
+    dest: "{{ hive_artifact_root }}/crsqlite-{{ hive_glibc_group }}.so"
+    flat: true

@@ -151,12 +151,12 @@ fn resolve_entry(build_dir: &Path, entry: &str) -> Result<PathBuf, String> {
     // `..` components are rejected above, but a SYMLINK inside the build
     // output could still point outside it (a zip can carry one). Resolve and
     // re-verify containment so an entry can never bundle a host file.
-    let canon = path.canonicalize().map_err(|e| {
-        format!("browser entry {entry:?} cannot be resolved: {e}")
-    })?;
-    let canon_root = build_dir.canonicalize().map_err(|e| {
-        format!("build dir cannot be resolved: {e}")
-    })?;
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("browser entry {entry:?} cannot be resolved: {e}"))?;
+    let canon_root = build_dir
+        .canonicalize()
+        .map_err(|e| format!("build dir cannot be resolved: {e}"))?;
     if !canon.starts_with(&canon_root) {
         return Err(format!(
             "browser entry {entry:?} escapes the deployment root through a symlink"
@@ -199,7 +199,8 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
             name()
         ));
     }
-    let entry_path = resolve_entry(build_dir, policy.entry.trim()).map_err(|e| format!("{}: {e}", name()))?;
+    let entry_path =
+        resolve_entry(build_dir, policy.entry.trim()).map_err(|e| format!("{}: {e}", name()))?;
     let ext = entry_path
         .extension()
         .and_then(|e| e.to_str())
@@ -603,15 +604,24 @@ pub fn descriptor_for(
             && record.state == fluid_core::DeployState::Ready
             && crate::admin::record_tenant(&record.tenant) == tenant
         {
-            let Some(f) = record.manifest.functions.iter().find(|f| f.name == function) else {
+            let Some(f) = record
+                .manifest
+                .functions
+                .iter()
+                .find(|f| f.name == function)
+            else {
                 // Deployment exists but has no such function — today's
                 // `deployment_not_ready` outcome, not "ineligible".
                 return None;
             };
-            return Some(f.browser_artifact.clone().map(|artifact| BrowserFunctionRef {
-                name: function.to_string(),
-                artifact,
-            }));
+            return Some(
+                f.browser_artifact
+                    .clone()
+                    .map(|artifact| BrowserFunctionRef {
+                        name: function.to_string(),
+                        artifact,
+                    }),
+            );
         }
     }
     for deployments in cloud.peer_deployments.read().values() {
@@ -802,7 +812,9 @@ pub fn resolve_for_tenant(
             continue;
         }
         for f in &record.manifest.functions {
-            let Some(a) = &f.browser_artifact else { continue };
+            let Some(a) = &f.browser_artifact else {
+                continue;
+            };
             if a.policy_digest == policy_digest {
                 if descriptor.is_none() {
                     descriptor = Some(a.clone());

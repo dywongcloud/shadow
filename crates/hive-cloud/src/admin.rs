@@ -529,10 +529,8 @@ async fn mint_token(
     // client-supplied claim for it. Case-insensitive membership, mirroring the
     // owner check's eq_ignore_ascii_case.
     let email = req.email.trim();
-    let platform_admin = !email.is_empty()
-        && c.admin_emails
-            .iter()
-            .any(|a| email.eq_ignore_ascii_case(a));
+    let platform_admin =
+        !email.is_empty() && c.admin_emails.iter().any(|a| email.eq_ignore_ascii_case(a));
     // Admins are always enterprise (feature: "make all admins automatically
     // always enterprise plan no matter what"). Set an unbypassable tier FLOOR
     // on the admin's tenant via the existing lock — the same mechanism
@@ -935,9 +933,34 @@ pub(crate) async fn project_network_put(
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty()),
             public_port: None,
+            preferred_public_port: None,
         });
     }
     let recs = c.gw.deployment_records();
+    // A Settings→Network save rebuilds the spec list from the FORM, which has
+    // no notion of compose publish requests — leaving `preferred_public_port`
+    // blank here silently UNPUBLISHED every compose-published port fleet-wide
+    // within one reconcile tick (the spec drops out of `raw_targets`, loses
+    // its stamp, and every raw-proxy listener closes). The publish request
+    // belongs to the compose file, not this form: carry it over from the
+    // current record's matching spec.
+    {
+        let current: Vec<fluid_core::PortSpec> = recs
+            .iter()
+            .filter(|r| r.project == project)
+            .max_by_key(|r| (r.production, r.created_at_ms))
+            .and_then(|r| r.manifest.functions.first())
+            .map(|f| f.ports.clone())
+            .unwrap_or_default();
+        for spec in specs.iter_mut() {
+            if let Some(cur) = current
+                .iter()
+                .find(|cs| cs.container_port == spec.container_port && cs.protocol == spec.protocol)
+            {
+                spec.preferred_public_port = cur.preferred_public_port;
+            }
+        }
+    }
     let rec = recs
         .iter()
         .filter(|r| r.project == project && r.production)
@@ -2317,8 +2340,7 @@ pub(crate) async fn build_cancel(
     let Some(b) = c.builds.get(&id) else {
         if !c.is_control_plane_leader() {
             let leader = c.control_plane_leader();
-            if let Some(v) =
-                post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
+            if let Some(v) = post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
             {
                 return Ok(Json(v));
             }
@@ -2350,7 +2372,15 @@ pub(crate) async fn build_cancel(
     // reflects the cancel immediately even if the kill itself is still racing
     // the build's own natural completion.
     c.build_cancels.cancel(&c, &id).await;
-    let ev = c.event(&c.region, "CANCEL", &b.project, "/", 200, "deploy", "build cancelled by user");
+    let ev = c.event(
+        &c.region,
+        "CANCEL",
+        &b.project,
+        "/",
+        200,
+        "deploy",
+        "build cancelled by user",
+    );
     c.record(ev);
     crate::webhooks::dispatch(
         &c.webhooks,
@@ -2922,7 +2952,9 @@ async fn dep_list(
             .filter(|d| {
                 // Trust the deployment's OWN tenant tag first — it's authoritative
                 // for who actually built/owns it (matches the peer branch below).
-                // `ProjectStore.team_of` is NODE-LOCAL and never gossiped, so on a
+                // `ProjectStore.team_of` is REPLICATED (store_sync merges rows
+                // with per-row updated_ms + tombstones) but converges on a sync
+                // cadence and repairs on the tenancy-reconcile loop, so on a
                 // node other than the one that ran `set_team` it can miss even for
                 // a correctly-tagged deployment; only consult it as a fallback when
                 // the record itself was never tagged, and even then fail CLOSED
@@ -3361,19 +3393,42 @@ async fn purge_project_resources(
             // `podman rm`/DB-container teardown site in this file (this one,
             // plus the two below in `database_delete`/the "remove" op) stays
             // hardcoded to podman for that reason, unconditionally.
-            let _ = tokio::process::Command::new("podman")
-                .args(["rm", "-f", &container])
-                .env(
-                    "PATH",
-                    format!(
-                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            // Comma-split: a Supabase record carries its whole stack.
+            for one in container
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = tokio::process::Command::new("podman")
+                    .args(["rm", "-f", "-v", one])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
+            if d.kind == crate::databases::DbKind::Supabase {
+                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
+                let _ = tokio::process::Command::new("podman")
+                    .args(["volume", "rm", "-f", &vol])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
         }
         c.databases.remove_db_and_purge_data(&d.id, &d.team);
     }
@@ -3390,6 +3445,12 @@ async fn purge_project_resources(
     if !released.is_empty() {
         tracing::info!(project, ports = ?released, "released public raw port(s) on project delete");
     }
+
+    // The purge runs DETACHED from both delete paths, after their persist() dirty
+    // bump — so the debounced writer can capture a snapshot BEFORE these catalog
+    // mutations land, and nothing here bumped it again. A restart in that window
+    // resurrected already-purged database rows. Bump once at the end.
+    crate::persist::persist(c);
 }
 
 /// Remove every volume named `hive-vol-<project>` or `hive-vol-<project>-<service>`
@@ -3453,10 +3514,7 @@ async fn purge_project_podman_volumes(project: &str) {
 /// written before the name was sanitized for path use).
 async fn purge_project_source_dirs(project: &str) {
     let prefixes = crate::git::checkout_prefixes(project);
-    for base in [
-        crate::git::deploy_root(),
-        crate::git::legacy_deploy_root(),
-    ] {
+    for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
         let Ok(mut rd) = tokio::fs::read_dir(&base).await else {
             continue;
         };
@@ -3526,24 +3584,78 @@ async fn project_delete(
     // broadcast the single-hop cascade and let owners tear down their copies.
     if !authorized {
         if q.cascade.unwrap_or(true) {
-            let c2 = c.clone();
-            let project2 = project.clone();
-            let team2 = t.clone();
-            tokio::spawn(async move {
-                let peers: Vec<String> = c2
-                    .registry
-                    .nodes()
-                    .into_iter()
-                    .filter(|n| !n.is_self && n.healthy)
-                    .map(|n| n.name)
-                    .collect();
-                for node in peers {
-                    dispatch_project_delete(&c2, &node, &project2, &team2).await;
+            // AWAIT the broadcast rather than spawning it and answering 200. This node
+            // holds no copy of the project, so a 200 here asserted a deletion it never
+            // performed and never observed anyone else perform — and the dashboard,
+            // which treats any 2xx as success, showed the user nothing at all while the
+            // project kept serving. That is the "deleting a project does nothing" bug.
+            // Deletes are rare and each hop is small, so paying the round trip to be
+            // able to tell the truth is the right trade.
+            //
+            // Broadcast to EVERY peer, not just healthy ones: health is a per-observer
+            // verdict, and a peer this node currently calls unhealthy is exactly the one
+            // most likely to still be serving the copy nobody could reach.
+            let peers: Vec<String> = c
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self)
+                .map(|n| n.name)
+                .collect();
+            let n_peers = peers.len();
+            // Quick single-attempt pass, hard-capped per peer: the user is waiting,
+            // and the leader-forward client that proxied this request times out at
+            // 30s — an answer slower than that reads as failure even when the
+            // cascade later succeeds. Peers the quick pass could not reach get the
+            // full retry budget DETACHED below.
+            let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
+                let c = c.clone();
+                let project = project.clone();
+                let t = t.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        dispatch_project_delete_with(&c, node, &project, &t, 1),
+                    )
+                    .await
+                    .unwrap_or(false)
                 }
-            });
-            return Ok(Json(
-                json!({ "project": project, "removed_deployments": [], "note": "not hosted here — cascade broadcast to peers" }),
-            ));
+            }))
+            .await;
+            let accepted = results.iter().filter(|ok| **ok).count();
+            let unreached: Vec<String> = peers
+                .iter()
+                .zip(results.iter())
+                .filter(|(_, ok)| !**ok)
+                .map(|(n, _)| n.clone())
+                .collect();
+            if !unreached.is_empty() {
+                let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
+                tokio::spawn(async move {
+                    futures::future::join_all(
+                        unreached.iter().map(|node| {
+                            dispatch_project_delete_with(&c2, node, &project2, &team2, 3)
+                        }),
+                    )
+                    .await;
+                });
+            }
+            if accepted == 0 {
+                // Nobody confirmed. Either the project does not exist under this tenant,
+                // or every node that could own it is unreachable. Both are honest
+                // failures the user must see; neither is a deletion.
+                tracing::warn!(
+                    project, tenant = %t, peers = n_peers,
+                    "project delete: not hosted locally and no peer accepted the cascade"
+                );
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            return Ok(Json(json!({
+                "project": project,
+                "removed_deployments": [],
+                "accepted_by": accepted,
+                "note": "not hosted here — deleted on peers that accepted the cascade",
+            })));
         }
         return Err(StatusCode::NOT_FOUND);
     }
@@ -3558,10 +3670,24 @@ async fn project_delete(
         "delete",
         &format!("deleted project {project} ({} deployment(s))", ids.len()),
     );
-    purge_project_resources(&c, &project, &t, ids.len()).await;
+    // Commit the authoritative state change BEFORE the best-effort resource purge.
+    // The purge is unbounded — it reaches databases, volumes and containers — and axum
+    // DROPS this request future the moment the client gives up (browser navigation,
+    // proxy deadline). With the purge first, an abandoned delete left the deployments
+    // removed and the PROJECT ROW STILL PRESENT: a half-deleted project that comes
+    // back in the dashboard with nothing behind it, and cannot be deleted again
+    // because the deployments the authorization check looks for are already gone.
+    // The row is the record of intent; write it first, then reclaim.
     c.projects.remove(&project);
     c.git_index.remove_project(&project);
     crate::persist::persist(&c);
+    {
+        // Reclamation itself runs detached for the same reason: a dropped future must
+        // not be able to abort it halfway through (the `ColdStartGuard` rule applied to
+        // teardown), and the dashboard should not wait on remote database deletes.
+        let (c2, project2, team2, n) = (c.clone(), project.clone(), t.clone(), ids.len());
+        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+    }
     crate::webhooks::dispatch(
         &c.webhooks,
         &project,
@@ -3581,21 +3707,103 @@ async fn project_delete(
         let project2 = project.clone();
         let team2 = t.clone();
         tokio::spawn(async move {
+            // Every peer, not only the ones this node currently calls healthy: health is
+            // a per-OBSERVER verdict, so an "unhealthy" peer is precisely the one most
+            // likely to still be serving a copy nobody could reach — and a delete it
+            // never receives is a project that serves forever. Concurrently, so one slow
+            // peer cannot delay the rest.
             let peers: Vec<String> = c2
                 .registry
                 .nodes()
                 .into_iter()
-                .filter(|n| !n.is_self && n.healthy)
+                .filter(|n| !n.is_self)
                 .map(|n| n.name)
                 .collect();
-            for node in peers {
-                dispatch_project_delete(&c2, &node, &project2, &team2).await;
-            }
+            futures::future::join_all(
+                peers
+                    .iter()
+                    .map(|node| dispatch_project_delete(&c2, node, &project2, &team2)),
+            )
+            .await;
         });
     }
     Ok(Json(
         json!({ "project": project, "removed_deployments": ids }),
     ))
+}
+
+/// LOCAL-ONLY relocation reap (the receiving side of
+/// [`dispatch_deployments_reap`]): remove THIS node's production-lane
+/// deployment records for the project and nothing else — previews stay,
+/// ProjectSettings stay (team tag, production_branch, env), the relational row
+/// stays, no resource purge. The full-teardown primitive
+/// ([`delete_project_local`]) was reused for relocation reaping and its
+/// settings wipe is what made projects vanish from accounts (the team tag is
+/// how every listing filter finds them) and made push-classified builds treat
+/// preview branches as production (production_branch erased).
+pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -> usize {
+    let ids = c.gw.remove_project_superseded(project).await;
+    if !ids.is_empty() {
+        record_event(
+            c,
+            project,
+            "reap",
+            &format!(
+                "relocation: removed {} superseded production record(s) of {project}",
+                ids.len()
+            ),
+        );
+        crate::persist::persist(c);
+    }
+    ids.len()
+}
+
+/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW
+/// arm rather than a parameter on the delete arm: a pre-upgrade peer answers
+/// NO_HANDLER (a safe no-op — its stale copies linger until it upgrades)
+/// instead of an old binary ignoring the scope parameter and running the FULL
+/// teardown, which is the destroy-by-omission this replaces.
+pub(crate) async fn dispatch_deployments_reap(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    team: &str,
+) -> bool {
+    if node == c.node_name {
+        return true;
+    }
+    for attempt in 0..2u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        }
+        let target = c
+            .registry
+            .nodes()
+            .into_iter()
+            .find(|n| n.name == node)
+            .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+        let Some((id, addr)) = target else {
+            return false;
+        };
+        let path = format!(
+            "/v1/projects/{project}/reap-deployments?{}",
+            mesh_team_qs(team)
+        );
+        if let Some(body) =
+            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+        {
+            let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+            if v.as_ref()
+                .map(|v| v.get("reaped").is_some())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            // NO_HANDLER (pre-upgrade peer) or a refusal — both terminal.
+            return false;
+        }
+    }
+    false
 }
 
 /// Tear down a project on ONE peer node, over whatever control-plane transport
@@ -3604,14 +3812,34 @@ async fn project_delete(
 /// tunnels were cut, which is exactly why HTTP-only cascade deletes silently
 /// never reached the hosting nodes and "deleting a project didn't work").
 /// `cascade=false` semantics on the receiving side: single hop, no loops.
+/// Returns `true` when a peer ACCEPTED the delete over some transport. The caller
+/// on the not-hosted-here path reports that outcome to the user instead of
+/// claiming success it never observed.
 pub(crate) async fn dispatch_project_delete(
     c: &Arc<CloudState>,
     node: &str,
     project: &str,
     team: &str,
-) {
+) -> bool {
+    dispatch_project_delete_with(c, node, project, team, 3).await
+}
+
+/// [`dispatch_project_delete`] with an explicit retry budget. The AWAITED
+/// cascade (the not-hosted-here delete path) uses `attempts = 1`: with the full
+/// 3-attempt budget a single dead peer holds the user's request for over a
+/// minute — longer than the leader-forward client's own 30s timeout, so the
+/// user would be told the delete failed while it went on to succeed. Reliability
+/// is not lost: the caller spawns the full-budget variant DETACHED for any peer
+/// the quick pass could not reach.
+pub(crate) async fn dispatch_project_delete_with(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    team: &str,
+    attempts: u32,
+) -> bool {
     if node == c.node_name {
-        return; // local copy already handled by the caller
+        return true; // local copy already handled by the caller
     }
     // A delete is a ONE-SHOT broadcast — unlike a database write mirror
     // (`db_replicate::send_mirrored`), there is no "next delete" to naturally
@@ -3621,8 +3849,7 @@ pub(crate) async fn dispatch_project_delete(
     // exclusive by transport availability, and retry the whole pair a few
     // times with backoff so one transient blip on both transports in the same
     // instant doesn't strand the peer either.
-    const ATTEMPTS: u32 = 3;
-    for attempt in 0..ATTEMPTS {
+    for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
         }
@@ -3640,7 +3867,7 @@ pub(crate) async fn dispatch_project_delete(
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
             if ok {
-                return;
+                return true;
             }
         }
         // iroh mesh path: resolve the peer's cryptographic identity + address from
@@ -3656,11 +3883,31 @@ pub(crate) async fn dispatch_project_delete(
         if let Some((id, addr)) = target {
             let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
             // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
-            if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-                .await
-                .is_some()
+            if let Some(body) =
+                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
+                    .await
             {
-                return;
+                // The mesh protocol carries no status code, so a peer's REFUSAL
+                // ("not owner") arrives as a perfectly well-delivered body.
+                // Treating any reply as acceptance fabricated `accepted_by`
+                // counts for projects that exist nowhere — on the fleet, where
+                // `node_admins` is empty and iroh is the only transport, EVERY
+                // peer's refusal was counted as a confirmed deletion. Accepted
+                // means the arm actually ran `delete_project_local` (it answers
+                // `{"removed": n}`); an `error` body is an authoritative no, so
+                // further transports/retries are pointless for this peer.
+                let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                let accepted = v
+                    .as_ref()
+                    .map(|v| v.get("error").is_none() && v.get("removed").is_some())
+                    .unwrap_or(false);
+                if accepted {
+                    return true;
+                }
+                if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
+                    return false;
+                }
+                // Unparseable reply: fall through to the retry loop.
             }
         } else if admin.is_none() {
             tracing::warn!(
@@ -3668,16 +3915,17 @@ pub(crate) async fn dispatch_project_delete(
                 project,
                 "project delete: no route to hosting node (no admin URL, no iroh identity)"
             );
-            return; // no route exists at all; retrying won't help until routes change
+            return false; // no route exists at all; retrying won't help until routes change
         }
     }
     tracing::warn!(
         node,
         project,
-        attempts = ATTEMPTS,
+        attempts,
         "project delete dispatch failed on every transport after retries — peer may keep \
          serving the deleted project until it receives a delete for another reason"
     );
+    false
 }
 
 /// LOCAL-ONLY project teardown used by the mesh delete arm (the receiving side of
@@ -3702,10 +3950,23 @@ pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, tea
     } else {
         team.to_string()
     };
-    purge_project_resources(c, project, &team, ids.len()).await;
+    // Same discipline as the HTTP handler above, for the same reasons — and one
+    // more that is specific to THIS path: the mesh caller polls with a 20s
+    // budget while the purge is unbounded (per-container `podman rm -f`, volume
+    // enumeration, source-tree removal, a raw-ports release with its own leader
+    // round trip). Purging inline blew that budget, the caller retried, and a
+    // second concurrent delete of the same project ran against a half-torn-down
+    // first — commit the row, answer fast, reclaim detached. This function is
+    // the receiving side of the fleet's ONLY working delete transport
+    // (`node_admins` is empty on Firecracker nodes), so the ordering fix in the
+    // HTTP handler alone would have missed every real cross-node delete.
     c.projects.remove(project);
     c.git_index.remove_project(project);
     crate::persist::persist(c);
+    {
+        let (c2, project2, team2, n) = (c.clone(), project.to_string(), team.clone(), ids.len());
+        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+    }
     ids.len()
 }
 
@@ -4088,11 +4349,23 @@ async fn fan_out_peers(
     team: &str,
     path: &str,
 ) -> Vec<Value> {
-    futures::future::join_all(
-        peers
-            .iter()
-            .map(|name| fetch_from_host(c, name, path, team)),
-    )
+    // PER-PEER budget, at the one chokepoint every dashboard fan-out funnels
+    // through. `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh)
+    // are DIAL-RESILIENCE budgets — right for one-shot control operations,
+    // structurally wrong for polled reads: one registry-healthy peer whose
+    // trunk is cold made `/v1/functions` and `/v1/metrics` take a flat ~20s
+    // per poll (measured live), which the 3-5s dashboard polling then piled
+    // onto until the usage page rendered nothing at all. The fetches run
+    // concurrently, so the whole fan-out now costs at most one budget; a peer
+    // that misses it contributes to the next poll instead (the wf_runs
+    // PHASE_BUDGET precedent, applied at the shared chokepoint).
+    const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
+    futures::future::join_all(peers.iter().map(|name| async move {
+        tokio::time::timeout(PER_PEER_BUDGET, fetch_from_host(c, name, path, team))
+            .await
+            .ok()
+            .flatten()
+    }))
     .await
     .into_iter()
     .flatten()
@@ -5086,10 +5359,44 @@ pub(crate) async fn nodes(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     let list = c.registry.nodes();
+    // Typed connectivity, derived from signals the node already tracks — the
+    // boolean `healthy` collapses three distinct situations the operator needs
+    // to tell apart, and the dashboard rendered them all as one gray:
+    //  - "healthy":  gossip-alive and this observer's probes pass.
+    //  - "degraded": gossip-alive and probes pass, but THIS observer's trunk
+    //    to it recently failed (`health::is_cold`) — an observer-local
+    //    transport fault, not a sick node; requests route around it while the
+    //    trunk re-forms.
+    //  - "suspect":  gossip-alive but this observer's probes fail repeatedly
+    //    (withdrawn from placement/DNS by `health::demote`'s guarded path).
+    //  - absent from the list entirely = no gossip for 30s = offline; the
+    //    registry already drops those, so the dashboard's "unreachable" rows
+    //    come from its own roster diff, not from this endpoint.
+    // Per-observer by design (AGENTS.md: a health verdict is per-OBSERVER) —
+    // reading this through the ops proxy answers with the LEADER's view.
+    let connectivity = |n: &hive_edge::region::NodeInfo| -> &'static str {
+        if n.is_self {
+            "self"
+        } else if !n.healthy {
+            "suspect"
+        } else if crate::health::is_cold(&n.name) {
+            "degraded"
+        } else {
+            "healthy"
+        }
+    };
     // Operators (and the mesh-internal gossip path) get the full record —
     // peer sync depends on iroh_addr/peer_id being present.
     if operator_allowed(cl, crate::auth::enforced()) {
-        return Ok(Json(json!(list)));
+        let full: Vec<Value> = list
+            .iter()
+            .map(|n| {
+                let mut v = json!(n);
+                v["connectivity"] = json!(connectivity(n));
+                v
+            })
+            .collect();
+        return Ok(Json(json!(full)));
     }
     // Every other signed-in user gets the sanitized topology: enough to render
     // the network page (mesh map, health, capacity totals), none of the
@@ -5113,6 +5420,7 @@ pub(crate) async fn nodes(
                 "lat": n.lat,
                 "lon": n.lon,
                 "healthy": n.healthy,
+                "connectivity": connectivity(&n),
                 "last_seen_ms": n.last_seen_ms,
                 "is_self": n.is_self,
                 "backend": n.backend,
@@ -6459,7 +6767,7 @@ pub(crate) struct LocalQ {
     pub(crate) local: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct WfQuery {
     /// Restrict to a single project.
     pub(crate) project: Option<String>,
@@ -7161,6 +7469,13 @@ async fn wf_define(
     Ok(Json(json!(defs)))
 }
 
+const WF_LAST_GOOD_TTL_MS: u64 = 60_000;
+type WfLastGoodMap = std::collections::HashMap<String, (u64, Value)>;
+fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
+    static LG: std::sync::OnceLock<parking_lot::Mutex<WfLastGoodMap>> = std::sync::OnceLock::new();
+    LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
+}
+
 pub(crate) async fn wf_runs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7184,6 +7499,100 @@ pub(crate) async fn wf_runs(
             return Json(v);
         }
     }
+    if !is_top_level {
+        // Inner `local=true` hop: run inline, never cached, never coalesced —
+        // its caller (a peer's own aggregation) carries the budget.
+        return Json(wf_runs_collect(c, team, q).await);
+    }
+    // Top-level: the aggregation runs on a DETACHED task, coalesced per cache
+    // key. Two reasons, both live-witnessed as "Error loading runs" on the
+    // dashboard: (1) the dashboard's own world proxy aborts this request at
+    // 20s, and axum then DROPS this handler future mid-await — with the
+    // caches written only at handler completion, an aborted poll starved
+    // `resp_cache` AND the last-known-good belt forever, so EVERY subsequent
+    // poll re-ran the full slow path and aborted identically (steady-state
+    // failure, not a transient). Detaching means the computation always
+    // finishes and always writes the caches — one slow poll instead of an
+    // endless series. (2) Coalescing means five aborted-and-retried polls
+    // spawn ONE aggregation, not five (the dc8286f amplification rule).
+    type WfShared = tokio::sync::watch::Receiver<Option<Value>>;
+    fn wf_inflight() -> &'static parking_lot::Mutex<std::collections::HashMap<String, WfShared>> {
+        static M: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::HashMap<String, WfShared>>,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+    let mut rx = {
+        let mut m = wf_inflight().lock();
+        match m.get(&cache_key) {
+            Some(rx) => rx.clone(),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                m.insert(cache_key.clone(), rx.clone());
+                let (c2, team2, q2, key2) = (c.clone(), team.clone(), q.clone(), cache_key.clone());
+                tokio::spawn(async move {
+                    // The map entry MUST clear even if the collector panics:
+                    // a leaked entry's dead sender makes every later poll fall
+                    // through to the uncached inline path forever — the exact
+                    // steady-state starvation this task exists to prevent.
+                    struct ClearOnDrop(String);
+                    impl Drop for ClearOnDrop {
+                        fn drop(&mut self) {
+                            wf_inflight().lock().remove(&self.0);
+                        }
+                    }
+                    let _clear = ClearOnDrop(key2.clone());
+                    let v = wf_runs_collect(c2.clone(), team2, q2).await;
+                    c2.resp_cache.set(key2, v.clone());
+                    let _ = tx.send(Some(v));
+                });
+                rx
+            }
+        }
+    };
+    // STALE-WHILE-REVALIDATE: with a computation already in flight, a recent
+    // last-known-good answer beats blocking this poll on the aggregation — the
+    // dashboard polls every few seconds, so it picks the fresh rows up on the
+    // next tick from the cache the detached task writes. Only the genuinely
+    // FIRST poll (nothing known yet) waits out the computation.
+    {
+        let g = wf_last_good().lock();
+        if let Some((at, v)) = g.get(&cache_key) {
+            if hive_core::now_ms().saturating_sub(*at) < WF_LAST_GOOD_TTL_MS {
+                return Json(v.clone());
+            }
+        }
+    }
+    loop {
+        if let Some(v) = rx.borrow().clone() {
+            return Json(v);
+        }
+        if rx.changed().await.is_err() {
+            // Compute task died (panic) — degrade to the collector inline.
+            return Json(wf_runs_collect(c, team, q).await);
+        }
+    }
+}
+
+/// The actual aggregation `wf_runs` serves — local workflow store + per-project
+/// Upstash world reads + peer fan-out, each slow phase under its OWN budget so
+/// the worst case stays inside the dashboard's 20s client abort (the phases'
+/// dial-resilience budgets — 10s HTTP + 20s iroh per peer, 20s per world read —
+/// are correct for one-shot control operations and structurally wrong for a
+/// polled read: this endpoint is re-asked every few seconds, so a phase that
+/// misses one poll's budget simply contributes to the next poll). Writes the
+/// LAST-KNOWN-GOOD belt (and consults it for empties) itself, so completion —
+/// not the HTTP caller's patience — is what populates it.
+async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value {
+    let is_top_level = !q.local.unwrap_or(false);
+    let cache_key = format!(
+        "wf_runs:{team}:{}:{}",
+        q.project.as_deref().unwrap_or(""),
+        q.summary.unwrap_or(false)
+    );
+    /// One phase's budget: generous for a healthy fleet, and small enough that
+    /// world-read + fan-out in sequence still complete under the client abort.
+    const PHASE_BUDGET: Duration = Duration::from_secs(8);
     // Scoped request for a project with a locally-readable, tenant-owned WORLD
     // (env is gossiped, so this is true on EVERY node): never depend on the
     // mesh forward for the world rows — the forward path returned a false-[]
@@ -7199,18 +7608,18 @@ pub(crate) async fn wf_runs(
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() && !scoped_world_local {
             if let Some(node) = host_node_for_project(&c, project) {
-                if let Some(v) = fetch_from_host(
-                    &c,
-                    &node,
-                    &format!("/v1/workflows/runs?project={project}&local=true"),
-                    &team,
+                if let Ok(Some(v)) = tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(
+                        &c,
+                        &node,
+                        &format!("/v1/workflows/runs?project={project}&local=true"),
+                        &team,
+                    ),
                 )
                 .await
                 {
-                    if is_top_level {
-                        c.resp_cache.set(cache_key.clone(), v.clone());
-                    }
-                    return Json(v);
+                    return v;
                 }
             }
         }
@@ -7274,13 +7683,23 @@ pub(crate) async fn wf_runs(
         // time (this function's own doc/comment history calls it "the most
         // expensive read on the dashboard"). join_all bounds the added latency to
         // the slowest single project's read instead of the sum of every project.
-        for wruns in
-            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100)))
-                .await
-                .into_iter()
-                .flatten()
+        // Budgeted: a single slow/hung Upstash world must cost this POLL its
+        // rows for that project, never the whole endpoint its deadline.
+        if let Ok(all) = tokio::time::timeout(
+            PHASE_BUDGET,
+            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100))),
+        )
+        .await
         {
-            runs.extend(wruns);
+            for wruns in all.into_iter().flatten() {
+                runs.extend(wruns);
+            }
+        } else if !locals.is_empty() {
+            tracing::warn!(
+                team,
+                projects = locals.len(),
+                "wf_runs: world reads exceeded the phase budget — serving without them this poll"
+            );
         }
     }
     let run_key = |r: &Value| -> Option<String> {
@@ -7292,7 +7711,30 @@ pub(crate) async fn wf_runs(
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
-        for v in fan_out_peers(&c, &peers, &team, "/v1/workflows/runs?local=true").await {
+        // Budgeted PER PEER, never as one timeout over the whole join: a
+        // single dark peer used to trip the outer budget and silently discard
+        // every HEALTHY peer's rows too — fast but permanently incomplete,
+        // and the incomplete (non-empty) result then overwrote last-known-
+        // good. Per-peer budgets bound the wall clock to one budget (the
+        // fetches run concurrently) while each healthy peer's rows land.
+        let peer_results: Vec<Value> = futures::future::join_all(peers.iter().map(|node| {
+            let c = c.clone();
+            let team = team.clone();
+            async move {
+                tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true", &team),
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        for v in peer_results {
             if let Some(arr) = v.as_array() {
                 for r in arr {
                     if let Some(id) = run_key(r) {
@@ -7317,11 +7759,14 @@ pub(crate) async fn wf_runs(
             if let Some(node) = host_node_for_project(&c, project) {
                 let mut seen: std::collections::HashSet<String> =
                     runs.iter().filter_map(run_key).collect();
-                if let Some(v) = fetch_from_host(
-                    &c,
-                    &node,
-                    &format!("/v1/workflows/runs?project={project}&local=true"),
-                    &team,
+                if let Ok(Some(v)) = tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(
+                        &c,
+                        &node,
+                        &format!("/v1/workflows/runs?project={project}&local=true"),
+                        &team,
+                    ),
                 )
                 .await
                 {
@@ -7363,19 +7808,12 @@ pub(crate) async fn wf_runs(
     // seconds-stale, never to false-empty. Genuine emptiness still wins once
     // the hold expires (WF_LAST_GOOD_TTL), so a truly-cleared world shows
     // empty within a minute rather than pinning stale rows forever.
-    const WF_LAST_GOOD_TTL_MS: u64 = 60_000;
-    type WfLastGoodMap = std::collections::HashMap<String, (u64, Value)>;
-    fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
-        static LG: std::sync::OnceLock<parking_lot::Mutex<WfLastGoodMap>> =
-            std::sync::OnceLock::new();
-        LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
-    }
     if is_top_level {
         if runs.is_empty() {
             let g = wf_last_good().lock();
             if let Some((at, v)) = g.get(&cache_key) {
                 if hive_core::now_ms().saturating_sub(*at) < WF_LAST_GOOD_TTL_MS {
-                    return Json(v.clone());
+                    return v.clone();
                 }
             }
         } else {
@@ -7384,11 +7822,7 @@ pub(crate) async fn wf_runs(
                 .insert(cache_key.clone(), (hive_core::now_ms(), json!(runs)));
         }
     }
-    let result = json!(runs);
-    if is_top_level {
-        c.resp_cache.set(cache_key, result.clone());
-    }
-    Json(result)
+    json!(runs)
 }
 
 /// One run with full step detail (for the trace timeline / Gantt). Resolves from
@@ -8123,17 +8557,12 @@ fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     if record_tenant(&c.projects.team_of(project)) != UNTAGGED_TENANT {
         return false;
     }
-    let local_clean = c
-        .gw
-        .deployment_records()
-        .iter()
-        .all(|r| !r.project.eq_ignore_ascii_case(project) || record_tenant(&r.tenant) == UNTAGGED_TENANT);
-    let peer_clean = c
-        .peer_deployments
-        .read()
-        .values()
-        .flatten()
-        .all(|d| !d.project.eq_ignore_ascii_case(project) || record_tenant(&d.tenant) == UNTAGGED_TENANT);
+    let local_clean = c.gw.deployment_records().iter().all(|r| {
+        !r.project.eq_ignore_ascii_case(project) || record_tenant(&r.tenant) == UNTAGGED_TENANT
+    });
+    let peer_clean = c.peer_deployments.read().values().flatten().all(|d| {
+        !d.project.eq_ignore_ascii_case(project) || record_tenant(&d.tenant) == UNTAGGED_TENANT
+    });
     local_clean && peer_clean
 }
 
@@ -8708,7 +9137,11 @@ async fn databases_list(
         }
     }
     // Deterministic order so a re-poll never reshuffles the rendered list.
-    list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| a.id.cmp(&b.id)));
+    list.sort_by(|a, b| {
+        b.created_ms
+            .cmp(&a.created_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Json(json!(list))
 }
 
@@ -8874,7 +9307,12 @@ async fn database_create(
         .databases
         .list(Some(&project))
         .into_iter()
-        .find(|d| d.team == req.team && d.name == req.name && d.kind == req.kind && !matches!(d.status, crate::databases::DbStatus::Error))
+        .find(|d| {
+            d.team == req.team
+                && d.name == req.name
+                && d.kind == req.kind
+                && !matches!(d.status, crate::databases::DbStatus::Error)
+        })
         .map(|d| d.id)
     {
         if let Some(existing) = c.databases.get_raw(&existing_id) {
@@ -8963,20 +9401,49 @@ async fn database_delete(
             }
         }
         if let Some(container) = d.container {
-            // Best-effort teardown of the backing container.
-            let _ = tokio::process::Command::new("podman")
-                .args(["rm", "-f", &container])
-                .env(
-                    "PATH",
-                    format!(
-                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            // Best-effort teardown of the backing container(s). A Supabase
+            // record carries its whole stack comma-joined (db,meta,studio);
+            // single-container kinds are unaffected by the split. `-v` is the
+            // podman lock-pool rule (anonymous volumes leak locks forever);
+            // the stack's NAMED data volume is removed explicitly below.
+            for one in container
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = tokio::process::Command::new("podman")
+                    .args(["rm", "-f", "-v", one])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
+            if d.kind == crate::databases::DbKind::Supabase {
+                // Deleting the database IS deleting its data — the stack's
+                // named volume is platform-templated (`hive-vol-supa-<id8>`),
+                // never tenant-named, so this cannot touch another volume.
+                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
+                let _ = tokio::process::Command::new("podman")
+                    .args(["volume", "rm", "-f", &vol])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
         }
     }
     // Purges the actual queue/vector/blob PAYLOAD data too (keyed by a
@@ -11355,45 +11822,43 @@ async fn billing_checkout(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
-    let (plan, amount, label, price_id): (String, u64, String, Option<String>) = match req
-        .kind
-        .as_str()
-    {
-        "credits" => {
-            let amt = req.amount_cents.unwrap_or(1000);
-            (
-                "".to_string(),
-                amt,
-                format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
-                None,
-            )
-        }
-        "addon" => {
-            if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
-                return Err(StatusCode::BAD_REQUEST);
+    let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
+        match req.kind.as_str() {
+            "credits" => {
+                let amt = req.amount_cents.unwrap_or(1000);
+                (
+                    "".to_string(),
+                    amt,
+                    format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
+                    None,
+                )
             }
-            target = req.target.clone().unwrap_or_default();
-            if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
-                return Err(StatusCode::FORBIDDEN);
+            "addon" => {
+                if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                target = req.target.clone().unwrap_or_default();
+                if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                (
+                    "".to_string(),
+                    crate::tencent_eip::PRICE_CENTS,
+                    format!("Dedicated IPv4 — {target}"),
+                    crate::tencent_eip::price_id(),
+                )
             }
-            (
-                "".to_string(),
-                crate::tencent_eip::PRICE_CENTS,
-                format!("Dedicated IPv4 — {target}"),
-                crate::tencent_eip::price_id(),
-            )
-        }
-        _ => {
-            let plan = req.plan.unwrap_or_else(|| "pro".into());
-            let spec = crate::billing::plan_spec(&plan);
-            (
-                plan,
-                spec.price_cents,
-                format!("OpenEdge {} plan", spec.name),
-                spec.stripe_price_id.map(|s| s.to_string()),
-            )
-        }
-    };
+            _ => {
+                let plan = req.plan.unwrap_or_else(|| "pro".into());
+                let spec = crate::billing::plan_spec(&plan);
+                (
+                    plan,
+                    spec.price_cents,
+                    format!("OpenEdge {} plan", spec.name),
+                    spec.stripe_price_id.map(|s| s.to_string()),
+                )
+            }
+        };
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
@@ -11422,9 +11887,14 @@ async fn billing_checkout(
     // already idempotent on `ProjectSettings::dedicated_ipv4` (see its own doc
     // comment), so this is safe to hit more than once for the same project.
     if amount == 0 && req.kind == "addon" {
-        let co = c
-            .billing
-            .open_checkout_full(&t, &req.kind, &plan, amount, crate::tencent_eip::SKU, &target);
+        let co = c.billing.open_checkout_full(
+            &t,
+            &req.kind,
+            &plan,
+            amount,
+            crate::tencent_eip::SKU,
+            &target,
+        );
         let (co, _acc) = c
             .billing
             .confirm_checkout(&co.id)
@@ -11470,7 +11940,10 @@ async fn billing_checkout(
                 percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
                     .to_string();
             (
-                format!("{base}/projects/{enc}/settings/network?addon_success={}", co.id),
+                format!(
+                    "{base}/projects/{enc}/settings/network?addon_success={}",
+                    co.id
+                ),
                 format!("{base}/projects/{enc}/settings/network?addon_canceled=1"),
             )
         } else {

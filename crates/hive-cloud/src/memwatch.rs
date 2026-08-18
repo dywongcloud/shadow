@@ -57,12 +57,7 @@ fn proc_status_kb(key: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix(key) {
-            let n: u64 = rest
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()?;
+            let n: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
             return Some(n.saturating_mul(1024));
         }
     }
@@ -173,11 +168,7 @@ fn prune_dumps(keep: usize) {
     {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("heap-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("heap-"))
             .filter_map(|e| {
                 let m = e.metadata().ok()?;
                 Some((m.modified().ok()?, e.path()))
@@ -301,7 +292,8 @@ fn arm_profiling() {
     if ARMED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let already = unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"prof.active\0") }.unwrap_or(false);
+    let already =
+        unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"prof.active\0") }.unwrap_or(false);
     if already {
         return;
     }

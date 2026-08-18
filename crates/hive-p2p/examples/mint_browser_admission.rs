@@ -45,10 +45,8 @@ async fn main() -> anyhow::Result<()> {
             let relay = std::env::var("MINT_RELAY_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3341".to_string());
             let url: iroh::RelayUrl = relay.parse()?;
-            let addr = iroh::EndpointAddr::from_parts(
-                secret.public(),
-                [iroh::TransportAddr::Relay(url)],
-            );
+            let addr =
+                iroh::EndpointAddr::from_parts(secret.public(), [iroh::TransportAddr::Relay(url)]);
             let addr_json = serde_json::to_string(&addr)?;
             (endpoint_id, addr_json, secret)
         }

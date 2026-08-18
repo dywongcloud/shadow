@@ -352,9 +352,9 @@ pub type BrowserCrrHandler = Arc<
     dyn Fn(
             String,
             Vec<u8>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Vec<u8>, u32>> + Send>,
-        > + Send
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, u32>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -377,8 +377,7 @@ pub type BrowserMeterHandler = Arc<dyn Fn(String, u64, u64) + Send + Sync>;
 /// reach it without growing `serve_tunnels_full`'s parameter list again.
 /// `None` (the default) makes metering a compiled-in no-op, so witness
 /// harnesses and embedders that never install a handler pay one RwLock read.
-static BROWSER_METER: std::sync::RwLock<Option<BrowserMeterHandler>> =
-    std::sync::RwLock::new(None);
+static BROWSER_METER: std::sync::RwLock<Option<BrowserMeterHandler>> = std::sync::RwLock::new(None);
 
 /// Install (or clear) the process-global [`BrowserMeterHandler`]. hive-cloud
 /// installs its per-tenant recorder once at boot, next to the admission
@@ -788,11 +787,7 @@ pub fn addr_json(ep: &Endpoint) -> Option<String> {
 /// publishing nothing. Loopback/unspecified addresses are rejected: advertising
 /// those tells peers to dial themselves.
 fn configured_public_addr() -> Option<std::net::SocketAddr> {
-    let ip: std::net::IpAddr = std::env::var("HIVE_PUBLIC_IP")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let ip: std::net::IpAddr = std::env::var("HIVE_PUBLIC_IP").ok()?.trim().parse().ok()?;
     if ip.is_loopback() || ip.is_unspecified() {
         return None;
     }
@@ -1181,7 +1176,10 @@ impl BrowserTrunk {
 
 enum BrowserAcquireError {
     Failed(BrowserInvokeError),
-    Retryable { error: BrowserInvokeError, epoch: u64 },
+    Retryable {
+        error: BrowserInvokeError,
+        epoch: u64,
+    },
     Fenced,
 }
 
@@ -1191,9 +1189,15 @@ struct BrowserAcquired {
 }
 
 enum BrowserAcquireAction {
-    Ready { epoch: u64, trunk: Arc<BrowserTrunk> },
+    Ready {
+        epoch: u64,
+        trunk: Arc<BrowserTrunk>,
+    },
     Wait(Arc<BrowserDial>),
-    Dial { epoch: u64, dial: Arc<BrowserDial> },
+    Dial {
+        epoch: u64,
+        dial: Arc<BrowserDial>,
+    },
 }
 
 struct BrowserStreamLease {
@@ -1219,28 +1223,24 @@ impl BrowserStreamLease {
             .last_used
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-        let global = match tokio::time::timeout(
-            BROWSER_STREAM_WAIT_TIMEOUT,
-            global.acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                trunk.release();
-                return Err(BrowserInvokeError::new(
-                    false,
-                    "browser global stream pool was closed",
-                ));
-            }
-            Err(_) => {
-                trunk.release();
-                return Err(BrowserInvokeError::new(
-                    false,
-                    "browser global stream wait timed out",
-                ));
-            }
-        };
+        let global =
+            match tokio::time::timeout(BROWSER_STREAM_WAIT_TIMEOUT, global.acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    trunk.release();
+                    return Err(BrowserInvokeError::new(
+                        false,
+                        "browser global stream pool was closed",
+                    ));
+                }
+                Err(_) => {
+                    trunk.release();
+                    return Err(BrowserInvokeError::new(
+                        false,
+                        "browser global stream wait timed out",
+                    ));
+                }
+            };
         Ok(Self {
             trunk,
             _stream: stream,
@@ -1272,11 +1272,7 @@ impl BrowserRequestGuard {
         }
     }
 
-    fn attach(
-        &mut self,
-        send: iroh::endpoint::SendStream,
-        recv: iroh::endpoint::RecvStream,
-    ) {
+    fn attach(&mut self, send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream) {
         self.send = Some(send);
         self.recv = Some(recv);
     }
@@ -1390,12 +1386,8 @@ impl BrowserPool {
         Arc::new(Self {
             ep,
             trunks: Mutex::new(HashMap::new()),
-            global_streams: Arc::new(tokio::sync::Semaphore::new(
-                BROWSER_MAX_ACTIVE_STREAMS,
-            )),
-            waiters: Arc::new(tokio::sync::Semaphore::new(
-                BROWSER_MAX_OUTBOUND_WAITERS,
-            )),
+            global_streams: Arc::new(tokio::sync::Semaphore::new(BROWSER_MAX_ACTIVE_STREAMS)),
+            waiters: Arc::new(tokio::sync::Semaphore::new(BROWSER_MAX_OUTBOUND_WAITERS)),
             next_epoch: AtomicU64::new(1),
             counters: BrowserPoolCounterCells::default(),
         })
@@ -1468,9 +1460,7 @@ impl BrowserPool {
                     {
                         BrowserAcquireAction::Ready { epoch, trunk }
                     }
-                    Some((_, BrowserSlotState::Dialing(dial))) => {
-                        BrowserAcquireAction::Wait(dial)
-                    }
+                    Some((_, BrowserSlotState::Dialing(dial))) => BrowserAcquireAction::Wait(dial),
                     Some((epoch, BrowserSlotState::Ready(trunk))) => {
                         trunk.close(0, b"dead browser trunk replaced");
                         self.counters
@@ -1507,12 +1497,10 @@ impl BrowserPool {
                                 .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
                                 .map(|(_, victim_key)| victim_key);
                             let Some(victim) = victim else {
-                                return Err(BrowserAcquireError::Failed(
-                                    BrowserInvokeError::new(
-                                        false,
-                                        "browser trunk pool is at active capacity",
-                                    ),
-                                ));
+                                return Err(BrowserAcquireError::Failed(BrowserInvokeError::new(
+                                    false,
+                                    "browser trunk pool is at active capacity",
+                                )));
                             };
                             if let Some(slot) = trunks.remove(&victim) {
                                 if let BrowserSlotState::Ready(trunk) = slot.state {
@@ -1543,16 +1531,12 @@ impl BrowserPool {
                     return Ok(BrowserAcquired { epoch, trunk });
                 }
                 BrowserAcquireAction::Wait(dial) => {
-                    let _waiter = self
-                        .waiters
-                        .clone()
-                        .try_acquire_owned()
-                        .map_err(|_| {
-                            BrowserAcquireError::Failed(BrowserInvokeError::new(
-                                false,
-                                "browser dial waiter pool is full",
-                            ))
-                        })?;
+                    let _waiter = self.waiters.clone().try_acquire_owned().map_err(|_| {
+                        BrowserAcquireError::Failed(BrowserInvokeError::new(
+                            false,
+                            "browser dial waiter pool is full",
+                        ))
+                    })?;
                     let fenced = tokio::time::timeout(
                         connect_budget() + Duration::from_secs(1),
                         dial.wait(),
@@ -1581,10 +1565,7 @@ impl BrowserPool {
                     {
                         Ok(Ok(conn)) => Ok(conn),
                         Ok(Err(error)) => Err(BrowserInvokeError::new(false, error)),
-                        Err(_) => Err(BrowserInvokeError::new(
-                            false,
-                            "browser connect timed out",
-                        )),
+                        Err(_) => Err(BrowserInvokeError::new(false, "browser connect timed out")),
                     };
                     match connected {
                         Ok(conn) => {
@@ -1606,10 +1587,7 @@ impl BrowserPool {
                             });
                             if !current {
                                 drop(trunks);
-                                conn.close(
-                                    browser_reset::FORBIDDEN.into(),
-                                    b"browser dial fenced",
-                                );
+                                conn.close(browser_reset::FORBIDDEN.into(), b"browser dial fenced");
                                 dial.finish(true);
                                 return Err(BrowserAcquireError::Fenced);
                             }
@@ -1702,10 +1680,7 @@ impl BrowserPool {
         };
         match state {
             BrowserSlotState::Ready(trunk) => {
-                trunk.close(
-                    browser_reset::FORBIDDEN,
-                    b"browser endpoint revoked",
-                );
+                trunk.close(browser_reset::FORBIDDEN, b"browser endpoint revoked");
                 self.counters
                     .trunk_evictions_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1853,11 +1828,8 @@ impl BrowserPool {
             };
             epoch = Some(acquired.epoch);
             let trunk = acquired.trunk;
-            let lease = BrowserStreamLease::acquire(
-                trunk.clone(),
-                self.global_streams.clone(),
-            )
-            .await?;
+            let lease =
+                BrowserStreamLease::acquire(trunk.clone(), self.global_streams.clone()).await?;
             if !self.epoch_current(endpoint_id, acquired.epoch).await {
                 drop(lease);
                 return Err(BrowserInvokeError::new(
@@ -1960,8 +1932,8 @@ impl BrowserPool {
         match stopped {
             Ok(Ok(None)) => {}
             Ok(Ok(Some(code))) => {
-                let reset = u32::try_from(code.into_inner())
-                    .unwrap_or(browser_reset::HANDLER_FAILED);
+                let reset =
+                    u32::try_from(code.into_inner()).unwrap_or(browser_reset::HANDLER_FAILED);
                 io.close(reset);
                 return Err(BrowserInvokeError::new(
                     true,
@@ -2055,10 +2027,7 @@ impl BrowserPool {
             }
             Err(_) => {
                 io.close(browser_reset::DEADLINE_EXCEEDED);
-                return Err(BrowserInvokeError::new(
-                    true,
-                    "browser reply EOF timed out",
-                ));
+                return Err(BrowserInvokeError::new(true, "browser reply EOF timed out"));
             }
         }
         io.disarm();
@@ -2073,6 +2042,16 @@ impl BrowserPool {
 /// instead of dialing a fresh connection (and paying a handshake / holepunch) each
 /// time. Directed dial + gossip discovery are unchanged; only the connection
 /// lifecycle is pooled.
+
+/// ms since UNIX epoch — local helper (this crate deliberately has no
+/// hive-core dependency).
+fn pool_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct PeerPool {
     ep: Endpoint,
     /// Live trunks keyed by CANONICAL ENDPOINT ID (`EndpointAddr::id`, 64-hex) —
@@ -2105,9 +2084,8 @@ pub struct PeerPool {
     /// acquire becomes the leader and dials; the rest `subscribe()` and await
     /// the shared outcome instead of double-handshaking (singleflight — the old
     /// last-insert-wins shape paid two holepunches per cold peer).
-    inflight: Mutex<
-        HashMap<String, tokio::sync::watch::Sender<Option<Result<Connection, String>>>>,
-    >,
+    inflight:
+        Mutex<HashMap<String, tokio::sync::watch::Sender<Option<Result<Connection, String>>>>>,
     /// Per-peer dial generation, bumped ONLY by `close_peer` (a peer-lifecycle
     /// eviction). Internal dead-trunk evictions stay within the generation. A
     /// leader dial that completes after its generation moved closes its fresh
@@ -2117,6 +2095,24 @@ pub struct PeerPool {
     opened: AtomicU64,
     reused: AtomicU64,
     timeouts: Arc<TimeoutCounters>,
+    /// Per-peer WARM backoff: canonical key → (next_attempt_ms, cur_delay_ms).
+    /// Consulted ONLY by [`PeerPool::warm`] — a request-driven `acquire` always
+    /// dials (a real caller's demand outranks the backoff; tau's peering loop
+    /// draws the same line). Cleared on a successful warm; grows
+    /// delay + delay/2 + dither, capped at 5 minutes. A stale entry left
+    /// behind after a REQUEST-driven recovery is harmless: warm's skip is a
+    /// no-op while the trunk is live, and the entry stops BLOCKING within one
+    /// cap (it is removed on the next successful warm, not by a timer).
+    warm_backoff: Mutex<HashMap<String, (u64, u64)>>,
+    /// Negative-discovery memo: node_id → (until_ms, cur_delay_ms). A peer
+    /// whose FRESH-DISCOVERY dial just failed is not re-discovered for a
+    /// bounded window (30s → 180s cap), so dead peers stop burning the
+    /// multi-second discovery budget healthy peers need every warmer tick.
+    /// The cap is deliberately LOW — the retain_dialable partition taught this
+    /// fleet that starving the dial path of addresses partitions it, so a
+    /// dead-looking peer (bootstrap seeds included) is always re-tried within
+    /// three minutes, and any success clears the memo.
+    neg_discovery: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 impl PeerPool {
@@ -2131,6 +2127,8 @@ impl PeerPool {
             opened: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             timeouts: Arc::new(TimeoutCounters::default()),
+            warm_backoff: Mutex::new(HashMap::new()),
+            neg_discovery: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2149,7 +2147,34 @@ impl PeerPool {
     /// Connect is bounded by the H4 budget, so a dead peer can't wedge the warmer.
     /// Returns whether a live trunk is now cached.
     pub async fn warm(&self, node_id: &str, addr_json: &str) -> bool {
-        self.acquire(node_id, addr_json).await.is_ok()
+        let key = self.canonical_key(node_id).await;
+        let now = pool_now_ms();
+        if let Some((next, _)) = self.warm_backoff.lock().await.get(&key) {
+            if now < *next {
+                return false; // inside the backoff window — skip this tick's dial
+            }
+        }
+        match self.acquire(node_id, addr_json).await {
+            Ok(_) => {
+                self.warm_backoff.lock().await.remove(&key);
+                true
+            }
+            Err(_) => {
+                let mut b = self.warm_backoff.lock().await;
+                let (_, delay) = b.get(&key).copied().unwrap_or((0, 0));
+                // 5s initial; grow by half plus a now-derived dither (up to
+                // +50%) so a fleet-wide roll cannot synchronize retry storms;
+                // cap 5 minutes.
+                let grown = if delay == 0 {
+                    5_000
+                } else {
+                    delay + delay / 2 + (now % (delay / 2 + 1))
+                };
+                let capped = grown.min(300_000);
+                b.insert(key, (now + capped, capped));
+                false
+            }
+        }
     }
 
     /// Number of currently-cached (live-or-not) trunks — for diagnostics / tests.
@@ -2323,7 +2348,10 @@ impl PeerPool {
         };
         {
             let mut inflight = self.inflight.lock().await;
-            if inflight.get(&key).is_some_and(|tx| tx.same_channel(&signal)) {
+            if inflight
+                .get(&key)
+                .is_some_and(|tx| tx.same_channel(&signal))
+            {
                 inflight.remove(&key);
             }
             let _ = signal.send(Some(shared));
@@ -2339,10 +2367,39 @@ impl PeerPool {
     /// cached-hint attempt has already failed/timed out — see `discovery_budget`
     /// for why iroh would otherwise never consult Discovery on its own here.
     async fn dial_fresh(&self, node_id: &str, id: iroh::EndpointId) -> Result<Connection> {
+        let now = pool_now_ms();
+        // Memo keyed on the CANONICAL endpoint id (available here by
+        // construction), never the caller's label — the two planes pass
+        // different labels for the same peer, and a label-keyed memo would
+        // give each caller its own window instead of one per peer.
+        let memo_key = id.to_string();
+        if let Some((until, _)) = self.neg_discovery.lock().await.get(&memo_key) {
+            if now < *until {
+                // Fresh discovery against this peer failed moments ago; do not
+                // burn the multi-second budget again inside the memo window.
+                return Err(anyhow::Error::new(DeadPeerTimeout {
+                    node_id: node_id.to_string(),
+                    phase: "connect",
+                    budget_ms: 0,
+                }));
+            }
+        }
+        let bump_memo = || async {
+            let mut m = self.neg_discovery.lock().await;
+            let (_, delay) = m.get(&memo_key).copied().unwrap_or((0, 0));
+            let grown = if delay == 0 {
+                30_000
+            } else {
+                delay + delay / 2 + (now % (delay / 2 + 1))
+            };
+            let capped = grown.min(180_000);
+            m.insert(memo_key.clone(), (now + capped, capped));
+        };
         let budget = discovery_budget();
         match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await
         {
             Ok(Ok(c)) => {
+                self.neg_discovery.lock().await.remove(&memo_key);
                 tracing::info!(
                     node_id,
                     "p2p connect recovered via fresh discovery (cached hint was stale)"
@@ -2350,11 +2407,13 @@ impl PeerPool {
                 Ok(c)
             }
             Ok(Err(e)) => {
+                bump_memo().await;
                 self.evict(node_id).await;
                 tracing::warn!(node_id, err = %e, "p2p connect error via fresh discovery (giving up)");
                 Err(e.into())
             }
             Err(_) => {
+                bump_memo().await;
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
                 self.evict(node_id).await;
                 tracing::warn!(
@@ -2869,7 +2928,12 @@ impl PeerPool {
         // Bump the generation FIRST so any leader dial still in flight for this
         // peer is fenced: its publish check fails and it closes its fresh
         // connection instead of resurrecting the trunk we are killing here.
-        *self.generations.lock().await.entry(key.clone()).or_insert(0) += 1;
+        *self
+            .generations
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_insert(0) += 1;
         if let Some(t) = self.trunks.lock().await.remove(&key) {
             t.conn.close(0u32.into(), b"closed by pool");
         }
@@ -3817,29 +3881,20 @@ async fn serve_browser_conn(
                 reject_browser_stream(&mut send, &mut recv, browser_reset::HANDLER_FAILED);
                 return;
             }
-            match tokio::time::timeout(
-                BROWSER_READ_TIMEOUT,
-                write_browser_reply(&mut send, &reply),
-            )
-            .await
+            match tokio::time::timeout(BROWSER_READ_TIMEOUT, write_browser_reply(&mut send, &reply))
+                .await
             {
                 Ok(Ok(())) => {
                     // The full framed reply (u32 LE prefix + body) is written;
                     // a FIN failure below does not un-send those bytes.
                     meter_browser_bytes(&remote_id, 0, 4 + reply.len() as u64);
                     if send.finish().is_err() {
-                        reject_browser_stream(
-                            &mut send,
-                            &mut recv,
-                            browser_reset::HANDLER_FAILED,
-                        );
+                        reject_browser_stream(&mut send, &mut recv, browser_reset::HANDLER_FAILED);
                     }
                 }
-                Ok(Err(())) => reject_browser_stream(
-                    &mut send,
-                    &mut recv,
-                    browser_reset::HANDLER_FAILED,
-                ),
+                Ok(Err(())) => {
+                    reject_browser_stream(&mut send, &mut recv, browser_reset::HANDLER_FAILED)
+                }
                 Err(_) => {
                     reject_browser_stream(&mut send, &mut recv, browser_reset::DEADLINE_EXCEEDED)
                 }

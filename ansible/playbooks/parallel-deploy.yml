@@ -273,6 +273,51 @@
       delegate_to: localhost
       become: false
 
+# The first-restarted node forms its trunks against a fleet that then bounces
+# 13 more times behind it, and its half-dead trunk state does not reliably
+# self-heal: measured live (2026-08-17 roll), the three EARLIEST restarts
+# (fc-bangkok, fc-sanjose, fc-saopaulo) were exactly the trio that wedged —
+# fc-bangkok at 3/18 visible peers for 90 minutes — while every later restart
+# converged cleanly against the already-settled fleet. One extra kick of node
+# #1 after the whole serial pass lets it re-form every trunk against the FINAL
+# fleet, the same remediation an operator applied by hand that night.
+- name: Re-kick the earliest-restarted nodes (trunks re-form against the settled fleet)
+  # First THREE, serially — the measured incident wedged exactly the three
+  # earliest restarts (bkk, sj, sp), not only node #1; every later restart
+  # converged against the already-settled fleet and needs nothing.
+  hosts: "{{ groups['platform'][0:3] | join(':') }}"
+  serial: 1
+  become: true
+  tags: [backend]
+  tasks:
+    - name: Let the fleet settle before the re-kick
+      ansible.builtin.pause:
+        seconds: 45
+      run_once: true
+
+    - name: Restart hive-node once more
+      ansible.builtin.systemd:
+        name: hive-node
+        state: restarted
+
+    - name: Wait for mesh re-convergence after the re-kick
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8786/v1/mesh"
+        return_content: true
+      register: rekick_mesh
+      retries: 18
+      delay: 10
+      # The meshwatch degraded floor (expected/4) is the failure shape this
+      # step exists to prevent; demand comfortably above it.
+      until: >-
+        rekick_mesh.status == 200 and
+        (rekick_mesh.json.visible_healthy_peers | int) >=
+        ([((rekick_mesh.json.expected_peers | int) / 4) | round(0, 'ceil') | int, 3] | max)
+
+    - name: Re-kick convergence summary
+      ansible.builtin.debug:
+        msg: "re-kicked {{ inventory_hostname }}: {{ rekick_mesh.json.visible_healthy_peers }}/{{ rekick_mesh.json.expected_peers }} visible healthy peers"
+
 - name: UI build (once, on the control-plane leader)
   hosts: ui_builder
   become: true

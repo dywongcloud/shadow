@@ -358,3 +358,60 @@ single honest status line on `/run-node` landed with the production wiring,
 §5), server-pushed
 sync scheduling, and any cross-project sharing. None of these are needed to
 implement the exchange, and each changes this contract when it lands.
+
+## 10. The REST/Hrana surface (bn-browser-db-rest, landed)
+
+Non-browser clients — a server, a CI job, `curl` — query the same replica
+over plain HTTP, without embedding a QUIC client. This is a query path
+ADDED to the contract, not a change to any sync rule above: the system of
+record is unchanged, and every write here is just another granted writer
+landing changes the CRR merge already knows how to carry.
+
+- **Credential.** `POST /v1/projects/:project/browser-db/rest-token`
+  (tenant-member JWT) mints one of two per-project bearers: team
+  (read+write) and public (read-only, mintable only while
+  `browser_db.public_read` is enabled and re-checked live on EVERY request,
+  so disabling `public_read` kills an already-minted public token
+  immediately). The plaintext is shown exactly once; only its SHA-256 hash
+  is stored, in the replicated ProjectSettings row
+  (`browser_db_rest_team` / `browser_db_rest_public`), checked
+  constant-time. Minting again rotates.
+- **Endpoints.** `libsql://api.<platform_domain>/v1/browser-db/<project>/`
+  speaks Hrana v2/v3 pipelines (`hrana_proto::execute_pipeline` verbatim,
+  so all wire type rules of the managed-SQLite lane hold identically) and
+  `POST https://api.<platform_domain>/v1/browser-db/<project>/sql` is the
+  Upstash-style `{query, params}` → `{fields, rows, rowCount}` shape. The
+  libsql base URL's trailing slash is load-bearing (clients resolve
+  `v2/pipeline` relatively). Both URLs are published server-derived from
+  `api_base()` — in the mint response and in the `rest` block of
+  `GET /v1/projects/:project/browser-db/status` — never reconstructed by
+  a client.
+- **CRR-safety invariants (the §-precedent "never point Hrana at a
+  browser-dbs file" rule, refined).** The hazard was always a BARE SQLite
+  connection: `sqlite_pool`'s extension-less `rusqlite::Connection` writes
+  without maintaining the clock tables the merge reads. This surface opens
+  via `hive_crsql::open` (extension loaded) and wraps every request in one
+  explicit transaction with `hive_crsql::set_ts` applied right after BEGIN
+  on any non-read-only request, so REST writes maintain the same clock
+  tables a sync apply does. Read-only enforcement is a hard statement-class
+  denylist (PRAGMA/ATTACH/DETACH, comment/whitespace-aware) plus refusal of
+  the "sequence" request type — a per-connection `PRAGMA query_only` is not
+  a boundary, because SQLite does not gate PRAGMA execution behind the flag
+  it controls.
+- **Ownership.** There is no stored `host_node`; every request proxies to a
+  deterministic rendezvous-hash owner (`browser_db::rest_owner_for_project`
+  — the `inference::coordinator_for` pattern, computed identically on every
+  node from the gossiped healthy roster), which lazily opens-or-creates its
+  local replica on first request (the reconcile loop's self-heal, triggered
+  synchronously).
+- **Caps.** `max_bytes` binds REST writes exactly as it binds sync applies:
+  measured AFTER the RESERVED lock is held, and a real detected write past
+  the cap rolls the whole transaction back with a typed quota message.
+  `max_value_bytes` stays sync-boundary-only by design (an oversized value
+  persists in its origin replica but never replicates).
+- **v1 limits, stated honestly.** No interactive baton streams — every
+  pipeline request is self-contained (`baton` in replies is always null; a
+  presented non-empty baton gets an honest STREAM_EXPIRED); no v3 cursor
+  (404 naming the gap); a client pipeline may not emit literal BEGIN/COMMIT
+  SQL text (one transaction is already open — use Hrana's batch request
+  type for atomic groups).

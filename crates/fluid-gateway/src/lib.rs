@@ -599,6 +599,31 @@ impl Gateway {
     }
 
     /// Delete every deployment for a project. Returns the removed deployment ids.
+    /// Relocation-scoped removal: drop this node's PRODUCTION-lane deployment
+    /// records for a project (target != "preview"; empty target = pre-target
+    /// legacy = production lane) and KEEP every preview. The relocation reaper
+    /// runs after every promotable production build against every non-target
+    /// node — using the full [`Registry::remove_project`] there destroyed
+    /// preview deployments hosted on nodes the new production placement did
+    /// not pick (preview URL 404, row gone from the table), and vice versa.
+    /// A preview is not a "stale copy" of anything: it was placed where it
+    /// was placed, and only a user delete or preview-retention policy may
+    /// remove it.
+    pub async fn remove_project_superseded(&self, project: &str) -> Vec<String> {
+        let ids: Vec<String> = {
+            let st = self.state.lock();
+            st.deployments
+                .values()
+                .filter(|d| d.project == project && d.target != "preview")
+                .map(|d| d.id.to_string())
+                .collect()
+        };
+        for id in &ids {
+            self.remove(id).await;
+        }
+        ids
+    }
+
     pub async fn remove_project(&self, project: &str) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock();
@@ -1173,30 +1198,32 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                 )
                 .await
             } else {
-            match dep.manifest.origin_function.clone() {
-                Some(origin) => match read_static_file(&dep, &path, enc).await {
-                    Some(r) => r,
-                    None => {
-                        let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
-                            Ok(b) => b,
-                            Err(_) => {
-                                return (StatusCode::BAD_REQUEST, "body too large").into_response()
-                            }
-                        };
-                        proxy_function(
-                            &gw,
-                            &dep,
-                            &origin,
-                            &parts.method,
-                            &path_q,
-                            &parts.headers,
-                            body_bytes,
-                        )
-                        .await
-                    }
-                },
-                None => serve_static(&dep, &path, enc).await,
-            }
+                match dep.manifest.origin_function.clone() {
+                    Some(origin) => match read_static_file(&dep, &path, enc).await {
+                        Some(r) => r,
+                        None => {
+                            let body_bytes =
+                                match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                                    Ok(b) => b,
+                                    Err(_) => {
+                                        return (StatusCode::BAD_REQUEST, "body too large")
+                                            .into_response()
+                                    }
+                                };
+                            proxy_function(
+                                &gw,
+                                &dep,
+                                &origin,
+                                &parts.method,
+                                &path_q,
+                                &parts.headers,
+                                body_bytes,
+                            )
+                            .await
+                        }
+                    },
+                    None => serve_static(&dep, &path, enc).await,
+                }
             }
         }
         RouteTarget::Function(name) => {
@@ -2639,12 +2666,11 @@ async fn try_browser(
                 BrowserScope::Public => true,
                 BrowserScope::Team => caller_tenant.as_deref() == Some(target.tenant.as_str()),
             };
-            let quota_ok = browser
-                .invoke_quota
-                .get(&target.endpoint_id)
-                .is_none_or(|(window_start, count)| {
+            let quota_ok = browser.invoke_quota.get(&target.endpoint_id).is_none_or(
+                |(window_start, count)| {
                     now.saturating_sub(*window_start) >= quota_window_ms || *count < quota_max
-                });
+                },
+            );
             target.tenant == dep.tenant
                 && target.deployment == dep.id.as_str()
                 && target.function == name
@@ -3240,6 +3266,41 @@ fn insert_deploy_aliases(st: &mut GwState, id: &DeploymentId) {
     }
 }
 
+/// The public wildcard domain user deployments are actually reachable on
+/// (`*.{apps_domain}`), published once at startup by the node.
+///
+/// The reported aliases used to be hardcoded `format!("{project}.localhost")`,
+/// a local-dev default that outlived local dev: a PRODUCTION deployment
+/// reported "Aliased to shoomoo.localhost" while genuinely serving on
+/// shoomoo.shadw.app, sending anyone who trusted the deploy log to a dead
+/// hostname.
+///
+/// This is display/reporting only and CANNOT affect routing — every host
+/// lookup (`host_deployment_id`, `serves_host`, `attribution_for_host`,
+/// `select`) keys on the FIRST LABEL of the host (`h.split('.').next()`), so
+/// the alias map is keyed by bare subdomain and the suffix here is never
+/// matched against anything. Changing it corrects what users are told without
+/// touching what the router does.
+static PUBLIC_APPS_DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Publish the node's apps domain for deployment-URL reporting. Idempotent;
+/// the first non-empty value wins. Unset (local dev, tests) keeps the previous
+/// `.localhost` behavior byte-for-byte.
+pub fn set_public_apps_domain(domain: &str) {
+    let d = domain.trim().trim_matches('.');
+    if !d.is_empty() {
+        let _ = PUBLIC_APPS_DOMAIN.set(d.to_ascii_lowercase());
+    }
+}
+
+/// `<sub>.<apps domain>`, or `<sub>.localhost` when no domain is configured.
+fn public_host(sub: &str) -> String {
+    match PUBLIC_APPS_DOMAIN.get() {
+        Some(d) => format!("{sub}.{d}"),
+        None => format!("{sub}.localhost"),
+    }
+}
+
 fn view_of(d: &Deployment) -> DeploymentInfo {
     let has_static = d.manifest.static_dir.is_some();
     let has_fn = !d.manifest.functions.is_empty();
@@ -3254,13 +3315,13 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         .git
         .as_ref()
         .filter(|g| !g.commit.is_empty())
-        .map(|g| format!("{}.localhost", commit_alias(&d.project, &g.commit)))
+        .map(|g| public_host(&commit_alias(&d.project, &g.commit)))
         .unwrap_or_default();
     let branch_alias = d
         .git
         .as_ref()
         .filter(|g| !g.branch.is_empty())
-        .map(|g| format!("{}.localhost", branch_alias(&d.project, &g.branch)))
+        .map(|g| public_host(&branch_alias(&d.project, &g.branch)))
         .unwrap_or_default();
     DeploymentInfo {
         id: d.id.clone(),
@@ -3272,10 +3333,10 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
             .map(|f| f.name.clone())
             .collect(),
         created_at_ms: d.created_at_ms,
-        alias: format!("{}.localhost", d.project),
+        alias: public_host(&d.project),
         commit_alias,
         branch_alias,
-        id_alias: format!("{}.localhost", d.id.as_str()),
+        id_alias: public_host(d.id.as_str()),
         // Immutable build environment (a superseded prod build stays "production").
         target: if d.target.is_empty() {
             if d.production {

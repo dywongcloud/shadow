@@ -12,7 +12,7 @@ import {
   usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { deploymentHost } from "@/lib/deploy-url";
+import { deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RawPortsBadge } from "@/components/raw-port-connections";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Landing } from "@/components/landing";
@@ -394,7 +394,7 @@ function RecentPreviewsBox({ deps }: { deps: Deployment[] }) {
                 <Triangle className="h-7 w-7 shrink-0" />
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-medium">{d.project}</div>
-                  <div className="truncate text-xs text-muted">{deploymentHost(d.alias)}</div>
+                  <div className="truncate text-xs text-muted">{(() => { const a = deploymentSelfAlias(d); return a ? deploymentHost(a) : "preview URL pending"; })()}</div>
                 </div>
                 <span className="shrink-0 text-xs text-muted">{timeAgo(d.created_at_ms)} ago</span>
               </Link>

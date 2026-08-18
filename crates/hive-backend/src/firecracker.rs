@@ -1045,6 +1045,22 @@ impl CellBackend for FirecrackerBackend {
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
+            // Extra raw/published TCP publishes (`FunctionLaunch::tcp_ports` —
+            // includes the primary, whose pairing is already ports[0]; a
+            // duplicate `-p` for the same pair fails the run). Without these
+            // the raw proxy's per-port loopback leg (`Lease::tcp_host_port`)
+            // dials a port nothing publishes — connection refused on every
+            // node running THIS backend while the mock path worked.
+            ports.extend(func.tcp_ports.iter().filter_map(|t| {
+                if t.host_port == func.port {
+                    return None;
+                }
+                Some(crate::ContainerPort {
+                    container_port: t.container_port,
+                    host_port: t.host_port,
+                    protocol: crate::ContainerProtocol::Tcp,
+                })
+            }));
             let (name, endpoint, task) = crate::podman_run_container(
                 &cell.id,
                 &image,

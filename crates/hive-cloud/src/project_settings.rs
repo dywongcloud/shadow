@@ -236,6 +236,13 @@ pub struct BrowserDbRestToken {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
+    /// Last write to THIS row on THIS node (ms epoch). The per-row freshness
+    /// key `merge_synced` compares — newest write wins a replication collision,
+    /// and a tombstone at-or-after it deletes the row. `0` = a row never
+    /// touched since the field existed: it merges fail-safe (never overwrites,
+    /// never overwritten by another 0-row).
+    #[serde(default)]
+    pub updated_ms: u64,
     #[serde(default)]
     pub env: Vec<EnvVar>,
     #[serde(default)]
@@ -357,6 +364,7 @@ fn default_true() -> bool {
 impl Default for ProjectSettings {
     fn default() -> Self {
         ProjectSettings {
+            updated_ms: 0,
             env: Vec::new(),
             build: BuildConfig::default(),
             functions: FunctionSettings::default(),
@@ -378,14 +386,33 @@ impl Default for ProjectSettings {
 }
 
 /// Store keyed by project name.
+/// Replication payload for the projects store: rows plus the tombstones that
+/// explain absences — the `SyncedDatabases` shape applied to projects, for the
+/// same witnessed reason: a wholesale-replace adoption makes "the sender has
+/// not got this row" and "this row was deleted" the same event, so one node's
+/// row loss (leader OOM before its debounced save, a since-fixed reaper wiping
+/// settings) replicated fleet-wide within a sync tick and the project
+/// VANISHED from its account everywhere.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SyncedProjects {
+    pub rows: std::collections::BTreeMap<String, ProjectSettings>,
+    #[serde(default)]
+    pub tombstones: std::collections::BTreeMap<String, u64>,
+}
+
 pub struct ProjectStore {
     map: RwLock<HashMap<String, ProjectSettings>>,
+    /// project → deletion ms. Records deletions so absence can replicate
+    /// EXPLICITLY (see [`SyncedProjects`]); retained for the same 30d window
+    /// the databases store uses.
+    tombstones: RwLock<std::collections::BTreeMap<String, u64>>,
 }
 
 impl ProjectStore {
     pub fn new() -> ProjectStore {
         ProjectStore {
             map: RwLock::new(HashMap::new()),
+            tombstones: RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -436,9 +463,71 @@ impl ProjectStore {
         *self.map.write() = data;
     }
 
+    /// Snapshot for replication: rows plus the tombstones explaining absences.
+    pub fn snapshot_synced(&self) -> SyncedProjects {
+        SyncedProjects {
+            rows: self.map.read().clone().into_iter().collect(),
+            tombstones: self.tombstones.read().clone(),
+        }
+    }
+
+    /// Merge a peer's snapshot. NEWEST-PER-ROW wins (`updated_ms` — projects
+    /// are legitimately written on many nodes: set_team on the ingress node,
+    /// env saves through the leader, production_branch on the build node), a
+    /// tombstone at-or-after a row's last write drops it, and a row
+    /// re-created AFTER its tombstone survives. Never a wholesale replace:
+    /// a sender that simply lacks a row cannot erase it here.
+    pub fn merge_synced(&self, remote: SyncedProjects) -> usize {
+        let now = now_ms();
+        {
+            let mut tombs = self.tombstones.write();
+            for (id, ms) in remote.tombstones {
+                let e = tombs.entry(id).or_insert(ms);
+                if ms > *e {
+                    *e = ms;
+                }
+            }
+            tombs
+                .retain(|_, ms| now.saturating_sub(*ms) < crate::databases::TOMBSTONE_RETENTION_MS);
+        }
+        let tombs = self.tombstones.read().clone();
+        let mut map = self.map.write();
+        for (name, remote_row) in remote.rows {
+            match map.get(&name) {
+                Some(local) if local.updated_ms >= remote_row.updated_ms => {}
+                _ => {
+                    map.insert(name, remote_row);
+                }
+            }
+        }
+        map.retain(|name, row| match tombs.get(name) {
+            Some(deleted_ms) => row.updated_ms > *deleted_ms,
+            None => true,
+        });
+        map.len()
+    }
+
+    /// Tombstones for the durable snapshot — a restart must not forget
+    /// deletions, or the node re-imports them from any peer (the
+    /// `database_tombstones` precedent in `persist.rs`).
+    pub fn tombstones_snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        self.tombstones.read().clone()
+    }
+
+    pub fn tombstones_load(&self, data: std::collections::BTreeMap<String, u64>) {
+        *self.tombstones.write() = data;
+    }
+
     /// Forget a project's settings (used when a project is deleted).
     pub fn remove(&self, project: &str) {
         self.map.write().remove(project);
+        // Record the deletion so it REPLICATES: without a tombstone, a peer
+        // still holding the row hands it straight back on the next sync tick
+        // (delete "doesn't stick"), and with wholesale-replace adoption the
+        // ABSENCE itself was indistinguishable from not-yet-created.
+        self.tombstones
+            .write()
+            .insert(project.to_string(), now_ms());
         let project = project.to_string();
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move { crate::relational::remove_project(&project).await });
@@ -462,19 +551,31 @@ impl ProjectStore {
         s
     }
 
+    /// Every mutator funnels row access through this: fetch-or-create AND
+    /// stamp `updated_ms`, so the replication merge always sees a fresh key
+    /// for the row that actually changed.
+    fn touch<'a>(
+        m: &'a mut HashMap<String, ProjectSettings>,
+        project: &str,
+    ) -> &'a mut ProjectSettings {
+        let s = m.entry(project.to_string()).or_default();
+        s.updated_ms = now_ms();
+        s
+    }
+
     pub fn set_build(&self, project: &str, build: BuildConfig) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().build = build;
+        Self::touch(&mut m, project).build = build;
     }
 
     pub fn set_functions(&self, project: &str, f: FunctionSettings) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().functions = f;
+        Self::touch(&mut m, project).functions = f;
     }
 
     pub fn set_inference(&self, project: &str, spec: Option<InferenceSpec>) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().inference = spec;
+        Self::touch(&mut m, project).inference = spec;
     }
 
     /// See [`ProjectSettings::browser_db`]. `None` clears the dashboard-managed
@@ -482,7 +583,7 @@ impl ProjectStore {
     /// an explicit fluid.json block, which still wins on the next build.
     pub fn set_browser_db(&self, project: &str, spec: Option<fluid_core::BrowserDbPolicy>) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().browser_db = spec;
+        Self::touch(&mut m, project).browser_db = spec;
     }
 
     /// Mint/rotate/clear one of this project's `browser_db` REST credentials.
@@ -496,7 +597,7 @@ impl ProjectStore {
         token: Option<BrowserDbRestToken>,
     ) {
         let mut m = self.map.write();
-        let s = m.entry(project.to_string()).or_default();
+        let s = Self::touch(&mut m, project);
         if public {
             s.browser_db_rest_public = token;
         } else {
@@ -510,7 +611,7 @@ impl ProjectStore {
     /// precedent).
     pub fn set_container(&self, project: &str, spec: Option<ContainerSettings>) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().container = spec;
+        Self::touch(&mut m, project).container = spec;
     }
 
     /// See [`ProjectSettings::dedicated_ipv4`]. Called exactly once per
@@ -521,12 +622,12 @@ impl ProjectStore {
     /// a second Tencent purchase.
     pub fn set_dedicated_ipv4(&self, project: &str, alloc: Option<fluid_core::DedicatedIpv4>) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().dedicated_ipv4 = alloc;
+        Self::touch(&mut m, project).dedicated_ipv4 = alloc;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().git_ci = Some(status);
+        Self::touch(&mut m, project).git_ci = Some(status);
     }
 
     /// Add or update an env var (by key+target). Sensitive values are sealed
@@ -544,7 +645,7 @@ impl ProjectStore {
             v.sensitive = true;
         }
         let mut m = self.map.write();
-        let s = m.entry(project.to_string()).or_default();
+        let s = Self::touch(&mut m, project);
         // EDIT semantics: sensitive values are masked to "" in every read, so the
         // dashboard's editor can't echo them back. An upsert of an EXISTING key
         // with an EMPTY value means "keep the stored value" (retarget/re-flag
@@ -580,7 +681,7 @@ impl ProjectStore {
     pub fn set_team(&self, project: &str, team: &str) {
         let root_dir = {
             let mut m = self.map.write();
-            let s = m.entry(project.to_string()).or_default();
+            let s = Self::touch(&mut m, project);
             s.team = team.to_string();
             s.build.root_dir.clone()
         };
@@ -599,7 +700,7 @@ impl ProjectStore {
     /// Persist the monorepo subdirectory so redeploys keep building it.
     pub fn set_root_dir(&self, project: &str, root_dir: &str) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().build.root_dir = root_dir.to_string();
+        Self::touch(&mut m, project).build.root_dir = root_dir.to_string();
     }
 
     /// The configured root/subdirectory for a project ("" if none).
@@ -624,17 +725,17 @@ impl ProjectStore {
     /// project's first git deploy, or explicitly from project settings.
     pub fn set_production_branch(&self, project: &str, branch: &str) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().production_branch = branch.to_string();
+        Self::touch(&mut m, project).production_branch = branch.to_string();
     }
 
     pub fn set_preview_protection(&self, project: &str, on: bool) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().preview_protection = on;
+        Self::touch(&mut m, project).preview_protection = on;
     }
 
     pub fn set_cron_enabled(&self, project: &str, on: bool) {
         let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().cron_enabled = on;
+        Self::touch(&mut m, project).cron_enabled = on;
     }
 
     /// Whether this project's cron jobs are allowed to fire (default true —
@@ -679,7 +780,7 @@ impl ProjectStore {
 
     pub fn add_domain(&self, project: &str, domain: String) {
         let mut m = self.map.write();
-        let s = m.entry(project.to_string()).or_default();
+        let s = Self::touch(&mut m, project);
         if !s.domains.contains(&domain) {
             s.domains.push(domain);
         }

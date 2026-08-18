@@ -51,6 +51,28 @@ function key(): string {
   return process.env.COMPOSIO_API_KEY || "";
 }
 
+/**
+ * Composio's canned refusal when a toolkit is toggled off in the Composio
+ * project's OWN admin console ("Execution of toolkit 'X' is temporarily
+ * disabled by the administrator") — an account-level state nothing in this
+ * repo controls, sometimes auto-set by Composio on plan/trial review. Callers
+ * use this to swap a third party's operational notice for a message that names
+ * something the user (or the platform operator) can actually act on.
+ */
+export function isToolkitDisabled(msg: unknown): boolean {
+  return /temporarily disabled by the administrator/i.test(String(msg ?? ""));
+}
+
+/** The actionable rewrite of a toolkit-disabled refusal, for user-facing errors. */
+export function toolkitDisabledMessage(toolkit: string): string {
+  return (
+    `The ${toolkit} integration provider (Composio) has this toolkit disabled at the ` +
+    `account level — nothing on your side is wrong. Use the first-party GitHub App ` +
+    `connection or a plain git repository URL instead; the platform operator can ` +
+    `re-enable the toolkit in the Composio console (app.composio.dev).`
+  );
+}
+
 async function v3(path: string, init?: RequestInit): Promise<any> {
   const r = await fetch(`${BASE}${path}`, {
     ...init,
@@ -135,7 +157,7 @@ export async function connectToolkit(
   entity: string,
   slug: string,
   redirectUrl: string
-): Promise<{ redirectUrl?: string; error?: string }> {
+): Promise<{ redirectUrl?: string; error?: string; providerDisabled?: boolean }> {
   if (!composioConfigured()) return { error: "COMPOSIO_API_KEY not set" };
   try {
     const authConfigId = await toolkitAuthConfigId(slug);
@@ -154,6 +176,9 @@ export async function connectToolkit(
     return { error: "Composio returned no redirect URL." };
   } catch (e: any) {
     console.error("composio connectToolkit failed", e);
+    if (isToolkitDisabled(e?.message)) {
+      return { error: toolkitDisabledMessage(slug.toUpperCase()), providerDisabled: true };
+    }
     return { error: `Composio: ${e?.message || "unknown error"}` };
   }
 }
@@ -323,7 +348,7 @@ export async function disconnectGithub(entity: string): Promise<{ ok: boolean; r
 export async function githubConnect(
   entity: string,
   redirectUrl: string
-): Promise<{ redirectUrl?: string; error?: string }> {
+): Promise<{ redirectUrl?: string; error?: string; providerDisabled?: boolean }> {
   if (!composioConfigured()) return { error: "COMPOSIO_API_KEY not set" };
   try {
     const authConfigId = await githubAuthConfigId();
@@ -338,6 +363,9 @@ export async function githubConnect(
     return url ? { redirectUrl: url } : { error: "Composio returned no redirect URL." };
   } catch (e: any) {
     console.error("composio connect failed", e);
+    if (isToolkitDisabled(e?.message)) {
+      return { error: toolkitDisabledMessage("GitHub"), providerDisabled: true };
+    }
     return { error: `Composio: ${e?.message || "unknown error"}` };
   }
 }

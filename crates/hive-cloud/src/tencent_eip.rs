@@ -79,8 +79,7 @@ pub async fn provision_from_checkout(
         return Ok(existing);
     }
     let alloc = allocate_eip(&c.http, project, &c.node_name).await?;
-    c.projects
-        .set_dedicated_ipv4(project, Some(alloc.clone()));
+    c.projects.set_dedicated_ipv4(project, Some(alloc.clone()));
     c.billing.record_addon_charge(
         &co.tenant,
         &format!("Dedicated IPv4 — {project}"),
@@ -219,16 +218,14 @@ async fn tc3_request(
     // protocol reads the action from `X-TC-Action`, not the signature), just
     // not folded into what's cryptographically signed — matching the
     // published example precisely rather than an unverifiable variant.
-    let canonical_headers =
-        format!("content-type:application/json; charset=utf-8\nhost:{host}\n");
+    let canonical_headers = format!("content-type:application/json; charset=utf-8\nhost:{host}\n");
     let signed_headers = "content-type;host";
     let canonical_request =
         format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{hashed_payload}");
     let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
     let credential_scope = format!("{date}/{service}/tc3_request");
-    let string_to_sign =
-        format!("TC3-HMAC-SHA256\n{ts}\n{credential_scope}\n{hashed_canonical}");
+    let string_to_sign = format!("TC3-HMAC-SHA256\n{ts}\n{credential_scope}\n{hashed_canonical}");
 
     let secret_date = hmac_sha256(format!("TC3{secret_key}").as_bytes(), date.as_bytes());
     let secret_service = hmac_sha256(&secret_date, service.as_bytes());

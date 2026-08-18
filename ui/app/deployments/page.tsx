@@ -6,16 +6,20 @@ import { useRouter } from "next/navigation";
 import { RotateCcw, RefreshCw, Trash2, Loader2, Plus, CircleX } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, cancelBuild, usePoll, type Deployment } from "@/lib/api";
-import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
+import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
-import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+import { deploymentUrl, deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RedeployModal } from "@/components/redeploy-modal";
 
 export default function DeploymentsPage() {
   const router = useRouter();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
-  // In-flight builds from the persistent store — survive navigation/reload.
-  const pending = usePendingBuilds();
+  // In-flight builds from the persistent store — survive navigation/reload. MERGED
+  // with the real records rather than replaced by them: a pending row is dropped
+  // only once a deployment record it corresponds to is actually visible here, which
+  // is what keeps the row on screen for the deploy's whole lifecycle instead of
+  // blinking out during the build->record handover.
+  const pending = mergePending(usePendingBuilds(), deps);
   const [busy, setBusy] = useState<string>("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
@@ -126,8 +130,10 @@ export default function DeploymentsPage() {
                   {/* Prefer the SHARED, mesh-routable commit alias for previews; the
                       per-node id alias (dpl-<id>) only resolves on its own host node
                       under multi-region fanout, so it 404s through the pooled ingress. */}
-                  {(() => { const self = d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias);
-                    return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{deploymentHost(self)}</a>; })()}
+                  {(() => { const self = deploymentSelfAlias(d);
+                    return self
+                      ? <a className="text-link hover:underline" href={deploymentUrl(self, d.region_code)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{deploymentHost(self, d.region_code)}</a>
+                      : <span className="text-muted">no preview URL yet</span>; })()}
                 </Td>
                 <Td className="text-xs text-secondary hidden md:table-cell">
                   {d.git ? <span className="font-mono">{d.git.branch}@{d.git.commit || "—"}</span> : <span className="text-muted">CLI</span>}

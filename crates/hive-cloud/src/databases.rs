@@ -49,6 +49,16 @@ pub enum DbKind {
     /// the cr-sqlite extension — a direct writer inside a CRR file would
     /// bypass the clock tables and silently diverge every replica.
     Sqlite,
+    /// Supabase Studio as a managed database option: a dedicated per-database
+    /// mini-stack (`supabase/postgres` + `postgres-meta` + `studio`
+    /// containers) provisioned like any managed engine. Studio's REQUIRED
+    /// dependency set only (upstream compose evidence: Studio needs db +
+    /// pg-meta + a router doing path-routing and basic-auth — the router's
+    /// two jobs are served by this platform's own edge, so no Kong container
+    /// runs). GoTrue/PostgREST/Realtime/Storage are deliberately deferred:
+    /// Studio's Authentication/Data-API pages degrade, everything else
+    /// (table editor, SQL editor, schema views) is fully functional.
+    Supabase,
 }
 impl DbKind {
     pub fn label(&self) -> &'static str {
@@ -61,6 +71,7 @@ impl DbKind {
             DbKind::Pubsub => "Pub/Sub",
             DbKind::Realtime => "Realtime",
             DbKind::Sqlite => "SQLite",
+            DbKind::Supabase => "Supabase",
         }
     }
 }
@@ -936,6 +947,32 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
                 ("DATABASE_URL".into(), dsn),
             ]
         }
+        // Supabase Studio stack: the app's own DSN (in-network when available)
+        // plus the public Supabase URL and JWT keys a supabase-js client takes.
+        // STUDIO_USERNAME/PASSWORD are deliberately NOT exported — those are
+        // the human's dashboard sign-in, not app configuration; they are read
+        // on demand from /credentials like every other secret.
+        DbKind::Supabase => {
+            let url = match net_host {
+                Some(h) => format!(
+                    "postgres://postgres:{}@{}:{}/{}?sslmode=disable",
+                    g("password"),
+                    h,
+                    c.get("net_port").cloned().unwrap_or_else(|| "5432".into()),
+                    c.get("database")
+                        .cloned()
+                        .unwrap_or_else(|| "postgres".into())
+                ),
+                None => g("DATABASE_URL"),
+            };
+            vec![
+                ("DATABASE_URL".into(), url),
+                ("SUPABASE_URL".into(), g("SUPABASE_URL")),
+                ("SUPABASE_ANON_KEY".into(), g("SUPABASE_ANON_KEY")),
+                ("SUPABASE_SERVICE_KEY".into(), g("SUPABASE_SERVICE_KEY")),
+                ("STUDIO_URL".into(), g("STUDIO_URL")),
+            ]
+        }
     };
     out.retain(|(_, v)| !v.is_empty());
     out
@@ -1029,6 +1066,30 @@ fn with_external_endpoint(
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), "443".into());
         }
+        // Supabase: the postgres wire rides the same SNI splice as managed
+        // Postgres (`local_port` preserved above); the Studio URL is the same
+        // per-database hostname on plain HTTPS — the edge arm
+        // (`db_rest::supabase_studio_proxy`) terminates it with the
+        // basic-auth gate. `studio_port` is the edge's proxy target on the
+        // host node and must survive this rewrite untouched.
+        DbKind::Supabase => {
+            let pw = conn.get("password").cloned().unwrap_or_default();
+            let dbname = conn
+                .get("database")
+                .cloned()
+                .unwrap_or_else(|| "postgres".into());
+            if let Some(internal) = conn.remove("DATABASE_URL") {
+                conn.insert("INTERNAL_DATABASE_URL".into(), internal);
+            }
+            conn.insert(
+                "DATABASE_URL".into(),
+                format!("postgres://postgres:{pw}@{db_host}:5432/{dbname}?sslmode=require"),
+            );
+            conn.insert("STUDIO_URL".into(), format!("https://{db_host}"));
+            conn.insert("SUPABASE_URL".into(), format!("https://{db_host}"));
+            conn.insert("host".into(), db_host.to_string());
+            conn.insert("port".into(), "5432".into());
+        }
         // HTTP-REST kinds (blob/queue/vector/pubsub/realtime): expose the gateway
         // host so their REST/WS URLs are externally reachable over TLS.
         _ => {
@@ -1088,8 +1149,10 @@ pub fn provision(
         // system of record on one node, and a second file elsewhere is a
         // DIVERGENT database, not a replica (the CRDT lane that does solve this
         // is `browser_db`, and it solves it with cr-sqlite, not file copies).
+        // Supabase is the same shape: one self-contained stack per database —
+        // a second stack elsewhere is a second database, not a replica.
         // Requested regions are dropped rather than silently "provisioned".
-        replicas: if req.kind == DbKind::Sqlite {
+        replicas: if req.kind == DbKind::Sqlite || req.kind == DbKind::Supabase {
             Vec::new()
         } else {
             req.replicas
@@ -1106,7 +1169,7 @@ pub fn provision(
     store.insert(db.clone());
 
     tokio::spawn(async move {
-        let outcome = provision_backing(&store, &id, &req, &api_base).await;
+        let outcome = provision_backing(&store, &id, &req, &api_base, &db_host).await;
         store.update(&id, |d| {
             match outcome {
                 Ok((mode, conn, container)) => {
@@ -1147,8 +1210,7 @@ pub fn rotate_blob_credentials(store: &Arc<DatabaseStore>, id: &str) -> Option<D
         return None;
     }
     store.update(id, |d| {
-        d.connection
-            .insert("access_key_id".into(), token("AKIA"));
+        d.connection.insert("access_key_id".into(), token("AKIA"));
         d.connection
             .insert("secret_access_key".into(), token("hbsk"));
         d.connection
@@ -1162,11 +1224,13 @@ async fn provision_backing(
     id: &str,
     req: &ProvisionReq,
     api_base: &str,
+    db_host: &str,
 ) -> Result<(String, HashMap<String, String>, Option<String>), String> {
     match req.kind {
         DbKind::Postgres => provision_postgres(store, id, &req.project).await,
         DbKind::Redis => provision_redis(store, id, &req.project).await,
         DbKind::Sqlite => provision_sqlite(id, api_base).await,
+        DbKind::Supabase => provision_supabase(store, id, &req, db_host).await,
         DbKind::Blob => {
             let bucket = format!("hive-{}", &id[3..11.min(id.len())]);
             let mut c = HashMap::new();
@@ -1472,6 +1536,381 @@ async fn provision_postgres(
     }
     // Fallback: record provisioned in simulated mode (no live engine available).
     Ok(("simulated".into(), conn, None))
+}
+
+/// A static Supabase API JWT (anon / service_role) — HS256 over
+/// `{role, iss:"supabase", iat, exp:+10y}` signed with the stack's JWT_SECRET,
+/// the exact derivation every Supabase service verifies symmetrically (the
+/// vendored supabase-docker / supahost mechanism). Static and long-lived by
+/// design: these identify the ROLE, not a session.
+fn supabase_api_jwt(jwt_secret: &str, role: &str) -> String {
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        role: &'a str,
+        iss: &'a str,
+        iat: u64,
+        exp: u64,
+    }
+    let now = now_ms() / 1000;
+    let claims = Claims {
+        role,
+        iss: "supabase",
+        iat: now,
+        exp: now + 10 * 365 * 24 * 60 * 60,
+    };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(jwt_secret.as_bytes()),
+    )
+    .unwrap_or_default()
+}
+
+/// Provision a Supabase Studio mini-stack (`DbKind::Supabase`): three
+/// containers on the project's DNS-less podman net —
+///   db     `supabase/postgres:15.8.1.085`      (the engine; named volume, so
+///                                               data survives container
+///                                               replacement — unlike the
+///                                               managed-Postgres lane's
+///                                               anonymous layer)
+///   meta   `supabase/postgres-meta:v0.95.2`    (Studio's management API;
+///                                               internal only, reached by
+///                                               studio over the net)
+///   studio `supabase/studio:2026.02.16-…`      (the dashboard; published on
+///                                               loopback, proxied by the
+///                                               edge arm behind basic-auth)
+/// This is Studio's REQUIRED dependency set per the upstream compose (its
+/// only declared dep is analytics-as-startup-barrier, and its functional env
+/// deps are db + pg-meta + a router); GoTrue/PostgREST/Realtime/Storage are
+/// deliberately not run — the record's note says so.
+///
+/// The router's two upstream jobs are served by the platform itself: path
+/// routing is unnecessary (Studio's server side calls pg-meta directly), and
+/// the `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` basic-auth gate that Kong
+/// enforces on the `/` catch-all is enforced by our edge arm
+/// (`db_rest::supabase_studio_proxy`) against these generated credentials —
+/// the supahost working example, same enforcement semantics, no Kong
+/// container.
+/// `podman pull` with one retry — explicit, because a transient registry/
+/// transport flake inside `podman run`'s OWN pull phase otherwise surfaces
+/// as a failed provision while the server-side pull completes anyway
+/// (witnessed on fc-bangkok 2026-08-18: the CLI exited mid-pull, the
+/// container started 2s later, and the provision tore the stack down as
+/// "simulated").
+async fn podman_pull_retry(image: &str) -> bool {
+    for attempt in 0..2 {
+        let out = Command::new("podman")
+            .args(["pull", image])
+            .env("PATH", augmented_path())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => return true,
+            Ok(o) => {
+                tracing::warn!(image, attempt, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "podman pull failed")
+            }
+            Err(e) => tracing::warn!(image, attempt, error = %e, "podman pull could not spawn"),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+    false
+}
+
+/// `podman run -d` with adoption of the server-side completion race: when the
+/// CLI fails but the named container nevertheless came up (the pull-phase
+/// transport flake above), the run DID provision — adopting it beats tearing
+/// down a healthy container on a phantom failure.
+async fn podman_run_detached(args: &[String]) -> Result<(), String> {
+    let name = args
+        .iter()
+        .position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let out = Command::new("podman")
+        .args(args)
+        .env("PATH", augmented_path())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !name.is_empty() {
+                let insp = Command::new("podman")
+                    .args(["inspect", "-f", "{{.State.Running}}", &name])
+                    .env("PATH", augmented_path())
+                    .output()
+                    .await;
+                if let Ok(i) = insp {
+                    if i.status.success() && String::from_utf8_lossy(&i.stdout).trim() == "true" {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(stderr)
+        }
+        Err(e) => Err(format!("spawn: {e}")),
+    }
+}
+
+async fn provision_supabase(
+    store: &Arc<DatabaseStore>,
+    id: &str,
+    req: &ProvisionReq,
+    db_host: &str,
+) -> Result<(String, HashMap<String, String>, Option<String>), String> {
+    let short = &id[3..11.min(id.len())];
+    let port_pg = store.next_port(54320);
+    let port_studio = store.next_port(23000);
+    let pg_password = uuid::Uuid::new_v4().simple().to_string();
+    let jwt_secret = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let dashboard_user = "supabase".to_string();
+    let dashboard_password = uuid::Uuid::new_v4().simple().to_string()[..24].to_string();
+    let crypto_key = uuid::Uuid::new_v4().simple().to_string();
+    let anon_key = supabase_api_jwt(&jwt_secret, "anon");
+    let service_key = supabase_api_jwt(&jwt_secret, "service_role");
+    let dbname = "postgres";
+    let public_base = if db_host.is_empty() {
+        format!("http://127.0.0.1:{port_studio}")
+    } else {
+        format!("https://{db_host}")
+    };
+
+    let mut conn = HashMap::new();
+    conn.insert("host".into(), "127.0.0.1".into());
+    conn.insert("port".into(), port_pg.to_string());
+    conn.insert("studio_port".into(), port_studio.to_string());
+    conn.insert("database".into(), dbname.into());
+    conn.insert("user".into(), "postgres".into());
+    conn.insert("password".into(), pg_password.clone());
+    conn.insert(
+        "DATABASE_URL".into(),
+        format!("postgres://postgres:{pg_password}@127.0.0.1:{port_pg}/{dbname}?sslmode=disable"),
+    );
+    conn.insert("SUPABASE_URL".into(), public_base.clone());
+    conn.insert("SUPABASE_ANON_KEY".into(), anon_key);
+    conn.insert("SUPABASE_SERVICE_KEY".into(), service_key);
+    conn.insert("STUDIO_URL".into(), public_base);
+    conn.insert("STUDIO_USERNAME".into(), dashboard_user);
+    conn.insert("STUDIO_PASSWORD".into(), dashboard_password);
+
+    if !podman_available().await {
+        return Ok(("simulated".into(), conn, None));
+    }
+    let Some((netname, db_ip)) = ensure_project_db_net(req.project.as_str(), id).await else {
+        return Ok(("simulated".into(), conn, None));
+    };
+    conn.insert("net_host".into(), db_ip.clone());
+    conn.insert("net_port".into(), "5432".into());
+    // Deterministic sibling IPs in bands clear of the managed-DB .200+ band
+    // (and of compose's .11+ blocks in practice); a collision fails the
+    // `podman run` loudly below, never silently.
+    let prefix = db_ip
+        .rsplit_once('.')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let meta_ip = format!(
+        "{prefix}.{}",
+        150 + (fnv1a(format!("{id}meta").as_bytes()) % 45)
+    );
+    let studio_ip = format!(
+        "{prefix}.{}",
+        100 + (fnv1a(format!("{id}studio").as_bytes()) % 45)
+    );
+
+    let c_db = format!("hive-supa-{short}-db");
+    let c_meta = format!("hive-supa-{short}-meta");
+    let c_studio = format!("hive-supa-{short}-studio");
+    let volume = format!("hive-vol-supa-{short}");
+    let mut started: Vec<String> = Vec::new();
+    let cleanup = |started: &[String]| {
+        let names: Vec<String> = started.to_vec();
+        async move {
+            for n in names {
+                let _ = Command::new("podman")
+                    .args(["rm", "-f", "-v", &n])
+                    .env("PATH", augmented_path())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+        }
+    };
+
+    // Pull all three images EXPLICITLY first (retry each): the pull phase is
+    // where a first-time provision is slowest and flakiest, and a pull folded
+    // into `podman run` fails the run opaquely (see podman_pull_retry's doc).
+    for image in [
+        "docker.io/supabase/postgres:15.8.1.085",
+        "docker.io/supabase/postgres-meta:v0.95.2",
+        "docker.io/supabase/studio:2026.02.16-sha-26c615c",
+    ] {
+        if !podman_pull_retry(image).await {
+            tracing::warn!(db = %id, image, "supabase image pull failed — simulating");
+            return Ok(("simulated".into(), conn, None));
+        }
+    }
+
+    // db — the engine. The supabase/postgres image bakes the Supabase role set;
+    // meta and studio both connect as the `postgres` superuser with this
+    // password, so the vendored roles/jwt init SQL is not needed for this
+    // dependency set.
+    let db_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_db.clone(),
+        "--replace".into(),
+        "-e".into(),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        "-v".into(),
+        format!("{volume}:/var/lib/postgresql/data"),
+        "-p".into(),
+        format!("127.0.0.1:{port_pg}:5432"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        db_ip.clone(),
+        "docker.io/supabase/postgres:15.8.1.085".into(),
+    ];
+    match podman_run_detached(&db_args).await {
+        Ok(()) => started.push(c_db.clone()),
+        Err(e) => {
+            tracing::warn!(db = %id, error = %e, "supabase db container failed — simulating");
+            return Ok(("simulated".into(), conn, None));
+        }
+    }
+    if !wait_tcp_ready(port_pg).await {
+        tracing::warn!(db = %id, %port_pg, "supabase postgres up but loopback port not reachable");
+    }
+
+    // meta — pg-meta, Studio's management API. Internal only: no host publish.
+    let meta_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_meta.clone(),
+        "--replace".into(),
+        "-e".into(),
+        "PG_META_DB_HOST=db".into(),
+        "-e".into(),
+        "PG_META_DB_PORT=5432".into(),
+        "-e".into(),
+        format!("PG_META_DB_NAME={dbname}"),
+        "-e".into(),
+        "PG_META_DB_USER=postgres".into(),
+        "-e".into(),
+        format!("PG_META_DB_PASSWORD={pg_password}"),
+        "-e".into(),
+        "PG_META_DB_SSL_MODE=disable".into(),
+        "-e".into(),
+        format!("CRYPTO_KEY={crypto_key}"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        meta_ip.clone(),
+        "--add-host".into(),
+        format!("db:{db_ip}"),
+        "docker.io/supabase/postgres-meta:v0.95.2".into(),
+    ];
+    match podman_run_detached(&meta_args).await {
+        Ok(()) => started.push(c_meta.clone()),
+        Err(e) => {
+            tracing::warn!(db = %id, error = %e, "supabase meta container failed — simulating");
+            cleanup(&started).await;
+            return Ok(("simulated".into(), conn, None));
+        }
+    }
+
+    // studio — the dashboard itself, published on loopback for the edge proxy.
+    let studio_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_studio.clone(),
+        "--replace".into(),
+        "-e".into(),
+        "HOSTNAME=::".into(),
+        "-e".into(),
+        "STUDIO_PG_META_URL=http://meta:8080".into(),
+        "-e".into(),
+        "POSTGRES_HOST=db".into(),
+        "-e".into(),
+        "POSTGRES_PORT=5432".into(),
+        "-e".into(),
+        format!("POSTGRES_DB={dbname}"),
+        "-e".into(),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        "-e".into(),
+        format!("PG_META_CRYPTO_KEY={crypto_key}"),
+        "-e".into(),
+        format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
+        "-e".into(),
+        format!("DEFAULT_PROJECT_NAME={}", req.name),
+        "-e".into(),
+        format!(
+            "SUPABASE_URL={}",
+            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_PUBLIC_URL={}",
+            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_ANON_KEY={}",
+            conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_SERVICE_KEY={}",
+            conn.get("SUPABASE_SERVICE_KEY")
+                .cloned()
+                .unwrap_or_default()
+        ),
+        "-e".into(),
+        format!("AUTH_JWT_SECRET={jwt_secret}"),
+        "-e".into(),
+        "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
+        "-p".into(),
+        format!("127.0.0.1:{port_studio}:3000"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        studio_ip.clone(),
+        "--add-host".into(),
+        format!("db:{db_ip}"),
+        "--add-host".into(),
+        format!("meta:{meta_ip}"),
+        "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
+    ];
+    match podman_run_detached(&studio_args).await {
+        Ok(()) => started.push(c_studio.clone()),
+        Err(e) => {
+            tracing::warn!(db = %id, error = %e, "supabase studio container failed — simulating");
+            cleanup(&started).await;
+            return Ok(("simulated".into(), conn, None));
+        }
+    }
+    // Studio (Next.js) takes a few seconds to come up; warn-only like the
+    // engine check — a slow boot must not demote the record to simulated.
+    if !wait_tcp_ready(port_studio).await {
+        tracing::warn!(db = %id, %port_studio, "supabase studio up but loopback port not reachable yet");
+    }
+    Ok((
+        "live".into(),
+        conn,
+        Some(format!("{c_db},{c_meta},{c_studio}")),
+    ))
 }
 
 async fn provision_redis(

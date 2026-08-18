@@ -202,9 +202,7 @@ fn tenants_json(tenants: BTreeMap<String, TenantMeter>) -> Vec<Value> {
             })
         })
         .collect();
-    rows.sort_by_key(|row| {
-        std::cmp::Reverse(row["bytes_total"].as_u64().unwrap_or_default())
-    });
+    rows.sort_by_key(|row| std::cmp::Reverse(row["bytes_total"].as_u64().unwrap_or_default()));
     rows
 }
 

@@ -57,6 +57,16 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
         return with_cors(err(StatusCode::NOT_FOUND, "no database at this hostname"));
     };
 
+    // Supabase Studio: this database's whole hostname is the Studio dashboard,
+    // gated by HTTP BASIC auth (the DASHBOARD_USERNAME/DASHBOARD_PASSWORD
+    // mechanism the upstream stack's Kong enforces on its `/` catch-all —
+    // here enforced by this arm instead of a Kong container) and reverse-
+    // proxied to the studio container's loopback port. Branch BEFORE the
+    // bearer check: Studio speaks basic-auth, not the DB REST bearer.
+    if db.kind == DbKind::Supabase {
+        return supabase_studio_proxy(&cloud, &db, req).await;
+    }
+
     // The engine lives on the host node's loopback. If per-DB DNS routed the
     // client elsewhere (stale record), say so honestly instead of a generic 500.
     let local = db
@@ -739,6 +749,183 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Supabase Studio edge arm (DbKind::Supabase)
+// ---------------------------------------------------------------------------
+
+/// The whole `<slug>.{db_domain}` hostname of a Supabase database IS the
+/// Studio dashboard: basic-auth gate (the generated STUDIO_USERNAME /
+/// STUDIO_PASSWORD — the `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` mechanism
+/// the upstream stack's Kong enforces on its `/` catch-all, `hide_credentials`
+/// included: the Authorization header is checked here and never forwarded),
+/// then a streaming reverse proxy to the studio container's loopback port.
+///
+/// Runs on the database's host node (per-DB DNS points the slug there), so
+/// the proxy target is always loopback — no cross-node forwarding in v1; a
+/// stale-DNS landing gets an honest 421 like the engine arms.
+async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Request) -> Response {
+    // ---- AuthN: HTTP Basic against this database's generated studio creds ---
+    let ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Basic ")
+                .or_else(|| v.strip_prefix("basic "))
+                .map(str::to_string)
+        })
+        .and_then(|b64| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .ok()
+        })
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|pair| {
+            let (u, p) = pair.split_once(':').unwrap_or((pair.as_str(), ""));
+            let eu = db
+                .connection
+                .get("STUDIO_USERNAME")
+                .map(String::as_str)
+                .unwrap_or("");
+            let ep = db
+                .connection
+                .get("STUDIO_PASSWORD")
+                .map(String::as_str)
+                .unwrap_or("");
+            !eu.is_empty()
+                && ct_eq(u.as_bytes(), eu.as_bytes())
+                && ct_eq(p.as_bytes(), ep.as_bytes())
+        })
+        .unwrap_or(false);
+    if !ok {
+        let mut resp = err(
+            StatusCode::UNAUTHORIZED,
+            "Supabase Studio credentials required (see this database's connection details)",
+        );
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Basic realm=\"supabase-studio\", charset=\"UTF-8\""),
+        );
+        return resp;
+    }
+
+    // ---- Proxy target: this node's loopback studio port ---------------------
+    let Some(port) = db
+        .connection
+        .get("studio_port")
+        .filter(|p| !p.is_empty())
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return err(
+            StatusCode::MISDIRECTED_REQUEST,
+            "this Supabase database is not hosted on this node (stale DNS?) or has no live Studio",
+        );
+    };
+    let method = req.method().clone();
+    let path_q = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let headers_vec: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = k.as_str().to_lowercase();
+            // Hop-by-hop + the gate itself: Kong's hide_credentials equivalent.
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "connection"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "upgrade"
+                    | "authorization"
+                    | "x-hive-proxied"
+                    | "x-hive-request-id"
+            ) {
+                return None;
+            }
+            v.to_str().ok().map(|s| (name, s.to_string()))
+        })
+        .collect();
+    // Buffered with a Studio-appropriate cap (SQL/CSV imports ride this body);
+    // the RESPONSE is streamed (Next.js asset bundles are multi-MB).
+    const STUDIO_BODY_CAP: usize = 64 * 1024 * 1024;
+    let body = match axum::body::to_bytes(req.into_body(), STUDIO_BODY_CAP).await {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+    };
+
+    let url = format!("http://127.0.0.1:{port}{path_q}");
+    let mut rb = cloud
+        .http
+        .request(method, &url)
+        .header("host", &host)
+        .header("x-forwarded-host", &host)
+        .header("x-forwarded-proto", "https")
+        .timeout(std::time::Duration::from_secs(120))
+        .body(body);
+    for (k, v) in &headers_vec {
+        rb = rb.header(k, v);
+    }
+    match rb.send().await {
+        Ok(r) => {
+            let status = r.status();
+            let rheaders = r.headers().clone();
+            let mut builder = Response::builder().status(status.as_u16());
+            for (k, v) in rheaders.iter() {
+                let lk = k.as_str().to_lowercase();
+                if matches!(
+                    lk.as_str(),
+                    "transfer-encoding" | "connection" | "content-length"
+                ) {
+                    continue;
+                }
+                // Studio must never navigate the browser to an internal origin.
+                if lk == "location" {
+                    if let Ok(loc) = v.to_str() {
+                        let rewritten = loc
+                            .replace(
+                                &format!("http://127.0.0.1:{port}"),
+                                &format!("https://{host}"),
+                            )
+                            .replace("http://meta:8080", &format!("https://{host}"));
+                        if let Ok(hv) = header::HeaderValue::from_str(&rewritten) {
+                            builder = builder.header(header::LOCATION, hv);
+                        }
+                        continue;
+                    }
+                }
+                if let (Ok(name), Ok(val)) = (
+                    header::HeaderName::from_bytes(k.as_str().as_bytes()),
+                    header::HeaderValue::from_bytes(v.as_bytes()),
+                ) {
+                    builder = builder.header(name, val);
+                }
+            }
+            builder
+                .body(axum::body::Body::from_stream(r.bytes_stream()))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(e) => {
+            tracing::warn!(db = %db.id, error = %e, "supabase studio proxy upstream error");
+            err(
+                StatusCode::BAD_GATEWAY,
+                "Studio is still starting (or stopped) — retry in a few seconds",
+            )
+        }
+    }
 }
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {

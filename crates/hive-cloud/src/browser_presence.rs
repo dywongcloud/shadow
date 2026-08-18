@@ -345,7 +345,9 @@ impl BrowserPresenceStore {
         let revision = state.next_version();
         record.revision = revision;
         state.tombstones.remove(&record.endpoint_id);
-        state.active.insert(record.endpoint_id.clone(), record.clone());
+        state
+            .active
+            .insert(record.endpoint_id.clone(), record.clone());
         self.counters
             .upserts_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -482,9 +484,17 @@ impl Default for BrowserPresenceStore {
 /// Server-side coordinate sanitation: bounds, finiteness, and the coarse
 /// quantization floor. `None` in, `None` out — a client that declines
 /// location (or sends nothing) never gets an accidental (0,0) placement.
-fn sanitize_location(lat: Option<f64>, lon: Option<f64>, accuracy_km: Option<f64>) -> Option<(f64, f64, f64)> {
+fn sanitize_location(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    accuracy_km: Option<f64>,
+) -> Option<(f64, f64, f64)> {
     let (lat, lon) = (lat?, lon?);
-    if !lat.is_finite() || !lon.is_finite() || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+    {
         return None;
     }
     let quant = |v: f64| (v / GEO_QUANT_DEGREES).round() * GEO_QUANT_DEGREES;
@@ -510,11 +520,15 @@ struct PresenceRequest {
 }
 
 pub fn routes() -> Router<Arc<CloudState>> {
-    Router::new().route(
-        "/v1/browser/presence",
-        get(list_presence).post(upsert_presence),
-    )
-    .route("/v1/browser/presence/:endpoint_id", axum::routing::delete(clear_presence))
+    Router::new()
+        .route(
+            "/v1/browser/presence",
+            get(list_presence).post(upsert_presence),
+        )
+        .route(
+            "/v1/browser/presence/:endpoint_id",
+            axum::routing::delete(clear_presence),
+        )
 }
 
 fn claims_required(claims: Claims) -> Result<crate::auth::Claims, (StatusCode, String)> {
@@ -533,11 +547,16 @@ fn require_owned_admission(
     endpoint_id: &str,
 ) -> Result<String, (StatusCode, String)> {
     let tenant = crate::admin::norm(&claims.tenant).to_string();
-    let admission = crate::browser_admission::local_admission(&cloud, &tenant, endpoint_id, hive_core::now_ms())
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "no active browser admission for this endpoint".into(),
-        ))?;
+    let admission = crate::browser_admission::local_admission(
+        &cloud,
+        &tenant,
+        endpoint_id,
+        hive_core::now_ms(),
+    )
+    .ok_or((
+        StatusCode::NOT_FOUND,
+        "no active browser admission for this endpoint".into(),
+    ))?;
     if admission.subject != claims.sub && !matches!(claims.role.as_str(), "owner" | "admin") {
         return Err((
             StatusCode::FORBIDDEN,

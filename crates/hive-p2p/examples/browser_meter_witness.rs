@@ -259,7 +259,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if failures == 0 {
-        println!("WITNESS_OK:ALL: per-tenant framed-byte metering is exact and separately attributed");
+        println!(
+            "WITNESS_OK:ALL: per-tenant framed-byte metering is exact and separately attributed"
+        );
         Ok(())
     } else {
         println!("WITNESS_FAIL:{failures} check(s) failed");

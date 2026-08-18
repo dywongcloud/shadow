@@ -343,7 +343,10 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     const prev = localStorage.getItem("hive_uid");
     const firstIdentity = prev !== identity.id; // includes unset -> set
     if (prev && firstIdentity) {
-      for (const k of ["hive_team", "hive_is_owner", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
+      // `hive_pending_builds` rides along: the previous account's in-flight build
+      // rows (project names + build ids, with live Cancel links) must not carry
+      // into the next signed-in user's session on a shared browser.
+      for (const k of ["hive_team", "hive_is_owner", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;

@@ -105,7 +105,12 @@ async fn setup_serving(function: String) -> Option<(Arc<hive_p2p::PeerPool>, Str
     Some((hive_p2p::PeerPool::new(ep_a), id, addr))
 }
 
-async fn one(pool: &hive_p2p::PeerPool, node_id: &str, addr_json: &str, path: &str) -> (u16, String) {
+async fn one(
+    pool: &hive_p2p::PeerPool,
+    node_id: &str,
+    addr_json: &str,
+    path: &str,
+) -> (u16, String) {
     let tr = tokio::time::timeout(
         Duration::from_secs(20),
         pool.request(node_id, addr_json, "GET", path, &[], b""),
@@ -145,7 +150,10 @@ async fn spawn_slow_function(chunks: usize, gap: Duration, then_hang: bool) -> S
                 }
                 let _ = s.flush().await;
                 for i in 0..chunks {
-                    if s.write_all(format!("data: {i}\n\n").as_bytes()).await.is_err() {
+                    if s.write_all(format!("data: {i}\n\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     let _ = s.flush().await;
@@ -237,8 +245,12 @@ async fn main() {
         let (s2, b2) = one(&pool, &id, &addr, "/b").await;
         let (opened, reused) = pool.stats();
         report(
-            s1 == 200 && s2 == 200 && b1.contains("iroh-p2p") && b2.contains("iroh-p2p")
-                && opened == 1 && reused == 1,
+            s1 == 200
+                && s2 == 200
+                && b1.contains("iroh-p2p")
+                && b2.contains("iroh-p2p")
+                && opened == 1
+                && reused == 1,
             "sequential-requests-reuse-one-connection",
             format!("two 200s over one trunk (opened={opened}, reused={reused})"),
         );
@@ -254,7 +266,9 @@ async fn main() {
             let pool = pool.clone();
             let id = id.clone();
             let addr = addr.clone();
-            handles.push(tokio::spawn(async move { one(&pool, &id, &addr, &format!("/c/{i}")).await }));
+            handles.push(tokio::spawn(async move {
+                one(&pool, &id, &addr, &format!("/c/{i}")).await
+            }));
         }
         let mut ok = 0;
         for h in handles {
@@ -267,7 +281,9 @@ async fn main() {
         report(
             s == 200 && ok == 16 && opened == 1 && reused == 16,
             "concurrent-requests-share-one-connection",
-            format!("16 concurrent streams over one trunk (opened={opened}, reused={reused}, ok={ok})"),
+            format!(
+                "16 concurrent streams over one trunk (opened={opened}, reused={reused}, ok={ok})"
+            ),
         );
     } else {
         println!("WITNESS_SKIP:concurrent-requests-share-one-connection: iroh could not bind");
@@ -280,7 +296,11 @@ async fn main() {
         pool.close_peer(&id).await;
         let (s2, b2) = one(&pool, &id, &addr, "/second").await;
         report(
-            s1 == 200 && s2 == 200 && b2.contains("iroh-p2p") && opened1 == 1 && pool.stats().0 == 2,
+            s1 == 200
+                && s2 == 200
+                && b2.contains("iroh-p2p")
+                && opened1 == 1
+                && pool.stats().0 == 2,
             "killed-trunk-redials",
             format!("opened {} -> {} after close_peer", opened1, pool.stats().0),
         );
@@ -295,8 +315,13 @@ async fn main() {
         let severed = pool.sever_peer(&id).await;
         let (s2, b2) = one(&pool, &id, &addr, "/after-sever").await;
         report(
-            s1 == 200 && s2 == 200 && b2.contains("iroh-p2p") && opened0 >= 1 && reused0 == 0
-                && severed && pool.stats().0 == opened0 + 1,
+            s1 == 200
+                && s2 == 200
+                && b2.contains("iroh-p2p")
+                && opened0 >= 1
+                && reused0 == 0
+                && severed
+                && pool.stats().0 == opened0 + 1,
             "severed-cached-trunk-is-detected-and-redialed",
             format!("severed={severed}, opened {opened0} -> {}", pool.stats().0),
         );
@@ -312,12 +337,18 @@ async fn main() {
         let direct = rs.direct_bytes_tx + rs.direct_bytes_rx;
         let one_bucket = rs.relayed_conns + rs.direct_conns == 1;
         let bytes_counted = relayed + direct > 0;
-        let consistent = if rs.direct_conns == 1 { relayed == 0 } else { direct == 0 };
+        let consistent = if rs.direct_conns == 1 {
+            relayed == 0
+        } else {
+            direct == 0
+        };
         report(
             s == 200 && one_bucket && bytes_counted && consistent,
             "relay-stats-classifies-and-counts-bytes",
-            format!("relayed_conns={} direct_conns={} relayed_bytes={} direct_bytes={}",
-                rs.relayed_conns, rs.direct_conns, relayed, direct),
+            format!(
+                "relayed_conns={} direct_conns={} relayed_bytes={} direct_bytes={}",
+                rs.relayed_conns, rs.direct_conns, relayed, direct
+            ),
         );
     } else {
         println!("WITNESS_SKIP:relay-stats-classifies-and-counts-bytes: iroh could not bind");
@@ -332,7 +363,13 @@ async fn main() {
                 format!("{method}:{path}:{}", String::from_utf8_lossy(&body)).into_bytes()
             })
         });
-        tokio::spawn(hive_p2p::serve_tunnels(ep_b, "127.0.0.1:1".into(), 100, None, Some(handler)));
+        tokio::spawn(hive_p2p::serve_tunnels(
+            ep_b,
+            "127.0.0.1:1".into(),
+            100,
+            None,
+            Some(handler),
+        ));
         let ep_a = hive_p2p::bind().await.unwrap();
         let pool = hive_p2p::PeerPool::new(ep_a);
         let r1 = tokio::time::timeout(
@@ -350,7 +387,11 @@ async fn main() {
             String::from_utf8_lossy(&r1) == "1:/v1/nodes:hello"
                 && String::from_utf8_lossy(&r2) == "0:/v1/serve-hosts:",
             "gossip-request-round-trips-over-iroh",
-            format!("{} | {}", String::from_utf8_lossy(&r1), String::from_utf8_lossy(&r2)),
+            format!(
+                "{} | {}",
+                String::from_utf8_lossy(&r1),
+                String::from_utf8_lossy(&r2)
+            ),
         );
     } else {
         println!("WITNESS_SKIP:gossip-request-round-trips-over-iroh: iroh could not bind");
@@ -375,14 +416,28 @@ async fn main() {
             let id_a = ep_a.id().to_string();
             let trust = trusted_case.then(|| {
                 let t: hive_p2p::TrustSet =
-                    Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([id_a.clone()])));
+                    Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
+                        id_a.clone(),
+                    ])));
                 t
             });
-            tokio::spawn(hive_p2p::serve_tunnels(ep_b, "127.0.0.1:1".into(), 100, trust, Some(handler)));
+            tokio::spawn(hive_p2p::serve_tunnels(
+                ep_b,
+                "127.0.0.1:1".into(),
+                100,
+                trust,
+                Some(handler),
+            ));
             let pool = hive_p2p::PeerPool::new(ep_a);
             let resp = tokio::time::timeout(
                 Duration::from_secs(20),
-                pool.gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_POST, "/v1/nodes", b"signed"),
+                pool.gossip_request(
+                    &id_b,
+                    &addr_b,
+                    hive_p2p::GOSSIP_POST,
+                    "/v1/nodes",
+                    b"signed",
+                ),
             )
             .await
             .expect("signed gossip timed out")
@@ -391,7 +446,10 @@ async fn main() {
             report(
                 String::from_utf8_lossy(&resp) == id_a && ok >= 1,
                 label,
-                format!("handler saw verified signer {} (signed_ok={ok})", String::from_utf8_lossy(&resp)),
+                format!(
+                    "handler saw verified signer {} (signed_ok={ok})",
+                    String::from_utf8_lossy(&resp)
+                ),
             );
         } else {
             println!("WITNESS_SKIP:{label}: iroh could not bind");
@@ -404,15 +462,38 @@ async fn main() {
         let id = sk.public().to_string();
         let now: u64 = 1_700_000_000_000;
         let trailer = hive_p2p::sign_gossip(&sk, hive_p2p::GOSSIP_POST, "/v1/x", b"body", now);
-        let valid = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now)
-            .map(|signer| signer == id)
-            .unwrap_or(false);
-        let tampered_body = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"evil", &id, now).is_err();
-        let tampered_path = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/y", b"body", &id, now).is_err();
-        let tampered_method = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_GET, "/v1/x", b"body", &id, now).is_err();
-        let replay = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now + 10 * 60 * 1000).is_err();
+        let valid =
+            hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now)
+                .map(|signer| signer == id)
+                .unwrap_or(false);
+        let tampered_body =
+            hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"evil", &id, now)
+                .is_err();
+        let tampered_path =
+            hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/y", b"body", &id, now)
+                .is_err();
+        let tampered_method =
+            hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_GET, "/v1/x", b"body", &id, now)
+                .is_err();
+        let replay = hive_p2p::verify_gossip(
+            &trailer,
+            hive_p2p::GOSSIP_POST,
+            "/v1/x",
+            b"body",
+            &id,
+            now + 10 * 60 * 1000,
+        )
+        .is_err();
         let other = iroh::SecretKey::generate().public().to_string();
-        let mismatch = hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &other, now).is_err();
+        let mismatch = hive_p2p::verify_gossip(
+            &trailer,
+            hive_p2p::GOSSIP_POST,
+            "/v1/x",
+            b"body",
+            &other,
+            now,
+        )
+        .is_err();
         report(
             valid && tampered_body && tampered_path && tampered_method && replay && mismatch,
             "gossip-signature-rejects-tamper-replay-and-mismatch",
@@ -435,7 +516,9 @@ async fn main() {
                 format!("warm={warm}, opened={opened}, reused={reused}"),
             );
         } else {
-            println!("WITNESS_SKIP:warm-pre-establishes-trunk-reused-by-request: iroh could not bind");
+            println!(
+                "WITNESS_SKIP:warm-pre-establishes-trunk-reused-by-request: iroh could not bind"
+            );
         }
     }
 
@@ -475,7 +558,9 @@ async fn main() {
                 format!("dead_peer_timeout={dead} elapsed={elapsed:?} counted={counted}"),
             );
         } else {
-            println!("WITNESS_SKIP:blackhole-connect-times-out-and-is-marked-dead: iroh could not bind");
+            println!(
+                "WITNESS_SKIP:blackhole-connect-times-out-and-is-marked-dead: iroh could not bind"
+            );
         }
     }
 
@@ -507,11 +592,18 @@ async fn main() {
                 .and_then(|e| e.downcast_ref::<hive_p2p::PostSendTimeout>())
                 .is_some();
             let opened = pool.stats().0;
-            let counted = pool.relay_stats().await.timeouts.iter().any(|t| t.phase == "firstbyte");
+            let counted = pool
+                .relay_stats()
+                .await
+                .timeouts
+                .iter()
+                .any(|t| t.phase == "firstbyte");
             report(
                 post_send && elapsed < Duration::from_secs(3) && opened == 1 && counted,
                 "accept-but-silent-first-byte-times-out-without-retry",
-                format!("post_send={post_send} elapsed={elapsed:?} opened={opened} counted={counted}"),
+                format!(
+                    "post_send={post_send} elapsed={elapsed:?} opened={opened} counted={counted}"
+                ),
             );
         } else {
             println!("WITNESS_SKIP:accept-but-silent-first-byte-times-out-without-retry: iroh could not bind");
@@ -537,16 +629,32 @@ async fn main() {
             let next = tokio::time::timeout(Duration::from_secs(5), ts.recv())
                 .await
                 .expect("recv must self-terminate on idle, not hang");
-            let counted = pool.relay_stats().await.timeouts.iter().any(|t| t.phase == "idle");
+            let counted = pool
+                .relay_stats()
+                .await
+                .timeouts
+                .iter()
+                .any(|t| t.phase == "idle");
             report(
-                ts.status == 200 && first.is_some() && next.is_none() && ts.timed_out()
-                    && t0.elapsed() < Duration::from_secs(3) && counted,
+                ts.status == 200
+                    && first.is_some()
+                    && next.is_none()
+                    && ts.timed_out()
+                    && t0.elapsed() < Duration::from_secs(3)
+                    && counted,
                 "idle-timeout-fires-when-stream-goes-silent",
-                format!("first={} next_none={} timed_out={} elapsed={:?} counted={counted}",
-                    first.is_some(), next.is_none(), ts.timed_out(), t0.elapsed()),
+                format!(
+                    "first={} next_none={} timed_out={} elapsed={:?} counted={counted}",
+                    first.is_some(),
+                    next.is_none(),
+                    ts.timed_out(),
+                    t0.elapsed()
+                ),
             );
         } else {
-            println!("WITNESS_SKIP:idle-timeout-fires-when-stream-goes-silent: iroh could not bind");
+            println!(
+                "WITNESS_SKIP:idle-timeout-fires-when-stream-goes-silent: iroh could not bind"
+            );
         }
     }
 
@@ -571,10 +679,16 @@ async fn main() {
             }
             let body_s = String::from_utf8_lossy(&body);
             report(
-                ts.status == 200 && !ts.timed_out()
-                    && body_s.contains("data: 0") && body_s.contains("data: 3"),
+                ts.status == 200
+                    && !ts.timed_out()
+                    && body_s.contains("data: 0")
+                    && body_s.contains("data: 3"),
                 "slow-but-alive-stream-survives",
-                format!("timed_out={} body={}", ts.timed_out(), body_s.replace('\n', "\\n")),
+                format!(
+                    "timed_out={} body={}",
+                    ts.timed_out(),
+                    body_s.replace('\n', "\\n")
+                ),
             );
         } else {
             println!("WITNESS_SKIP:slow-but-alive-stream-survives: iroh could not bind");
@@ -595,7 +709,8 @@ async fn main() {
             let t0 = Instant::now();
             let first = tokio::time::timeout(Duration::from_millis(400), ts.recv()).await;
             let first_elapsed = t0.elapsed();
-            let first_ok = matches!(&first, Ok(Some(_))) && first_elapsed < Duration::from_millis(400);
+            let first_ok =
+                matches!(&first, Ok(Some(_))) && first_elapsed < Duration::from_millis(400);
             let mut body = Vec::new();
             if let Ok(Some(c)) = first {
                 body.extend_from_slice(&c);
@@ -626,7 +741,8 @@ async fn main() {
             raw.write_all(msg).await.expect("write");
             raw.flush().await.expect("flush");
             let mut got = vec![0u8; msg.len()];
-            let read = tokio::time::timeout(Duration::from_secs(10), raw.read_exact(&mut got)).await;
+            let read =
+                tokio::time::timeout(Duration::from_secs(10), raw.read_exact(&mut got)).await;
             let echoed = matches!(read, Ok(Ok(_))) && got == msg;
             report(
                 echoed,
@@ -640,7 +756,9 @@ async fn main() {
 
     let failures = FAILURES.load(std::sync::atomic::Ordering::Relaxed);
     if failures == 0 {
-        println!("WITNESS_OK:ALL: every deleted tests/pool.rs + tests/stream_ws.rs assertion holds live");
+        println!(
+            "WITNESS_OK:ALL: every deleted tests/pool.rs + tests/stream_ws.rs assertion holds live"
+        );
     } else {
         println!("WITNESS_FAIL:{failures} phase(s) failed");
         std::process::exit(1);

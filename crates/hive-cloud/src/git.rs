@@ -400,17 +400,9 @@ async fn cancel_remote_build(cloud: &Arc<CloudState>, m: &MirrorTarget) -> bool 
             .unwrap_or(false);
     }
     if let Some((id, addr)) = &m.iroh {
-        return crate::gossip::request_to(
-            cloud,
-            id,
-            addr,
-            hive_p2p::GOSSIP_POST,
-            &path,
-            &[],
-            15,
-        )
-        .await
-        .is_some();
+        return crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, &path, &[], 15)
+            .await
+            .is_some();
     }
     false
 }
@@ -817,7 +809,9 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
             let cancelled = e.downcast_ref::<BuildCancelled>().is_some()
                 || cloud.build_cancels.is_cancelled(&bid);
             if cancelled {
-                cloud.builds.log(&bid, "Build cancelled by user.".to_string());
+                cloud
+                    .builds
+                    .log(&bid, "Build cancelled by user.".to_string());
                 cloud.builds.update(&bid, |b| {
                     if !matches!(b.state, DeployState::Cancelled) {
                         b.state = DeployState::Cancelled;
@@ -919,9 +913,7 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
             candidates.push(format!("{stem}.{ext}"));
         }
     }
-    candidates
-        .into_iter()
-        .find(|c| build_dir.join(c).is_file())
+    candidates.into_iter().find(|c| build_dir.join(c).is_file())
 }
 
 /// Every function name a repo's `fluid.json` EXPLICITLY opted into browser
@@ -1029,9 +1021,33 @@ pub(crate) fn redeploy_on_host(
             true,
         )
         .await;
-        let cancelled = !ok && cloud.build_cancels.is_cancelled(&bid);
+        // Single pinned host: promotable == that one host is Ready. The
+        // outcome type still matters here for the REASON reported — an
+        // unreachable pinned host is a fleet fault, not a build failure.
+        let promotable = ok.promotable();
+        let cancelled = (!promotable && ok.cancelled())
+            || (!promotable && cloud.build_cancels.is_cancelled(&bid));
+        if !promotable && !cancelled && ok.build_failed() == 0 {
+            let unreachable = ok.unreachable().join(", ");
+            cloud.builds.log(
+                &bid,
+                if unreachable.is_empty() {
+                    // Reachable, but it declined to host (stateful single-writer
+                    // guard). Not a fleet fault and not a build failure.
+                    "✗ the pinned host declined to run this deploy as a stateful single-writer \
+                     service — nothing was built there and the existing deployment is untouched."
+                        .to_string()
+                } else {
+                    format!(
+                        "✗ could not reach {unreachable} to run this deploy — nothing was built \
+                         there, so the existing deployment is untouched. This is a \
+                         fleet-reachability fault, not a build failure; retry once the node is back."
+                    )
+                },
+            );
+        }
         cloud.builds.update(&bid, |b| {
-            b.state = if ok {
+            b.state = if promotable {
                 DeployState::Ready
             } else if cancelled {
                 DeployState::Cancelled
@@ -1288,7 +1304,16 @@ async fn run_build(
             // take down the currently-serving deployment; the old one keeps serving
             // and the user just sees a failed build. (This is the bug that dropped a
             // healthy project when a relocating redeploy errored.)
-            let cancelled = !ok && cloud.build_cancels.is_cancelled(bid);
+            // PROMOTION POLICY (see `FanoutOutcome::promotable`): at least one
+            // target genuinely Ready promotes the deployment. A target we could
+            // never REACH degrades capacity; it does not veto the regions that
+            // are demonstrably serving. Before this, every outcome folded into
+            // one bool, so an unreachable node failed the whole deploy even
+            // when two regions had built and gone live.
+            let promotable = ok.promotable();
+            let unreachable = ok.unreachable();
+            let cancelled = (!promotable && ok.cancelled())
+                || (!promotable && cloud.build_cancels.is_cancelled(bid));
             // Honest wording. "Keeping the existing deployment in place" is a
             // claim that something is still serving, and it is FALSE for a
             // project's first-ever deploy attempt — there is nothing to keep.
@@ -1296,35 +1321,87 @@ async fn run_build(
             // deployment records, ever) and every failure log line still said
             // "keeping the existing deployment in place", which reads as "your
             // site is fine" to an operator watching a genuinely-down project.
-            let had_prior_deployment = cloud
-                .gw
-                .deployment_records()
-                .iter()
-                .any(|r| r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready)
-                || cloud
-                    .peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .any(|d| d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready);
-            if ok {
+            let had_prior_deployment =
+                cloud.gw.deployment_records().iter().any(|r| {
+                    r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready
+                }) || cloud.peer_deployments.read().values().flatten().any(|d| {
+                    d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready
+                });
+            if promotable {
+                // DEGRADED, not failed: name every target the deploy could not
+                // be delivered to, so the operator sees reduced replication
+                // instead of silence, and so a later reconcile can repair it.
+                if !unreachable.is_empty() {
+                    log(format!(
+                        "⚠ Deployed to {} of {} target(s). Could not reach: {} — those regions ran \
+                         nothing and are DEGRADED, not failed; replication is repaired when they \
+                         return. Serving continues from the healthy region(s).",
+                        ok.ready(),
+                        ok.per_target.len(),
+                        unreachable.join(", ")
+                    ));
+                }
                 // OFF the critical path: the new placement is provably serving
                 // at this point, so the user's build must not stay "Building"
                 // while stale copies are reaped from unrelated peers. Every
                 // delete is idempotent and independently retried, and nothing
                 // below reads its result.
-                let c2 = cloud.clone();
-                let p2 = project.clone();
-                let n2 = names.clone();
-                tokio::spawn(async move {
-                    cleanup_non_targets(&c2, &p2, &n2).await;
-                });
+                //
+                // Unreachable targets are EXCLUDED from the relocation set's
+                // "keep" list only in the sense that they were never reached —
+                // `names` still lists every intended target, so a node that is
+                // simply unreachable right now is NOT reaped as a stale copy.
+                // Relocation reaping is PRODUCTION-lane semantics: only a
+                // production build defines a new authoritative placement whose
+                // non-targets hold "stale copies". A preview build must never
+                // reap anything (its placement says nothing about where
+                // production lives), and an UNRESOLVABLE environment (no
+                // explicit target, production_branch unknown here) skips the
+                // reap — stale copies linger until the next classified
+                // production build, which is retention, never correctness.
+                if request_is_production(cloud, &req, &project) == Some(true) {
+                    let c2 = cloud.clone();
+                    let p2 = project.clone();
+                    let n2 = names.clone();
+                    tokio::spawn(async move {
+                        cleanup_non_targets(&c2, &p2, &n2).await;
+                    });
+                }
             } else if cancelled {
                 log(if had_prior_deployment {
                     "Build cancelled by user — keeping the existing deployment in place.".into()
                 } else {
                     "Build cancelled by user.".to_string()
                 });
+            } else if ok.build_failed() == 0 && !unreachable.is_empty() {
+                // NOTHING ran anywhere: every target was unreachable. Still a
+                // failed deploy (there is no new version serving), but it must
+                // NOT be reported as a build failure — the application was
+                // never executed, so nothing is known about whether it builds.
+                // Saying "Build failed" here sent users to debug an app that
+                // was never run.
+                log(format!(
+                    "✗ Could not reach any target to run this deploy ({}). Nothing was built, so {} \
+                     This is a fleet-reachability fault, not a build failure — retry when the \
+                     node(s) are back.",
+                    unreachable.join(", "),
+                    if had_prior_deployment {
+                        "the existing deployment is untouched and still serving."
+                    } else {
+                        "this project still has nothing serving."
+                    }
+                ));
+            } else if ok.build_failed() == 0 && ok.declined() > 0 {
+                // Every reachable target deliberately declined to host (stateful
+                // single-writer guard) and none failed. Nothing is serving the new
+                // version, but no application fault occurred — reporting "Build
+                // failed" here would send the user to debug an app that built fine.
+                log(format!(
+                    "✗ No target hosted this deploy: {} target(s) declined as a stateful \
+                     single-writer service. Nothing was built incorrectly — this is a placement \
+                     outcome, not a build failure.",
+                    ok.declined()
+                ));
             } else {
                 log(if had_prior_deployment {
                     "Build failed — keeping the existing deployment in place (no relocation)."
@@ -1336,7 +1413,7 @@ async fn run_build(
                 });
             }
             cloud.builds.update(bid, |b| {
-                b.state = if ok {
+                b.state = if promotable {
                     DeployState::Ready
                 } else if cancelled {
                     DeployState::Cancelled
@@ -1423,7 +1500,14 @@ async fn run_build(
         // project (or a concurrent redeploy re-extracting it) otherwise truncate/
         // rewrite this shared file mid-read — a torn zip fails the OTHER build.
         let retained = retained_source_write_path(&project);
-        let retained_tmp = deploy_root().join(format!("{}.{}.tmp", retained.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bid));
+        let retained_tmp = deploy_root().join(format!(
+            "{}.{}.tmp",
+            retained
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bid
+        ));
         match tokio::fs::write(&retained_tmp, &bytes).await {
             Ok(()) => {
                 if let Err(e) = tokio::fs::rename(&retained_tmp, &retained).await {
@@ -1636,7 +1720,9 @@ async fn run_build(
                                         .arg("checkout")
                                         .arg("-q")
                                         .arg("FETCH_HEAD");
-                                    match run_cancellable_output(&mut checkout, &ccloud, &cbid).await {
+                                    match run_cancellable_output(&mut checkout, &ccloud, &cbid)
+                                        .await
+                                    {
                                         Ok(cout) if cout.status.success() => {
                                             return (true, scrub(&cout.stderr));
                                         }
@@ -2067,8 +2153,29 @@ async fn run_build(
         if f.max_duration_secs == fluid_core::FunctionConfig::default().max_duration_secs {
             f.max_duration_secs = fsettings.default_max_duration_secs;
         }
-        f.vcpus = fsettings.vcpus.max(1);
-        f.memory_mib = fsettings.memory_mib;
+        // Same rule, same reason, for the size knobs: a value the FUNCTION
+        // declared must survive the project default. These two were left as
+        // unconditional overwrites when `max_duration_secs` above was fixed,
+        // so a fluid.json `{"memory_mib": 8192}` (or a container's
+        // `{"container":{"memory":"8g"}}`, which lands here as `memory_mib`)
+        // was silently replaced by the dashboard default on EVERY deploy. The
+        // user-visible shape is the reported one: the setting has no effect,
+        // and a container that genuinely needs the memory is OOM-killed
+        // (exit 137) — which then presents as repeated cold-start failure and
+        // an open circuit, blamed on the app.
+        //
+        // Distinguishing "explicitly wrote the default" from "omitted" is not
+        // possible through serde here, and it does not matter: falling back to
+        // the project setting when the function is AT the default is a no-op
+        // whenever they agree, and honours the project default when they
+        // differ — which is exactly the intent.
+        if f.vcpus == fluid_core::FunctionConfig::default().vcpus {
+            f.vcpus = fsettings.vcpus.max(1);
+        }
+        if f.memory_mib == fluid_core::FunctionConfig::default().memory_mib {
+            f.memory_mib = fsettings.memory_mib;
+        }
+        f.vcpus = f.vcpus.max(1);
         // Serverless GPU: the project-level toggle marks every function; a
         // per-function fluid.json `gpu: true` (already parsed into the manifest)
         // is preserved — settings can only turn GPU ON, never strip a
@@ -2215,10 +2322,9 @@ async fn run_build(
     // through `Runtime::resolve` (config value wins, else argv basename) rather
     // than a bare string compare, so a function whose runtime was inferred from
     // a `wasmer …` start_cmd counts too.
-    let is_wasm = manifest
-        .functions
-        .iter()
-        .any(|f| hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer);
+    let is_wasm = manifest.functions.iter().any(|f| {
+        hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer
+    });
 
     // ---- Stateful fanout-replica guard (the remote sub-build side) ---------
     // The coordinator's two placement gates cannot cover the pure-remote fanout
@@ -2346,7 +2452,8 @@ async fn run_build(
             })
             .collect();
         if !dropped.is_empty() {
-            let msg = format!(
+            let msg =
+                format!(
                 "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
                  `functions[].browser` for {}, but this project builds through the {} path, which \
                  constructs its own function list and cannot carry a per-function browser opt-in. \
@@ -2387,10 +2494,7 @@ async fn run_build(
                 continue; // explicit opt-in — leave it exactly as authored
             }
             let runtime = hive_core::Runtime::resolve(&f.runtime, &f.start_cmd);
-            if !matches!(
-                runtime,
-                hive_core::Runtime::Node | hive_core::Runtime::Bun
-            ) {
+            if !matches!(runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun) {
                 // container/python/go/command — never browser-eligible. Recorded
                 // rather than skipped: this is the single most common reason a
                 // ready deployment is missing from the picker.
@@ -2462,7 +2566,9 @@ async fn run_build(
             for note in &bundled.notes {
                 log(format!("Browser artifact ({}): {note}", f.name));
             }
-            if let Err(e) = crate::browser_artifacts::persist(&bundled.source, &bundled.descriptor).await {
+            if let Err(e) =
+                crate::browser_artifacts::persist(&bundled.source, &bundled.descriptor).await
+            {
                 let msg = format!(
                     "Browser artifact ({}): could not persist to the content-addressed store: {e}",
                     f.name
@@ -2543,10 +2649,38 @@ async fn run_build(
     // claim not persistable) degrades with a logged warning rather than
     // failing the whole deploy — HTTP-family routes still work.
     match crate::raw_ports::allocate_raw_ports_coordinated(cloud, &project, &mut manifest).await {
-        Ok(ports) if !ports.is_empty() => log(format!(
-            "Allocated public raw port(s): {} (stable across redeploys).",
-            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-        )),
+        Ok(ports) if !ports.is_empty() => {
+            log(format!(
+                "Allocated public raw port(s): {} (stable across redeploys).",
+                ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+            // A compose publish request asked for a LITERAL host port. Name the
+            // outcome for every such spec — grant == request is confirmation,
+            // grant != request is the loud never-silent fallback the compose
+            // author needs to see (their :9000 is somewhere else).
+            for f in &manifest.functions {
+                for spec in &f.ports {
+                    let (Some(want), Some(got)) = (spec.preferred_public_port, spec.public_port)
+                    else {
+                        continue;
+                    };
+                    if want == got {
+                        log(format!(
+                            "✓ '{}' port {}: published on :{got} as requested — reach it at \
+                             <host>:{got} (plain TCP passthrough; HTTPS stays on 443).",
+                            f.name, spec.container_port
+                        ));
+                    } else {
+                        log(format!(
+                            "⚠ '{}' port {}: requested public port :{want} is reserved or \
+                             already taken fleet-wide — published on :{got} INSTEAD. Update \
+                             clients to <host>:{got}, or free :{want} and redeploy.",
+                            f.name, spec.container_port
+                        ));
+                    }
+                }
+            }
+        }
         Ok(_) => {}
         Err(e) => log(format!(
             "WARN: could not allocate public raw port(s): {e} — raw TCP/UDP ingress is unavailable for this deployment."
@@ -2569,7 +2703,49 @@ async fn run_build(
 
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
-    let tenant = cloud.projects.team_of(&manifest.project);
+    let tenant = {
+        // STICKY: never downgrade an already-tagged project to untagged. The
+        // team tag lives in node-local ProjectSettings; on a node that never
+        // ran set_team (webhook/poll-triggered build landing on a fresh
+        // placement) team_of comes back untagged, and stamping THAT onto the
+        // record hid the deployment from every fail-closed tenant listing —
+        // "the project disappeared from the account". Inherit from the newest
+        // record that knows (local, then gossiped peers) before accepting
+        // untagged as truth.
+        let own = cloud.projects.team_of(&manifest.project);
+        if crate::admin::record_tenant(&own) != crate::admin::UNTAGGED_TENANT {
+            own
+        } else {
+            let inherited = cloud
+                .gw
+                .list()
+                .into_iter()
+                .filter(|d| d.project == manifest.project)
+                .max_by_key(|d| d.created_at_ms)
+                .map(|d| d.tenant.clone())
+                .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
+                .or_else(|| {
+                    cloud
+                        .peer_deployments
+                        .read()
+                        .values()
+                        .flatten()
+                        .filter(|d| d.project == manifest.project)
+                        .max_by_key(|d| d.created_at_ms)
+                        .map(|d| d.tenant.clone())
+                        .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
+                });
+            match inherited {
+                Some(t) => {
+                    // Repair the local settings row too, so the NEXT build (and
+                    // every listing served from this node) has the tag directly.
+                    cloud.projects.set_team(&manifest.project, &t);
+                    t
+                }
+                None => own,
+            }
+        }
+    };
     let info = cloud.gw.deploy_full(
         build_dir.to_string_lossy().into_owned(),
         manifest,
@@ -2589,7 +2765,9 @@ async fn run_build(
     // persisted; ownership is bookkeeping — the GC keep-set derives from live
     // deployment records, so a failed write here is a WARN, never fatal.
     for (function, descriptor) in &browser_bundles {
-        if let Err(e) = crate::browser_artifacts::add_owner(&descriptor.policy_digest, &info.id.0).await {
+        if let Err(e) =
+            crate::browser_artifacts::add_owner(&descriptor.policy_digest, &info.id.0).await
+        {
             log(format!(
                 "WARN: browser artifact ({function}) ownership was not recorded ({e}); the GC keep-set still protects it."
             ));
@@ -2726,13 +2904,38 @@ async fn run_build(
         }
     }
 
+    // The host THIS deployment answers on. `info.alias` is the PROJECT's
+    // production host — correct for a production deploy, and exactly wrong for
+    // a PREVIEW: stamping it on the build record sent the deploy page, the
+    // GitHub commit status, the audit line and the webhook all to the
+    // production URL, so "selecting the preview" showed production. A preview's
+    // own host is its immutable per-deployment alias (`id_alias`), which always
+    // routes to THIS deployment — including while a different deployment holds
+    // the production domain.
+    let self_alias = if is_production {
+        info.alias.clone()
+    } else if !info.commit_alias.is_empty() {
+        // Prefer the commit alias for previews: it is minted on EVERY fanout
+        // target (same commit), so it routes through pooled ingress even when
+        // round-robin lands on a different target node — the per-deployment
+        // id_alias exists only on the node that registered that record.
+        info.commit_alias.clone()
+    } else if !info.id_alias.is_empty() {
+        info.id_alias.clone()
+    } else {
+        info.alias.clone()
+    };
     if build_failed {
         log(format!(
-            "Deployment created (build failed). Aliased to {}",
+            "Deployment created (build failed). Aliased to {self_alias}"
+        ));
+    } else if is_production {
+        log(format!("Deployment ready. Aliased to {self_alias}"));
+    } else {
+        log(format!(
+            "Preview deployment ready. Aliased to {self_alias} (production stays on {})",
             info.alias
         ));
-    } else {
-        log(format!("Deployment ready. Aliased to {}", info.alias));
     }
     cloud.builds.update(bid, |b| {
         b.state = if build_failed {
@@ -2742,7 +2945,7 @@ async fn run_build(
         };
         b.finished_ms = Some(now_ms());
         b.deployment_id = Some(info.id.to_string());
-        b.alias = Some(info.alias.clone());
+        b.alias = Some(self_alias.clone());
     });
     // Persist HERE, not only at the tail of this function: `deploy_full` above
     // already minted the (in-memory-only) Deployment record, and this update
@@ -2813,14 +3016,14 @@ async fn run_build(
         },
         "deployment",
         &info.id.to_string(),
-        &format!("{} → {}", info.project, info.alias),
+        &format!("{} → {self_alias}", info.project),
     );
     crate::persist::persist(cloud);
     // Best-effort final GitHub commit status (success/failure). No-op without a
     // GITHUB_TOKEN; points the check at the live deployment URL.
     {
         let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
-        let url = cloud.deploy_url(&info.alias);
+        let url = cloud.deploy_url(&self_alias);
         let (state, desc) = if build_failed {
             ("failure", "Build failed")
         } else if is_production {
@@ -2844,7 +3047,7 @@ async fn run_build(
         serde_json::json!({
             "id": info.id.to_string(),
             "project": info.project,
-            "url": cloud.deploy_url(&info.alias),
+            "url": cloud.deploy_url(&self_alias),
             "state": "ready",
             "production": is_production,
             "target": if is_production { "production" } else { "preview" },
@@ -2863,14 +3066,8 @@ async fn run_build(
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
-        let targets = crate::schedule::place(
-            cloud,
-            &regions,
-            false,
-            is_stateful,
-            needs_gpu,
-            is_wasm,
-        );
+        let targets =
+            crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu, is_wasm);
         if targets
             .iter()
             .any(|t| t.admin.is_none() && t.iroh.is_none())
@@ -2888,17 +3085,109 @@ async fn run_build(
                 // for stateless deploys, where the secondary flag is inert.
                 let _ = fanout_remote(cloud, bid, &req, &project, &remote, false).await;
             }
-            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
-            cleanup_non_targets(cloud, &project, &names).await;
+            if is_production {
+                let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+                cleanup_non_targets(cloud, &project, &names).await;
+            }
         }
     }
     Ok(())
 }
 
+/// What happened to ONE target of a fan-out, kept distinct instead of folded
+/// into a bare `bool`.
+///
+/// The distinction is the whole point: `DispatchFailed` means the request never
+/// reached the node, so that node's application NEVER RAN and has said nothing
+/// about whether it builds. `BuildFailed` means the node received the deploy,
+/// ran it, and the application genuinely failed. Collapsing both to `false` let
+/// one unreachable node veto an otherwise-successful multi-region deploy:
+/// measured in production with targets fc-sanjose-gpu-3 (built, ready),
+/// fc-virginia-3 (built, ready) and shadw1 (never reached —
+/// "iroh: no reply (peer unreachable over the mesh, or timed out after 20s)"),
+/// where the whole deployment was stamped Error and the user was told
+/// "Build failed — keeping the existing deployment in place (no relocation)"
+/// despite two healthy regions being live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetOutcome {
+    /// The remote build reached a Ready deployment.
+    Ready,
+    /// The deploy was DELIVERED and the remote build reported failure — a real
+    /// application fault, and the only outcome that may fail a deployment.
+    BuildFailed,
+    /// The request never reached this node (no transport succeeded), or the
+    /// node accepted it but its state could never be read back. Nothing ran
+    /// there, so this is a FLEET-health condition, not an app fault.
+    DispatchFailed,
+    /// The user cancelled the build.
+    Cancelled,
+    /// The node received the deploy and deliberately DECLINED to host it — the
+    /// stateful `fanout_secondary` guard, which stamps its own build Ready with
+    /// NO deployment id precisely because it is not registering a replica.
+    ///
+    /// This must never count toward promotion. It reads as success on the wire
+    /// (`state: "ready"`), and under the at-least-one-ready policy a deploy
+    /// whose primary was unreachable and whose two secondaries both declined
+    /// would otherwise promote with ZERO nodes actually serving it — strictly
+    /// worse than the veto bug this enum exists to fix. It is equally not a
+    /// failure: declining is the correct, designed behavior for a single-writer
+    /// service, so it must not fail the deploy either.
+    Declined,
+}
+
+/// The aggregate verdict over every target of one fan-out.
+pub(crate) struct FanoutOutcome {
+    pub per_target: Vec<(String, TargetOutcome)>,
+}
+
+impl FanoutOutcome {
+    fn count(&self, want: TargetOutcome) -> usize {
+        self.per_target.iter().filter(|(_, o)| *o == want).count()
+    }
+    /// Targets that are live and serving.
+    pub(crate) fn ready(&self) -> usize {
+        self.count(TargetOutcome::Ready)
+    }
+    /// Targets that ran the app and failed it.
+    pub(crate) fn build_failed(&self) -> usize {
+        self.count(TargetOutcome::BuildFailed)
+    }
+    /// Targets we could not reach at all — degraded capacity, repairable by a
+    /// later reconcile once the node returns.
+    pub(crate) fn unreachable(&self) -> Vec<String> {
+        self.per_target
+            .iter()
+            .filter(|(_, o)| *o == TargetOutcome::DispatchFailed)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.count(TargetOutcome::Cancelled) > 0
+    }
+    /// Targets that deliberately refused to host (stateful single-writer guard).
+    pub(crate) fn declined(&self) -> usize {
+        self.count(TargetOutcome::Declined)
+    }
+    /// PROMOTION POLICY: at least one target is genuinely serving.
+    ///
+    /// Chosen over quorum deliberately. Each target of a stateless fan-out is
+    /// an INDEPENDENT full replica that serves the project on its own (the
+    /// sub-deploys carry `no_fanout: true` and each registers its own
+    /// deployment record), so one Ready region is a working deployment, not a
+    /// minority of a consensus group — there is no shared log or split-brain
+    /// risk to protect against here. Quorum would mean discarding a region
+    /// that is demonstrably serving users because a DIFFERENT region is
+    /// unreachable, which is the bug this type exists to fix.
+    pub(crate) fn promotable(&self) -> bool {
+        self.ready() > 0
+    }
+}
+
 /// Dispatch a per-target deploy to each remote target's admin and MIRROR its
 /// build into this coordinator build record (so the dashboard's existing build
-/// page streams the real, remote build log). Returns true if every target ended
-/// in a Ready state. Each dispatched deploy carries `no_fanout:true` so the
+/// page streams the real, remote build log). Returns the PER-TARGET outcome —
+/// see [`TargetOutcome`] for why this is not a bool. Each dispatched deploy
+/// carries `no_fanout:true` so the
 /// target just builds + hosts (no recursion), the project's current env (so the
 /// target has it even on a redeploy), and the owning team header.
 ///
@@ -2918,7 +3207,7 @@ async fn fanout_remote(
     project: &str,
     remote: &[crate::schedule::Target],
     primary_first: bool,
-) -> bool {
+) -> FanoutOutcome {
     let log = |s: String| cloud.builds.log(bid, s);
     let team = cloud.projects.team_of(project);
     let env = cloud.projects.env_map(project);
@@ -2930,7 +3219,6 @@ async fn fanout_remote(
         .map(|s| s.build)
         .and_then(|b| serde_json::to_value(b).ok());
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
-    let mut all_ok = true;
     // PHASE 1 — dispatch every target CONCURRENTLY, then PHASE 2 mirrors them
     // all concurrently (below). This loop used to do both serially per target:
     // dispatch region A, then await A's ENTIRE remote build (clone + npm
@@ -2942,6 +3230,18 @@ async fn fanout_remote(
     let dispatch_futs = remote.iter().enumerate().map(|(idx, t)| {
         let mut dreq = req.clone();
         dreq.no_fanout = true;
+        // Stamp the ENVIRONMENT before dispatch whenever this node can resolve
+        // it: the remote's classification uses ITS node-local production_branch
+        // — never gossiped, never previously forwarded — so a fresh node (or
+        // one whose settings a pre-fix reaper wiped) classified a preview
+        // branch as production, claimed the production domain, and poisoned its
+        // own production_branch with the preview branch. With the target
+        // explicit, the remote's branch heuristic never runs.
+        if dreq.target.is_none() {
+            if let Some(is_prod) = request_is_production(cloud, &dreq, project) {
+                dreq.target = Some(if is_prod { "production" } else { "preview" }.into());
+            }
+        }
         // Everyone but the designated primary is a secondary replica — see this
         // fn's doc + the stateful fanout-replica guard in `run_build`.
         dreq.fanout_secondary = !(primary_first && idx == 0);
@@ -3064,17 +3364,23 @@ async fn fanout_remote(
     // Dispatch all targets at once. `join_all` polls these futures on THIS
     // task (no spawn), so the borrows of `cloud`/`req`/`remote` stay valid and
     // nothing needs to be 'static.
-    let dispatched: Vec<Option<(String, bool)>> =
-        futures::future::join_all(dispatch_futs).await;
+    let dispatched: Vec<Option<(String, bool)>> = futures::future::join_all(dispatch_futs).await;
 
     // Register the PRIMARY's cancel mirror before any mirroring begins — see
     // this fn's doc: `cancel_build` on the coordinator's mirror build id has to
     // reach the REAL process, which runs on the primary target, not here.
     // Secondaries are extras a cancel doesn't need to chase.
     let mut live: Vec<(&crate::schedule::Target, String)> = Vec::new();
+    let mut per_target: Vec<(String, TargetOutcome)> = Vec::new();
     for (t, d) in remote.iter().zip(dispatched.into_iter()) {
         match d {
-            None => all_ok = false, // already logged by the dispatch future
+            None => {
+                // Dispatch never landed (every transport failed, or the node
+                // advertised none) — the deploy did NOT run here, so this can
+                // never be reported as an application failure. Already logged
+                // with its real cause by the dispatch future.
+                per_target.push((t.node.clone(), TargetOutcome::DispatchFailed));
+            }
             Some((target_bid, secondary)) => {
                 if !secondary {
                     cloud.build_cancels.set_mirror(
@@ -3098,8 +3404,8 @@ async fn fanout_remote(
             .map(|(t, target_bid)| mirror_remote_build(cloud, bid, t, target_bid, &t.node)),
     )
     .await;
-    if mirrors.iter().any(|ok| !ok) {
-        all_ok = false;
+    for ((t, _), outcome) in live.iter().zip(mirrors.iter()) {
+        per_target.push((t.node.clone(), *outcome));
     }
 
     // Sync auto-detected Build settings back from ONE reachable HTTP target
@@ -3109,7 +3415,7 @@ async fn fanout_remote(
     let sync_from = live
         .iter()
         .zip(mirrors.iter())
-        .find(|(entry, ok)| **ok && entry.0.admin.is_some())
+        .find(|(entry, o)| **o == TargetOutcome::Ready && entry.0.admin.is_some())
         .map(|(entry, _)| entry.0);
     if let Some(t) = sync_from {
         if let Some(admin) = &t.admin {
@@ -3160,7 +3466,7 @@ async fn fanout_remote(
             }
         }
     }
-    all_ok
+    FanoutOutcome { per_target }
 }
 
 /// Poll a remote node's `/v1/builds/{id}` and stream NEW log lines into this
@@ -3173,26 +3479,26 @@ async fn mirror_remote_build(
     target: &crate::schedule::Target,
     target_bid: &str,
     node: &str,
-) -> bool {
+) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
-    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-    // anonymous tenant, `build_owned_by` never matched the build's real
-    // team, and every poll 404'd — INCLUDING every poll against a target
-    // build that had already finished. Verified live: 400/400 polls failed
-    // for a target build that reached `ready` in under 3 seconds, on a
-    // reachable node, every single time. This is not a mesh-health symptom;
-    // it silently broke remote-build status mirroring for every
-    // fanout-placed deployment on the whole fleet, always burning the full
-    // 10-minute deadline regardless of how fast the actual remote build was.
-    // `mesh_team_qs` is the SAME delegation-token minting already used for
-    // every other mesh-internal proxied read (`fetch_from_host` and
-    // friends) — the coordinator knows the real owning team from its own
-    // local build record, so it can assert it the same way.
+                                              // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
+                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+                                              // anonymous tenant, `build_owned_by` never matched the build's real
+                                              // team, and every poll 404'd — INCLUDING every poll against a target
+                                              // build that had already finished. Verified live: 400/400 polls failed
+                                              // for a target build that reached `ready` in under 3 seconds, on a
+                                              // reachable node, every single time. This is not a mesh-health symptom;
+                                              // it silently broke remote-build status mirroring for every
+                                              // fanout-placed deployment on the whole fleet, always burning the full
+                                              // 10-minute deadline regardless of how fast the actual remote build was.
+                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
+                                              // every other mesh-internal proxied read (`fetch_from_host` and
+                                              // friends) — the coordinator knows the real owning team from its own
+                                              // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -3210,7 +3516,7 @@ async fn mirror_remote_build(
             cloud
                 .builds
                 .log(bid, format!("{node}: mirror stopped (build cancelled)"));
-            return false;
+            return TargetOutcome::Cancelled;
         }
         // Poll the target's build over HTTP admin when one is advertised, and
         // FALL BACK to iroh IN THE SAME ITERATION when HTTP yields nothing.
@@ -3290,7 +3596,10 @@ async fn mirror_remote_build(
             }
             if now_ms() > deadline {
                 cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
-                return false;
+                // NOT a build failure: this node never told us its app failed —
+                // we simply could not read it. Treated as unreachable so it
+                // degrades capacity instead of vetoing healthy regions.
+                return TargetOutcome::DispatchFailed;
             }
             continue;
         };
@@ -3306,18 +3615,29 @@ async fn mirror_remote_build(
         }
         let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
         if state.eq_ignore_ascii_case("ready") {
-            if let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) {
-                let dep = dep.to_string();
-                let alias = v.get("alias").and_then(|x| x.as_str()).map(String::from);
-                cloud.builds.update(bid, |b| {
-                    b.deployment_id = Some(dep.clone());
-                    if let Some(a) = &alias {
-                        b.alias = Some(a.clone());
-                    }
-                });
-            }
+            // A Ready state with NO deployment id is not a replica: it is the
+            // stateful `fanout_secondary` guard declining to host (it stamps its
+            // own build Ready on the way out). Counting it as Ready would let a
+            // deploy promote with nothing serving it, so the deployment id — the
+            // proof that something is actually registered and routable on that
+            // node — is what distinguishes the two.
+            let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) else {
+                cloud.builds.log(
+                    bid,
+                    format!("• {node}: declined to host (stateful service, not replicated here)"),
+                );
+                return TargetOutcome::Declined;
+            };
+            let dep = dep.to_string();
+            let alias = v.get("alias").and_then(|x| x.as_str()).map(String::from);
+            cloud.builds.update(bid, |b| {
+                b.deployment_id = Some(dep.clone());
+                if let Some(a) = &alias {
+                    b.alias = Some(a.clone());
+                }
+            });
             cloud.builds.log(bid, format!("✓ {node}: deployment ready"));
-            return true;
+            return TargetOutcome::Ready;
         }
         if state.eq_ignore_ascii_case("error") {
             // Link the FAILED remote build to its deployment too (the remote
@@ -3333,13 +3653,15 @@ async fn mirror_remote_build(
                 });
             }
             cloud.builds.log(bid, format!("✗ {node}: build failed"));
-            return false;
+            return TargetOutcome::BuildFailed;
         }
         if now_ms() > deadline {
             cloud
                 .builds
                 .log(bid, format!("✗ {node}: remote build timed out"));
-            return false;
+            // Distinct from "lost contact": we COULD read this node's state, so
+            // the deploy really did run there and never reached Ready.
+            return TargetOutcome::BuildFailed;
         }
     }
 }
@@ -3347,6 +3669,30 @@ async fn mirror_remote_build(
 /// After placing a project on its target node(s), tell every OTHER node that
 /// still hosts it to delete it — so changing regions RELOCATES the deployment
 /// rather than leaving stale copies. Best-effort; never fails the deploy.
+/// Resolve a request's environment WITHOUT running the build: Some(true/false)
+/// when this node can classify it (explicit target, or branch vs a locally
+/// KNOWN production_branch), None when it genuinely cannot. Callers that gate
+/// destructive production-lane actions treat None as "not production".
+fn request_is_production(
+    cloud: &Arc<CloudState>,
+    req: &fluid_core::GitDeployRequest,
+    project: &str,
+) -> Option<bool> {
+    match req.target.as_deref().map(str::trim) {
+        Some("production") => Some(true),
+        Some("preview") => Some(false),
+        _ => {
+            let pb = cloud.projects.production_branch_of(project);
+            let branch = req.branch.as_deref().unwrap_or("").trim();
+            if !pb.is_empty() && !branch.is_empty() {
+                Some(branch == pb)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_names: &[String]) {
     // SELF cleanup first: peer_routes only ever lists PEERS, so a stale copy on
     // THIS (coordinator) node would otherwise survive a relocation — wasting disk,
@@ -3361,11 +3707,14 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             sub == project || sub.starts_with(&format!("{project}-"))
         });
         if hosts_locally {
-            let removed = cloud.gw.remove_project(project).await;
+            // Superseded PRODUCTION records only — a preview hosted here is not
+            // a stale copy of the production placement; reaping it is what made
+            // preview URLs 404 after every production push.
+            let removed = cloud.gw.remove_project_superseded(project).await;
             tracing::info!(
                 project,
                 removed = removed.len(),
-                "relocation: removed stale local copy from coordinator"
+                "relocation: removed stale local production copy from coordinator"
             );
             crate::persist::persist(cloud);
         }
@@ -3391,11 +3740,19 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
     // the build was stamped Ready, i.e. it showed up to the user as minutes of
     // "Building" on a deployment that was already serving. The receiving arm
     // is idempotent and order-independent, so fanning out is safe.
+    // SCOPED reap, never the full project delete: the receiving arm removes
+    // only superseded production-lane records — previews survive, and so do
+    // the peer's node-local ProjectSettings (team tag, production_branch,
+    // env). Reusing the full-teardown primitive here is what made projects
+    // vanish from accounts (the team tag is how listings find them) and made
+    // preview records disappear after every production push. A pre-upgrade
+    // peer answers NO_HANDLER and keeps its stale copies until it upgrades —
+    // retention, not correctness.
     futures::future::join_all(
         peers
             .iter()
             .filter(|node| !target_names.iter().any(|t| t == *node))
-            .map(|node| crate::admin::dispatch_project_delete(cloud, node, project, &team)),
+            .map(|node| crate::admin::dispatch_deployments_reap(cloud, node, project, &team)),
     )
     .await;
 }
@@ -3796,7 +4153,10 @@ async fn build_via_fdi(
                  to count; a Git-LFS pointer or truncated download does not)"
             );
         };
-        log(format!("Provisioning Wasmer server: `{}`.", start.join(" ")));
+        log(format!(
+            "Provisioning Wasmer server: `{}`.",
+            start.join(" ")
+        ));
         return Ok(function_manifest(project, start, runtime_override));
     }
 
@@ -4376,7 +4736,11 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
 /// a 4-byte read of a file already on local disk.
 async fn is_wasm_module(p: &Path) -> bool {
     use tokio::io::AsyncReadExt;
-    if !tokio::fs::metadata(p).await.map(|m| m.is_file()).unwrap_or(false) {
+    if !tokio::fs::metadata(p)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return false;
     }
     let Ok(mut f) = tokio::fs::File::open(p).await else {
@@ -5313,7 +5677,8 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
         async move { (peer, cloud.http.get(&url).timeout(per_peer).send().await) }
     });
-    let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts)).await
+    let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts))
+        .await
     {
         Ok(r) => r,
         Err(_) => {
@@ -6135,7 +6500,38 @@ async fn build_compose_manifest(
     };
     let subnet = format!("10.{o2}.{o3}.0/24");
     let gw = format!("10.{o2}.{o3}.1");
-    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + i);
+    // Per-GENERATION block INSIDE that project /24. The host part used to be keyed on
+    // the project alone (`11 + i`), so every redeploy re-requested the exact addresses
+    // the still-running PREVIOUS generation held — old instances linger for
+    // `idle_ttl_secs` after the new deployment goes Ready, by design. podman refused
+    // the run ("requested ip address X is already allocated to container Y") and the
+    // IPAM self-heal in `hive-backend` then force-removed what it took for a leaked
+    // ghost but which was in fact the LIVE serving container — or escalated to
+    // removing the whole project network and every sibling on it, managed database
+    // containers included. That is the redeploy breakage: the new generation could not
+    // start, and the old one was destroyed trying.
+    //
+    // A block per BUILD lets the two generations coexist for the overlap window, which
+    // is exactly what a rolling redeploy needs. Blocks are sized to the service count
+    // so the whole /24 stays usable, and the offset is a stable FNV-1a over the build
+    // id — never `DefaultHasher`, whose output is not stable across rustc versions,
+    // and these addresses are written into a manifest that outlives this process.
+    let n_svc = services.len().max(1);
+    anyhow::ensure!(
+        n_svc <= 243,
+        "compose file declares {n_svc} services — more than the {} that fit one project /24",
+        243
+    );
+    let blocks = (243 / n_svc).max(1);
+    let gen_off = {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bid.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h % blocks as u64) as usize * n_svc
+    };
+    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + gen_off + i);
     let hosts: Vec<String> = services
         .iter()
         .enumerate()
@@ -6297,7 +6693,15 @@ async fn build_compose_manifest(
             memory_mib: 512,
             max_concurrency: 20,
             min_instances: 1, // keep every service warm so internal deps actually run
-            max_instances: 3,
+            // ONE instance per compose service, structurally: every instance of a
+            // service shares the single static `--ip` in its start_cmd, so a second
+            // instance always collides with the first — before the live-holder
+            // guard existed, the "self-heal" then force-removed instance #1 (the
+            // service thrashed itself under scale-out); with the guard it is an
+            // honest failed start. Neither is scaling. Compose semantics are one
+            // container per service on a shared network — concurrency scales via
+            // max_concurrency, not replicas.
+            max_instances: 1,
             idle_ttl_secs: 300,
             max_duration_secs: 300,
             protocol: resolved_protocol,
@@ -6317,15 +6721,72 @@ async fn build_compose_manifest(
             // stayed permanently unallocated — the primary service's own log line
             // a few lines down ("reachable through its allocated raw public port
             // instead") was a promise the code never kept.
-            ports: if svc.expose.enabled {
-                vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
-            } else if is_primary && resolved_protocol.needs_raw_proxy() {
-                vec![PortSpec::single(svc.port, resolved_protocol)]
-            } else {
-                Vec::new()
+            ports: {
+                // The primary allocation, exactly as before.
+                let mut specs = if svc.expose.enabled {
+                    vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
+                } else if is_primary && resolved_protocol.needs_raw_proxy() {
+                    vec![PortSpec::single(svc.port, resolved_protocol)]
+                } else {
+                    Vec::new()
+                };
+                // …plus every OTHER port the service declared. Only the first was
+                // ever read, so a service publishing several ports had the rest
+                // discarded in silence — MinIO's `["9000:9000", "9001:9001"]` lost
+                // its web console with nothing in the build output to say so.
+                //
+                // A `HOST:CONTAINER` entry is docker-compose's own PUBLISH request
+                // and is honored as one: the spec carries the declared host port as
+                // `preferred_public_port`, which makes it eligible for a public raw
+                // allocation even when its protocol is Http (served as plain-TCP
+                // passthrough — the same thing `docker compose up` publishes; TLS
+                // stays the shared 443 gateway's job). The allocator prefers the
+                // literal number and the build log names the outcome either way.
+                // A bare `PORT` entry keeps today's behavior: documented on the
+                // manifest, reachable from siblings, no public ingress.
+                for cp in svc.all_ports.iter().copied() {
+                    if let Some(existing) =
+                        specs.iter_mut().find(|s| s.container_port == cp.container)
+                    {
+                        // The primary/expose spec above already covers this
+                        // container port — carry the publish request onto it.
+                        if existing.preferred_public_port.is_none() {
+                            existing.preferred_public_port = cp.host;
+                        }
+                        continue;
+                    }
+                    let mut spec = PortSpec::single(cp.container, cp.protocol);
+                    spec.preferred_public_port = cp.host;
+                    specs.push(spec);
+                }
+                specs
             },
             ..Default::default()
         });
+        if svc.all_ports.len() > 1 || svc.all_ports.iter().any(|p| p.host.is_some()) {
+            // Say out loud what is and is not publicly reachable. Dropping these
+            // silently is what made the MinIO console present as "the port just
+            // closes the connection", with no way to tell from the build output
+            // that the platform had never been told about that port at all.
+            let described: Vec<String> = svc
+                .all_ports
+                .iter()
+                .map(|p| match p.host {
+                    Some(h) => format!("{}/{} published on :{h}", p.container, p.protocol),
+                    None => format!("{}/{} internal-only", p.container, p.protocol),
+                })
+                .collect();
+            log(format!(
+                "Service '{}' ports: {}. Published entries get a public raw-TCP allocation \
+                 preferring the declared host port (exact outcome logged at allocation); \
+                 internal-only entries stay reachable from sibling services on the shared \
+                 network. '/' still routes over HTTPS to {}/{}.",
+                svc.name,
+                described.join(", "),
+                svc.port,
+                resolved_protocol,
+            ));
+        }
         if is_primary && !resolved_protocol.needs_raw_proxy() {
             routes.push(Route {
                 pattern: "/".into(),
@@ -6918,13 +7379,14 @@ fn git_poll_concurrency() -> usize {
 /// count regardless of how many git-sourced projects the platform has.
 async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
-    let outcomes: Vec<GitPollOutcome> = futures::stream::iter(projects.into_iter().map(|project| {
-        let cloud = Arc::clone(cloud);
-        async move { git_poll_one(&cloud, project).await }
-    }))
-    .buffer_unordered(git_poll_concurrency())
-    .collect()
-    .await;
+    let outcomes: Vec<GitPollOutcome> =
+        futures::stream::iter(projects.into_iter().map(|project| {
+            let cloud = Arc::clone(cloud);
+            async move { git_poll_one(&cloud, project).await }
+        }))
+        .buffer_unordered(git_poll_concurrency())
+        .collect()
+        .await;
 
     let mut n_git = 0u32; // git-sourced projects actually polled this cycle
     let mut n_deployed = 0u32; // projects whose HEAD advanced -> build started

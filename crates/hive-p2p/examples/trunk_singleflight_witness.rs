@@ -19,7 +19,11 @@
 use std::sync::Arc;
 
 fn check(name: &str, ok: bool) -> bool {
-    println!("{}: {}", if ok { "WITNESS_OK" } else { "WITNESS_FAIL" }, name);
+    println!(
+        "{}: {}",
+        if ok { "WITNESS_OK" } else { "WITNESS_FAIL" },
+        name
+    );
     ok
 }
 
@@ -54,10 +58,7 @@ async fn main() {
         "concurrent_first_contacts_share_one_dial",
         opened_after - opened_before == 1,
     );
-    all &= check(
-        "pool_converged_to_one_trunk",
-        pool.trunk_count().await == 1,
-    );
+    all &= check("pool_converged_to_one_trunk", pool.trunk_count().await == 1);
 
     // 2. close_peer bumps the generation: the next warm redials (opened +1).
     pool.close_peer(&id).await;

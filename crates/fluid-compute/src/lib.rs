@@ -45,6 +45,8 @@ struct Instance {
     /// `endpoint`, so they go straight at `127.0.0.1:<host_port>`. Empty for
     /// non-container functions and containers with no declared UDP specs.
     udp_ports: Vec<hive_core::UdpPublish>,
+    /// TCP twin of `udp_ports` (includes the primary; see `TcpPublish`).
+    tcp_ports: Vec<hive_core::TcpPublish>,
     inflight: u32,
     started_at_ms: u64,
     last_active_ms: u64,
@@ -1105,6 +1107,67 @@ impl Fluid {
             } else {
                 Vec::new()
             };
+            // TCP twin of the UDP block above: every raw/published TCP-transport
+            // spec gets its own loopback host port so the raw proxy's resolver
+            // can splice DIRECTLY into that container port (`Lease::
+            // tcp_host_port`). The primary spec rides with host = the launch's
+            // assigned `port` — that mapping already exists, recording it here
+            // just makes it resolvable per container port. Extra specs probe a
+            // fresh host port each; a failed probe skips that spec LOUDLY, same
+            // policy as UDP.
+            let tcp_ports: Vec<hive_core::TcpPublish> = if pool
+                .cfg
+                .start_cmd
+                .first()
+                .map(String::as_str)
+                == Some("__container__")
+            {
+                let primary: Option<u16> = pool.cfg.start_cmd.get(2).and_then(|s| s.parse().ok());
+                let mut seen = std::collections::BTreeSet::new();
+                pool.cfg
+                    .ports
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.protocol,
+                            fluid_core::ServiceProtocol::Tcp | fluid_core::ServiceProtocol::Grpc
+                        ) || (s.protocol == fluid_core::ServiceProtocol::Http
+                            && s.preferred_public_port.is_some())
+                    })
+                    .filter(|s| seen.insert(s.container_port))
+                    .filter_map(|s| {
+                        if Some(s.container_port) == primary {
+                            return Some(hive_core::TcpPublish {
+                                container_port: s.container_port,
+                                host_port: port,
+                            });
+                        }
+                        match free_port() {
+                            // A fresh probe returning EXACTLY the launch's own
+                            // primary host port would collide with the primary
+                            // `-p` pairing (the emitters dedupe on host ==
+                            // launch.port, so the extra spec would be
+                            // advertised in tcp_ports yet published nowhere —
+                            // its traffic spliced into the PRIMARY container
+                            // port). Skip it; the next cold start re-probes.
+                            Ok(hp) if hp == port => {
+                                warn!(func = %key, container_port = s.container_port, "loopback TCP probe returned the primary host port; skipping this publish for this instance");
+                                None
+                            }
+                            Ok(hp) => Some(hive_core::TcpPublish {
+                                container_port: s.container_port,
+                                host_port: hp,
+                            }),
+                            Err(e) => {
+                                warn!(func = %key, container_port = s.container_port, error = %e, "no free loopback TCP host port; skipping this TCP publish");
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let launch = FunctionLaunch {
                 start_cmd: pool.cfg.start_cmd.clone(),
                 env: pool.cfg.env.clone(),
@@ -1126,6 +1189,7 @@ impl Fluid {
                 // Minecraft wire bytes by HTTP-parsing them).
                 raw_proxy: pool.cfg.needs_raw_proxy(),
                 udp_ports,
+                tcp_ports,
                 // Serverless GPU: the backend's podman path passes the host
                 // GPUs through (CDI) when set.
                 gpu: pool.cfg.gpu,
@@ -1167,6 +1231,19 @@ impl Fluid {
                                 host_port: u.host_port,
                                 protocol: hive_backend::ContainerProtocol::Udp,
                             }
+                        }));
+                        // Extra raw/published TCP specs likewise — minus the
+                        // primary, whose pairing is ports[0] already (a duplicate
+                        // `-p` for the same pair would fail the podman run).
+                        ports.extend(launch.tcp_ports.iter().filter_map(|t| {
+                            if t.host_port == launch.port {
+                                return None;
+                            }
+                            Some(hive_backend::ContainerPort {
+                                container_port: t.container_port,
+                                host_port: t.host_port,
+                                protocol: hive_backend::ContainerProtocol::Tcp,
+                            })
                         }));
                         ports
                     },
@@ -1219,6 +1296,7 @@ impl Fluid {
                     handle: handle.clone(),
                     endpoint: endpoint.clone(),
                     udp_ports: launch.udp_ports.clone(),
+                    tcp_ports: launch.tcp_ports.clone(),
                     inflight: 1, // this lease
                     started_at_ms: now_ms(),
                     last_active_ms: now_ms(),
@@ -1522,10 +1600,9 @@ impl Fluid {
         // with the pools themselves joined is enough — no semaphore needed.
         let sampled_pools = futures::future::join_all(targets.into_iter().map(
             |(key, handles, current, max)| async move {
-                let samples = futures::future::join_all(
-                    handles.iter().map(|h| self.backend.cpu_percent(h)),
-                )
-                .await;
+                let samples =
+                    futures::future::join_all(handles.iter().map(|h| self.backend.cpu_percent(h)))
+                        .await;
                 (key, samples, current, max)
             },
         ))
@@ -1620,6 +1697,22 @@ impl Lease {
             .iter()
             .find(|u| u.container_port == container_port)
             .map(|u| u.host_port)
+    }
+
+    /// The loopback host port THIS lease's instance publishes `container_port`
+    /// over TCP on — the direct local splice leg for raw/published TCP ports
+    /// (extra Tcp/Grpc specs, compose-published Http ports, and the primary).
+    /// Same contract as [`Lease::udp_host_port`].
+    pub fn tcp_host_port(&self, container_port: u16) -> Option<u16> {
+        let reg = self.fluid.registry.lock();
+        reg.get(&self.key)?
+            .instances
+            .iter()
+            .find(|i| i.cell_id == self.cell_id)?
+            .tcp_ports
+            .iter()
+            .find(|t| t.container_port == container_port)
+            .map(|t| t.host_port)
     }
 }
 
@@ -1794,6 +1887,7 @@ mod tests {
             },
             endpoint: CellEndpoint::Tcp("127.0.0.1:1".into()),
             udp_ports: Vec::new(),
+            tcp_ports: Vec::new(),
             inflight: 0,
             started_at_ms: now_ms(),
             last_active_ms: now_ms(),
@@ -1944,6 +2038,7 @@ mod tests {
             },
             endpoint: CellEndpoint::Tcp("127.0.0.1:1".into()),
             udp_ports: Vec::new(),
+            tcp_ports: Vec::new(),
             inflight,
             started_at_ms: now_ms(),
             last_active_ms: now_ms(),

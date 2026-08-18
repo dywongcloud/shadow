@@ -228,6 +228,20 @@ pub struct PortSpec {
     /// before the allocator existed (re-allocated on their next deploy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+    /// The compose-declared HOST port this spec asks to be published on
+    /// (`ports: ["9000:9000"]` → 9000). This is a PUBLISH REQUEST with two
+    /// effects, both matching docker-compose's own publish semantics: its
+    /// presence alone makes the spec eligible for a public raw allocation even
+    /// when `protocol` is Http (served as plain-TCP passthrough — exactly what
+    /// `docker compose up` does with a published HTTP port; no TLS on raw
+    /// ports, the shared 443 gateway remains the TLS surface), and the
+    /// allocator PREFERS this exact number, falling back to its normal range
+    /// with a loud build log when the number is taken fleet-wide or reserved —
+    /// never a silent substitution. `public_port` above remains the GRANT.
+    /// Absent for every record written before this field existed and for all
+    /// non-compose paths — those keep today's behavior byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_public_port: Option<u16>,
 }
 
 impl PortSpec {
@@ -242,6 +256,7 @@ impl PortSpec {
             protocol,
             label: None,
             public_port: None,
+            preferred_public_port: None,
         }
     }
 
@@ -817,7 +832,10 @@ pub fn browser_policy_digest(
         BROWSER_POLICY_DIGEST_DOMAIN.len()
             + 32
             + 4
-            + abis.iter().map(|(_, abi)| 8 + 1 + 4 + abi.len()).sum::<usize>()
+            + abis
+                .iter()
+                .map(|(_, abi)| 8 + 1 + 4 + abi.len())
+                .sum::<usize>()
             + 1
             + 8 * 3,
     );
@@ -1745,7 +1763,8 @@ impl Manifest {
                     // text — else a catch-all `/*` (2 chars) would outrank the
                     // `/api` (4 chars) it is meant to be the fallback for the
                     // moment wildcards became matchable.
-                    Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {}
+                    Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {
+                    }
                     _ => best = Some(r),
                 }
             }
@@ -2619,18 +2638,21 @@ mod routing_tests {
                 protocol: ServiceProtocol::Tcp,
                 label: Some("game".into()),
                 public_port: None,
+                preferred_public_port: None,
             },
             PortSpec {
                 container_port: 25575,
                 protocol: ServiceProtocol::Tcp,
                 label: Some("rcon".into()),
                 public_port: None,
+                preferred_public_port: None,
             },
             PortSpec {
                 container_port: 25565,
                 protocol: ServiceProtocol::Udp,
                 label: Some("query".into()),
                 public_port: None,
+                preferred_public_port: None,
             },
         ];
         let j2 = serde_json::to_string(&f).unwrap();

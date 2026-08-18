@@ -504,7 +504,11 @@ impl LiteboxBackend {
                 "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {} 2>/dev/null",
                 net.tun_dev
             );
-            let _ = Command::new("/bin/sh").arg("-c").arg(&script).status().await;
+            let _ = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .await;
         }
     }
 
@@ -536,11 +540,8 @@ impl LiteboxBackend {
     /// combined tar doesn't exist yet.
     fn combined_tar_path(&self, image: &str, bin: &Path) -> PathBuf {
         let bin_key = bin.to_string_lossy().replace('/', "_");
-        self.images_dir().join(format!(
-            "{}.{}.tar",
-            crate::sanitize_image(image),
-            bin_key
-        ))
+        self.images_dir()
+            .join(format!("{}.{}.tar", crate::sanitize_image(image), bin_key))
     }
 
     async fn ensure_combined_tar(&self, image: &str, bin: &Path) -> anyhow::Result<PathBuf> {
@@ -579,7 +580,11 @@ impl LiteboxBackend {
         let deps = ldd_closure(bin).await?;
         let tmp = combined.with_extension("tar.tmp");
         tokio::fs::copy(&app_tar, &tmp).await.map_err(|e| {
-            anyhow::anyhow!("failed to copy {} -> {}: {e}", app_tar.display(), tmp.display())
+            anyhow::anyhow!(
+                "failed to copy {} -> {}: {e}",
+                app_tar.display(),
+                tmp.display()
+            )
         })?;
         if !deps.is_empty() {
             let mut cmd = Command::new("tar");
@@ -592,10 +597,7 @@ impl LiteboxBackend {
             // "cannot open shared object file" on exactly that library.
             // Storing the real bytes under the SONAME name sidesteps the
             // guest ever needing to resolve a symlink target at all.
-            cmd.arg("-h")
-                .arg("--absolute-names")
-                .arg("-rf")
-                .arg(&tmp);
+            cmd.arg("-h").arg("--absolute-names").arg("-rf").arg(&tmp);
             for d in &deps {
                 cmd.arg(d);
             }
@@ -762,8 +764,9 @@ impl LiteboxBackend {
         // preloaded (harmless no-op for this wildcard case, but proves the
         // shim mechanism itself didn't break — see `LiteboxBackend`'s
         // module doc, "Networking").
-        let script =
-            format!("require('http').createServer((q,r)=>{{r.end('{marker}')}}).listen({PROBE_PORT});");
+        let script = format!(
+            "require('http').createServer((q,r)=>{{r.end('{marker}')}}).listen({PROBE_PORT});"
+        );
 
         let mut cmd = Command::new(&self.cfg.runner_bin);
         reset_signal_dispositions_before_exec(&mut cmd);
@@ -1084,6 +1087,22 @@ impl CellBackend for LiteboxBackend {
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
+            // Extra raw/published TCP publishes (`FunctionLaunch::tcp_ports` —
+            // includes the primary, whose pairing is already ports[0]; a
+            // duplicate `-p` for the same pair fails the run). Without these
+            // the raw proxy's per-port loopback leg (`Lease::tcp_host_port`)
+            // dials a port nothing publishes — connection refused on every
+            // node running THIS backend while the mock path worked.
+            ports.extend(func.tcp_ports.iter().filter_map(|t| {
+                if t.host_port == func.port {
+                    return None;
+                }
+                Some(crate::ContainerPort {
+                    container_port: t.container_port,
+                    host_port: t.host_port,
+                    protocol: crate::ContainerProtocol::Tcp,
+                })
+            }));
             let (name, endpoint, task) = crate::podman_run_container(
                 &cell.id,
                 &image,
@@ -1152,7 +1171,10 @@ impl CellBackend for LiteboxBackend {
         // address still needs rewriting to this cell's real guest IP — TUN
         // can never bridge host<->guest loopback. Python is not covered
         // yet — see `crate::litebox`'s tracking note.
-        let is_node = matches!(func.runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun);
+        let is_node = matches!(
+            func.runtime,
+            hive_core::Runtime::Node | hive_core::Runtime::Bun
+        );
 
         let mut cmd = Command::new(&self.cfg.runner_bin);
         reset_signal_dispositions_before_exec(&mut cmd);

@@ -42,7 +42,13 @@ const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 // override only.
 const DEFAULT_PROJECT = process.env.HIVE_WF_PROJECT || "";
 const DEFAULT_TEAM = process.env.HIVE_WF_TEAM || "personal";
-const TIMEOUT_MS = 20_000;
+// Server-side budget for one hive call. Must exceed the backend's own summed
+// phase budgets for /v1/workflows/runs (wf_runs_collect: 8s world reads + 8s
+// peer fan-out) or a healthy-but-full aggregation gets aborted mid-flight —
+// which is exactly the "Error creating response: This operation was aborted"
+// the runs tab showed. Tunable for operators; the retry below covers the
+// first-poll case where the backend is warming its caches.
+const TIMEOUT_MS = Number(process.env.HIVE_WF_TIMEOUT_MS || 25_000);
 
 // ---------------------------------------------------------------------------
 // Request context (shared with app/wf-console/[[...slug]]/route.ts)
@@ -79,6 +85,23 @@ function projectBody() {
 // ---------------------------------------------------------------------------
 
 async function hive(path, init) {
+  // One retry for aborted/timed-out READS: the backend computes the runs
+  // aggregation on a detached, coalesced task and serves later polls from
+  // cache, so the retry is cheap and typically hits the cache the first
+  // attempt just populated. Writes are never retried (not idempotent here).
+  const method = (init && init.method) || "GET";
+  try {
+    return await hiveOnce(path, init);
+  } catch (e) {
+    const aborted = e && (e.name === "AbortError" || /aborted/i.test(String(e.message || "")));
+    if (method === "GET" && aborted) {
+      return await hiveOnce(path, init);
+    }
+    throw e;
+  }
+}
+
+async function hiveOnce(path, init) {
   const c = ctx();
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);

@@ -21,6 +21,28 @@ export interface PendingBuild {
   env: "production" | "preview";
   /** Epoch ms this build was started (for "just now" + stale-prune). */
   at: number;
+  /**
+   * Epoch ms the build reached a terminal READY state, if it has. The row is
+   * deliberately kept for a grace window afterwards: the real deployment record
+   * is created on the node that ran the build, and the dashboard reads
+   * `/deployments` through round-robin DNS, so for a beat after the build
+   * finishes NEITHER the pending row nor the real row exists on the node being
+   * polled. Removing on `ready` is what made the row blink out near the end of a
+   * deploy and reappear moments later.
+   */
+  settledAt?: number;
+  /**
+   * The REAL deployment record's id, stamped from the build's own
+   * `deployment_id` when it reaches ready. This is the merge key: the row is
+   * dropped exactly when a deployment with this id is visible in the list being
+   * rendered. Ids are minted server-side, so the comparison is clock-free —
+   * the first cut compared the browser's `Date.now()` against the server's
+   * `created_at_ms`, and a browser running behind dropped the row instantly
+   * (the original vanishing bug, reintroduced), while one running ahead
+   * rendered duplicates; any project+time heuristic also mis-supersedes one of
+   * two CONCURRENT redeploys of the same project.
+   */
+  deploymentId?: string;
 }
 
 const KEY = "hive_pending_builds";
@@ -54,6 +76,41 @@ export function addPendingBuild(b: Omit<PendingBuild, "at">): void {
   write(list);
 }
 
+/**
+ * Mark a build as finished-and-ready without removing its row yet. The row keeps
+ * rendering (as "Finalizing") until either the real deployment record shows up in
+ * the list being rendered, or `SETTLED_GRACE_MS` elapses.
+ */
+export function markPendingSettled(id: string, deploymentId?: string | null): void {
+  const list = read();
+  let changed = false;
+  const next = list.map((x) => {
+    if (x.id !== id || x.settledAt) return x;
+    changed = true;
+    return { ...x, settledAt: Date.now(), ...(deploymentId ? { deploymentId } : {}) };
+  });
+  if (changed) write(next);
+}
+
+/**
+ * Re-home rows recorded under an unresolved tenant placeholder to the tenant the
+ * session has since resolved to. A row stored as `__pending__` (identity sync
+ * still in flight at deploy time) matches EVERY viewer's filter; once the real
+ * tenant is known, pin the row to it.
+ */
+export function rehomePendingTeam(): void {
+  const t = currentTeam();
+  if (!t || t === "__pending__") return;
+  const list = read();
+  let changed = false;
+  const next = list.map((x) => {
+    if (x.team && x.team !== "__pending__") return x;
+    changed = true;
+    return { ...x, team: t };
+  });
+  if (changed) write(next);
+}
+
 /** Drop a pending build (build finished, or being pruned). */
 export function removePendingBuild(id: string): void {
   const list = read();
@@ -62,26 +119,114 @@ export function removePendingBuild(id: string): void {
 }
 
 /**
+ * Is this tenant value actually KNOWN? `currentTeam()` returns the `__pending__`
+ * placeholder (and, before hydration, an empty string) while identity sync is still
+ * resolving `hive_uid` / `hive_is_owner` — see `lib/api.ts`. An unresolved value
+ * means "not known yet", never "does not match", and treating the two the same is
+ * what made a deploying user's own row vanish mid-build on any reload: the row was
+ * stored under the resolved tenant at click time, then compared against
+ * `__pending__` on the next page load and filtered straight out.
+ */
+function teamKnown(t: string): boolean {
+  return !!t && t !== "__pending__";
+}
+
+/** How long a finished (ready) row keeps rendering while the real record propagates. */
+export const SETTLED_GRACE_MS = 90_000;
+
+/**
  * React hook: the current team's pending builds (optionally scoped to one project),
  * live-updated on same-tab changes, cross-tab `storage` events, and team switches.
+ *
+ * Never hides a row merely because the current tenant is still resolving — an
+ * in-flight build the user started must stay visible for its whole lifecycle.
  */
 export function usePendingBuilds(opts?: { project?: string }): PendingBuild[] {
   const [list, setList] = useState<PendingBuild[]>([]);
   const [team, setTeam] = useState<string>("");
   useEffect(() => {
+    // Change detection on the RAW serialized store + the team string: `read()`
+    // allocates a fresh array every call and React's useState bailout is
+    // `Object.is`-based, so unconditional setState here re-rendered the whole
+    // deployments table every tick even when nothing changed.
+    let lastRaw: string | null = null;
+    let lastTeam: string | null = null;
     const sync = () => {
-      setList(read());
-      setTeam(currentTeam());
+      const raw = typeof window === "undefined" ? "[]" : localStorage.getItem(KEY) || "[]";
+      if (raw !== lastRaw) {
+        lastRaw = raw;
+        setList(read());
+      }
+      const t = currentTeam();
+      if (t !== lastTeam) {
+        lastTeam = t;
+        setTeam(t);
+      }
     };
     sync();
     window.addEventListener(EVT, sync);
     window.addEventListener("storage", sync);
     window.addEventListener("hive-team-changed", sync);
+    // `hive_uid` / `hive_is_owner` are written by the topnav's identity effects, which
+    // only re-broadcast `hive-team-changed` when the resolved value CHANGES — so the
+    // very first resolution of a fresh session lands with no event at all and this
+    // hook would keep comparing against a stale `__pending__`. A cheap poll closes
+    // that window without coupling this store to the identity plumbing. Paused while
+    // the tab is hidden (the same background-tab discipline `usePoll` and the
+    // provider already keep), with a catch-up sync the moment it is visible again.
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const active = () => typeof document === "undefined" || !document.hidden;
+    const start = () => {
+      if (!timer && active()) timer = setInterval(sync, 2000);
+    };
+    const onVisibility = () => {
+      if (active()) {
+        sync();
+        start();
+      } else if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    start();
+    if (typeof document !== "undefined")
+      document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      if (timer) clearInterval(timer);
+      if (typeof document !== "undefined")
+        document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener(EVT, sync);
       window.removeEventListener("storage", sync);
       window.removeEventListener("hive-team-changed", sync);
     };
   }, []);
-  return list.filter((b) => b.team === team && (!opts?.project || b.project === opts.project));
+  const now = Date.now();
+  return list.filter(
+    (b) =>
+      // Tenant filter applies only when BOTH sides are known.
+      (!teamKnown(team) || !teamKnown(b.team) || b.team === team) &&
+      (!opts?.project || b.project === opts.project) &&
+      // A settled row lingers only for the propagation window.
+      (!b.settledAt || now - b.settledAt < SETTLED_GRACE_MS),
+  );
+}
+
+/**
+ * MERGE, never replace: drop the pending rows whose REAL deployment record is
+ * already visible in the list being rendered, so the handover neither duplicates
+ * the row nor blinks it out. Keyed on the deployment id the build itself
+ * reported (see `PendingBuild.deploymentId`) — never on project+time, which
+ * breaks under browser/server clock skew in both directions and mis-supersedes
+ * concurrent redeploys of one project. A row that has not settled yet has no id
+ * and is never superseded (no record for it can exist); a settled row whose
+ * record never becomes visible here expires via `SETTLED_GRACE_MS`.
+ */
+export function mergePending<T extends { id: string }>(
+  pending: PendingBuild[],
+  deployments: T[] | null | undefined,
+): PendingBuild[] {
+  if (!deployments?.length) return pending;
+  return pending.filter(
+    (b) => !b.deploymentId || !deployments.some((d) => d.id === b.deploymentId),
+  );
 }

@@ -21,9 +21,9 @@ pub mod state;
 pub mod time;
 
 pub use error::{fault, HiveError, Result};
-pub use logcap::{CappedLine, LOG_CAP_STATS, MAX_LOG_LINE_BYTES};
 pub use ids::{BoxId, CellId, HiveId, JobId};
 pub use job::{BuildJob, ResourceSpec};
+pub use logcap::{CappedLine, LOG_CAP_STATS, MAX_LOG_LINE_BYTES};
 pub use proto::*;
 pub use state::{CellState, JobState};
 pub use time::now_ms;

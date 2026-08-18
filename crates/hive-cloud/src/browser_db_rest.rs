@@ -215,21 +215,32 @@ async fn rest_token_mint(
             created_ms: hive_core::now_ms(),
         }),
     );
+    let (libsql_url, sql_url) = rest_urls(&cloud, &project);
+    Ok(Json(json!({
+        "project": project,
+        "scope": if public { "public" } else { "team" },
+        "token": token,
+        "libsql_url": libsql_url,
+        "sql_url": sql_url,
+    })))
+}
+
+/// The two public URLs of a project's REST/Hrana surface, derived from the
+/// same `api_base()` everywhere they are published (mint response, status
+/// endpoint) — one construction, never two format strings to keep in sync.
+/// The libsql base's TRAILING SLASH is load-bearing: libsql clients resolve
+/// `v2/pipeline` RELATIVELY against it (the `hrana.rs` precedent).
+pub(crate) fn rest_urls(cloud: &Arc<CloudState>, project: &str) -> (String, String) {
     let base = cloud.api_base();
     let base_trimmed = base.trim_end_matches('/');
     let scheme_swapped = base_trimmed
         .strip_prefix("https://")
         .map(|rest| format!("libsql://{rest}"))
         .unwrap_or_else(|| base_trimmed.to_string());
-    Ok(Json(json!({
-        "project": project,
-        "scope": if public { "public" } else { "team" },
-        "token": token,
-        // TRAILING SLASH is load-bearing: libsql clients resolve `v2/pipeline`
-        // RELATIVELY against this base (the `hrana.rs` precedent).
-        "libsql_url": format!("{scheme_swapped}/v1/browser-db/{project}/"),
-        "sql_url": format!("{base_trimmed}/v1/browser-db/{project}/sql"),
-    })))
+    (
+        format!("{scheme_swapped}/v1/browser-db/{project}/"),
+        format!("{base_trimmed}/v1/browser-db/{project}/sql"),
+    )
 }
 
 /// Which scope (if any) `bearer` matches for `project`'s minted REST
@@ -304,7 +315,8 @@ where
         );
     };
     tokio::task::spawn_blocking(move || -> Result<T, String> {
-        let path = crate::browser_db::store_dir().join(crate::browser_db::replica_file_name(&project));
+        let path =
+            crate::browser_db::store_dir().join(crate::browser_db::replica_file_name(&project));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -327,7 +339,11 @@ where
         // request, including a plain SELECT, with "attempt to write a
         // readonly database" — caught live via the Public-scope read test.
         // A read-only session uses a plain (deferred) `BEGIN` instead.
-        let begin = if read_only { "BEGIN" } else { "BEGIN IMMEDIATE" };
+        let begin = if read_only {
+            "BEGIN"
+        } else {
+            "BEGIN IMMEDIATE"
+        };
         conn.execute_batch(begin).map_err(|e| e.to_string())?;
         // Measured AFTER the RESERVED lock is held, not before: SQLite
         // serializes writers on that lock (a concurrent `BEGIN IMMEDIATE`
@@ -371,10 +387,22 @@ where
     .map_err(|e| format!("worker join failed: {e}"))?
 }
 
-async fn pipeline(project: &str, resolved: &ResolvedBrowserDbPolicy, read_only: bool, version: u8, body: &[u8]) -> Response {
+async fn pipeline(
+    project: &str,
+    resolved: &ResolvedBrowserDbPolicy,
+    read_only: bool,
+    version: u8,
+    body: &[u8],
+) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}"), None),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+                None,
+            )
+        }
     };
     if parsed
         .get("baton")
@@ -395,13 +423,26 @@ async fn pipeline(project: &str, resolved: &ResolvedBrowserDbPolicy, read_only: 
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
-    let out = with_replica(project.to_string(), resolved.clone(), read_only, move |conn| {
-        let o = crate::hrana_proto::execute_pipeline(conn, requests, crate::hrana_proto::SqlCache::new(), version, read_only);
-        Ok(o.results)
-    })
+    let out = with_replica(
+        project.to_string(),
+        resolved.clone(),
+        read_only,
+        move |conn| {
+            let o = crate::hrana_proto::execute_pipeline(
+                conn,
+                requests,
+                crate::hrana_proto::SqlCache::new(),
+                version,
+                read_only,
+            );
+            Ok(o.results)
+        },
+    )
     .await;
     match out {
-        Ok(results) => ok_json(json!({ "baton": Value::Null, "base_url": Value::Null, "results": results })),
+        Ok(results) => {
+            ok_json(json!({ "baton": Value::Null, "base_url": Value::Null, "results": results }))
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e, Some("SQLITE_ERROR")),
     }
 }
@@ -413,7 +454,12 @@ struct SqlReq {
     params: Vec<Value>,
 }
 
-async fn sql(project: &str, resolved: &ResolvedBrowserDbPolicy, read_only: bool, body: &[u8]) -> Response {
+async fn sql(
+    project: &str,
+    resolved: &ResolvedBrowserDbPolicy,
+    read_only: bool,
+    body: &[u8],
+) -> Response {
     let req: SqlReq = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -424,9 +470,12 @@ async fn sql(project: &str, resolved: &ResolvedBrowserDbPolicy, read_only: bool,
             )
         }
     };
-    let out = with_replica(project.to_string(), resolved.clone(), read_only, move |conn| {
-        run_upstash_sql(conn, &req.query, &req.params)
-    })
+    let out = with_replica(
+        project.to_string(),
+        resolved.clone(),
+        read_only,
+        move |conn| run_upstash_sql(conn, &req.query, &req.params),
+    )
     .await;
     match out {
         Ok(v) => ok_json(v),
@@ -472,7 +521,11 @@ fn run_upstash_sql(
     // is per-CONNECTION and only DML updates it, so an unguarded read after a
     // write would claim it wrote a row (the `hrana.rs` doc's own warning).
     let is_readonly = stmt.readonly();
-    let col_names: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut rows_json = Vec::new();
     {
         let mut rows = stmt.raw_query();
@@ -506,7 +559,10 @@ fn run_upstash_sql(
 /// non-finite float is a loud, named error (JSON cannot represent it and
 /// `null` would be indistinguishable from a real NULL) — both the
 /// `db_rest::col_to_json` precedent.
-fn sql_value_to_json(v: hive_crsql::rusqlite::types::ValueRef<'_>, col: &str) -> Result<Value, String> {
+fn sql_value_to_json(
+    v: hive_crsql::rusqlite::types::ValueRef<'_>,
+    col: &str,
+) -> Result<Value, String> {
     use hive_crsql::rusqlite::types::ValueRef;
     Ok(match v {
         ValueRef::Null => Value::Null,
@@ -601,7 +657,11 @@ async fn serve(
         return r;
     };
     let Some(policy) = crate::browser_db::policy_for_project(&cloud, &project) else {
-        return err(StatusCode::NOT_FOUND, "project has no live browser_db opt-in", None);
+        return err(
+            StatusCode::NOT_FOUND,
+            "project has no live browser_db opt-in",
+            None,
+        );
     };
     let resolved = policy.resolve();
     if scope == BrowserScope::Public && !resolved.public_read {
@@ -620,7 +680,11 @@ async fn serve(
         );
     };
     if body.len() > BODY_CAP {
-        return err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large", None);
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+            None,
+        );
     }
     let read_only = scope == BrowserScope::Public;
 
@@ -742,7 +806,9 @@ fn decode_envelope(v: &Value) -> Option<Response> {
         .decode(v.get("body_b64").and_then(|b| b.as_str()).unwrap_or(""))
         .ok()?;
     let ct = header::HeaderValue::from_str(&ct).ok()?;
-    Some(cors((status, [(header::CONTENT_TYPE, ct)], body).into_response()))
+    Some(cors(
+        (status, [(header::CONTENT_TYPE, ct)], body).into_response(),
+    ))
 }
 
 /// Owner-side re-check: this is `hrana::mesh_serve`'s shape, re-deriving
@@ -767,7 +833,10 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> 
         );
     };
     let Some(policy) = crate::browser_db::policy_for_project(cloud, project) else {
-        return refuse(StatusCode::NOT_FOUND, "project has no live browser_db opt-in");
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "project has no live browser_db opt-in",
+        );
     };
     let resolved = policy.resolve();
     if scope == BrowserScope::Public && !resolved.public_read {
@@ -776,7 +845,9 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> 
             "browser_db.public_read has been disabled for this project since this token was minted",
         );
     }
-    if crate::browser_db::rest_owner_for_project(cloud, project).as_deref() != Some(cloud.node_name.as_str()) {
+    if crate::browser_db::rest_owner_for_project(cloud, project).as_deref()
+        != Some(cloud.node_name.as_str())
+    {
         return refuse(
             StatusCode::MISDIRECTED_REQUEST,
             "this node is not the current browser_db REST owner for this project",
@@ -784,7 +855,10 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> 
     }
     let path = env.get("path").and_then(|p| p.as_str()).unwrap_or_default();
     let Some(endpoint) = route(&Method::POST, path).or_else(|| route(&Method::GET, path)) else {
-        return refuse(StatusCode::NOT_FOUND, "unsupported browser_db REST endpoint");
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "unsupported browser_db REST endpoint",
+        );
     };
     let body = base64::engine::general_purpose::STANDARD
         .decode(env.get("body_b64").and_then(|b| b.as_str()).unwrap_or(""))
@@ -818,8 +892,14 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> 
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/v1/projects/:project/browser-db/rest-token", post(rest_token_mint))
-        .route("/v1/projects/:project/browser-db/rest-mesh", post(mesh_route))
+        .route(
+            "/v1/projects/:project/browser-db/rest-token",
+            post(rest_token_mint),
+        )
+        .route(
+            "/v1/projects/:project/browser-db/rest-mesh",
+            post(mesh_route),
+        )
         .route(
             "/v1/browser-db/:project/v2/pipeline",
             post(api_pipeline_v2).options(preflight),
@@ -828,37 +908,80 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
             "/v1/browser-db/:project/v3/pipeline",
             post(api_pipeline_v3).options(preflight),
         )
-        .route("/v1/browser-db/:project/v2", get(api_probe_v2).options(preflight))
-        .route("/v1/browser-db/:project/v3", get(api_probe_v3).options(preflight))
-        .route("/v1/browser-db/:project/sql", post(api_sql).options(preflight))
+        .route(
+            "/v1/browser-db/:project/v2",
+            get(api_probe_v2).options(preflight),
+        )
+        .route(
+            "/v1/browser-db/:project/v3",
+            get(api_probe_v3).options(preflight),
+        )
+        .route(
+            "/v1/browser-db/:project/sql",
+            post(api_sql).options(preflight),
+        )
 }
 
 async fn preflight() -> Response {
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn api_serve(cloud: Arc<CloudState>, project: String, headers: HeaderMap, method: Method, path: &str, body: Bytes) -> Response {
+async fn api_serve(
+    cloud: Arc<CloudState>,
+    project: String,
+    headers: HeaderMap,
+    method: Method,
+    path: &str,
+    body: Bytes,
+) -> Response {
     let bearer = crate::db_rest::bearer_token(&headers).unwrap_or_default();
     serve(cloud, project, bearer, method, path.to_string(), body).await
 }
 
-async fn api_pipeline_v2(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, headers: HeaderMap, body: Bytes) -> Response {
+async fn api_pipeline_v2(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     api_serve(c, project, headers, Method::POST, "/v2/pipeline", body).await
 }
-async fn api_pipeline_v3(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, headers: HeaderMap, body: Bytes) -> Response {
+async fn api_pipeline_v3(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     api_serve(c, project, headers, Method::POST, "/v3/pipeline", body).await
 }
-async fn api_probe_v2(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, headers: HeaderMap) -> Response {
+async fn api_probe_v2(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
     api_serve(c, project, headers, Method::GET, "/v2", Bytes::new()).await
 }
-async fn api_probe_v3(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, headers: HeaderMap) -> Response {
+async fn api_probe_v3(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    headers: HeaderMap,
+) -> Response {
     api_serve(c, project, headers, Method::GET, "/v3", Bytes::new()).await
 }
-async fn api_sql(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, headers: HeaderMap, body: Bytes) -> Response {
+async fn api_sql(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     api_serve(c, project, headers, Method::POST, "/sql", body).await
 }
 
-async fn mesh_route(State(c): State<Arc<CloudState>>, AxPath(project): AxPath<String>, Json(env): Json<Value>) -> Json<Value> {
+async fn mesh_route(
+    State(c): State<Arc<CloudState>>,
+    AxPath(project): AxPath<String>,
+    Json(env): Json<Value>,
+) -> Json<Value> {
     Json(mesh_serve(&c, &project, &env).await)
 }
 

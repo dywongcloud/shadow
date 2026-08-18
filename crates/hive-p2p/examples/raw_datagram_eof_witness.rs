@@ -11,7 +11,11 @@
 use hive_p2p::{read_raw_datagram, write_raw_datagram, RAW_MAX_DATAGRAM};
 
 fn check(name: &str, ok: bool) -> bool {
-    println!("{}: {}", if ok { "WITNESS_OK" } else { "WITNESS_FAIL" }, name);
+    println!(
+        "{}: {}",
+        if ok { "WITNESS_OK" } else { "WITNESS_FAIL" },
+        name
+    );
     ok
 }
 
@@ -22,10 +26,7 @@ async fn main() {
     // 1. Clean EOF at a frame boundary -> Ok(None).
     let mut r: &[u8] = &[];
     let res = read_raw_datagram(&mut r).await;
-    all &= check(
-        "clean_eof_at_boundary_is_none",
-        matches!(res, Ok(None)),
-    );
+    all &= check("clean_eof_at_boundary_is_none", matches!(res, Ok(None)));
 
     // 2. One valid frame -> Ok(Some(payload)).
     let mut frame = Vec::new();
@@ -80,10 +81,7 @@ async fn main() {
     let big = vec![0u8; RAW_MAX_DATAGRAM + 1];
     let mut sink = Vec::new();
     let res = write_raw_datagram(&mut sink, &big).await;
-    all &= check(
-        "oversize_write_refused",
-        res.is_err() && sink.is_empty(),
-    );
+    all &= check("oversize_write_refused", res.is_err() && sink.is_empty());
 
     // 8. Zero-length datagram round-trips as Some(empty), distinct from EOF.
     let mut frame = Vec::new();

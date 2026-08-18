@@ -41,7 +41,7 @@
 //! (socket semantics, `[u32 len]`-framed mesh datagrams) is the UDP relay
 //! layer's, which shares the same allocations and mesh primitive.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use fluid_core::{DeployState, ServiceProtocol};
@@ -52,10 +52,18 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::state::CloudState;
 
 /// Protocols this proxy carries: anything whose public transport is a TCP byte
-/// stream. (`Udp` needs the datagram relay; HTTP-family never gets a stamped
-/// public port at all.)
+/// stream. `Udp` needs the datagram relay. `Http`-family is here because of
+/// compose PUBLISH requests (`ports: ["9001:9001"]` → a stamped public port on
+/// an Http spec): the published port is served as a plain-TCP passthrough —
+/// exactly what `docker compose up` publishes, plain HTTP with no TLS; the
+/// shared 443 gateway remains the platform's TLS surface. An Http spec WITHOUT
+/// a publish request still never gets a stamped public port, so nothing
+/// reaches this proxy for it.
 fn tcp_transport(p: ServiceProtocol) -> bool {
-    matches!(p, ServiceProtocol::Tcp | ServiceProtocol::Grpc)
+    matches!(
+        p,
+        ServiceProtocol::Tcp | ServiceProtocol::Grpc | ServiceProtocol::Http
+    )
 }
 
 /// What a public port maps to — the flattened allocation identity, from
@@ -100,7 +108,7 @@ pub fn spawn(cloud: Arc<CloudState>) {
             // spliced run in their own tasks and drain naturally.
             let stale: Vec<u16> = listeners
                 .keys()
-                .filter(|p| !desired.contains(p))
+                .filter(|p| !desired.contains_key(p))
                 .copied()
                 .collect();
             for p in stale {
@@ -112,17 +120,18 @@ pub fn spawn(cloud: Arc<CloudState>) {
             // A finished handle means the accept loop died (listener error) —
             // forget it so the port is re-bound below.
             listeners.retain(|_, h| !h.is_finished());
-            for &p in &desired {
+            for (&p, &proto) in &desired {
                 if listeners.contains_key(&p) {
                     continue;
                 }
                 // Bind HERE (not inside the spawned task) so a squatted port is
                 // observed and retried on the next reconcile tick instead of
                 // leaving a dead handle behind.
+                let tls = proto == ServiceProtocol::Http;
                 match TcpListener::bind(("0.0.0.0", p)).await {
                     Ok(l) => {
-                        tracing::info!(port = p, "raw-proxy: public raw TCP listener up");
-                        listeners.insert(p, tokio::spawn(accept_loop(cloud.clone(), p, l)));
+                        tracing::info!(port = p, tls, "raw-proxy: public raw TCP listener up");
+                        listeners.insert(p, tokio::spawn(accept_loop(cloud.clone(), p, l, tls)));
                     }
                     Err(e) => {
                         tracing::warn!(port = p, error = %e, "raw-proxy: cannot bind allocated port (will retry)");
@@ -135,16 +144,19 @@ pub fn spawn(cloud: Arc<CloudState>) {
 }
 
 /// Every public port some Ready deployment (local or gossiped) holds a
-/// TCP-transport binding for.
-fn desired_ports(cloud: &Arc<CloudState>) -> BTreeSet<u16> {
-    let mut out = BTreeSet::new();
+/// TCP-transport binding for, with the binding's protocol — Http-protocol
+/// (compose-published) ports get TLS termination at accept time; raw Tcp/Grpc
+/// stay pure passthrough. First writer wins a (theoretical) protocol
+/// collision; public ports are fleet-unique by allocation.
+fn desired_ports(cloud: &Arc<CloudState>) -> BTreeMap<u16, ServiceProtocol> {
+    let mut out = BTreeMap::new();
     let mut add = |d: &fluid_core::DeploymentInfo| {
         if d.state != DeployState::Ready {
             return;
         }
         for b in &d.raw_ports {
             if tcp_transport(b.protocol) {
-                out.insert(b.public_port);
+                out.entry(b.public_port).or_insert(b.protocol);
             }
         }
     };
@@ -159,7 +171,11 @@ fn desired_ports(cloud: &Arc<CloudState>) -> BTreeSet<u16> {
     out
 }
 
-async fn accept_loop(cloud: Arc<CloudState>, port: u16, listener: TcpListener) {
+async fn accept_loop(cloud: Arc<CloudState>, port: u16, listener: TcpListener, tls: bool) {
+    // One acceptor per listener, sharing the 443 gateway's SNI resolver (same
+    // wildcard/per-host certs) with ALPN pinned to http/1.1 — see
+    // `acme::raw_server_config` for why h2 must not be offered here.
+    let acceptor = tls.then(|| tokio_rustls::TlsAcceptor::from(crate::acme::raw_server_config()));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -170,6 +186,7 @@ async fn accept_loop(cloud: Arc<CloudState>, port: u16, listener: TcpListener) {
             }
         };
         let cloud = cloud.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
             // WARN, not debug: every reachable error here is a genuine
             // resolution/splice failure (no deployment holds the port, a
@@ -178,16 +195,55 @@ async fn accept_loop(cloud: Arc<CloudState>, port: u16, listener: TcpListener) {
             // disconnect, which `copy_bidirectional` completes as `Ok`. A
             // fleet-wide misroute (e.g. the F1/F3 classes) would be invisible
             // at the default log level otherwise.
-            if let Err(e) = handle(cloud, port, stream).await {
+            let r = match acceptor {
+                Some(acc) => serve_maybe_tls(cloud, port, stream, acc).await,
+                None => handle(cloud, port, stream).await,
+            };
+            if let Err(e) = r {
                 tracing::warn!(port, %peer, error = %e, "raw-proxy: connection failed");
             }
         });
     }
 }
 
+/// A PUBLISHED Http port serves both schemes on one number, exactly the way a
+/// docker-published port would if docker carried the platform's certs: the
+/// first byte decides. 0x16 is a TLS handshake record → terminate TLS with the
+/// platform cert (the browser's `https://<host>:9001` case, the reason this
+/// exists) and splice decrypted bytes; anything else is plain HTTP → pure
+/// passthrough (curl/S3 SDKs pointed at an `http://` endpoint, docker parity).
+/// The peek costs nothing on the wire — it does not consume the byte.
+async fn serve_maybe_tls(
+    cloud: Arc<CloudState>,
+    port: u16,
+    client: TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> anyhow::Result<()> {
+    let mut first = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), client.peek(&mut first))
+        .await
+        .map_err(|_| anyhow::anyhow!("no first byte within 10s"))??;
+    if n == 0 {
+        return Ok(()); // closed before sending anything
+    }
+    if first[0] == 0x16 {
+        let tls_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(client))
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
+                .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
+        handle(cloud, port, tls_stream).await
+    } else {
+        handle(cloud, port, client).await
+    }
+}
+
 /// One inbound public connection: map the port to its deployment, decide
 /// local-vs-remote, splice.
-async fn handle(cloud: Arc<CloudState>, port: u16, mut client: TcpStream) -> anyhow::Result<()> {
+async fn handle<S>(cloud: Arc<CloudState>, port: u16, mut client: S) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let target = resolve_binding(&cloud, port)
         .ok_or_else(|| anyhow::anyhow!("no deployment holds public raw port {port}"))?;
     anyhow::ensure!(

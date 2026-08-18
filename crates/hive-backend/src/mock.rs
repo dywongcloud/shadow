@@ -359,6 +359,18 @@ impl CellBackend for MockBackend {
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
+            // Extra raw/published TCP publishes, minus the primary pairing
+            // already at ports[0] (a duplicate `-p` fails the run).
+            ports.extend(func.tcp_ports.iter().filter_map(|t| {
+                if t.host_port == port {
+                    return None;
+                }
+                Some(crate::ContainerPort {
+                    container_port: t.container_port,
+                    host_port: t.host_port,
+                    protocol: crate::ContainerProtocol::Tcp,
+                })
+            }));
             let mut args: Vec<String> = vec![
                 "run".into(),
                 "-d".into(),
@@ -463,8 +475,7 @@ impl CellBackend for MockBackend {
             if !entrypoint.is_empty() {
                 args.push("--entrypoint".into());
                 args.push(
-                    serde_json::to_string(&entrypoint)
-                        .unwrap_or_else(|_| entrypoint.join(" ")),
+                    serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")),
                 );
             }
             args.push(image.clone());
@@ -815,7 +826,8 @@ impl MockBackend {
         // real shell would apply, so "npm"/"npx"/a node_modules/.bin tool
         // all resolve the same way a host process rooted at `workdir` would,
         // without this code needing to special-case each one.
-        let guest_path = "/usr/local/bin:/usr/local/lib/node_modules/npm/bin:/bin:/usr/bin:./node_modules/.bin";
+        let guest_path =
+            "/usr/local/bin:/usr/local/lib/node_modules/npm/bin:/bin:/usr/bin:./node_modules/.bin";
         let script = func
             .start_cmd
             .iter()
@@ -900,7 +912,8 @@ pub(crate) async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Res
         // default SYN-retry timeout is on the order of a minute, not
         // milliseconds. Reproduced live on fc-frankfurt (2026-08-08): a
         // 10s-budget wait_tcp_ready call hung for 60+ seconds.
-        let per_attempt = Duration::from_secs(2).min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let per_attempt = Duration::from_secs(2)
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
         match tokio::time::timeout(per_attempt, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(_)) => return Ok(()),
             Ok(Err(e)) => {

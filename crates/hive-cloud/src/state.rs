@@ -418,6 +418,9 @@ pub struct MeshHealth {
     /// Of those, how many are visible + healthy in the LIVE gossip-derived
     /// registry right now.
     pub visible_healthy_peers: usize,
+    /// Gossip-fresh expected peers regardless of health verdict — see
+    /// `mesh_health` for why this exists (wedge vs outage discrimination).
+    pub audible_peers: usize,
     /// True iff peers were expected but NONE are currently visible — the exact
     /// shape of the node-a/node-b isolation incident (see `mesh_isolated`).
     pub isolated: bool,
@@ -731,15 +734,26 @@ impl CloudState {
                     .collect()
             })
             .unwrap_or_default();
-        let visible: std::collections::HashSet<String> = self
-            .registry
-            .nodes()
+        let fresh_nodes = self.registry.nodes();
+        // AUDIBLE peers: gossip-fresh (the registry drops >30s-stale rows)
+        // regardless of the healthy flag — the discriminator between "the
+        // fleet is alive and talking to us but our transport to it is broken"
+        // (a restart can help) and "the fleet is dark to us entirely"
+        // (partition/outage; a restart conjures nothing).
+        let audible = fresh_nodes
+            .iter()
+            .filter(|n| !n.is_self)
+            .filter_map(|n| n.peer_id.as_ref())
+            .filter(|pid| expected.contains(*pid))
+            .count();
+        let visible: std::collections::HashSet<String> = fresh_nodes
             .into_iter()
             .filter(|n| !n.is_self && n.healthy)
             .filter_map(|n| n.peer_id)
             .filter(|pid| expected.contains(pid))
             .collect();
         MeshHealth {
+            audible_peers: audible,
             expected_peers: expected.len(),
             visible_healthy_peers: visible.len(),
             isolated: mesh_isolated(expected.len(), visible.len()),

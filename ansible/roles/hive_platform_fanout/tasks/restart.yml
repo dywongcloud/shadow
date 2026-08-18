@@ -72,6 +72,31 @@
     mode: "0644"
   register: _unit
 
+# The packaged cr-sqlite extension (build.yml's note names the outage class).
+# Followers take the pushed copy; the build host installs from its own dist.
+- name: Install the cr-sqlite extension when its content changed
+  ansible.builtin.shell: |
+    set -e
+    if [ "{{ inventory_hostname }}" = "{{ hive_group_build_host }}" ]; then
+      src="{{ hive_src_dir }}/vendor/cr-sqlite/core/dist/crsqlite.so"
+    else
+      src=/tmp/crsqlite.so.new
+    fi
+    dst=/var/lib/hive/crsqlite.so
+    if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+      install -m 0755 "$src" "$dst"
+    fi
+  args:
+    executable: /bin/bash
+
+- name: Drop in HIVE_CRSQL_EXTENSION_PATH for hive-node
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hive-node.service.d/crsqlite.conf
+    mode: "0644"
+    content: |
+      [Service]
+      Environment=HIVE_CRSQL_EXTENSION_PATH=/var/lib/hive/crsqlite.so
+
 - name: Reload systemd if the unit changed
   ansible.builtin.systemd:
     daemon_reload: true

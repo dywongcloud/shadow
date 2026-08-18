@@ -153,3 +153,23 @@ export async function openDeployment(alias: string | undefined | null, project: 
   }
   window.open(`${base}/`, "_blank", "noopener");
 }
+
+/**
+ * The alias a deployment ITSELF answers on — never someone else's URL.
+ * Production deployments own the project alias. A preview's own hosts are its
+ * commit / branch / per-deployment aliases (commit first: it is minted on
+ * every fanout target, so it routes through pooled ingress; the per-node id
+ * alias only resolves on its host node). Returns "" when a preview has none
+ * of them — callers render a disabled/pending state, because the one thing a
+ * preview must NEVER display is the production URL.
+ */
+export function deploymentSelfAlias(d: {
+  production: boolean;
+  alias: string;
+  commit_alias?: string;
+  branch_alias?: string;
+  id_alias?: string;
+}): string {
+  if (d.production) return d.alias;
+  return d.commit_alias || d.branch_alias || d.id_alias || "";
+}

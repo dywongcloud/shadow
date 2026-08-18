@@ -21,6 +21,7 @@ export const KIND_ICON: Record<UnifiedKind, React.ReactNode> = {
   realtime: <Wifi className="h-5 w-5" />,
   sqlite: <FileStack className="h-5 w-5" />,
   browser_sqlite: <FileStack className="h-5 w-5" />,
+  supabase: <Zap className="h-5 w-5" />,
 };
 
 const KIND_TONE = {
@@ -33,6 +34,7 @@ const KIND_TONE = {
   realtime: "green",
   sqlite: "green",
   browser_sqlite: "green",
+  supabase: "green",
 } as const;
 
 export function KindBadge({ kind }: { kind: UnifiedKind }) {

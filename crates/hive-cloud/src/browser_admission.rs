@@ -295,7 +295,8 @@ impl BrowserAdmissionSnapshot {
         let floor = now.saturating_sub(TOMBSTONE_RETENTION_MS);
         self.tombstones.retain(|_, revision| *revision >= floor);
         let deny_floor = now.saturating_sub(RELAY_DENYLIST_RETENTION_MS);
-        self.denylist.retain(|_, revoked_at| *revoked_at >= deny_floor);
+        self.denylist
+            .retain(|_, revoked_at| *revoked_at >= deny_floor);
     }
 }
 
@@ -505,7 +506,9 @@ impl BrowserAdmissionStore {
         let record = state.active.remove(endpoint_id)?;
         let revision = state.next_version();
         state.tombstones.insert(endpoint_id.to_string(), revision);
-        state.denylist.insert(endpoint_id.to_string(), hive_core::now_ms());
+        state
+            .denylist
+            .insert(endpoint_id.to_string(), hive_core::now_ms());
         state.prune_tombstones(hive_core::now_ms());
         self.counters
             .revocations_total
@@ -812,10 +815,7 @@ pub fn routes() -> Router<Arc<CloudState>> {
         // makes a node-local mailbox correct at all; the read rides the POST's
         // own reply.
         .route("/v1/browser/signals", post(browser_signals))
-        .route(
-            "/v1/browser/deployments/:id/status",
-            get(deployment_status),
-        )
+        .route("/v1/browser/deployments/:id/status", get(deployment_status))
 }
 
 /// Tenant-scoped "is my browser function actually being served right now"
@@ -883,21 +883,22 @@ async fn deployment_status(
         let live: Vec<_> = admissions
             .iter()
             .filter(|a| {
-                a.serve_entries().iter().any(|entry| {
-                    entry.deployment == id && entry.digest == descriptor.policy_digest
-                })
+                a.serve_entries()
+                    .iter()
+                    .any(|entry| entry.deployment == id && entry.digest == descriptor.policy_digest)
             })
             .collect();
         let online = presence
             .iter()
-            .filter(|p| {
-                p.state == "online" && live.iter().any(|a| a.endpoint_id == p.endpoint_id)
-            })
+            .filter(|p| p.state == "online" && live.iter().any(|a| a.endpoint_id == p.endpoint_id))
             .count();
-        let artifact_hosts =
-            crate::browser_artifacts::resolve_for_tenant(&cloud, &tenant, &descriptor.policy_digest)
-                .map(|r| r.hosts)
-                .unwrap_or_default();
+        let artifact_hosts = crate::browser_artifacts::resolve_for_tenant(
+            &cloud,
+            &tenant,
+            &descriptor.policy_digest,
+        )
+        .map(|r| r.hosts)
+        .unwrap_or_default();
         let local_verified = crate::browser_artifacts::read_verified(descriptor)
             .await
             .is_some();
@@ -997,8 +998,8 @@ fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, AdmissionFai
 /// under one of these tenants mints `role: "member"` (Clerk-verified at mint),
 /// which the base owner/admin gate would otherwise reject.
 fn public_node_tenants() -> Vec<String> {
-    let raw = std::env::var("HIVE_PUBLIC_NODE_TENANTS")
-        .unwrap_or_else(|_| "thoth-division".to_string());
+    let raw =
+        std::env::var("HIVE_PUBLIC_NODE_TENANTS").unwrap_or_else(|_| "thoth-division".to_string());
     raw.split(',')
         .map(|s| crate::admin::norm(s).to_string())
         .filter(|s| !s.is_empty())
@@ -1412,9 +1413,7 @@ async fn admit(
         revision: 0,
         scope: request.scope,
         protocol_version: request.protocol_version,
-        db: db_capability
-            .as_ref()
-            .map(|(grant, _)| grant.clone()),
+        db: db_capability.as_ref().map(|(grant, _)| grant.clone()),
     };
     let old = cloud
         .browser_admissions
@@ -1589,7 +1588,8 @@ fn capability_json(
     // name, caps, schema and sync peers from exactly this — present only when
     // the admission carries a database grant at all.
     if let Some((tenant, grant, resolved)) = db {
-        out["db"] = crate::browser_db::capability_db_json(cloud, tenant, grant, resolved, expires_ms);
+        out["db"] =
+            crate::browser_db::capability_db_json(cloud, tenant, grant, resolved, expires_ms);
     }
     // The browser↔browser DIRECT lane's peer set (bn-browser-peer-webrtc-mesh)
     // rides the SAME atomic snapshot, for the same reason `db` and
@@ -2067,7 +2067,11 @@ async fn browser_signals(
             "browser endpoint id is malformed",
         ));
     }
-    verify_proof_of_possession(&request.endpoint_id, request.challenge_ms, &request.signature)?;
+    verify_proof_of_possession(
+        &request.endpoint_id,
+        request.challenge_ms,
+        &request.signature,
+    )?;
     let now = hive_core::now_ms();
     // The caller must STILL hold a live admission under the authenticated
     // tenant. This is re-read per call, not trusted from the session: a
@@ -2457,7 +2461,8 @@ pub fn roll_call(cloud: &Arc<CloudState>) -> RollCall {
         if live.is_some_and(|p| p.shard_eligible) {
             shard_eligible += 1;
         }
-        if live.is_none() && started_ms.saturating_sub(record.issued_ms) > ROLL_CALL_PRESENCE_GRACE_MS
+        if live.is_none()
+            && started_ms.saturating_sub(record.issued_ms) > ROLL_CALL_PRESENCE_GRACE_MS
         {
             drift.push(RollCallDrift {
                 kind: "presence_missing",
@@ -2563,10 +2568,7 @@ pub fn roll_call(cloud: &Arc<CloudState>) -> RollCall {
             shard_eligible: live.is_some_and(|p| p.shard_eligible),
             mesh_peers: if mesh_on {
                 mesh_degree(
-                    per_tenant
-                        .get(record.tenant.as_str())
-                        .copied()
-                        .unwrap_or(0),
+                    per_tenant.get(record.tenant.as_str()).copied().unwrap_or(0),
                     peer_cap,
                 )
             } else {
@@ -2608,9 +2610,9 @@ pub fn roll_call(cloud: &Arc<CloudState>) -> RollCall {
             continue;
         };
         let entries = record.serve_entries();
-        let authorized = entries
-            .iter()
-            .find(|entry| entry.deployment == target.deployment && entry.function == target.function);
+        let authorized = entries.iter().find(|entry| {
+            entry.deployment == target.deployment && entry.function == target.function
+        });
         match authorized {
             None => drift.push(RollCallDrift {
                 kind: "route_unauthorized",
@@ -2901,7 +2903,9 @@ fn fanout_revoke(cloud: &Arc<CloudState>, endpoint_id: &str) {
 /// ONLY the relay denylist + gateway routing, never the versioned
 /// active/tombstone state.
 pub async fn mesh_revoke_echo(cloud: &Arc<CloudState>, endpoint_id: &str) {
-    cloud.browser_admissions.mark_denied(endpoint_id, hive_core::now_ms());
+    cloud
+        .browser_admissions
+        .mark_denied(endpoint_id, hive_core::now_ms());
     remove_endpoint(cloud, endpoint_id).await;
 }
 

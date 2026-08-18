@@ -4,12 +4,13 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
-  ArrowLeft, Copy, Check, Trash2, Globe2, Users, Info, Rocket, Pencil, FileStack,
+  ArrowLeft, Copy, Check, Trash2, Globe2, Users, Info, Rocket, Pencil, FileStack, KeyRound,
 } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
 import {
-  apiGet, apiSend, usePoll,
+  apiGet, apiSend, usePoll, mintBrowserDbRestToken,
   type Deployment, type ProjectSettings, type BrowserDbPolicy,
+  type BrowserDbStatusResponse, type BrowserDbRestMint,
 } from "@/lib/api";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
@@ -21,10 +22,10 @@ import { BrowserDbConfigModal, BrowserDbStatusPanel, formatBytes } from "../brow
 /**
  * Detail page for a browser-replicated SQLite database — deliberately the same
  * shell as the managed-engine detail (back link, PageHeader + status + Delete,
- * a Mini stat row, a Connection card, then the specifics). The ONE honest
- * difference is inside the Connection card: this lane has no server-side wire
- * endpoint, so it states what is missing and what it costs instead of printing
- * a DSN that would connect to nothing.
+ * a Mini stat row, a Connection card, then the specifics). The Connection card
+ * is honest about the two access shapes: browsers sync a local replica (no
+ * DSN), and servers use the token-gated libsql/Hrana + Upstash-style REST
+ * surface (`browser_db_rest`) whose URLs are server-derived and shown here.
  */
 export function SqliteDatabaseDetail({ project }: { project: string }) {
   const router = useRouter();
@@ -67,6 +68,30 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
   const [editing, setEditing] = useState(false);
   const [redeploying, setRedeploying] = useState(false);
   const [copied, setCopied] = useState("");
+
+  // The REST/Hrana surface: URLs + token-existence ride the same status poll
+  // the Replication panel uses (shared cache, one wire request). `minted`
+  // holds a just-minted plaintext token — shown ONCE, never re-fetchable.
+  const { data: dbStatus, refresh: refreshStatus } = usePoll<BrowserDbStatusResponse>(
+    `/v1/projects/${encodeURIComponent(project)}/browser-db/status`,
+    10000,
+  );
+  const rest = dbStatus && dbStatus.opted_in ? dbStatus.rest : null;
+  const [minting, setMinting] = useState<"team" | "public" | null>(null);
+  const [minted, setMinted] = useState<BrowserDbRestMint | null>(null);
+
+  async function mint(scope: "team" | "public") {
+    setMinting(scope);
+    try {
+      const m = await mintBrowserDbRestToken(project, scope);
+      setMinted(m);
+      await refreshStatus();
+    } catch (e) {
+      toast(`Couldn't mint token: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    } finally {
+      setMinting(null);
+    }
+  }
 
   async function copy(key: string, value: string) {
     if (await copyText(value)) {
@@ -163,6 +188,72 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
             <ul className="flex flex-col gap-1.5 text-xs text-secondary">
               {missing.map((line) => <li key={line} className="flex gap-1.5"><span className="text-muted">·</span><span>{line}</span></li>)}
             </ul>
+          </div>
+        </div>
+        {/* Server access: the token-gated libsql/REST surface — URLs are
+            server-derived (status poll), the token is minted here. */}
+        {rest && (
+          <div className="mt-4 divide-y divide-border border-t border-border">
+            <CopyRow
+              label="libsql URL"
+              value={rest.libsql_url}
+              hint="Any libsql/Turso client (v2/v3 pipeline). Bearer = access token."
+              copied={copied === "libsql URL"}
+              onCopy={() => copy("libsql URL", rest.libsql_url)}
+            />
+            <CopyRow
+              label="REST URL"
+              value={rest.sql_url}
+              hint='Upstash-style: POST {"query","params"} with the token as Bearer.'
+              copied={copied === "REST URL"}
+              onCopy={() => copy("REST URL", rest.sql_url)}
+            />
+          </div>
+        )}
+        <div className="mt-4 rounded-lg border border-border p-3">
+          <div className="mb-2 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">
+            <KeyRound className="h-3.5 w-3.5" /> Access tokens
+          </div>
+          <div className="flex flex-col gap-2 text-xs">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-secondary">
+                Team (read+write) ·{" "}
+                {rest?.team_token_ms ? `minted ${timeAgo(rest.team_token_ms)} ago` : "not minted"}
+              </span>
+              <Button variant="outline" disabled={minting !== null} onClick={() => mint("team")}>
+                {minting === "team" ? "Minting…" : rest?.team_token_ms ? "Rotate" : "Mint"}
+              </Button>
+            </div>
+            {db.policy.public_read && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-secondary">
+                  Public (read-only) ·{" "}
+                  {rest?.public_token_ms ? `minted ${timeAgo(rest.public_token_ms)} ago` : "not minted"}
+                </span>
+                <Button variant="outline" disabled={minting !== null} onClick={() => mint("public")}>
+                  {minting === "public" ? "Minting…" : rest?.public_token_ms ? "Rotate" : "Mint"}
+                </Button>
+              </div>
+            )}
+            {!db.policy.public_read && rest?.public_token_ms && (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                A public token was minted earlier, but public read is now disabled — it refuses every request until re-enabled.
+              </p>
+            )}
+            {minted && (
+              <div className="rounded-md border border-green/40 bg-green/5 p-2.5">
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="font-medium text-green">{minted.scope} token — shown once, store it now</span>
+                  <button onClick={() => copy("new token", minted.token)} className="text-muted hover:text-fg" title="Copy token">
+                    {copied === "new token" ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+                <code className="block break-all font-mono text-[11px] text-fg">{minted.token}</code>
+                <p className="mt-1 text-[11px] text-muted">
+                  Only its hash is kept server-side — this exact value is never recoverable again; rotate to replace.
+                </p>
+              </div>
+            )}
           </div>
         </div>
         <div className="mt-4 divide-y divide-border border-t border-border">

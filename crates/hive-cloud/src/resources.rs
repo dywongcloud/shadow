@@ -64,8 +64,8 @@ pub fn detect_wasm_runtime(backend: &str) -> Option<bool> {
         // drops a marker next to the image naming what was staged into it, so
         // the probe is a cheap stat of a file the image BUILDER wrote — the
         // builder is the only thing that actually knows.
-        let dir = std::env::var("HIVE_ROOTFS_DIR")
-            .unwrap_or_else(|_| "/var/lib/hive/rootfs".to_string());
+        let dir =
+            std::env::var("HIVE_ROOTFS_DIR").unwrap_or_else(|_| "/var/lib/hive/rootfs".to_string());
         let base = std::env::var("HIVE_CELL_IMAGE").unwrap_or_else(|_| "default".to_string());
         let marker = std::path::Path::new(&dir).join(format!("{base}.wasmer"));
         return Some(marker.exists());
