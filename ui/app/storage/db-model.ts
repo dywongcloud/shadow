@@ -42,6 +42,7 @@ export const KIND_LABEL: Record<UnifiedKind, string> = {
   realtime: "Realtime",
   sqlite: "SQLite",
   browser_sqlite: "SQLite (browser)",
+  supabase: "Supabase",
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +144,17 @@ export function managedEndpoint(db: Database): EndpointInfo | null {
       };
     }
   }
+  // Supabase: the per-database hostname serves the Studio dashboard (HTTPS,
+  // basic-auth — the credentials live behind /credentials like every secret).
+  // The Postgres wire rides the same host:5432 SNI splice as managed Postgres.
+  if (db.kind === "supabase" && host) {
+    return {
+      key: "STUDIO_URL",
+      address: host,
+      reach: reachOfHost(host),
+      protocol: "Supabase Studio (HTTPS) + postgres wire :5432",
+    };
+  }
   const endpoint = c.endpoint ?? "";
   if (endpoint) {
     return {
@@ -163,6 +175,9 @@ export function managedNoEndpointReason(db: Database): string {
   }
   if (db.kind === "sqlite") {
     return "No libsql URL published yet — the backend publishes one on the DB gateway hostname, or on the platform API when that domain is unset.";
+  }
+  if (db.kind === "supabase") {
+    return "No Studio URL published yet — the per-database hostname appears once the stack is up (and only while the DB gateway domain is configured).";
   }
   return `${KIND_LABEL[db.kind]} is served by the platform API under this database's token — see the connection details.`;
 }

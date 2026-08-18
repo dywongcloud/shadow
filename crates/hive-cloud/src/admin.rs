@@ -3393,19 +3393,38 @@ async fn purge_project_resources(
             // `podman rm`/DB-container teardown site in this file (this one,
             // plus the two below in `database_delete`/the "remove" op) stays
             // hardcoded to podman for that reason, unconditionally.
-            let _ = tokio::process::Command::new("podman")
-                .args(["rm", "-f", &container])
-                .env(
-                    "PATH",
-                    format!(
-                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            // Comma-split: a Supabase record carries its whole stack.
+            for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let _ = tokio::process::Command::new("podman")
+                    .args(["rm", "-f", "-v", one])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
+            if d.kind == crate::databases::DbKind::Supabase {
+                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
+                let _ = tokio::process::Command::new("podman")
+                    .args(["volume", "rm", "-f", &vol])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
         }
         c.databases.remove_db_and_purge_data(&d.id, &d.team);
     }
@@ -9366,20 +9385,45 @@ async fn database_delete(
             }
         }
         if let Some(container) = d.container {
-            // Best-effort teardown of the backing container.
-            let _ = tokio::process::Command::new("podman")
-                .args(["rm", "-f", &container])
-                .env(
-                    "PATH",
-                    format!(
-                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            // Best-effort teardown of the backing container(s). A Supabase
+            // record carries its whole stack comma-joined (db,meta,studio);
+            // single-container kinds are unaffected by the split. `-v` is the
+            // podman lock-pool rule (anonymous volumes leak locks forever);
+            // the stack's NAMED data volume is removed explicitly below.
+            for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let _ = tokio::process::Command::new("podman")
+                    .args(["rm", "-f", "-v", one])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
+            if d.kind == crate::databases::DbKind::Supabase {
+                // Deleting the database IS deleting its data — the stack's
+                // named volume is platform-templated (`hive-vol-supa-<id8>`),
+                // never tenant-named, so this cannot touch another volume.
+                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
+                let _ = tokio::process::Command::new("podman")
+                    .args(["volume", "rm", "-f", &vol])
+                    .env(
+                        "PATH",
+                        format!(
+                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
         }
     }
     // Purges the actual queue/vector/blob PAYLOAD data too (keyed by a

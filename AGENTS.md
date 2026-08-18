@@ -938,6 +938,52 @@ releases).
   (operator, node-local like `/v1/dns/stats`) reports each pool's
   live/idle/opened/reused/waited/refused counters and the open stream count.
 
+## Managed Supabase Studio (`DbKind::Supabase`)
+
+- **A self-contained mini-stack per database, not a shared Supabase.**
+  `provision_supabase` (databases.rs) runs three containers on the owning
+  project's DNS-less podman net with deterministic static IPs in bands clear
+  of the managed-DB `.200+` band: `supabase/postgres:15.8.1.085` (named
+  volume `hive-vol-supa-<id8>` — data survives container replacement),
+  `supabase/postgres-meta:v0.95.2` (internal only), and
+  `supabase/studio:2026.02.16-sha-26c615c` (loopback-published, recorded as
+  `studio_port`). This is Studio's REQUIRED dependency set per the upstream
+  compose: its only declared dep is analytics-as-startup-barrier, and its
+  functional env deps are db + pg-meta + a router. GoTrue/PostgREST/
+  Realtime/Storage are deliberately NOT run — Studio's Authentication and
+  Data-API pages degrade; table/SQL editors are full. Do not "complete" the
+  stack silently; adding services is a resource + routing decision.
+- **Kong's two jobs are served by the platform, so no Kong container runs.**
+  Path routing is unnecessary (Studio's server side calls pg-meta directly
+  over the project net via `--add-host`), and the
+  `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` gate Kong applies to its `/`
+  catch-all is enforced by `db_rest::supabase_studio_proxy` — HTTP Basic
+  against the generated `STUDIO_USERNAME`/`STUDIO_PASSWORD`, constant-time,
+  with Kong's `hide_credentials` semantics (the Authorization header is
+  checked, then stripped, never proxied). The proxy streams the studio
+  container over loopback and rewrites `Location` headers that point at
+  internal origins.
+- **The Postgres wire rides the existing db_gateway SNI splice** — the
+  record's `local_port` is the stack's published 5432, so
+  `postgres://postgres:<pw>@<slug>.{db_domain}:5432/postgres?sslmode=require`
+  works exactly like a managed Postgres DSN. `with_external_endpoint` has the
+  Supabase arm that rewrites `DATABASE_URL`/`STUDIO_URL`/`SUPABASE_URL` to
+  the public host; when `HIVE_DB_DOMAIN` is unset the Studio URL stays
+  loopback-honest (reach "internal").
+- **JWT keys are static HS256 over `{role, iss:"supabase", exp:+10y}`** signed
+  with the stack's generated JWT_SECRET (the upstream/supahost derivation,
+  `supabase_api_jwt`) — they identify roles, not sessions; no rotation path
+  in v1.
+- **The record's `container` field is comma-joined (db,meta,studio)** —
+  every teardown site (`database_delete`, `purge_project_resources`) splits
+  on `,`, removes with `-v` (podman lock-pool rule), and removes the named
+  volume explicitly (delete = data destroyed, same semantics as any managed
+  engine delete). Replicas are dropped at provision (a second stack is a
+  divergent database, the SQLite-lane rule). The reconcile loop does NOT
+  auto-rebuild a vanished stack (the Postgres-lane behavior): WARN + the
+  record stays `live` — rebuild-on-drift is a deliberate follow-up, not an
+  oversight.
+
 ## Browser-replicated databases (the `browser_db` contract)
 
 The contract the browser↔fleet CRR exchange implements is
@@ -1038,6 +1084,19 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   `HIVE_CRSQL_EXTENSION_PATH` points at the packaged cr-sqlite extension on
   fleet nodes (the vendored build is the local-dev default; a missing
   extension is a loud WARN + refused rounds, never a boot failure).
+  **Fleet packaging is manual and was a fleet-wide outage-in-hiding until
+  2026-08-18:** the backend deploy syncs only `crates/` + `Cargo.*`, never
+  `vendor/`, and `extension_path()`'s baked default
+  (`$CARGO_MANIFEST_DIR/../../vendor/cr-sqlite/core/dist/crsqlite.so`)
+  therefore never existed on ANY node — every CRR round and every
+  `browser_db_rest` request failed "replica open failed" while replica
+  records looked fine. The packaged extension lives at
+  `/var/lib/hive/crsqlite.so` (systemd drop-in
+  `/etc/systemd/system/hive-node.service.d/crsqlite.conf` sets the env),
+  built per glibc group from `vendor/cr-sqlite` with `make` at the TOP level
+  (the `loadable` target exists only in `core/`; the top-level target is
+  `crsqlite`). Any new node needs the .so + drop-in or its browser_db lanes
+  silently refuse every round.
 - **The REST/Hrana surface (`browser_db_rest`) is this lane's non-browser
   query path, and it is CRR-safe by construction.** A server, CI job or curl
   reads/writes the same replica browsers sync, without embedding a QUIC

@@ -136,6 +136,49 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         </Card>
       )}
 
+      {db.kind === "supabase" && (
+        <Card className="mb-4">
+          <div className="mb-2 flex items-center gap-2">
+            <h3 className="text-sm font-semibold">Supabase Studio</h3>
+            <KindBadge kind={db.kind} />
+          </div>
+          <p className="mb-3 text-xs text-secondary">
+            The dashboard for this database — table editor, SQL editor, schema views. Sign in with the
+            generated credentials below (HTTP basic auth at the edge, the upstream stack&apos;s
+            DASHBOARD_USERNAME/PASSWORD mechanism).
+          </p>
+          <div className="divide-y divide-border border-t border-border">
+            {(["STUDIO_URL", "STUDIO_USERNAME", "STUDIO_PASSWORD"] as const).map((k) => (
+              <div key={k} className="flex items-center gap-3 py-2.5">
+                <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
+                <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">
+                  {revealed?.[k] ?? (k === "STUDIO_URL" && endpoint ? `https://${endpoint.address}` : "••••••••")}
+                </div>
+                {k === "STUDIO_URL" && endpoint?.reach === "external" && (
+                  <a
+                    href={revealed?.[k] ?? `https://${endpoint.address}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0 text-xs text-blue hover:underline"
+                  >
+                    Open
+                  </a>
+                )}
+                <button onClick={() => copy(k)} className="shrink-0 text-muted hover:text-fg" title={`Copy ${k}`}>
+                  {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+            ))}
+          </div>
+          <p className="mt-3 flex items-start gap-1.5 text-xs text-muted">
+            <Info className="mt-0.5 h-3 w-3 shrink-0" />
+            Runs Postgres + Studio + postgres-meta. Auth (GoTrue), generated REST/GraphQL APIs
+            (PostgREST), Realtime and Storage are not part of this offering yet — Studio&apos;s pages
+            for those degrade; the database itself is fully managed.
+          </p>
+        </Card>
+      )}
+
       {/* Primary connection string — the value most people want to copy, with an
           honest reachability verdict next to it: a loopback DSN is real but only
           resolves on the node running the engine. */}

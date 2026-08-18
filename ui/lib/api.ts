@@ -1173,7 +1173,7 @@ export interface Delivery {
 // different object from the browser-replicated cr-sqlite lane, which the
 // storage page models as `browser_sqlite` and which has no wire endpoint.
 export type DbKind =
-  | "postgres" | "redis" | "blob" | "queue" | "vector" | "pubsub" | "realtime" | "sqlite";
+  | "postgres" | "redis" | "blob" | "queue" | "vector" | "pubsub" | "realtime" | "sqlite" | "supabase";
 export type DbStatus = "provisioning" | "ready" | "error";
 export interface Database {
   id: string;
