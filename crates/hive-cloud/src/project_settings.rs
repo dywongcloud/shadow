@@ -471,6 +471,7 @@ impl ProjectStore {
         }
     }
 
+    // (helper below `merge_synced`)
     /// Merge a peer's snapshot. NEWEST-PER-ROW wins (`updated_ms` — projects
     /// are legitimately written on many nodes: set_team on the ingress node,
     /// env saves through the leader, production_branch on the build node), a
@@ -493,11 +494,23 @@ impl ProjectStore {
         let tombs = self.tombstones.read().clone();
         let mut map = self.map.write();
         for (name, remote_row) in remote.rows {
-            match map.get(&name) {
-                Some(local) if local.updated_ms >= remote_row.updated_ms => {}
-                _ => {
-                    map.insert(name, remote_row);
-                }
+            let take = match map.get(&name) {
+                None => true,
+                Some(local) if remote_row.updated_ms > local.updated_ms => true,
+                Some(local) if remote_row.updated_ms < local.updated_ms => false,
+                // EQUAL updated_ms but the rows may differ (two nodes wrote in
+                // the same millisecond, or a pre-monotonic-stamp legacy state).
+                // A plain `>=`-keeps-local here made both sides keep their own
+                // copy forever — the divergence never converged. Break the tie
+                // DETERMINISTICALLY so every node picks the SAME winner: the
+                // row with more env vars wins (a strict superset is the common
+                // real case — one node saw an add the other missed), and a
+                // content-signature tie-break settles the rest. Both nodes
+                // compute the identical answer, so they converge in one round.
+                Some(local) => tie_break_take(local, &remote_row),
+            };
+            if take {
+                map.insert(name, remote_row);
             }
         }
         map.retain(|name, row| match tombs.get(name) {
@@ -517,6 +530,8 @@ impl ProjectStore {
     pub fn tombstones_load(&self, data: std::collections::BTreeMap<String, u64>) {
         *self.tombstones.write() = data;
     }
+
+    // (see merge_synced's equal-updated_ms arm)
 
     /// Forget a project's settings (used when a project is deleted).
     pub fn remove(&self, project: &str) {
@@ -559,7 +574,14 @@ impl ProjectStore {
         project: &str,
     ) -> &'a mut ProjectSettings {
         let s = m.entry(project.to_string()).or_default();
-        s.updated_ms = now_ms();
+        // STRICTLY monotonic: two writes to the same row inside one wall-clock
+        // millisecond (or a write right after adopting a peer's newer row) must
+        // still advance the stamp, or the replication merge can't tell them
+        // apart. Witnessed live: three nodes held DIFFERENT env sets for one
+        // project at the IDENTICAL updated_ms, and the `>=`-keeps-local merge
+        // stranded the divergence permanently — a freshly added var was
+        // invisible on whichever node round-robin picked.
+        s.updated_ms = now_ms().max(s.updated_ms.saturating_add(1));
         s
     }
 
@@ -803,6 +825,68 @@ impl ProjectStore {
             .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
             .collect()
     }
+
+    /// Env for ONE environment — `"production"` | `"preview"` |
+    /// `"development"`. A var applies when its `target` is `"all"` or matches;
+    /// an empty/unknown target is treated as `"production"` (the field's own
+    /// serde default), so nothing silently widens.
+    ///
+    /// `EnvVar::target` and the dashboard's Production/Preview/Development
+    /// selector existed, but every consumer used the unfiltered [`env_map`] —
+    /// so a preview deployment (any non-production branch, any PR) launched
+    /// with the project's PRODUCTION secrets. The isolation the UI promised
+    /// was never enforced anywhere.
+    pub fn env_map_for(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        let want = environment.trim().to_ascii_lowercase();
+        self.get(project)
+            .env
+            .into_iter()
+            .filter(|e| {
+                let t = e.target.trim().to_ascii_lowercase();
+                t == "all" || t == want || (t.is_empty() && want == "production")
+            })
+            .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
+            .collect()
+    }
+}
+
+/// Deterministic winner for two equal-`updated_ms` rows so replication
+/// converges instead of each node keeping its own. More env vars wins (a
+/// superset is the common real cause of an equal-stamp divergence); on an
+/// equal count, the larger content signature wins — both nodes compute the
+/// same, so they agree in one round.
+fn tie_break_take(local: &ProjectSettings, remote: &ProjectSettings) -> bool {
+    if remote.env.len() != local.env.len() {
+        return remote.env.len() > local.env.len();
+    }
+    // STABLE hash (FNV-1a), never `DefaultHasher`: two nodes on different
+    // binary versions must compute the IDENTICAL signature or they would pick
+    // different winners and oscillate. Order-independent (XOR-fold per row) so
+    // env-list ordering can't change the answer.
+    fn sig(s: &ProjectSettings) -> u64 {
+        let mut acc: u64 = 0;
+        for e in &s.env {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in e
+                .key
+                .bytes()
+                .chain([0])
+                .chain(e.value.bytes())
+                .chain([0])
+                .chain(e.target.bytes())
+            {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            acc ^= h;
+        }
+        acc
+    }
+    sig(remote) > sig(local)
 }
 
 impl Default for ProjectStore {

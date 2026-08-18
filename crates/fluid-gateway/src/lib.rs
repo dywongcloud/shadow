@@ -851,6 +851,30 @@ impl Gateway {
         self.state.lock().aliases.keys().cloned().collect()
     }
 
+    /// Every alias LABEL that resolves to a deployment of `project` — the
+    /// project's own name, its per-commit/branch/deployment labels, and any
+    /// custom domain attached to it (aliases are keyed by first label, the
+    /// platform-wide routing convention).
+    ///
+    /// Exists so a tenant-controlled surface can be scoped to exactly the
+    /// hostnames it legitimately speaks for: the raw-port TLS terminator used
+    /// the fleet-wide SNI resolver, which holds every platform and every other
+    /// tenant's certificate.
+    pub fn alias_labels_for_project(&self, project: &str) -> Vec<String> {
+        let st = self.state.lock();
+        let ids: std::collections::HashSet<&DeploymentId> = st
+            .deployments
+            .values()
+            .filter(|d| d.project.eq_ignore_ascii_case(project))
+            .map(|d| &d.id)
+            .collect();
+        st.aliases
+            .iter()
+            .filter(|(_, id)| ids.contains(id))
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
+
     /// The subset of [`Gateway::served_hosts`] whose deployment is actually
     /// `Ready`. Anything that steers traffic to ONE node (DNS affinity records)
     /// must use this, not `served_hosts`: a specific A record beats the

@@ -655,17 +655,30 @@ async fn project_settings_get(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    if crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT {
-        let path = format!("/v1/projects/{project}/settings");
-        if !c.is_control_plane_leader() {
-            let leader = c.control_plane_leader();
-            if let Some(v) = fetch_from_host(&c, &leader, &path, &t).await {
-                return Ok(Json(v));
-            }
+    // READ-YOUR-WRITES: env/build/settings MUTATIONS are forwarded to the
+    // control-plane leader (admin_ingress), so the leader's copy is always the
+    // freshest. A non-leader serving its own copy is subject to replication
+    // lag — and the dashboard reads through round-robin DNS, so an add on the
+    // leader followed by a read on a lagging follower showed the OLD list
+    // ("I added a var and nothing appeared"). A non-leader therefore fetches
+    // the leader's authoritative copy first, falling back to local only when
+    // the leader is unreachable (never fail a read that local state can
+    // answer). The leader itself serves local (no self-loop: it IS the
+    // leader, so this branch is skipped there).
+    let path = format!("/v1/projects/{project}/settings");
+    if !c.is_control_plane_leader() {
+        let leader = c.control_plane_leader();
+        if let Some(v) = fetch_from_host(&c, &leader, &path, &t).await {
+            return Ok(Json(v));
         }
-        if let Some(node) = host_node_for_project(&c, &project) {
-            if let Some(v) = fetch_from_host(&c, &node, &path, &t).await {
-                return Ok(Json(v));
+        // Leader unreachable: for a project this node never hosted (untagged
+        // local row), try the host node before giving up to a possibly-empty
+        // local default.
+        if crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT {
+            if let Some(node) = host_node_for_project(&c, &project) {
+                if let Some(v) = fetch_from_host(&c, &node, &path, &t).await {
+                    return Ok(Json(v));
+                }
             }
         }
     }
@@ -691,7 +704,7 @@ async fn project_build_put(
 }
 
 /// The tier (hobby/pro/enterprise) of the team owning a project.
-fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
+pub(crate) fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
     let team = norm(&c.projects.team_of(project)).to_string();
     // Fall back to the BILLING plan when there is no team row — a personal
     // namespace (`u_<uid>`, `personal`) has a billing account but no team, so

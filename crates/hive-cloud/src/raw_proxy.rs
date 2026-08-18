@@ -172,10 +172,24 @@ fn desired_ports(cloud: &Arc<CloudState>) -> BTreeMap<u16, ServiceProtocol> {
 }
 
 async fn accept_loop(cloud: Arc<CloudState>, port: u16, listener: TcpListener, tls: bool) {
-    // One acceptor per listener, sharing the 443 gateway's SNI resolver (same
-    // wildcard/per-host certs) with ALPN pinned to http/1.1 — see
-    // `acme::raw_server_config` for why h2 must not be offered here.
-    let acceptor = tls.then(|| tokio_rustls::TlsAcceptor::from(crate::acme::raw_server_config()));
+    // The acceptor is SCOPED to the hostnames of the project that owns this
+    // port. The fleet-wide SNI resolver holds every platform certificate
+    // (api./admin./dashboard) and every other tenant's custom domain, so
+    // handing it to a tenant-controlled listener would let that port present
+    // any of them to a client that asked by SNI — a credential-harvesting
+    // surface on a port the tenant chose. Rebuilt per accept-loop from the
+    // live binding, and re-derived on rebind, so a project that gains a custom
+    // domain picks it up on the next reconcile tick. ALPN stays http/1.1-only
+    // (see `acme::raw_server_config_for`).
+    let acceptor = tls.then(|| {
+        let hosts = scoped_tls_hosts(&cloud, port);
+        tracing::info!(
+            port,
+            hosts = hosts.len(),
+            "raw-proxy: TLS acceptor scoped to this port's project hostnames"
+        );
+        tokio_rustls::TlsAcceptor::from(crate::acme::raw_server_config_for(hosts))
+    });
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -285,6 +299,38 @@ where
 /// `public_port` → allocation. Sources, most-authoritative first: this node's
 /// own durable claim registry (the allocator node knows even before the record
 /// gossips), then local deployments' stamped bindings, then gossiped peers'.
+/// The hostnames a PUBLISHED port may legitimately present a certificate for:
+/// every alias label of the owning project, rendered on the apps domain, plus
+/// any managed custom domain whose first label is one of those (aliases are
+/// keyed by first label — the platform-wide routing convention). Empty when
+/// the port resolves to nothing, which fails every handshake — the correct
+/// outcome for a listener with no owner.
+fn scoped_tls_hosts(cloud: &Arc<CloudState>, port: u16) -> Vec<String> {
+    let Some(target) = resolve_binding(cloud, port) else {
+        return Vec::new();
+    };
+    let labels = cloud.gw.alias_labels_for_project(&target.project);
+    let apps = cloud.apps_domain.trim().trim_matches('.').to_string();
+    let mut hosts: Vec<String> = Vec::new();
+    for l in &labels {
+        if !apps.is_empty() {
+            hosts.push(format!("{l}.{apps}"));
+        }
+    }
+    // Managed custom domains attach by first label; include their FULL name so
+    // a browser hitting `shop.example.com:9001` completes, while
+    // `api.<platform>` (never a label of this project) does not.
+    for d in cloud.domains.snapshot() {
+        let first = d.domain.split('.').next().unwrap_or("");
+        if !first.is_empty() && labels.iter().any(|l| l == first) {
+            hosts.push(d.domain.to_ascii_lowercase());
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 fn resolve_binding(cloud: &Arc<CloudState>, port: u16) -> Option<Target> {
     if let Some(a) = crate::raw_ports::lookup(port) {
         return Some(Target {

@@ -132,6 +132,23 @@ pub const PLANS: &[PlanSpec] = &[
     },
 ];
 
+/// Per-plan CEILING on a single function's resources: `(max_vcpus,
+/// max_memory_mib)`, or `None` for no plan-specific cap (the container-level
+/// `HIVE_CONTAINER_*_MAX` clamp still applies fleet-wide).
+///
+/// Capacity policy (operator decision, 2026-08): enterprise deployments are
+/// the fleet's biggest consumers, so an enterprise function is capped at
+/// 2 vCPU / 4 GiB (the default sizing, 1 vCPU / 2 GiB, is unchanged — this
+/// only lowers the MAX an enterprise function may request). Every other plan
+/// — including any legacy/grandfathered tenant — is left exactly as it was:
+/// `None` means "no new cap here", so nothing about their sizing changes.
+pub fn plan_resource_ceiling(plan: &str) -> Option<(u32, u32)> {
+    match plan.trim().to_ascii_lowercase().as_str() {
+        "enterprise" => Some((2, 4096)),
+        _ => None,
+    }
+}
+
 pub fn plan_spec(id: &str) -> &'static PlanSpec {
     PLANS.iter().find(|p| p.id == id).unwrap_or(&PLANS[0])
 }

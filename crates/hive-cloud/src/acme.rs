@@ -135,6 +135,64 @@ pub fn install_bundle(bundle: &CertBundle) -> anyhow::Result<()> {
 /// the terminated plaintext is spliced byte-for-byte into the container's own
 /// HTTP server, and a client that negotiated h2 via ALPN would then speak h2
 /// frames at an HTTP/1.1 backend.
+/// SNI resolver SCOPED to one tenant's hostnames. The shared [`SniResolver`]
+/// holds EVERY fleet certificate — api./admin./webhook./dashboard hosts, the
+/// apps and DB wildcards, and every tenant's custom domain — and handing it to
+/// a tenant-controlled raw-port listener let that listener present ANY of them
+/// to a client that asked by SNI. On a port the tenant chose, that is a
+/// credential-harvesting surface: a victim pointed at `<tenant-port>` while
+/// sending `api.<platform>` as SNI would complete a handshake against the
+/// platform's own certificate. A published port may only ever speak for the
+/// hostnames that legitimately route to its project; anything else fails the
+/// handshake (resolve → None), which is the correct, loud outcome.
+pub struct ScopedSniResolver {
+    allowed: Vec<String>,
+}
+
+impl ScopedSniResolver {
+    pub fn new(allowed: Vec<String>) -> ScopedSniResolver {
+        ScopedSniResolver {
+            allowed: allowed
+                .into_iter()
+                .map(|h| h.trim().trim_matches('.').to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ScopedSniResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedSniResolver")
+            .field("allowed", &self.allowed.len())
+            .finish()
+    }
+}
+
+impl ResolvesServerCert for ScopedSniResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let name = hello.server_name()?.to_ascii_lowercase();
+        if !self.allowed.iter().any(|a| a == &name) {
+            return None;
+        }
+        let map = certs().load();
+        if let Some(k) = map.get(&name) {
+            return Some(k.clone());
+        }
+        let (_, zone) = name.split_once('.')?;
+        map.get(zone).cloned()
+    }
+}
+
+/// Raw-port TLS scoped to the hostnames of ONE project.
+pub fn raw_server_config_for(hosts: Vec<String>) -> Arc<rustls::ServerConfig> {
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(ScopedSniResolver::new(hosts)));
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(cfg)
+}
+
 pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()

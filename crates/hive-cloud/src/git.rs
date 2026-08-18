@@ -2124,8 +2124,34 @@ async fn run_build(
         }
     }
 
-    // Inject project env vars + function settings.
-    let env = cloud.projects.env_map(&manifest.project);
+    // ---- Classify production vs preview (Vercel's model) ----
+    // A project's production branch is recorded on its first deploy (the imported
+    // branch). Pushes to it are PRODUCTION; every other branch / PR is a PREVIEW.
+    // An explicit target on the request (webhook PR events) overrides the branch.
+    let mut prod_branch = cloud.projects.production_branch_of(&project);
+    if prod_branch.is_empty() && !actual_branch.is_empty() {
+        prod_branch = actual_branch.clone();
+        cloud.projects.set_production_branch(&project, &prod_branch);
+        log(format!("Production branch set to '{prod_branch}'."));
+    }
+    let is_production = match req.target.as_deref().map(str::trim) {
+        Some("preview") => false,
+        Some("production") => true,
+        // No explicit target -> classify from the branch.
+        _ => !actual_branch.is_empty() && actual_branch == prod_branch,
+    };
+    let deploy_env = if is_production {
+        "production"
+    } else {
+        "preview"
+    };
+
+    // Inject project env vars + function settings. FILTERED BY ENVIRONMENT:
+    // the classification above must happen BEFORE this, because a preview
+    // deployment launching with the project's production secrets is exactly
+    // the isolation the dashboard's Production/Preview selector promises and
+    // nothing enforced.
+    let env = cloud.projects.env_map_for(&manifest.project, deploy_env);
     let project_settings = cloud.projects.get(&manifest.project);
     let dedicated_ipv4_alloc = project_settings.dedicated_ipv4;
     let fsettings = project_settings.functions;
@@ -2176,6 +2202,30 @@ async fn run_build(
             f.memory_mib = fsettings.memory_mib;
         }
         f.vcpus = f.vcpus.max(1);
+        // Per-plan resource CEILING (capacity policy): an enterprise function
+        // is capped at 2 vCPU / 4 GiB. `plan_resource_ceiling` returns None for
+        // every other plan, so a legacy/grandfathered tenant is untouched.
+        // Applied AFTER the project-default fallback and the min-1 floor so it
+        // is the last word on sizing — a fluid.json or project setting can ask
+        // for more, but the plan caps it (and the deploy log says so).
+        if let Some((max_vcpus, max_mem)) =
+            crate::billing::plan_resource_ceiling(&crate::admin::team_plan(cloud, &project))
+        {
+            if f.vcpus > max_vcpus {
+                log(format!(
+                    "Function '{}' requested {} vCPU; capped to {} by the plan.",
+                    f.name, f.vcpus, max_vcpus
+                ));
+                f.vcpus = max_vcpus;
+            }
+            if f.memory_mib > max_mem {
+                log(format!(
+                    "Function '{}' requested {} MiB; capped to {} MiB by the plan.",
+                    f.name, f.memory_mib, max_mem
+                ));
+                f.memory_mib = max_mem;
+            }
+        }
         // Serverless GPU: the project-level toggle marks every function; a
         // per-function fluid.json `gpu: true` (already parsed into the manifest)
         // is preserved — settings can only turn GPU ON, never strip a
@@ -2245,22 +2295,6 @@ async fn run_build(
         manifest.functions.len()
     ));
 
-    // ---- Classify production vs preview (Vercel's model) ----
-    // A project's production branch is recorded on its first deploy (the imported
-    // branch). Pushes to it are PRODUCTION; every other branch / PR is a PREVIEW.
-    // An explicit target on the request (webhook PR events) overrides the branch.
-    let mut prod_branch = cloud.projects.production_branch_of(&project);
-    if prod_branch.is_empty() && !actual_branch.is_empty() {
-        prod_branch = actual_branch.clone();
-        cloud.projects.set_production_branch(&project, &prod_branch);
-        log(format!("Production branch set to '{prod_branch}'."));
-    }
-    let is_production = match req.target.as_deref().map(str::trim) {
-        Some("preview") => false,
-        Some("production") => true,
-        // No explicit target -> classify from the branch.
-        _ => !actual_branch.is_empty() && actual_branch == prod_branch,
-    };
     log(format!(
         "Target: {} (branch '{}' vs production branch '{}')",
         if is_production {
@@ -8555,7 +8589,10 @@ mod tests {
         // across tenants — the cache restores content a previous build could
         // write, so a shared key is a cross-tenant code path.
         let k_other = compute_cache_key(&base, "npm", "team:other").await;
-        assert_ne!(k3, k_other, "the same lockfile must not share a key across tenants");
+        assert_ne!(
+            k3, k_other,
+            "the same lockfile must not share a key across tenants"
+        );
 
         // No lockfile/package.json → None.
         let empty = std::env::temp_dir().join(format!("oe-cachekey-empty-{}", now_ms()));
