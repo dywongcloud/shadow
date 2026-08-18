@@ -1589,6 +1589,69 @@ fn supabase_api_jwt(jwt_secret: &str, role: &str) -> String {
 /// (`db_rest::supabase_studio_proxy`) against these generated credentials —
 /// the supahost working example, same enforcement semantics, no Kong
 /// container.
+/// `podman pull` with one retry — explicit, because a transient registry/
+/// transport flake inside `podman run`'s OWN pull phase otherwise surfaces
+/// as a failed provision while the server-side pull completes anyway
+/// (witnessed on fc-bangkok 2026-08-18: the CLI exited mid-pull, the
+/// container started 2s later, and the provision tore the stack down as
+/// "simulated").
+async fn podman_pull_retry(image: &str) -> bool {
+    for attempt in 0..2 {
+        let out = Command::new("podman")
+            .args(["pull", image])
+            .env("PATH", augmented_path())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => return true,
+            Ok(o) => tracing::warn!(image, attempt, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "podman pull failed"),
+            Err(e) => tracing::warn!(image, attempt, error = %e, "podman pull could not spawn"),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+    false
+}
+
+/// `podman run -d` with adoption of the server-side completion race: when the
+/// CLI fails but the named container nevertheless came up (the pull-phase
+/// transport flake above), the run DID provision — adopting it beats tearing
+/// down a healthy container on a phantom failure.
+async fn podman_run_detached(args: &[String]) -> Result<(), String> {
+    let name = args
+        .iter()
+        .position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let out = Command::new("podman")
+        .args(args)
+        .env("PATH", augmented_path())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !name.is_empty() {
+                let insp = Command::new("podman")
+                    .args(["inspect", "-f", "{{.State.Running}}", &name])
+                    .env("PATH", augmented_path())
+                    .output()
+                    .await;
+                if let Ok(i) = insp {
+                    if i.status.success() && String::from_utf8_lossy(&i.stdout).trim() == "true" {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(stderr)
+        }
+        Err(e) => Err(format!("spawn: {e}")),
+    }
+}
+
 async fn provision_supabase(
     store: &Arc<DatabaseStore>,
     id: &str,
@@ -1669,31 +1732,36 @@ async fn provision_supabase(
         }
     };
 
+    // Pull all three images EXPLICITLY first (retry each): the pull phase is
+    // where a first-time provision is slowest and flakiest, and a pull folded
+    // into `podman run` fails the run opaquely (see podman_pull_retry's doc).
+    for image in [
+        "docker.io/supabase/postgres:15.8.1.085",
+        "docker.io/supabase/postgres-meta:v0.95.2",
+        "docker.io/supabase/studio:2026.02.16-sha-26c615c",
+    ] {
+        if !podman_pull_retry(image).await {
+            tracing::warn!(db = %id, image, "supabase image pull failed — simulating");
+            return Ok(("simulated".into(), conn, None));
+        }
+    }
+
     // db — the engine. The supabase/postgres image bakes the Supabase role set;
     // meta and studio both connect as the `postgres` superuser with this
     // password, so the vendored roles/jwt init SQL is not needed for this
     // dependency set.
-    let out = Command::new("podman")
-        .args([
-            "run", "-d", "--name", &c_db, "--replace",
-            "-e", &format!("POSTGRES_PASSWORD={pg_password}"),
-            "-v", &format!("{volume}:/var/lib/postgresql/data"),
-            "-p", &format!("127.0.0.1:{port_pg}:5432"),
-            "--network", &netname, "--ip", &db_ip,
-            "docker.io/supabase/postgres:15.8.1.085",
-        ])
-        .env("PATH", augmented_path())
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => started.push(c_db.clone()),
-        Ok(o) => {
-            tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "supabase db container failed — simulating");
-            cleanup(&started).await;
-            return Ok(("simulated".into(), conn, None));
-        }
+    let db_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_db.clone(), "--replace".into(),
+        "-e".into(), format!("POSTGRES_PASSWORD={pg_password}"),
+        "-v".into(), format!("{volume}:/var/lib/postgresql/data"),
+        "-p".into(), format!("127.0.0.1:{port_pg}:5432"),
+        "--network".into(), netname.clone(), "--ip".into(), db_ip.clone(),
+        "docker.io/supabase/postgres:15.8.1.085".into(),
+    ];
+    match podman_run_detached(&db_args).await {
+        Ok(()) => started.push(c_db.clone()),
         Err(e) => {
-            tracing::warn!(db = %id, error = %e, "supabase db container could not spawn — simulating");
+            tracing::warn!(db = %id, error = %e, "supabase db container failed — simulating");
             return Ok(("simulated".into(), conn, None));
         }
     }
@@ -1702,74 +1770,56 @@ async fn provision_supabase(
     }
 
     // meta — pg-meta, Studio's management API. Internal only: no host publish.
-    let out = Command::new("podman")
-        .args([
-            "run", "-d", "--name", &c_meta, "--replace",
-            "-e", &format!("PG_META_DB_HOST=db"),
-            "-e", "PG_META_DB_PORT=5432",
-            "-e", &format!("PG_META_DB_NAME={dbname}"),
-            "-e", "PG_META_DB_USER=postgres",
-            "-e", &format!("PG_META_DB_PASSWORD={pg_password}"),
-            "-e", "PG_META_DB_SSL_MODE=disable",
-            "-e", &format!("CRYPTO_KEY={crypto_key}"),
-            "--network", &netname, "--ip", &meta_ip,
-            "--add-host", &format!("db:{db_ip}"),
-            "docker.io/supabase/postgres-meta:v0.95.2",
-        ])
-        .env("PATH", augmented_path())
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => started.push(c_meta.clone()),
-        Ok(o) => {
-            tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "supabase meta container failed — simulating");
-            cleanup(&started).await;
-            return Ok(("simulated".into(), conn, None));
-        }
+    let meta_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_meta.clone(), "--replace".into(),
+        "-e".into(), "PG_META_DB_HOST=db".into(),
+        "-e".into(), "PG_META_DB_PORT=5432".into(),
+        "-e".into(), format!("PG_META_DB_NAME={dbname}"),
+        "-e".into(), "PG_META_DB_USER=postgres".into(),
+        "-e".into(), format!("PG_META_DB_PASSWORD={pg_password}"),
+        "-e".into(), "PG_META_DB_SSL_MODE=disable".into(),
+        "-e".into(), format!("CRYPTO_KEY={crypto_key}"),
+        "--network".into(), netname.clone(), "--ip".into(), meta_ip.clone(),
+        "--add-host".into(), format!("db:{db_ip}"),
+        "docker.io/supabase/postgres-meta:v0.95.2".into(),
+    ];
+    match podman_run_detached(&meta_args).await {
+        Ok(()) => started.push(c_meta.clone()),
         Err(e) => {
-            tracing::warn!(db = %id, error = %e, "supabase meta container could not spawn — simulating");
+            tracing::warn!(db = %id, error = %e, "supabase meta container failed — simulating");
             cleanup(&started).await;
             return Ok(("simulated".into(), conn, None));
         }
     }
 
     // studio — the dashboard itself, published on loopback for the edge proxy.
-    let out = Command::new("podman")
-        .args([
-            "run", "-d", "--name", &c_studio, "--replace",
-            "-e", "HOSTNAME=::",
-            "-e", &format!("STUDIO_PG_META_URL=http://meta:8080"),
-            "-e", "POSTGRES_HOST=db",
-            "-e", "POSTGRES_PORT=5432",
-            "-e", &format!("POSTGRES_DB={dbname}"),
-            "-e", &format!("POSTGRES_PASSWORD={pg_password}"),
-            "-e", &format!("PG_META_CRYPTO_KEY={crypto_key}"),
-            "-e", &format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
-            "-e", &format!("DEFAULT_PROJECT_NAME={}", req.name),
-            "-e", &format!("SUPABASE_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
-            "-e", &format!("SUPABASE_PUBLIC_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
-            "-e", &format!("SUPABASE_ANON_KEY={}", conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()),
-            "-e", &format!("SUPABASE_SERVICE_KEY={}", conn.get("SUPABASE_SERVICE_KEY").cloned().unwrap_or_default()),
-            "-e", &format!("AUTH_JWT_SECRET={jwt_secret}"),
-            "-e", "NEXT_PUBLIC_ENABLE_LOGS=false",
-            "-p", &format!("127.0.0.1:{port_studio}:3000"),
-            "--network", &netname, "--ip", &studio_ip,
-            "--add-host", &format!("db:{db_ip}"),
-            "--add-host", &format!("meta:{meta_ip}"),
-            "docker.io/supabase/studio:2026.02.16-sha-26c615c",
-        ])
-        .env("PATH", augmented_path())
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => started.push(c_studio.clone()),
-        Ok(o) => {
-            tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "supabase studio container failed — simulating");
-            cleanup(&started).await;
-            return Ok(("simulated".into(), conn, None));
-        }
+    let studio_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_studio.clone(), "--replace".into(),
+        "-e".into(), "HOSTNAME=::".into(),
+        "-e".into(), "STUDIO_PG_META_URL=http://meta:8080".into(),
+        "-e".into(), "POSTGRES_HOST=db".into(),
+        "-e".into(), "POSTGRES_PORT=5432".into(),
+        "-e".into(), format!("POSTGRES_DB={dbname}"),
+        "-e".into(), format!("POSTGRES_PASSWORD={pg_password}"),
+        "-e".into(), format!("PG_META_CRYPTO_KEY={crypto_key}"),
+        "-e".into(), format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
+        "-e".into(), format!("DEFAULT_PROJECT_NAME={}", req.name),
+        "-e".into(), format!("SUPABASE_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
+        "-e".into(), format!("SUPABASE_PUBLIC_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
+        "-e".into(), format!("SUPABASE_ANON_KEY={}", conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()),
+        "-e".into(), format!("SUPABASE_SERVICE_KEY={}", conn.get("SUPABASE_SERVICE_KEY").cloned().unwrap_or_default()),
+        "-e".into(), format!("AUTH_JWT_SECRET={jwt_secret}"),
+        "-e".into(), "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
+        "-p".into(), format!("127.0.0.1:{port_studio}:3000"),
+        "--network".into(), netname.clone(), "--ip".into(), studio_ip.clone(),
+        "--add-host".into(), format!("db:{db_ip}"),
+        "--add-host".into(), format!("meta:{meta_ip}"),
+        "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
+    ];
+    match podman_run_detached(&studio_args).await {
+        Ok(()) => started.push(c_studio.clone()),
         Err(e) => {
-            tracing::warn!(db = %id, error = %e, "supabase studio container could not spawn — simulating");
+            tracing::warn!(db = %id, error = %e, "supabase studio container failed — simulating");
             cleanup(&started).await;
             return Ok(("simulated".into(), conn, None));
         }
