@@ -52,16 +52,31 @@ export async function GET(req: NextRequest) {
   if (target.protocol !== "https:") {
     return new NextResponse("only https upstreams are proxied", { status: 400 });
   }
+  // Forward the client's Range so the video element's own byte-range requests
+  // (and #EXT-X-BYTERANGE segments) are satisfied by the upstream as 206.
+  const range = req.headers.get("range");
+  const fetchUpstream = () =>
+    fetch(target.toString(), {
+      // Some CDNs 403 an empty UA / wrong referer.
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)",
+        ...(range ? { range } : {}),
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(25_000),
+    });
   let upstream: Response;
   try {
-    upstream = await fetch(target.toString(), {
-      // Some CDNs 403 an empty UA / wrong referer.
-      headers: { "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)" },
-      cache: "no-store",
-      signal: AbortSignal.timeout(15_000),
-    });
-  } catch (e) {
-    return new NextResponse(`upstream error: ${String(e)}`, { status: 502 });
+    upstream = await fetchUpstream();
+  } catch {
+    // One transient retry before surfacing. Mid-stream, a single failed
+    // segment fetch becomes a FATAL player error, which reads to the user as a
+    // freeze — so a blip must not propagate on the first try.
+    try {
+      upstream = await fetchUpstream();
+    } catch (e) {
+      return new NextResponse(`upstream error: ${String(e)}`, { status: 502 });
+    }
   }
   if (!upstream.ok) {
     return new NextResponse(`upstream ${upstream.status}`, { status: 502 });
@@ -90,12 +105,19 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  // Segment (or key): stream the bytes straight through, preserving type.
+  // Segment (or key): stream the bytes straight through, preserving type and
+  // any range/length metadata so partial (206) responses reach the player
+  // intact instead of confusing its buffer.
+  const segHeaders: Record<string, string> = {
+    "content-type": ctype || "application/octet-stream",
+    "cache-control": "no-store",
+  };
+  for (const h of ["content-range", "accept-ranges", "content-length"]) {
+    const v = upstream.headers.get(h);
+    if (v) segHeaders[h] = v;
+  }
   return new NextResponse(upstream.body, {
-    status: 200,
-    headers: {
-      "content-type": ctype || "application/octet-stream",
-      "cache-control": "no-store",
-    },
+    status: upstream.status === 206 ? 206 : 200,
+    headers: segHeaders,
   });
 }

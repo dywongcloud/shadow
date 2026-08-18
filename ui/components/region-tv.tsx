@@ -228,9 +228,82 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
     // Same-origin proxy so hls.js's playlist+segment fetches pass the app's
     // CSP (`connect-src 'self'`); arbitrary IPTV hosts can never be allowlisted.
     const src = proxiedStreamUrl(channel.url);
+
+    // Live IPTV is inherently flaky: the auth token embedded in the stream URL
+    // expires, ad-stitchers emit discontinuities, CDNs blip, and a single
+    // proxied segment can time out. Each of those surfaces to the player as a
+    // FATAL error, and with no recovery every one is a permanent freeze — the
+    // reported symptom. So recover in place: reload the source on network
+    // errors (which also re-mints an expired token via the upstream redirect),
+    // recoverMediaError on media errors, and run a stall watchdog that nudges a
+    // wedged element back to the live edge. Give up only after bounded retries.
+    let netRetries = 0;
+    let mediaRetries = 0;
+    let lastTime = -1;
+    let stalledFor = 0;
+    let watchdog = 0;
+    let recoverTimer = 0;
+
+    const reload = () => {
+      if (cancelled) return;
+      try {
+        if (hls) {
+          hls.stopLoad();
+          hls.loadSource(src);
+          hls.startLoad();
+        } else {
+          video.src = src;
+        }
+        video.play().catch(() => {});
+      } catch {
+        /* torn down mid-recover */
+      }
+    };
+
+    const nudgeToLive = () => {
+      if (cancelled) return;
+      try {
+        const live = hls?.liveSyncPosition ?? NaN;
+        if (Number.isFinite(live) && (live as number) > video.currentTime) {
+          video.currentTime = live as number;
+        } else if (video.seekable.length) {
+          const end = video.seekable.end(video.seekable.length - 1);
+          if (end - video.currentTime > 6) video.currentTime = end - 1;
+        }
+      } catch {
+        /* seeking not permitted yet */
+      }
+    };
+
+    const startWatchdog = () => {
+      watchdog = window.setInterval(() => {
+        if (cancelled || video.paused || video.ended) {
+          stalledFor = 0;
+          return;
+        }
+        if (video.currentTime === lastTime) {
+          // Wedged while it should be playing: nudge to the live edge first,
+          // then escalate to a full reload if that didn't unstick it.
+          stalledFor += 3;
+          if (stalledFor === 6) nudgeToLive();
+          else if (stalledFor >= 12) {
+            stalledFor = 0;
+            reload();
+          }
+        } else {
+          stalledFor = 0;
+          lastTime = video.currentTime;
+        }
+      }, 3000);
+    };
+
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Native HLS (Safari/iOS): the engine recovers most stalls itself; an
+      // error->reload plus the watchdog cover the cases where it wedges.
       video.src = src;
       video.play().catch(() => {});
+      video.addEventListener("error", reload);
+      startWatchdog();
     } else {
       loadHls().then(() => {
         if (cancelled || !HlsModule) return;
@@ -238,17 +311,58 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
           setErr("HLS not supported in this browser");
           return;
         }
-        hls = new HlsModule({ enableWorker: true });
+        hls = new HlsModule({
+          enableWorker: true,
+          backBufferLength: 60,
+          fragLoadingTimeOut: 30000,
+          fragLoadingMaxRetry: 6,
+          manifestLoadingTimeOut: 20000,
+          manifestLoadingMaxRetry: 4,
+          levelLoadingMaxRetry: 6,
+        });
         hls.loadSource(src);
         hls.attachMedia(video);
+        hls.on(HlsModule.Events.FRAG_BUFFERED, () => {
+          // Progressing again — forget past failures so a later blip gets its
+          // full retry budget, and clear any stale error banner.
+          netRetries = 0;
+          mediaRetries = 0;
+          setErr(null);
+        });
         hls.on(HlsModule.Events.ERROR, (_e, data) => {
-          if (data.fatal) setErr(`stream error: ${data.type}`);
+          if (!data.fatal || cancelled || !HlsModule || !hls) return;
+          switch (data.type) {
+            case HlsModule.ErrorTypes.NETWORK_ERROR:
+              if (netRetries < 8) {
+                window.clearTimeout(recoverTimer);
+                recoverTimer = window.setTimeout(reload, Math.min(1000 * (netRetries + 1), 5000));
+                netRetries += 1;
+              } else {
+                setErr("stream error: network");
+              }
+              break;
+            case HlsModule.ErrorTypes.MEDIA_ERROR:
+              if (mediaRetries < 3) {
+                mediaRetries += 1;
+                hls.recoverMediaError();
+              } else {
+                setErr("stream error: media");
+              }
+              break;
+            default:
+              setErr(`stream error: ${data.type}`);
+              hls.destroy();
+          }
         });
         video.play().catch(() => {});
+        startWatchdog();
       });
     }
     return () => {
       cancelled = true;
+      window.clearInterval(watchdog);
+      window.clearTimeout(recoverTimer);
+      video.removeEventListener("error", reload);
       hls?.destroy();
       video.removeAttribute("src");
       video.load();
