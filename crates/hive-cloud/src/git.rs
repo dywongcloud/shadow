@@ -8535,26 +8535,32 @@ mod tests {
             .await
             .unwrap();
 
-        let k1 = compute_cache_key(&base, "npm").await;
-        let k2 = compute_cache_key(&base, "npm").await;
+        let k1 = compute_cache_key(&base, "npm", "team:acme").await;
+        let k2 = compute_cache_key(&base, "npm", "team:acme").await;
         assert!(k1.is_some());
         assert_eq!(k1, k2, "same lockfile+pm must yield the same key");
 
         // Different package manager → different key.
-        let k_pnpm = compute_cache_key(&base, "pnpm").await;
+        let k_pnpm = compute_cache_key(&base, "pnpm", "team:acme").await;
         assert_ne!(k1, k_pnpm);
 
         // Changed lockfile → different key.
         tokio::fs::write(base.join("package-lock.json"), b"{\"v\":2}")
             .await
             .unwrap();
-        let k3 = compute_cache_key(&base, "npm").await;
+        let k3 = compute_cache_key(&base, "npm", "team:acme").await;
         assert_ne!(k1, k3, "changed lockfile must change the key");
+
+        // TENANT SCOPING: identical lockfile + package manager must NOT collide
+        // across tenants — the cache restores content a previous build could
+        // write, so a shared key is a cross-tenant code path.
+        let k_other = compute_cache_key(&base, "npm", "team:other").await;
+        assert_ne!(k3, k_other, "the same lockfile must not share a key across tenants");
 
         // No lockfile/package.json → None.
         let empty = std::env::temp_dir().join(format!("oe-cachekey-empty-{}", now_ms()));
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        assert_eq!(compute_cache_key(&empty, "npm").await, None);
+        assert_eq!(compute_cache_key(&empty, "npm", "team:acme").await, None);
 
         let _ = tokio::fs::remove_dir_all(&base).await;
         let _ = tokio::fs::remove_dir_all(&empty).await;
