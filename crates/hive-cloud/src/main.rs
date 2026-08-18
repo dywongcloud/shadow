@@ -4640,22 +4640,29 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
             // DNS and placement. Measured live as audible=15 / visible_healthy=6
             // across nine nodes at once. Runs every round, after the verdicts.
             let restored = crate::health::restore_gossip_alive(&cloud.registry);
-            if restored > 0 {
+            if !restored.is_empty() {
                 // Probing is what SHOULD be clearing these; a nonzero count is a
                 // local transport fault, not a peer fault.
                 tracing::warn!(
-                    restored,
+                    restored = restored.len(),
                     "health: restored peers that are gossiping but unprobeable — \
                      this node's mesh transport is failing against live peers"
                 );
-                // Those peers' trunks are the ones that failed; drop them so the
-                // next probe re-dials fresh instead of re-timing-out on a wedge.
+                // Drop the trunks of EXACTLY the peers restored above, resolved by
+                // id — never by testing `latency_ms == RESTORED_LATENCY_MS`, which
+                // a genuine measurement can equal (probe RTT is stored raw, and
+                // ~1s cross-continent probes are normal here) and which a relayed
+                // NodeInfo can carry in from another observer. Those peers' trunks
+                // are the ones that just failed, so dropping them lets the next
+                // probe re-dial fresh instead of re-timing-out on the wedge.
                 if let Some(pool) = cloud.mesh.read().clone() {
+                    let restored_set: std::collections::HashSet<&str> =
+                        restored.iter().map(|s| s.as_str()).collect();
                     let ids: Vec<String> = cloud
                         .registry
                         .nodes()
                         .into_iter()
-                        .filter(|n| !n.is_self && n.healthy && n.latency_ms == hive_edge::region::NodeRegistry::RESTORED_LATENCY_MS)
+                        .filter(|n| !n.is_self && restored_set.contains(n.id.as_str()))
                         .filter_map(|n| n.peer_id)
                         .collect();
                     tokio::spawn(async move {

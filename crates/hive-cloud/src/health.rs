@@ -198,18 +198,27 @@ pub fn demote(
 /// it cannot resurrect a genuinely dead peer: a silent node's `last_seen_ms`
 /// ages past the window and `NodeRegistry::nodes()` drops it outright at 30s.
 ///
-/// Returns the number of peers restored this pass.
-pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> usize {
+/// Returns the ids actually restored this pass.
+///
+/// The IDS, not a count: the caller's follow-up (dropping those peers' wedged
+/// trunks) must act on exactly the peers this pass restored. Re-deriving that
+/// set by testing `latency_ms == RESTORED_LATENCY_MS` conflates the sentinel
+/// with a genuine measurement — `set_health` stores the raw probe RTT and this
+/// fleet really does see ~1s cross-continent probes (AGENTS.md records a
+/// successful 7462ms one), so a correctly-probed peer that happened to measure
+/// exactly 999ms would have its healthy trunk closed. It also mis-fires on a
+/// peer whose `NodeInfo` was relayed from an observer that had restored it,
+/// since `upsert_peer` adopts an unknown peer's healthy/latency verbatim.
+pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<String> {
     let stale_ids: Vec<String> = registry
         .nodes()
         .into_iter()
         .filter(|n| !n.is_self && !n.healthy)
         .map(|n| n.id)
         .collect();
-    let mut restored = 0usize;
+    let mut restored: Vec<String> = Vec::new();
     for id in stale_ids {
         if registry.restore_health_if_gossip_fresh(&id, GOSSIP_ALIVE_MS) {
-            restored += 1;
             RESTORED.fetch_add(1, Ordering::Relaxed);
             // A restored peer is reachable-by-evidence, so it must not keep
             // serving out a routing penalty from the transport fault that
@@ -220,6 +229,7 @@ pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> usize
                 "peer RESTORED to healthy — it is still gossiping, so the withdrawal that \
                  removed it from DNS/placement is no longer supported by evidence"
             );
+            restored.push(id);
         }
     }
     restored
