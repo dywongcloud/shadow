@@ -39,54 +39,24 @@ export const REGION_TV_GEO: Record<string, { lat: number; lon: number; country: 
   frankfurt: { lat: 50.1109, lon: 8.6821, country: "DE" },
 };
 
-const CHANNELS_URL = "https://iptv-org.github.io/api/channels.json";
-const STREAMS_URL = "https://iptv-org.github.io/api/streams.json";
-
-interface IptvChannel {
-  id: string;
-  name: string;
-  country: string;
-  categories?: string[];
-  is_nsfw?: boolean;
-  closed?: string | null;
-}
-interface IptvStream {
-  channel: string | null;
-  url: string;
-}
-
 let catalogPromise: Promise<Map<string, TvChannel[]>> | null = null;
 
-/** country code → playable channels, joined + filtered once per session. */
+/** country code → playable channels. Fetched from THIS origin's proxy
+ *  (`/api/tv/catalog`) — the browser can't reach iptv-org directly under the
+ *  app's CSP, and the join runs server-side there. Cached once per session. */
 export function loadTvCatalog(): Promise<Map<string, TvChannel[]>> {
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
-    const [chRes, stRes] = await Promise.all([fetch(CHANNELS_URL), fetch(STREAMS_URL)]);
-    if (!chRes.ok || !stRes.ok) throw new Error("TV catalog fetch failed");
-    const channels = (await chRes.json()) as IptvChannel[];
-    const streams = (await stRes.json()) as IptvStream[];
-    // First https HLS stream per channel id.
-    const streamByChannel = new Map<string, string>();
-    for (const s of streams) {
-      if (!s.channel || streamByChannel.has(s.channel)) continue;
-      if (!s.url?.startsWith("https://") || !s.url.includes(".m3u8")) continue;
-      streamByChannel.set(s.channel, s.url);
-    }
-    const wanted = new Set(Object.values(REGION_TV_GEO).map((g) => g.country));
+    const res = await fetch("/api/tv/catalog");
+    if (!res.ok) throw new Error(`TV catalog fetch failed (${res.status})`);
+    const data = (await res.json()) as {
+      byCountry?: Record<string, TvChannel[]>;
+      error?: string;
+    };
+    if (data.error) throw new Error(data.error);
     const byCountry = new Map<string, TvChannel[]>();
-    for (const c of channels) {
-      if (!wanted.has(c.country) || c.is_nsfw || c.closed) continue;
-      const url = streamByChannel.get(c.id);
-      if (!url) continue;
-      const list = byCountry.get(c.country) ?? [];
-      list.push({
-        id: c.id,
-        name: c.name,
-        country: c.country,
-        categories: c.categories ?? [],
-        url,
-      });
-      byCountry.set(c.country, list);
+    for (const [country, list] of Object.entries(data.byCountry ?? {})) {
+      byCountry.set(country, list);
     }
     return byCountry;
   })().catch((e) => {
@@ -94,6 +64,12 @@ export function loadTvCatalog(): Promise<Map<string, TvChannel[]>> {
     throw e;
   });
   return catalogPromise;
+}
+
+/** Route a third-party HLS URL through this origin's proxy so hls.js's fetches
+ *  are same-origin (CSP `connect-src 'self'`). */
+export function proxiedStreamUrl(url: string): string {
+  return `/api/tv/hls?url=${encodeURIComponent(url)}`;
 }
 
 /** The per-region view over the loaded catalog, for regions the mesh serves. */

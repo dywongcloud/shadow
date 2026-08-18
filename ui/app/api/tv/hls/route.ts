@@ -1,0 +1,96 @@
+import { NextRequest, NextResponse } from "next/server";
+
+// Same-origin HLS proxy. hls.js fetches the .m3u8 playlist and every segment
+// over fetch/XHR, which the app's CSP `connect-src` gates — and the stream
+// hosts are arbitrary third parties that can never be allowlisted. Proxying
+// through this route makes every request same-origin ('self'), so the tight
+// CSP is untouched. The playlist's segment/variant URIs are REWRITTEN to point
+// back at this route (absolute-resolved against the playlist's own URL), so
+// hls.js follows them here too; segment responses stream straight through.
+//
+// Safety: only https upstreams are proxied, and the platform node — not the
+// arbitrary host — is the client, so no browser CSP is weakened. This does put
+// viewing bytes on the node's egress; acceptable for a nice-to-have TV feature
+// and the only CSP-clean way to play arbitrary IPTV.
+
+export const dynamic = "force-dynamic";
+
+const SELF_PATH = "/api/tv/hls";
+
+function proxied(absUrl: string): string {
+  return `${SELF_PATH}?url=${encodeURIComponent(absUrl)}`;
+}
+
+/** Rewrite every URI line + URI="" attribute in an m3u8 to route through us. */
+function rewritePlaylist(text: string, baseUrl: string): string {
+  const base = new URL(baseUrl);
+  const resolve = (u: string) => new URL(u, base).toString();
+  return text
+    .split("\n")
+    .map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      // Attribute form: URI="..." (EXT-X-KEY, EXT-X-MEDIA, EXT-X-MAP, …).
+      if (t.startsWith("#")) {
+        return line.replace(/URI="([^"]+)"/g, (_m, u) => `URI="${proxied(resolve(u))}"`);
+      }
+      // A bare URI line (segment or variant playlist).
+      return proxied(resolve(t));
+    })
+    .join("\n");
+}
+
+export async function GET(req: NextRequest) {
+  const url = req.nextUrl.searchParams.get("url");
+  if (!url) return new NextResponse("missing url", { status: 400 });
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return new NextResponse("bad url", { status: 400 });
+  }
+  if (target.protocol !== "https:") {
+    return new NextResponse("only https upstreams are proxied", { status: 400 });
+  }
+  let upstream: Response;
+  try {
+    upstream = await fetch(target.toString(), {
+      // Some CDNs 403 an empty UA / wrong referer.
+      headers: { "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (e) {
+    return new NextResponse(`upstream error: ${String(e)}`, { status: 502 });
+  }
+  if (!upstream.ok) {
+    return new NextResponse(`upstream ${upstream.status}`, { status: 502 });
+  }
+
+  const ctype = (upstream.headers.get("content-type") || "").toLowerCase();
+  const isPlaylist =
+    target.pathname.endsWith(".m3u8") ||
+    ctype.includes("mpegurl") ||
+    ctype.includes("vnd.apple.mpegurl");
+
+  if (isPlaylist) {
+    const text = await upstream.text();
+    const rewritten = rewritePlaylist(text, target.toString());
+    return new NextResponse(rewritten, {
+      status: 200,
+      headers: {
+        "content-type": "application/vnd.apple.mpegurl",
+        "cache-control": "no-store",
+      },
+    });
+  }
+
+  // Segment (or key): stream the bytes straight through, preserving type.
+  return new NextResponse(upstream.body, {
+    status: 200,
+    headers: {
+      "content-type": ctype || "application/octet-stream",
+      "cache-control": "no-store",
+    },
+  });
+}

@@ -15,7 +15,7 @@
 import { ChevronDown, ChevronUp, Circle, HardDrive, Square, Tv, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MAP_VIEW, projectGeo } from "@/components/world-choropleth";
-import { regionTv, useTvCatalog, type RegionTv } from "@/lib/tv";
+import { proxiedStreamUrl, regionTv, useTvCatalog, type RegionTv } from "@/lib/tv";
 import {
   fmtBytes,
   fmtClock,
@@ -225,7 +225,9 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
     if (!video || !channel) return;
     let cancelled = false;
     let hls: import("hls.js").default | null = null;
-    const src = channel.url;
+    // Same-origin proxy so hls.js's playlist+segment fetches pass the app's
+    // CSP (`connect-src 'self'`); arbitrary IPTV hosts can never be allowlisted.
+    const src = proxiedStreamUrl(channel.url);
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = src;
       video.play().catch(() => {});
