@@ -1,0 +1,231 @@
+"use client";
+
+// Region TV overlay — the dial.wtf atlas TV logic on THIS dashboard's world
+// map. Plots are green "OLED" digital text hovering over each serving
+// region: fully transparent fill with a glassmorphic edge (backdrop blur +
+// hairline border), glow from text-shadow, never a solid panel. Clicking a
+// plot opens that region's live TV (iptv-org catalog for the region's
+// country, HLS playback). A collapsible statistics strip renders below the
+// map. Alignment: plots use the SAME static projection the choropleth paints
+// with (projectGeo/MAP_VIEW), expressed as percentage offsets over the SVG
+// box — correct at any rendered size. Known limit, deliberate: the map's
+// double-click country zoom transforms only the SVG, so plots hold their
+// full-world positions until zoom-out.
+
+import { ChevronDown, ChevronUp, Tv, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { MAP_VIEW, projectGeo } from "@/components/world-choropleth";
+import { regionTv, useTvCatalog, type RegionTv } from "@/lib/tv";
+
+// Lazy hls.js, the StreamViewer pattern from the atlas: native HLS on
+// Safari/iOS, hls.js everywhere else, loaded only in the browser on demand.
+let HlsModule: typeof import("hls.js").default | null = null;
+let hlsLoad: Promise<void> | null = null;
+function loadHls(): Promise<void> {
+  if (typeof window === "undefined") return Promise.resolve();
+  if (HlsModule) return Promise.resolve();
+  if (!hlsLoad) {
+    hlsLoad = import("hls.js").then((m) => {
+      HlsModule = m.default;
+    });
+  }
+  return hlsLoad;
+}
+
+const OLED =
+  "font-mono text-[11px] leading-none text-green-400 [text-shadow:0_0_6px_rgba(74,222,128,0.9),0_0_18px_rgba(74,222,128,0.35)]";
+const GLASS = "bg-transparent backdrop-blur-[2px] border border-green-400/25 rounded";
+
+export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
+  const { catalog, error } = useTvCatalog();
+  const [open, setOpen] = useState<RegionTv | null>(null);
+
+  const regions = useMemo(
+    () => (catalog ? regionTv(catalog, liveRegions) : []),
+    [catalog, liveRegions],
+  );
+
+  return (
+    <>
+      {/* Plots: absolutely positioned inside the map's relative wrapper. */}
+      {regions.map((r) => {
+        const p = projectGeo(r.lon, r.lat);
+        if (!p) return null;
+        const [x, y] = p;
+        return (
+          <button
+            key={r.region}
+            onClick={() => setOpen(r)}
+            className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 px-1.5 py-1 ${GLASS} ${OLED} cursor-pointer transition-transform hover:scale-110`}
+            style={{ left: `${(x / MAP_VIEW.width) * 100}%`, top: `${(y / MAP_VIEW.height) * 100}%` }}
+            title={`Watch live TV near ${r.region}`}
+          >
+            <span className="flex items-center gap-1">
+              <Tv className="h-3 w-3" aria-hidden />
+              {r.region.toUpperCase()}
+              <span className="opacity-70">·{r.channels.length}</span>
+            </span>
+          </button>
+        );
+      })}
+      {!catalog && !error && (
+        <span className={`absolute right-2 top-2 z-10 px-1.5 py-1 ${GLASS} ${OLED} animate-pulse`}>
+          TV GRID SYNC…
+        </span>
+      )}
+      {error && (
+        <span className={`absolute right-2 top-2 z-10 px-1.5 py-1 ${GLASS} ${OLED} !text-amber-400`}>
+          TV OFFLINE
+        </span>
+      )}
+
+      {open && <RegionTvViewer region={open} onClose={() => setOpen(null)} />}
+    </>
+  );
+}
+
+/** Collapsible statistics strip — mounted by the page BELOW the map card.
+ *  Shares the layer's catalog through the module-cached hook (one fetch). */
+export function RegionTvStats({ liveRegions }: { liveRegions: string[] }) {
+  const { catalog } = useTvCatalog();
+  const [open, setOpen] = useState(false);
+  const regions = useMemo(
+    () => (catalog ? regionTv(catalog, liveRegions) : []),
+    [catalog, liveRegions],
+  );
+  const loaded = !!catalog;
+  const total = regions.reduce((n, r) => n + r.channels.length, 0);
+  const categories = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of regions)
+      for (const c of r.channels) for (const cat of c.categories) m.set(cat, (m.get(cat) ?? 0) + 1);
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+  }, [regions]);
+
+  return (
+    <div className={`relative mt-2 ${GLASS} px-3 py-2`}>
+      <button onClick={() => setOpen(!open)} className={`flex w-full items-center justify-between ${OLED}`}>
+        <span>
+          TV GRID · {regions.length} REGION{regions.length === 1 ? "" : "S"} ·{" "}
+          {loaded ? `${total} LIVE CHANNELS` : "SYNCING"}
+        </span>
+        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      {open && (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div className="flex flex-col gap-1.5">
+            {regions.map((r) => (
+              <div key={r.region} className={`flex items-center justify-between ${OLED}`}>
+                <span className="opacity-80">
+                  {r.region.toUpperCase()} [{r.country}]
+                </span>
+                <span>{r.channels.length} CH</span>
+              </div>
+            ))}
+            {!regions.length && <span className={`${OLED} opacity-60`}>NO REGION DATA YET</span>}
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {categories.map(([cat, n]) => (
+              <div key={cat} className={`flex items-center justify-between ${OLED}`}>
+                <span className="uppercase opacity-80">{cat}</span>
+                <span>{n}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The TV: full-viewport lightbox with the region's channels, hls.js playback
+ *  with native-HLS fallback, prev/next channel switching. */
+function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => void }) {
+  const [idx, setIdx] = useState(0);
+  const [err, setErr] = useState<string | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const channel = region.channels[idx] ?? null;
+
+  useEffect(() => {
+    setErr(null);
+    const video = videoRef.current;
+    if (!video || !channel) return;
+    let cancelled = false;
+    let hls: import("hls.js").default | null = null;
+    const src = channel.url;
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+      video.play().catch(() => {});
+    } else {
+      loadHls().then(() => {
+        if (cancelled || !HlsModule) return;
+        if (!HlsModule.isSupported()) {
+          setErr("HLS not supported in this browser");
+          return;
+        }
+        hls = new HlsModule({ enableWorker: true });
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        hls.on(HlsModule.Events.ERROR, (_e, data) => {
+          if (data.fatal) setErr(`stream error: ${data.type}`);
+        });
+        video.play().catch(() => {});
+      });
+    }
+    return () => {
+      cancelled = true;
+      hls?.destroy();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [channel]);
+
+  const step = (d: number) => {
+    if (!region.channels.length) return;
+    setIdx((i) => (i + d + region.channels.length) % region.channels.length);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+      onClick={onClose}
+      role="dialog"
+      aria-label={`Live TV — ${region.region}`}
+    >
+      <div className={`w-full max-w-3xl ${GLASS} p-3`} onClick={(e) => e.stopPropagation()}>
+        <div className={`mb-2 flex items-center justify-between ${OLED}`}>
+          <span>
+            {region.region.toUpperCase()} [{region.country}] · CH {idx + 1}/{region.channels.length} ·{" "}
+            {channel?.name?.toUpperCase() ?? "NO SIGNAL"}
+          </span>
+          <button onClick={onClose} aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        {/* The screen itself stays a real black rectangle — it is a TV; the
+            chrome around it is the transparent glass. */}
+        <div className="relative aspect-video w-full overflow-hidden rounded bg-black">
+          {channel ? (
+            <video ref={videoRef} className="h-full w-full" controls playsInline muted autoPlay />
+          ) : (
+            <div className={`flex h-full items-center justify-center ${OLED}`}>NO CHANNELS FOR THIS REGION</div>
+          )}
+          {err && (
+            <div className={`absolute inset-x-0 bottom-0 p-2 text-center ${OLED} !text-amber-400`}>
+              {err.toUpperCase()} — TRY NEXT CHANNEL
+            </div>
+          )}
+        </div>
+        <div className={`mt-2 flex items-center justify-between ${OLED}`}>
+          <button onClick={() => step(-1)} className={`px-2 py-1 ${GLASS} hover:scale-105`}>
+            ◀ PREV
+          </button>
+          <span className="opacity-70">IPTV-ORG PUBLIC CATALOG · STREAMS ARE THIRD-PARTY</span>
+          <button onClick={() => step(1)} className={`px-2 py-1 ${GLASS} hover:scale-105`}>
+            NEXT ▶
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

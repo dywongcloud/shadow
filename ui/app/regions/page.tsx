@@ -7,6 +7,7 @@ import { usePoll, type NodeInfo } from "@/lib/api";
 import { timeAgo, cn } from "@/lib/utils";
 import { type MapMarker, type SatelliteMarker, PALETTE, GPU_COLOR } from "@/components/region-map";
 import { WorldChoropleth } from "@/components/world-choropleth";
+import { RegionTvLayer, RegionTvStats } from "@/components/region-tv";
 import { RegionsCommandBar } from "@/components/regions-command-bar";
 import { useNodeEventLog } from "@/lib/node-event-log";
 import type { BrowserPresence } from "@/lib/run-node-client";
@@ -180,6 +181,9 @@ export default function RegionsPage() {
         />
         <div className="relative overflow-hidden bg-white dark:bg-black">
           <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} activated={activated} />
+          {/* Live-TV plots: green OLED text on transparent glass, one per
+              serving region, aligned via the map's own projection. */}
+          <RegionTvLayer liveRegions={regions} />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
             {markers.length} node{markers.length === 1 ? "" : "s"} live on the mesh
@@ -208,6 +212,7 @@ export default function RegionsPage() {
             </span>
           </div>
         </div>
+        <RegionTvStats liveRegions={regions} />
         {/* Log — real, live-derived join/leave/health transitions diffed from
             the /v1/nodes poll (see lib/node-event-log.ts); never fabricated
             lines. Matches the reference design's log panel below the map. */}

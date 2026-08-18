@@ -1,0 +1,135 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+// Region TV — the atlas "TV logic" from PeerSpeak/dial.wtf mapped onto THIS
+// fleet's regions. Data source: iptv-org's public channel + stream catalog
+// (https://github.com/iptv-org/iptv, MIT — the dataset that powers
+// tv.garden). No API key; two static JSON snapshots fetched lazily in the
+// browser the first time the TV layer is opened and cached in module memory
+// for the session (they are ~MBs — never fetched on page load).
+
+export interface TvChannel {
+  id: string;
+  name: string;
+  country: string;
+  categories: string[];
+  /** Playable stream URL (HLS .m3u8, https). */
+  url: string;
+}
+
+export interface RegionTv {
+  region: string;
+  /** ISO country the region's channels come from. */
+  country: string;
+  lat: number;
+  lon: number;
+  channels: TvChannel[];
+}
+
+/** The fleet's serving regions → geo + the country whose national catalog
+ *  represents them. Static by design (regions are operator-provisioned; a
+ *  region missing here simply gets no TV plot — never an error). */
+export const REGION_TV_GEO: Record<string, { lat: number; lon: number; country: string }> = {
+  bangkok: { lat: 13.7563, lon: 100.5018, country: "TH" },
+  "hong-kong": { lat: 22.3193, lon: 114.1694, country: "HK" },
+  virginia: { lat: 39.0438, lon: -77.4874, country: "US" },
+  "san-jose": { lat: 37.3382, lon: -121.8863, country: "US" },
+  "sao-paulo": { lat: -23.5505, lon: -46.6333, country: "BR" },
+  frankfurt: { lat: 50.1109, lon: 8.6821, country: "DE" },
+};
+
+const CHANNELS_URL = "https://iptv-org.github.io/api/channels.json";
+const STREAMS_URL = "https://iptv-org.github.io/api/streams.json";
+
+interface IptvChannel {
+  id: string;
+  name: string;
+  country: string;
+  categories?: string[];
+  is_nsfw?: boolean;
+  closed?: string | null;
+}
+interface IptvStream {
+  channel: string | null;
+  url: string;
+}
+
+let catalogPromise: Promise<Map<string, TvChannel[]>> | null = null;
+
+/** country code → playable channels, joined + filtered once per session. */
+export function loadTvCatalog(): Promise<Map<string, TvChannel[]>> {
+  if (catalogPromise) return catalogPromise;
+  catalogPromise = (async () => {
+    const [chRes, stRes] = await Promise.all([fetch(CHANNELS_URL), fetch(STREAMS_URL)]);
+    if (!chRes.ok || !stRes.ok) throw new Error("TV catalog fetch failed");
+    const channels = (await chRes.json()) as IptvChannel[];
+    const streams = (await stRes.json()) as IptvStream[];
+    // First https HLS stream per channel id.
+    const streamByChannel = new Map<string, string>();
+    for (const s of streams) {
+      if (!s.channel || streamByChannel.has(s.channel)) continue;
+      if (!s.url?.startsWith("https://") || !s.url.includes(".m3u8")) continue;
+      streamByChannel.set(s.channel, s.url);
+    }
+    const wanted = new Set(Object.values(REGION_TV_GEO).map((g) => g.country));
+    const byCountry = new Map<string, TvChannel[]>();
+    for (const c of channels) {
+      if (!wanted.has(c.country) || c.is_nsfw || c.closed) continue;
+      const url = streamByChannel.get(c.id);
+      if (!url) continue;
+      const list = byCountry.get(c.country) ?? [];
+      list.push({
+        id: c.id,
+        name: c.name,
+        country: c.country,
+        categories: c.categories ?? [],
+        url,
+      });
+      byCountry.set(c.country, list);
+    }
+    return byCountry;
+  })().catch((e) => {
+    catalogPromise = null; // a transient failure must not poison the session
+    throw e;
+  });
+  return catalogPromise;
+}
+
+/** The per-region view over the loaded catalog, for regions the mesh serves. */
+export function regionTv(catalog: Map<string, TvChannel[]>, liveRegions: string[]): RegionTv[] {
+  const seen = new Set<string>();
+  const out: RegionTv[] = [];
+  for (const region of liveRegions) {
+    if (seen.has(region)) continue;
+    seen.add(region);
+    const geo = REGION_TV_GEO[region];
+    if (!geo) continue;
+    out.push({ region, ...geo, channels: catalog.get(geo.country) ?? [] });
+  }
+  return out;
+}
+
+/** Shared catalog hook — both the plots layer and the stats strip mount it;
+ *  the module-level promise cache means exactly ONE fetch per session. */
+export function useTvCatalog(): {
+  catalog: Map<string, TvChannel[]> | null;
+  error: string | null;
+} {
+  const [catalog, setCatalog] = useState<Map<string, TvChannel[]> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    loadTvCatalog()
+      .then((c) => {
+        if (!stop) setCatalog(c);
+      })
+      .catch((e) => {
+        if (!stop) setError(String(e?.message ?? e));
+      });
+    return () => {
+      stop = true;
+    };
+  }, []);
+  return { catalog, error };
+}

@@ -36,6 +36,14 @@ const projection = geoEqualEarth().fitSize(
 );
 const pathGen = geoPath(projection);
 
+/** Exported for overlay layers (the region TV plots) so they position with
+ *  THE SAME static projection the map paints with — percentage offsets over
+ *  the SVG's viewBox stay aligned at any rendered size. */
+export function projectGeo(lon: number, lat: number): [number, number] | null {
+  return projection([lon, lat]);
+}
+export const MAP_VIEW = { width: WIDTH, height: HEIGHT };
+
 function project(lon: number, lat: number): [number, number] | null {
   return projection([lon, lat]);
 }
