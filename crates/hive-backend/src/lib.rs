@@ -1488,7 +1488,21 @@ pub(crate) async fn podman_run_container(
                 .output()
                 .await
                 .ok()
-                .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .map(|o| {
+                    // BOTH streams: `podman logs` mirrors the container's stdout
+                    // to stdout and stderr to stderr — an app that logged its
+                    // dying reason via console.log/print (stdout) was invisible
+                    // to the stderr-only capture.
+                    let mut t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    if !e.is_empty() {
+                        if !t.is_empty() {
+                            t.push('\n');
+                        }
+                        t.push_str(&e);
+                    }
+                    t
+                })
                 .unwrap_or_default();
             let _ = Command::new(bin)
                 .args(crate::container_cli::rm_args(apple, &name))

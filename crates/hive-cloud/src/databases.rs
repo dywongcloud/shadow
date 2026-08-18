@@ -2038,6 +2038,19 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                         Ok(o) if o.status.success() => {
                             // It exists locally: this node hosts (or hosted) it.
                             mark_db_container_local(&cname);
+                            // Pre-upgrade Supabase records lack the secrets the
+                            // rebuild path needs (JWT_SECRET/PG_META_CRYPTO_KEY
+                            // were not stored before). Backfill them ONCE from
+                            // the live studio container's env — the values are
+                            // identical by construction, and a rebuilt member
+                            // must match the rest of the running stack exactly.
+                            if kind == DbKind::Supabase
+                                && (d.connection.get("JWT_SECRET").is_none()
+                                    || d.connection.get("PG_META_CRYPTO_KEY").is_none())
+                                && cname.ends_with("-studio")
+                            {
+                                supa_backfill_record_secrets(&cloud, &id, &cname).await;
+                            }
                             if String::from_utf8_lossy(&o.stdout).trim() != "true" {
                                 match Command::new("podman")
                                     .args(["start", &cname])
@@ -2187,6 +2200,56 @@ fn mark_db_container_local(name: &str) {
 
 fn db_container_seen_local(name: &str) -> bool {
     db_container_marker_path(name).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// One-time upgrade-in-place for pre-2026-08-18 Supabase records: pull
+/// AUTH_JWT_SECRET / PG_META_CRYPTO_KEY out of the live studio container's
+/// env and store them on the record, so the rebuild path
+/// (`supa_stack_from_record`) has every field it needs. Self-eliminating —
+/// the caller gates on the fields being absent.
+async fn supa_backfill_record_secrets(
+    cloud: &Arc<crate::state::CloudState>,
+    id: &str,
+    studio_container: &str,
+) {
+    let out = Command::new("podman")
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            studio_container,
+        ])
+        .env("PATH", augmented_path())
+        .output()
+        .await;
+    let Ok(o) = out else { return };
+    if !o.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&o.stdout).to_string();
+    let mut jwt = None;
+    let mut crypto = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("AUTH_JWT_SECRET=") {
+            jwt = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("PG_META_CRYPTO_KEY=") {
+            crypto = Some(v.trim().to_string());
+        }
+    }
+    let (Some(jwt), Some(crypto)) = (jwt, crypto) else { return };
+    if jwt.is_empty() || crypto.is_empty() {
+        return;
+    }
+    cloud.databases.update(id, |d| {
+        d.connection
+            .entry("JWT_SECRET".into())
+            .or_insert(jwt.clone());
+        d.connection
+            .entry("PG_META_CRYPTO_KEY".into())
+            .or_insert(crypto.clone());
+    });
+    crate::persist::persist(cloud);
+    tracing::info!(db = %id, "db-reconcile: backfilled supabase record secrets from the live stack (rebuild now possible)");
 }
 
 async fn podman_available() -> bool {

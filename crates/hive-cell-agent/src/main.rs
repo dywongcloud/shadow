@@ -510,8 +510,37 @@ mod linux {
             }
         }
         // Detach: the function lives until the cell is torn down. Dropping the
-        // std Child does not kill it.
-        let _child = cmd.spawn()?;
+        // std Child does not kill it. STDERR is piped into a bounded capture
+        // (last 4 KiB) so a process that dies before binding its port can be
+        // DIAGNOSED: the bare "did not bind its port" error told tenants to
+        // "check the deployment's logs" while the guest threw those logs away
+        // — the one artifact that says WHY (missing env, unreachable database,
+        // a stack trace) never left the microVM.
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        let stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        if let Some(err_pipe) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut r = std::io::BufReader::new(err_pipe);
+                let mut buf = [0u8; 1024];
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                            t.extend(&buf[..n]);
+                            while t.len() > 4096 {
+                                t.pop_front();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let _child = child;
 
         // Wait for the function to bind its port.
         //
@@ -539,10 +568,22 @@ mod linux {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "function did not bind its port",
-                ));
+                // Attach the process's own last words — the single most
+                // diagnostic artifact for a bind failure, previously discarded.
+                let tail: Vec<u8> = stderr_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .collect();
+                let tail = String::from_utf8_lossy(&tail);
+                let tail = tail.trim();
+                let msg = if tail.is_empty() {
+                    "function did not bind its port (process wrote nothing to stderr)".to_string()
+                } else {
+                    format!("function did not bind its port. Its stderr (last 4KiB): {tail}")
+                };
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, msg));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
