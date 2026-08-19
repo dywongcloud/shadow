@@ -441,9 +441,18 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/domains/")
-            && p.ends_with("/detach") =>
+            && p.split('?').next().unwrap_or("").ends_with("/detach") =>
         {
+            // The forwarded path carries the team query (`/detach?team=…` or
+            // `?tok=…`), so suffix matches and suffix trims must run on the
+            // query-stripped path — the bare ends_with("/detach") guard and
+            // trim_end_matches("/detach") previously matched/parsed NOTHING
+            // with a query attached, the arm never fired, and the caller
+            // read an empty reply as a forward failure (live witness 502).
             let rest = p
+                .split('?')
+                .next()
+                .unwrap_or("")
                 .trim_start_matches("/v1/projects/")
                 .trim_end_matches("/detach")
                 .trim_end_matches('/');
@@ -488,9 +497,14 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/domains/")
-            && p.ends_with("/activate") =>
+            && p.split('?').next().unwrap_or("").ends_with("/activate") =>
         {
+            // Query-stripped matching, same as the /detach arm above (the
+            // forwarded path always carries the team query).
             let rest = p
+                .split('?')
+                .next()
+                .unwrap_or("")
                 .trim_start_matches("/v1/projects/")
                 .trim_end_matches("/activate")
                 .trim_end_matches('/');
