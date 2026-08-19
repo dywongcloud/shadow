@@ -19,6 +19,12 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [v, setV] = useState("");
   const [target, setTarget] = useState("production");
   const [sensitive, setSensitive] = useState(true);
+  // Save-path error + busy state: the server answer to a failed write (401
+  // session expired, 403 wrong workspace, network) used to be swallowed by an
+  // unhandled rejection, so every failure looked identical — "nothing
+  // happens". Surface the actual error text next to the Save button.
+  const [saveErr, setSaveErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
   // Inline EDIT state: which key is expanded + its draft value/target. Sensitive
   // values are never returned by the API (masked to ""), so the editor shows an
@@ -41,16 +47,29 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   useEffect(() => { load(); }, [project]);
 
   async function add() {
-    if (!k) return;
-    await apiSend("POST", `/v1/projects/${project}/env`, {
-      key: k.trim(), value: v, target, sensitive, updated_ms: 0,
-    });
-    setK(""); setV(""); setSensitive(true); setAdding(false);
-    load();
+    if (!k || busy) return;
+    setBusy(true);
+    setSaveErr("");
+    try {
+      await apiSend("POST", `/v1/projects/${project}/env`, {
+        key: k.trim(), value: v, target, sensitive, updated_ms: 0,
+      });
+      setK(""); setV(""); setSensitive(true); setAdding(false);
+      load();
+    } catch (e) {
+      setSaveErr(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setBusy(false);
+    }
   }
   async function remove(key: string) {
-    await apiSend("DELETE", `/v1/projects/${project}/env/${encodeURIComponent(key)}`);
-    load();
+    setSaveErr("");
+    try {
+      await apiSend("DELETE", `/v1/projects/${project}/env/${encodeURIComponent(key)}`);
+      load();
+    } catch (e) {
+      setSaveErr(String(e).replace(/^Error:\s*/, ""));
+    }
   }
   function openEdit(e: EnvVar) {
     setEditing(e.key);
@@ -61,11 +80,20 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
     // Backend semantics: an empty value on an existing key KEEPS the stored
     // value (secrets are never echoed back to the client), so leaving the field
     // blank on a sensitive var means "unchanged".
-    await apiSend("POST", `/v1/projects/${project}/env`, {
-      key: e.key, value: editVal, target: editTarget, sensitive: e.sensitive, updated_ms: 0,
-    });
-    setEditing(null);
-    load();
+    if (busy) return;
+    setBusy(true);
+    setSaveErr("");
+    try {
+      await apiSend("POST", `/v1/projects/${project}/env`, {
+        key: e.key, value: editVal, target: editTarget, sensitive: e.sensitive, updated_ms: 0,
+      });
+      setEditing(null);
+      load();
+    } catch (err) {
+      setSaveErr(String(err).replace(/^Error:\s*/, ""));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const filtered = vars.filter((e) => e.key.toLowerCase().includes(q.toLowerCase()));
@@ -110,9 +138,10 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
               <Switch checked={sensitive} onChange={setSensitive} label="Sensitive" /> Sensitive (encrypted, hidden after save)
             </label>
           </div>
-          <div className="mt-4 flex gap-2">
-            <Button onClick={add}>Save</Button>
+          <div className="mt-4 flex items-center gap-2">
+            <Button onClick={add} disabled={busy}>{busy ? "Saving…" : "Save"}</Button>
             <Button variant="ghost" onClick={() => setAdding(false)}>Cancel</Button>
+            {saveErr && <span className="text-sm text-red-500">{saveErr}</span>}
           </div>
         </Card>
       )}
@@ -202,9 +231,10 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
                     </select>
                   </div>
                 </div>
-                <div className="mt-3 flex gap-2">
-                  <Button onClick={() => saveEdit(e)}>Save</Button>
+                <div className="mt-3 flex items-center gap-2">
+                  <Button onClick={() => saveEdit(e)} disabled={busy}>{busy ? "Saving…" : "Save"}</Button>
                   <Button variant="ghost" onClick={() => setEditing(null)}>Cancel</Button>
+                  {saveErr && <span className="text-sm text-red-500">{saveErr}</span>}
                 </div>
               </div>
             )}
