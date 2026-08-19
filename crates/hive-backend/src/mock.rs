@@ -44,16 +44,43 @@ impl Default for MockConfig {
     }
 }
 
+struct RootRollback {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RootRollback {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RootRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let path = self.path.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::fs::remove_dir_all(path).await;
+            });
+        }
+    }
+}
+
 pub struct MockBackend {
     cfg: MockConfig,
     /// Long-lived function processes, keyed by cell, killed on terminate.
     funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
-    /// Per-cell container name (Railway-style container deploys) + which CLI
-    /// created it (`true` = Apple's `container`, `false` = podman), so
-    /// teardown uses the matching `delete`/`rm` verb.
-    containers: Arc<AsyncMutex<HashMap<CellId, (String, bool)>>>,
+    /// Per-cell host-container ownership: exact container identity and tunnel task.
+    containers: Arc<AsyncMutex<HashMap<CellId, crate::ContainerLaunch>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2).
     sampler: Arc<crate::CpuSampler>,
     /// Native macOS litebox: config + per-cell net identity (needed by
@@ -238,9 +265,11 @@ impl CellBackend for MockBackend {
             .root
             .join(crate::sanitize_tenant(tenant))
             .join(spec.id.as_str());
+        let mut provision = RootRollback::new(root.clone());
         tokio::fs::create_dir_all(&root).await?;
         // Simulate the cold-boot + image-load cost the warm pool exists to hide.
         tokio::time::sleep(self.cfg.provision_latency).await;
+        provision.commit();
         Ok(CellHandle {
             id: spec.id.clone(),
             image: spec.image.clone(),
@@ -266,306 +295,49 @@ impl CellBackend for MockBackend {
     ) -> anyhow::Result<CellEndpoint> {
         anyhow::ensure!(!func.start_cmd.is_empty(), "empty function start_cmd");
 
-        // Container deploys (Railway-style): `["__container__", image, internal]`.
-        // Run detached + named so the gateway can proxy to the published port and
-        // `terminate` can clean it up reliably (kill_on_drop can't stop podman).
         if func.start_cmd[0] == "__container__" {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
             let internal = func
                 .start_cmd
                 .get(2)
-                .cloned()
-                .unwrap_or_else(|| "8080".into());
-            // Multi-service (compose) deploys: JSON network config in start_cmd[3] — a
-            // DNS-less shared network with static IPs + sibling host entries.
-            let net = func
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
+            let net_json = func
                 .start_cmd
                 .get(3)
-                .filter(|s| !s.is_empty())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-            let name = format!(
-                "hive-{}",
-                cell.id
-                    .as_str()
-                    .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
-            );
-            // A real multi-service (compose) deploy pins a static IP + sibling
-            // `/etc/hosts` — podman-only (see `container_cli::needs_podman_networking`'s
-            // doc: Apple's `container` tool has no static-IP flag, no
-            // --add-host, no name-based DNS between containers on a shared
-            // network, and a correct macOS equivalent needs a two-phase
-            // launch this per-cell call has no visibility to orchestrate
-            // across siblings). Every OTHER deploy — including a "standalone"
-            // single container, which still gets its own project-scoped
-            // network purely for TENANT isolation, no static IP — is fully
-            // Apple-`container`-eligible.
-            let apple = !net
-                .as_ref()
-                .map(crate::container_cli::needs_podman_networking)
-                .unwrap_or(false)
-                && crate::container_cli::is_apple_default();
-            let bin = if apple { "container" } else { "podman" };
-            let path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-            let _ = std::process::Command::new(bin)
-                .args(crate::container_cli::rm_args(apple, &name))
-                .output();
-            if let Some(n) = &net {
-                if let Some(netname) = n
-                    .get("net")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    let mut c = vec!["network".to_string(), "create".to_string()];
-                    if !apple {
-                        c.push("--disable-dns".to_string());
-                    }
-                    if let Some(s) = n
-                        .get("subnet")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        c.push("--subnet".into());
-                        c.push(s.to_string());
-                    }
-                    if !apple {
-                        if let Some(g) = n
-                            .get("gw")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                        {
-                            c.push("--gateway".into());
-                            c.push(g.to_string());
-                        }
-                    }
-                    c.push(netname.to_string());
-                    let _ = Command::new(bin)
-                        .args(&c)
-                        .env("PATH", path_env)
-                        .output()
-                        .await;
-                }
-            }
-            let port = func.port;
-            // Primary port (TCP, drives readiness + the tunnel) plus one `/udp`
-            // publish per `FunctionLaunch::udp_ports` entry — the loopback
-            // datagram legs the UDP relay forwards to. Mirrors
-            // `podman_run_container`'s emission for macOS dev parity.
-            let mut ports = vec![crate::ContainerPort::tcp(
-                internal.parse().unwrap_or(8080),
-                port,
-            )];
+                .map(String::as_str)
+                .filter(|s| !s.is_empty());
+            let mut ports = vec![crate::ContainerPort::tcp(internal, func.port)];
             ports.extend(func.udp_ports.iter().map(|u| crate::ContainerPort {
                 container_port: u.container_port,
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
-            // Extra raw/published TCP publishes, minus the primary pairing
-            // already at ports[0] (a duplicate `-p` fails the run).
             ports.extend(func.tcp_ports.iter().filter_map(|t| {
-                if t.host_port == port {
-                    return None;
-                }
-                Some(crate::ContainerPort {
+                (t.host_port != func.port).then_some(crate::ContainerPort {
                     container_port: t.container_port,
                     host_port: t.host_port,
                     protocol: crate::ContainerProtocol::Tcp,
                 })
             }));
-            let mut args: Vec<String> = vec![
-                "run".into(),
-                "-d".into(),
-                "--name".into(),
-                name.clone(),
-                "-e".into(),
-                format!("PORT={internal}"),
-            ];
-            // Inject the project's env vars into the container runtime.
-            for (k, v) in &func.env {
-                args.push("-e".into());
-                args.push(format!("{k}={v}"));
-            }
-            // Automatic persistent volume (start_cmd[3] `vol`/`volpath`): a host-backed
-            // named volume (≥1 GB) mounted so the container's data survives restarts.
-            // Same behavior as `podman_run_container` (used by the Firecracker backend).
-            if let Some((vname, vpath)) = net.as_ref().and_then(|n| {
-                let name = n
-                    .get("vol")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())?;
-                let path = n
-                    .get("volpath")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("/data");
-                Some((name.to_string(), path.to_string()))
-            }) {
-                let _ = Command::new(bin)
-                    .args(["volume", "create", &vname])
-                    .env("PATH", path_env)
-                    .output()
-                    .await;
-                args.push("-e".into());
-                args.push(format!("HIVE_VOLUME={vpath}"));
-                args.push("-v".into());
-                args.push(format!("{vname}:{vpath}"));
-            }
-            if let Some(n) = &net {
-                if let Some(netname) = n
-                    .get("net")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    args.push("--network".into());
-                    args.push(netname.to_string());
-                    if let Some(ip) = n
-                        .get("ip")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        args.push("--ip".into());
-                        args.push(ip.to_string());
-                    }
-                    if let Some(hosts) = n.get("hosts").and_then(|v| v.as_array()) {
-                        for h in hosts.iter().filter_map(|h| h.as_str()) {
-                            args.push("--add-host".into());
-                            args.push(h.to_string());
-                        }
-                    }
-                }
-            }
-            // Resource ceilings + privilege drop (DoS / escalation defense) — `run`
-            // OPTIONS, so they precede the image name. Honors the deployment's
-            // requested memory (else the generous env-tunable default).
-            args.extend(crate::container_cli::resource_flags(
-                apple,
+            let runtime = crate::container_runtime();
+            let launch = crate::podman_run_container(
+                &cell.id,
+                &image,
+                &ports,
+                &func.env,
+                func.max_concurrency,
+                "/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
+                runtime.as_deref(),
+                net_json,
                 &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids),
-            ));
-            // One `-p` per published port; UDP gets podman's literal `/udp`
-            // suffix on the internal port, TCP (the default, and today's only
-            // case) gets none — byte-identical to the pre-multi-port single
-            // `-p` for a one-TCP-port spec. Mirrors `podman_run_container`'s
-            // emission (see lib.rs) for macOS dev parity.
-            for p in &ports {
-                args.push("-p".into());
-                let suffix = match p.protocol {
-                    crate::ContainerProtocol::Udp => "/udp",
-                    crate::ContainerProtocol::Tcp => "",
-                };
-                args.push(format!(
-                    "127.0.0.1:{}:{}{suffix}",
-                    p.host_port, p.container_port
-                ));
-            }
-            // compose `entrypoint:` (a run OPTION, before the image) and
-            // `command:` (trailing argv, after it) — same semantics podman gets
-            // in `podman_run_container`; see that call site for why dropping
-            // them makes images like `minio/minio` unstartable.
-            let argv_of = |key: &str| -> Vec<String> {
-                net.as_ref()
-                    .and_then(|n| n.get(key))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let entrypoint = argv_of("entrypoint");
-            if !entrypoint.is_empty() {
-                args.push("--entrypoint".into());
-                args.push(
-                    serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")),
-                );
-            }
-            args.push(image.clone());
-            args.extend(argv_of("cmd"));
-            let status = Command::new(bin)
-                .args(&args)
-                .env("PATH", path_env)
-                .output()
-                .await?;
-            if !status.status.success() {
-                // Reclaim the podman lock a failed start may leak (see the same
-                // fix in lib.rs::podman_run_container — leaked `created` shells
-                // exhaust the 2048-lock pool → CAPACITY_EXHAUSTED fleet-wide).
-                let _ = Command::new(bin)
-                    .args(crate::container_cli::rm_args(apple, &name))
-                    .env("PATH", path_env)
-                    .output()
-                    .await;
-                let stderr = String::from_utf8_lossy(&status.stderr);
-                let stderr = stderr.trim();
-                // This path runs REAL podman on a `HIVE_FORCE_MOCK=1` node (that
-                // is why fc-frankfurt is on it), so lock-pool exhaustion here has
-                // to classify exactly as it does in `podman_run_container` —
-                // otherwise the same host fault reports NODE_LOCK_POOL_EXHAUSTED
-                // on one node and CAPACITY_EXHAUSTED on another.
-                if !apple && crate::is_lock_exhaustion(stderr) {
-                    anyhow::bail!(
-                        "node cannot start containers: podman's lock pool is exhausted and \
-                         nothing was reclaimable — raise `num_locks` in containers.conf then run \
-                         `podman system renumber` on this node (a config change alone is inert). \
-                         Not an application fault and not host disk/memory capacity ({}). {bin} \
-                         run failed: {stderr}",
-                        hive_core::fault::NODE_LOCK_POOL_EXHAUSTED
-                    );
-                }
-                anyhow::bail!("{bin} run failed: {stderr}");
-            }
-            self.containers
-                .lock()
-                .await
-                .insert(cell.id.clone(), (name.clone(), apple));
-            let func_addr = format!("127.0.0.1:{port}");
-            // Readiness failure must ALSO remove the container (else a crash-looping
-            // image leaks a lock every keep-warm tick).
-            if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
-                let _ = Command::new(bin)
-                    .args(crate::container_cli::rm_args(apple, &name))
-                    .env("PATH", path_env)
-                    .output()
-                    .await;
-                self.containers.lock().await.remove(&cell.id);
-                return Err(e);
-            }
-            // Front the container with the tunnel server. Non-HTTP services
-            // (`func.raw_proxy`: gRPC / raw TCP — Postgres, Minecraft, …) get a
-            // genuine raw byte splice to the container's published loopback
-            // port; HTTP-family services keep the existing HTTP-framed
-            // multiplexed path unchanged. (UDP needs a separate datagram relay
-            // targeting the published `/udp` loopback port directly — see the
-            // extension-point note in `podman_run_container`.)
-            let raw_proxy = func.raw_proxy;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let tunnel_addr = listener.local_addr()?.to_string();
-            let max_conc = func.max_concurrency.max(1);
-            let task = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((conn, _)) => {
-                            let local = func_addr.clone();
-                            tokio::spawn(async move {
-                                if raw_proxy {
-                                    fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
-                                } else {
-                                    // serve_maybe_raw: lets edge.rs's local WS splice open a
-                                    // raw connection to this same listener (magic-byte-gated,
-                                    // see TunnelServer::serve_maybe_raw), byte-identical for
-                                    // every ordinary framed request.
-                                    fluid_tunnel::TunnelServer::serve_maybe_raw(
-                                        conn, local, max_conc,
-                                    )
-                                    .await;
-                                }
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            self.tunnels.lock().await.insert(cell.id.clone(), task);
-            return Ok(CellEndpoint::Tcp(tunnel_addr));
+                func.raw_proxy,
+                func.gpu,
+            )
+            .await?;
+            let endpoint = launch.endpoint();
+            self.containers.lock().await.insert(cell.id.clone(), launch);
+            return Ok(endpoint);
         }
 
         // Native macOS litebox: real syscall-level sandboxing for Node
@@ -726,48 +498,46 @@ impl CellBackend for MockBackend {
                 }
             }
         });
-        self.tunnels.lock().await.insert(cell.id.clone(), task);
+        let task = crate::AbortTask::new(task);
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(task) = task.publish() {
+            tunnels.insert(cell.id.clone(), task);
+        }
 
         Ok(CellEndpoint::Tcp(tunnel_addr))
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Each `remove` binds out of the guard BEFORE the await that follows —
-        // see the same change in `firecracker.rs::terminate` for why: an
-        // `if let Some(x) = map.lock().await.remove(..)` keeps the map locked
-        // for the whole body, holding it across `container rm`/`child.wait()`
-        // and blocking `cpu_percent` + cold starts node-wide.
-        let tunnel = self.tunnels.lock().await.remove(&cell.id);
-        if let Some(task) = tunnel {
-            task.abort();
-        }
-        // Remove any container bound to this cell.
-        let container = self.containers.lock().await.remove(&cell.id);
-        if let Some((name, apple)) = container {
-            let bin = if apple { "container" } else { "podman" };
-            let _ = Command::new(bin)
-                .args(crate::container_cli::rm_args(apple, &name))
-                .output()
-                .await;
-        }
-        // Kill any function process bound to this cell.
-        let func = self.funcs.lock().await.remove(&cell.id);
-        if let Some(mut child) = func {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        // Belt-and-suspenders for a litebox-macos cell: `start_kill()` above
-        // reaches the `sudo` wrapper, which may only fork-and-exec the real
-        // runner rather than replace itself — this reaches the runner
-        // directly by its own binary name + this cell's unique
-        // `--tun-device-name=`, so its utun device is never orphaned.
-        let macos_net = self.litebox_macos_cells.lock().await.remove(&cell.id);
-        if let Some(net) = macos_net {
-            crate::litebox_macos::kill_runner(&self.litebox_macos_cfg, &net).await;
-        }
-        // Single-use build cell: blow away the work dir.
-        let _ = tokio::fs::remove_dir_all(&cell.root).await;
-        Ok(())
+        let id = cell.id.clone();
+        let root = cell.root.clone();
+        let tunnels = self.tunnels.clone();
+        let containers = self.containers.clone();
+        let funcs = self.funcs.clone();
+        let macos_cells = self.litebox_macos_cells.clone();
+        let macos_cfg = self.litebox_macos_cfg.clone();
+        let cleanup = tokio::spawn(async move {
+            let tunnel = tunnels.lock().await.remove(&id);
+            if let Some(task) = tunnel {
+                task.abort();
+            }
+            let container = containers.lock().await.remove(&id);
+            if let Some(container) = container {
+                container.terminate().await;
+            }
+            let process = funcs.lock().await.remove(&id);
+            if let Some(mut child) = process {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            let macos_net = macos_cells.lock().await.remove(&id);
+            if let Some(net) = macos_net {
+                crate::litebox_macos::kill_runner(&macos_cfg, &net).await;
+            }
+            let _ = tokio::fs::remove_dir_all(root).await;
+        });
+        cleanup
+            .await
+            .map_err(|e| anyhow::anyhow!("mock cleanup task failed: {e}"))
     }
 
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
@@ -840,6 +610,10 @@ impl MockBackend {
         env.insert("PATH".into(), guest_path.into());
         env.insert("HOME".into(), "/".into());
 
+        self.litebox_macos_cells
+            .lock()
+            .await
+            .insert(cell.id.clone(), net.clone());
         let child = crate::litebox_macos::start(
             &self.litebox_macos_cfg,
             &net,
@@ -850,10 +624,6 @@ impl MockBackend {
         )
         .await?;
 
-        self.litebox_macos_cells
-            .lock()
-            .await
-            .insert(cell.id.clone(), net.clone());
         self.funcs.lock().await.insert(cell.id.clone(), child);
 
         // The runner's own `start()` only returns once the utun device is up
@@ -861,12 +631,7 @@ impl MockBackend {
         // remaining wait is purely for the guest's OWN process to accept a
         // connection (matches every other backend's readiness contract).
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
-        if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
-            self.funcs.lock().await.remove(&cell.id);
-            self.litebox_macos_cells.lock().await.remove(&cell.id);
-            crate::litebox_macos::kill_runner(&self.litebox_macos_cfg, &net).await;
-            return Err(e);
-        }
+        wait_tcp_ready(&func_addr, Duration::from_secs(60)).await?;
 
         let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -890,7 +655,11 @@ impl MockBackend {
                 }
             }
         });
-        self.tunnels.lock().await.insert(cell.id.clone(), task);
+        let task = crate::AbortTask::new(task);
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(task) = task.publish() {
+            tunnels.insert(cell.id.clone(), task);
+        }
 
         Ok(CellEndpoint::Tcp(tunnel_addr))
     }

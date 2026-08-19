@@ -83,13 +83,9 @@ pub struct FirecrackerBackend {
     net_idx: Arc<std::sync::atomic::AtomicU32>,
     /// Set once host NAT/forwarding has been configured.
     nat_ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Container cells: cell -> podman container name. A Firecracker node runs
-    /// CONTAINER deployments via podman ON THE HOST (outside the microVM), so these
-    /// cells have no `Child` in `procs`; they're tracked + torn down here instead.
-    containers: Arc<Mutex<HashMap<CellId, String>>>,
-    /// Per-container tunnel-server accept loops (front the container's host port),
-    /// aborted on teardown.
-    ctnl_tasks: Arc<Mutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
+    /// Container cells run on the host and own their exact container identity and
+    /// tunnel task here; they have no `Child` in `procs`.
+    containers: Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2): samples the per-cell
     /// Firecracker VMM host process, whose CPU tracks the guest's vCPU work
     /// (Firecracker is a thin VMM).
@@ -99,7 +95,8 @@ pub struct FirecrackerBackend {
 impl FirecrackerBackend {
     pub fn new(cfg: FirecrackerConfig) -> Self {
         let procs = Arc::new(Mutex::new(HashMap::new()));
-        let containers: Arc<Mutex<HashMap<CellId, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let containers: Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // Self-management GC: periodically reap orphaned per-cell run dirs — the
         // multi-GB microVM overlays left behind when a cell's firecracker process
         // is gone (e.g. after a node restart). Without this, dead overlays
@@ -124,7 +121,6 @@ impl FirecrackerBackend {
             net_idx: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             containers,
-            ctnl_tasks: Arc::new(Mutex::new(HashMap::new())),
             sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
@@ -270,7 +266,7 @@ impl FirecrackerBackend {
     async fn gc_orphans(
         run_dir: &std::path::Path,
         procs: &Arc<Mutex<HashMap<CellId, Child>>>,
-        containers: &Arc<Mutex<HashMap<CellId, String>>>,
+        containers: &Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>>,
     ) {
         let mut live: std::collections::HashSet<String> =
             procs.lock().await.keys().map(|c| c.to_string()).collect();
@@ -544,6 +540,7 @@ impl FirecrackerBackend {
         let host_ip = format!("172.16.{third}.{}", base + 1);
         let guest_ip = format!("172.16.{third}.{}", base + 2);
         let tap = format!("fc{i}");
+        let mut rollback = LinkRollback::new(tap.clone());
         let mac = format!("02:fc:00:00:{:02x}:{:02x}", (i >> 8) as u8, i as u8);
         // Recreate the tap fresh (delete any stale one from a prior cell at this index).
         let script = format!(
@@ -554,6 +551,7 @@ impl FirecrackerBackend {
         let ok = Command::new("/bin/sh")
             .arg("-c")
             .arg(&script)
+            .kill_on_drop(true)
             .status()
             .await
             .map(|s| s.success())
@@ -562,6 +560,7 @@ impl FirecrackerBackend {
             return None;
         }
         self.taps.lock().await.insert(id.clone(), tap.clone());
+        rollback.commit();
         Some(CellNet {
             tap,
             mac,
@@ -595,13 +594,6 @@ impl FirecrackerBackend {
             .await;
         let _ = tokio::fs::remove_file(&tmp).await;
     }
-
-    /// Tear down a cell's TAP (best-effort).
-    async fn teardown_cell_net(&self, id: &CellId) {
-        if let Some(tap) = self.taps.lock().await.remove(id) {
-            let _ = Command::new("/bin/sh").arg("-c").arg(format!("export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {tap} 2>/dev/null")).status().await;
-        }
-    }
 }
 
 /// Per-cell egress networking config (host TAP + guest boot args).
@@ -609,6 +601,111 @@ struct CellNet {
     tap: String,
     mac: String,
     ip_cmdline: String,
+}
+
+struct FirecrackerProvisionGuard {
+    id: CellId,
+    root: PathBuf,
+    procs: Arc<Mutex<HashMap<CellId, Child>>>,
+    taps: Arc<Mutex<HashMap<CellId, String>>>,
+    armed: bool,
+}
+
+impl FirecrackerProvisionGuard {
+    fn new(
+        id: CellId,
+        root: PathBuf,
+        procs: Arc<Mutex<HashMap<CellId, Child>>>,
+        taps: Arc<Mutex<HashMap<CellId, String>>>,
+    ) -> Self {
+        Self {
+            id,
+            root,
+            procs,
+            taps,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FirecrackerProvisionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let id = self.id.clone();
+        let root = self.root.clone();
+        let procs = self.procs.clone();
+        let taps = self.taps.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_firecracker_process_and_tap(&id, &procs, &taps).await;
+                let _ = tokio::fs::remove_dir_all(root).await;
+            });
+        }
+    }
+}
+
+struct LinkRollback {
+    name: String,
+    armed: bool,
+}
+
+impl LinkRollback {
+    fn new(name: String) -> Self {
+        Self { name, armed: true }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LinkRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                delete_link(&name).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                delete_link(&name).await;
+            });
+        }
+    }
+}
+
+async fn delete_link(name: &str) {
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {name} 2>/dev/null"
+        ))
+        .kill_on_drop(true)
+        .status()
+        .await;
+}
+
+async fn cleanup_firecracker_process_and_tap(
+    id: &CellId,
+    procs: &Arc<Mutex<HashMap<CellId, Child>>>,
+    taps: &Arc<Mutex<HashMap<CellId, String>>>,
+) {
+    let process = procs.lock().await.remove(id);
+    if let Some(mut child) = process {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+    let tap = taps.lock().await.remove(id);
+    if let Some(tap) = tap {
+        delete_link(&tap).await;
+    }
 }
 
 /// Guest path the per-deployment build output is mounted at (the agent mounts
@@ -668,8 +765,15 @@ impl CellBackend for FirecrackerBackend {
                 .run_dir
                 .join(crate::sanitize_tenant(tenant))
                 .join(spec.id.as_str());
+            let mut provision = FirecrackerProvisionGuard::new(
+                spec.id.clone(),
+                run_dir.clone(),
+                self.procs.clone(),
+                self.taps.clone(),
+            );
             tokio::fs::create_dir_all(&run_dir).await?;
             tracing::debug!(cell = %spec.id, image = %ctr.image, "provisioning container cell (host podman)");
+            provision.commit();
             return Ok(CellHandle {
                 id: spec.id.clone(),
                 image: spec.image.clone(),
@@ -710,6 +814,12 @@ impl CellBackend for FirecrackerBackend {
             .run_dir
             .join(crate::sanitize_tenant(tenant))
             .join(spec.id.as_str());
+        let mut provision = FirecrackerProvisionGuard::new(
+            spec.id.clone(),
+            run_dir.clone(),
+            self.procs.clone(),
+            self.taps.clone(),
+        );
         tokio::fs::create_dir_all(&run_dir).await?;
 
         let api_sock = run_dir.join("api.sock");
@@ -786,10 +896,11 @@ impl CellBackend for FirecrackerBackend {
         // `firecracker_safe_id` below, sanitizing only the CLI arg.
         const SPAWN_ATTEMPTS: u32 = 3;
         let mut last_err = None;
+        let mut process = None;
         for attempt in 1..=SPAWN_ATTEMPTS {
             let _ = tokio::fs::remove_file(&api_sock).await;
             let console = std::fs::File::create(&log_file)?;
-            let child = Command::new(&self.cfg.firecracker_bin)
+            let mut child = Command::new(&self.cfg.firecracker_bin)
                 .arg("--api-sock")
                 .arg(&api_sock)
                 .arg("--id")
@@ -799,19 +910,16 @@ impl CellBackend for FirecrackerBackend {
                 .stderr(Stdio::from(console))
                 .kill_on_drop(true)
                 .spawn()?;
-            self.procs.lock().await.insert(spec.id.clone(), child);
 
             match wait_for_path(&api_sock, Duration::from_secs(5)).await {
                 Ok(()) => {
                     last_err = None;
+                    process = Some(child);
                     break;
                 }
                 Err(e) => {
-                    // Dead/never-bound child — reap it before retrying so a
-                    // zombie doesn't linger under this cell id.
-                    if let Some(mut dead) = self.procs.lock().await.remove(&spec.id) {
-                        let _ = dead.kill().await;
-                    }
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
                     tracing::warn!(cell = %spec.id, attempt, max = SPAWN_ATTEMPTS, error = %e, "firecracker spawn did not bind its API socket — retrying");
                     last_err = Some(e);
                 }
@@ -820,6 +928,8 @@ impl CellBackend for FirecrackerBackend {
         if let Some(e) = last_err {
             return Err(e);
         }
+        let process =
+            process.ok_or_else(|| anyhow::anyhow!("firecracker spawn produced no process"))?;
 
         // Outbound networking: give the cell a host TAP + NAT egress so the app
         // can reach databases/APIs (Upstash, OpenAI, …). Best-effort — if it
@@ -911,6 +1021,8 @@ impl CellBackend for FirecrackerBackend {
         )
         .await?;
 
+        self.procs.lock().await.insert(spec.id.clone(), process);
+        provision.commit();
         Ok(CellHandle {
             id: spec.id.clone(),
             image: spec.image.clone(),
@@ -1061,7 +1173,7 @@ impl CellBackend for FirecrackerBackend {
                     protocol: crate::ContainerProtocol::Tcp,
                 })
             }));
-            let (name, endpoint, task) = crate::podman_run_container(
+            let launch = crate::podman_run_container(
                 &cell.id,
                 &image,
                 &ports,
@@ -1077,8 +1189,8 @@ impl CellBackend for FirecrackerBackend {
                 func.gpu,
             )
             .await?;
-            self.containers.lock().await.insert(cell.id.clone(), name);
-            self.ctnl_tasks.lock().await.insert(cell.id.clone(), task);
+            let endpoint = launch.endpoint();
+            self.containers.lock().await.insert(cell.id.clone(), launch);
             return Ok(endpoint);
         }
 
@@ -1170,31 +1282,22 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Every `remove` below binds its value OUT of the guard before any
-        // await. Written as `if let Some(x) = map.lock().await.remove(..)` the
-        // temporary guard lives to the end of the `if let`, so the map stays
-        // LOCKED across `podman_stop_container` (seconds under load) and across
-        // `child.wait()`. That map is the same one `cpu_percent` takes on every
-        // autoscaler tick (500ms) and that container cold starts take to insert
-        // — so a drain wave serialized terminations against each other AND
-        // stalled sampling/cold-starts on the whole node for its duration.
-        let ctnl_task = self.ctnl_tasks.lock().await.remove(&cell.id);
-        if let Some(task) = ctnl_task {
-            task.abort();
-        }
-        let container = self.containers.lock().await.remove(&cell.id);
-        if let Some(name) = container {
-            crate::podman_stop_container(&name, Self::PODMAN_PATH).await;
-        }
-        // Firecracker microVM cell: kill the process + tear down its egress net.
-        let proc = self.procs.lock().await.remove(&cell.id);
-        if let Some(mut child) = proc {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        self.teardown_cell_net(&cell.id).await;
-        let _ = tokio::fs::remove_dir_all(&cell.root).await;
-        Ok(())
+        let id = cell.id.clone();
+        let root = cell.root.clone();
+        let containers = self.containers.clone();
+        let procs = self.procs.clone();
+        let taps = self.taps.clone();
+        let cleanup = tokio::spawn(async move {
+            let container = containers.lock().await.remove(&id);
+            if let Some(container) = container {
+                container.terminate().await;
+            }
+            cleanup_firecracker_process_and_tap(&id, &procs, &taps).await;
+            let _ = tokio::fs::remove_dir_all(root).await;
+        });
+        cleanup
+            .await
+            .map_err(|e| anyhow::anyhow!("firecracker cleanup task failed: {e}"))
     }
 
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {

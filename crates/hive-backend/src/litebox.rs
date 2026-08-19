@@ -334,6 +334,97 @@ struct LiteboxNet {
     guest_ip: String,
 }
 
+struct LiteboxLinkRollback {
+    tun_dev: String,
+    armed: bool,
+}
+
+impl LiteboxLinkRollback {
+    fn new(tun_dev: String) -> Self {
+        Self {
+            tun_dev,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiteboxLinkRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let tun_dev = self.tun_dev.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                delete_litebox_link(&tun_dev).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                delete_litebox_link(&tun_dev).await;
+            });
+        }
+    }
+}
+
+struct LiteboxProvisionGuard {
+    id: CellId,
+    root: PathBuf,
+    cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
+    armed: bool,
+}
+
+impl LiteboxProvisionGuard {
+    fn new(
+        id: CellId,
+        root: PathBuf,
+        cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
+    ) -> Self {
+        Self {
+            id,
+            root,
+            cell_nets,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiteboxProvisionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let id = self.id.clone();
+        let root = self.root.clone();
+        let cell_nets = self.cell_nets.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let net = cell_nets.lock().await.remove(&id);
+                if let Some(net) = net {
+                    delete_litebox_link(&net.tun_dev).await;
+                }
+                let _ = tokio::fs::remove_dir_all(root).await;
+            });
+        }
+    }
+}
+
+async fn delete_litebox_link(tun_dev: &str) {
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {tun_dev} 2>/dev/null"
+        ))
+        .kill_on_drop(true)
+        .status()
+        .await;
+}
+
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
     /// Long-lived function processes (the litebox runner itself — guest and
@@ -341,11 +432,9 @@ pub struct LiteboxBackend {
     funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
-    /// Per-cell podman container name (CONTAINER cells bypass litebox — see
-    /// module doc — and run exactly like `FirecrackerBackend`'s container
-    /// branch).
-    containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
-    ctnl_tasks: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
+    /// Per-cell host-container ownership. Container cells bypass litebox and run
+    /// through the shared owned launch path.
+    containers: Arc<AsyncMutex<HashMap<CellId, crate::ContainerLaunch>>>,
     /// Per-cell TUN device state — see [`LiteboxNet`]. Set
     /// up in `provision` (before the port is known), torn down in
     /// `terminate`. Absent for CONTAINER cells, which never touch this path.
@@ -382,7 +471,6 @@ impl LiteboxBackend {
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
-            ctnl_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
             net_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sampler: Arc::new(crate::CpuSampler::new()),
@@ -450,6 +538,7 @@ impl LiteboxBackend {
         let host_ip = format!("10.88.{third}.{}", base + 1);
         let guest_ip = format!("10.88.{third}.{}", base + 2);
         let tun_dev = format!("lbt{i}");
+        let mut rollback = LiteboxLinkRollback::new(tun_dev.clone());
 
         // Recreate fresh every time (delete any stale device from a prior
         // cell at this index) — same idempotency shape as
@@ -473,6 +562,7 @@ impl LiteboxBackend {
         let ok = Command::new("/bin/sh")
             .arg("-c")
             .arg(&script)
+            .kill_on_drop(true)
             .status()
             .await
             .map(|s| s.success())
@@ -493,6 +583,7 @@ impl LiteboxBackend {
             guest_ip,
         };
         self.cell_nets.lock().await.insert(id.clone(), net.clone());
+        rollback.commit();
         Some(net)
     }
 
@@ -974,6 +1065,8 @@ impl CellBackend for LiteboxBackend {
             .root
             .join(crate::sanitize_tenant(tenant))
             .join(spec.id.as_str());
+        let mut provision =
+            LiteboxProvisionGuard::new(spec.id.clone(), root.clone(), self.cell_nets.clone());
         tokio::fs::create_dir_all(&root).await?;
         if !self.cfg.provision_latency.is_zero() {
             tokio::time::sleep(self.cfg.provision_latency).await;
@@ -993,6 +1086,7 @@ impl CellBackend for LiteboxBackend {
                  section"
             );
         }
+        provision.commit();
         Ok(CellHandle {
             id: spec.id.clone(),
             image: spec.image.clone(),
@@ -1103,7 +1197,7 @@ impl CellBackend for LiteboxBackend {
                     protocol: crate::ContainerProtocol::Tcp,
                 })
             }));
-            let (name, endpoint, task) = crate::podman_run_container(
+            let launch = crate::podman_run_container(
                 &cell.id,
                 &image,
                 &ports,
@@ -1117,8 +1211,8 @@ impl CellBackend for LiteboxBackend {
                 func.gpu,
             )
             .await?;
-            self.containers.lock().await.insert(cell.id.clone(), name);
-            self.ctnl_tasks.lock().await.insert(cell.id.clone(), task);
+            let endpoint = launch.endpoint();
+            self.containers.lock().await.insert(cell.id.clone(), launch);
             return Ok(endpoint);
         }
 
@@ -1220,13 +1314,7 @@ impl CellBackend for LiteboxBackend {
         self.funcs.lock().await.insert(cell.id.clone(), child);
 
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
-        if let Err(e) = crate::mock::wait_tcp_ready(&func_addr, Duration::from_secs(15)).await {
-            if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
-            return Err(e);
-        }
+        crate::mock::wait_tcp_ready(&func_addr, Duration::from_secs(15)).await?;
 
         // Front the function with a multiplexed tunnel server — same shape
         // as every other backend's serving path.
@@ -1234,7 +1322,7 @@ impl CellBackend for LiteboxBackend {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let tunnel_addr = listener.local_addr()?.to_string();
         let max_conc = func.max_concurrency.max(1);
-        let task = tokio::spawn(async move {
+        let task = crate::AbortTask::new(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((conn, _)) => {
@@ -1251,40 +1339,45 @@ impl CellBackend for LiteboxBackend {
                     Err(_) => break,
                 }
             }
-        });
-        self.tunnels.lock().await.insert(cell.id.clone(), task);
+        }));
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(task) = task.publish() {
+            tunnels.insert(cell.id.clone(), task);
+        }
 
         Ok(CellEndpoint::Tcp(tunnel_addr))
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Bind each `remove` out of its guard before the following await — see
-        // `firecracker.rs::terminate` for the full reasoning (an `if let` over
-        // `map.lock().await.remove(..)` holds the map for the whole body, i.e.
-        // across `podman_stop_container` and `child.wait()`, blocking
-        // `cpu_percent` and cold starts node-wide during a drain).
-        let tunnel = self.tunnels.lock().await.remove(&cell.id);
-        if let Some(task) = tunnel {
-            task.abort();
-        }
-        let ctnl_task = self.ctnl_tasks.lock().await.remove(&cell.id);
-        if let Some(task) = ctnl_task {
-            task.abort();
-        }
-        let container = self.containers.lock().await.remove(&cell.id);
-        if let Some(name) = container {
-            crate::podman_stop_container(&name, crate::PODMAN_PATH).await;
-        }
-        let func = self.funcs.lock().await.remove(&cell.id);
-        if let Some(mut child) = func {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        // Deleting the namespace also destroys its TUN device and every
-        // iptables rule inside it — nothing else to clean up per cell.
-        self.teardown_cell_net(&cell.id).await;
-        let _ = tokio::fs::remove_dir_all(&cell.root).await;
-        Ok(())
+        let id = cell.id.clone();
+        let root = cell.root.clone();
+        let tunnels = self.tunnels.clone();
+        let containers = self.containers.clone();
+        let funcs = self.funcs.clone();
+        let cell_nets = self.cell_nets.clone();
+        let cleanup = tokio::spawn(async move {
+            let tunnel = tunnels.lock().await.remove(&id);
+            if let Some(task) = tunnel {
+                task.abort();
+            }
+            let container = containers.lock().await.remove(&id);
+            if let Some(container) = container {
+                container.terminate().await;
+            }
+            let process = funcs.lock().await.remove(&id);
+            if let Some(mut child) = process {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            let net = cell_nets.lock().await.remove(&id);
+            if let Some(net) = net {
+                delete_litebox_link(&net.tun_dev).await;
+            }
+            let _ = tokio::fs::remove_dir_all(root).await;
+        });
+        cleanup
+            .await
+            .map_err(|e| anyhow::anyhow!("litebox cleanup task failed: {e}"))
     }
 
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {

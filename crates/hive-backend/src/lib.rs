@@ -713,11 +713,6 @@ fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
         || e.contains("network not found") // net was rm'd/leaked and couldn't be recreated with the pinned subnet
 }
 
-/// Run an OCI image as a detached podman container on the HOST, then front it with
-/// the Fluid tunnel server (so in-function concurrency + the gateway proxy work the
-/// same as any other cell). Shared by the mock + Firecracker backends so Firecracker
-/// nodes can run containers outside their microVMs. Returns the podman container
-/// name (for teardown), the tunnel endpoint, and the accept-loop task handle.
 /// Make a logical image name safe as a single filename component. Shared by
 /// every backend that caches a per-image artifact on disk (Firecracker's
 /// rootfs/data images, Litebox's initial-files tar).
@@ -738,6 +733,138 @@ pub(crate) fn sanitize_image(image: &str) -> String {
 /// minimal env). Covers the standard distro locations. Shared by every
 /// backend that runs containers via host podman (Firecracker, Litebox).
 pub(crate) const PODMAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub(crate) struct AbortTask(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortTask {
+    pub(crate) fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    pub(crate) fn publish(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+
+    pub(crate) fn abort(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+pub(crate) struct ContainerRollback {
+    name: String,
+    apple: bool,
+    path_env: String,
+    armed: bool,
+}
+
+impl ContainerRollback {
+    pub(crate) fn new(name: String, apple: bool, path_env: &str) -> Self {
+        Self {
+            name,
+            apple,
+            path_env: path_env.to_string(),
+            armed: true,
+        }
+    }
+
+    async fn cleanup(&mut self) {
+        remove_container_eventually(&self.name, self.apple, &self.path_env).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        let apple = self.apple;
+        let path_env = self.path_env.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                remove_container_eventually(&name, apple, &path_env).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new(crate::container_cli::bin(apple))
+                    .args(crate::container_cli::rm_args(apple, &name))
+                    .env("PATH", path_env)
+                    .output();
+            });
+        }
+    }
+}
+
+pub(crate) struct ContainerLaunch {
+    endpoint: CellEndpoint,
+    task: AbortTask,
+    rollback: ContainerRollback,
+}
+
+impl ContainerLaunch {
+    pub(crate) fn new(
+        endpoint: CellEndpoint,
+        task: tokio::task::JoinHandle<()>,
+        rollback: ContainerRollback,
+    ) -> Self {
+        Self {
+            endpoint,
+            task: AbortTask::new(task),
+            rollback,
+        }
+    }
+
+    pub(crate) fn endpoint(&self) -> CellEndpoint {
+        self.endpoint.clone()
+    }
+
+    pub(crate) async fn terminate(mut self) {
+        self.task.abort();
+        self.rollback.cleanup().await;
+    }
+}
+
+async fn remove_container(name: &str, apple: bool, path_env: &str) {
+    let _ = tokio::process::Command::new(crate::container_cli::bin(apple))
+        .args(crate::container_cli::rm_args(apple, name))
+        .env("PATH", path_env)
+        .kill_on_drop(true)
+        .output()
+        .await;
+}
+
+async fn remove_container_eventually(name: &str, apple: bool, path_env: &str) {
+    for delay_ms in [0, 100, 500] {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        remove_container(name, apple, path_env).await;
+    }
+}
+
+async fn run_container_command(
+    bin: &str,
+    args: &[String],
+    path_env: &str,
+) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(bin)
+        .args(args)
+        .env("PATH", path_env)
+        .kill_on_drop(true)
+        .output()
+        .await
+}
 
 /// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
 /// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
@@ -821,7 +948,7 @@ pub(crate) async fn podman_run_container(
     // retry-on-default-runtime fallback below already lands the container on
     // the default runtime, GPUs intact.
     gpu: bool,
-) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<ContainerLaunch> {
     use tokio::process::Command;
     anyhow::ensure!(
         !ports.is_empty(),
@@ -852,6 +979,7 @@ pub(crate) async fn podman_run_container(
         .unwrap_or(false)
         && crate::container_cli::is_apple_default();
     let bin = crate::container_cli::bin(apple);
+    let rollback = ContainerRollback::new(name.clone(), apple, path_env);
     // Clear any stale container from a prior cell at this id (kill_on_drop can't).
     let _ = Command::new(bin)
         .args(crate::container_cli::rm_args(apple, &name))
@@ -1071,11 +1199,7 @@ pub(crate) async fn podman_run_container(
         }
     }
     attempt.extend(base.iter().cloned());
-    let mut out = Command::new(bin)
-        .args(&attempt)
-        .env("PATH", path_env)
-        .output()
-        .await?;
+    let mut out = run_container_command(bin, &attempt, path_env).await?;
 
     // Non-breaking fallback: if a sandbox runtime was requested but the container
     // couldn't start under it (a gVisor incompatibility), retry on podman's DEFAULT
@@ -1094,11 +1218,7 @@ pub(crate) async fn podman_run_container(
             .await;
         let mut fb: Vec<String> = vec!["run".into()];
         fb.extend(base.iter().cloned());
-        out = Command::new(bin)
-            .args(&fb)
-            .env("PATH", path_env)
-            .output()
-            .await?;
+        out = run_container_command(bin, &fb, path_env).await?;
     }
 
     // CRITICAL leaked-IPAM self-heal (compose static-IP churn): a compose service
@@ -1206,7 +1326,7 @@ pub(crate) async fn podman_run_container(
                     .output()
                     .await;
                 let _ = Command::new(bin)
-                    .args(["rm", "-f", &stale_id])
+                    .args(crate::container_cli::rm_args(false, &stale_id))
                     .env("PATH", path_env)
                     .output()
                     .await;
@@ -1215,11 +1335,7 @@ pub(crate) async fn podman_run_container(
                     .env("PATH", path_env)
                     .output()
                     .await;
-                out = Command::new(bin)
-                    .args(&build_run(runtime))
-                    .env("PATH", path_env)
-                    .output()
-                    .await?;
+                out = run_container_command(bin, &build_run(runtime), path_env).await?;
             }
 
             // Step 2: if the surgical reap didn't release the lease (a truly
@@ -1322,11 +1438,7 @@ pub(crate) async fn podman_run_container(
                         .env("PATH", path_env)
                         .output()
                         .await;
-                    out = Command::new(bin)
-                        .args(&build_run(runtime))
-                        .env("PATH", path_env)
-                        .output()
-                        .await?;
+                    out = run_container_command(bin, &build_run(runtime), path_env).await?;
                 }
             }
 
@@ -1366,11 +1478,7 @@ pub(crate) async fn podman_run_container(
                     retry.push(rt.to_string());
                 }
                 retry.extend(dyn_base);
-                out = Command::new(bin)
-                    .args(&retry)
-                    .env("PATH", path_env)
-                    .output()
-                    .await?;
+                out = run_container_command(bin, &retry, path_env).await?;
             }
         }
     }
@@ -1404,11 +1512,7 @@ pub(crate) async fn podman_run_container(
                 retry.push(rt.to_string());
             }
             retry.extend(base.iter().cloned());
-            out = Command::new(bin)
-                .args(&retry)
-                .env("PATH", path_env)
-                .output()
-                .await?;
+            out = run_container_command(bin, &retry, path_env).await?;
         } else {
             // Nothing was reclaimable, so the pool is genuinely full of live
             // objects — raising `num_locks` is the real remedy. Say so instead of
@@ -1567,19 +1671,11 @@ pub(crate) async fn podman_run_container(
             }
         }
     });
-    Ok((name, CellEndpoint::Tcp(tunnel_addr), task))
-}
-
-/// Stop + remove a podman container by name (cell teardown). Best-effort.
-pub(crate) async fn podman_stop_container(name: &str, path_env: &str) {
-    // Only called from the Firecracker backend (Linux-only), so this always
-    // resolves to podman — routed through the shared helper for consistency.
-    let apple = crate::container_cli::is_apple_default();
-    let _ = tokio::process::Command::new(crate::container_cli::bin(apple))
-        .args(crate::container_cli::rm_args(apple, name))
-        .env("PATH", path_env)
-        .output()
-        .await;
+    Ok(ContainerLaunch::new(
+        CellEndpoint::Tcp(tunnel_addr),
+        task,
+        rollback,
+    ))
 }
 
 /// What the control plane asks a backend to materialize.

@@ -193,6 +193,41 @@ pub struct MacosNet {
     pub guest_ip: String,
 }
 
+struct RunnerRollback {
+    cfg: LiteboxMacosConfig,
+    net: MacosNet,
+    armed: bool,
+}
+
+impl RunnerRollback {
+    fn new(cfg: LiteboxMacosConfig, net: MacosNet) -> Self {
+        Self {
+            cfg,
+            net,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunnerRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        let net = self.net.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                kill_runner(&cfg, &net).await;
+            });
+        }
+    }
+}
+
 /// Allocates a fresh `/30` per cell. Deliberately a DIFFERENT address range
 /// (`10.90.x.x`) than `crate::litebox`'s Linux `LiteboxNet` (`10.88.x.x`) —
 /// the two backends never run on the same host, but keeping the ranges
@@ -279,6 +314,7 @@ pub async fn start(
     let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn litebox-macos runner via sudo: {e}"))?;
+    let mut rollback = RunnerRollback::new(cfg.clone(), net.clone());
 
     // The utun device only exists once the runner's own `open_utun` call has
     // completed — poll rather than assume a fixed delay. This happens very
@@ -329,6 +365,7 @@ pub async fn start(
         net.guest_ip
     );
 
+    rollback.commit();
     Ok(child)
 }
 
@@ -394,6 +431,7 @@ pub async fn build_combined_tar(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn tar: {e}"))?;
     child

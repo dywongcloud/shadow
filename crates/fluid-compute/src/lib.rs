@@ -25,7 +25,9 @@
 //! teardown happen outside the lock.
 
 use fluid_core::FunctionConfig;
-use hive_backend::{connect_endpoint, CellBackend, CellEndpoint, CellSpec, FunctionLaunch};
+use hive_backend::{
+    connect_endpoint, CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch,
+};
 use hive_core::{now_ms, CellId, ResourceSpec};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -355,6 +357,38 @@ pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
         _ => configured_max,
     };
     cap.max(1)
+}
+
+struct UnpublishedCell {
+    backend: Arc<dyn CellBackend>,
+    handle: Option<CellHandle>,
+}
+
+impl UnpublishedCell {
+    fn new(backend: Arc<dyn CellBackend>, handle: CellHandle) -> Self {
+        Self {
+            backend,
+            handle: Some(handle),
+        }
+    }
+
+    fn publish(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for UnpublishedCell {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let backend = self.backend.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = backend.terminate(&handle).await;
+            });
+        }
+    }
 }
 
 /// Releases a cold start's `provisioning` reservation and records the failure if
@@ -1270,18 +1304,10 @@ impl Fluid {
         // start is explainable, not a single opaque number.
         let t_prov = now_ms();
         let handle = self.backend.provision(&spec).await?;
+        let mut unpublished = UnpublishedCell::new(self.backend.clone(), handle.clone());
         let provision_ms = now_ms().saturating_sub(t_prov);
-        // If starting the function fails, the cell was already provisioned —
-        // tear it back down so it doesn't leak (a leaked "Created" container
-        // still holds a lock + process slot on the host).
         let t_run = now_ms();
-        let endpoint = match self.backend.start_function(&handle, &launch).await {
-            Ok(ep) => ep,
-            Err(e) => {
-                let _ = self.backend.terminate(&handle).await;
-                return Err(e);
-            }
-        };
+        let endpoint = self.backend.start_function(&handle, &launch).await?;
 
         let runtime_init_ms = now_ms().saturating_sub(t_run);
         let cell_id = spec.id.clone();
@@ -1309,10 +1335,9 @@ impl Fluid {
             }
         };
         if !added {
-            // Function was unregistered mid-start; tear the cell back down.
-            let _ = self.backend.terminate(&handle).await;
             anyhow::bail!("function '{key}' unregistered during cold start");
         }
+        unpublished.publish();
         Ok((cell_id, endpoint))
     }
 
