@@ -18,7 +18,10 @@ import { deploymentHost } from "@/lib/deploy-url";
  * three genuinely different moves, which every registrar doc names but
  * users conflate constantly:
  *   A. POINT RECORDS — the domain keeps its current DNS; the user adds
- *      records (A at apex / CNAME for subdomains) plus our ownership TXT.
+ *      ONE record (ALIAS/ANAME at apex where the provider supports it,
+ *      CNAME for subdomains — it follows the deployment, so there are no
+ *      edge IP addresses to maintain; per-IP A records only as a fallback)
+ *      plus our ownership TXT.
  *   B. DELEGATE DNS — the user changes nameservers to ours; we serve the
  *      zone (record import offered first), manage certs, verify via TXT.
  *   C. TRANSFER REGISTRATION — billing/renewal moves registrars (5–7 days,
@@ -239,7 +242,7 @@ export function DomainWizard({
                   active={path === "records"}
                   onClick={() => setPath("records")}
                   title="Point DNS records — fastest"
-                  body="Keep your current registrar and DNS. Add one or two records (an A record or CNAME for this name) plus a short ownership TXT. Your email and other DNS records stay untouched — only the records for this name point at us. You manage DNS in two places from now on."
+                  body="Keep your current registrar and DNS. Add one record (an ALIAS or CNAME for this name — it follows your deployment automatically, no IP addresses to maintain) plus a short ownership TXT. Your email and other DNS records stay untouched — only the records for this name point at us. You manage DNS in two places from now on."
                 />
                 <PathCard
                   active={path === "delegate"}
@@ -312,14 +315,47 @@ export function DomainWizard({
               {path === "records" && (
                 <div className="flex flex-col gap-2">
                   {isApex ? (
-                    <RecordRow
-                      label="A"
-                      name="@"
-                      value={edgeV4.join("  ·  ") || "loading…"}
-                      hint="One A record per address if your provider allows it, else the first one."
-                      onCopy={() => copy("A record", edgeV4.join("\n"))}
-                      copied={copied === "A record"}
-                    />
+                    <>
+                      <RecordRow
+                        label="ALIAS"
+                        name="@"
+                        value={cnameTarget || "…"}
+                        hint="One record, set once — it follows your deployment automatically as the fleet changes, so there are no IP addresses to maintain."
+                        onCopy={() => copy("ALIAS record", cnameTarget)}
+                        copied={copied === "ALIAS record"}
+                      />
+                      {/* GoDaddy / Route 53 / Vercel DNS have no apex ALIAS/ANAME we
+                          can point at a platform hostname (Route 53 aliases only target
+                          AWS resources) — for those, delegation or the A-record set is
+                          the honest fallback. */}
+                      {registrar === "GoDaddy" || registrar === "Route 53" || registrar === "Vercel Domains" ? (
+                        <>
+                          <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-secondary">
+                            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+                            <span>
+                              {registrar} has no apex ALIAS/ANAME record. Easiest: go back a step and choose
+                              <strong className="text-fg"> Delegate DNS to us</strong> — we then manage every record
+                              for you. Staying here? Add each A record below, and update them whenever the platform's
+                              edge set changes.
+                            </span>
+                          </p>
+                          <RecordRow
+                            label="A"
+                            name="@"
+                            value={edgeV4.join("  ·  ") || "loading…"}
+                            hint="Fallback only — one A record per address. These are edge IPs and they change as the fleet grows, which is exactly what ALIAS or DNS delegation avoids."
+                            onCopy={() => copy("A record", edgeV4.join("\n"))}
+                            copied={copied === "A record"}
+                          />
+                        </>
+                      ) : (
+                        <p className="text-[11px] text-muted">
+                          ALIAS works at Namecheap, DNSimple, and Cloudflare (CNAME flattening). If your provider turns
+                          out to have no ALIAS/ANAME, go back a step and delegate DNS to us instead — then we manage
+                          every record, and you never touch an IP address.
+                        </p>
+                      )}
+                    </>
                   ) : (
                     <RecordRow
                       label="CNAME"
