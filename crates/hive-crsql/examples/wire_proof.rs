@@ -228,9 +228,12 @@ fn main() -> anyhow::Result<()> {
             let mut lines = String::new();
             let mut total = 0usize;
             for (site, _) in hive_crsql::known_sites(&conn)? {
-                for batch in
-                    hive_crsql::changes_since_site(&conn, &site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?
-                {
+                for batch in hive_crsql::changes_since_site(
+                    &conn,
+                    &site,
+                    0,
+                    hive_crsql::DEFAULT_MAX_BATCH_CHANGES,
+                )? {
                     lines.push_str(&hex(&batch.encode()));
                     lines.push('\n');
                     total += 1;
@@ -275,7 +278,10 @@ fn main() -> anyhow::Result<()> {
             for o in &outcomes {
                 println!("apply-hcb1: {o:?}");
             }
-            println!("apply-hcb1: applied {} batch(es) from JS-encoded frames", outcomes.len());
+            println!(
+                "apply-hcb1: applied {} batch(es) from JS-encoded frames",
+                outcomes.len()
+            );
             Ok(())
         }
         other => {

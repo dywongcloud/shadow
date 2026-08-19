@@ -515,107 +515,313 @@ fn snapshot_key() -> Option<String> {
 /// the full snapshot under this node's own key (`node/<name>/snapshot`) — the
 /// durable copy the boot-time rollback guard restores from when the local file
 /// regressed. Spawned so persistence is never blocked on replication.
-pub fn replicate(snap: &PlatformSnapshot) {
-    let docs = crate::persist::namespaced(snap);
-    let payloads: Vec<(String, Vec<u8>)> = docs
-        .into_iter()
-        .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
-        .collect();
-    let full = serde_json::to_vec(snap).ok();
+type SnapshotDigest = [u8; 32];
 
-    // CHURN GATE (fleet OOM fix): `capture()` stamps `saved_ms = now` on every
-    // snapshot, so the full snapshot's bytes DIFFER every 120s even when nothing
-    // meaningful changed — defeating the "identical bytes = same hash = no new
-    // blob" premise this loop was written on. A `put` of that byte-different
-    // snapshot creates a NEW content-addressed blob AND a doc-update event on
-    // every peer (author+seq bump) → mesh-wide index-rebuild + compressed-cache
-    // retention storm every 120s per node. We therefore gate each replicate on
-    // a content SIGNATURE that EXCLUDES saved_ms: the per-namespace payloads
-    // (which carry the meaningful, replicated tenant state and no saved_ms).
-    // When the signature is unchanged we skip ALL puts — no new blob, no doc
-    // event, no downstream churn. Node-local extras in the full snapshot
-    // (builds/database_data) are restored from the local FILE anyway
-    // (`strip_node_local`), so gating the full-snapshot put on meaningful
-    // content is safe.
-    let mut to_put: Vec<(String, Vec<u8>)> = Vec::new();
-    {
-        let mut guard = last_replica_hashes()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut sig: u64 = 1469598103934665603; // FNV offset basis
-        for (ns, json) in payloads {
-            let key = format!("ns/{ns}/state");
-            let h = hash_bytes(&json);
-            sig = (sig ^ h).wrapping_mul(1099511628211);
-            if guard.get(&key).copied() != Some(h) {
-                guard.insert(key.clone(), h);
-                to_put.push((key, json));
+#[derive(Clone)]
+struct PreparedValue {
+    change_digest: SnapshotDigest,
+    bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct KeyedPreparedValue {
+    key: String,
+    value: PreparedValue,
+}
+
+#[derive(Clone)]
+struct DesiredReplication {
+    generation: u64,
+    namespaces: std::collections::BTreeMap<String, PreparedValue>,
+    full: Option<KeyedPreparedValue>,
+}
+
+#[derive(Default)]
+struct CommittedReplication {
+    namespaces: std::collections::BTreeMap<String, SnapshotDigest>,
+    full: Option<(String, SnapshotDigest)>,
+}
+
+impl DesiredReplication {
+    fn committed_state(&self) -> CommittedReplication {
+        CommittedReplication {
+            namespaces: self
+                .namespaces
+                .iter()
+                .map(|(key, value)| (key.clone(), value.change_digest))
+                .collect(),
+            full: self
+                .full
+                .as_ref()
+                .map(|full| (full.key.clone(), full.value.change_digest)),
+        }
+    }
+}
+
+const REPLICATION_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const REPLICATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+const SHARED_SNAPSHOT_EXCLUSIONS: [&str; 6] = [
+    "saved_ms",
+    "deployments",
+    "database_data",
+    "metrics_rollup",
+    "builds",
+    "sandboxes",
+];
+
+static REPLICATION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPLICATION_QUEUE: OnceLock<tokio::sync::watch::Sender<Arc<DesiredReplication>>> =
+    OnceLock::new();
+
+fn sha256(bytes: &[u8]) -> SnapshotDigest {
+    <sha2::Sha256 as sha2::Digest>::digest(bytes).into()
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut entries: Vec<_> = std::mem::take(fields).into_iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (_, value) in &mut entries {
+                canonicalize_json(value);
+            }
+            fields.extend(entries);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
             }
         }
-        if let Some(fkey) = snapshot_key() {
-            // The full snapshot is re-put only when the meaningful per-namespace
-            // content changed (tracked by `sig`), NOT merely because saved_ms
-            // advanced.
-            if guard.get(&fkey).copied() != Some(sig) {
-                guard.insert(fkey.clone(), sig);
-                if let Some(bytes) = full {
-                    to_put.push((fkey, bytes));
+        _ => {}
+    }
+}
+
+fn canonical_json_bytes(mut value: serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    canonicalize_json(&mut value);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn remove_siem_delivery_counters(value: &mut serde_json::Value) {
+    let Some(siem) = value
+        .as_object_mut()
+        .and_then(|root| root.get_mut("enterprise"))
+        .and_then(|enterprise| enterprise.as_object_mut())
+        .and_then(|enterprise| enterprise.get_mut("siem"))
+    else {
+        return;
+    };
+    let remove = |config: &mut serde_json::Value| {
+        if let Some(fields) = config.as_object_mut() {
+            fields.remove("delivered");
+            fields.remove("failed");
+        }
+    };
+    match siem {
+        serde_json::Value::Object(configs) => {
+            for config in configs.values_mut() {
+                remove(config);
+            }
+        }
+        serde_json::Value::Array(configs) => {
+            for config in configs {
+                remove(config);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn shared_snapshot_digest(snap: &PlatformSnapshot) -> anyhow::Result<SnapshotDigest> {
+    let mut value = serde_json::to_value(snap)?;
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("PlatformSnapshot did not serialize as a JSON object"))?;
+    for field in SHARED_SNAPSHOT_EXCLUSIONS {
+        root.remove(field);
+    }
+    remove_siem_delivery_counters(&mut value);
+    Ok(sha256(&canonical_json_bytes(value)?))
+}
+
+fn prepare_replication(
+    snap: &PlatformSnapshot,
+    generation: u64,
+) -> anyhow::Result<Arc<DesiredReplication>> {
+    let mut namespaces = std::collections::BTreeMap::new();
+    for (namespace, value) in crate::persist::namespaced(snap) {
+        let bytes = canonical_json_bytes(value)?;
+        namespaces.insert(
+            format!("ns/{namespace}/state"),
+            PreparedValue {
+                change_digest: sha256(&bytes),
+                bytes: Arc::new(bytes),
+            },
+        );
+    }
+    let full = match snapshot_key() {
+        Some(key) => Some(KeyedPreparedValue {
+            key,
+            value: PreparedValue {
+                change_digest: shared_snapshot_digest(snap)?,
+                bytes: Arc::new(serde_json::to_vec(snap)?),
+            },
+        }),
+        None => None,
+    };
+    Ok(Arc::new(DesiredReplication {
+        generation,
+        namespaces,
+        full,
+    }))
+}
+
+fn publish_replication(
+    sender: &tokio::sync::watch::Sender<Arc<DesiredReplication>>,
+    desired: Arc<DesiredReplication>,
+) {
+    sender.send_if_modified(|queued| {
+        if queued.generation >= desired.generation {
+            return false;
+        }
+        *queued = desired.clone();
+        true
+    });
+}
+
+fn is_namespace_state_key(key: &str) -> bool {
+    key.strip_prefix("ns/")
+        .and_then(|rest| rest.strip_suffix("/state"))
+        .is_some_and(|namespace| !namespace.is_empty())
+}
+
+async fn write_replication_batch(
+    desired: &DesiredReplication,
+    committed: &CommittedReplication,
+    owned_namespaces: &mut std::collections::BTreeMap<String, SnapshotDigest>,
+) -> anyhow::Result<()> {
+    let h = handle().await?;
+    let live = h.kv.all();
+
+    for (key, value) in &desired.namespaces {
+        let live_matches = live
+            .get(key)
+            .is_some_and(|bytes| sha256(bytes) == value.change_digest);
+        if committed.namespaces.get(key) != Some(&value.change_digest) || !live_matches {
+            h.kv.put(key, value.bytes.as_ref().clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian namespace put {key}: {e}"))?;
+            owned_namespaces.insert(key.clone(), value.change_digest);
+        }
+    }
+
+    let mut deletes: Vec<String> = live
+        .iter()
+        .filter_map(|(key, bytes)| {
+            if !is_namespace_state_key(key) || desired.namespaces.contains_key(key) {
+                return None;
+            }
+            let live_digest = sha256(bytes);
+            let owned = owned_namespaces.get(key) == Some(&live_digest)
+                || committed.namespaces.get(key) == Some(&live_digest);
+            owned.then(|| key.clone())
+        })
+        .collect();
+    deletes.sort_unstable();
+    for key in deletes {
+        h.kv.delete(&key)
+            .await
+            .map_err(|e| anyhow::anyhow!("guardian namespace delete {key}: {e}"))?;
+        owned_namespaces.remove(&key);
+    }
+
+    if let Some(full) = &desired.full {
+        let committed_matches = committed
+            .full
+            .as_ref()
+            .is_some_and(|(key, digest)| key == &full.key && digest == &full.value.change_digest);
+        if !committed_matches || !live.contains_key(&full.key) {
+            h.kv.put(&full.key, full.value.bytes.as_ref().clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian full snapshot put {}: {e}", full.key))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn replication_writer(mut receiver: tokio::sync::watch::Receiver<Arc<DesiredReplication>>) {
+    let mut committed = CommittedReplication::default();
+    let mut owned_namespaces = std::collections::BTreeMap::new();
+    let mut retry_delay = REPLICATION_RETRY_MIN;
+    loop {
+        let desired = receiver.borrow_and_update().clone();
+        match write_replication_batch(&desired, &committed, &mut owned_namespaces).await {
+            Ok(()) => {
+                committed = desired.committed_state();
+                owned_namespaces.clone_from(&committed.namespaces);
+                retry_delay = REPLICATION_RETRY_MIN;
+                if receiver.changed().await.is_err() {
+                    return;
                 }
             }
+            Err(error) => {
+                tracing::debug!(
+                    generation = desired.generation,
+                    error = %error,
+                    retry_ms = retry_delay.as_millis() as u64,
+                    "GuardianDB snapshot batch failed; retaining desired bytes for retry"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay.saturating_mul(2), REPLICATION_RETRY_MAX);
+            }
         }
     }
-    if to_put.is_empty() {
-        // Nothing meaningful changed since the last replicate — do not touch
-        // GuardianDB (this is the steady state most of the time).
-        return;
-    }
+}
 
-    let task = async move {
-        let h = match handle().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(error = %e, "GuardianDB unavailable; snapshot kept on disk only");
+pub fn replicate(snap: &PlatformSnapshot) {
+    use std::sync::atomic::Ordering;
+
+    let generation =
+        match REPLICATION_GENERATION.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        }) {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                tracing::error!("GuardianDB snapshot generation exhausted");
                 return;
             }
         };
-        for (key, bytes) in to_put {
-            if let Err(e) = h.kv.put(&key, bytes).await {
-                tracing::debug!(key = %key, error = %e, "GuardianDB put failed");
-            }
+    let desired = match prepare_replication(snap, generation) {
+        Ok(desired) => desired,
+        Err(error) => {
+            tracing::warn!(error = %error, "GuardianDB snapshot preparation failed");
+            return;
         }
     };
-    // Callers include the runtime-less `hive-persister` OS thread — a bare
-    // `tokio::spawn` would panic there and kill the persister (see RUNTIME).
-    match tokio::runtime::Handle::try_current()
+
+    if let Some(sender) = REPLICATION_QUEUE.get() {
+        publish_replication(sender, desired);
+        return;
+    }
+
+    let runtime = tokio::runtime::Handle::try_current()
         .ok()
-        .or_else(|| RUNTIME.get().cloned())
-    {
-        Some(rt) => {
-            rt.spawn(task);
-        }
-        None => tracing::debug!(
-            "no tokio runtime; guardian replication skipped (snapshot on disk only)"
-        ),
+        .or_else(|| RUNTIME.get().cloned());
+    if let Some(runtime) = runtime {
+        let sender = REPLICATION_QUEUE.get_or_init(|| {
+            let (sender, receiver) = tokio::sync::watch::channel(desired.clone());
+            runtime.spawn(replication_writer(receiver));
+            sender
+        });
+        publish_replication(sender, desired);
+        return;
     }
-}
 
-/// Last replicated content-hash per key (see `replicate`'s churn gate). Keeps
-/// steady-state replication a no-op so a stable fleet stops generating a new
-/// snapshot blob + doc-update storm every 120s.
-fn last_replica_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
-    static H: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-        std::sync::OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// FNV-1a hash of a byte slice (stable, fast, no deps).
-fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h: u64 = 1469598103934665603;
-    for &byte in b {
-        h ^= byte as u64;
-        h = h.wrapping_mul(1099511628211);
+    if let Some(sender) = REPLICATION_QUEUE.get() {
+        publish_replication(sender, desired);
+    } else {
+        tracing::debug!("no tokio runtime; guardian replication skipped (snapshot on disk only)");
     }
-    h
 }
 
 /// The replicated full snapshot for THIS node, if GuardianDB holds one.

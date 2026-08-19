@@ -42,7 +42,10 @@ fn maybe_print_banner() {
     if !landing {
         return;
     }
-    println!("{}", BANNER.if_supports_color(Stream::Stdout, |t| t.green()));
+    println!(
+        "{}",
+        BANNER.if_supports_color(Stream::Stdout, |t| t.green())
+    );
     println!();
 }
 

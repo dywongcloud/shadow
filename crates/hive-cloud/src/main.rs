@@ -181,6 +181,93 @@ pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\
 /// "not set" as that case, not an error.
 static SHUTDOWN_HTTPS_HANDLE: std::sync::OnceLock<axum_server::Handle> = std::sync::OnceLock::new();
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RestartReason {
+    MemoryPressure = 1,
+    MeshIsolation = 2,
+    MeshDegradation = 3,
+}
+
+impl RestartReason {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::MemoryPressure),
+            2 => Some(Self::MeshIsolation),
+            3 => Some(Self::MeshDegradation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ControlledRestart {
+    inner: Arc<ControlledRestartInner>,
+}
+
+struct ControlledRestartInner {
+    reason: std::sync::atomic::AtomicU8,
+    notify: tokio::sync::Notify,
+}
+
+impl ControlledRestart {
+    const SEALED: u8 = 1 << 7;
+    const REASON_MASK: u8 = !Self::SEALED;
+
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ControlledRestartInner {
+                reason: std::sync::atomic::AtomicU8::new(0),
+                notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn request(&self, reason: RestartReason) -> bool {
+        if self
+            .inner
+            .reason
+            .compare_exchange(
+                0,
+                reason as u8,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.inner.notify.notify_one();
+        true
+    }
+
+    fn reason(&self) -> Option<RestartReason> {
+        let state = self.inner.reason.load(std::sync::atomic::Ordering::Acquire);
+        RestartReason::from_u8(state & Self::REASON_MASK)
+    }
+
+    /// Atomically close the request latch and consume the winning reason. A
+    /// watchdog racing this boundary either wins before the seal and changes
+    /// the exit code, or observes the sealed state and reports `false`; it can
+    /// never report a successful request after main committed to exit zero.
+    fn seal(&self) -> Option<RestartReason> {
+        let state = self
+            .inner
+            .reason
+            .fetch_or(Self::SEALED, std::sync::atomic::Ordering::AcqRel);
+        RestartReason::from_u8(state & Self::REASON_MASK)
+    }
+
+    async fn wait(&self) -> RestartReason {
+        loop {
+            if let Some(reason) = self.reason() {
+                return reason;
+            }
+            self.inner.notify.notified().await;
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "hive-cloud",
@@ -921,35 +1008,56 @@ async fn main() -> anyhow::Result<()> {
     // HIVE_SHUTDOWN_GRACE_SECS (default 15s) so a stuck connection cannot hang a
     // restart forever; systemd's own TimeoutStopSec is the final backstop if this
     // grace window is somehow exceeded.
+    let controlled_restart = ControlledRestart::new();
     {
         let flush_cloud = cloud.clone();
         let flush_node_name = args.name.clone();
+        let shutdown_restart = controlled_restart.clone();
         tokio::spawn(async move {
-            let _ = &flush_cloud; // keep state alive for the flush
-            let mut term =
+            let terminate = async {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-            let mut intr =
+                    Ok(mut signal) => {
+                        signal.recv().await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to install SIGTERM handler");
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+            let interrupt = async {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = intr.recv() => {}
+                    Ok(mut signal) => {
+                        signal.recv().await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to install SIGINT handler");
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+            let requested_reason = tokio::select! {
+                _ = terminate => None,
+                _ = interrupt => None,
+                reason = shutdown_restart.wait() => Some(reason),
+            };
+            match requested_reason {
+                Some(reason) => tracing::error!(
+                    ?reason,
+                    "controlled restart requested; beginning graceful shutdown"
+                ),
+                None => tracing::info!("shutdown signal received; beginning graceful shutdown"),
             }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
-                tracing::info!(?grace, "shutdown signal → draining public listener (in-flight requests + cell tunnels)");
+                tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
                 handle.graceful_shutdown(Some(grace));
                 // graceful_shutdown stops new connections and gives existing ones
                 // the grace window; wait for it here since exit() below would
                 // otherwise kill them the instant this task returns regardless.
                 tokio::time::sleep(grace).await;
             }
-            tracing::info!("shutdown signal → flushing platform state");
+            tracing::info!("shutdown requested → flushing platform state");
             persist::flush_blocking();
             // Stamp the run marker as a GRACEFUL exit. Without this every
             // deploy restart and every `systemctl restart` would be classified
@@ -988,7 +1096,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            std::process::exit(0);
+            let restart_reason = shutdown_restart.seal();
+            if let Some(reason) = restart_reason {
+                tracing::error!(
+                    ?reason,
+                    exit_code = 17,
+                    "controlled restart shutdown complete"
+                );
+            }
+            std::process::exit(if restart_reason.is_some() { 17 } else { 0 });
         });
     }
     // Start the enterprise SIEM streamer: audit entries for teams with SIEM
@@ -1253,11 +1369,11 @@ async fn main() -> anyhow::Result<()> {
         let cloud = cloud.clone();
         tokio::spawn(async move {
             relational::init_schema().await;
-            let existing: Vec<(String, String, String)> = cloud
+            let existing: Vec<(String, String, String, u64)> = cloud
                 .projects
                 .snapshot()
                 .into_iter()
-                .map(|(project, s)| (project, s.team, s.build.root_dir))
+                .map(|(project, s)| (project, s.team, s.build.root_dir, s.updated_ms))
                 .collect();
             relational::backfill_projects(existing).await;
         });
@@ -1441,9 +1557,17 @@ async fn main() -> anyhow::Result<()> {
     // SNI resolver. No-ops entirely in ngrok ingress mode.
     acme::spawn_acme(cloud.clone());
     acme::spawn_cert_sync(cloud.clone());
+    // Custom tenant domains (verified attaches) get per-domain HTTP-01
+    // bundles: leader issues/renews, every node syncs via the same
+    // guardian/mesh/http distribution as the platform bundles.
+    acme::spawn_custom_cert_loop(cloud.clone());
     // Self-heal provisioned DB backings (restart-killed / machine-reset
     // containers) — see spawn_db_reconcile's doc for the witnessed loss classes.
     databases::spawn_db_reconcile(cloud.clone());
+    // Custom-domain ownership verification: the leader watches pending
+    // challenges and asks each attach's owning node to activate (the owner
+    // arm re-proves the TXT itself) — see activate_domain_alias in admin.rs.
+    crate::admin::spawn_domain_verify_loop(cloud.clone());
     // Managed serverless-GPU inference endpoints (llama.cpp): coordinator
     // nodes run/converge llama-server children, the leader injects
     // HIVE_INFERENCE_URL — see inference.rs's module doc.
@@ -1474,7 +1598,7 @@ async fn main() -> anyhow::Result<()> {
     // catches, so this arms jemalloc sampling and dumps a profile DURING the
     // burst, and logs the allocator/RSS/bound gauges every tick above the arm
     // threshold — the record that survives the kill. See `memwatch`.
-    memwatch::spawn(cloud.hive.clone());
+    memwatch::spawn(cloud.hive.clone(), controlled_restart.clone());
 
     // Mesh-isolation watchdog. Every node. A node whose iroh transport wedges
     // keeps its process, unit and HTTP surfaces healthy while seeing ZERO of
@@ -1680,29 +1804,111 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(error = %e, %https_addr, "HTTPS listener failed (check CAP_NET_BIND_SERVICE / port availability)");
             }
         });
-        // Port 80: redirect-only (no content ever served in cleartext).
+        // Port 80: redirect-only (no content ever served in cleartext) — with
+        // ONE deliberate exception: ACME HTTP-01 challenges, which Let's
+        // Encrypt fetches over plain http by definition. Answering them
+        // directly (instead of 301ing to an https host that has no cert yet —
+        // the deadlock that made first issuance impossible) is the entire
+        // point of the challenge type. Everything else still 301s.
+        let challenge_cloud = cloud.clone();
         tokio::spawn(async move {
-            let redirect = axum::Router::new().fallback(
-                |req: axum::http::Request<axum::body::Body>| async move {
-                    let host = req
-                        .headers()
-                        .get(axum::http::header::HOST)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string())
-                        .or_else(|| req.uri().host().map(|h| h.to_string()))
-                        .unwrap_or_default()
-                        .split(':')
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    let path_q = req
-                        .uri()
-                        .path_and_query()
-                        .map(|p| p.as_str().to_string())
-                        .unwrap_or_else(|| "/".into());
-                    axum::response::Redirect::permanent(&format!("https://{host}{path_q}"))
-                },
-            );
+            let cloud = challenge_cloud;
+            let redirect =
+                axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+                    let cloud = cloud.clone();
+                    async move {
+                        use axum::response::IntoResponse as _;
+                        let path_q = req
+                            .uri()
+                            .path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_else(|| "/".into());
+                        if let Some(token) = path_q
+                            .split('?')
+                            .next()
+                            .unwrap_or("")
+                            .strip_prefix("/.well-known/acme-challenge/")
+                        {
+                            return match cloud.acme_http01.lookup(token) {
+                                Some(body) => (
+                                    axum::http::StatusCode::OK,
+                                    [(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "text/plain; charset=utf-8",
+                                    )],
+                                    body,
+                                )
+                                    .into_response(),
+                                None => {
+                                    // Miss on this node: the issuer is the
+                                    // leader and Let's Encrypt's
+                                    // multi-perspective fetches land on RANDOM
+                                    // nodes within ~1s of set_ready — long
+                                    // before the 60s store_sync pull can
+                                    // replicate the leader-local token. Proxy
+                                    // the lookup to the leader (whose own
+                                    // port-80 arm answers from the store)
+                                    // instead of fail-validating every
+                                    // issuance ~13/14 of the time — the proxy
+                                    // previously existed only on the 443
+                                    // pipeline LE never reaches (adversarial
+                                    // finding, both re-reviews). Unknown token
+                                    // everywhere = flat 404, no existence leak.
+                                    let leader = cloud.control_plane_leader();
+                                    if leader != cloud.node_name {
+                                        if let Some(ip) = cloud
+                                            .registry
+                                            .nodes()
+                                            .into_iter()
+                                            .find(|n| n.name == leader && n.healthy)
+                                            .and_then(|n| {
+                                                n.public_ip.clone().filter(|ip| !ip.is_empty())
+                                            })
+                                        {
+                                            let url = format!("http://{ip}{path_q}");
+                                            if let Ok(r) = cloud
+                                                .http
+                                                .get(&url)
+                                                .timeout(std::time::Duration::from_secs(5))
+                                                .send()
+                                                .await
+                                            {
+                                                if r.status().is_success() {
+                                                    if let Ok(body) = r.text().await {
+                                                        return (
+                                                            axum::http::StatusCode::OK,
+                                                            [(
+                                                                axum::http::header::CONTENT_TYPE,
+                                                                "text/plain; charset=utf-8",
+                                                            )],
+                                                            body,
+                                                        )
+                                                            .into_response();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    (axum::http::StatusCode::NOT_FOUND, "unknown challenge")
+                                        .into_response()
+                                }
+                            };
+                        }
+                        let host = req
+                            .headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string())
+                            .or_else(|| req.uri().host().map(|h| h.to_string()))
+                            .unwrap_or_default()
+                            .split(':')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        axum::response::Redirect::permanent(&format!("https://{host}{path_q}"))
+                            .into_response()
+                    }
+                });
             tracing::info!(%http_addr, "port-80 listener (301 → https only)");
             match tokio::net::TcpListener::bind(http_addr).await {
                 Ok(l) => {
@@ -3115,13 +3321,19 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                         .insert(peer.clone(), (ps.id.clone(), addr));
                 }
             }
-            let peer_self_id = peer_self.map(|n| n.id);
+            let peer_self_id = peer_self.as_ref().map(|n| n.id.clone());
+            let peer_endpoint_id = peer_self
+                .as_ref()
+                .and_then(|n| n.peer_id.clone())
+                .filter(|id| !id.is_empty());
             for n in nodes {
                 if n.id != cloud.node_name {
-                    if let Some(addr) = n.iroh_addr.as_deref() {
-                        if let Some(eid) = hive_p2p::endpoint_id_from_addr_json(addr) {
-                            if let Ok(mut t) = cloud.trusted_peer_ids.write() {
-                                t.insert(eid);
+                    if cloud.relayed_trust_compat {
+                        if let Some(addr) = n.iroh_addr.as_deref() {
+                            if let Some(eid) = hive_p2p::endpoint_id_from_addr_json(addr) {
+                                if let Ok(mut trust) = cloud.trusted_peer_ids.write() {
+                                    trust.insert(eid);
+                                }
                             }
                         }
                     }
@@ -3140,11 +3352,17 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 }
             }
             if let Some(pid) = peer_self_id {
-                cloud.registry.set_health(&pid, rtt, true);
-                // A successful exchange retires the local routing penalty
-                // immediately — a recovered trunk must not serve out a cold
-                // window it no longer deserves.
-                crate::health::clear_cold(&pid);
+                if let Some(endpoint_id) = peer_endpoint_id {
+                    if cloud
+                        .registry
+                        .set_health_if_endpoint(&pid, &endpoint_id, rtt, true)
+                    {
+                        crate::health::clear_cold_identity(&endpoint_id);
+                    }
+                } else {
+                    cloud.registry.set_health(&pid, rtt, true);
+                    crate::health::clear_cold(&cloud.registry, &pid);
+                }
                 // `node_admins` MUST hold only real HTTP(S) admin URLs — the
                 // deploy dispatcher (see git.rs / schedule.rs) treats any entry
                 // here as "reachable via HTTP" and does `http.post(format!(
@@ -3983,14 +4201,16 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
                 tick.tick().await;
                 crate::supervise::beat("deletion-reconcile");
                 for (project, tomb_ms) in cloud.projects.tombstones_snapshot() {
-                    // Re-created after deletion (settings): tombstone is spent.
-                    if cloud
+                    let settings_recreated = cloud
                         .projects
                         .get_if_set(&project)
-                        .is_some_and(|s| s.updated_ms > tomb_ms)
-                    {
-                        continue;
-                    }
+                        .is_some_and(|s| s.updated_ms > tomb_ms);
+                    let peer_recreated = cloud
+                        .peer_deployments
+                        .read()
+                        .values()
+                        .flatten()
+                        .any(|d| d.project == project && d.created_at_ms > tomb_ms);
                     let mine: Vec<fluid_core::DeploymentInfo> = cloud
                         .gw
                         .list()
@@ -3998,6 +4218,14 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
                         .filter(|d| d.project == project)
                         .collect();
                     if mine.is_empty() {
+                        if settings_recreated || peer_recreated {
+                            continue;
+                        }
+                        // Re-apply even with no local deployments: this drives
+                        // the generation-conditional relational delete every
+                        // tick, so a stale offline node's late boot backfill
+                        // cannot resurrect project_teams indefinitely.
+                        cloud.projects.apply_delete(&project, tomb_ms);
                         // No deployment records left, but a node can still hold
                         // the project's durable PUBLIC PORT claim: the release
                         // runs inside `purge_project_resources`, which only runs
@@ -4009,32 +4237,31 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
                         // no longer exist. Witnessed: 9000/9001 still claimed for
                         // a project deleted fleet-wide. The tombstone is the
                         // authority here too.
-                        let released = crate::raw_ports::release_raw_ports(&project);
-                        if !released.is_empty() {
+                        let retired = crate::raw_ports::release_raw_ports(&project);
+                        if !retired.is_empty() {
                             tracing::warn!(
                                 project,
-                                ports = ?released,
-                                "deletion reconcile: released public raw port(s) still claimed \
-                                 by a project deleted fleet-wide"
+                                ports = ?retired,
+                                "deletion reconcile: retired public raw port(s) still claimed by \
+                                 a project deleted fleet-wide — never re-granted"
                             );
                             crate::persist::persist(&cloud);
                         }
                         continue;
                     }
-                    // Re-created after deletion (a newer deployment): leave the
-                    // whole project alone rather than reaping its older half.
-                    if mine.iter().any(|d| d.created_at_ms > tomb_ms) {
-                        continue;
-                    }
+                    // A newer local deployment is a causal recreation. The
+                    // generation-aware helper removes only old-incarnation
+                    // records and preserves the recreated row/resources.
                     let team = crate::admin::norm(&cloud.projects.team_of(&project)).to_string();
-                    let n = crate::admin::delete_project_local(&cloud, &project, &team).await;
+                    let outcome =
+                        crate::admin::delete_project_local(&cloud, &project, &team, tomb_ms).await;
                     tracing::warn!(
                         project,
-                        deployments = n,
+                        deployments = outcome.removed.len(),
+                        recreated = outcome.recreated,
                         tombstone_ms = tomb_ms,
-                        "deletion reconcile: applied a replicated project tombstone to \
-                         deployment records this node still held — the project was deleted \
-                         while this node could not be reached"
+                        "deletion reconcile: re-applied a replicated project deletion generation — \
+                         stale old-incarnation records were removed while any causal recreation survived"
                     );
                 }
             }
@@ -4065,8 +4292,8 @@ fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
 }
 
 /// Relational mirror loop — keeps the admin "view as PostgreSQL" browser's
-/// teams / team_members / deployments tables (and a FULL billing_accounts
-/// backfill) populated from live store snapshots. The metering loop's
+/// project_teams / teams / team_members / deployments tables (and a FULL
+/// billing_accounts backfill) populated from live store snapshots.
 /// `upsert_billing` only fires for tenants with active usage THIS tick, so an
 /// account that exists but isn't currently metered would otherwise never
 /// appear in the mirror (the live-witnessed missing-billing-accounts gap:
@@ -4081,16 +4308,16 @@ fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
 /// - deployments: EVERY node syncs only its OWN `gw.list()` rows (single
 ///   writer per row by construction — see `relational::sync_deployments`).
 ///
-/// A content hash per section skips ticks with no change, so a quiet fleet
-/// writes nothing (no CRDT doc churn — same debounce discipline as the
-/// guardian mesh/roster replication). Best-effort throughout: these tables
-/// feed ONLY the read-only admin browser, never control-plane logic.
+/// A content hash per ordinary section skips ticks with no change. Project rows
+/// are deliberately re-asserted every ten leader ticks: that bounded write is
+/// the repair path for a stale offline node's late LWW backfill. Best-effort
+/// throughout: these tables feed only fleet visibility/read-only admin views.
 /// Config: `HIVE_RELATIONAL_MIRROR_SECS` (s, def 60).
 fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_RELATIONAL_MIRROR_SECS", 60));
     tracing::info!(
         ?interval,
-        "relational mirror loop (teams/members/deployments + billing backfill → SQL view)"
+        "relational mirror loop (projects/teams/members/deployments + billing backfill → SQL view)"
     );
     crate::supervise::spawn_supervised("relational-mirror", move || {
         let cloud = cloud.clone();
@@ -4103,6 +4330,13 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
             };
             let mut tick = tokio::time::interval(interval);
             let (mut teams_hash, mut deps_hash) = (0u64, 0u64);
+            // Re-assert authoritative project rows every ten leader ticks. A
+            // stale node can boot and backfill an old ProjectStore snapshot
+            // after the real deletion/recreation write; version-conditional SQL
+            // rejects it when visible, and this bounded re-assertion repairs the
+            // distributed LWW race if the stale replica had not received the
+            // newer row yet. Start at 9 so a newly elected leader runs it now.
+            let mut project_reconcile_round = 9u8;
             // Per-tenant billing hashes: only tenants whose own rows changed are
             // re-upserted (an aggregate hash re-wrote all of them for one
             // tenant's change).
@@ -4130,7 +4364,17 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                 let isolated = cloud.mesh_health().isolated;
                 let cp_leader = cloud.control_plane_leader() == cloud.node_name && !isolated;
                 if cp_leader {
-                    let teams = cloud.teams.list();
+                    project_reconcile_round = (project_reconcile_round + 1) % 10;
+                    if project_reconcile_round == 0 {
+                        let projects: Vec<(String, String, String, u64)> = cloud
+                            .projects
+                            .snapshot()
+                            .into_iter()
+                            .map(|(project, s)| (project, s.team, s.build.root_dir, s.updated_ms))
+                            .collect();
+                        relational::backfill_projects(projects).await;
+                    }
+                    let teams = cloud.teams.list_authoritative();
                     if let Ok(json) = serde_json::to_string(&teams) {
                         let h = hash_of(&json);
                         if h != teams_hash {
@@ -4225,6 +4469,7 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             )
                             .collect::<Vec<_>>()
                             .await;
+                        let mut adopted_store = false;
                         for (store, local, bytes) in bounded {
                             let Some(bytes) = bytes else { continue };
                             // Raw byte-compare change-gate: `snapshot` is
@@ -4232,6 +4477,7 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             // empties (an old leader without this arm returns []).
                             if !bytes.is_empty() && bytes != local {
                                 if let Some(n) = (store.adopt)(&cloud, &bytes) {
+                                    adopted_store = true;
                                     tracing::info!(
                                         leader = %leader,
                                         store = store.name,
@@ -4240,6 +4486,13 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                                     );
                                 }
                             }
+                        }
+                        if adopted_store {
+                            // A follower merge is a real mutation, including
+                            // recovered permanent tombstones. Queue persistence
+                            // now instead of leaving a crash-loss window until
+                            // the unrelated periodic capture.
+                            persist::persist(&cloud);
                         }
                     } else if last_peer_lookup_warn.elapsed() >= Duration::from_secs(300) {
                         tracing::warn!(
@@ -4525,17 +4778,21 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 continue;
             }
             // Probe set: every OTHER node with a public IP + a resolvable iroh address.
-            // `last_seen` is captured from the SAME snapshot so the liveness check
-            // below can never disagree with the set actually probed this round.
-            let snapshot = cloud.registry.nodes();
-            let last_seen: std::collections::HashMap<String, u64> = snapshot
-                .iter()
-                .map(|n| (n.id.clone(), n.last_seen_ms))
-                .collect();
-            let targets: Vec<(String, String, String)> = snapshot
+            // Each result retains the immutable endpoint id and liveness timestamp
+            // captured with the attempted address.
+            let targets: Vec<(String, String, String, u64)> = cloud
+                .registry
+                .nodes()
                 .into_iter()
                 .filter(|n| !n.is_self && n.public_ip.is_some())
-                .filter_map(|n| Some((n.id.clone(), n.peer_id.clone()?, n.iroh_addr.clone()?)))
+                .filter_map(|n| {
+                    Some((
+                        n.id,
+                        n.peer_id.filter(|id| !id.is_empty())?,
+                        n.iroh_addr?,
+                        n.last_seen_ms,
+                    ))
+                })
                 .collect();
             if targets.is_empty() {
                 continue;
@@ -4554,126 +4811,79 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
             // dropped from client DNS and placement, so this silently shrank the
             // fleet. Once a target is already failing, give it the full
             // dial_fallback_ceiling so discovery gets a genuine chance to recover it.
-            let results = futures::future::join_all(targets.into_iter().map(|(name, id, addr)| {
-                let cloud = cloud.clone();
-                let failing = *misses.get(&name).unwrap_or(&0) >= threshold;
-                let budget = if failing {
-                    hive_p2p::dial_fallback_ceiling()
-                } else {
-                    timeout
-                };
-                async move {
-                    // TWO samples per round, pass on EITHER (tau's multi-ping
-                    // liveness): a single lost datagram train on a lossy
-                    // cross-continent path counted as a full round miss, and
-                    // at threshold=2 two unlucky rounds withdrew a healthy
-                    // peer. The samples run sequentially so the second only
-                    // spends budget when the first genuinely failed (which
-                    // also gives `probe`'s trunk-eviction from the first
-                    // failure a fresh-dial chance within the same round).
-                    let first = gossip::probe(&cloud, &id, &addr, budget).await;
-                    let rtt = match first {
-                        Some(ms) => Some(ms),
-                        None => gossip::probe(&cloud, &id, &addr, budget).await,
+            let results = futures::future::join_all(targets.into_iter().map(
+                |(name, endpoint_id, addr, observed_last_seen_ms)| {
+                    let cloud = cloud.clone();
+                    let failing = *misses.get(&endpoint_id).unwrap_or(&0) >= threshold;
+                    let budget = if failing {
+                        hive_p2p::dial_fallback_ceiling()
+                    } else {
+                        timeout
                     };
-                    (name, rtt)
-                }
-            }))
+                    async move {
+                        // TWO samples per round, pass on EITHER (tau's multi-ping
+                        // liveness): a single lost datagram train on a lossy
+                        // cross-continent path counted as a full round miss, and
+                        // at threshold=2 two unlucky rounds withdrew a healthy
+                        // peer. The samples run sequentially so the second only
+                        // spends budget when the first genuinely failed (which
+                        // also gives `probe`'s trunk-eviction from the first
+                        // failure a fresh-dial chance within the same round).
+                        let first = gossip::probe(&cloud, &endpoint_id, &addr, budget).await;
+                        let rtt = match first {
+                            Some(ms) => Some(ms),
+                            None => gossip::probe(&cloud, &endpoint_id, &addr, budget).await,
+                        };
+                        (name, endpoint_id, observed_last_seen_ms, rtt)
+                    }
+                },
+            ))
             .await;
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (name, rtt) in results {
-                live.insert(name.clone());
-                let prev = *misses.get(&name).unwrap_or(&0);
+            for (name, endpoint_id, observed_last_seen_ms, rtt) in results {
+                live.insert(endpoint_id.clone());
+                let prev = *misses.get(&endpoint_id).unwrap_or(&0);
                 let (next, write) = health_decision(prev, rtt.is_some(), threshold);
-                misses.insert(name.clone(), next);
+                misses.insert(endpoint_id.clone(), next);
                 match write {
                     Some(true) => {
-                        cloud.registry.set_health(&name, rtt.unwrap_or(0), true);
-                        crate::health::clear_cold(&name);
+                        if cloud.registry.set_health_if_endpoint(
+                            &name,
+                            &endpoint_id,
+                            rtt.unwrap_or(0),
+                            true,
+                        ) {
+                            crate::health::clear_cold_identity(&endpoint_id);
+                        }
                     }
                     Some(false) => {
-                        // A WEDGED LOCAL PROBER MUST NEVER WITHDRAW A LIVE NODE.
-                        // Gossip announces every 3-4s and `upsert_peer` refreshes
-                        // `last_seen_ms` from it while deliberately NOT touching
-                        // `healthy` ("owned by our OWN direct probes"), so a fresh
-                        // timestamp is INDEPENDENT proof the peer is alive and
-                        // still talking to us — the probe failing against that is a
-                        // local mesh-path artifact (stale cached addr, wedged
-                        // trunk), not a dead peer.
-                        //
-                        // Witnessed in production: after a fleet-wide roll the
-                        // control-plane LEADER marked 10 of 17 nodes unhealthy
-                        // while every one of them kept gossiping, and it did not
-                        // self-recover — and because DNS and placement are driven
-                        // from the leader, those 10 live nodes were withheld from
-                        // client DNS and scheduling until the leader was restarted.
-                        // Two other vantages saw the same fleet as 0 and 1
-                        // unhealthy, so the withdrawing verdict was the wrong one.
-                        //
-                        // A genuinely dead node stops gossiping, so it still leaves
-                        // service on its own: `NodeRegistry::nodes()` drops any peer
-                        // stale >30s, which is the real safety net. This only
-                        // declines the redundant, unsafe half of that.
-                        //
-                        // The guard now lives in `health::demote` — ONE writer
-                        // for every withdrawal on this node, because it was
-                        // implemented here and nowhere else while five other
-                        // call sites withdrew peers with no guard at all.
-                        // `last_seen` is still passed from the SAME snapshot the
-                        // probe set was built from, so the liveness check can
-                        // never disagree with the set actually probed this round.
-                        crate::health::demote(
+                        crate::health::demote_exact(
                             &cloud.registry,
                             &name,
+                            &endpoint_id,
                             &format!("mesh probe failed ({next} consecutive)"),
-                            last_seen.get(&name).copied(),
+                            Some(observed_last_seen_ms),
                         );
                     }
                     None => {}
                 }
             }
-            // Reverse any withdrawal the gossip evidence no longer supports.
-            // `demote` already refuses to withdraw a peer that is still
-            // announcing, but nothing undid a verdict once written: a peer whose
-            // probe path stayed broken while its gossip kept arriving was
-            // unhealthy for the life of the process, and unhealthy peers leave
-            // DNS and placement. Measured live as audible=15 / visible_healthy=6
-            // across nine nodes at once. Runs every round, after the verdicts.
             let restored = crate::health::restore_gossip_alive(&cloud.registry);
             if !restored.is_empty() {
-                // Probing is what SHOULD be clearing these; a nonzero count is a
-                // local transport fault, not a peer fault.
+                let pool = { cloud.mesh.read().clone() };
+                if let Some(pool) = pool {
+                    for endpoint_id in &restored {
+                        pool.close_peer(endpoint_id).await;
+                    }
+                }
                 tracing::warn!(
                     restored = restored.len(),
                     "health: restored peers that are gossiping but unprobeable — \
                      this node's mesh transport is failing against live peers"
                 );
-                // Drop the trunks of EXACTLY the peers restored above, resolved by
-                // id — never by testing `latency_ms == RESTORED_LATENCY_MS`, which
-                // a genuine measurement can equal (probe RTT is stored raw, and
-                // ~1s cross-continent probes are normal here) and which a relayed
-                // NodeInfo can carry in from another observer. Those peers' trunks
-                // are the ones that just failed, so dropping them lets the next
-                // probe re-dial fresh instead of re-timing-out on the wedge.
-                if let Some(pool) = cloud.mesh.read().clone() {
-                    let restored_set: std::collections::HashSet<&str> =
-                        restored.iter().map(|s| s.as_str()).collect();
-                    let ids: Vec<String> = cloud
-                        .registry
-                        .nodes()
-                        .into_iter()
-                        .filter(|n| !n.is_self && restored_set.contains(n.id.as_str()))
-                        .filter_map(|n| n.peer_id)
-                        .collect();
-                    tokio::spawn(async move {
-                        for id in ids {
-                            pool.close_peer(&id).await;
-                        }
-                    });
-                }
             }
-            // Forget miss-counters for nodes no longer in the probe set (relocated/gone).
-            misses.retain(|k, _| live.contains(k));
+            // Forget miss-counters for endpoint identities no longer in the probe set.
+            misses.retain(|endpoint_id, _| live.contains(endpoint_id));
         }
     });
 }

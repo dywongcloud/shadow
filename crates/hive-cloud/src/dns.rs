@@ -57,6 +57,33 @@ pub struct DomainRecord {
     pub nameservers: Vec<String>,
     pub ssl: SslCert,
     pub records: Vec<DnsRecord>,
+    /// Ownership-verification state for custom-domain attachment. `None` for
+    /// records that only manage DNS (never attached to a project) and for
+    /// attachments that predate verification (grandfathered — they keep
+    /// routing; only NEW attaches are gated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<DomainVerify>,
+}
+
+/// TXT-challenge ownership proof for a custom domain attach. The alias only
+/// activates once the applying node observes `txt_value` in a
+/// `_hive-verify.<domain>` TXT answer (DoH, independently at activation
+/// time — never trusted from a caller). Status vocabulary mirrors the
+/// industry shape: pending -> verified (failed is reserved for probe errors,
+/// never for "not yet propagated").
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DomainVerify {
+    pub status: String, // "pending" | "verified"
+    pub txt_name: String,
+    pub txt_value: String,
+    /// The project this verification gates (the attach target).
+    pub project: String,
+    pub created_ms: u64,
+    pub checked_ms: u64,
+    pub verified_ms: u64,
+    /// Latest probe outcome for the UI ("no TXT answer yet", "NXDOMAIN",
+    /// "resolver error"), honest about what was seen — never a fake error.
+    pub last_probe: String,
 }
 
 #[derive(Default)]
@@ -76,6 +103,7 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
         created_ms: now,
         expires_ms: now + YEAR_MS,
         nameservers: vec!["ns1.openedge-dns.com".into(), "ns2.openedge-dns.com".into()],
+        verify: None,
         ssl: SslCert {
             id: format!("cert_{}", &Uuid::new_v4().simple().to_string()[..20]),
             cns: vec![format!("*.{domain}"), domain.to_string()],
@@ -84,31 +112,22 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
             expires_ms: now + CERT_TTL_MS,
             provider: "OpenEdge (Let's Encrypt)".into(),
         },
-        // A free managed cert needs CAA records authorizing the issuer.
-        records: vec![
-            DnsRecord {
-                id: rec_id(),
-                name: String::new(),
-                kind: "CAA".into(),
-                value: "0 issue \"letsencrypt.org\"".into(),
-                ttl: 60,
-                priority: None,
-                comment: "Managed SSL issuer".into(),
-                created_ms: now,
-                system: true,
-            },
-            DnsRecord {
-                id: rec_id(),
-                name: String::new(),
-                kind: "A".into(),
-                value: "76.76.21.21".into(),
-                ttl: 60,
-                priority: None,
-                comment: "OpenEdge anycast".into(),
-                created_ms: now,
-                system: true,
-            },
-        ],
+        // A free managed cert needs CAA records authorizing the issuer. The
+        // apex A/AAAA set is deliberately NOT seeded here: a fake "anycast"
+        // address would resolve the domain somewhere that does not serve it.
+        // Real edge addresses are pinned by `set_system_address_records` when
+        // an attachment verifies (the same set the roster endpoint shows).
+        records: vec![DnsRecord {
+            id: rec_id(),
+            name: String::new(),
+            kind: "CAA".into(),
+            value: "0 issue \"letsencrypt.org\"".into(),
+            ttl: 60,
+            priority: None,
+            comment: "Managed SSL issuer".into(),
+            created_ms: now,
+            system: true,
+        }],
     }
 }
 
@@ -244,6 +263,250 @@ impl DomainStore {
     pub fn load(&self, list: Vec<DomainRecord>) {
         *self.map.write() = list.into_iter().map(|d| (d.domain.clone(), d)).collect();
     }
+
+    /// Create (or refresh, when the attach target changed) the verification
+    /// challenge for a domain attach. Keeps an existing challenge for the
+    /// SAME project (rotating it would strand the TXT the user just pasted);
+    /// a different project re-issues (the proof is per-attach).
+    ///
+    /// **Only a VERIFIED record locks to its tenant.** An unproven record —
+    /// never verified (DNS-only zone) or a pending claim — confers no
+    /// ownership: any tenant's attach takes it over with a fresh challenge
+    /// and the tenant binding moves with it. DNS control is the only proof,
+    /// so a bare claim can never lock the real owner out of their own domain
+    /// (adversarial finding: a first-come squatter's pending claim 403'd the
+    /// real owner forever, and for a delegated zone the victim's own NS
+    /// delegation completed the squatter's "proof" via the platform-served
+    /// challenge). A verified record is the one settled state: it 409s.
+    pub fn ensure_verify(
+        &self,
+        domain: &str,
+        tenant: &str,
+        project: &str,
+    ) -> Result<DomainVerify, String> {
+        let mut m = self.map.write();
+        let rec = m
+            .entry(domain.to_string())
+            .or_insert_with(|| default_domain(domain, tenant));
+        if let Some(v) = &rec.verify {
+            if v.project == project && rec.tenant.eq_ignore_ascii_case(tenant) {
+                return Ok(v.clone());
+            }
+            if v.status == "verified" {
+                return Err(format!(
+                    "'{domain}' is already verified for project '{}' — detach it there first",
+                    v.project
+                ));
+            }
+        }
+        // Fresh claim or takeover of an unproven one: the tenant binding
+        // moves with the challenge so the attaching team can manage the zone
+        // while it proves; verification rebinds definitively.
+        rec.tenant = tenant.to_string();
+        let v = DomainVerify {
+            status: "pending".into(),
+            txt_name: format!("_hive-verify.{domain}"),
+            txt_value: format!(
+                "hive-verify={}",
+                &uuid::Uuid::new_v4().simple().to_string()[..16]
+            ),
+            project: project.to_string(),
+            created_ms: now_ms(),
+            checked_ms: 0,
+            verified_ms: 0,
+            last_probe: String::new(),
+        };
+        rec.verify = Some(v.clone());
+        Ok(v)
+    }
+
+    pub fn verify_of(&self, domain: &str) -> Option<DomainVerify> {
+        self.map.read().get(domain).and_then(|d| d.verify.clone())
+    }
+
+    pub fn mark_verify_probe(&self, domain: &str, outcome: &str) {
+        let mut m = self.map.write();
+        if let Some(d) = m.get_mut(domain) {
+            if let Some(v) = &mut d.verify {
+                v.checked_ms = now_ms();
+                v.last_probe = outcome.to_string();
+            }
+        }
+    }
+
+    /// Mark verified AND rebind the record's tenant to the proving team (the
+    /// proving attach owns the record from now on — the first-come claim is
+    /// superseded by real proof, so a squatter who pre-created the record
+    /// loses it exactly when someone actually proves control).
+    pub fn mark_verified_as(&self, domain: &str, tenant: Option<&str>) -> Option<DomainVerify> {
+        let mut m = self.map.write();
+        let d = m.get_mut(domain)?;
+        // An empty tenant means "unknown" (personal namespaces have no team
+        // row) — never rebind a record to nothing.
+        if let Some(t) = tenant.filter(|t| !t.is_empty()) {
+            d.tenant = t.to_string();
+        }
+        let v = d.verify.as_mut()?;
+        v.status = "verified".into();
+        v.verified_ms = now_ms();
+        v.last_probe = "TXT matched".into();
+        Some(v.clone())
+    }
+
+    /// Pending challenges older than this are abandoned: the watcher stops
+    /// polling them and the claim lapses (a claim is a statement of intent,
+    /// not a lease — an unproven claim must not hold a domain or its LE/watcher
+    /// budget forever).
+    pub const PENDING_VERIFY_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
+
+    /// Every record with a live pending verification, for the leader's
+    /// watcher. Expired pendings are CLEARED here (the one place that sweeps
+    /// them) so an abandoned attach never outlives its TTL.
+    pub fn pending_verifications(&self) -> Vec<(String, DomainVerify)> {
+        let now = now_ms();
+        let mut m = self.map.write();
+        let mut out = Vec::new();
+        for d in m.values_mut() {
+            let Some(v) = &d.verify else {
+                continue;
+            };
+            if v.status != "pending" {
+                continue;
+            }
+            if now.saturating_sub(v.created_ms) > Self::PENDING_VERIFY_TTL_MS {
+                d.verify = None;
+                continue;
+            }
+            out.push((d.domain.clone(), v.clone()));
+        }
+        out
+    }
+
+    /// Every record with a VERIFIED attachment as (domain, project), for the
+    /// watcher's address refresh + routing re-assert: the pinned apex set
+    /// must track fleet membership, and a redeployed project's alias must be
+    /// re-applied on its new host.
+    pub fn verified_attachments(&self) -> Vec<(String, String)> {
+        self.map
+            .read()
+            .values()
+            .filter_map(|d| {
+                d.verify
+                    .as_ref()
+                    .filter(|v| v.status == "verified")
+                    .map(|v| (d.domain.clone(), v.project.clone()))
+            })
+            .collect()
+    }
+
+    /// Clear verification state (detach) — a later re-attach proves again
+    /// with a fresh challenge.
+    pub fn clear_verify(&self, domain: &str) {
+        let mut m = self.map.write();
+        if let Some(d) = m.get_mut(domain) {
+            d.verify = None;
+        }
+    }
+
+    /// Clear verification for every domain gated on `project` (project
+    /// deletion). A tombstoned project must not keep domains "verified":
+    /// `custom_domain_bundles` reads the status alone and would renew TLS
+    /// for a dead project forever, and a recreated same-name project would
+    /// inherit routing it never proved. The records stay — the tenant may
+    /// still manage the zone. Returns the affected domains (for the event
+    /// log).
+    pub fn clear_verify_for_project(&self, project: &str) -> Vec<String> {
+        let mut m = self.map.write();
+        let mut out = Vec::new();
+        for d in m.values_mut() {
+            if d.verify.as_ref().is_some_and(|v| v.project == project) {
+                d.verify = None;
+                out.push(d.domain.clone());
+            }
+        }
+        out
+    }
+
+    /// Replace the zone's serving records for a verified attachment: the
+    /// system apex A/AAAA set (the platform's live edge addresses) plus a
+    /// `www` CNAME to the apex — LE's HTTP-01 order carries a `www` SAN and
+    /// a delegated zone must resolve it or the WHOLE order fails (adversarial
+    /// finding: path-B zones NODATA'd `www`, so no cert ever issued). An
+    /// EMPTY address set clears all three (full detach): the zone stops
+    /// claiming the platform's edge. Only system records are touched —
+    /// tenant records and the CAA are never disturbed. The input is
+    /// `dnsserver::lb_records_strings`, the identical set the roster endpoint
+    /// tells the tenant to point at.
+    pub fn set_system_address_records(
+        &self,
+        domain: &str,
+        v4: Vec<String>,
+        v6: Vec<String>,
+    ) -> bool {
+        let mut m = self.map.write();
+        let Some(d) = m.get_mut(domain) else {
+            return false;
+        };
+        // Damping: an unchanged set is a no-op — the watcher re-pins every
+        // cadence, and without this each pass would bump every record's
+        // created_ms/id, churning the wholesale-replicated store (and every
+        // follower's copy of it) on a healthy fleet.
+        let same = |kind: &str, ips: &[String]| {
+            let mut have: Vec<&str> = d
+                .records
+                .iter()
+                .filter(|r| r.system && r.name.is_empty() && r.kind == kind)
+                .map(|r| r.value.as_str())
+                .collect();
+            have.sort_unstable();
+            let mut want: Vec<&str> = ips.iter().map(|s| s.as_str()).collect();
+            want.sort_unstable();
+            have == want
+        };
+        let attached = !(v4.is_empty() && v6.is_empty());
+        let www_now = d
+            .records
+            .iter()
+            .any(|r| r.system && r.name.eq_ignore_ascii_case("www") && r.kind == "CNAME");
+        if same("A", &v4) && same("AAAA", &v6) && www_now == attached {
+            return false;
+        }
+        d.records.retain(|r| {
+            !(r.system
+                && ((r.name.is_empty() && matches!(r.kind.as_str(), "A" | "AAAA"))
+                    || (r.name.eq_ignore_ascii_case("www") && r.kind == "CNAME")))
+        });
+        let now = now_ms();
+        for (kind, ips) in [("A", v4), ("AAAA", v6)] {
+            for ip in ips {
+                d.records.push(DnsRecord {
+                    id: rec_id(),
+                    name: String::new(),
+                    kind: kind.into(),
+                    value: ip,
+                    ttl: 60,
+                    priority: None,
+                    comment: "Platform edge (verified attachment)".into(),
+                    created_ms: now,
+                    system: true,
+                });
+            }
+        }
+        if attached {
+            d.records.push(DnsRecord {
+                id: rec_id(),
+                name: String::new(),
+                kind: "CNAME".into(),
+                value: d.domain.clone(),
+                ttl: 60,
+                priority: None,
+                comment: "www alias (verified attachment)".into(),
+                created_ms: now,
+                system: true,
+            });
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -270,9 +533,13 @@ mod tests {
         let d = s.ensure("acme.com", "personal");
         assert_eq!(d.domain, "acme.com");
         assert_eq!(d.tenant, "personal");
-        // Default system records: a CAA (managed-SSL issuer) + the anycast A.
+        // Default system records: the managed-SSL CAA only. No apex A/AAAA is
+        // seeded — those are pinned from the live edge set on verification.
         assert!(d.records.iter().any(|r| r.kind == "CAA" && r.system));
-        assert!(d.records.iter().any(|r| r.kind == "A" && r.system));
+        assert!(
+            !d.records.iter().any(|r| r.kind == "A" && r.system),
+            "no fake apex address is seeded"
+        );
         let n = d.records.len();
         // ensure again must NOT recreate / duplicate.
         let d2 = s.ensure("acme.com", "personal");

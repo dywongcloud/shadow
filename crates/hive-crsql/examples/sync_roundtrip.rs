@@ -36,10 +36,7 @@ fn rows(conn: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
 }
 
 /// Full per-site export of everything this peer holds for `site`, one batch.
-fn full_export(
-    conn: &rusqlite::Connection,
-    site: &[u8],
-) -> anyhow::Result<Vec<ChangeBatch>> {
+fn full_export(conn: &rusqlite::Connection, site: &[u8]) -> anyhow::Result<Vec<ChangeBatch>> {
     hive_crsql::changes_since_site(conn, site, 0, usize::MAX)
 }
 
@@ -71,26 +68,45 @@ fn main() -> anyhow::Result<()> {
     b.execute("INSERT INTO items (id, label) VALUES (2, 'from-b')", [])?;
 
     // Outbound half: per-site bounded export. One change each -> one batch.
-    let a_out = hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
-    let b_out = hive_crsql::changes_since_site(&b, &b_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
+    let a_out =
+        hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
+    let b_out =
+        hive_crsql::changes_since_site(&b, &b_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
     assert_eq!(a_out.len(), 1);
     assert_eq!(b_out.len(), 1);
-    assert_eq!(a_out[0].since_db_version, 0, "first batch chains from the request watermark");
+    assert_eq!(
+        a_out[0].since_db_version, 0,
+        "first batch chains from the request watermark"
+    );
     let ac = &a_out[0].changes[0];
     println!(
         "a change: table={} cid={} col_v={} db_v={} cl={} seq={} ts={}",
         ac.table, ac.cid, ac.col_version, ac.db_version, ac.cl, ac.seq, ac.ts
     );
-    assert_eq!(ac.ts, "1754000000001", "a's write must carry the ts its transaction set");
-    assert_eq!(b_out[0].changes[0].ts, "1754000000002", "b's write must carry the ts its transaction set");
+    assert_eq!(
+        ac.ts, "1754000000001",
+        "a's write must carry the ts its transaction set"
+    );
+    assert_eq!(
+        b_out[0].changes[0].ts, "1754000000002",
+        "b's write must carry the ts its transaction set"
+    );
 
     // Bounded DETERMINISTIC serialization: encoding is stable across exports
     // and round-trips exactly.
     let enc1: Vec<u8> = a_out[0].encode();
-    let a_out2 = hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
-    assert_eq!(enc1, a_out2[0].encode(), "two exports of the same state must be byte-identical");
+    let a_out2 =
+        hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
+    assert_eq!(
+        enc1,
+        a_out2[0].encode(),
+        "two exports of the same state must be byte-identical"
+    );
     let decoded = ChangeBatch::decode(&enc1)?;
-    assert_eq!(decoded, a_out[0], "decode(encode(batch)) must round-trip exactly");
+    assert_eq!(
+        decoded, a_out[0],
+        "decode(encode(batch)) must round-trip exactly"
+    );
     println!("[1] wire encoding deterministic: {} byte frame, export-encode-export stable, round-trip exact", enc1.len());
 
     // Inbound half over the WIRE FORM (not the in-memory structs): real sync.
@@ -104,9 +120,18 @@ fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<_>>()?;
     let outcomes_b = hive_crsql::apply_batches(&b, &a_wire)?;
     let outcomes_a = hive_crsql::apply_batches(&a, &b_wire)?;
-    println!("[1] apply outcomes: b<-a {:?} ; a<-b {:?}", outcomes_b, outcomes_a);
-    assert!(matches!(outcomes_b[0], ApplyOutcome::Applied { applied: 1, .. }));
-    assert!(matches!(outcomes_a[0], ApplyOutcome::Applied { applied: 1, .. }));
+    println!(
+        "[1] apply outcomes: b<-a {:?} ; a<-b {:?}",
+        outcomes_b, outcomes_a
+    );
+    assert!(matches!(
+        outcomes_b[0],
+        ApplyOutcome::Applied { applied: 1, .. }
+    ));
+    assert!(matches!(
+        outcomes_a[0],
+        ApplyOutcome::Applied { applied: 1, .. }
+    ));
 
     // ts must survive the merge verbatim -- the winner-clock insert binds the
     // inbound change's own ts (changes_vtab_write.rs `set_winner_clock`).
@@ -114,16 +139,28 @@ fn main() -> anyhow::Result<()> {
     let b_holds_a = full_export(&b, &a_site)?;
     let merged_from_b = &a_holds_b[0].changes[0];
     let merged_from_a = &b_holds_a[0].changes[0];
-    assert_eq!(merged_from_b.ts, "1754000000002", "ts must survive merge into a verbatim");
-    assert_eq!(merged_from_a.ts, "1754000000001", "ts must survive merge into b verbatim");
-    println!("[1] ts survived merge on both peers: {} / {}", merged_from_a.ts, merged_from_b.ts);
+    assert_eq!(
+        merged_from_b.ts, "1754000000002",
+        "ts must survive merge into a verbatim"
+    );
+    assert_eq!(
+        merged_from_a.ts, "1754000000001",
+        "ts must survive merge into b verbatim"
+    );
+    println!(
+        "[1] ts survived merge on both peers: {} / {}",
+        merged_from_a.ts, merged_from_b.ts
+    );
 
     let a_labels = rows(&a)?;
     let b_labels = rows(&b)?;
     println!("[1] a rows after sync: {a_labels:?}");
     println!("[1] b rows after sync: {b_labels:?}");
     assert_eq!(a_labels, vec!["from-a".to_string(), "from-b".to_string()]);
-    assert_eq!(a_labels, b_labels, "divergent peers must converge to the identical row set");
+    assert_eq!(
+        a_labels, b_labels,
+        "divergent peers must converge to the identical row set"
+    );
     println!("[1] OK divergent peers converged via per-site sync");
 
     // ---------------------------------------------------------------
@@ -138,7 +175,11 @@ fn main() -> anyhow::Result<()> {
     c_mem.execute("INSERT INTO items (id, label) VALUES (2, 'c2')", [])?;
     // max_changes_per_batch=1 forces one batch per commit -> a 2-batch chain.
     let cd_batches = hive_crsql::changes_since_site(&c_mem, &c_mem_site, 0, 1)?;
-    assert_eq!(cd_batches.len(), 2, "bound of 1 change must split two commits into two batches");
+    assert_eq!(
+        cd_batches.len(),
+        2,
+        "bound of 1 change must split two commits into two batches"
+    );
     assert_eq!(
         cd_batches[1].since_db_version,
         cd_batches[0].max_db_version().unwrap(),
@@ -146,7 +187,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     let first = hive_crsql::apply_batches(&d_mem, &cd_batches)?;
-    assert!(first.iter().all(|o| matches!(o, ApplyOutcome::Applied { .. })));
+    assert!(first
+        .iter()
+        .all(|o| matches!(o, ApplyOutcome::Applied { .. })));
     let state_after_first = rows(&d_mem)?;
     let export_after_first = full_export(&d_mem, &c_mem_site)?;
     let d_watermark = hive_crsql::watermark_for(&d_mem, &c_mem_site)?;
@@ -159,14 +202,26 @@ fn main() -> anyhow::Result<()> {
             .all(|o| matches!(o, ApplyOutcome::Replay { skipped: 1, .. })),
         "re-applying an already-applied batch must be a Replay no-op"
     );
-    assert_eq!(rows(&d_mem)?, state_after_first, "replay must not change rows");
+    assert_eq!(
+        rows(&d_mem)?,
+        state_after_first,
+        "replay must not change rows"
+    );
     assert_eq!(
         full_export(&d_mem, &c_mem_site)?,
         export_after_first,
         "replay must not change the change-store"
     );
-    assert_eq!(hive_crsql::watermark_for(&d_mem, &c_mem_site)?, d_watermark, "replay must not move the watermark");
-    assert_eq!(state_after_first.len(), 2, "no duplicated rows from redelivery");
+    assert_eq!(
+        hive_crsql::watermark_for(&d_mem, &c_mem_site)?,
+        d_watermark,
+        "replay must not move the watermark"
+    );
+    assert_eq!(
+        state_after_first.len(),
+        2,
+        "no duplicated rows from redelivery"
+    );
     println!("[2] OK replay is a deterministic no-op (watermark {d_watermark} unchanged, state byte-identical)");
 
     // ---------------------------------------------------------------
@@ -206,7 +261,11 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
     for (i, label) in ["r1", "r2", "r3"].iter().enumerate() {
         hive_crsql::set_ts(&c, 1_754_000_002_001 + i as u64)?;
         c.execute(
-            &format!("INSERT INTO items (id, label) VALUES ({}, '{}')", 10 + i, label),
+            &format!(
+                "INSERT INTO items (id, label) VALUES ({}, '{}')",
+                10 + i,
+                label
+            ),
             [],
         )?;
     }
@@ -229,7 +288,9 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         hive_crsql::as_crr(&d, "items")?;
         let out = hive_crsql::apply_batch(&d, &batches[0])?;
         applied_before_crash = hive_crsql::watermark_for(&d, &c_site)?;
-        println!("[3] d applied batch 1/3 -> {out:?}; watermark before crash = {applied_before_crash}");
+        println!(
+            "[3] d applied batch 1/3 -> {out:?}; watermark before crash = {applied_before_crash}"
+        );
         assert!(matches!(out, ApplyOutcome::Applied { applied: 1, .. }));
     } // d dropped here: the "process" is gone.
 
@@ -241,12 +302,18 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         "per-origin-site progress must be durable across a restart"
     );
     let sites = hive_crsql::known_sites(&d)?;
-    println!("[3] after reopen, d's durable per-site progress: {}", sites
-        .iter()
-        .map(|(s, v)| format!("{}@{}", hive_crsql::hex(s), v))
-        .collect::<Vec<_>>()
-        .join(" , "));
-    assert!(sites.iter().any(|(s, _)| s == &c_site), "reopened peer must still know the source site");
+    println!(
+        "[3] after reopen, d's durable per-site progress: {}",
+        sites
+            .iter()
+            .map(|(s, v)| format!("{}@{}", hive_crsql::hex(s), v))
+            .collect::<Vec<_>>()
+            .join(" , ")
+    );
+    assert!(
+        sites.iter().any(|(s, _)| s == &c_site),
+        "reopened peer must still know the source site"
+    );
 
     // Resume: redelivery of batch 1 is a Replay no-op, then 2 and 3 apply.
     let resume0 = hive_crsql::apply_batch(&d, &batches[0])?;
@@ -255,7 +322,9 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         "redelivered batch after restart must be a Replay no-op, got {resume0:?}"
     );
     let resume_rest = hive_crsql::apply_batches(&d, &batches[1..])?;
-    assert!(resume_rest.iter().all(|o| matches!(o, ApplyOutcome::Applied { .. })));
+    assert!(resume_rest
+        .iter()
+        .all(|o| matches!(o, ApplyOutcome::Applied { .. })));
     println!("[3] resume: redelivered batch 1 -> Replay; batches 2-3 -> {resume_rest:?}");
 
     // E: uninterrupted baseline, same three batches in one go.
@@ -264,14 +333,21 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
     hive_crsql::as_crr(&e, "items")?;
     hive_crsql::apply_batches(&e, &batches)?;
 
-    assert_eq!(rows(&d)?, rows(&e)?, "interrupted peer must equal uninterrupted peer");
+    assert_eq!(
+        rows(&d)?,
+        rows(&e)?,
+        "interrupted peer must equal uninterrupted peer"
+    );
     assert_eq!(rows(&d)?, rows(&c)?, "synced peers must equal the source");
     assert_eq!(
         full_export(&d, &c_site)?,
         full_export(&e, &c_site)?,
         "interrupted and uninterrupted change-stores must be identical"
     );
-    println!("[3] OK interrupted resume converged to the uninterrupted state {:?}", rows(&d)?);
+    println!(
+        "[3] OK interrupted resume converged to the uninterrupted state {:?}",
+        rows(&d)?
+    );
     Ok(())
 }
 

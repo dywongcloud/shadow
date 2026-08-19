@@ -112,6 +112,74 @@ async fn edge_pipeline_inner(
     let ip = peer.ip().to_string();
     let region = cloud.region.clone();
 
+    // ACME HTTP-01 challenges for custom tenant domains, answered from the
+    // replicated `acme_http01` store — a validation fetch lands on ANY node
+    // (round-robin/geo DNS is exactly what makes HTTP-01 work for a tenant
+    // whose DNS already points at the fleet). Before EVERY other gate
+    // (host_allowed would 404 an unattached host, which is precisely the
+    // state a domain is in while being validated): the answer is a tiny
+    // static string for a token only the order initiator knows, never
+    // tenant-controlled content. Unknown token = plain 404, no existence leak.
+    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+        if let Some(body) = cloud.acme_http01.lookup(token) {
+            return (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response();
+        }
+        // Miss on this node: the issuer is the leader and Let's Encrypt's
+        // multi-perspective fetches land on RANDOM nodes within ~1s of
+        // set_ready, long before the 60s store_sync pull can replicate the
+        // token. Proxy the lookup to the leader rather than fail-validating
+        // every issuance ~13/14 of the time (adversarial finding). Unknown
+        // token everywhere = flat 404, no existence leak.
+        let leader = cloud.control_plane_leader();
+        if leader != cloud.node_name {
+            if let Some(ip) = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .find(|n| n.name == leader && n.healthy)
+                .and_then(|n| n.public_ip.clone().filter(|ip| !ip.is_empty()))
+            {
+                let url = format!(
+                    "http://{ip}{}",
+                    req.uri()
+                        .path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| "/".into())
+                );
+                if let Ok(r) = cloud
+                    .http
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    if r.status().is_success() {
+                        if let Ok(body) = r.text().await {
+                            return (
+                                StatusCode::OK,
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    "text/plain; charset=utf-8",
+                                )],
+                                body,
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+        }
+        return (StatusCode::NOT_FOUND, "unknown challenge").into_response();
+    }
+
     // DB-gateway HTTP REST surface: `<slug>.{db_domain}` hosts are the per-tenant
     // database endpoints (Upstash-style redis REST / SQL-over-HTTP), NOT app
     // deployments — branch before the deploy-suffix host validation below would
@@ -497,7 +565,9 @@ async fn edge_pipeline_inner(
                 .project_for_host(&host)
                 .unwrap_or_else(|| sub.clone());
             let fs = cloud.projects.get(&project).functions;
-            order_candidates(raw.clone(), &fs, &region)
+            order_candidates_with_cold(raw.clone(), &fs, &region, |node| {
+                crate::health::is_cold(&cloud.registry, node)
+            })
         };
 
         if cands.is_empty() {
@@ -538,7 +608,13 @@ async fn edge_pipeline_inner(
                     "no candidate in preferred region; falling back to healthy routes (incomplete per-node route metadata)"
                 );
                 let mut fb = raw;
-                fb.sort_by_key(|r| (if r.region == region { 0u8 } else { 1u8 }, r.latency_ms));
+                fb.sort_by_key(|r| {
+                    (
+                        u8::from(crate::health::is_cold(&cloud.registry, &r.node_id)),
+                        if r.region == region { 0u8 } else { 1u8 },
+                        hive_edge::region::peer_latency_sort_key(r.latency_ms),
+                    )
+                });
                 cands = fb;
             }
             // else: no routes at all → fall through to DEPLOYMENT_NOT_FOUND below.
@@ -2017,30 +2093,34 @@ fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
 ///
 /// Only `healthy` candidates are passed in; latency is always the within-region
 /// tiebreak.
+#[allow(dead_code)]
 fn order_candidates(
-    mut raw: Vec<crate::state::PeerRoute>,
+    raw: Vec<crate::state::PeerRoute>,
     fs: &crate::project_settings::FunctionSettings,
     serving_region: &str,
 ) -> Vec<crate::state::PeerRoute> {
+    order_candidates_with_cold(raw, fs, serving_region, |_| false)
+}
+
+fn order_candidates_with_cold(
+    mut raw: Vec<crate::state::PeerRoute>,
+    fs: &crate::project_settings::FunctionSettings,
+    serving_region: &str,
+    is_cold: impl Fn(&str) -> bool,
+) -> Vec<crate::state::PeerRoute> {
     let regions: Vec<&String> = fs.regions.iter().filter(|r| !r.is_empty()).collect();
-    // A peer whose trunk just timed out sorts LAST within its tier, but is
-    // never removed. This is what the four data-plane call sites actually
-    // wanted when they marked a peer unhealthy on one `DeadPeerTimeout` — stop
-    // re-paying the connect budget against a stale trunk — expressed as a
-    // node-local, time-boxed preference instead of a fleet-visible verdict that
-    // also pulled the node out of DNS and placement (see health.rs). Never a
-    // filter: deprioritizing the only candidate would 404 the deployment, which
-    // is strictly worse than paying one connect budget.
-    let cold = |r: &crate::state::PeerRoute| u8::from(crate::health::is_cold(&r.node_id));
+    let cold = |r: &crate::state::PeerRoute| u8::from(is_cold(&r.node_id));
+    let latency =
+        |r: &crate::state::PeerRoute| hive_edge::region::peer_latency_sort_key(r.latency_ms);
     if regions.is_empty() {
         raw.sort_by_key(|r| {
             (
                 cold(r),
                 if r.region == serving_region { 0u8 } else { 1u8 },
-                r.latency_ms,
+                latency(r),
             )
         });
-        return balance_same_region(raw);
+        return balance_same_region(raw, &is_cold);
     }
     let rank = |r: &crate::state::PeerRoute| {
         regions
@@ -2049,13 +2129,13 @@ fn order_candidates(
     };
     if fs.failover {
         raw.retain(|r| rank(r).is_some());
-        raw.sort_by_key(|r| (cold(r), rank(r).unwrap_or(usize::MAX) as u16, r.latency_ms));
+        raw.sort_by_key(|r| (cold(r), rank(r).unwrap_or(usize::MAX) as u16, latency(r)));
     } else {
         let primary = regions[0].clone();
         raw.retain(|r| r.region.eq_ignore_ascii_case(&primary));
-        raw.sort_by_key(|r| (cold(r), r.latency_ms));
+        raw.sort_by_key(|r| (cold(r), latency(r)));
     }
-    balance_same_region(raw)
+    balance_same_region(raw, &is_cold)
 }
 
 /// Load-balance across nodes in the BEST (front) region tier so same-region peers
@@ -2064,7 +2144,10 @@ fn order_candidates(
 /// global round-robin counter; the rest (failover tiers) keep their order. Still
 /// adheres to Fluid Compute: each chosen node runs its own in-instance-concurrent
 /// pool, this just spreads the *first-tried* node across same-region peers.
-fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::state::PeerRoute> {
+fn balance_same_region(
+    mut raw: Vec<crate::state::PeerRoute>,
+    is_cold: &impl Fn(&str) -> bool,
+) -> Vec<crate::state::PeerRoute> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RR: AtomicUsize = AtomicUsize::new(0);
     // Co-located peers (e.g. virginia + virginia-2) are within this latency band of
@@ -2075,10 +2158,16 @@ fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::stat
     if raw.len() > 1 {
         let best = raw[0].region.clone();
         let best_lat = raw[0].latency_ms;
+        let best_cold = is_cold(&raw[0].node_id);
+        let best_latency_class = hive_edge::region::peer_latency_sort_key(best_lat).0;
         let n = raw
             .iter()
             .take_while(|r| {
-                r.region.eq_ignore_ascii_case(&best) && r.latency_ms <= best_lat + BAND_MS
+                r.region.eq_ignore_ascii_case(&best)
+                    && is_cold(&r.node_id) == best_cold
+                    && hive_edge::region::peer_latency_sort_key(r.latency_ms).0
+                        == best_latency_class
+                    && r.latency_ms <= best_lat.saturating_add(BAND_MS)
             })
             .count();
         if n > 1 {

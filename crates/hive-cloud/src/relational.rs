@@ -59,7 +59,8 @@ pub(crate) async fn init_schema() {
             project TEXT PRIMARY KEY, \
             team TEXT NOT NULL, \
             root_dir TEXT NOT NULL DEFAULT '', \
-            updated_ms BIGINT NOT NULL\
+            updated_ms BIGINT NOT NULL, \
+            deleted_ms BIGINT NOT NULL DEFAULT 0\
         )",
         ),
         // Normalized (real columns, one row per fact) — replaces the old
@@ -252,6 +253,7 @@ pub(crate) async fn init_schema() {
     // correct schema a boot-time guarantee rather than an operator-remembered
     // manual step (previously this only ran inside the admin-triggered
     // `backfill_billing_normalize` endpoint).
+    reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
 }
@@ -335,6 +337,40 @@ async fn ensure_table_exists(
     }
 }
 
+static PROJECT_TEAMS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Add the relational tombstone column on nodes whose `project_teams` table
+/// predates deletion generations. `CREATE TABLE IF NOT EXISTS` never alters an
+/// existing table, so every read/write path calls this memoized reconciliation
+/// before referring to `deleted_ms`.
+async fn reconcile_project_teams_schema(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+) {
+    if PROJECT_TEAMS_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Err(e) = exec(
+        s,
+        "ALTER TABLE project_teams ADD COLUMN IF NOT EXISTS deleted_ms BIGINT DEFAULT 0",
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "relational: ALTER TABLE project_teams add deleted_ms failed");
+        return;
+    }
+    if let Err(e) = exec(
+        s,
+        "UPDATE project_teams SET deleted_ms = 0 WHERE deleted_ms IS NULL",
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "relational: project_teams deleted_ms backfill failed");
+        return;
+    }
+    PROJECT_TEAMS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One-time boot backfill: mirror THIS node's existing `ProjectStore` snapshot
 /// into the relational table. Without this, a project created BEFORE this
 /// migration shipped (e.g. `drugs-wtf`) would never appear in the mirror —
@@ -352,9 +388,62 @@ async fn ensure_table_exists(
 /// with wrong data. Billing self-heals instead via `spawn_billing_meter_loop`,
 /// which mirrors every actively-metered tenant on every tick (default 60s)
 /// from whichever node is actually authoritative at the time.
-pub(crate) async fn backfill_projects(projects: Vec<(String, String, String)>) {
-    for (project, team, root_dir) in projects {
-        set_project_team(&project, &team, &root_dir).await;
+pub(crate) async fn backfill_projects(projects: Vec<(String, String, String, u64)>) {
+    if projects.is_empty() {
+        return;
+    }
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
+    let mut s = session(db).await;
+    reconcile_project_teams_schema(&mut s).await;
+    for (project, team, root_dir, updated_ms) in projects {
+        // Skip rows the replica already holds IDENTICALLY (same live row,
+        // same version): re-asserting an unchanged row still lands a FRESH
+        // doc put, and GuardianDB's LWW compares DOC timestamps, not row
+        // values — a long-offline node's boot backfill would otherwise
+        // resurrect a stale live row over the fleet's newer tombstone for a
+        // whole converge window (adversarial finding). Rows the replica
+        // holds only as a TOMBSTONE are written (the causal arms refuse
+        // stale content); rows absent or genuinely different are written
+        // (the migration's purpose).
+        let probe = format!(
+            "SELECT team, root_dir, updated_ms, deleted_ms FROM project_teams WHERE project = {}",
+            q(&project)
+        );
+        if let Ok(res) = exec(&mut s, &probe).await {
+            let num = |row: &[SqlValue], i: usize| match row.get(i) {
+                Some(SqlValue::Int8(n)) => *n as u64,
+                Some(SqlValue::Int4(n)) => *n as u64,
+                Some(SqlValue::Int2(n)) => *n as u64,
+                Some(SqlValue::Text(t)) => t.parse().unwrap_or(0),
+                _ => 0,
+            };
+            let unchanged = res.iter().any(|r| {
+                if let ExecResult::Rows { rows, .. } = r {
+                    rows.iter().any(|row| {
+                        let rt = match row.first() {
+                            Some(SqlValue::Text(t)) => t.as_str(),
+                            _ => "",
+                        };
+                        let rr = match row.get(1) {
+                            Some(SqlValue::Text(t)) => t.as_str(),
+                            _ => "",
+                        };
+                        rt == team && rr == root_dir && num(row, 2) == updated_ms && num(row, 3) == 0
+                    })
+                } else {
+                    false
+                }
+            });
+            if unchanged {
+                continue;
+            }
+        }
+        let query = project_team_upsert_sql(&project, &team, &root_dir, updated_ms);
+        if let Err(e) = exec(&mut s, &query).await {
+            tracing::debug!(project, error = %e, "relational: project backfill failed (non-fatal, periodic leader reconciliation will retry)");
+        }
     }
 }
 
@@ -469,38 +558,95 @@ async fn exec(
 // Projects (the durable fix for the Simpfi/drugs-wtf visibility gap)
 // ---------------------------------------------------------------------------
 
-/// Upsert a project's team tag + root dir. Called from `ProjectStore::set_team`
-/// (the mutation that actually changes ownership) so every node's replicated
-/// copy converges regardless of which node the project was created/built on —
-/// the durable fix for a project-with-no-deployment being invisible on any
-/// node lacking its local `ProjectSettings` row (`drugs-wtf`'s exact bug:
-/// zero deployments fleet-wide, so the peer_deployments-derived fallback in
-/// `gitops_projects` can't help it).
-pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str) {
+fn project_team_upsert_sql(project: &str, team: &str, root_dir: &str, updated_ms: u64) -> String {
+    format!(
+        "BEGIN; \
+         UPDATE project_teams SET team = {}, root_dir = {}, updated_ms = {}, deleted_ms = 0 \
+         WHERE project = {} AND deleted_ms = 0 AND updated_ms <= {}; \
+         UPDATE project_teams SET team = {}, root_dir = {}, updated_ms = {}, deleted_ms = 0 \
+         WHERE project = {} AND deleted_ms > 0 AND updated_ms < {}; \
+         INSERT INTO project_teams (project, team, root_dir, updated_ms, deleted_ms) \
+         VALUES ({}, {}, {}, {}, 0) \
+         ON CONFLICT (project) DO NOTHING; \
+         COMMIT;",
+        q(team),
+        q(root_dir),
+        updated_ms,
+        q(project),
+        updated_ms,
+        q(team),
+        q(root_dir),
+        updated_ms,
+        q(project),
+        updated_ms,
+        q(project),
+        q(team),
+        q(root_dir),
+        updated_ms,
+    )
+}
+
+/// Upsert a project's team tag + root dir at the ProjectStore row's own causal
+/// version. Never stamp at async execution time: a delayed pre-delete write
+/// would otherwise look newer than the deletion merely because its task ran
+/// later, and could resurrect a stale relational row indefinitely.
+pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str, updated_ms: u64) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
     };
     let mut s = session(db).await;
-    let query = format!(
-        "INSERT INTO project_teams (project, team, root_dir, updated_ms) VALUES ({}, {}, {}, {}) \
-         ON CONFLICT (project) DO UPDATE SET team = excluded.team, root_dir = excluded.root_dir, updated_ms = excluded.updated_ms",
-        q(project),
-        q(team),
-        q(root_dir),
-        hive_core::now_ms(),
-    );
+    reconcile_project_teams_schema(&mut s).await;
+    let query = project_team_upsert_sql(project, team, root_dir, updated_ms);
     if let Err(e) = exec(&mut s, &query).await {
         tracing::debug!(project, error = %e, "relational: set_project_team failed (non-fatal, fleet-fallback unavailable for this project until retried)");
     }
 }
 
-/// Forget a project's relational row (mirrors `ProjectStore::remove`).
-pub(crate) async fn remove_project(project: &str) {
+/// Record a project tombstone in the relational table. Keeping the row is
+/// load-bearing: after a hard DELETE, a delayed pre-delete backfill sees no
+/// conflict and can INSERT stale ownership again. A retained tombstone makes
+/// every stale insert conflict, while a causal recreation with a strictly newer
+/// `updated_ms` can clear it through `project_team_upsert_sql`.
+pub(crate) async fn remove_project(project: &str, deleted_ms: u64) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
     };
     let mut s = session(db).await;
-    let query = format!("DELETE FROM project_teams WHERE project = {}", q(project));
+    reconcile_project_teams_schema(&mut s).await;
+    // Idempotency pre-check: a tombstone at-or-past this generation already
+    // covers the assert, so skip the write entirely. Every node's deletion
+    // reconcile re-asserts every tombstone every 60s, and each write is a
+    // signed replicated doc put — without the skip this is unbounded
+    // permanent write churn proportional to total historical deletions
+    // (adversarial finding).
+    let probe = format!(
+        "SELECT deleted_ms FROM project_teams WHERE project = {}",
+        q(project)
+    );
+    if let Ok(res) = exec(&mut s, &probe).await {
+        let cur = all_text_firsts(&res)
+            .first()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if cur >= deleted_ms {
+            return;
+        }
+    }
+    let query = format!(
+        "BEGIN; \
+         UPDATE project_teams SET team = '', root_dir = '', updated_ms = {}, deleted_ms = {} \
+         WHERE project = {} AND deleted_ms = 0 AND updated_ms <= {}; \
+         INSERT INTO project_teams (project, team, root_dir, updated_ms, deleted_ms) \
+         VALUES ({}, '', '', {}, {}) ON CONFLICT (project) DO NOTHING; \
+         COMMIT;",
+        deleted_ms,
+        deleted_ms,
+        q(project),
+        deleted_ms,
+        q(project),
+        deleted_ms,
+        deleted_ms,
+    );
     if let Err(e) = exec(&mut s, &query).await {
         tracing::debug!(project, error = %e, "relational: remove_project failed (non-fatal)");
     }
@@ -516,8 +662,9 @@ pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut s = session(db).await;
+    reconcile_project_teams_schema(&mut s).await;
     let query = format!(
-        "SELECT project, team FROM project_teams WHERE team = {}",
+        "SELECT project, team FROM project_teams WHERE team = {} AND deleted_ms = 0",
         q(team)
     );
     let Ok(res) = exec(&mut s, &query).await else {
@@ -535,7 +682,13 @@ pub(crate) async fn all_project_teams() -> Vec<(String, String)> {
         return Vec::new();
     };
     let mut s = session(db).await;
-    let Ok(res) = exec(&mut s, "SELECT project, team FROM project_teams").await else {
+    reconcile_project_teams_schema(&mut s).await;
+    let Ok(res) = exec(
+        &mut s,
+        "SELECT project, team FROM project_teams WHERE deleted_ms = 0",
+    )
+    .await
+    else {
         return Vec::new();
     };
     all_text_pairs(&res)

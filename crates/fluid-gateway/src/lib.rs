@@ -38,6 +38,12 @@ struct GwState {
     deployments: HashMap<DeploymentId, Deployment>,
     /// project name -> current deployment id.
     aliases: HashMap<String, DeploymentId>,
+    /// FULL hostname (lowercased, e.g. `numo.gg`, `www.numo.gg`) -> deployment
+    /// id, for tenant-attached custom domains. Checked BEFORE the label map in
+    /// every resolution path: an attached domain must route its exact host and
+    /// nothing else — first-label keying would also serve `numo.attacker.tld`
+    /// and let `www.numo.gg` shadow the platform's own `www` label.
+    aliases_full: HashMap<String, DeploymentId>,
     default: Option<DeploymentId>,
 }
 
@@ -145,6 +151,7 @@ impl Gateway {
             state: Mutex::new(GwState {
                 deployments: HashMap::new(),
                 aliases: HashMap::new(),
+                aliases_full: HashMap::new(),
                 default: None,
             }),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
@@ -417,6 +424,7 @@ impl Gateway {
         let dep = Deployment {
             id: id.clone(),
             project: manifest.project.clone(),
+            project_incarnation: None,
             root: PathBuf::from(root),
             manifest: manifest.clone(),
             created_at_ms: now_ms(),
@@ -462,10 +470,37 @@ impl Gateway {
         // deploy — a preview deploy of an existing project must NOT hijack prod.
         // Exception: the project's first-ever deploy claims it so the URL resolves.
         if production || !has_production {
+            // Custom domains follow the project's production deployment —
+            // their whole point is to be the production URL, so a redeploy or
+            // promote must not strand them on the superseded build. The old
+            // production id is simply the project alias's previous target.
+            let old_production = st.aliases.get(&project).cloned();
             st.aliases.insert(project, id.clone());
             st.default = Some(id.clone());
+            if let Some(old) = old_production {
+                if old != id {
+                    for v in st.aliases_full.values_mut() {
+                        if *v == old {
+                            *v = id.clone();
+                        }
+                    }
+                }
+            }
         }
         info
+    }
+
+    /// Re-stamp a deployment's creation time — the causal-stamp seam for
+    /// project-delete generations: a deployment registered over a fresh
+    /// tombstone must dominate it (`remove_project_through` sweeps
+    /// `created_at_ms <= deleted_ms`), so hive-cloud floors the stamp at
+    /// tombstone+1 right after registration. Gossiped copies carry the same
+    /// value, so every node classifies the record identically.
+    pub fn restamp_created(&self, id: &str, created_at_ms: u64) {
+        let mut st = self.state.lock();
+        if let Some(d) = st.deployments.get_mut(&DeploymentId::from(id.to_string())) {
+            d.created_at_ms = created_at_ms;
+        }
     }
 
     /// Resolve which project serves a given request host (the same way the
@@ -483,18 +518,46 @@ impl Gateway {
         self.select(Some(host)).map(|d| view_of(&d))
     }
 
-    /// Attach a custom domain to a project (its first label aliases to the
-    /// project's current deployment). Returns true if the project exists.
+    /// Attach a custom domain to a project. The FULL lowercased hostname is
+    /// keyed to the project's current PRODUCTION deployment (never its first
+    /// label — label keying would also serve every root sharing that label).
+    /// Returns true if a local production deployment exists.
+    ///
+    /// A custom domain is the project's production URL: pinning it to the
+    /// bare project alias would serve a first-ever PREVIEW deploy as
+    /// production (a preview claims the project alias when no production
+    /// exists yet) and never move — the follow logic only tracks the
+    /// production alias target. No local production deployment = false, so
+    /// activation forwards to a node that really hosts one (adversarial
+    /// finding).
     pub fn add_alias(&self, domain: &str, project: &str) -> bool {
-        let label = domain.split('.').next().unwrap_or(domain).to_string();
+        let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let mut st = self.state.lock();
-        let target = st.aliases.get(project).cloned();
+        let target = st
+            .deployments
+            .values()
+            .find(|d| d.project == project && d.production)
+            .map(|d| d.id.clone());
         if let Some(id) = target {
-            st.aliases.insert(label, id);
+            st.aliases_full.insert(host, id);
             true
         } else {
             false
         }
+    }
+
+    /// Detach a custom domain from the resolution map (idempotent). The
+    /// LABEL map is deliberately untouched: it holds only platform aliases
+    /// (project names, per-deploy/commit/branch labels) and pre-gate
+    /// grandfathered attaches, none of which belong to this full-host entry —
+    /// dropping any of them would sever unrelated routing (adversarial
+    /// finding: an attach/detach pair on `numo.evil.com` wiped a victim's
+    /// grandfathered `numo` label). Grandfathered labels already die with
+    /// their deployment via `remove()`'s retain.
+    pub fn remove_alias(&self, domain: &str) {
+        let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut st = self.state.lock();
+        st.aliases_full.remove(&host);
     }
 
     /// Promote an existing deployment to be its project's production (rollback /
@@ -509,8 +572,19 @@ impl Gateway {
                 d.production = d.id == did;
             }
         }
+        let old_production = st.aliases.get(&project).cloned();
         st.aliases.insert(project, did.clone());
         st.default = Some(did.clone());
+        // Custom domains follow the promote too (see deploy_full's note).
+        if let Some(old) = old_production {
+            if old != did {
+                for v in st.aliases_full.values_mut() {
+                    if *v == old {
+                        *v = did.clone();
+                    }
+                }
+            }
+        }
         st.deployments.get(&did).map(view_of)
     }
 
@@ -578,6 +652,7 @@ impl Gateway {
         st.deployments.remove(&did);
         // Drop any aliases that pointed at this deployment.
         st.aliases.retain(|_, v| *v != did);
+        st.aliases_full.retain(|_, v| *v != did);
         if st.default.as_ref() == Some(&did) {
             st.default = st
                 .deployments
@@ -624,12 +699,16 @@ impl Gateway {
         ids
     }
 
-    pub async fn remove_project(&self, project: &str) -> Vec<String> {
+    /// Delete every deployment for a project whose creation is not newer than
+    /// `deleted_ms`. A causal recreation gets a strictly newer creation stamp
+    /// and survives an old deletion generation, including a retry racing that
+    /// redeploy. Returns the removed deployment ids.
+    pub async fn remove_project_through(&self, project: &str, deleted_ms: u64) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock();
             st.deployments
                 .values()
-                .filter(|d| d.project == project)
+                .filter(|d| d.project == project && d.created_at_ms <= deleted_ms)
                 .map(|d| d.id.to_string())
                 .collect()
         };
@@ -637,6 +716,10 @@ impl Gateway {
             self.remove(id).await;
         }
         ids
+    }
+
+    pub async fn remove_project(&self, project: &str) -> Vec<String> {
+        self.remove_project_through(project, u64::MAX).await
     }
 
     /// The git source of a project's newest deployment (for "redeploy"), skipping
@@ -670,6 +753,7 @@ impl Gateway {
             .map(|d| fluid_core::DeployRecord {
                 id: d.id.to_string(),
                 project: d.project.clone(),
+                project_incarnation: d.project_incarnation,
                 root: d.root.to_string_lossy().into_owned(),
                 manifest: d.manifest.clone(),
                 created_at_ms: d.created_at_ms,
@@ -705,6 +789,7 @@ impl Gateway {
         let dep = Deployment {
             id: id.clone(),
             project: rec.project.clone(),
+            project_incarnation: rec.project_incarnation,
             root: PathBuf::from(&rec.root),
             manifest: rec.manifest,
             created_at_ms: rec.created_at_ms,
@@ -776,6 +861,9 @@ impl Gateway {
         let st = self.state.lock();
         if let Some(h) = host {
             let h = h.split(':').next().unwrap_or(h); // strip port
+            if let Some(id) = st.aliases_full.get(&h.to_ascii_lowercase()) {
+                return st.deployments.get(id).cloned();
+            }
             let sub = h.split('.').next().unwrap_or(h);
             if let Some(id) = st.aliases.get(sub) {
                 return st.deployments.get(id).cloned();
@@ -791,12 +879,12 @@ impl Gateway {
     /// and for asserting which deployment a project host points at.
     pub fn host_deployment_id(&self, host: &str) -> Option<String> {
         let h = host.split(':').next().unwrap_or(host);
+        let st = self.state.lock();
+        if let Some(id) = st.aliases_full.get(&h.to_ascii_lowercase()) {
+            return Some(id.as_str().to_string());
+        }
         let sub = h.split('.').next().unwrap_or(h);
-        self.state
-            .lock()
-            .aliases
-            .get(sub)
-            .map(|id| id.as_str().to_string())
+        st.aliases.get(sub).map(|id| id.as_str().to_string())
     }
 
     /// EXACT host attribution for event/log tagging: the `(deployment id,
@@ -810,9 +898,12 @@ impl Gateway {
     /// hosts return `None` and must be recorded UNATTRIBUTED.
     pub fn attribution_for_host(&self, host: &str) -> Option<(String, String)> {
         let h = host.split(':').next().unwrap_or(host);
-        let sub = h.split('.').next().unwrap_or(h);
         let st = self.state.lock();
-        let id = st.aliases.get(sub)?.clone();
+        let id = st
+            .aliases_full
+            .get(&h.to_ascii_lowercase())
+            .or_else(|| st.aliases.get(h.split('.').next().unwrap_or(h)))?
+            .clone();
         let project = st.deployments.get(&id)?.project.clone();
         Some((id.as_str().to_string(), project))
     }
@@ -822,8 +913,12 @@ impl Gateway {
     /// whether to serve locally or proxy to the peer that really hosts it.
     pub fn serves_host(&self, host: &str) -> bool {
         let h = host.split(':').next().unwrap_or(host);
+        let st = self.state.lock();
+        if st.aliases_full.contains_key(&h.to_ascii_lowercase()) {
+            return true;
+        }
         let sub = h.split('.').next().unwrap_or(h);
-        self.state.lock().aliases.contains_key(sub)
+        st.aliases.contains_key(sub)
     }
 
     /// The state of the deployment this host's subdomain alias EXACTLY names —
@@ -839,22 +934,31 @@ impl Gateway {
     /// deployment. Witnessed live on `archive-zip.shadw.app` (2026-08-05).
     pub fn host_deploy_state(&self, host: &str) -> Option<fluid_core::DeployState> {
         let h = host.split(':').next().unwrap_or(host);
-        let sub = h.split('.').next().unwrap_or(h);
         let st = self.state.lock();
+        if let Some(id) = st.aliases_full.get(&h.to_ascii_lowercase()) {
+            return st.deployments.get(id).map(|d| d.state);
+        }
+        let sub = h.split('.').next().unwrap_or(h);
         let id = st.aliases.get(sub)?;
         st.deployments.get(id).map(|d| d.state)
     }
 
-    /// All host subdomains this node serves (project aliases + deployment ids),
-    /// published to peers so the mesh knows where each deployment lives.
+    /// All host subdomains this node serves (project aliases + deployment ids
+    /// + full custom-domain hosts), published to peers so the mesh knows where
+    /// each deployment lives.
     pub fn served_hosts(&self) -> Vec<String> {
-        self.state.lock().aliases.keys().cloned().collect()
+        let st = self.state.lock();
+        st.aliases
+            .keys()
+            .cloned()
+            .chain(st.aliases_full.keys().cloned())
+            .collect()
     }
 
-    /// Every alias LABEL that resolves to a deployment of `project` — the
-    /// project's own name, its per-commit/branch/deployment labels, and any
-    /// custom domain attached to it (aliases are keyed by first label, the
-    /// platform-wide routing convention).
+    /// Every alias LABEL or full host that resolves to a deployment of
+    /// `project` — the project's own name, its per-commit/branch/deployment
+    /// labels, and any custom domain attached to it (custom domains are keyed
+    /// by FULL hostname; platform aliases by first label).
     ///
     /// Exists so a tenant-controlled surface can be scoped to exactly the
     /// hostnames it legitimately speaks for: the raw-port TLS terminator used
@@ -870,6 +974,7 @@ impl Gateway {
             .collect();
         st.aliases
             .iter()
+            .chain(st.aliases_full.iter())
             .filter(|(_, id)| ids.contains(id))
             .map(|(label, _)| label.clone())
             .collect()
@@ -886,6 +991,7 @@ impl Gateway {
         let st = self.state.lock();
         st.aliases
             .iter()
+            .chain(st.aliases_full.iter())
             .filter(|(_, id)| {
                 st.deployments
                     .get(*id)
@@ -919,10 +1025,12 @@ impl Gateway {
     /// Is the deployment behind `host` a container deployment?
     pub fn is_container_host(&self, host: &str) -> bool {
         let h = host.split(':').next().unwrap_or(host);
-        let sub = h.split('.').next().unwrap_or(h);
         let st = self.state.lock();
-        st.aliases
-            .get(sub)
+        let resolved = st
+            .aliases_full
+            .get(&h.to_ascii_lowercase())
+            .or_else(|| st.aliases.get(h.split('.').next().unwrap_or(h)));
+        resolved
             .and_then(|id| st.deployments.get(id))
             .map(|d| {
                 d.manifest
@@ -3350,6 +3458,7 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
     DeploymentInfo {
         id: d.id.clone(),
         project: d.project.clone(),
+        project_incarnation: d.project_incarnation,
         functions: d
             .manifest
             .functions
@@ -3484,6 +3593,7 @@ mod route_policy_tests {
             },
             created_at_ms: 0,
             state: fluid_core::DeployState::Ready,
+            project_incarnation: None,
             creator: String::new(),
             git: None,
             production: true,

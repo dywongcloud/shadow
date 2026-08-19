@@ -47,22 +47,17 @@
 //!   The stamped [`PortSpec::public_port`] on the deployment record is a
 //!   second durable copy — boot restore re-adopts those stamps
 //!   ([`adopt_record`]) so a lost registry file self-heals from the records.
-//! * **Release** — [`release_raw_ports`] returns a project's ports to the
-//!   pool; hooked into project deletion (`purge_project_resources`) and
-//!   last-deployment deletion. A RELOCATION (the scheduler moving a
-//!   project's serving node) ALSO releases on the OLD host: `git.rs`'s
-//!   `cleanup_non_targets` broadcasts a single-hop `dispatch_project_delete`
-//!   to every non-target node, and the receiving `project_delete` handler
-//!   calls `purge_project_resources` → `release_raw_ports` unconditionally
-//!   of its `cascade=false` query param (that param only suppresses a
-//!   FURTHER re-broadcast, never the local teardown) — this comment
-//!   previously claimed the opposite and was wrong. Release is
-//!   leader-coordinated the same way allocation is
-//!   ([`release_raw_ports_coordinated`]): a non-leader host still clears its
-//!   own local cache immediately (so its `lookup` never serves a stale
-//!   claim) AND forwards the release to the leader's authoritative registry,
-//!   so a relocation's old-host release and new-host (re)allocation are
-//!   never split across two different un-synced local registries.
+//! * **Permanent retirement** — [`release_raw_ports`] removes a project's live
+//!   claim but QUARANTINES every former number forever. Entry nodes can retain
+//!   stale deployment/routes across missed cascades and restarts; re-granting
+//!   such a number to another tenant would turn that stale route into a
+//!   cross-tenant splice. Retirement is therefore leader-coordinated through
+//!   [`release_raw_ports_coordinated`] (the wire path keeps its historical
+//!   `/release` name for rolling compatibility). A non-leader retires its local
+//!   cache first, then forwards the same operation to the authoritative leader.
+//!   Relocation does NOT retire the stable project claim: it uses the separate
+//!   scoped `/reap-deployments` arm, which removes only superseded production
+//!   records and preserves ProjectSettings, resources, and raw-port bindings.
 //!
 //! The LISTENER on an allocated port is the generic raw proxy's job
 //! (`crate::raw_proxy`), not this module's — this is pure allocation/
@@ -108,18 +103,25 @@ pub struct RawPortAllocation {
 struct RegistryFile {
     #[serde(default)]
     allocs: Vec<RawPortAllocation>,
+    /// Port numbers whose former binding may still exist in an entry node's
+    /// stale deployment/cache state. They are intentionally never re-granted.
+    #[serde(default)]
+    quarantined: BTreeSet<u16>,
 }
 
 struct Registry {
     /// claim key ([`alloc_key`]) → allocation. BTreeMap for deterministic
     /// file output.
     by_key: BTreeMap<String, RawPortAllocation>,
-    /// Every public port currently claimed (derived from `by_key`, kept in
-    /// lockstep) — the O(log n) membership set the claim scan checks.
+    /// Every public port currently claimed OR quarantined — the O(log n)
+    /// membership set the claim scan checks.
     in_use: BTreeSet<u16>,
+    /// Durable non-reuse set. A deleted or migrated binding moves here before
+    /// its key disappears, so a stale node can never route this number for one
+    /// tenant after the leader has granted it to another.
+    quarantined: BTreeSet<u16>,
     /// Rotating scan offset into the range so successive claims don't all
-    /// re-probe from the bottom (and a just-released port isn't instantly
-    /// re-handed to the next unrelated deploy while old clients still dial it).
+    /// re-probe from the bottom.
     cursor: u32,
 }
 
@@ -179,18 +181,21 @@ fn registry() -> &'static Mutex<Registry> {
     REG.get_or_init(|| {
         let mut by_key: BTreeMap<String, RawPortAllocation> = BTreeMap::new();
         let mut in_use: BTreeSet<u16> = BTreeSet::new();
+        let mut quarantined: BTreeSet<u16> = BTreeSet::new();
         match std::fs::read_to_string(file_path()) {
             Ok(s) => match serde_json::from_str::<RegistryFile>(&s) {
                 Ok(f) => {
+                    quarantined = f.quarantined;
+                    in_use.extend(quarantined.iter().copied());
                     for a in f.allocs {
                         let key = alloc_key(&a.project, &a.function, a.container_port, a.protocol);
-                        // A (corrupt) duplicate port must never load as two
-                        // live claims — first entry wins, the rest are dropped
-                        // loudly and will re-allocate on their next deploy.
+                        // A (corrupt) duplicate or quarantined port must never
+                        // load as a live claim — first durable state wins, the
+                        // rejected record re-allocates on its next deploy.
                         if in_use.insert(a.public_port) {
                             by_key.insert(key, a);
                         } else {
-                            tracing::warn!(project = %a.project, port = a.public_port, "raw-port registry: dropped duplicate port claim on load");
+                            tracing::warn!(project = %a.project, port = a.public_port, "raw-port registry: dropped duplicate/quarantined port claim on load");
                         }
                     }
                 }
@@ -203,7 +208,12 @@ fn registry() -> &'static Mutex<Registry> {
             },
             Err(_) => {} // no file yet — first boot
         }
-        Mutex::new(Registry { by_key, in_use, cursor: 0 })
+        Mutex::new(Registry {
+            by_key,
+            in_use,
+            quarantined,
+            cursor: 0,
+        })
     })
 }
 
@@ -224,6 +234,7 @@ fn save(reg: &Registry) -> std::io::Result<()> {
     let tmp = dir.join("raw_ports.json.tmp");
     let file = RegistryFile {
         allocs: reg.by_key.values().cloned().collect(),
+        quarantined: reg.quarantined.clone(),
     };
     let json = serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{}".into());
     {
@@ -289,7 +300,7 @@ fn next_free(reg: &mut Registry) -> anyhow::Result<u16> {
     }
     anyhow::bail!(
         "raw public-port range {lo}-{hi} is exhausted (or nothing in it is bindable) — \
-         widen HIVE_RAW_PORT_RANGE or delete unused raw TCP/UDP deployments"
+         widen HIVE_RAW_PORT_RANGE; retired numbers are intentionally never reused"
     )
 }
 
@@ -364,9 +375,10 @@ fn claim_local(
             reg.by_key.remove(k);
             reg.in_use.remove(p);
             if let Some(old) = displaced {
-                // The displaced grant's number was quarantined (never removed
-                // from in_use), so restoring the mapping alone reproduces the
-                // exact pre-call state a reload from disk would give.
+                // A successful migration retires the displaced number. Undo
+                // that retirement when the whole batch fails, then restore the
+                // exact live mapping that the still-current disk file contains.
+                reg.quarantined.remove(&old.public_port);
                 reg.in_use.insert(old.public_port);
                 reg.by_key.insert(k.clone(), old.clone());
             }
@@ -431,6 +443,10 @@ fn claim_local(
                 // migration back to a previously-quarantined number is
                 // refused.
                 if let Some(old) = &prior {
+                    // Persist the non-reuse decision in the same atomic file as
+                    // the replacement claim. Keeping the number only in
+                    // `in_use` lost the quarantine on every process restart.
+                    reg.quarantined.insert(old.public_port);
                     tracing::info!(
                         project,
                         function = %f.name,
@@ -582,30 +598,27 @@ pub fn allocate_raw_ports_records(
     claim_local(project, manifest, &targets)
 }
 
-/// Deploy-deletion entry point (LEADER-COORDINATED): the mirror of
-/// [`allocate_raw_ports_coordinated`] for release. Always clears THIS node's
-/// own local cache first (idempotent no-op if it holds none of `project`'s
-/// claims), so `lookup`/`udp_allocations` here never serve a stale claim
-/// regardless of leader status; when this node is NOT the leader, also
-/// forwards the release to the leader's authoritative registry so a claim
-/// freed here doesn't silently linger there forever (which would otherwise
-/// leak the port — a deleted project's key would never re-clear from the
-/// leader's `by_key`, since only the leader's own registry is authoritative).
-/// Best-effort on the forward: a failed release-forward leaks a claim (the
-/// safe failure direction — never a double allocation), logged rather than
-/// surfaced as a deletion error.
+/// Project-deletion entry point (LEADER-COORDINATED): the mirror of
+/// [`allocate_raw_ports_coordinated`] for permanent retirement. The function
+/// name and `/release` wire path are retained for compatibility, but no number
+/// returns to the pool. Always retires THIS node's local claim first, so
+/// `lookup`/`udp_allocations` here never serve it; when this node is NOT the
+/// leader, also forwards retirement to the authoritative registry. Best-effort
+/// on the forward: failure leaves the leader's live claim unavailable (the safe
+/// direction) and deletion reconciliation retries the operation from its
+/// durable project tombstone.
 pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &str) -> Vec<u16> {
-    let released = release_raw_ports(project);
+    let retired = release_raw_ports(project);
     if cloud.is_control_plane_leader() {
-        return released;
+        return retired;
     }
     let leader = cloud.control_plane_leader();
     let peer = cloud.registry.nodes().into_iter().find(|n| {
         n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some()
     });
     let Some(peer) = peer else {
-        tracing::warn!(project, leader = %leader, "raw-port release: control-plane leader has no reachable mesh address — leader-side claim may leak until the next release");
-        return released;
+        tracing::warn!(project, leader = %leader, "raw-port retirement: control-plane leader has no reachable mesh address — leader-side live claim remains unavailable and will retry from the deletion tombstone");
+        return retired;
     };
     let (peer_id, peer_addr) = (
         peer.peer_id.clone().unwrap(),
@@ -613,7 +626,7 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
     );
     let req_body =
         serde_json::to_vec(&serde_json::json!({ "project": project })).unwrap_or_default();
-    if crate::gossip::request_to(
+    match crate::gossip::request_to(
         cloud,
         &peer_id,
         &peer_addr,
@@ -623,16 +636,30 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
         15,
     )
     .await
-    .is_none()
     {
-        tracing::warn!(project, leader = %leader, "raw-port release: forward to control-plane leader failed — leader-side claim may leak until the next release");
+        Some(body) => {
+            let confirmed = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .is_some_and(|v| v.get("retired").is_some() || v.get("released").is_some());
+            if !confirmed {
+                tracing::warn!(project, leader = %leader, "raw-port retirement: leader returned an unconfirmed response — deletion reconciliation will retry");
+            }
+        }
+        None => {
+            tracing::warn!(project, leader = %leader, "raw-port retirement: forward to control-plane leader failed — leader-side live claim remains unavailable and will retry from the deletion tombstone");
+        }
     }
-    released
+    retired
 }
 
-/// Release every public port allocated to `project` back to the pool. Returns
-/// the released ports (empty when the project held none). Hooked into project
-/// deletion and last-deployment deletion; idempotent.
+/// Remove every live allocation for `project` while permanently quarantining
+/// each public number. Returns the retired ports (empty when the project held
+/// none). Hooked into project/last-deployment deletion; idempotent.
+///
+/// A stale entry node can retain the old deployment record and route for an
+/// unbounded time. Reusing its number for another tenant would turn that stale
+/// route into a cross-tenant splice, so deletion retires the number rather than
+/// returning it to the allocator.
 pub fn release_raw_ports(project: &str) -> Vec<u16> {
     let mut reg = lock();
     let doomed: Vec<String> = reg
@@ -644,20 +671,24 @@ pub fn release_raw_ports(project: &str) -> Vec<u16> {
     if doomed.is_empty() {
         return Vec::new();
     }
-    let mut released = Vec::with_capacity(doomed.len());
+    let mut retired = Vec::with_capacity(doomed.len());
     for k in &doomed {
         if let Some(a) = reg.by_key.remove(k) {
-            reg.in_use.remove(&a.public_port);
-            released.push(a.public_port);
+            // Keep `in_use`: quarantined numbers are deliberately unavailable
+            // to `next_free` and preferred-port claims forever.
+            reg.quarantined.insert(a.public_port);
+            reg.in_use.insert(a.public_port);
+            retired.push(a.public_port);
         }
     }
-    // Best-effort save: on failure the FILE still claims the ports — the safe
-    // failure direction (a leaked claim, never a double allocation); any later
-    // successful save converges the file.
+    // Best-effort save: on failure the FILE still carries the former live
+    // claim, which remains unavailable to reallocation (safe failure
+    // direction). This process has already stopped routing it, and any later
+    // successful registry save persists the quarantine.
     if let Err(e) = save(&reg) {
-        tracing::warn!(project, error = %e, "raw-port release not persisted (ports stay claimed on disk until the next save)");
+        tracing::warn!(project, error = %e, "raw-port quarantine not persisted (ports remain claimed on disk until the next save)");
     }
-    released
+    retired
 }
 
 /// Shared dedup core for adopting an externally-sourced allocation into the
@@ -670,6 +701,10 @@ fn adopt_one(reg: &mut Registry, a: &RawPortAllocation) -> bool {
     let key = alloc_key(&a.project, &a.function, a.container_port, a.protocol);
     if reg.by_key.contains_key(&key) {
         return false; // registry claim wins
+    }
+    if reg.quarantined.contains(&a.public_port) {
+        tracing::warn!(project = %a.project, function = %a.function, port = a.public_port, "raw-port registry: not adopting stale record — port is permanently quarantined");
+        return false;
     }
     if reg.in_use.contains(&a.public_port) {
         tracing::warn!(project = %a.project, function = %a.function, port = a.public_port, "raw-port registry: not adopting — port already claimed by a different key");

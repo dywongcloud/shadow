@@ -312,9 +312,11 @@ const RTT_UNKNOWN: u64 = u64::MAX;
 /// name. Primary signal: the registry's `latency_ms` — each node's OWN gossip
 /// probes measure it, and since `reconcile_local` runs only on the elected
 /// coordinator, the local registry vantage IS the coordinator→candidate RTT.
-/// `latency_ms == 0` on a non-self peer means "never probed by us", so that
-/// hole (and only that hole) falls back to a TCP connect-time probe of the
-/// member's rpc port, cached in-process with a TTL.
+/// `latency_ms == 0` or `NodeRegistry::RESTORED_LATENCY_MS` on a non-self peer
+/// means "unmeasured by us" (the latter was restored from indirect gossip), so
+/// either hole falls back to a TCP connect-time probe of the member's rpc port,
+/// cached in-process with a TTL. `u64::MAX` is withdrawn and likewise never a
+/// measurement.
 async fn member_rtts(
     cloud: &Arc<CloudState>,
     coordinator: &hive_edge::NodeInfo,
@@ -327,7 +329,11 @@ async fn member_rtts(
     let registry = cloud.registry.nodes();
     for cand in rp.nodes.iter().filter(|n| n.name != coordinator.name) {
         let reg = registry.iter().find(|n| n.name == cand.name);
-        if let Some(ms) = reg.map(|n| n.latency_ms).filter(|ms| *ms > 0) {
+        if let Some(ms) = reg.map(|n| n.latency_ms).filter(|ms| {
+            *ms > 0
+                && *ms != hive_edge::region::NodeRegistry::RESTORED_LATENCY_MS
+                && *ms != u64::MAX
+        }) {
             out.insert(cand.name.clone(), ms);
             continue;
         }

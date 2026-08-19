@@ -216,7 +216,13 @@ async fn tunnel_meters_bytes_in_and_out() {
     let body = vec![b'z'; 1000];
     for i in 0..10 {
         let resp = client
-            .request("POST", &format!("/p/{i}"), vec![], &body, Duration::from_secs(10))
+            .request(
+                "POST",
+                &format!("/p/{i}"),
+                vec![],
+                &body,
+                Duration::from_secs(10),
+            )
             .await
             .expect("request failed");
         assert_eq!(resp.status, 200);

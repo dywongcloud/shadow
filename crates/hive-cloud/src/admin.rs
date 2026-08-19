@@ -118,6 +118,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         )
         .route("/v1/deployments/:id/promote", post(dep_promote))
         .route("/v1/projects/:project", delete(project_delete))
+        .route(
+            "/v1/project-delete/capabilities",
+            get(project_delete_capabilities),
+        )
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
         .route("/v1/git/deploy", post(git_deploy))
         // Zip upload: raw `.zip` body (default 2 MB axum limit raised to 12 MB; the
@@ -168,9 +172,23 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             get(project_service_graph),
         )
         .route("/v1/projects/:project/domains", post(project_domain_add))
+        .route(
+            "/v1/projects/:project/domains/:domain/activate",
+            post(domain_activate),
+        )
+        .route(
+            "/v1/projects/:project/domains/:domain/detach",
+            post(domain_detach_owner),
+        )
+        .route(
+            "/v1/projects/:project/domains/:domain",
+            delete(project_domain_detach),
+        )
         .route("/v1/projects/:project/team", put(project_team_put))
         .route("/v1/domains", get(domains_list))
         .route("/v1/domains/:domain", get(domain_get))
+        .route("/v1/domains/:domain/verify", post(domain_verify_now))
+        .route("/v1/domains-nameserver-roster", get(domain_ns_roster))
         .route("/v1/domains/:domain/records", post(domain_add_record))
         .route(
             "/v1/domains/:domain/records/:id",
@@ -1169,62 +1187,661 @@ async fn project_domain_add(
     Json(b): Json<AddDomain>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let team = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    let ok = c.gw.add_alias(&b.domain, &project);
-    if !ok {
-        // Not hosted locally — this project (unlike a static site fanned to
-        // every node) is placed on ONE real node, and every OTHER node only
-        // ever reaches it via mesh-proxy to that owner (confirmed live: this
-        // exact node served `smsrelay.shadw.app` at 200 purely by proxying,
-        // while its OWN `c.gw.aliases` never actually contained "smsrelay" —
-        // `add_alias` requires the LOCAL alias to derive the target deployment
-        // id, so it correctly 404'd here). Forward the add to the real owner
-        // (mirrors `project_network_put`'s identical not-local-forward
-        // pattern) instead of failing OR trying to fan the mutation to every
-        // node — most of which could never satisfy it anyway. Once applied on
-        // the true owner, that node's own next periodic `serve_hosts` gossip
-        // publish carries the new alias to every peer's `peer_routes` table
-        // automatically — the SAME distribution path that already makes
-        // `smsrelay.shadw.app` reachable from every node; no separate fanout
-        // mechanism needed once `host_allowed()` also admits `peer_routes`
-        // hits (see state.rs).
-        if let Some(node) = host_node_for_project(&c, &project) {
-            let body = json!({ "domain": b.domain });
-            if let Some(v) = post_to_host_json(
-                &c,
-                &node,
-                &format!("/v1/projects/{project}/domains"),
-                &team,
-                &body,
-            )
-            .await
-            {
-                return Ok(Json(v));
-            }
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("project '{project}' is hosted on node '{node}' but the domain-add forward failed"),
-            ));
+    let domain = b.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
+        return Err((StatusCode::BAD_REQUEST, "not a valid domain".into()));
+    }
+    // A DomainRecord belongs to its tenant from first verified attach: an
+    // existing record owned by another team 403s here, before any challenge
+    // is issued or state touched (adversarial finding: first-come claims let
+    // a squatter steer a delegated zone's contents — and Seer is the public
+    // resolver for delegated zones, so zone contents ARE the proof channel).
+    require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    // Ownership proof is the gate: the challenge is issued now, and the alias
+    // only activates once `_hive-verify.<domain>` answers this exact TXT
+    // (checked independently at every activation, never from a caller's say-
+    // so). Attachments that predate this gate are grandfathered and keep
+    // routing; new attaches route only after proof.
+    let verify = match c.domains.ensure_verify(&domain, &team, &project) {
+        Ok(v) => v,
+        Err(msg) => return Err((StatusCode::CONFLICT, msg)),
+    };
+    c.projects.add_domain(&project, domain.clone());
+    crate::persist::persist(&c);
+    if verify.status == "verified" {
+        return activate_domain_alias(&c, &domain, &project, &team).await;
+    }
+    Ok(Json(json!({
+        "domain": domain,
+        "project": project,
+        "attached": false,
+        "status": "pending",
+        "verify": verify,
+        "instructions": format!(
+            "Add a TXT record named {} with the value {} at your DNS provider, then verification completes automatically (usually within a few minutes).",
+            verify.txt_name, verify.txt_value
+        ),
+    })))
+}
+
+/// DoH TXT lookup: does `_hive-verify.<domain>` currently answer `want`?
+/// Returns (matched, human-readable outcome for the record's last_probe).
+/// Cloudflare's public resolver, same client shape as `domain_scan_dns`.
+async fn doh_txt_match(c: &Arc<CloudState>, qname: &str, want: &str) -> (bool, String) {
+    let url = format!("https://cloudflare-dns.com/dns-query?name={qname}&type=TXT");
+    let resp = c
+        .http
+        .get(&url)
+        .header("accept", "application/dns-json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return (false, "resolver error (no answer from public DoH)".into());
+    };
+    let Ok(v) = resp.json::<Value>().await else {
+        return (false, "resolver error (bad DoH response)".into());
+    };
+    let status = v.get("Status").and_then(|s| s.as_u64()).unwrap_or(0);
+    let Some(ans) = v.get("Answer").and_then(|a| a.as_array()) else {
+        return (
+            false,
+            if status == 3 {
+                "NXDOMAIN".into()
+            } else {
+                "no TXT answer yet".into()
+            },
+        );
+    };
+    for a in ans {
+        if a.get("type").and_then(|t| t.as_u64()) != Some(16) {
+            continue;
         }
+        let data = a
+            .get("data")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim_matches('"')
+            .trim();
+        if data == want {
+            return (true, "TXT matched".into());
+        }
+    }
+    (false, "TXT present but value does not match".into())
+}
+
+/// Pin a delegated zone's apex to the CURRENT healthy edge set (returns true
+/// when the set actually changed — `set_system_address_records` damps no-op
+/// refreshes). Shared by verification (first pin) and the watcher's refresh
+/// sweep (membership drift).
+fn pin_zone_addresses(c: &Arc<CloudState>, domain: &str) -> bool {
+    let nodes = c.registry.nodes();
+    c.domains.set_system_address_records(
+        domain,
+        crate::dnsserver::lb_records_strings(&nodes, 1),
+        crate::dnsserver::lb_records_strings(&nodes, 28),
+    )
+}
+
+/// Mark the domain verified (rebinding the record to the proving team) AND
+/// pin the delegated zone's apex to the live healthy edge set — one helper
+/// for every activation path (local apply, forward ack, owner arm, watcher)
+/// so they can never drift: without the records write, a domain DELEGATED to
+/// the platform verified clean but its zone served no address records at
+/// all, so it resolved nowhere (adversarial finding).
+fn mark_domain_verified(c: &Arc<CloudState>, domain: &str, project: &str) {
+    c.domains
+        .mark_verified_as(domain, Some(&verify_project_team(c, project)));
+    pin_zone_addresses(c, domain);
+}
+
+/// Activate an attached domain's routing alias — self-verifying: the DoH
+/// proof is re-checked HERE, so activation can never be asserted by a caller,
+/// only proven. Runs the alias insert locally when this node hosts the
+/// project, else forwards to the owner's activate arm (the
+/// `project_domain_add` not-local pattern). On a match the leader's
+/// DomainStore marks verified (replicating the status fleet-wide); the
+/// owning node applies the alias and persists.
+async fn activate_domain_alias(
+    c: &Arc<CloudState>,
+    domain: &str,
+    project: &str,
+    team: &str,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(verify) = c.domains.verify_of(domain) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no verification challenge exists for '{domain}' — attach it to the project first"
+            ),
+        ));
+    };
+    let (matched, outcome) = doh_txt_match(c, &verify.txt_name, &verify.txt_value).await;
+    c.domains.mark_verify_probe(domain, &outcome);
+    if !matched {
+        return Ok(Json(json!({
+            "domain": domain,
+            "project": project,
+            "attached": false,
+            "status": "pending",
+            "verify": c.domains.verify_of(domain),
+            "probe": outcome,
+        })));
+    }
+    // Proof good at THIS node — now route. The alias applies on the node
+    // that HOSTS the project, and the verified mark lands only after the
+    // apply is confirmed (locally or by the owner arm's ack): a failed apply
+    // must leave the record pending so the watcher keeps retrying instead of
+    // wedging in verified-but-unrouted (adversarial finding). Everywhere
+    // else learns the route via the host's `serve_hosts` gossip (the
+    // `smsrelay.shadw.app` mechanism).
+    if c.gw.add_alias(domain, project) {
+        mark_domain_verified(c, domain, project);
+        crate::persist::persist(&c);
+        let ev = c.event(
+            c.region.clone().as_str(),
+            "DOMAIN",
+            domain,
+            "/",
+            200,
+            "domain-verified",
+            project,
+        );
+        c.record(ev);
+        // Kick the custom-cert pass now (internally leader-gated) so TLS is
+        // issued within seconds instead of at the next loop cadence.
+        let kick = c.clone();
+        tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+        return Ok(Json(json!({
+            "domain": domain,
+            "project": project,
+            "attached": true,
+            "status": "verified",
+        })));
+    }
+    let Some(node) = host_node_for_project(c, project) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("no deployment for project '{project}'"),
         ));
+    };
+    let body = json!({ "project": project });
+    if let Some(v) = post_to_host_json(
+        c,
+        &node,
+        &format!("/v1/projects/{project}/domains/{domain}/activate"),
+        team,
+        &body,
+    )
+    .await
+    {
+        if v.get("status").and_then(|s| s.as_str()) == Some("verified") {
+            // The owner arm applied the alias and marked its own copy; mark
+            // the leader's (this store wholesale-replicates from here).
+            mark_domain_verified(c, domain, project);
+            crate::persist::persist(&c);
+            let kick = c.clone();
+            tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+        }
+        return Ok(Json(v));
     }
-    c.projects.add_domain(&project, b.domain.clone());
-    crate::persist::persist(&c);
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("project '{project}' is hosted on node '{node}' but the domain activation forward failed"),
+    ))
+}
+
+/// Owner-side activation arm (`POST /v1/projects/:p/domains/:domain/activate`).
+/// Applies the alias ONLY after independently re-proving the TXT — a
+/// forwarded activation carries no authority of its own.
+/// The local half of domain activation, shared by the HTTP arm and the
+/// gossip arm: re-prove the TXT at THIS node, apply the alias, and only then
+/// mark verified — a failed apply must leave the record pending so the
+/// watcher keeps retrying (the stuck-verified-unrouted state the adversarial
+/// review found).
+pub(crate) async fn domain_activate_local(
+    c: &Arc<CloudState>,
+    project: &str,
+    domain: &str,
+) -> Value {
+    let Some(verify) = c.domains.verify_of(domain) else {
+        return json!({
+            "domain": domain,
+            "project": project,
+            "attached": false,
+            "status": "error",
+            "error": format!("no verification challenge exists for '{domain}'"),
+        });
+    };
+    if verify.status == "verified" {
+        // Already proven — this is a re-assert (the watcher re-applying
+        // routing after a cross-node redeploy/relocation, or a verify-now
+        // click). The TXT may legitimately be GONE now: path-A tenants remove
+        // it after success and the Seer arm stops serving it once verified,
+        // so re-demanding the DoH proof would wedge a verified domain
+        // (adversarial finding: a cross-node redeploy darkened the domain
+        // until the new host happened to restart). The proof stands
+        // server-side; only the alias needs re-applying. Ownership is checked
+        // by every caller before this point.
+        if c.gw.add_alias(domain, project) {
+            return json!({
+                "domain": domain,
+                "project": project,
+                "attached": true,
+                "status": "verified",
+            });
+        }
+        return json!({
+            "domain": domain,
+            "project": project,
+            "attached": false,
+            "status": "pending",
+            "probe": "verified, but the project has no production deployment on this node yet",
+        });
+    }
+    let (matched, outcome) = doh_txt_match(c, &verify.txt_name, &verify.txt_value).await;
+    c.domains.mark_verify_probe(domain, &outcome);
+    if !matched {
+        return json!({
+            "domain": domain,
+            "project": project,
+            "attached": false,
+            "status": "pending",
+            "probe": outcome,
+        });
+    }
+    if !c.gw.add_alias(domain, project) {
+        return json!({
+            "domain": domain,
+            "project": project,
+            "attached": false,
+            "status": "pending",
+            "probe": "TXT matched, but the project has no deployment on this node yet",
+        });
+    }
+    mark_domain_verified(c, domain, project);
+    crate::persist::persist(c);
+    let kick = c.clone();
+    tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
     let ev = c.event(
-        &c.region,
+        c.region.clone().as_str(),
         "DOMAIN",
-        &b.domain,
+        domain,
         "/",
         200,
-        "domain-add",
-        &project,
+        "domain-verified",
+        project,
     );
     c.record(ev);
+    json!({
+        "domain": domain,
+        "project": project,
+        "attached": true,
+        "status": "verified",
+    })
+}
+
+/// The proving attach's team for the tenant rebind on verification — the
+/// project tag when known, never invented (personal namespaces have no team
+/// row; a rebind to "" would orphan the record, so fall back to the record's
+/// own tenant then).
+fn verify_project_team(c: &Arc<CloudState>, project: &str) -> String {
+    let t = c.projects.team_of(project);
+    if !t.is_empty() {
+        return t;
+    }
+    String::new()
+}
+
+/// Owner-side activation arm (`POST /v1/projects/:p/domains/:domain/activate`).
+/// Applies the alias ONLY after independently re-proving the TXT — a
+/// forwarded activation carries no authority of its own.
+async fn domain_activate(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path((project, domain)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // The domain being activated must be the caller's AND the stored
+    // challenge must belong to THIS attach: activation applies routing for
+    // whatever challenge is stored, so without the binding a caller could
+    // drive another tenant's proof onto their own project (adversarial
+    // finding — cross-tenant domain theft).
+    require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    if !c
+        .domains
+        .verify_of(&domain)
+        .is_some_and(|v| v.project == project)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("no verification challenge links '{domain}' to project '{project}'"),
+        ));
+    }
+    Ok(Json(domain_activate_local(&c, &project, &domain).await))
+}
+
+/// `POST /v1/domains/:domain/verify` — synchronous re-check for the UI's
+/// "verify now" button. Same self-proving path as the background watcher.
+async fn domain_verify_now(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    let Some(verify) = c.domains.verify_of(&domain) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no verification challenge exists for '{domain}' — attach it to a project first"
+            ),
+        ));
+    };
+    let team = crate::admin::tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    activate_domain_alias(&c, &domain, &verify.project, &team).await
+}
+
+/// `GET /v1/domains-nameserver-roster` — the nameserver hostnames a tenant
+/// points their registrar at when delegating DNS to the platform (the same
+/// roster `dnsserver::apex_ns_names` computes, so the wizard and the served
+/// zone can never disagree). Unauthenticated-ish (tenant-scoped like every
+/// dashboard read): the set is public DNS data anyway.
+/// `GET /v1/domains-nameserver-roster` — the nameserver hostnames a tenant
+/// points their registrar at when delegating DNS to the platform. ONLY
+/// peer-ATTESTED nameservers are named, with the platform's own ≥2 floor:
+/// "advertise only what peers have PROVEN, never what a node claims" — the
+/// rule whose violation once put two dead nameservers into a live
+/// delegation, here applied to the tenant-facing roster the wizard shows
+/// (adversarial finding: it previously fed declared-only names). Below the
+/// floor the response says so honestly instead of inventing a pair.
+async fn domain_ns_roster(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // The attested set + live edge addresses double as a real-time
+    // health/attestation signal for the fleet — not public data (the old
+    // "tenant-scoped like every dashboard read" comment was simply false:
+    // GETs pass require_auth). Claims are required whenever auth is
+    // enforced; the nameserver hostnames themselves remain public DNS data.
+    if crate::auth::enforced() && claims.is_none() {
+        return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
+    }
+    crate::admin::tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let nodes = c.registry.nodes();
+    let verdicts = crate::dns_probe::validate_nameservers(&nodes);
+    let proven: Vec<String> = verdicts
+        .iter()
+        .filter(|v| v.validated)
+        .map(|v| {
+            format!(
+                "{}.{}",
+                crate::vercel_dns::ns_label(&v.node),
+                c.apps_domain.trim().trim_matches('.').to_lowercase()
+            )
+        })
+        .collect();
+    // The address set a tenant points A/AAAA records at when they keep their
+    // own DNS (path A of the wizard): exactly the set this node's DNS would
+    // answer for the apps wildcard right now (`lb_records` — healthy +
+    // public-address, latency-ordered, capped), so the guidance and the wire
+    // can never disagree.
+    let nodes = c.registry.nodes();
+    let (rr4, _) = crate::dnsserver::lb_records_pub(&nodes, 1);
+    let (rr6, _) = crate::dnsserver::lb_records_pub(&nodes, 28);
+    let fmt = |rd: &[u8]| -> String {
+        if rd.len() == 4 {
+            format!("{}.{}.{}.{}", rd[0], rd[1], rd[2], rd[3])
+        } else {
+            rd.chunks(2)
+                .map(|c| format!("{:x}", u16::from_be_bytes([c[0], c[1]])))
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+    };
+    let v4: Vec<String> = rr4.iter().map(|rd| fmt(rd)).collect();
+    let v6: Vec<String> = rr6.iter().map(|rd| fmt(rd)).collect();
+    Ok(Json(json!({
+        "nameservers": proven,
+        "delegation_ready": proven.len() >= 2,
+        "edge_ipv4": v4,
+        "edge_ipv6": v6,
+    })))
+}
+
+/// `DELETE /v1/projects/:p/domains/:domain` — detach: drop the routing alias
+/// (on the owner, via the same not-local forward as attach) and the settings
+/// entry. The DomainStore record stays (the user may still manage DNS); the
+/// verification state clears so a later re-attach proves again.
+async fn project_domain_detach(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path((project, domain)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // The DOMAIN is the revoked resource, so the domain — not just the
+    // project in the path — must be the caller's (adversarial finding: any
+    // tenant could wipe a foreign domain's verification and its TLS
+    // fleet-wide by naming it in a detach against their own project).
+    require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    // Only a domain ACTUALLY attached to this project may be detached here —
+    // another project may hold the live verified attach (ensure_verify
+    // re-issues cross-project pendings), and clearing THAT would kill its
+    // routing + TLS (adversarial finding).
+    let attached = c
+        .projects
+        .all_domains()
+        .into_iter()
+        .any(|(p, d)| p == project && d == domain);
+    if !attached {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("'{domain}' is not attached to project '{project}'"),
+        ));
+    }
+    c.projects.remove_domain(&project, &domain);
+    // Clear verification only when THIS project's attach holds it — the live
+    // verified attach may belong to a different project of the same tenant.
+    if c.domains
+        .verify_of(&domain)
+        .is_some_and(|v| v.project == project)
+    {
+        c.domains.clear_verify(&domain);
+    }
+    // Detach is a revocation: it must reach EVERY node hosting the project,
+    // not the first registry entry (adversarial finding: fanout/static
+    // projects kept serving on the other hosts while the UI said
+    // "detached"). Local first, then every hosting peer; the route dies
+    // everywhere `serve_hosts` stops carrying it. The alias itself is only
+    // touched when NO project still lists the domain — a second project's
+    // live attach must survive this detach.
+    let still_attached = c
+        .projects
+        .all_domains()
+        .into_iter()
+        .any(|(_, d)| d == domain);
+    if !still_attached {
+        c.gw.remove_alias(&domain);
+        // A fully-detached domain's zone stops claiming the platform edge —
+        // the pinned system records (apex A/AAAA + www CNAME) would
+        // otherwise keep resolving to the fleet forever, serving 404s on a
+        // domain the tenant believes is detached.
+        c.domains
+            .set_system_address_records(&domain, vec![], vec![]);
+    }
+    let hosts: Vec<String> = {
+        let pd = c.peer_deployments.read();
+        pd.iter()
+            .filter(|(node, deps)| {
+                **node != c.node_name && deps.iter().any(|d| d.project == project)
+            })
+            .map(|(node, _)| node.clone())
+            .collect()
+    };
+    if !still_attached {
+        for node in hosts {
+            let body = json!({});
+            // Best-effort per peer: an unreachable peer stops publishing the host
+            // at its own next serve_hosts tick, and the alias is gone there too
+            // since its table is rebuilt from the same settings + heal rules.
+            let _ = post_to_host_json(
+                &c,
+                &node,
+                &format!("/v1/projects/{project}/domains/{domain}/detach"),
+                &team,
+                &body,
+            )
+            .await;
+        }
+    }
+    crate::persist::persist(&c);
     Ok(Json(
-        json!({ "domain": b.domain, "project": project, "attached": true }),
+        json!({ "domain": domain, "project": project, "detached": true }),
     ))
+}
+
+/// Owner-side detach arm (`POST /v1/projects/:p/domains/:domain/detach`).
+async fn domain_detach_owner(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path((project, domain)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // This route is reachable directly, not only via the internal forward —
+    // the same domain-side guards as the tenant-facing detach apply (the
+    // domain must be the caller's, the attach must be this project's, and a
+    // second project's live attach must survive).
+    require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    let attached = c
+        .projects
+        .all_domains()
+        .into_iter()
+        .any(|(p, d)| p == project && d == domain);
+    if !attached {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("'{domain}' is not attached to project '{project}'"),
+        ));
+    }
+    c.projects.remove_domain(&project, &domain);
+    if !c
+        .projects
+        .all_domains()
+        .into_iter()
+        .any(|(_, d)| d == domain)
+    {
+        c.gw.remove_alias(&domain);
+        c.domains
+            .set_system_address_records(&domain, vec![], vec![]);
+    }
+    crate::persist::persist(&c);
+    Ok(Json(
+        json!({ "domain": domain, "project": project, "detached": true }),
+    ))
+}
+
+/// Leader-only watcher for pending custom-domain verifications (45s tick).
+/// For each pending challenge it asks the attach's OWNING node to activate —
+/// the owner arm re-proves the TXT itself, so this loop never asserts a
+/// proof, it just polls for one. `HIVE_DOMAIN_VERIFY_SECS` overrides the
+/// cadence; `0` disables (rollout/debug).
+pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
+    let secs = std::env::var("HIVE_DOMAIN_VERIFY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(45);
+    if secs == 0 {
+        return;
+    }
+    crate::supervise::spawn_supervised("domain-verify", move || {
+        let cloud = cloud.clone();
+        async move {
+            loop {
+                crate::supervise::beat("domain-verify");
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                let isolated = cloud.mesh_health().isolated;
+                if cloud.control_plane_leader() != cloud.node_name || isolated {
+                    continue;
+                }
+                // Refresh the pinned apex set for verified attachments:
+                // fleet membership moves under a static zone record (a node
+                // leaves, a closer edge joins), and a delegated domain must
+                // not keep resolving to a dead address. Damped — no store
+                // churn, and no persist, when every set is unchanged.
+                let verified = cloud.domains.verified_attachments();
+                let mut addrs_changed = false;
+                for (domain, _) in &verified {
+                    addrs_changed |= pin_zone_addresses(&cloud, domain);
+                }
+                if addrs_changed {
+                    crate::persist::persist(&cloud);
+                }
+                // Re-assert routing for every verified attachment: a
+                // cross-node redeploy/relocation drops the alias on the old
+                // host and nothing re-applies it on the new one until a
+                // restart (adversarial finding). The owner arm's verified
+                // fast-path re-applies the alias idempotently WITHOUT
+                // re-demanding the (possibly removed) TXT; the proof already
+                // stands server-side.
+                for (domain, project) in &verified {
+                    let Some(node) = host_node_for_project(&cloud, project) else {
+                        continue;
+                    };
+                    if node == cloud.node_name {
+                        cloud.gw.add_alias(domain, project);
+                        continue;
+                    }
+                    let tenant = cloud
+                        .domains
+                        .get(domain)
+                        .map(|d| d.tenant.clone())
+                        .unwrap_or_default();
+                    let body = json!({ "project": project });
+                    let _ = post_to_host_json(
+                        &cloud,
+                        &node,
+                        &format!("/v1/projects/{project}/domains/{domain}/activate"),
+                        &tenant,
+                        &body,
+                    )
+                    .await;
+                }
+                for (domain, verify) in cloud.domains.pending_verifications() {
+                    let Some(node) = host_node_for_project(&cloud, &verify.project) else {
+                        continue;
+                    };
+                    let tenant = cloud
+                        .domains
+                        .get(&domain)
+                        .map(|d| d.tenant.clone())
+                        .unwrap_or_default();
+                    let body = json!({ "project": verify.project });
+                    let v = post_to_host_json(
+                        &cloud,
+                        &node,
+                        &format!(
+                            "/v1/projects/{}/domains/{}/activate",
+                            verify.project, domain
+                        ),
+                        &tenant,
+                        &body,
+                    )
+                    .await;
+                    if let Some(v) = v {
+                        if v.get("status").and_then(|s| s.as_str()) == Some("verified") {
+                            mark_domain_verified(&cloud, &domain, &verify.project);
+                            crate::persist::persist(&cloud);
+                            tracing::info!(domain, project = %verify.project, "domain-verify: TXT proof observed, domain attached");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Body-carrying POST forward to a specific node's admin surface — the POST
@@ -1239,10 +1856,27 @@ async fn post_to_host_json(
 ) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
-        if let Ok(r) = c
+        // The forwarded call must authenticate like any cross-node mutation:
+        // x-hive-team alone got bounced by the receiver's loopback-forwarder
+        // (adversarial finding: every activate/detach forward returned 401/403
+        // or looped back to the leader). Attach the internal marker and, under
+        // enforced auth, a short service JWT — the
+        // `dispatch_project_delete_with` shape, proven on this same fleet.
+        let mut request = c
             .http
             .post(format!("{admin}{path}"))
-            .header("x-hive-team", team)
+            .header("x-hive-team", team);
+        if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+            if !token.trim().is_empty() {
+                request = request.header("x-hive-internal", token);
+            }
+        }
+        if crate::auth::enforced() {
+            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+                request = request.bearer_auth(token);
+            }
+        }
+        if let Ok(r) = request
             .timeout(std::time::Duration::from_secs(15))
             .json(body)
             .send()
@@ -1292,7 +1926,15 @@ pub(crate) async fn domains_list(
     let mut out: Vec<Value> = Vec::new();
     for (p, d) in c.projects.all_domains() {
         if norm(&c.projects.team_of(&p)) == t && seen.insert(format!("{p}\u{0}{d}")) {
-            out.push(json!({ "project": p, "domain": d }));
+            // The verify status rides every row (fanned-out peers answer from
+            // their own replicated DomainStore, so the badge is consistent
+            // whichever node serves the list).
+            let vs = c
+                .domains
+                .verify_of(&d)
+                .map(|v| v.status)
+                .unwrap_or_default();
+            out.push(json!({ "project": p, "domain": d, "verify_status": vs }));
         }
     }
     if !q.local.unwrap_or(false) {
@@ -1481,7 +2123,19 @@ async fn domain_get(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // A GET must never CREATE a DomainRecord — first-come claiming via a
+    // read endpoint is how squatters pre-seeded zones (adversarial finding).
+    // Records come into existence through the verified-attach flow alone.
+    let Some(rec) = c.domains.get(&domain) else {
+        return Err((StatusCode::NOT_FOUND, "no such domain".into()));
+    };
+    if norm(&rec.tenant) != norm(&t) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "domain belongs to a different team".into(),
+        ));
+    }
     // Connected projects: projects in this tenant whose domain ends with this one.
     let connected: Vec<Value> = c
         .projects
@@ -1493,9 +2147,7 @@ async fn domain_get(
         })
         .map(|(p, d)| json!({ "project": p, "domain": d }))
         .collect();
-    Ok(Json(
-        json!({ "domain": c.domains.ensure(&domain, &t), "connected": connected }),
-    ))
+    Ok(Json(json!({ "domain": rec, "connected": connected })))
 }
 
 #[derive(Deserialize)]
@@ -1516,6 +2168,113 @@ fn default_dns_ttl() -> u32 {
     60
 }
 
+/// Value length bound for any zone record: an unbounded TXT made a tenant
+/// zone a UDP amplifier (adversarial finding — Seer shipped whatever the
+/// store held in one datagram).
+const MAX_RECORD_VALUE_BYTES: usize = 4096;
+/// Per-(name, kind) RR bound — the amplifier needs many answers at one name.
+const MAX_RECORDS_PER_NAME_KIND: usize = 32;
+
+/// Is this record name platform-managed? `_hive-verify` (the ownership
+/// proof) and `_acme-challenge` (LE DNS-01) are answered by the platform
+/// itself — the proof channel MUST NOT be tenant-writable, or a zone holder
+/// could self-answer their own challenge (the circular-verification break).
+fn reserved_record_name(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n == "_hive-verify"
+        || n.starts_with("_hive-verify.")
+        || n == "_acme-challenge"
+        || n.starts_with("_acme-challenge.")
+}
+
+/// Shared write-side validation for zone records (add/update/import):
+/// reserved names, MX/SRV/CAA shapes (the encoder must never emit a wrong
+/// answer), value length and per-(name,kind) count (the amplifier bounds).
+/// `replacing_id` excludes the record being updated from the count.
+fn validate_record_write(
+    c: &Arc<CloudState>,
+    domain: &str,
+    name: &str,
+    kind: &str,
+    value: &str,
+    priority: Option<u32>,
+    replacing_id: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if reserved_record_name(name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' is a platform-managed name — it cannot be set as a zone record",
+                name.trim().to_ascii_lowercase()
+            ),
+        ));
+    }
+    let kind_u = kind.to_uppercase();
+    if value.len() > MAX_RECORD_VALUE_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("record value exceeds {MAX_RECORD_VALUE_BYTES} bytes"),
+        ));
+    }
+    // Numeric/shape validation at write time (the encoder must never emit a
+    // wrong answer): MX/SRV priority fits u16; SRV value is
+    // `<weight> <port> <target>`; CAA is `<flags> <tag> "<value>"`.
+    if (kind_u == "MX" || kind_u == "SRV") && priority.unwrap_or(0) > 65_535 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "priority must fit in 16 bits (0–65535)".into(),
+        ));
+    }
+    if kind_u == "SRV" {
+        let mut it = value.split_whitespace();
+        let ok = it.next().and_then(|w| w.parse::<u16>().ok()).is_some()
+            && it.next().and_then(|p| p.parse::<u16>().ok()).is_some()
+            && it.next().is_some_and(|t| !t.is_empty());
+        if !ok {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "SRV value must be '<weight> <port> <target>' (e.g. '1 443 sip.example.com')"
+                    .into(),
+            ));
+        }
+    }
+    if kind_u == "CAA" {
+        let mut it = value.splitn(3, char::is_whitespace);
+        let ok = it.next().and_then(|f| f.parse::<u8>().ok()).is_some()
+            && it.next().is_some_and(|t| !t.is_empty() && t.len() <= 255);
+        if !ok {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "CAA value must be '<flags> <tag> \"<value>\"' (e.g. '0 issue \"letsencrypt.org\"')".into(),
+            ));
+        }
+    }
+    let count = c
+        .domains
+        .get(domain)
+        .map(|d| {
+            d.records
+                .iter()
+                .filter(|r| {
+                    r.name.trim().eq_ignore_ascii_case(name.trim())
+                        && r.kind == kind_u
+                        && Some(r.id.as_str()) != replacing_id
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if count >= MAX_RECORDS_PER_NAME_KIND {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many {kind_u} records at '{}' (max {MAX_RECORDS_PER_NAME_KIND})",
+                name.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn domain_add_record(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1524,6 +2283,7 @@ async fn domain_add_record(
     Json(r): Json<AddRecordReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    validate_record_write(&c, &domain, &r.name, &r.kind, &r.value, r.priority, None)?;
     let rec = crate::dns::DnsRecord {
         id: String::new(),
         name: r.name,
@@ -1576,6 +2336,18 @@ async fn domain_update_record(
     Json(r): Json<AddRecordReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    // The update path enforces the same write-side rules as add/import —
+    // renaming a record to a platform-reserved name or an invalid shape was
+    // previously possible here and only here (adversarial finding).
+    validate_record_write(
+        &c,
+        &domain,
+        &r.name,
+        &r.kind,
+        &r.value,
+        r.priority,
+        Some(&id),
+    )?;
     let updated = c
         .domains
         .update_record(
@@ -1625,9 +2397,14 @@ async fn domain_import_records(
     Json(req): Json<ImportReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    // The `_hive-verify`/`_acme-challenge` reservation and the amplifier
+    // bounds apply to bulk imports exactly as to single adds (see
+    // validate_record_write) — over-cap or over-length records are SKIPPED
+    // and named in the response, never silently stored or silently dropped.
     let mut recs: Vec<crate::dns::DnsRecord> = req
         .records
         .into_iter()
+        .filter(|r| !reserved_record_name(&r.name))
         .map(|r| crate::dns::DnsRecord {
             id: String::new(),
             name: r.name,
@@ -1641,8 +2418,41 @@ async fn domain_import_records(
         })
         .collect();
     if !req.zone.trim().is_empty() {
-        recs.extend(parse_zone(&req.zone, &domain));
+        recs.extend(
+            parse_zone(&req.zone, &domain)
+                .into_iter()
+                .filter(|r| !reserved_record_name(&r.name)),
+        );
     }
+    let before = recs.len();
+    recs.retain(|r| r.value.len() <= MAX_RECORD_VALUE_BYTES);
+    // Per-(name,kind) bound, counting what the zone ALREADY holds — a bulk
+    // import is exactly the vector an amplifier set would arrive by.
+    let existing = c.domains.get(&domain);
+    let mut counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    recs.retain(|r| {
+        let key = (r.name.trim().to_ascii_lowercase(), r.kind.clone());
+        let n = counts.entry(key).or_insert_with(|| {
+            existing
+                .as_ref()
+                .map(|d| {
+                    d.records
+                        .iter()
+                        .filter(|x| {
+                            x.name.trim().eq_ignore_ascii_case(r.name.trim()) && x.kind == r.kind
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        });
+        if *n >= MAX_RECORDS_PER_NAME_KIND {
+            return false;
+        }
+        *n += 1;
+        true
+    });
+    let skipped = before - recs.len();
     let added = c.domains.import_records(&domain, recs);
     if !added.is_empty() {
         c.audit.record(
@@ -1655,7 +2465,9 @@ async fn domain_import_records(
         );
         crate::persist::persist(&c);
     }
-    Ok(Json(json!({ "imported": added.len(), "records": added })))
+    Ok(Json(
+        json!({ "imported": added.len(), "skipped": skipped, "records": added }),
+    ))
 }
 
 /// Detect a domain's CURRENT public DNS records (via DNS-over-HTTPS) so a user can
@@ -2151,6 +2963,7 @@ pub(crate) async fn deploy_zip(
         commit: None,        // zip upload: no git history, nothing to pin to
         head_repo_url: None, // zip upload has no git clone, let alone a fork
         project: meta.project,
+        project_incarnation: None,
         creator: Some("you".into()),
         production: meta.production.unwrap_or(true),
         target: None,
@@ -2251,6 +3064,7 @@ pub(crate) async fn deploy_image(
         commit: None,        // prebuilt image deploy: no git clone, nothing to pin to
         head_repo_url: None, // prebuilt image deploy has no git clone, let alone a fork
         project: body.project,
+        project_incarnation: None,
         creator: Some("you".into()),
         production: body.production.unwrap_or(true),
         target: None,
@@ -2831,7 +3645,13 @@ fn require_domain_owner_if_exists(
 ) -> Result<String, (StatusCode, String)> {
     let t = tenant(c, h, claims);
     if let Some(rec) = c.domains.get(domain) {
-        if norm(&rec.tenant) != norm(&t) {
+        // Only a VERIFIED record locks to its tenant (the `ensure_verify`
+        // rule): an unproven claim — pending or DNS-only — confers no
+        // ownership and must never 403 the real owner's attach, which takes
+        // the record over and lets DNS proof settle ownership (adversarial
+        // finding: first-come pending claims locked owners out permanently).
+        let locked = rec.verify.as_ref().is_some_and(|v| v.status == "verified");
+        if locked && norm(&rec.tenant) != norm(&t) {
             return Err((
                 StatusCode::FORBIDDEN,
                 "domain belongs to a different team".into(),
@@ -3117,8 +3937,20 @@ async fn dep_create(
     );
     // Persist so the deployment survives a node restart (without this it lived
     // only in memory and was lost on reboot).
+    causal_stamp_new_deployment(&c, &project, &info.id.0);
     crate::persist::persist(&c);
     Ok(Json(json!(info)))
+}
+
+/// Floor a fresh deployment's causal stamp at the project tombstone +1 (see
+/// `ProjectStore::tombstone_of`): without it a redeploy landing inside the
+/// delete generation's skew lead is swept as "old incarnation" by the next
+/// deletion reconcile — the recreated project's first deployment dies and
+/// its resources purge under it (adversarial finding).
+pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id: &str) {
+    if let Some(t) = c.projects.tombstone_of(project) {
+        c.gw.restamp_created(id, t.saturating_add(1));
+    }
 }
 
 /// Roll back / promote: make an existing deployment the project's production.
@@ -3361,9 +4193,9 @@ async fn dep_delete(
         // same stable per-project allocation, so releasing earlier would yank
         // the port out from under a still-registered record.
         if !c.gw.list().iter().any(|d| d.project == *p) {
-            let released = crate::raw_ports::release_raw_ports_coordinated(&c, p).await;
-            if !released.is_empty() {
-                tracing::info!(project = %p, ports = ?released, "released public raw port(s) — last deployment deleted");
+            let retired = crate::raw_ports::release_raw_ports_coordinated(&c, p).await;
+            if !retired.is_empty() {
+                tracing::info!(project = %p, ports = ?retired, "retired public raw port(s) — last deployment deleted; never re-granted");
             }
         }
     }
@@ -3386,7 +4218,16 @@ async fn purge_project_resources(
     project: &str,
     team: &str,
     n_deployments: usize,
+    delete_ms: u64,
 ) {
+    if observed_project_version_ms(c, project) > delete_ms {
+        tracing::info!(
+            project,
+            delete_ms,
+            "project purge skipped — a causal recreation is newer than this delete generation"
+        );
+        return;
+    }
     c.audit.record(
         team,
         "user",
@@ -3396,6 +4237,16 @@ async fn purge_project_resources(
         &format!("{n_deployments} deployment(s)"),
     );
 
+    // Re-check the delete generation before EVERY destructive phase, not
+    // just at entry (the entry check passes before a mid-purge recreate can
+    // exist): a recreate landing while this purge runs must stop the
+    // remaining phases — the still-running purge otherwise destroys the new
+    // incarnation's databases, live data volume, and checkout underneath it
+    // (adversarial finding).
+    if observed_project_version_ms(c, project) > delete_ms {
+        tracing::info!(project, delete_ms, "project purge aborted before database phase — causal recreation mid-purge");
+        return;
+    }
     for d in c.databases.list(Some(project)) {
         if !d.replicas.is_empty() {
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
@@ -3447,17 +4298,33 @@ async fn purge_project_resources(
         c.databases.remove_db_and_purge_data(&d.id, &d.team);
     }
 
+    if observed_project_version_ms(c, project) > delete_ms {
+        tracing::info!(project, delete_ms, "project purge aborted before volume/source phase — causal recreation mid-purge");
+        return;
+    }
     purge_project_podman_volumes(project).await;
     c.builds.remove_for_project(project);
     purge_project_source_dirs(project).await;
 
-    // Return the project's PUBLIC raw ports (TCP/UDP/gRPC ingress) to the
-    // allocator pool. Runs on every teardown path (direct delete + mesh
-    // cascade) so the durable claim in raw_ports.json never outlives the
-    // project it was allocated for.
-    let released = crate::raw_ports::release_raw_ports_coordinated(c, project).await;
-    if !released.is_empty() {
-        tracing::info!(project, ports = ?released, "released public raw port(s) on project delete");
+    // Public raw ports are a permanent non-reuse boundary: a stale entry-node
+    // route could otherwise splice the former tenant's traffic into a later
+    // tenant. Retire the grants only when this generation still represents a
+    // full project deletion; a newer recreation keeps its stable claim.
+    if observed_project_version_ms(c, project) <= delete_ms {
+        let retired = crate::raw_ports::release_raw_ports_coordinated(c, project).await;
+        if !retired.is_empty() {
+            tracing::info!(
+                project,
+                ports = ?retired,
+                "retired public raw port(s) on project delete — never re-granted"
+            );
+        }
+    } else {
+        tracing::info!(
+            project,
+            delete_ms,
+            "raw-port retirement skipped — project was causally recreated"
+        );
     }
 
     // The purge runs DETACHED from both delete paths, after their persist() dirty
@@ -3550,11 +4417,78 @@ fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>)
     claims_present || team_header.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
+fn delete_forward_is_internal(headers: &HeaderMap, claims: Option<&crate::auth::Claims>) -> bool {
+    let service_claim = claims.is_some_and(|cl| cl.sub == "mesh-internal" && cl.role == "service");
+    let shared_secret = std::env::var("HIVE_INTERNAL_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .is_some_and(|t| {
+            headers
+                .get("x-hive-internal")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| ct_eq(v, &t))
+        });
+    service_claim || shared_secret
+}
+
+/// A delete generation may lead the receiver's clock only by the skew the
+/// origin intentionally adds plus the opposite-direction skew of this receiver.
+/// Older generations remain valid forever for idempotent retries.
+pub(crate) const MAX_DELETE_GENERATION_FUTURE_MS: u64 =
+    hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2;
+
+pub(crate) fn valid_delete_generation(delete_ms: u64) -> bool {
+    delete_ms > 0 && delete_ms <= now_ms().saturating_add(MAX_DELETE_GENERATION_FUTURE_MS)
+}
+
+/// Newest causal version this coordinator can see for `project`. A fresh
+/// deletion generation is issued strictly above this floor so it dominates
+/// settings and deployment records already visible anywhere in the fleet.
+fn observed_project_version_ms(c: &Arc<CloudState>, project: &str) -> u64 {
+    let settings_ms = c
+        .projects
+        .get_if_set(project)
+        .map(|s| s.updated_ms)
+        .unwrap_or(0);
+    let local_ms =
+        c.gw.list()
+            .into_iter()
+            .filter(|d| d.project == project)
+            .map(|d| d.created_at_ms)
+            .max()
+            .unwrap_or(0);
+    let peer_ms = c
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .filter(|d| d.project == project)
+        .map(|d| d.created_at_ms)
+        .max()
+        .unwrap_or(0);
+    let observed = settings_ms.max(local_ms).max(peer_ms);
+    let ceiling = now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS);
+    if observed > ceiling {
+        tracing::warn!(
+            project,
+            observed_ms = observed,
+            ceiling_ms = ceiling,
+            "project version is implausibly future-dated; bounding delete-generation input"
+        );
+        ceiling
+    } else {
+        observed
+    }
+}
+
+async fn project_delete_capabilities() -> Json<Value> {
+    Json(json!({ "delete_generation": "v1" }))
+}
+
 /// Delete an entire project: all its deployments + settings. By default this
-/// cascades across the mesh (removing the project from any peer node the
-/// placement scheduler put it on); `?cascade=false` deletes only on this node
-/// (used by the scheduler's relocate cleanup, which must NOT cascade back and
-/// wipe the freshly-placed copy on another node).
+/// cascades across the mesh. `?cascade=false` is the internal single-hop form
+/// used by a cascade receiver; relocation uses the separate, narrowly-scoped
+/// `/reap-deployments` arm and never calls project deletion.
 async fn project_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3578,6 +4512,16 @@ async fn project_delete(
         headers.get("x-hive-team").and_then(|v| v.to_str().ok()),
     ) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    let cascade = q.cascade.unwrap_or(true);
+    let supplied_delete_ms = q.delete_ms;
+    if supplied_delete_ms.is_some()
+        && (cascade || !delete_forward_is_internal(&headers, claims.as_ref().map(|e| &e.0)))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if supplied_delete_ms.is_some_and(|ms| !valid_delete_generation(ms)) {
+        return Err(StatusCode::BAD_REQUEST);
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Authorize against the local store if we have it, else against the gossiped
@@ -3608,7 +4552,18 @@ async fn project_delete(
     // before acting, so the safe behavior is: skip local teardown, but still
     // broadcast the single-hop cascade and let owners tear down their copies.
     if !authorized {
-        if q.cascade.unwrap_or(true) {
+        if cascade {
+            // The coordinator cannot create a project-name tombstone until an
+            // owner has authenticated the tenant: on a sparse observer, doing
+            // so before one peer accepts could poison another tenant's project
+            // with the same name. Issue a candidate generation, let every
+            // receiver authorize locally, then retain it here only after the
+            // first confirmed acceptance. The small future allowance dominates
+            // an ordinary in-flight write on a peer whose clock is a few seconds
+            // ahead without letting retries ratchet the generation forever.
+            let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
+                now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
+            });
             // AWAIT the broadcast rather than spawning it and answering 200. This node
             // holds no copy of the project, so a 200 here asserted a deletion it never
             // performed and never observed anyone else perform — and the dashboard,
@@ -3640,7 +4595,7 @@ async fn project_delete(
                 async move {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(20),
-                        dispatch_project_delete_with(&c, node, &project, &t, 1),
+                        dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
                     .unwrap_or(false)
@@ -3654,29 +4609,37 @@ async fn project_delete(
                 .filter(|(_, ok)| !**ok)
                 .map(|(n, _)| n.clone())
                 .collect();
-            if !unreached.is_empty() {
-                let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
-                tokio::spawn(async move {
-                    futures::future::join_all(
-                        unreached.iter().map(|node| {
-                            dispatch_project_delete_with(&c2, node, &project2, &team2, 3)
-                        }),
-                    )
-                    .await;
-                });
-            }
             if accepted == 0 {
                 // Nobody confirmed. Either the project does not exist under this tenant,
                 // or every node that could own it is unreachable. Both are honest
-                // failures the user must see; neither is a deletion.
+                // failures the user must see; neither is a deletion. Crucially, do
+                // not leave detached retries running after this 502: a later success
+                // would perform a deletion the coordinator never recorded.
                 tracing::warn!(
                     project, tenant = %t, peers = n_peers,
                     "project delete: not hosted locally and no peer accepted the cascade"
                 );
                 return Err(StatusCode::BAD_GATEWAY);
             }
+            // Authorization is now witnessed by at least one owner. Persist the
+            // same generation locally BEFORE scheduling slower retries, so every
+            // later acceptance is tracked by a durable tombstone on this
+            // coordinator even if the original HTTP request disappears.
+            c.projects.apply_delete(&project, delete_ms);
+            c.git_index.remove_project(&project);
+            crate::persist::persist(&c);
+            if !unreached.is_empty() {
+                let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
+                tokio::spawn(async move {
+                    futures::future::join_all(unreached.iter().map(|node| {
+                        dispatch_project_delete_with(&c2, node, &project2, &team2, delete_ms, 3)
+                    }))
+                    .await;
+                });
+            }
             return Ok(Json(json!({
                 "project": project,
+                "delete_ms": delete_ms,
                 "removed_deployments": [],
                 "accepted_by": accepted,
                 "note": "not hosted here — deleted on peers that accepted the cascade",
@@ -3684,50 +4647,31 @@ async fn project_delete(
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    // Remove locally + persist FIRST, then respond — so the dashboard gets an
-    // immediate result. The cross-mesh teardown runs in the BACKGROUND; a slow or
-    // unreachable peer must not make the request error after the delete already
-    // succeeded (the "choppy: HTTP error, then it deletes" symptom).
-    let ids = c.gw.remove_project(&project).await;
-    record_event(
-        &c,
-        &project,
-        "delete",
-        &format!("deleted project {project} ({} deployment(s))", ids.len()),
-    );
-    // Commit the authoritative state change BEFORE the best-effort resource purge.
-    // The purge is unbounded — it reaches databases, volumes and containers — and axum
-    // DROPS this request future the moment the client gives up (browser navigation,
-    // proxy deadline). With the purge first, an abandoned delete left the deployments
-    // removed and the PROJECT ROW STILL PRESENT: a half-deleted project that comes
-    // back in the dashboard with nothing behind it, and cannot be deleted again
-    // because the deployments the authorization check looks for are already gone.
-    // The row is the record of intent; write it first, then reclaim.
-    c.projects.remove(&project);
-    c.git_index.remove_project(&project);
-    crate::persist::persist(&c);
-    {
-        // Reclamation itself runs detached for the same reason: a dropped future must
-        // not be able to abort it halfway through (the `ColdStartGuard` rule applied to
-        // teardown), and the dashboard should not wait on remote database deletes.
-        let (c2, project2, team2, n) = (c.clone(), project.clone(), t.clone(), ids.len());
-        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+    // One explicit request creates exactly ONE immutable generation. Internal
+    // receivers/retries reuse the supplied value; a user-originated delete
+    // issues strictly above every project version visible to this coordinator.
+    let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
+        c.projects
+            .begin_delete(&project, observed_project_version_ms(&c, &project))
+    });
+    let outcome = delete_project_local(&c, &project, &t, delete_ms).await;
+    let ids = outcome.removed;
+    if !outcome.recreated {
+        crate::webhooks::dispatch(
+            &c.webhooks,
+            &project,
+            "project.removed",
+            json!({ "project": project, "deployments": ids.len(), "delete_ms": delete_ms }),
+        );
     }
-    crate::webhooks::dispatch(
-        &c.webhooks,
-        &project,
-        "project.removed",
-        json!({ "project": project, "deployments": ids.len() }),
-    );
 
     // Background cascade (cascade=false → single hop, no loops): BROADCAST the
-    // delete to EVERY healthy peer instead of a gossip-derived "hosting" set —
+    // delete to EVERY peer instead of a gossip-derived "hosting" set —
     // peer_deployments/peer_routes can be sparse right after restarts, which made
-    // the cascade silently dispatch to NOBODY and leave remote copies serving
-    // (the "deleting a project doesn't work" bug). The receiving arm is
-    // team-checked and idempotent, and deletes are rare, so N-1 tiny messages is
-    // the correct trade.
-    if q.cascade.unwrap_or(true) {
+    // the cascade silently dispatch to NOBODY and leave remote copies serving.
+    // The receiving arm is team-checked and idempotent, and retries carry this
+    // exact generation so they can never erase a causal recreation.
+    if cascade {
         let c2 = c.clone();
         let project2 = project.clone();
         let team2 = t.clone();
@@ -3747,14 +4691,20 @@ async fn project_delete(
             futures::future::join_all(
                 peers
                     .iter()
-                    .map(|node| dispatch_project_delete(&c2, node, &project2, &team2)),
+                    .map(|node| dispatch_project_delete(&c2, node, &project2, &team2, delete_ms)),
             )
             .await;
         });
     }
-    Ok(Json(
-        json!({ "project": project, "removed_deployments": ids }),
-    ))
+    Ok(Json(json!({
+        "project": project,
+        // Echo the STORED generation (a receiver-side clamp of an
+        // over-ceiling stamp must surface as the value this node actually
+        // recorded — never the requested one).
+        "delete_ms": c.projects.tombstone_of(&project).unwrap_or(delete_ms),
+        "removed_deployments": ids,
+        "recreated": outcome.recreated,
+    })))
 }
 
 /// LOCAL-ONLY relocation reap (the receiving side of
@@ -3845,8 +4795,9 @@ pub(crate) async fn dispatch_project_delete(
     node: &str,
     project: &str,
     team: &str,
+    delete_ms: u64,
 ) -> bool {
-    dispatch_project_delete_with(c, node, project, team, 3).await
+    dispatch_project_delete_with(c, node, project, team, delete_ms, 3).await
 }
 
 /// [`dispatch_project_delete`] with an explicit retry budget. The AWAITED
@@ -3861,6 +4812,7 @@ pub(crate) async fn dispatch_project_delete_with(
     node: &str,
     project: &str,
     team: &str,
+    delete_ms: u64,
     attempts: u32,
 ) -> bool {
     if node == c.node_name {
@@ -3874,6 +4826,8 @@ pub(crate) async fn dispatch_project_delete_with(
     // exclusive by transport availability, and retry the whole pair a few
     // times with backoff so one transient blip on both transports in the same
     // instant doesn't strand the peer either.
+    let mut http_generation_v1 = false;
+    let mut mesh_generation_v1 = false;
     for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
@@ -3882,16 +4836,69 @@ pub(crate) async fn dispatch_project_delete_with(
         // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
-            let ok = c
-                .http
-                .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
-                .header("x-hive-team", team.to_string())
-                .timeout(std::time::Duration::from_secs(15))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            if ok {
+            if !http_generation_v1 {
+                http_generation_v1 = match c
+                    .http
+                    .get(format!("{admin}/v1/project-delete/capabilities"))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        r.json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| {
+                                v.get("delete_generation")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .as_deref()
+                            == Some("v1")
+                    }
+                    _ => false,
+                };
+            }
+            // Never send a generation-bearing delete to a pre-upgrade HTTP
+            // receiver. An old handler ignores `delete_ms` and can erase a
+            // causal recreation before its ambiguous legacy response is rejected.
+            let accepted = if http_generation_v1 {
+                let mut request = c
+                    .http
+                    .delete(format!(
+                        "{admin}/v1/projects/{project}?cascade=false&delete_ms={delete_ms}"
+                    ))
+                    .header("x-hive-team", team.to_string());
+                if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                    if !token.trim().is_empty() {
+                        request = request.header("x-hive-internal", token);
+                    }
+                }
+                if crate::auth::enforced() {
+                    if let Ok(token) =
+                        crate::auth::issue("mesh-internal", team, "service", false, 60)
+                    {
+                        request = request.bearer_auth(token);
+                    }
+                }
+                match request
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        r.json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.get("delete_ms").and_then(Value::as_u64))
+                            == Some(delete_ms)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if accepted {
                 return true;
             }
         }
@@ -3906,7 +4913,33 @@ pub(crate) async fn dispatch_project_delete_with(
             .find(|n| n.name == node)
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
-            let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
+            if !mesh_generation_v1 {
+                mesh_generation_v1 = crate::gossip::request_to(
+                    c,
+                    &id,
+                    &addr,
+                    hive_p2p::GOSSIP_GET,
+                    "/v1/project-delete/capabilities",
+                    &[],
+                    10,
+                )
+                .await
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .and_then(|v| {
+                    v.get("delete_generation")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                    == Some("v1");
+            }
+            if !mesh_generation_v1 {
+                continue;
+            }
+            let path = format!(
+                "/v1/projects/{project}/delete?{}&delete_ms={delete_ms}",
+                mesh_team_qs(team)
+            );
             // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
             if let Some(body) =
                 crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
@@ -3924,7 +4957,11 @@ pub(crate) async fn dispatch_project_delete_with(
                 let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
                 let accepted = v
                     .as_ref()
-                    .map(|v| v.get("error").is_none() && v.get("removed").is_some())
+                    .map(|v| {
+                        v.get("error").is_none()
+                            && v.get("removed").is_some()
+                            && v.get("delete_ms").and_then(Value::as_u64) == Some(delete_ms)
+                    })
                     .unwrap_or(false);
                 if accepted {
                     return true;
@@ -3953,54 +4990,99 @@ pub(crate) async fn dispatch_project_delete_with(
     false
 }
 
-/// LOCAL-ONLY project teardown used by the mesh delete arm (the receiving side of
-/// [`dispatch_project_delete`]): remove deployments + settings on THIS node,
-/// persist, and record the event. Team-checked by the caller. `team` is used
-/// only for the durable audit record and to resolve owned databases' team
-/// (falls back to this node's own `team_of` if the caller has none, e.g. a
-/// legacy single-hop dispatch that predates the `?team=` param).
-pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, team: &str) -> usize {
-    let ids = c.gw.remove_project(project).await;
-    record_event(
-        c,
-        project,
-        "delete",
-        &format!(
-            "deleted project {project} ({} deployment(s), mesh cascade)",
-            ids.len()
-        ),
-    );
+pub(crate) struct ProjectDeleteOutcome {
+    pub removed: Vec<String>,
+    /// A project row/deployment newer than this delete generation exists, so
+    /// shared resources and project identity were deliberately preserved.
+    pub recreated: bool,
+}
+
+/// LOCAL-ONLY project teardown used by the HTTP and mesh delete arms. The
+/// immutable `delete_ms` makes retries idempotent: only deployments at or below
+/// that generation are removed, while a causal recreation survives. Team
+/// ownership is checked by the caller.
+pub(crate) async fn delete_project_local(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+    delete_ms: u64,
+) -> ProjectDeleteOutcome {
     let team = if team.trim().is_empty() {
         norm(&c.projects.team_of(project)).to_string()
     } else {
         team.to_string()
     };
-    // Same discipline as the HTTP handler above, for the same reasons — and one
-    // more that is specific to THIS path: the mesh caller polls with a 20s
-    // budget while the purge is unbounded (per-container `podman rm -f`, volume
-    // enumeration, source-tree removal, a raw-ports release with its own leader
-    // round trip). Purging inline blew that budget, the caller retried, and a
-    // second concurrent delete of the same project ran against a half-torn-down
-    // first — commit the row, answer fast, reclaim detached. This function is
-    // the receiving side of the fleet's ONLY working delete transport
-    // (`node_admins` is empty on Firecracker nodes), so the ordering fix in the
-    // HTTP handler alone would have missed every real cross-node delete.
-    c.projects.remove(project);
-    c.git_index.remove_project(project);
-    crate::persist::persist(c);
-    {
-        let (c2, project2, team2, n) = (c.clone(), project.to_string(), team.clone(), ids.len());
-        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+
+    // Apply the tombstone BEFORE awaiting deployment teardown. Any settings
+    // mutation that races after this point recreates strictly above delete_ms.
+    c.projects.apply_delete(project, delete_ms);
+    let ids = c.gw.remove_project_through(project, delete_ms).await;
+    let recreated = c
+        .projects
+        .get_if_set(project)
+        .is_some_and(|s| s.updated_ms > delete_ms)
+        || c.gw
+            .list()
+            .iter()
+            .any(|d| d.project == project && d.created_at_ms > delete_ms)
+        || c.peer_deployments
+            .read()
+            .values()
+            .flatten()
+            .any(|d| d.project == project && d.created_at_ms > delete_ms);
+
+    record_event(
+        c,
+        project,
+        "delete",
+        &format!(
+            "applied project delete generation {delete_ms} to {project} ({} deployment(s), recreated={recreated})",
+            ids.len()
+        ),
+    );
+
+    // Commit the generation before any best-effort reclamation. If a causal
+    // recreation exists, its settings/deployments and every shared resource
+    // remain intact; an old retry may only remove objects from its own era.
+    if !recreated {
+        c.git_index.remove_project(project);
+        // Custom domains gated on this project prove again on a future
+        // attach: a tombstoned project must not keep a domain "verified" —
+        // `custom_domain_bundles` reads the status alone and would renew its
+        // TLS forever, and a recreated same-name project would inherit
+        // routing it never proved. The zone records stay (DNS management is
+        // the tenant's, independent of any project).
+        let cleared_domains = c.domains.clear_verify_for_project(project);
+        if !cleared_domains.is_empty() {
+            tracing::info!(%project, domains = ?cleared_domains, "cleared custom-domain verification with project delete");
+        }
     }
-    ids.len()
+    crate::persist::persist(c);
+    if !recreated {
+        // Reclamation runs detached so cancellation of the HTTP/mesh request
+        // cannot strand a half-applied delete. It re-checks the generation at
+        // task start before touching databases, volumes, sources or raw ports.
+        let (c2, project2, team2, n) = (c.clone(), project.to_string(), team.clone(), ids.len());
+        tokio::spawn(
+            async move { purge_project_resources(&c2, &project2, &team2, n, delete_ms).await },
+        );
+    }
+    ProjectDeleteOutcome {
+        removed: ids,
+        recreated,
+    }
 }
 
 /// Query for project_delete: `cascade=false` deletes only on this node (no mesh
-/// fan-out). Defaults to cascade when absent.
+/// fan-out). `delete_ms` is the immutable generation issued by the originating
+/// delete and reused by every retry; absent on a user-originated request and on
+/// pre-upgrade peers. Defaults to cascade when absent.
 #[derive(Deserialize, Default)]
 struct CascadeQ {
     #[serde(default, deserialize_with = "de_lenient_bool")]
     cascade: Option<bool>,
+    #[serde(default)]
+    delete_ms: Option<u64>,
 }
 
 /// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
@@ -4439,6 +5521,7 @@ fn redeploy_request(
         // no webhook PR payload here to have identified a fork in the first place.
         head_repo_url: None,
         project: Some(project.to_string()),
+        project_incarnation: None,
         creator: Some("you".into()),
         production: true,
         target,
@@ -5077,6 +6160,7 @@ async fn git_webhook(
             // None for same-repo PRs and every push — clones `git.repo_url` as before.
             head_repo_url: head_repo_url.clone(),
             project: Some(project.clone()),
+            project_incarnation: None,
             creator: Some("github".into()),
             production: true, // legacy field; classification uses `target`/branch
             target: target.clone(),
@@ -5404,7 +6488,7 @@ pub(crate) async fn nodes(
             "self"
         } else if !n.healthy {
             "suspect"
-        } else if crate::health::is_cold(&n.name) {
+        } else if crate::health::is_cold(&c.registry, &n.name) {
             "degraded"
         } else {
             "healthy"
@@ -8225,7 +9309,7 @@ struct CreateTeam {
     slug: String,
 }
 fn default_plan() -> String {
-    "pro".into()
+    "hobby".into()
 }
 
 #[derive(Deserialize)]
@@ -8268,7 +9352,6 @@ async fn team_get(
 
 async fn team_create(
     State(c): State<Arc<CloudState>>,
-    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -8279,17 +9362,53 @@ async fn team_create(
     if !b.slug.trim().is_empty() {
         require_operator(claims.as_ref().map(|e| &e.0))?;
     }
+    let plan = b.plan.trim().to_ascii_lowercase();
+    if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
+        return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
+    }
+    if plan != "hobby"
+        && !claims
+            .as_ref()
+            .map(|claims| claims.0.platform_admin)
+            .unwrap_or(false)
+    {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            "create the team on Hobby, then complete checkout to upgrade".into(),
+        ));
+    }
+    let creator_email = match claims.as_ref() {
+        Some(claims) => c
+            .identity
+            .users()
+            .into_iter()
+            .find(|user| user.id == claims.0.sub && !user.email.trim().is_empty())
+            .map(|user| user.email)
+            .or_else(|| claims.0.platform_admin.then(|| c.owner_email.clone()))
+            .ok_or((
+                StatusCode::PRECONDITION_FAILED,
+                "team creation requires a verified user email".into(),
+            ))?,
+        None if !crate::auth::enforced() => c.owner_email.clone(),
+        None => {
+            return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
+        }
+    };
     let slug = b.slug.trim();
     let t = if slug.is_empty() {
-        c.teams.create(&b.name, &b.plan, &c.owner_email)
+        c.teams.create(&b.name, &plan, &creator_email)
     } else {
         c.teams
-            .create_with_slug(slug, &b.name, &b.plan, &c.owner_email)
+            .create_with_slug(slug, &b.name, &plan, &creator_email)
             .ok_or((
                 StatusCode::CONFLICT,
                 format!("team slug '{slug}' already exists"),
             ))?
     };
+    // Tier lives in both TeamStore and BillingStore. Creation is not a special
+    // third write path: initialize the billing half through the same helper every
+    // later upgrade/downgrade uses.
+    apply_plan_everywhere(&c, &t.slug, &plan);
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -8385,10 +9504,15 @@ async fn team_remove_member(
             tracing::info!(team = %slug, user = %uid, purged, "revoked ex-member push/SMS registrations");
         }
     }
+    // Commit the membership and notification purge before the first await.
+    // Client cancellation while relay revocation is in flight must not restore
+    // the removed member on the next process restart.
+    crate::persist::persist(&c);
     // TeamStore membership is email-keyed while browser grants are subject-id
     // keyed. Revoke the whole team fail-closed; remaining members renew from a
     // fresh platform session, while the removed member loses service now.
     crate::browser_admission::revoke_team(&c, &slug).await;
+    // Revocation mutates its own persisted admission state after the first save.
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -8511,9 +9635,13 @@ async fn team_delete(
         .remove(&s)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
     c.billing.remove_account(&s);
+    // The row+tombstone and billing removal are the authoritative deletion.
+    // Persist before relay revocation can suspend and the request be cancelled.
+    crate::persist::persist(&c);
     crate::browser_admission::revoke_team(&c, &s).await;
     c.audit
         .record(&s, "user", "team_delete", "team", &s, "team deleted");
+    // Capture the admission revocation and audit append as a second generation.
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true, "deleted": s })))
 }

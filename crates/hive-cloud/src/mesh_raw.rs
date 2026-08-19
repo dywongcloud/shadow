@@ -70,8 +70,11 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
     //    alias holder first, then newest ready).
     let recs = cloud.gw.deployment_records();
     let rec = if !t.deployment.is_empty() {
-        recs.into_iter()
-            .find(|r| r.id == t.deployment && r.state == fluid_core::DeployState::Ready)?
+        recs.into_iter().find(|r| {
+            r.id == t.deployment
+                && r.project == t.project
+                && r.state == fluid_core::DeployState::Ready
+        })?
     } else {
         recs.into_iter()
             .filter(|r| {

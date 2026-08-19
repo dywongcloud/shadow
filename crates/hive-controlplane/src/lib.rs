@@ -243,7 +243,11 @@ impl Hive {
             // rather than dependent on HashMap iteration order.
             finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             let drop_n = finished.len() - keep;
-            let evict: Vec<JobId> = finished.into_iter().take(drop_n).map(|(_, id)| id).collect();
+            let evict: Vec<JobId> = finished
+                .into_iter()
+                .take(drop_n)
+                .map(|(_, id)| id)
+                .collect();
             for id in &evict {
                 inner.jobs.remove(id);
             }

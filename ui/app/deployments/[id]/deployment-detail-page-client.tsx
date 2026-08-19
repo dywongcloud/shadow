@@ -12,6 +12,7 @@ import { BuildLogs } from "@/components/build-logs";
 import { WfConsoleFrame } from "@/components/wf-console-frame";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { RawPortConnections } from "@/components/raw-port-connections";
+import { AttachedDomains } from "@/components/attached-domains";
 import { apiSend, cancelBuild, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
@@ -223,20 +224,23 @@ function DeploymentDetail({ id }: { id: string }) {
 
             <div className="col-span-2">
               <MetaLabel>Domains</MetaLabel>
-              {host ? (
-                <a
-                  href={url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className={`inline-flex items-center gap-1.5 text-sm ${ready ? "text-link hover:underline" : "text-muted"}`}
-                >
-                  <Globe className="h-3.5 w-3.5 shrink-0" />
-                  {host}
-                  {ready && <ExternalLink className="h-3 w-3" />}
-                </a>
-              ) : (
-                <span className="text-sm text-muted">No domain yet</span>
-              )}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                {host ? (
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className={`inline-flex items-center gap-1.5 text-sm ${ready ? "text-link hover:underline" : "text-muted"}`}
+                  >
+                    <Globe className="h-3.5 w-3.5 shrink-0" />
+                    {host}
+                    {ready && <ExternalLink className="h-3 w-3" />}
+                  </a>
+                ) : (
+                  <span className="text-sm text-muted">No domain yet</span>
+                )}
+                {dep?.project && <AttachedDomains project={dep.project} />}
+              </div>
             </div>
 
             {dep?.raw_ports && dep.raw_ports.length > 0 && (

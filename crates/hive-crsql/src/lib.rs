@@ -76,8 +76,7 @@ pub fn extension_path() -> PathBuf {
     if let Ok(p) = std::env::var("HIVE_CRSQL_EXTENSION_PATH") {
         return PathBuf::from(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/cr-sqlite/core/dist/crsqlite")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/cr-sqlite/core/dist/crsqlite")
 }
 
 /// Open a connection with the cr-sqlite extension loaded. Extension loading

@@ -113,21 +113,24 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "teams",
-        // HashMap<String, Team> → sorted BTreeMap for deterministic bytes.
-        snapshot: |c| {
-            let m: std::collections::BTreeMap<String, crate::teams::Team> =
-                c.teams.snapshot().into_iter().collect();
-            enc(&m)
-        },
+        snapshot: |c| enc(&c.teams.snapshot_synced()),
+        // Merge the versioned aggregate and permanent tombstones. A legacy bare
+        // map is accepted without tombstones; a pre-upgrade peer safely declines
+        // the new envelope rather than replacing its state by omission.
         adopt: |c, b| {
-            let m: std::collections::BTreeMap<String, crate::teams::Team> =
-                serde_json::from_slice(b).ok()?;
-            if m.is_empty() {
+            let synced: crate::teams::SyncedTeams =
+                serde_json::from_slice(b).ok().or_else(|| {
+                    let rows: std::collections::BTreeMap<String, crate::teams::Team> =
+                        serde_json::from_slice(b).ok()?;
+                    Some(crate::teams::SyncedTeams {
+                        rows,
+                        tombstones: Default::default(),
+                    })
+                })?;
+            if synced.rows.is_empty() && synced.tombstones.is_empty() {
                 return None;
             }
-            let n = m.len();
-            c.teams.load(m.into_iter().collect());
-            Some(n)
+            Some(c.teams.merge_synced(synced))
         },
     },
     SyncedStore {
@@ -198,9 +201,13 @@ pub static REGISTRY: &[SyncedStore] = &[
                     Some(crate::project_settings::SyncedProjects {
                         rows: m,
                         tombstones: Default::default(),
+                        incarnation_tombstones: Default::default(),
                     })
                 })?;
-            if synced.rows.is_empty() && synced.tombstones.is_empty() {
+            if synced.rows.is_empty()
+                && synced.tombstones.is_empty()
+                && synced.incarnation_tombstones.is_empty()
+            {
                 return None;
             }
             Some(c.projects.merge_synced(synced))
@@ -516,9 +523,31 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(n)
         },
     },
+    // HTTP-01 equivalents for custom tenant domains: a validation fetch can
+    // land on ANY node (that is the whole point of the challenge type), so
+    // the token → key-authorization map replicates exactly like the TXT one.
+    SyncedStore {
+        name: "acme_http01",
+        snapshot: |c| enc(&c.acme_http01.snapshot()),
+        adopt: |c, b| {
+            let m: std::collections::BTreeMap<String, crate::acme::Http01Challenge> =
+                serde_json::from_slice(b).ok()?;
+            if m.is_empty() {
+                return None;
+            }
+            let n = m.len();
+            c.acme_http01.load(m);
+            Some(n)
+        },
+    },
 ];
 
-pub static MERGE_STORES: &[&str] = &["browser_admissions", "browser_presence"];
+pub static MERGE_STORES: &[&str] = &[
+    "browser_admissions",
+    "browser_presence",
+    "projects",
+    "teams",
+];
 
 /// Rate-limit config wire shape — deliberately config-only (see the registry
 /// entry above for why the live counters are excluded).
@@ -689,6 +718,12 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
                  accepted"
             );
         }
+    }
+    if !adopted.is_empty() {
+        // Promotion merges are authoritative mutations. Queue them immediately;
+        // otherwise a hard crash before the periodic capture can lose a newly
+        // recovered row or tombstone and reboot into the stale local snapshot.
+        crate::persist::persist(cloud);
     }
     tracing::info!(
         peers = ?peer_names,

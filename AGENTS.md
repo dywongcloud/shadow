@@ -717,6 +717,116 @@ releases).
   until it opens; a `rateLimited` issuance error opens a Major incident
   naming the bundle and the window.
 
+## Custom tenant domains (attach → verify → TLS → serve)
+
+- **Routing keys are full hostnames, checked first.** `fluid_gateway`'s
+  `aliases_full` map carries exact-host aliases (`foo.com`, `www.foo.com`)
+  and is consulted before every first-label/wildcard lookup in `select`,
+  `serves_host`, `host_allowed` and `attribution`; entries follow production
+  redeploys and promotes like any alias. Never route a custom host through
+  the first-label path — a tenant named `foo` and a custom domain
+  `foo.example.com` must not collide.
+- **Attachment is gated on observed ownership proof, and every activation
+  path re-proves it independently.** `POST /v1/projects/:p/domains` issues a
+  `_hive-verify.<domain>` TXT challenge (`DomainVerify`); the alias only
+  activates when the activating node itself observes the value via DoH —
+  never from a caller's assertion, a forwarded request's authority, or a
+  stale store. Attaches that predate the gate are grandfathered (persist
+  heal skips unverified attaches only for those). A DomainRecord belongs to
+  its tenant from first verified attach: `require_domain_owner_if_exists` +
+  `ensure_verify` refuse cross-tenant or verified-elsewhere attaches, and
+  `mark_verified_as` rebinds the record to the proving team.
+- **Every verified-mark goes through ONE helper.** `mark_domain_verified`
+  (admin.rs) marks verified, rebinds the tenant, AND pins the delegated
+  zone's system apex A/AAAA from `dnsserver::lb_records_strings` (the exact
+  set the roster endpoint shows). The local-apply, forward-ack, owner-arm
+  and watcher paths all call it — a new activation path that marks verified
+  without it leaves a delegated domain resolving nowhere. The pinned set is
+  static zone data (the dynamic geo arm never applies to tenant zones), and
+  the watcher re-pins it every cadence from the CURRENT healthy edge set —
+  damped by `set_system_address_records`'s unchanged-set no-op, so a healthy
+  fleet churns nothing.
+- **Custom-domain TLS is HTTP-01 with apex+`www` SANs only.** LE never
+  offers HTTP-01 for a wildcard identifier, so asking for `*.{domain}`
+  fails every order; wildcards belong to DNS-01 against a delegated zone.
+  The port-80 listener answers `/.well-known/acme-challenge/` from the
+  replicated `Http01Store` (store_sync `acme_http01`) instead of
+  blanket-301ing, and the 443 edge arm proxies a challenge MISS to the
+  leader — LE validates within ~1s of `set_ready`, far inside the store's
+  replication cadence. `custom_cert_pass` is internally leader-gated (the
+  kick paths spawn it everywhere), checks the guardian replica before
+  issuing (a fresh leader adopts, never duplicate-issues), and backs off
+  per-bundle to a 6h ceiling, parking after 12 consecutive failures with a
+  deduped incident.
+- **Detach and project death both revoke TLS, not just routing.**
+  `spawn_cert_sync` prunes any installed `dom-*` bundle no longer in
+  `custom_domain_bundles` (SNI map entries keyed exactly as
+  `install_bundle` keyed them + the local cache file) on every node's own
+  cadence; `delete_project_local` calls `clear_verify_for_project` so a
+  tombstoned project stops its domains' renewals and a recreated same-name
+  project proves again. Detach itself fans the alias removal out to EVERY
+  node hosting the project, never just the first registry entry.
+- **Seer's tenant-zone arm answers from the DomainStore, with the platform
+  stores owning reserved names.** `_acme-challenge` answers from the LE
+  challenge store and `_hive-verify` from the record's own challenge (a
+  delegate-first tenant can prove without hand-creating anything); both
+  names (any case) are rejected in add/import/zone-parse so the proof
+  channel is unforgeable. Wildcards follow RFC 4592: `*` only synthesizes
+  when no exact record exists, never at the apex, never over the reserved
+  names. TXT values >255 bytes encode as multiple RFC 1035
+  character-strings (DKIM); MX/SRV/CAA are write-validated.
+- **The nameserver roster a tenant is shown is peer-ATTESTED, never
+  declared.** `GET /v1/domains-nameserver-roster` runs the same
+  `dns_probe::validate_nameservers` the reconciler publishes from and
+  reports `delegation_ready` only with ≥2 proven nameservers; the UI must
+  show "still converging" rather than literal NS names until then. The
+  DomainStore replicates wholesale from the leader, so domain mutations
+  follow the round-robin rule (owner/leader forward; a follower GET is
+  node-local and eventually consistent).
+- **Only a VERIFIED record locks to its tenant.** An unproven record
+  (pending claim or DNS-only zone) confers no ownership: any tenant's
+  attach takes it over with a fresh challenge (`ensure_verify` rebinds the
+  tenant immediately, `mark_verified_as` again at proof), so a first-come
+  squatter can never lock the real owner out — DNS proof settles ownership
+  permanently. Pending claims expire after
+  `DomainStore::PENDING_VERIFY_TTL_MS` (7d, swept by
+  `pending_verifications`). `require_domain_owner_if_exists` 403s ONLY on a
+  verified-elsewhere record. Seer answers `_hive-verify` only while the
+  challenge is pending — a completed proof must not stay publicly
+  replayable.
+- **Detach and activate are domain-side operations, not just
+  project-side.** Both require `require_domain_owner_if_exists` AND that
+  the stored challenge's `verify.project` matches the path project
+  (activate) / the attach actually belongs to the path project (detach);
+  detach clears verification only when THIS project holds it and only
+  removes the alias + pinned zone records when NO project still lists the
+  domain. Without those bindings any tenant could wipe or steal a foreign
+  domain's routing and TLS (both re-reviews' critical findings).
+- **The port-80 challenge arm proxies misses to the leader; the 443 arm is
+  not enough.** LE's HTTP-01 fetch is plain HTTP within ~1s of
+  `set_ready`, from multiple perspectives landing on random nodes, while
+  the token only exists in the leader-local store (60s replication). A
+  flat-404 on a follower fails EVERY issuance ~13/14 of the time — the
+  miss-proxy must exist on the listener LE actually fetches.
+- **The HTTP-01 SAN set is what validates THIS pass.** `effective_sans`
+  drops `www.{domain}` when it doesn't resolve to a fleet edge (a failed
+  www SAN fails the WHOLE order, apex included); delegated zones get a
+  system `www` CNAME at verification (`set_system_address_records`, which
+  also CLEARS all three records on full detach). `custom_cert_pass` holds a
+  per-bundle in-flight guard (`IssuingGuard`, Drop-released) — concurrent
+  kicks and leadership flaps must never duplicate-order against LE's
+  5/168h duplicate-cert window.
+- **Cert prune has blast-radius guards like every GC in this repo.**
+  cert-sync prunes a `dom-*` bundle only after 2 consecutive unwanted
+  ticks, never when the domain snapshot is empty (wholesale-replace flap
+  signature), and never removes an SNI key a WANTED bundle still covers
+  (two attachments share the `www` key).
+- **Seer answers are bounded against tenant-programmed amplification.**
+  Record values cap at `MAX_RECORD_VALUE_BYTES` (4096) and each
+  (name,kind) pair at `MAX_RECORDS_PER_NAME_KIND` (32) on add/update/
+  import (update previously bypassed ALL validation); UDP responses over
+  1232 bytes are truncated with TC=1 (the TCP listener is the retry path).
+
 ## Managed inference (serverless GPU pooling)
 
 - A project opts in with a `fluid.json` TOP-LEVEL block:
@@ -1302,8 +1412,10 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   (store_sync `projects` entry, the `SyncedDatabases` shape) — the old
   "node-local, never gossiped" claim is DEAD and was load-bearing in the wrong
   direction (it justified the reaper's settings wipe). Every mutator stamps
-  `updated_ms` through `ProjectStore::touch`; `remove` records a tombstone
-  (persisted, 30d retention); merges never let absence erase a row.
+  `updated_ms` through `ProjectStore::touch`; `remove` records a tombstone that
+  is persisted permanently — an offline node can return after any bounded
+  retention window, so expiring deletion facts would let its old row resurrect
+  fleet-wide. Merges never let absence erase a row.
 - **Tenancy is repaired, not only protected.** `spawn_tenancy_reconcile`
   (every node, 60s after boot + every `HIVE_TENANCY_RECONCILE_SECS`) restores
   any UNTAGGED local project row from the relational `project_teams` replica

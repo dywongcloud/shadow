@@ -161,7 +161,10 @@ const NEUTRAL_WORDS: &[&str] = &["pending", "building", "preview", "unknown", "q
 fn status_color(raw: &str, padded: String) -> String {
     let lower = raw.trim().to_ascii_lowercase();
     if GOOD_WORDS.contains(&lower.as_str()) {
-        format!("{}", padded.if_supports_color(Stream::Stdout, |t| t.green()))
+        format!(
+            "{}",
+            padded.if_supports_color(Stream::Stdout, |t| t.green())
+        )
     } else if BAD_WORDS.contains(&lower.as_str()) {
         format!("{}", padded.if_supports_color(Stream::Stdout, |t| t.red()))
     } else if NEUTRAL_WORDS.contains(&lower.as_str()) {
@@ -180,17 +183,33 @@ fn status_color(raw: &str, padded: String) -> String {
 fn colored_json(v: &Value, indent: usize, out: &mut String) {
     match v {
         Value::Null => {
-            let _ = write!(out, "{}", "null".if_supports_color(Stream::Stdout, |t| t.dimmed()));
+            let _ = write!(
+                out,
+                "{}",
+                "null".if_supports_color(Stream::Stdout, |t| t.dimmed())
+            );
         }
         Value::Bool(true) => {
-            let _ = write!(out, "{}", "true".if_supports_color(Stream::Stdout, |t| t.green()));
+            let _ = write!(
+                out,
+                "{}",
+                "true".if_supports_color(Stream::Stdout, |t| t.green())
+            );
         }
         Value::Bool(false) => {
-            let _ = write!(out, "{}", "false".if_supports_color(Stream::Stdout, |t| t.red()));
+            let _ = write!(
+                out,
+                "{}",
+                "false".if_supports_color(Stream::Stdout, |t| t.red())
+            );
         }
         Value::Number(n) => {
             let s = n.to_string();
-            let _ = write!(out, "{}", s.if_supports_color(Stream::Stdout, |t| t.yellow()));
+            let _ = write!(
+                out,
+                "{}",
+                s.if_supports_color(Stream::Stdout, |t| t.yellow())
+            );
         }
         Value::String(s) => {
             let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"));

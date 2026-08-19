@@ -213,7 +213,7 @@ fn prune_dumps(keep: usize) {
 ///
 /// `HIVE_MEM_WATCH=0` disables it entirely. `HIVE_MEM_RESTART_MB=0` disables
 /// only the restart tier — arm/dump still run.
-pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>) {
+pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::ControlledRestart) {
     if std::env::var("HIVE_MEM_WATCH").ok().as_deref() == Some("0") {
         tracing::info!("memory watchdog disabled (HIVE_MEM_WATCH=0)");
         return;
@@ -268,18 +268,12 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>) {
                     rss_mb = rss / 1024 / 1024,
                     restart_mb = restart_bytes / 1024 / 1024,
                     "memory watchdog: RSS crossed the restart threshold — dumping a final \
-                     profile, flushing state, and exiting for a clean systemd restart \
-                     (Restart=always) rather than waiting for the kernel OOM killer"
+                     profile and requesting a controlled systemd restart rather than waiting \
+                     for the kernel OOM killer"
                 );
-                // One last profile, ignoring the normal cooldown — this exit is about
-                // to make the process (and its heap) unavailable to inspect.
                 dump_profile(rss, keep);
-                // The background persister writes on its own cadence; without an
-                // explicit flush here, whatever changed since its last tick is lost
-                // on exit — the exact hazard `persist::flush_blocking`'s SIGTERM
-                // call site already exists to close, reused here for the same reason.
-                crate::persist::flush_blocking();
-                std::process::exit(17);
+                restart.request(crate::RestartReason::MemoryPressure);
+                return;
             }
         }
     });

@@ -372,6 +372,24 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     if let Some(rr) = opt_rr {
         resp.extend_from_slice(&rr);
     }
+    // UDP amplification guard: never emit a datagram past the practical DNS
+    // payload — a tenant-programmed record set (an uncapped TXT, a huge RR
+    // set at one name) must not turn every fleet node into a reflector for
+    // spoofed-source queries (adversarial finding). TC=1 is the standards
+    // answer: the resolver retries over TCP, which this server also runs.
+    const MAX_UDP_RESPONSE: usize = 1232;
+    if resp.len() > MAX_UDP_RESPONSE {
+        let mut t = Vec::with_capacity(64);
+        t.extend_from_slice(&id);
+        let tflags: u16 = 0x8000 | 0x0400 | 0x0200 | ((rd as u16) << 8) | rcode as u16;
+        t.extend_from_slice(&tflags.to_be_bytes());
+        t.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        t.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        t.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        t.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        t.extend_from_slice(question);
+        return Some(t);
+    }
     Some(resp)
 }
 
@@ -549,17 +567,69 @@ fn lookup(
             .to_string()
     };
 
+    // Apex authority answers first: a delegated tenant zone is only real if
+    // its NS/SOA exist at the child (validators and resolvers both look).
+    if rec_name.is_empty() && qtype == 2 {
+        let rrs = apex_ns_rrs(cloud, false);
+        return (rrs, Vec::new(), true, false);
+    }
+    if rec_name.is_empty() && qtype == 6 {
+        let rrs = apex_soa_rrs(cloud, false);
+        return (rrs, Vec::new(), true, false);
+    }
+
     let want = match qtype {
         1 => "A",
         28 => "AAAA",
         5 => "CNAME",
         16 => "TXT",
+        15 => "MX",
+        2 => "NS",
+        33 => "SRV",
+        257 => "CAA",
+        12 => "PTR",
         _ => "",
     };
 
     let mut out = Vec::new();
+    // Platform-managed names are answered from the platform's own stores,
+    // never from zone records (the reservation that makes the proof channel
+    // unforgeable): `_acme-challenge` from the LE challenge store, and
+    // `_hive-verify` from the attachment's own verification challenge — so a
+    // tenant who delegates DNS FIRST can still complete ownership proof
+    // without hand-creating anything (path B of the wizard).
+    if want == "TXT" && rec_name.eq_ignore_ascii_case("_acme-challenge") {
+        out.extend(acme_txt_rrs(cloud, qname));
+    }
+    if want == "TXT" && rec_name.eq_ignore_ascii_case("_hive-verify") {
+        // Served only while the challenge is PENDING: once verification
+        // completes, the proof value must stop being publicly answerable —
+        // otherwise yesterday's proof is replayable by anyone who can reach
+        // an activation path (adversarial finding), and a detached domain's
+        // stale challenge keeps matching forever.
+        if let Some(v) = &zone.verify {
+            if v.status == "pending" {
+                if let Some(rd) = encode_rdata("TXT", &v.txt_value) {
+                    out.push((16u16, 60, rd));
+                }
+            }
+        }
+    }
+    // Wildcard semantics (RFC 1034/4592): `*` synthesizes answers ONLY for
+    // names that do not otherwise exist — an exact-name record, or a
+    // platform-reserved name answered from platform stores above, shadows the
+    // wildcard. The old unconditional `|| r.name == "*"` let one `*` record
+    // answer EVERY name in the zone alongside (and contrary to) the exact
+    // records, and it also matched the apex, which a wildcard never covers.
+    let exact_exists = zone
+        .records
+        .iter()
+        .any(|r| r.name.eq_ignore_ascii_case(&rec_name))
+        || rec_name.eq_ignore_ascii_case("_acme-challenge")
+        || rec_name.eq_ignore_ascii_case("_hive-verify");
     for r in &zone.records {
-        let name_match = r.name.eq_ignore_ascii_case(&rec_name) || r.name == "*";
+        let name_match = r.name.eq_ignore_ascii_case(&rec_name)
+            || (r.name == "*" && !exact_exists && !rec_name.is_empty());
         if !name_match {
             continue;
         }
@@ -569,18 +639,28 @@ fn lookup(
         if kind != want && !serve_as_cname {
             continue;
         }
-        if let Some(rd) = encode_rdata(&kind, &r.value) {
-            let atype = match kind.as_str() {
-                "A" => 1u16,
-                "AAAA" => 28,
-                "CNAME" => 5,
-                "TXT" => 16,
-                _ => continue,
-            };
+        let atype = match kind.as_str() {
+            "A" => 1u16,
+            "AAAA" => 28,
+            "CNAME" => 5,
+            "TXT" => 16,
+            "MX" => 15,
+            "NS" => 2,
+            "SRV" => 33,
+            "CAA" => 257,
+            "PTR" => 12,
+            _ => continue,
+        };
+        if let Some(rd) = encode_rdata_typed(&kind, &r.value, r.priority) {
             out.push((atype, r.ttl, rd));
         }
     }
-    // Static records are the operator's own answer, identical for every client.
+    // An authoritative empty answer MUST carry the zone's SOA in AUTHORITY
+    // (RFC 2308) or resolvers can never negative-cache — every miss under the
+    // zone would come back to us for its full lifetime.
+    if out.is_empty() {
+        return (out, negative_soa(cloud, &zone.domain, false), true, false);
+    }
     (out, Vec::new(), true, false)
 }
 
@@ -674,6 +754,15 @@ fn acme_txt_rrs(cloud: &Arc<CloudState>, qname: &str) -> Vec<(u16, u32, Vec<u8>)
 }
 
 fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
+    encode_rdata_typed(kind, value, None)
+}
+
+/// Typed record-data encoder for the static (tenant-zone) arm. MX/SRV carry
+/// their numeric fields from the record's `priority` (SRV additionally parses
+/// `<weight> <port> <target>` from the value — the one shape the record model
+/// holds); CAA parses `<flags> <tag> "<value>"`; anything unparseable is
+/// skipped, never encoded wrong.
+fn encode_rdata_typed(kind: &str, value: &str, priority: Option<u32>) -> Option<Vec<u8>> {
     match kind {
         "A" => value
             .parse::<Ipv4Addr>()
@@ -683,15 +772,53 @@ fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
             .parse::<Ipv6Addr>()
             .ok()
             .map(|ip| ip.octets().to_vec()),
-        "CNAME" => Some(encode_name(value)),
+        "CNAME" | "NS" | "PTR" => Some(encode_name(value)),
         "TXT" => {
+            // RFC 1035: TXT RDATA is one or more <length><bytes>
+            // character-strings, each at most 255 bytes. Long values (DKIM
+            // keys are the common one) MUST split into consecutive strings —
+            // resolvers re-concatenate them — never be dropped (the old
+            // behavior, which made any >255-byte TXT silently vanish from
+            // the zone). An empty value is one zero-length string.
             let bytes = value.as_bytes();
-            if bytes.len() > 255 {
+            let mut v = Vec::with_capacity(bytes.len() + bytes.len() / 255 + 1);
+            for chunk in bytes.chunks(255) {
+                v.push(chunk.len() as u8);
+                v.extend_from_slice(chunk);
+            }
+            if bytes.is_empty() {
+                v.push(0);
+            }
+            Some(v)
+        }
+        "MX" => {
+            let mut v = (priority.unwrap_or(10) as u16).to_be_bytes().to_vec();
+            v.extend_from_slice(&encode_name(value));
+            Some(v)
+        }
+        "SRV" => {
+            let mut it = value.split_whitespace();
+            let weight = it.next()?.parse::<u16>().ok()?;
+            let port = it.next()?.parse::<u16>().ok()?;
+            let target = it.next()?;
+            let mut v = (priority.unwrap_or(0) as u16).to_be_bytes().to_vec();
+            v.extend_from_slice(&weight.to_be_bytes());
+            v.extend_from_slice(&port.to_be_bytes());
+            v.extend_from_slice(&encode_name(target));
+            Some(v)
+        }
+        "CAA" => {
+            // Stored shape: `<flags> <tag> "<value>"` (quotes optional).
+            let mut it = value.splitn(3, char::is_whitespace);
+            let flags = it.next()?.parse::<u8>().ok()?;
+            let tag = it.next()?;
+            let val = it.next().unwrap_or("").trim_matches('"');
+            if tag.len() > 255 {
                 return None;
             }
-            let mut v = Vec::with_capacity(bytes.len() + 1);
-            v.push(bytes.len() as u8);
-            v.extend_from_slice(bytes);
+            let mut v = vec![flags, tag.len() as u8];
+            v.extend_from_slice(tag.as_bytes());
+            v.extend_from_slice(val.as_bytes());
             Some(v)
         }
         _ => None,
@@ -733,10 +860,44 @@ fn apex_ns_names(cloud: &Arc<CloudState>, require_api: bool) -> Vec<String> {
     names
 }
 
+/// Public handle for the admin roster endpoint (the wizard shows tenants the
+/// exact hostnames to delegate to; private so the filter stays in one place).
+pub fn apex_ns_names_pub(cloud: &Arc<CloudState>) -> Vec<String> {
+    apex_ns_names(cloud, false)
+}
+
 fn apex_ns_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec<u8>)> {
     apex_ns_names(cloud, require_api)
         .into_iter()
         .map(|n| (2u16, APEX_TTL, encode_name(&n)))
+        .collect()
+}
+
+/// The healthy+public address record set the apps/deploy answers are built
+/// from (`lb_records`' own filter), shared so the tenant-facing roster
+/// endpoint returns byte-identical guidance to what the wire would answer
+/// for the wildcard — never a separate computation of "the same set".
+pub fn lb_records_pub(nodes: &[NodeInfo], qtype: u16) -> (Vec<Vec<u8>>, bool) {
+    let (rrs, capped) = lb_records(nodes, qtype, None);
+    (rrs.into_iter().map(|(_, _, rd)| rd).collect(), capped)
+}
+
+/// The same healthy edge set as display strings (dotted-quad / compressed
+/// v6), decoded straight from `lb_records_pub`'s wire rdata so the delegated
+/// zone's system records and the roster endpoint can never render a
+/// different set than the dynamic arm answers.
+pub fn lb_records_strings(nodes: &[NodeInfo], qtype: u16) -> Vec<String> {
+    let (rrs, _) = lb_records_pub(nodes, qtype);
+    rrs.iter()
+        .filter_map(|rd| match rd.as_slice() {
+            [a, b, c, d] => Some(Ipv4Addr::new(*a, *b, *c, *d).to_string()),
+            v if v.len() == 16 => {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(v);
+                Some(Ipv6Addr::from(o).to_string())
+            }
+            _ => None,
+        })
         .collect()
 }
 

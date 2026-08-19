@@ -25,6 +25,7 @@ import { DeploymentResources } from "@/components/deployment-resources";
 import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { CreateDeploymentModal } from "@/components/create-deployment-modal";
+import { AttachedDomains } from "@/components/attached-domains";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -249,9 +250,12 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 </div>
                 <div>
                   <div className="text-muted">Domains</div>
-                  <a className="text-link hover:underline" href={deploymentUrl(prodAlias, prod?.region_code)} target="_blank" rel="noreferrer">
-                    {prod ? deploymentHost(prodAlias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
-                  </a>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a className="text-link hover:underline" href={deploymentUrl(prodAlias, prod?.region_code)} target="_blank" rel="noreferrer">
+                      {prod ? deploymentHost(prodAlias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
+                    </a>
+                    <AttachedDomains project={name} />
+                  </div>
                 </div>
                 {prod && prod.raw_ports && prod.raw_ports.length > 0 && (
                   <div>

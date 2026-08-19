@@ -250,6 +250,76 @@ pub struct AcmeChallengeStore {
     inner: parking_lot::RwLock<std::collections::BTreeMap<String, AcmeChallenge>>,
 }
 
+// ---- HTTP-01 challenges (custom tenant domains) --------------------------------
+
+/// One pending HTTP-01 answer: the body LE expects at
+/// `http://<domain>/.well-known/acme-challenge/<token>`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Http01Challenge {
+    pub key_authorization: String,
+    pub created_ms: u64,
+}
+
+/// token → key-authorization for in-flight HTTP-01 orders, replicated via the
+/// `acme_http01` store_sync entry so a validation fetch landing on ANY node
+/// (round-robin/geo DNS is the whole point of HTTP-01) gets the answer. Same
+/// TTL/sweep discipline as the DNS-01 store: issuance is the sweep cadence,
+/// and an abandoned entry ages out instead of answering forever.
+pub struct Http01Store {
+    inner: parking_lot::RwLock<std::collections::BTreeMap<String, Http01Challenge>>,
+}
+
+impl Http01Store {
+    pub fn new() -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn norm(token: &str) -> String {
+        token.trim().to_string()
+    }
+
+    pub fn insert(&self, token: &str, key_authorization: &str) {
+        let now = hive_core::now_ms();
+        let mut m = self.inner.write();
+        m.retain(|_, e| now.saturating_sub(e.created_ms) < CHALLENGE_TTL_MS);
+        m.insert(
+            Self::norm(token),
+            Http01Challenge {
+                key_authorization: key_authorization.to_string(),
+                created_ms: now,
+            },
+        );
+    }
+
+    pub fn remove(&self, token: &str) {
+        self.inner.write().remove(&Self::norm(token));
+    }
+
+    pub fn lookup(&self, token: &str) -> Option<String> {
+        self.inner
+            .read()
+            .get(&Self::norm(token))
+            .filter(|e| hive_core::now_ms().saturating_sub(e.created_ms) < CHALLENGE_TTL_MS)
+            .map(|e| e.key_authorization.clone())
+    }
+
+    pub fn snapshot(&self) -> std::collections::BTreeMap<String, Http01Challenge> {
+        self.inner.read().clone()
+    }
+
+    pub fn load(&self, m: std::collections::BTreeMap<String, Http01Challenge>) {
+        *self.inner.write() = m;
+    }
+}
+
+impl Default for Http01Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AcmeChallengeStore {
     pub fn new() -> Self {
         Self {
@@ -930,6 +1000,356 @@ async fn cleanup_txt(
     }
 }
 
+// ---- custom tenant domains (HTTP-01) -------------------------------------------
+
+/// Bundle name for a tenant domain — deterministic, never a raw tenant string
+/// (the same discipline as every other name in this file).
+pub fn custom_bundle_name(domain: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(
+        domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            .as_bytes(),
+    );
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("dom-{}", &hex[..12])
+}
+
+/// The (bundle, SANs, zone) set for every verified custom domain — the third
+/// element mirrors `bundles()`'s shape so cert-sync can chain the two lists.
+/// SANs are apex + the explicit `www` host ONLY: Let's Encrypt never offers
+/// HTTP-01 for a wildcard identifier (CA/B forbids it), so asking for
+/// `*.{domain}` here made every order fail "no http-01 challenge offered"
+/// (adversarial finding — first issuance was impossible). Wildcards for
+/// tenant domains belong to the DNS-01 path against a delegated zone (the
+/// tenant-zone `_acme-challenge` arm in dnsserver.rs).
+pub fn custom_domain_bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
+    let mut out = Vec::new();
+    for d in cloud.domains.snapshot() {
+        let Some(v) = &d.verify else { continue };
+        if v.status != "verified" {
+            continue;
+        }
+        let domain = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            continue;
+        }
+        out.push((
+            custom_bundle_name(&domain),
+            vec![domain.clone(), format!("www.{domain}")],
+            domain,
+        ));
+    }
+    out
+}
+
+/// HTTP-01 issuance for custom domains — `issue()`'s shape with the challenge
+/// type swapped and the replicated token store standing in for the TXT
+/// double-write. No Vercel zone is involved: the tenant's DNS points the name
+/// at the fleet already (that is what verification proved), so LE's fetch of
+/// `/.well-known/acme-challenge/<token>` lands on some node, and any node can
+/// answer from the replicated store.
+async fn issue_http01(
+    http: &reqwest::Client,
+    names: &[String],
+    store: &Http01Store,
+    incidents: Option<&crate::incidents::IncidentStore>,
+) -> anyhow::Result<CertBundle> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let acct = account(http, incidents).await?;
+    let identifiers: Vec<Identifier> = names.iter().map(|n| Identifier::Dns(n.clone())).collect();
+    let mut order = acct.new_order(&NewOrder::new(&identifiers)).await?;
+
+    let mut tokens: Vec<String> = Vec::new();
+    {
+        let mut authzs = order.authorizations();
+        while let Some(a) = authzs.next().await {
+            let mut authz = a?;
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| anyhow::anyhow!("no http-01 challenge offered"))?;
+            let token = challenge.token.clone();
+            let key_auth = challenge.key_authorization().as_str().to_string();
+            store.insert(&token, &key_auth);
+            tokens.push(token);
+            challenge.set_ready().await?;
+        }
+    }
+
+    let retry = instant_acme::RetryPolicy::default();
+    let status = order.poll_ready(&retry).await;
+    for t in &tokens {
+        store.remove(t);
+    }
+    let status = status?;
+    if status != OrderStatus::Ready {
+        anyhow::bail!("ACME http-01 order not ready (status {status:?})");
+    }
+    let key_pem = order.finalize().await?;
+    let chain = order.poll_certificate(&retry).await?;
+
+    let now = hive_core::now_ms();
+    Ok(CertBundle {
+        names: names.to_vec(),
+        chain_pem: chain,
+        key_pem_enc: crate::secrets::encrypt(&key_pem),
+        issued_ms: now,
+        not_after_ms: now + NINETY_DAYS_MS,
+    })
+}
+
+/// Drop guard returning a bundle name to the in-flight issuance set (see
+/// `custom_cert_pass`) on every exit path, cancellation included.
+struct IssuingGuard<'a> {
+    set: &'a parking_lot::Mutex<std::collections::HashSet<String>>,
+    bundle: String,
+}
+impl Drop for IssuingGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.bundle);
+    }
+}
+
+/// The SAN set an HTTP-01 order can actually validate THIS pass:
+/// `www.{domain}` is kept only when it resolves to a current fleet edge
+/// address — LE validates each SAN independently and fails the WHOLE order
+/// otherwise, so a tenant who pointed only their apex (path A) or a
+/// delegated zone pre-verification would otherwise never get even the apex
+/// cert (adversarial finding). The narrowed set feeds the freshness check
+/// too, so a later www arrival naturally re-issues with full coverage.
+/// DoH lookup, same client shape as the domain verifier.
+async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String> {
+    if names.len() != 2 {
+        return names.to_vec();
+    }
+    let (apex, www) = (&names[0], &names[1]);
+    let edge: std::collections::HashSet<String> = {
+        let nodes = cloud.registry.nodes();
+        crate::dnsserver::lb_records_strings(&nodes, 1)
+            .into_iter()
+            .collect()
+    };
+    let url = format!("https://cloudflare-dns.com/dns-query?name={www}&type=A");
+    let resolved: Option<Vec<String>> = async {
+        let resp = cloud
+            .http
+            .get(&url)
+            .header("accept", "application/dns-json")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        let v = resp.json::<serde_json::Value>().await.ok()?;
+        Some(
+            v.get("Answer")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|x| x.get("type").and_then(|t| t.as_u64()) == Some(1))
+                        .filter_map(|x| {
+                            x.get("data")
+                                .and_then(|d| d.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+    }
+    .await;
+    match resolved {
+        Some(ips) if ips.iter().any(|ip| edge.contains(ip)) => names.to_vec(),
+        _ => {
+            tracing::warn!(%apex, %www, "custom-domain www does not resolve to the fleet — ordering apex-only SAN this pass (the whole order would fail otherwise)");
+            vec![apex.clone()]
+        }
+    }
+}
+
+/// One pass over every verified custom domain: ensure a fresh, SAN-covering
+/// bundle exists, else issue one via HTTP-01 and publish it (guardian + local
+/// store) for the fleet's cert-sync to pick up. **Leader-only internally** —
+/// the kick paths spawn it from several nodes at once, and an un-gated pass
+/// both duplicate-issues against LE's 5/168h duplicate-cert budget (every
+/// node has its own "no local cache" view) and drops its tokens into a
+/// follower store the next store_sync pull wipes mid-order (adversarial
+/// findings). Safe to call from anywhere: it simply no-ops off the leader.
+pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
+    if cloud.ingress == "ngrok" {
+        return;
+    }
+    if cloud.control_plane_leader() != cloud.node_name || cloud.mesh_health().isolated {
+        return;
+    }
+    // Per-domain failure streak + backoff (the crash-loop rule from AGENTS.md:
+    // a circuit's open window must outlast the failure it guards). A domain
+    // whose DNS never arrives would otherwise order LE every 300s forever —
+    // burning the fleet account's failed-validation AND new-orders budgets
+    // until the platform's own renewals starve too. Backoff doubles per
+    // consecutive failure to a 6h ceiling; after 12 the domain is dropped
+    // from the pass set with an incident naming the state (a fresh
+    // verification or a settings change resets the streak by process
+    // restart, and each success resets it immediately).
+    static STREAKS: std::sync::OnceLock<
+        parking_lot::RwLock<std::collections::HashMap<String, (u32, u64)>>,
+    > = std::sync::OnceLock::new();
+    let streaks =
+        STREAKS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // Per-bundle in-flight issuance set: concurrent kicks (attach,
+    // forward-ack, owner arm, watcher, verify-now, the 300s loop) plus
+    // per-observer leadership flaps must never run two issuances of the same
+    // SAN set — five duplicate orders inside 168h closes LE's
+    // duplicate-certificate window for a week, and this repo treats a closed
+    // window as a Major incident (adversarial finding).
+    static ISSUING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let issuing = ISSUING.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    for (bundle, names, _zone) in custom_domain_bundles(cloud) {
+        // The reservation is held from the freshness check through order
+        // completion and released by the guard's Drop on EVERY exit path —
+        // a cancelled pass (leader flap mid-await, task abort) must never
+        // wedge the bundle's renewals (the ColdStartGuard rule).
+        if !issuing.lock().insert(bundle.clone()) {
+            continue;
+        }
+        let _issue_guard = IssuingGuard {
+            set: issuing,
+            bundle: bundle.clone(),
+        };
+        {
+            let (fails, next_at) = streaks.read().get(&bundle).copied().unwrap_or((0, 0));
+            if fails >= 12 || hive_core::now_ms() < next_at {
+                continue;
+            }
+        }
+        // Narrow the SAN set to what validates this pass (www pre-flight —
+        // see effective_sans). Drives the freshness check and the order, so
+        // coverage widens on its own once www reaches the fleet.
+        let names = effective_sans(cloud, &names).await;
+        let fresh = |issued: u64, have: &[String]| {
+            hive_core::now_ms().saturating_sub(issued) < RENEW_AFTER_MS
+                && names.iter().all(|n| have.contains(n))
+        };
+        if let Some(b) = load_bundle_local(&bundle) {
+            if fresh(b.issued_ms, &b.names) {
+                continue;
+            }
+        } else {
+            // The local disk is not the only source of truth — a fresh
+            // leader boot/a wiped dir must adopt the guardian replica instead
+            // of re-issuing every domain (the duplicate-cert budget again).
+            let gb = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::guardian::get(&guardian_key(&bundle)),
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<CertBundle>(&bytes).ok());
+            match gb {
+                Some(b) if fresh(b.issued_ms, &b.names) => {
+                    store_bundle_local(&bundle, &b);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        tracing::info!(%bundle, ?names, "custom-domain TLS bundle missing or stale — issuing via HTTP-01");
+        match issue_http01(
+            &cloud.http,
+            &names,
+            &cloud.acme_http01,
+            Some(&cloud.incidents),
+        )
+        .await
+        {
+            Ok(b) => {
+                streaks.write().remove(&bundle);
+                store_bundle_local(&bundle, &b);
+                let js = serde_json::to_vec(&b).unwrap_or_default();
+                crate::guardian::put(&guardian_key(&bundle), js).await;
+                if install_bundle(&b).is_ok() {
+                    tracing::info!(%bundle, ?names, "custom-domain TLS bundle issued + installed");
+                }
+            }
+            Err(e) => {
+                let fails = {
+                    let mut w = streaks.write();
+                    let e = w.entry(bundle.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    let f = e.0;
+                    e.1 = hive_core::now_ms() + (60_000u64 << f.min(6)).min(6 * 3_600_000);
+                    f
+                };
+                // Rate limits and validation failures are typed incidents,
+                // deduped per bundle per process (an unguarded `open` appends
+                // one per pass forever — the incidents store replicates).
+                let msg = e.to_string();
+                if msg.contains("rateLimited") || msg.contains("rate limit") {
+                    static RL_FIRED: std::sync::OnceLock<
+                        parking_lot::RwLock<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let set = RL_FIRED
+                        .get_or_init(|| parking_lot::RwLock::new(std::collections::HashSet::new()));
+                    if set.write().insert(bundle.clone()) {
+                        cloud.incidents.open(crate::incidents::OpenReq {
+                            title: format!("ACME rate limit: {bundle}"),
+                            severity: crate::incidents::Severity::Major,
+                            affected: names.clone(),
+                            message: format!(
+                                "ACME rate limit for custom domain bundle {bundle}: {msg}"
+                            ),
+                        });
+                    }
+                }
+                if fails == 12 {
+                    cloud.incidents.open(crate::incidents::OpenReq {
+                        title: format!("Custom domain cert failing: {bundle}"),
+                        severity: crate::incidents::Severity::Minor,
+                        affected: names.clone(),
+                        message: format!(
+                            "HTTP-01 issuance for {bundle} ({}) has failed 12 consecutive times — the domain is parked (its DNS likely doesn't point at the platform). Last error: {msg}",
+                            names.join(", ")
+                        ),
+                    });
+                }
+                tracing::warn!(%bundle, fails, error = %e, "custom-domain HTTP-01 issuance failed (backoff)");
+            }
+        }
+    }
+}
+
+/// Leader loop for custom-domain certificates: an on-boot pass, then a slow
+/// cadence (renewal + newly verified domains). `HIVE_CUSTOM_CERT_SECS`
+/// overrides the cadence; `0` disables. Kick-on-verify calls
+/// `custom_cert_pass` directly for instant issuance.
+pub fn spawn_custom_cert_loop(cloud: Arc<CloudState>) {
+    if cloud.ingress == "ngrok" {
+        return;
+    }
+    let secs = std::env::var("HIVE_CUSTOM_CERT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    if secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if cloud.control_plane_leader() == cloud.node_name && !cloud.mesh_health().isolated {
+                custom_cert_pass(&cloud).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+    });
+}
+
 // ---- orchestration ---------------------------------------------------------------
 
 fn guardian_key(bundle: &str) -> String {
@@ -1079,6 +1499,37 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
     });
 }
 
+/// Remove a custom-domain bundle that is no longer wanted: its SNI map
+/// entries (derived from the cached bundle exactly the way `install_bundle`
+/// keyed them, minus any name a WANTED bundle still covers — two
+/// attachments can share the `www` key, and detaching one must not kill the
+/// other's cert) and its local cache file. Without this a detached/unverified
+/// domain kept answering HTTPS with a still-valid cert until process
+/// restart — routing revoked, TLS not.
+fn prune_custom_bundle(
+    bundle: &str,
+    wanted_names: &std::collections::HashSet<String>,
+    installed: &mut HashMap<String, u64>,
+) {
+    if let Some(b) = load_bundle_local(bundle) {
+        let mut map = (**certs().load()).clone();
+        for name in &b.names {
+            if wanted_names.contains(name) {
+                continue;
+            }
+            let zone = name.strip_prefix("*.").unwrap_or(name).to_ascii_lowercase();
+            map.remove(&zone);
+            if name.contains('.') && !name.starts_with("*.") {
+                map.remove(&name.to_ascii_lowercase());
+            }
+        }
+        certs().store(Arc::new(map));
+    }
+    let _ = std::fs::remove_file(cache_path(bundle));
+    installed.remove(bundle);
+    tracing::info!(%bundle, "TLS bundle pruned (custom domain no longer attached)");
+}
+
 /// Every node: load local cache at boot, then poll the guardian replicated store
 /// and hot-swap the SNI resolver when a newer bundle lands.
 pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
@@ -1087,8 +1538,13 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
     }
     tokio::spawn(async move {
         let mut installed: HashMap<String, u64> = HashMap::new(); // bundle -> issued_ms
-                                                                  // boot: local cache first (guardian may take a while to come online)
-        for (bundle, ..) in bundles(&cloud) {
+                                                                  // bundle -> consecutive unwanted ticks (prune flap damping)
+        let mut unwanted: HashMap<String, u8> = HashMap::new();
+        // boot: local cache first (guardian may take a while to come online)
+        for (bundle, ..) in bundles(&cloud)
+            .into_iter()
+            .chain(custom_domain_bundles(&cloud))
+        {
             if let Some(b) = load_bundle_local(&bundle) {
                 if install_bundle(&b).is_ok() {
                     installed.insert(bundle.clone(), b.issued_ms);
@@ -1097,7 +1553,55 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
             }
         }
         loop {
-            for (bundle, ..) in bundles(&cloud) {
+            // Prune custom-domain bundles no longer wanted (detached /
+            // verification cleared / project deleted): they must stop
+            // answering TLS here, not just stop renewing. Guards (every
+            // prune/GC in this codebase has one — the podman lock pool and
+            // gc_rootfs_images lessons): (1) an EMPTY domain snapshot is a
+            // wholesale-replace flap signature, never a real "zero domains"
+            // — skip the pass entirely rather than prune everything;
+            // (2) a bundle must be unwanted for TWO consecutive ticks before
+            // it is pruned, so a one-tick status flap (owner-election churn,
+            // the 2026-08-18 lesson) never reaches the SNI map; (3) SNI
+            // keys still covered by a WANTED bundle are never removed (two
+            // attachments can share the `www` key). Peers prune on their own
+            // cadence; a guardian replica may linger but is never fetched
+            // (this loop only iterates the wanted set), so a fresh node
+            // never installs one.
+            let wanted: Vec<(String, Vec<String>, String)> = custom_domain_bundles(&cloud);
+            let wanted_bundles: std::collections::HashSet<String> =
+                wanted.iter().map(|(b, ..)| b.clone()).collect();
+            let wanted_names: std::collections::HashSet<String> = wanted
+                .iter()
+                .flat_map(|(_, names, _)| names.iter().cloned())
+                .collect();
+            for b in installed
+                .keys()
+                .filter(|b| b.starts_with("dom-"))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                if wanted_bundles.contains(&b) {
+                    unwanted.remove(&b);
+                } else {
+                    *unwanted.entry(b).or_insert(0) += 1;
+                }
+            }
+            if !cloud.domains.snapshot().is_empty() {
+                let stale: Vec<String> = unwanted
+                    .iter()
+                    .filter(|(_, n)| **n >= 2)
+                    .map(|(b, _)| b.clone())
+                    .collect();
+                for b in stale {
+                    prune_custom_bundle(&b, &wanted_names, &mut installed);
+                    unwanted.remove(&b);
+                }
+            }
+            for (bundle, ..) in bundles(&cloud)
+                .into_iter()
+                .chain(custom_domain_bundles(&cloud))
+            {
                 let cur = installed.get(&bundle).copied().unwrap_or(0);
                 // Guardian replica first (works when local == writer), then the
                 // authenticated mesh (the cross-node path: per-node AEAD keys
@@ -1172,7 +1676,12 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                 }
             }
             // Fast cadence until BOTH bundles are installed, then relax.
-            let have_all = installed.len() >= bundles(&cloud).len();
+            // Fast cadence until every bundle is installed, then relax.
+            let have_all = installed.len()
+                >= bundles(&cloud)
+                    .into_iter()
+                    .chain(custom_domain_bundles(&cloud))
+                    .count();
             tokio::time::sleep(std::time::Duration::from_secs(if have_all {
                 300
             } else {
@@ -1280,7 +1789,7 @@ pub fn bundle_for_mesh(bundle: &str) -> Vec<u8> {
     // on any non-leader node needs the cert locally to complete the TLS handshake,
     // and without this the follower's `mesh_fetch("db")` gets an empty reply and the
     // gateway can't serve `<slug>.{db_domain}` off the leader.
-    if bundle != "apps" && bundle != "platform" && bundle != "db" {
+    if bundle != "apps" && bundle != "platform" && bundle != "db" && !bundle.starts_with("dom-") {
         return Vec::new();
     }
     let Some(b) = load_bundle_local(bundle) else {

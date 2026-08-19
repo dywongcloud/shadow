@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -1057,6 +1057,7 @@ impl TunnelStream {
 /// would funnel every request through a single QUIC stream and head-of-line-block
 /// them on a lossy WAN. Each request opens its own bi stream over this connection.
 struct Trunk {
+    incarnation: u64,
     conn: Connection,
 }
 
@@ -2052,46 +2053,146 @@ fn pool_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone)]
+struct AcquiredPeer {
+    key: String,
+    generation: u64,
+    trunk_incarnation: u64,
+    conn: Connection,
+}
+
+struct UnpublishedConnection(Option<Connection>);
+
+impl UnpublishedConnection {
+    fn new(conn: Connection) -> Self {
+        Self(Some(conn))
+    }
+
+    fn publish(mut self) -> Connection {
+        self.0.take().expect("unpublished connection is present")
+    }
+}
+
+impl Drop for UnpublishedConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            conn.close(0u32.into(), b"dial canceled before publication");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DialLifecycleError {
+    Canceled,
+    Superseded,
+}
+
+impl std::fmt::Display for DialLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Canceled => "leader dial dropped before completing",
+            Self::Superseded => "dial superseded by peer lifecycle change",
+        })
+    }
+}
+
+impl std::error::Error for DialLifecycleError {}
+
+#[derive(Clone, Debug)]
+enum SharedDialError {
+    DeadPeer(DeadPeerTimeout),
+    Failed(String),
+    Lifecycle(DialLifecycleError),
+}
+
+impl SharedDialError {
+    fn from_anyhow(error: &anyhow::Error) -> Self {
+        error
+            .downcast_ref::<DeadPeerTimeout>()
+            .cloned()
+            .map(Self::DeadPeer)
+            .unwrap_or_else(|| Self::Failed(error.to_string()))
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::DeadPeer(error) => anyhow::Error::new(error),
+            Self::Failed(message) => anyhow::anyhow!(message),
+            Self::Lifecycle(error) => anyhow::Error::new(error),
+        }
+    }
+}
+
+type DialOutcome = Option<std::result::Result<AcquiredPeer, SharedDialError>>;
+
+struct DialFlight {
+    generation: u64,
+    signal: tokio::sync::watch::Sender<DialOutcome>,
+}
+
+#[derive(Default)]
+struct DialEvidenceTimes {
+    last_success: Option<Instant>,
+    last_failure: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PeerPoolState {
+    trunks: HashMap<String, Trunk>,
+    aliases: HashMap<String, String>,
+    inflight: HashMap<String, DialFlight>,
+    generations: HashMap<String, u64>,
+    dial_evidence: HashMap<String, DialEvidenceTimes>,
+    next_trunk_incarnation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerDialEvidence {
+    pub endpoint_id: String,
+    pub last_success_ago: Option<Duration>,
+    pub last_failure_ago: Option<Duration>,
+}
+
+struct DialLeaderGuard<'a> {
+    state: &'a StdMutex<PeerPoolState>,
+    key: String,
+    signal: tokio::sync::watch::Sender<DialOutcome>,
+    armed: bool,
+}
+
+impl DialLeaderGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DialLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .inflight
+            .get(&self.key)
+            .is_some_and(|flight| flight.signal.same_channel(&self.signal))
+        {
+            state.inflight.remove(&self.key);
+            let _ = self
+                .signal
+                .send_replace(Some(Err(SharedDialError::Lifecycle(
+                    DialLifecycleError::Canceled,
+                ))));
+        }
+    }
+}
+
 pub struct PeerPool {
     ep: Endpoint,
-    /// Live trunks keyed by CANONICAL ENDPOINT ID (`EndpointAddr::id`, 64-hex) —
-    /// never by whatever label a caller happened to pass.
-    ///
-    /// This used to be keyed by the caller's `node_id` argument, which sounds
-    /// harmless until you notice the two planes of this platform disagree about
-    /// what a peer is called. The DATA plane passes node NAMES (`NodeInfo.id`,
-    /// which `main.rs` sets to `args.name`; see `edge.rs`'s candidates and the
-    /// trunk warmer), while the CONTROL plane passes 64-hex endpoint ids
-    /// (`NodeInfo.peer_id`; see `gossip::request_to`, `admin::fetch_from_host`,
-    /// `peer_iroh`). Same peer, two keys, so the pool held TWO QUIC connections
-    /// to every node — double handshakes and holepunches, `relay_stats()`
-    /// double-counting every peer, the trunk warmer warming only the name-keyed
-    /// half (leaving the control-plane trunk that gossip, health probes,
-    /// anti-entropy, ACME and db_replicate all ride permanently cold), and
-    /// `close_peer(eid)` from `gossip::probe` unable to evict the edge's
-    /// name-keyed trunk after a peer restarted.
-    ///
-    /// Keying by the id parsed out of `addr_json` — which `acquire` must parse
-    /// anyway in order to dial — makes the two planes converge by construction
-    /// rather than by every caller remembering to agree.
-    trunks: Mutex<HashMap<String, Trunk>>,
-    /// Caller label (node name OR endpoint id) → canonical endpoint id, learned
-    /// on each successful `acquire`. Exists so the label-taking diagnostics
-    /// (`close_peer`, `sever_peer`) still work for callers that only know a name,
-    /// without reintroducing a second keyspace for the trunks themselves.
-    aliases: Mutex<HashMap<String, String>>,
-    /// In-flight first-contact dials, keyed like `trunks`. The FIRST concurrent
-    /// acquire becomes the leader and dials; the rest `subscribe()` and await
-    /// the shared outcome instead of double-handshaking (singleflight — the old
-    /// last-insert-wins shape paid two holepunches per cold peer).
-    inflight:
-        Mutex<HashMap<String, tokio::sync::watch::Sender<Option<Result<Connection, String>>>>>,
-    /// Per-peer dial generation, bumped ONLY by `close_peer` (a peer-lifecycle
-    /// eviction). Internal dead-trunk evictions stay within the generation. A
-    /// leader dial that completes after its generation moved closes its fresh
-    /// connection instead of publishing it — a stale dial can never resurrect
-    /// a trunk the pool meant to kill.
-    generations: Mutex<HashMap<String, u64>>,
+    state: StdMutex<PeerPoolState>,
     opened: AtomicU64,
     reused: AtomicU64,
     timeouts: Arc<TimeoutCounters>,
@@ -2120,16 +2221,57 @@ impl PeerPool {
     pub fn new(ep: Endpoint) -> Arc<PeerPool> {
         Arc::new(PeerPool {
             ep,
-            trunks: Mutex::new(HashMap::new()),
-            aliases: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
-            generations: Mutex::new(HashMap::new()),
+            state: StdMutex::new(PeerPoolState::default()),
             opened: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             timeouts: Arc::new(TimeoutCounters::default()),
             warm_backoff: Mutex::new(HashMap::new()),
             neg_discovery: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PeerPoolState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn canonical_key_locked(state: &PeerPoolState, label: &str) -> String {
+        state
+            .aliases
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| label.to_string())
+    }
+
+    fn fence_identity_locked(state: &mut PeerPoolState, key: &str, close_reason: &'static [u8]) {
+        let generation = state.generations.entry(key.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        if let Some(flight) = state.inflight.remove(key) {
+            let _ = flight
+                .signal
+                .send_replace(Some(Err(SharedDialError::Lifecycle(
+                    DialLifecycleError::Superseded,
+                ))));
+        }
+        if let Some(trunk) = state.trunks.remove(key) {
+            trunk.conn.close(0u32.into(), close_reason);
+        }
+    }
+
+    fn install_alias_locked(state: &mut PeerPoolState, label: &str, key: &str) {
+        if let Some(previous) = state.aliases.get(label).filter(|old| *old != key).cloned() {
+            Self::fence_identity_locked(state, &previous, b"peer label remapped");
+        }
+        state.aliases.insert(label.to_string(), key.to_string());
+    }
+
+    fn allocate_trunk_incarnation_locked(state: &mut PeerPoolState) -> u64 {
+        state.next_trunk_incarnation = state.next_trunk_incarnation.wrapping_add(1);
+        if state.next_trunk_incarnation == 0 {
+            state.next_trunk_incarnation = 1;
+        }
+        state.next_trunk_incarnation
     }
 
     /// `(opened, reused)` connection counters — for diagnostics and tests.
@@ -2140,6 +2282,48 @@ impl PeerPool {
         )
     }
 
+    pub fn dial_evidence_snapshot(&self) -> Vec<PeerDialEvidence> {
+        let state = self.lock_state();
+        let now = Instant::now();
+        let mut snapshot = state
+            .dial_evidence
+            .iter()
+            .map(|(endpoint_id, evidence)| PeerDialEvidence {
+                endpoint_id: endpoint_id.clone(),
+                last_success_ago: evidence
+                    .last_success
+                    .map(|at| now.saturating_duration_since(at)),
+                last_failure_ago: evidence
+                    .last_failure
+                    .map(|at| now.saturating_duration_since(at)),
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        snapshot
+    }
+
+    fn record_success(&self, acquired: &AcquiredPeer) {
+        let mut state = self.lock_state();
+        let generation_current = state
+            .generations
+            .get(&acquired.key)
+            .copied()
+            .unwrap_or_default()
+            == acquired.generation;
+        let trunk_current = state
+            .trunks
+            .get(&acquired.key)
+            .is_some_and(|trunk| trunk.incarnation == acquired.trunk_incarnation);
+        if !generation_current || !trunk_current {
+            return;
+        }
+        state
+            .dial_evidence
+            .entry(acquired.key.clone())
+            .or_default()
+            .last_success = Some(Instant::now());
+    }
+
     /// Proactively ensure a live trunk to `node_id` exists — dial (holepunch) if
     /// missing/dead, reuse if already warm — WITHOUT opening a request stream. Lets
     /// a background maintainer keep the whole mesh pre-trunked so a request-time
@@ -2147,11 +2331,15 @@ impl PeerPool {
     /// Connect is bounded by the H4 budget, so a dead peer can't wedge the warmer.
     /// Returns whether a live trunk is now cached.
     pub async fn warm(&self, node_id: &str, addr_json: &str) -> bool {
-        let key = self.canonical_key(node_id).await;
+        let addr: EndpointAddr = match serde_json::from_str(addr_json) {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        let key = addr.id.to_string();
         let now = pool_now_ms();
         if let Some((next, _)) = self.warm_backoff.lock().await.get(&key) {
             if now < *next {
-                return false; // inside the backoff window — skip this tick's dial
+                return false;
             }
         }
         match self.acquire(node_id, addr_json).await {
@@ -2162,9 +2350,6 @@ impl PeerPool {
             Err(_) => {
                 let mut b = self.warm_backoff.lock().await;
                 let (_, delay) = b.get(&key).copied().unwrap_or((0, 0));
-                // 5s initial; grow by half plus a now-derived dither (up to
-                // +50%) so a fleet-wide roll cannot synchronize retry storms;
-                // cap 5 minutes.
                 let grown = if delay == 0 {
                     5_000
                 } else {
@@ -2179,7 +2364,7 @@ impl PeerPool {
 
     /// Number of currently-cached (live-or-not) trunks — for diagnostics / tests.
     pub async fn trunk_count(&self) -> usize {
-        self.trunks.lock().await.len()
+        self.lock_state().trunks.len()
     }
 
     /// Relay cost accounting (#23): classify each live trunk as relay vs direct via
@@ -2189,25 +2374,26 @@ impl PeerPool {
     /// peer-to-peer (and whether holepunching is succeeding).
     pub async fn relay_stats(&self) -> RelayStats {
         let mut s = RelayStats::default();
-        let map = self.trunks.lock().await;
-        for t in map.values() {
-            let cs = t.conn.stats();
-            let (tx, rx) = (cs.udp_tx.bytes, cs.udp_rx.bytes);
-            // A connection with ANY direct (IP) path has holepunched — its traffic
-            // goes peer-to-peer. A relay-only connection (no IP path) is costing
-            // relay bandwidth for all its bytes.
-            let has_direct = t.conn.paths().iter().any(|p| p.is_ip());
-            if has_direct {
-                s.direct_conns += 1;
-                s.direct_bytes_tx += tx;
-                s.direct_bytes_rx += rx;
-            } else {
-                s.relayed_conns += 1;
-                s.relayed_bytes_tx += tx;
-                s.relayed_bytes_rx += rx;
+        {
+            let state = self.lock_state();
+            for t in state.trunks.values() {
+                let cs = t.conn.stats();
+                let (tx, rx) = (cs.udp_tx.bytes, cs.udp_rx.bytes);
+                // A connection with ANY direct (IP) path has holepunched — its traffic
+                // goes peer-to-peer. A relay-only connection (no IP path) is costing
+                // relay bandwidth for all its bytes.
+                let has_direct = t.conn.paths().iter().any(|p| p.is_ip());
+                if has_direct {
+                    s.direct_conns += 1;
+                    s.direct_bytes_tx += tx;
+                    s.direct_bytes_rx += rx;
+                } else {
+                    s.relayed_conns += 1;
+                    s.relayed_bytes_tx += tx;
+                    s.relayed_bytes_rx += rx;
+                }
             }
         }
-        drop(map);
         s.timeouts = self.timeouts.snapshot().await;
         s
     }
@@ -2216,86 +2402,105 @@ impl PeerPool {
     /// The map lock is taken ONLY to look up / insert — **never** held across the
     /// (possibly slow, holepunching) `connect`, so a slow first-contact to one peer
     /// can't serialize requests to the others.
-    async fn acquire(&self, node_id: &str, addr_json: &str) -> Result<Connection> {
-        // Parse FIRST: the canonical endpoint id is the trunk key (see `trunks`),
-        // and it is only knowable from the address. `node_id` is retained purely
-        // as a human-facing label for logs, metrics and the alias map.
+    async fn acquire(&self, node_id: &str, addr_json: &str) -> Result<AcquiredPeer> {
         let addr: EndpointAddr = serde_json::from_str(addr_json)?;
         let id = addr.id;
         let key = id.to_string();
 
-        // Fast path: reuse a still-live trunk.
-        {
-            let map = self.trunks.lock().await;
-            if let Some(t) = map.get(&key) {
-                if t.conn.close_reason().is_none() {
-                    let conn = t.conn.clone();
-                    drop(map);
-                    self.reused.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(node_id, key = %key, "trunk reused");
-                    return Ok(conn);
-                }
+        let (signal, generation, leader) = {
+            let mut state = self.lock_state();
+            if let Some((trunk_incarnation, conn)) = state
+                .trunks
+                .get(&key)
+                .filter(|trunk| trunk.conn.close_reason().is_none())
+                .map(|trunk| (trunk.incarnation, trunk.conn.clone()))
+            {
+                let generation = *state.generations.entry(key.clone()).or_insert(0);
+                // The label→eid alias installs ONLY against a proven live
+                // trunk: installed eagerly (as the first cut did), a STALE
+                // cached addr fences the label's previous — healthy — eid,
+                // closing a good trunk and failing its in-flight dial on
+                // every warm-backoff cadence (refutation finding F3: the
+                // trunk-instability class canonical-endpoint keying exists
+                // to prevent, reintroduced through the alias fence). A label
+                // remap must be proven by a completed dial, never asserted
+                // by cached input.
+                Self::install_alias_locked(&mut state, node_id, &key);
+                drop(state);
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(node_id, key = %key, "trunk reused");
+                return Ok(AcquiredPeer {
+                    key,
+                    generation,
+                    trunk_incarnation,
+                    conn,
+                });
             }
-        } // lock dropped: trunk missing or dead → dial below
+            if let Some(dead) = state.trunks.remove(&key) {
+                dead.conn.close(0u32.into(), b"dead trunk removed by pool");
+            }
 
-        // Singleflight: the FIRST concurrent acquire dials as the leader; the
-        // rest subscribe to the shared outcome instead of paying a second
-        // holepunch (previously: last-insert-wins double-dial, with the
-        // displaced connection dropped unclosed).
-        let (signal, leader) = {
-            let mut inflight = self.inflight.lock().await;
-            match inflight.get(&key) {
-                Some(tx) => (tx.clone(), false),
-                None => {
-                    let (tx, _) = tokio::sync::watch::channel(None);
-                    inflight.insert(key.clone(), tx.clone());
-                    (tx, true)
+            let generation = *state.generations.entry(key.clone()).or_insert(0);
+            let existing = state
+                .inflight
+                .get(&key)
+                .map(|flight| (flight.generation, flight.signal.clone()));
+            match existing {
+                Some((flight_generation, signal)) if flight_generation == generation => {
+                    (signal, generation, false)
+                }
+                stale => {
+                    if let Some((_, stale_signal)) = stale {
+                        state.inflight.remove(&key);
+                        let _ = stale_signal.send_replace(Some(Err(SharedDialError::Lifecycle(
+                            DialLifecycleError::Superseded,
+                        ))));
+                    }
+                    let (signal, _) = tokio::sync::watch::channel(None);
+                    state.inflight.insert(
+                        key.clone(),
+                        DialFlight {
+                            generation,
+                            signal: signal.clone(),
+                        },
+                    );
+                    (signal, generation, true)
                 }
             }
         };
+
         if !leader {
-            let mut rx = signal.subscribe();
-            return match rx.wait_for(|v| v.is_some()).await {
-                Ok(guard) => match &*guard {
-                    Some(Ok(conn)) => Ok(conn.clone()),
-                    Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
-                    None => Err(anyhow::anyhow!("dial signal resolved empty")),
+            let mut receiver = signal.subscribe();
+            return match receiver.wait_for(|outcome| outcome.is_some()).await {
+                Ok(outcome) => match (*outcome).clone() {
+                    Some(Ok(acquired)) => Ok(acquired),
+                    Some(Err(error)) => Err(error.into_anyhow()),
+                    None => {
+                        Err(SharedDialError::Lifecycle(DialLifecycleError::Canceled).into_anyhow())
+                    }
                 },
-                Err(_) => Err(anyhow::anyhow!("leader dial dropped before completing")),
+                Err(_) => {
+                    Err(SharedDialError::Lifecycle(DialLifecycleError::Canceled).into_anyhow())
+                }
             };
         }
 
-        // Leader path. Record the generation BEFORE dialing: a `close_peer`
-        // landing mid-dial moves it and vetoes the publish below, so a stale
-        // dial can never resurrect a trunk the pool just killed.
-        let gen = *self.generations.lock().await.get(&key).unwrap_or(&0);
-
-        // Slow path: dial OUTSIDE the lock, BOUNDED by the connect budget (#H4).
-        // A holepunch that never completes would otherwise hang here forever and —
-        // since edge.rs walks candidates sequentially — block the whole queue.
+        let mut leader_guard = DialLeaderGuard {
+            state: &self.state,
+            key: key.clone(),
+            signal: signal.clone(),
+            armed: true,
+        };
         let dialed: Result<Connection> = async {
             let budget = connect_budget();
             Ok(match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    // Hard connect error against the CACHED hint. This hint is very often a
-                    // stale, never-refreshed snapshot learned second/third-hand via gossip
-                    // (see `addr_json` — built once at the peer's own boot, no refresh setter
-                    // exists) rather than something this node ever dialed directly. Don't
-                    // give up on the peer yet: fall back to fresh discovery below. Log it —
-                    // previously this branch discarded the error with zero tracing, which is
-                    // exactly how the hk↔sj mesh-flap went unnoticed in production.
-                    self.evict(&key).await;
-                    tracing::warn!(node_id, err = %e, "p2p connect error using cached hint; retrying via fresh discovery");
+                Ok(Ok(conn)) => conn,
+                Ok(Err(error)) => {
+                    tracing::warn!(node_id, err = %error, "p2p connect error using cached hint; retrying via fresh discovery");
                     self.dial_fresh(node_id, id).await?
                 }
                 Err(_) => {
-                    // Pre-send timeout against the cached hint: nothing was sent. Rather than
-                    // declaring the peer dead outright (the old behavior), give discovery a
-                    // real shot — the hint's direct addrs/relay may simply be stale, not the
-                    // peer itself.
                     self.timeouts.bump(node_id, PHASE_CONNECT).await;
-                    self.evict(&key).await; // stale trunk (if any) is definitely dead
                     tracing::warn!(
                         node_id,
                         budget_ms = budget.as_millis() as u64,
@@ -2307,56 +2512,92 @@ impl PeerPool {
         }
         .await;
 
-        // Publish under the generation fence, then complete the shared cell so
-        // every waiter resolves with the same outcome. The LEADER keeps its
-        // original typed error (e.g. DeadPeerTimeout, which callers and
-        // witnesses downcast); only the wire to waiters is stringified.
-        let (shared, own): (Result<Connection, String>, Result<Connection>) = match dialed {
+        match dialed {
             Ok(conn) => {
-                let now = *self.generations.lock().await.get(&key).unwrap_or(&0);
-                if now == gen {
-                    {
-                        let mut map = self.trunks.lock().await;
-                        if let Some(old) = map.insert(key.clone(), Trunk { conn: conn.clone() }) {
-                            // The displaced trunk (e.g. a severed-in-place
-                            // connection) must be closed EXPLICITLY — dropping
-                            // it closes silently, with no code and no reason.
-                            old.conn.close(0u32.into(), b"replaced by fresh trunk");
-                        }
+                let mut state = self.lock_state();
+                let same_channel = state.inflight.get(&key).is_some_and(|flight| {
+                    flight.generation == generation && flight.signal.same_channel(&signal)
+                });
+                let current =
+                    same_channel && state.generations.get(&key).copied().unwrap_or(0) == generation;
+                if current {
+                    // Same proof-gated alias install as the reuse path: the
+                    // dial completed, so remapping the label — and fencing
+                    // the previous identity's trunk — is earned (F3).
+                    Self::install_alias_locked(&mut state, node_id, &key);
+                    let trunk_incarnation = Self::allocate_trunk_incarnation_locked(&mut state);
+                    let acquired = AcquiredPeer {
+                        key: key.clone(),
+                        generation,
+                        trunk_incarnation,
+                        conn: conn.clone(),
+                    };
+                    if let Some(old) = state.trunks.insert(
+                        key.clone(),
+                        Trunk {
+                            incarnation: trunk_incarnation,
+                            conn: conn.clone(),
+                        },
+                    ) {
+                        old.conn.close(0u32.into(), b"replaced by fresh trunk");
                     }
-                    // Remember how this caller referred to the peer so the label-taking
-                    // helpers can find the trunk without a second keyspace.
-                    if node_id != key {
-                        self.aliases
-                            .lock()
-                            .await
-                            .insert(node_id.to_string(), key.clone());
-                    }
+                    state.inflight.remove(&key);
+                    state
+                        .dial_evidence
+                        .entry(key.clone())
+                        .or_default()
+                        .last_success = Some(Instant::now());
+                    let _ = signal.send_replace(Some(Ok(acquired.clone())));
+                    drop(state);
+                    leader_guard.disarm();
                     self.opened.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(node_id, key = %key, "trunk opened");
-                    (Ok(conn.clone()), Ok(conn))
+                    Ok(acquired)
                 } else {
-                    conn.close(0u32.into(), b"dial superseded by eviction");
-                    tracing::info!(node_id, key = %key, "dial superseded by eviction; fresh connection closed");
-                    (
-                        Err("dial superseded by eviction".to_string()),
-                        Err(anyhow::anyhow!("dial superseded by eviction")),
-                    )
+                    if same_channel {
+                        state.inflight.remove(&key);
+                        let _ = signal.send_replace(Some(Err(SharedDialError::Lifecycle(
+                            DialLifecycleError::Superseded,
+                        ))));
+                    }
+                    conn.close(0u32.into(), b"dial superseded by peer lifecycle change");
+                    drop(state);
+                    leader_guard.disarm();
+                    tracing::info!(node_id, key = %key, "dial superseded; fresh connection closed");
+                    Err(anyhow::Error::new(DialLifecycleError::Superseded))
                 }
             }
-            Err(e) => (Err(format!("{e}")), Err(e)),
-        };
-        {
-            let mut inflight = self.inflight.lock().await;
-            if inflight
-                .get(&key)
-                .is_some_and(|tx| tx.same_channel(&signal))
-            {
-                inflight.remove(&key);
+            Err(error) => {
+                let shared = SharedDialError::from_anyhow(&error);
+                let mut state = self.lock_state();
+                let same_channel = state.inflight.get(&key).is_some_and(|flight| {
+                    flight.generation == generation && flight.signal.same_channel(&signal)
+                });
+                let current =
+                    same_channel && state.generations.get(&key).copied().unwrap_or(0) == generation;
+                if current {
+                    state.inflight.remove(&key);
+                    state
+                        .dial_evidence
+                        .entry(key.clone())
+                        .or_default()
+                        .last_failure = Some(Instant::now());
+                    let _ = signal.send_replace(Some(Err(shared)));
+                } else if same_channel {
+                    state.inflight.remove(&key);
+                    let _ = signal.send_replace(Some(Err(SharedDialError::Lifecycle(
+                        DialLifecycleError::Superseded,
+                    ))));
+                }
+                drop(state);
+                leader_guard.disarm();
+                if current {
+                    Err(error)
+                } else {
+                    Err(anyhow::Error::new(DialLifecycleError::Superseded))
+                }
             }
-            let _ = signal.send(Some(shared));
         }
-        own
     }
 
     /// Fallback dial using ONLY the peer's `EndpointId` — no cached direct addrs,
@@ -2399,23 +2640,22 @@ impl PeerPool {
         match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await
         {
             Ok(Ok(c)) => {
+                let c = UnpublishedConnection::new(c);
                 self.neg_discovery.lock().await.remove(&memo_key);
                 tracing::info!(
                     node_id,
                     "p2p connect recovered via fresh discovery (cached hint was stale)"
                 );
-                Ok(c)
+                Ok(c.publish())
             }
             Ok(Err(e)) => {
                 bump_memo().await;
-                self.evict(node_id).await;
                 tracing::warn!(node_id, err = %e, "p2p connect error via fresh discovery (giving up)");
                 Err(e.into())
             }
             Err(_) => {
                 bump_memo().await;
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
-                self.evict(node_id).await;
                 tracing::warn!(
                     node_id,
                     budget_ms = budget.as_millis() as u64,
@@ -2430,22 +2670,34 @@ impl PeerPool {
         }
     }
 
-    /// Close and drop the cached trunk for a peer so the next request re-dials.
-    ///
-    /// CLOSES, not just removes. Removing the map entry is not enough to tear the
-    /// connection down: `acquire` hands out `conn.clone()`, and every live
-    /// `SendStream`/`RecvStream` holds its own reference, so the handle dropped
-    /// here is usually NOT the last one. The connection would instead close later,
-    /// implicitly, carrying no close code and no reason — which is precisely the
-    /// "dropping a `Connection` implicitly calls close" hazard iroh's own QUIC
-    /// guide tells embedders to manage explicitly, and it matters most here, on
-    /// the timeout path, where the peer deserves to learn immediately that we
-    /// consider this trunk dead. `close_peer` below already did this correctly;
-    /// eviction simply never got the same treatment.
-    async fn evict(&self, node_id: &str) {
-        if let Some(t) = self.trunks.lock().await.remove(node_id) {
-            t.conn.close(0u32.into(), b"evicted by pool");
+    /// Close one failed acquired trunk and remove it only if it is still the
+    /// published trunk for this peer. A delayed failure from an older connection
+    /// must never evict a healthy replacement published under the same peer
+    /// generation.
+    async fn evict_acquired(&self, acquired: &AcquiredPeer) {
+        let mut state = self.lock_state();
+        let generation_current = state
+            .generations
+            .get(&acquired.key)
+            .copied()
+            .unwrap_or_default()
+            == acquired.generation;
+        let trunk_current = state
+            .trunks
+            .get(&acquired.key)
+            .is_some_and(|trunk| trunk.incarnation == acquired.trunk_incarnation);
+        if generation_current && trunk_current {
+            state.trunks.remove(&acquired.key);
+            state
+                .dial_evidence
+                .entry(acquired.key.clone())
+                .or_default()
+                .last_failure = Some(Instant::now());
         }
+        drop(state);
+        acquired
+            .conn
+            .close(0u32.into(), b"failed acquired trunk evicted by pool");
     }
 
     /// Cross-node gateway-side call: send ONE HTTP request over a NEW bi stream on
@@ -2511,10 +2763,9 @@ impl PeerPool {
             attempt += 1;
             // ACQUIRE (connect is bounded inside `acquire`). A connect timeout /
             // failure is PRE-SEND → evict + retry once (safe even for POST).
-            let conn = match self.acquire(node_id, addr_json).await {
-                Ok(c) => c,
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
                 Err(e) => {
-                    self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
@@ -2523,24 +2774,25 @@ impl PeerPool {
             };
             // OPEN_BI — PRE-SEND, bounded by the open budget. An error OR a timeout
             // means no request bytes left this node → evict + retry once.
-            let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+            let (mut send, recv) =
+                match tokio::time::timeout(open_budget(), acquired.conn.open_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        self.evict_acquired(&acquired).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_OPEN).await;
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+                    Err(_) => {
+                        self.timeouts.bump(node_id, PHASE_OPEN).await;
+                        self.evict_acquired(&acquired).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(self.dead_peer(node_id, "open", open_budget()));
                     }
-                    return Err(self.dead_peer(node_id, "open", open_budget()));
-                }
-            };
+                };
             // Select the multiplexed tunnel mode for the owner's dispatcher.
             send.write_all(&[STREAM_TUNNEL]).await?;
             send.flush().await?;
@@ -2567,6 +2819,7 @@ impl PeerPool {
                     }));
                 }
             };
+            self.record_success(&acquired);
             // Move the client INTO the stream so it lives until the body is drained
             // (keeping the QUIC streams open); see `TunnelStream::_client`.
             return Ok(TunnelStream {
@@ -2599,34 +2852,34 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = match self.acquire(node_id, addr_json).await {
-                Ok(c) => c,
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
                 Err(e) => {
-                    self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
                     return Err(e);
                 }
             };
-            let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+            let (mut send, recv) =
+                match tokio::time::timeout(open_budget(), acquired.conn.open_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        self.evict_acquired(&acquired).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_OPEN).await;
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+                    Err(_) => {
+                        self.timeouts.bump(node_id, PHASE_OPEN).await;
+                        self.evict_acquired(&acquired).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(self.dead_peer(node_id, "open", open_budget()));
                     }
-                    return Err(self.dead_peer(node_id, "open", open_budget()));
-                }
-            };
+                };
             send.write_all(&[STREAM_RAW]).await?;
             send.flush().await?;
             return Ok(tokio::io::join(recv, send));
@@ -2662,10 +2915,9 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = match self.acquire(node_id, addr_json).await {
-                Ok(c) => c,
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
                 Err(e) => {
-                    self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
@@ -2673,10 +2925,10 @@ impl PeerPool {
                 }
             };
             let (mut send, mut recv) =
-                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                match tokio::time::timeout(open_budget(), acquired.conn.open_bi()).await {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2684,7 +2936,7 @@ impl PeerPool {
                     }
                     Err(_) => {
                         self.timeouts.bump(node_id, PHASE_OPEN).await;
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2724,7 +2976,10 @@ impl PeerPool {
                 );
             }
             match resp[4] {
-                RAW_TARGET_OK => return Ok(tokio::io::join(recv, send)),
+                RAW_TARGET_OK => {
+                    self.record_success(&acquired);
+                    return Ok(tokio::io::join(recv, send));
+                }
                 RAW_TARGET_NOT_FOUND => anyhow::bail!(
                     "peer {node_id} has no local target for {}/{} port {} ({:?})",
                     target.project,
@@ -2758,10 +3013,9 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = match self.acquire(node_id, addr_json).await {
-                Ok(c) => c,
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
                 Err(e) => {
-                    self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
@@ -2769,10 +3023,10 @@ impl PeerPool {
                 }
             };
             let (mut send, mut recv) =
-                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                match tokio::time::timeout(open_budget(), acquired.conn.open_bi()).await {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2780,7 +3034,7 @@ impl PeerPool {
                     }
                     Err(_) => {
                         self.timeouts.bump(node_id, PHASE_OPEN).await;
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2828,6 +3082,7 @@ impl PeerPool {
                     }));
                 }
             };
+            self.record_success(&acquired);
             return Ok(resp);
         }
     }
@@ -2847,10 +3102,9 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = match self.acquire(node_id, addr_json).await {
-                Ok(c) => c,
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
                 Err(e) => {
-                    self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
@@ -2858,10 +3112,10 @@ impl PeerPool {
                 }
             };
             let (mut send, mut recv) =
-                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                match tokio::time::timeout(open_budget(), acquired.conn.open_bi()).await {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2869,7 +3123,7 @@ impl PeerPool {
                     }
                     Err(_) => {
                         self.timeouts.bump(node_id, PHASE_OPEN).await;
-                        self.evict(node_id).await;
+                        self.evict_acquired(&acquired).await;
                         if attempt < 2 {
                             continue;
                         }
@@ -2896,47 +3150,15 @@ impl PeerPool {
                     }));
                 }
             };
+            self.record_success(&acquired);
             return Ok(resp);
         }
     }
 
-    /// Resolve a caller-supplied label (node NAME or endpoint id) to the canonical
-    /// trunk key. An endpoint id maps to itself; a name resolves through the alias
-    /// map learned at `acquire` time. Falls back to the label itself so a lookup
-    /// for a peer we have never dialed simply misses instead of erroring.
-    async fn canonical_key(&self, label: &str) -> String {
-        if self.trunks.lock().await.contains_key(label) {
-            return label.to_string();
-        }
-        self.aliases
-            .lock()
-            .await
-            .get(label)
-            .cloned()
-            .unwrap_or_else(|| label.to_string())
-    }
-
-    /// Close + drop a peer's trunk so the next request re-dials a fresh connection.
-    ///
-    /// Accepts either a node name or an endpoint id: `gossip::probe`'s recovery
-    /// path calls this with an endpoint id while the edge knows peers by name, and
-    /// before the pool keyed canonically an eid-keyed close could not evict the
-    /// name-keyed trunk at all — so a restarted peer's stale edge trunk survived
-    /// the very eviction meant to clear it.
     pub async fn close_peer(&self, node_id: &str) {
-        let key = self.canonical_key(node_id).await;
-        // Bump the generation FIRST so any leader dial still in flight for this
-        // peer is fenced: its publish check fails and it closes its fresh
-        // connection instead of resurrecting the trunk we are killing here.
-        *self
-            .generations
-            .lock()
-            .await
-            .entry(key.clone())
-            .or_insert(0) += 1;
-        if let Some(t) = self.trunks.lock().await.remove(&key) {
-            t.conn.close(0u32.into(), b"closed by pool");
-        }
+        let mut state = self.lock_state();
+        let key = Self::canonical_key_locked(&state, node_id);
+        Self::fence_identity_locked(&mut state, &key, b"closed by pool");
     }
 
     /// Test/diagnostic helper: forcibly close a peer's cached connection IN PLACE
@@ -2945,9 +3167,9 @@ impl PeerPool {
     /// `close_reason()` or an `open_bi()` failure — and re-dial. Returns whether a
     /// trunk was cached, and (for assertions) whether that handle now reports closed.
     pub async fn sever_peer(&self, node_id: &str) -> bool {
-        let key = self.canonical_key(node_id).await;
-        let map = self.trunks.lock().await;
-        match map.get(&key) {
+        let state = self.lock_state();
+        let key = Self::canonical_key_locked(&state, node_id);
+        match state.trunks.get(&key) {
             Some(t) => {
                 t.conn.close(0u32.into(), b"severed by test");
                 // Same Arc-backed connection state, so the cached clone observes it.

@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
                 creator: Some("cli".into()),
                 git: None,
                 production: true,
+                project_incarnation: None,
             };
             let info: DeploymentInfo = http
                 .post(format!("{}/deployments", cli.admin))

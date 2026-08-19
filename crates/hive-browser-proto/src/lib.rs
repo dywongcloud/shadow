@@ -580,15 +580,27 @@ impl<'a> CrrCursor<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, ProtoError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+        Ok(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| ProtoError::MalformedCrrSync)?,
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, ProtoError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| ProtoError::MalformedCrrSync)?,
+        ))
     }
 
     fn i64(&mut self) -> Result<i64, ProtoError> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+        Ok(i64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| ProtoError::MalformedCrrSync)?,
+        ))
     }
 
     fn watermarks(&mut self) -> Result<Vec<(Vec<u8>, i64)>, ProtoError> {
@@ -637,7 +649,11 @@ impl<'a> CrrCursor<'a> {
 pub fn encode_crr_sync_request(request: &CrrSyncRequest) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + request.batches.iter().map(Vec::len).sum::<usize>());
     out.push(CRR_SYNC_VERSION);
-    out.push(if request.push_more { CRR_FLAG_PUSH_MORE } else { 0 });
+    out.push(if request.push_more {
+        CRR_FLAG_PUSH_MORE
+    } else {
+        0
+    });
     let db_file = request.db_file.as_bytes();
     let db_file = &db_file[..db_file.len().min(CRR_MAX_DB_FILE)];
     out.extend_from_slice(&(db_file.len() as u16).to_be_bytes());
@@ -659,8 +675,8 @@ pub fn split_crr_sync_request(payload: &[u8]) -> Result<CrrSyncRequest, ProtoErr
     if db_len == 0 || db_len > CRR_MAX_DB_FILE {
         return Err(ProtoError::MalformedCrrSync);
     }
-    let db_file = String::from_utf8(cur.take(db_len)?.to_vec())
-        .map_err(|_| ProtoError::MalformedCrrSync)?;
+    let db_file =
+        String::from_utf8(cur.take(db_len)?.to_vec()).map_err(|_| ProtoError::MalformedCrrSync)?;
     let watermarks = cur.watermarks()?;
     let batches = cur.batches()?;
     cur.finish()?;
@@ -700,8 +716,8 @@ pub fn split_crr_sync_reply(payload: &[u8]) -> Result<CrrSyncReply, ProtoError> 
     if msg_len > CRR_MAX_MESSAGE {
         return Err(ProtoError::MalformedCrrSync);
     }
-    let message = String::from_utf8(cur.take(msg_len)?.to_vec())
-        .map_err(|_| ProtoError::MalformedCrrSync)?;
+    let message =
+        String::from_utf8(cur.take(msg_len)?.to_vec()).map_err(|_| ProtoError::MalformedCrrSync)?;
     let watermarks = cur.watermarks()?;
     let batches = cur.batches()?;
     cur.finish()?;

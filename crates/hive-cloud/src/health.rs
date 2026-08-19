@@ -81,10 +81,22 @@ fn cold_window_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
-/// node id -> epoch-ms the local routing penalty expires.
+/// immutable peer identity -> epoch-ms the local routing penalty expires.
 fn cold() -> &'static RwLock<HashMap<String, u64>> {
     static COLD: OnceLock<RwLock<HashMap<String, u64>>> = OnceLock::new();
     COLD.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn cold_key(identity: &hive_edge::region::PeerIdentity) -> String {
+    identity
+        .endpoint_id
+        .as_ref()
+        .map(|id| format!("endpoint:{id}"))
+        .unwrap_or_else(|| format!("name:{}", identity.name))
+}
+
+fn endpoint_cold_key(endpoint_id: &str) -> String {
+    format!("endpoint:{endpoint_id}")
 }
 
 static DEMOTED: AtomicU64 = AtomicU64::new(0);
@@ -93,76 +105,85 @@ static UNKNOWN_PEER: AtomicU64 = AtomicU64::new(0);
 static COLD_MARKS: AtomicU64 = AtomicU64::new(0);
 static RESTORED: AtomicU64 = AtomicU64::new(0);
 
-/// Record the node-local routing penalty. Returns `true` when the peer was not
-/// already cold — the caller uses that to log once per window instead of once
-/// per request, so a hot loop cannot turn a failing peer into a log flood.
-pub fn mark_cold(node: &str) -> bool {
+fn mark_cold_key(key: String) -> bool {
     let now = now_ms();
     let until = now.saturating_add(cold_window_ms());
     let mut map = cold().write();
-    // Opportunistic expiry — the map is bounded by the peer count, but a peer
-    // that leaves the fleet should not linger in it forever either.
     map.retain(|_, exp| *exp > now);
     COLD_MARKS.fetch_add(1, Ordering::Relaxed);
-    map.insert(node.to_string(), until).is_none()
+    map.insert(key, until).is_none()
 }
 
-/// Is this peer inside its local routing penalty window? Node-local and
-/// advisory: it may only DEPRIORITIZE a candidate, never remove the last one.
-pub fn is_cold(node: &str) -> bool {
-    cold().read().get(node).is_some_and(|exp| *exp > now_ms())
+/// Record a node-local routing penalty against the peer's current immutable
+/// endpoint identity. Unknown peers cannot create an unresolvable penalty.
+pub fn mark_cold(registry: &hive_edge::region::NodeRegistry, node: &str) -> bool {
+    registry
+        .peer_identity(node)
+        .is_some_and(|identity| mark_cold_key(cold_key(&identity)))
 }
 
-/// Clear the penalty — call after any SUCCESSFUL exchange with the peer, so a
-/// recovered trunk is preferred again immediately rather than serving out a
-/// window it no longer deserves.
-pub fn clear_cold(node: &str) {
-    if !cold().read().contains_key(node) {
-        return; // read-only fast path: the common case takes no write lock
+/// Is the peer's current immutable identity inside its local routing penalty
+/// window? A replacement reusing the same name never inherits the old key.
+pub fn is_cold(registry: &hive_edge::region::NodeRegistry, node: &str) -> bool {
+    let Some(identity) = registry.peer_identity(node) else {
+        return false;
+    };
+    cold()
+        .read()
+        .get(&cold_key(&identity))
+        .is_some_and(|exp| *exp > now_ms())
+}
+
+/// Clear a penalty by exact immutable endpoint after a fenced direct success.
+pub fn clear_cold_identity(endpoint_id: &str) {
+    let key = endpoint_cold_key(endpoint_id);
+    if !cold().read().contains_key(&key) {
+        return;
     }
-    cold().write().remove(node);
+    cold().write().remove(&key);
 }
 
-/// The single writer allowed to mark a peer unhealthy.
-///
-/// `observed_last_seen_ms` lets a caller pass the liveness timestamp from the
-/// SAME snapshot it made its failing observation against (the prober does
-/// this deliberately, so its liveness check can never disagree with the set it
-/// actually probed); `None` reads the registry now.
-///
-/// Returns `true` when the withdrawal was applied. `false` means the peer is
-/// still gossiping and was kept in service — the caller's failure is real, but
-/// it is a local transport fault, and it is recorded as a cold trunk instead.
-pub fn demote(
+/// Clear the current peer's penalty when only a name-or-endpoint label is
+/// available.
+pub fn clear_cold(registry: &hive_edge::region::NodeRegistry, node: &str) {
+    let Some(identity) = registry.peer_identity(node) else {
+        return;
+    };
+    let key = cold_key(&identity);
+    if !cold().read().contains_key(&key) {
+        return;
+    }
+    cold().write().remove(&key);
+}
+
+fn demote_inner(
     registry: &hive_edge::region::NodeRegistry,
     node: &str,
+    expected_endpoint_id: Option<&str>,
     reason: &str,
     observed_last_seen_ms: Option<u64>,
 ) -> bool {
-    // Not a registry peer at all — there is no health to withdraw and no route
-    // to deprioritize, so this is neither a demotion nor a refusal.
-    //
-    // Witnessed live and not hypothetical: the gossip round addresses iroh
-    // peers by 64-hex ENDPOINT ID while the registry is keyed by node NAME, so
-    // every failed round against an unmeshed seed called this with an id no
-    // peer map has ever held. `set_health` is already a no-op for an unknown
-    // id, but counting those as demotions made a healthy node's counters read
-    // `demoted: 5` in its first 30 seconds — an operator metric that cries
-    // wolf is the same failure as no metric at all, which is the whole reason
-    // this endpoint exists.
-    let known = registry.peer_last_seen_ms(node);
-    if known.is_none() && observed_last_seen_ms.is_none() {
-        UNKNOWN_PEER.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let newly_cold = mark_cold(node);
-    let last_seen = observed_last_seen_ms.or(known);
-    let alive_by_gossip = last_seen.is_some_and(|ms| now_ms().saturating_sub(ms) < GOSSIP_ALIVE_MS);
-    if alive_by_gossip {
+    let outcome = registry.demote_if_gossip_stale(
+        node,
+        expected_endpoint_id,
+        observed_last_seen_ms,
+        GOSSIP_ALIVE_MS,
+    );
+    let (identity, demoted) = match outcome {
+        hive_edge::region::PeerDemotion::Missing => {
+            UNKNOWN_PEER.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        hive_edge::region::PeerDemotion::GossipAlive(identity) => (identity, false),
+        hive_edge::region::PeerDemotion::Demoted(identity) => (identity, true),
+    };
+    let newly_cold = mark_cold_key(cold_key(&identity));
+    if !demoted {
         REFUSED_GOSSIP_ALIVE.fetch_add(1, Ordering::Relaxed);
         if newly_cold {
             tracing::warn!(
-                node,
+                node = %identity.name,
+                endpoint_id = identity.endpoint_id.as_deref().unwrap_or("legacy-name-only"),
                 reason,
                 "peer transport failed but the peer is still gossiping — keeping it HEALTHY \
                  (a single-observer transport fault must not withdraw a live node from \
@@ -172,64 +193,98 @@ pub fn demote(
         return false;
     }
     DEMOTED.fetch_add(1, Ordering::Relaxed);
-    // u64::MAX, not 0: an unhealthy peer that still gets ranked anywhere should
-    // sort last, and 0 (the old prober value) sorts FIRST on a latency key.
-    registry.set_health(node, u64::MAX, false);
     tracing::warn!(
-        node,
+        node = %identity.name,
+        endpoint_id = identity.endpoint_id.as_deref().unwrap_or("legacy-name-only"),
         reason,
         "peer marked UNHEALTHY (transport failed AND gossip stale) — it leaves DNS and placement"
     );
     true
 }
 
-/// Reverse withdrawals that the gossip evidence no longer supports.
-///
-/// [`demote`] refuses to withdraw a peer whose gossip is fresh, but until this
-/// existed nothing ever UNDID a withdrawal: only a successful probe could clear
-/// `healthy = false`, so a peer whose probe path was broken (stale cached addr,
-/// wedged trunk) while its announces kept arriving stayed unhealthy for the life
-/// of the process. Measured live on nine nodes simultaneously:
-/// `audible_peers = 15` beside `visible_healthy_peers = 6` — a node that had
-/// heard from 15 peers seconds earlier serving 6 to DNS and placement. Hand
-/// restarts "fixed" it only because a restart drops the stale verdict.
-///
-/// Applying the same evidence symmetrically is what makes this self-healing, and
-/// it cannot resurrect a genuinely dead peer: a silent node's `last_seen_ms`
-/// ages past the window and `NodeRegistry::nodes()` drops it outright at 30s.
-///
-/// Returns the ids actually restored this pass.
-///
-/// The IDS, not a count: the caller's follow-up (dropping those peers' wedged
-/// trunks) must act on exactly the peers this pass restored. Re-deriving that
-/// set by testing `latency_ms == RESTORED_LATENCY_MS` conflates the sentinel
-/// with a genuine measurement — `set_health` stores the raw probe RTT and this
-/// fleet really does see ~1s cross-continent probes (AGENTS.md records a
-/// successful 7462ms one), so a correctly-probed peer that happened to measure
-/// exactly 999ms would have its healthy trunk closed. It also mis-fires on a
-/// peer whose `NodeInfo` was relayed from an observer that had restored it,
-/// since `upsert_peer` adopts an unknown peer's healthy/latency verbatim.
+/// Withdraw the peer currently denoted by a name or endpoint id. Current
+/// registry evidence is re-read atomically by `NodeRegistry` before mutation.
+pub fn demote(
+    registry: &hive_edge::region::NodeRegistry,
+    node: &str,
+    reason: &str,
+    observed_last_seen_ms: Option<u64>,
+) -> bool {
+    demote_inner(registry, node, None, reason, observed_last_seen_ms)
+}
+
+/// Withdraw only if `node` still maps to the immutable endpoint captured with
+/// the failed operation.
+pub fn demote_exact(
+    registry: &hive_edge::region::NodeRegistry,
+    node: &str,
+    expected_endpoint_id: &str,
+    reason: &str,
+    observed_last_seen_ms: Option<u64>,
+) -> bool {
+    demote_inner(
+        registry,
+        node,
+        Some(expected_endpoint_id),
+        reason,
+        observed_last_seen_ms,
+    )
+}
+
+/// Consecutive fresh rounds a withdrawn peer must show before it is
+/// restored — the restore-side hysteresis (refutation finding F5): demotion
+/// needs threshold probe misses AND >25s gossip silence, but restoration
+/// previously needed a SINGLE fresh timestamp, so a lossy-announce peer
+/// oscillated withdrawn↔restored and DNS/placement flapped with it. Three
+/// rounds at the 5s cadence is ~15s of sustained evidence — still far
+/// faster than the probe-driven demotion path.
+const RESTORE_HYSTERESIS_ROUNDS: u8 = 3;
+
+static RESTORE_STREAKS: std::sync::OnceLock<
+    parking_lot::RwLock<std::collections::HashMap<String, u8>>,
+> = std::sync::OnceLock::new();
+
+/// Reverse withdrawals that current gossip evidence no longer supports —
+/// gated on RESTORE_HYSTERESIS_ROUNDS of sustained freshness (F5). Health
+/// mutation and immutable endpoint capture happen under one registry lock,
+/// so callers can close only the trunks that were actually restored.
 pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<String> {
-    let stale_ids: Vec<String> = registry
-        .nodes()
+    let streaks = RESTORE_STREAKS
+        .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let candidates: std::collections::HashSet<String> = registry
+        .gossip_fresh_unhealthy(GOSSIP_ALIVE_MS)
         .into_iter()
-        .filter(|n| !n.is_self && !n.healthy)
-        .map(|n| n.id)
         .collect();
-    let mut restored: Vec<String> = Vec::new();
-    for id in stale_ids {
-        if registry.restore_health_if_gossip_fresh(&id, GOSSIP_ALIVE_MS) {
-            RESTORED.fetch_add(1, Ordering::Relaxed);
-            // A restored peer is reachable-by-evidence, so it must not keep
-            // serving out a routing penalty from the transport fault that
-            // withdrew it.
-            clear_cold(&id);
+    let ready: Vec<String> = {
+        let mut w = streaks.write();
+        // A peer that went silent mid-streak starts over — the streak must
+        // be CONSECUTIVE rounds, not cumulative sightings.
+        w.retain(|id, _| candidates.contains(id));
+        let mut ready = Vec::new();
+        for id in &candidates {
+            let n = w.entry(id.clone()).or_insert(0);
+            *n = n.saturating_add(1);
+            if *n >= RESTORE_HYSTERESIS_ROUNDS {
+                ready.push(id.clone());
+            }
+        }
+        for id in &ready {
+            w.remove(id);
+        }
+        ready
+    };
+    if ready.is_empty() {
+        return Vec::new();
+    }
+    let restored = registry.restore_only(&ready);
+    if !restored.is_empty() {
+        RESTORED.fetch_add(restored.len() as u64, Ordering::Relaxed);
+        for endpoint_id in &restored {
             tracing::info!(
-                node = %id,
-                "peer RESTORED to healthy — it is still gossiping, so the withdrawal that \
-                 removed it from DNS/placement is no longer supported by evidence"
+                endpoint_id,
+                "peer RESTORED to healthy — sustained gossip liveness past the hysteresis, so the \
+                 withdrawal that removed it from DNS/placement is no longer supported by evidence"
             );
-            restored.push(id);
         }
     }
     restored

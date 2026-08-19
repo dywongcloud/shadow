@@ -236,6 +236,10 @@ pub struct BrowserDbRestToken {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<fluid_core::ProjectIncarnation>,
+    #[serde(default)]
+    pub incarnation_created_ms: u64,
     /// Last write to THIS row on THIS node (ms epoch). The per-row freshness
     /// key `merge_synced` compares — newest write wins a replication collision,
     /// and a tombstone at-or-after it deletes the row. `0` = a row never
@@ -364,6 +368,8 @@ fn default_true() -> bool {
 impl Default for ProjectSettings {
     fn default() -> Self {
         ProjectSettings {
+            incarnation: None,
+            incarnation_created_ms: 0,
             updated_ms: 0,
             env: Vec::new(),
             build: BuildConfig::default(),
@@ -398,14 +404,58 @@ pub struct SyncedProjects {
     pub rows: std::collections::BTreeMap<String, ProjectSettings>,
     #[serde(default)]
     pub tombstones: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub incarnation_tombstones: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
+    >,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectIncarnationError {
+    Missing,
+    Legacy,
+    Mismatch {
+        active: fluid_core::ProjectIncarnation,
+    },
+    AlreadyExists,
+    Tombstoned,
+}
+
+impl std::fmt::Display for ProjectIncarnationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("project does not exist"),
+            Self::Legacy => f.write_str("project has no incarnation"),
+            Self::Mismatch { active } => write!(f, "project incarnation changed to {active}"),
+            Self::AlreadyExists => f.write_str("project already exists"),
+            Self::Tombstoned => f.write_str("project incarnation was deleted"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectIncarnationError {}
 
 pub struct ProjectStore {
     map: RwLock<HashMap<String, ProjectSettings>>,
     /// project → deletion ms. Records deletions so absence can replicate
-    /// EXPLICITLY (see [`SyncedProjects`]); retained for the same 30d window
-    /// the databases store uses.
+    /// EXPLICITLY (see [`SyncedProjects`]). Retained permanently: an offline
+    /// node can return after any bounded GC window and otherwise resurrect a
+    /// deleted project, while this map grows only once per deleted project.
     tombstones: RwLock<std::collections::BTreeMap<String, u64>>,
+    incarnation_tombstones: RwLock<
+        std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
+        >,
+    >,
+}
+
+fn project_time_ceiling(now: u64) -> u64 {
+    // A delete issuer may intentionally lead by one skew allowance; a receiver
+    // can be the same allowance behind it. Locally-issued generations still use
+    // the narrower one-skew ceiling in `begin_delete`.
+    now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2)
 }
 
 impl ProjectStore {
@@ -413,11 +463,119 @@ impl ProjectStore {
         ProjectStore {
             map: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(std::collections::BTreeMap::new()),
+            incarnation_tombstones: RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
     pub fn get(&self, project: &str) -> ProjectSettings {
         self.map.read().get(project).cloned().unwrap_or_default()
+    }
+
+    pub fn create(
+        &self,
+        project: &str,
+    ) -> Result<fluid_core::ProjectIncarnation, ProjectIncarnationError> {
+        let mut map = self.map.write();
+        if map.contains_key(project) {
+            return Err(ProjectIncarnationError::AlreadyExists);
+        }
+        let legacy_floor = self.tombstones.read().get(project).copied().unwrap_or(0);
+        let incarnation_floor = self
+            .incarnation_tombstones
+            .read()
+            .get(project)
+            .and_then(|tombstones| tombstones.values().copied().max())
+            .unwrap_or(0);
+        let incarnation = fluid_core::ProjectIncarnation::mint();
+        let created_ms = now_ms()
+            .max(legacy_floor.saturating_add(1))
+            .max(incarnation_floor.saturating_add(1));
+        let row = ProjectSettings {
+            incarnation: Some(incarnation),
+            incarnation_created_ms: created_ms,
+            updated_ms: created_ms,
+            ..ProjectSettings::default()
+        };
+        map.insert(project.to_string(), row);
+        Ok(incarnation)
+    }
+
+    pub fn adopt_incarnation(
+        &self,
+        project: &str,
+        incarnation: fluid_core::ProjectIncarnation,
+    ) -> Result<(), ProjectIncarnationError> {
+        let mut map = self.map.write();
+        if self
+            .incarnation_tombstones
+            .read()
+            .get(project)
+            .is_some_and(|tombstones| tombstones.contains_key(&incarnation))
+        {
+            return Err(ProjectIncarnationError::Tombstoned);
+        }
+        match map.get(project) {
+            Some(row) if row.incarnation == Some(incarnation) => Ok(()),
+            Some(row) => Err(match row.incarnation {
+                Some(active) => ProjectIncarnationError::Mismatch { active },
+                None => ProjectIncarnationError::Legacy,
+            }),
+            None => {
+                let legacy_floor = self.tombstones.read().get(project).copied().unwrap_or(0);
+                let incarnation_floor = self
+                    .incarnation_tombstones
+                    .read()
+                    .get(project)
+                    .and_then(|tombstones| tombstones.values().copied().max())
+                    .unwrap_or(0);
+                let created_ms = now_ms()
+                    .max(legacy_floor.saturating_add(1))
+                    .max(incarnation_floor.saturating_add(1));
+                map.insert(
+                    project.to_string(),
+                    ProjectSettings {
+                        incarnation: Some(incarnation),
+                        incarnation_created_ms: created_ms,
+                        updated_ms: created_ms,
+                        ..ProjectSettings::default()
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn active_incarnation(
+        &self,
+        project: &str,
+    ) -> Result<fluid_core::ProjectIncarnation, ProjectIncarnationError> {
+        match self.map.read().get(project) {
+            None => Err(ProjectIncarnationError::Missing),
+            Some(row) => row.incarnation.ok_or(ProjectIncarnationError::Legacy),
+        }
+    }
+
+    pub fn with_active<R>(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        apply: impl FnOnce(&ProjectSettings) -> R,
+    ) -> Result<R, ProjectIncarnationError> {
+        let map = self.map.read();
+        let row = map.get(project).ok_or(ProjectIncarnationError::Missing)?;
+        match row.incarnation {
+            Some(active) if active == expected => Ok(apply(row)),
+            Some(active) => Err(ProjectIncarnationError::Mismatch { active }),
+            None => Err(ProjectIncarnationError::Legacy),
+        }
+    }
+
+    pub fn get_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+    ) -> Result<ProjectSettings, ProjectIncarnationError> {
+        self.with_active(project, expected, Clone::clone)
     }
 
     /// Full snapshot (project -> settings) for persistence.
@@ -459,7 +617,22 @@ impl ProjectStore {
     }
 
     /// Replace the whole store (used on boot).
-    pub fn load(&self, data: HashMap<String, ProjectSettings>) {
+    pub fn load(&self, mut data: HashMap<String, ProjectSettings>) {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        for (id, row) in data.iter_mut() {
+            if row.incarnation.is_some() && row.incarnation_created_ms == 0 {
+                row.incarnation_created_ms = row.updated_ms;
+            }
+            if row.incarnation_created_ms > ceiling {
+                tracing::warn!(project = %id, created_ms = row.incarnation_created_ms, ceiling_ms = ceiling, "normalizing implausibly future persisted project incarnation on load");
+                row.incarnation_created_ms = now;
+            }
+            if row.updated_ms > ceiling {
+                tracing::warn!(project = %id, updated_ms = row.updated_ms, ceiling_ms = ceiling, "normalizing implausibly future persisted project row on load");
+                row.updated_ms = now;
+            }
+        }
         *self.map.write() = data;
     }
 
@@ -468,6 +641,7 @@ impl ProjectStore {
         SyncedProjects {
             rows: self.map.read().clone().into_iter().collect(),
             tombstones: self.tombstones.read().clone(),
+            incarnation_tombstones: self.incarnation_tombstones.read().clone(),
         }
     }
 
@@ -480,42 +654,97 @@ impl ProjectStore {
     /// a sender that simply lacks a row cannot erase it here.
     pub fn merge_synced(&self, remote: SyncedProjects) -> usize {
         let now = now_ms();
+        let ceiling = project_time_ceiling(now);
         {
             let mut tombs = self.tombstones.write();
+            // Repair poison persisted by pre-boundary binaries. Without this, one
+            // `u64::MAX` tombstone makes every future recreation overflow and
+            // stay deleted permanently.
+            for (id, ms) in tombs.iter_mut() {
+                if *ms > ceiling {
+                    tracing::warn!(project = %id, deleted_ms = *ms, ceiling_ms = ceiling, "normalizing implausibly future project tombstone");
+                    *ms = now;
+                }
+            }
             for (id, ms) in remote.tombstones {
+                if ms > ceiling {
+                    tracing::warn!(project = %id, deleted_ms = ms, ceiling_ms = ceiling, "dropping relayed project tombstone with implausibly future generation");
+                    continue;
+                }
                 let e = tombs.entry(id).or_insert(ms);
                 if ms > *e {
                     *e = ms;
                 }
             }
-            tombs
-                .retain(|_, ms| now.saturating_sub(*ms) < crate::databases::TOMBSTONE_RETENTION_MS);
+            // Project deletions are permanent anti-entropy facts. Expiring this
+            // set lets a node offline longer than the window return with an old
+            // row that every peer now mistakes for a recreation.
+        }
+        {
+            let mut incarnation_tombstones = self.incarnation_tombstones.write();
+            for (project, remote_tombstones) in remote.incarnation_tombstones {
+                let local_tombstones = incarnation_tombstones.entry(project).or_default();
+                for (incarnation, deleted_ms) in remote_tombstones {
+                    if deleted_ms > ceiling {
+                        tracing::warn!(
+                            %incarnation,
+                            deleted_ms,
+                            ceiling_ms = ceiling,
+                            "dropping relayed project-incarnation tombstone with implausibly future generation"
+                        );
+                        continue;
+                    }
+                    let current = local_tombstones.entry(incarnation).or_insert(deleted_ms);
+                    if deleted_ms > *current {
+                        *current = deleted_ms;
+                    }
+                }
+            }
         }
         let tombs = self.tombstones.read().clone();
+        let incarnation_tombstones = self.incarnation_tombstones.read().clone();
         let mut map = self.map.write();
-        for (name, remote_row) in remote.rows {
+        for (name, row) in map.iter_mut() {
+            if row.incarnation.is_some() && row.incarnation_created_ms == 0 {
+                row.incarnation_created_ms = row.updated_ms;
+            }
+            if row.incarnation_created_ms > ceiling {
+                tracing::warn!(project = %name, created_ms = row.incarnation_created_ms, ceiling_ms = ceiling, "normalizing implausibly future local project incarnation");
+                row.incarnation_created_ms = now;
+            }
+            if row.updated_ms > ceiling {
+                tracing::warn!(project = %name, updated_ms = row.updated_ms, ceiling_ms = ceiling, "normalizing implausibly future local project row");
+                row.updated_ms = now.max(row.incarnation_created_ms);
+            }
+        }
+        for (name, mut remote_row) in remote.rows {
+            if remote_row.incarnation.is_some() && remote_row.incarnation_created_ms == 0 {
+                remote_row.incarnation_created_ms = remote_row.updated_ms;
+            }
+            if remote_row.incarnation_created_ms > ceiling {
+                tracing::warn!(project = %name, created_ms = remote_row.incarnation_created_ms, ceiling_ms = ceiling, "dropping relayed project incarnation with implausibly future generation");
+                continue;
+            }
+            if remote_row.updated_ms > ceiling {
+                tracing::warn!(project = %name, updated_ms = remote_row.updated_ms, ceiling_ms = ceiling, "dropping relayed project row with implausibly future version");
+                continue;
+            }
             let take = match map.get(&name) {
                 None => true,
-                Some(local) if remote_row.updated_ms > local.updated_ms => true,
-                Some(local) if remote_row.updated_ms < local.updated_ms => false,
-                // EQUAL updated_ms but the rows may differ (two nodes wrote in
-                // the same millisecond, or a pre-monotonic-stamp legacy state).
-                // A plain `>=`-keeps-local here made both sides keep their own
-                // copy forever — the divergence never converged. Break the tie
-                // DETERMINISTICALLY so every node picks the SAME winner: the
-                // row with more env vars wins (a strict superset is the common
-                // real case — one node saw an add the other missed), and a
-                // content-signature tie-break settles the rest. Both nodes
-                // compute the identical answer, so they converge in one round.
-                Some(local) => tie_break_take(local, &remote_row),
+                Some(local) => merge_take(local, &remote_row),
             };
             if take {
                 map.insert(name, remote_row);
             }
         }
-        map.retain(|name, row| match tombs.get(name) {
-            Some(deleted_ms) => row.updated_ms > *deleted_ms,
-            None => true,
+        map.retain(|name, row| match row.incarnation {
+            Some(incarnation) => !incarnation_tombstones
+                .get(name)
+                .is_some_and(|tombstones| tombstones.contains_key(&incarnation)),
+            None => match tombs.get(name) {
+                Some(deleted_ms) => row.updated_ms > *deleted_ms,
+                None => true,
+            },
         });
         map.len()
     }
@@ -527,38 +756,246 @@ impl ProjectStore {
         self.tombstones.read().clone()
     }
 
-    pub fn tombstones_load(&self, data: std::collections::BTreeMap<String, u64>) {
+    /// The project's permanent deletion generation, if tombstoned — the
+    /// causal floor every new incarnation's timestamps must dominate
+    /// (deployments register with `created_at_ms` floored at this +1, or the
+    /// next delete's `remove_project_through` sweeps the fresh incarnation
+    /// as "old": adversarial finding).
+    pub fn tombstone_of(&self, project: &str) -> Option<u64> {
+        self.tombstones.read().get(project).copied()
+    }
+
+    pub fn tombstones_load(&self, mut data: std::collections::BTreeMap<String, u64>) {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        for (id, ms) in data.iter_mut() {
+            if *ms > ceiling {
+                tracing::warn!(project = %id, deleted_ms = *ms, ceiling_ms = ceiling, "normalizing implausibly future persisted project tombstone on load");
+                *ms = now;
+            }
+        }
+        // A persisted row dominated by a tombstone in the SAME snapshot dies
+        // here (a delete landing between the row-capture and the
+        // tombstone-capture wrote both) — the `teams.rs` retain pass this
+        // loader previously lacked, letting a deleted project's row briefly
+        // revive at boot (adversarial finding).
+        {
+            let mut m = self.map.write();
+            m.retain(|project, row| {
+                row.incarnation.is_some()
+                    || data
+                        .get(project)
+                        .is_none_or(|tombstone| row.updated_ms > *tombstone)
+            });
+        }
         *self.tombstones.write() = data;
+    }
+
+    pub fn incarnation_tombstones_snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
+    > {
+        self.incarnation_tombstones.read().clone()
+    }
+
+    pub fn incarnation_tombstones_load(
+        &self,
+        mut data: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
+        >,
+    ) {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        for tombstones in data.values_mut() {
+            for deleted_ms in tombstones.values_mut() {
+                if *deleted_ms > ceiling {
+                    *deleted_ms = now;
+                }
+            }
+        }
+        {
+            let mut map = self.map.write();
+            map.retain(|project, row| match row.incarnation {
+                Some(incarnation) => !data
+                    .get(project)
+                    .is_some_and(|tombstones| tombstones.contains_key(&incarnation)),
+                None => true,
+            });
+        }
+        *self.incarnation_tombstones.write() = data;
     }
 
     // (see merge_synced's equal-updated_ms arm)
 
-    /// Forget a project's settings (used when a project is deleted).
-    pub fn remove(&self, project: &str) {
-        let existed = self.map.write().remove(project).is_some();
-        // Record the deletion so it REPLICATES: without a tombstone, a peer
-        // still holding the row hands it straight back on the next sync tick
-        // (delete "doesn't stick"), and with wholesale-replace adoption the
-        // ABSENCE itself was indistinguishable from not-yet-created.
-        //
-        // But a REPEAT removal must not move the timestamp. Deletes are retried
-        // by design — the mesh cascade re-dispatches to peers it could not
-        // reach, and the deletion reconcile re-applies the tombstone on every
-        // tick — and tombstones merge MAX-WINS, so a re-stamp would ratchet the
-        // tombstone forward in time forever. A project legitimately RE-CREATED
-        // after its deletion would then find a tombstone NEWER than its own row
-        // and be deleted again, fleet-wide, by the very loop meant to converge
-        // the original delete. Stamp only when this call actually removed a row
-        // (a real, newly-observed deletion) or when nothing has recorded one
-        // yet; otherwise keep the original instant.
-        if existed || !self.tombstones.read().contains_key(project) {
-            self.tombstones
-                .write()
-                .insert(project.to_string(), now_ms());
+    pub fn tombstone_of_incarnation(
+        &self,
+        project: &str,
+        incarnation: fluid_core::ProjectIncarnation,
+    ) -> Option<u64> {
+        self.incarnation_tombstones
+            .read()
+            .get(project)
+            .and_then(|tombstones| tombstones.get(&incarnation))
+            .copied()
+    }
+
+    pub fn remove_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+    ) -> Result<ProjectSettings, ProjectIncarnationError> {
+        let mut map = self.map.write();
+        let active = map.get(project).ok_or_else(|| {
+            if self.tombstone_of_incarnation(project, expected).is_some() {
+                ProjectIncarnationError::Tombstoned
+            } else {
+                ProjectIncarnationError::Missing
+            }
+        })?;
+        match active.incarnation {
+            Some(incarnation) if incarnation == expected => {}
+            Some(active) => return Err(ProjectIncarnationError::Mismatch { active }),
+            None => return Err(ProjectIncarnationError::Legacy),
         }
+        let row = map.remove(project).ok_or(ProjectIncarnationError::Missing)?;
+        let now = now_ms();
+        let ceiling = now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS);
+        let mut all_tombstones = self.incarnation_tombstones.write();
+        let tombstones = all_tombstones.entry(project.to_string()).or_default();
+        let prior = tombstones.get(&expected).copied().unwrap_or(0).min(ceiling);
+        let deleted_ms = now
+            .max(row.updated_ms.min(ceiling).saturating_add(1))
+            .max(row.incarnation_created_ms.min(ceiling).saturating_add(1))
+            .max(prior.saturating_add(1))
+            .min(ceiling);
+        tombstones.insert(expected, deleted_ms);
+        Ok(row)
+    }
+
+    pub fn apply_delete_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        deleted_ms: u64,
+    ) -> Option<ProjectSettings> {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        let deleted_ms = deleted_ms.min(ceiling);
+        let mut map = self.map.write();
+        let removed = if map
+            .get(project)
+            .is_some_and(|row| row.incarnation == Some(expected))
+        {
+            map.remove(project)
+        } else {
+            None
+        };
+        let mut all_tombstones = self.incarnation_tombstones.write();
+        let current = all_tombstones
+            .entry(project.to_string())
+            .or_default()
+            .entry(expected)
+            .or_insert(deleted_ms);
+        if deleted_ms > *current {
+            *current = deleted_ms;
+        }
+        removed
+    }
+
+    /// Start a NEW user-requested deletion generation, even when this node has
+    /// no settings row. `observed_ms` is the newest deployment/settings version
+    /// the coordinator saw anywhere in the fleet; issuing strictly above it
+    /// makes this deletion dominate every object it authorized against. The
+    /// returned stamp must ride every retry/fanout of this one delete; receivers
+    /// apply it idempotently with [`Self::apply_delete`].
+    pub fn begin_delete(&self, project: &str, observed_ms: u64) -> u64 {
+        let now = now_ms();
+        let ceiling = now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS);
+        let removed_ms = self
+            .map
+            .write()
+            .remove(project)
+            .map(|row| row.updated_ms.min(ceiling))
+            .unwrap_or(0);
+        let observed_ms = observed_ms.min(ceiling);
+        let mut tombs = self.tombstones.write();
+        let prior = tombs.get(project).copied().unwrap_or(0);
+        let prior = if prior > ceiling {
+            tracing::warn!(project, deleted_ms = prior, ceiling_ms = ceiling, "discarding implausibly future prior project tombstone before issuing delete generation");
+            now
+        } else {
+            prior
+        };
+        let deleted_ms = now
+            .max(observed_ms.saturating_add(1))
+            .max(removed_ms.saturating_add(1))
+            .max(prior.saturating_add(1));
+        tombs.insert(project.to_string(), deleted_ms);
+        drop(tombs);
+        Self::remove_relational(project, deleted_ms);
+        deleted_ms
+    }
+
+    /// Apply one already-issued deletion generation. A retry with the same
+    /// stamp cannot ratchet the tombstone forward; a row causally recreated
+    /// after that stamp survives.
+    pub fn apply_delete(&self, project: &str, deleted_ms: u64) -> bool {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        let deleted_ms = if deleted_ms > ceiling {
+            tracing::warn!(
+                project,
+                deleted_ms,
+                ceiling_ms = ceiling,
+                "clamping implausibly future project delete generation to the ceiling"
+            );
+            // Monotone clamp: rewinding to local `now` made the "immutable
+            // generation" node-dependent (issuer stored T+11s, receiver
+            // stored T) and split the fleet on which records the delete
+            // dominates (adversarial finding). The boundary gate
+            // `valid_delete_generation` already rejects these loudly; this is
+            // the store-layer match for any caller that skips it.
+            ceiling
+        } else {
+            deleted_ms
+        };
+        let removed = {
+            let mut map = self.map.write();
+            match map.get(project) {
+                Some(row) if row.updated_ms > deleted_ms => false,
+                Some(_) => {
+                    map.remove(project);
+                    true
+                }
+                None => false,
+            }
+        };
+        let mut tombs = self.tombstones.write();
+        let current = tombs.entry(project.to_string()).or_insert(deleted_ms);
+        if deleted_ms > *current {
+            *current = deleted_ms;
+        }
+        drop(tombs);
+        // An older delete must not erase the relational identity of a row that
+        // already proves a later recreation on this node.
+        if self
+            .map
+            .read()
+            .get(project)
+            .map_or(true, |row| row.updated_ms <= deleted_ms)
+        {
+            Self::remove_relational(project, deleted_ms);
+        }
+        removed
+    }
+
+    fn remove_relational(project: &str, deleted_ms: u64) {
         let project = project.to_string();
         if let Ok(h) = tokio::runtime::Handle::try_current() {
-            h.spawn(async move { crate::relational::remove_project(&project).await });
+            h.spawn(async move { crate::relational::remove_project(&project, deleted_ms).await });
         }
     }
 
@@ -583,34 +1020,147 @@ impl ProjectStore {
     /// stamp `updated_ms`, so the replication merge always sees a fresh key
     /// for the row that actually changed.
     fn touch<'a>(
+        &self,
         m: &'a mut HashMap<String, ProjectSettings>,
         project: &str,
     ) -> &'a mut ProjectSettings {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        let tombstone_ms = {
+            let mut tombstones = self.tombstones.write();
+            let ms = tombstones.get(project).copied().unwrap_or(0);
+            if ms > ceiling {
+                tracing::warn!(
+                    project,
+                    deleted_ms = ms,
+                    ceiling_ms = ceiling,
+                    "normalizing implausibly future project tombstone before mutation"
+                );
+                tombstones.insert(project.to_string(), now);
+                now
+            } else {
+                ms
+            }
+        };
         let s = m.entry(project.to_string()).or_default();
-        // STRICTLY monotonic: two writes to the same row inside one wall-clock
-        // millisecond (or a write right after adopting a peer's newer row) must
-        // still advance the stamp, or the replication merge can't tell them
-        // apart. Witnessed live: three nodes held DIFFERENT env sets for one
-        // project at the IDENTICAL updated_ms, and the `>=`-keeps-local merge
-        // stranded the divergence permanently — a freshly added var was
-        // invisible on whichever node round-robin picked.
-        s.updated_ms = now_ms().max(s.updated_ms.saturating_add(1));
+        if s.updated_ms > ceiling {
+            tracing::warn!(
+                project,
+                updated_ms = s.updated_ms,
+                ceiling_ms = ceiling,
+                "normalizing implausibly future project row before mutation"
+            );
+            s.updated_ms = now;
+        }
+        // STRICTLY monotonic across both live rows and retained tombstones. A
+        // causal recreation must be newer than the delete it supersedes, even
+        // when wall time has moved backwards or the tombstone came from a peer.
+        s.updated_ms = now
+            .max(s.updated_ms.saturating_add(1))
+            .max(tombstone_ms.saturating_add(1));
         s
+    }
+
+    fn mutate_exact<R>(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        apply: impl FnOnce(&mut ProjectSettings) -> R,
+    ) -> Result<R, ProjectIncarnationError> {
+        let mut map = self.map.write();
+        let row = map.get_mut(project).ok_or_else(|| {
+            if self.tombstone_of_incarnation(project, expected).is_some() {
+                ProjectIncarnationError::Tombstoned
+            } else {
+                ProjectIncarnationError::Missing
+            }
+        })?;
+        match row.incarnation {
+            Some(active) if active == expected => {
+                row.updated_ms = now_ms().max(row.updated_ms.saturating_add(1));
+                Ok(apply(row))
+            }
+            Some(active) => Err(ProjectIncarnationError::Mismatch { active }),
+            None => Err(ProjectIncarnationError::Legacy),
+        }
+    }
+
+    pub fn set_build_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        build: BuildConfig,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.build = build)
+    }
+
+    pub fn set_functions_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        functions: FunctionSettings,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.functions = functions)
+    }
+
+    pub fn set_inference_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        spec: Option<InferenceSpec>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.inference = spec)
+    }
+
+    pub fn set_browser_db_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        spec: Option<fluid_core::BrowserDbPolicy>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.browser_db = spec)
+    }
+
+    pub fn set_container_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        spec: Option<ContainerSettings>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.container = spec)
+    }
+
+    pub fn set_dedicated_ipv4_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        allocation: Option<fluid_core::DedicatedIpv4>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.dedicated_ipv4 = allocation)
+    }
+
+    pub fn set_git_ci_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        status: GitCiStatus,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.git_ci = Some(status))
     }
 
     pub fn set_build(&self, project: &str, build: BuildConfig) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).build = build;
+        self.touch(&mut m, project).build = build;
     }
 
     pub fn set_functions(&self, project: &str, f: FunctionSettings) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).functions = f;
+        self.touch(&mut m, project).functions = f;
     }
 
     pub fn set_inference(&self, project: &str, spec: Option<InferenceSpec>) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).inference = spec;
+        self.touch(&mut m, project).inference = spec;
     }
 
     /// See [`ProjectSettings::browser_db`]. `None` clears the dashboard-managed
@@ -618,7 +1168,7 @@ impl ProjectStore {
     /// an explicit fluid.json block, which still wins on the next build.
     pub fn set_browser_db(&self, project: &str, spec: Option<fluid_core::BrowserDbPolicy>) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).browser_db = spec;
+        self.touch(&mut m, project).browser_db = spec;
     }
 
     /// Mint/rotate/clear one of this project's `browser_db` REST credentials.
@@ -632,12 +1182,28 @@ impl ProjectStore {
         token: Option<BrowserDbRestToken>,
     ) {
         let mut m = self.map.write();
-        let s = Self::touch(&mut m, project);
+        let s = self.touch(&mut m, project);
         if public {
             s.browser_db_rest_public = token;
         } else {
             s.browser_db_rest_team = token;
         }
+    }
+
+    pub fn set_browser_db_rest_token_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        public: bool,
+        token: Option<BrowserDbRestToken>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            if public {
+                row.browser_db_rest_public = token;
+            } else {
+                row.browser_db_rest_team = token;
+            }
+        })
     }
 
     /// See [`ProjectSettings::container`]. `None` clears the dashboard-managed
@@ -646,7 +1212,7 @@ impl ProjectStore {
     /// precedent).
     pub fn set_container(&self, project: &str, spec: Option<ContainerSettings>) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).container = spec;
+        self.touch(&mut m, project).container = spec;
     }
 
     /// See [`ProjectSettings::dedicated_ipv4`]. Called exactly once per
@@ -657,68 +1223,59 @@ impl ProjectStore {
     /// a second Tencent purchase.
     pub fn set_dedicated_ipv4(&self, project: &str, alloc: Option<fluid_core::DedicatedIpv4>) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).dedicated_ipv4 = alloc;
+        self.touch(&mut m, project).dedicated_ipv4 = alloc;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).git_ci = Some(status);
+        self.touch(&mut m, project).git_ci = Some(status);
     }
 
     /// Add or update an env var (by key+target). Sensitive values are sealed
     /// (encrypted at rest) before storing, so they're persisted as secrets — never
     /// written to disk / the replicated snapshot in plaintext.
-    pub fn put_env(&self, project: &str, mut v: EnvVar) {
-        v.updated_ms = now_ms();
-        // A value that LOOKS like a real credential is treated as sensitive
-        // regardless of what the caller sent — closes a real plaintext-leak class
-        // where a user forgets to check "Sensitive" and the token is then served
-        // back in full by every settings/gitops read (live-witnessed: a GitHub PAT
-        // stored non-sensitive on a real project). Never downgrades an explicit
-        // sensitive=true.
-        if !v.sensitive && looks_like_secret(&v.value) {
-            v.sensitive = true;
-        }
-        let mut m = self.map.write();
-        let s = Self::touch(&mut m, project);
-        // EDIT semantics: sensitive values are masked to "" in every read, so the
-        // dashboard's editor can't echo them back. An upsert of an EXISTING key
-        // with an EMPTY value means "keep the stored value" (retarget/re-flag
-        // only) — never silently blank a secret. The kept value is already
-        // encrypted when the previous entry was sensitive (don't re-encrypt).
-        if v.value.is_empty() {
-            if let Some(prev) = s.env.iter().find(|e| e.key == v.key) {
-                v.value = prev.value.clone();
-                if v.sensitive && !prev.sensitive && !v.value.is_empty() {
-                    v.value = crate::secrets::encrypt(&v.value);
-                }
-            }
-        } else if v.sensitive {
-            v.value = crate::secrets::encrypt(&v.value);
-        }
-        // Upsert by KEY — one row per key, matching `delete_env` and the
-        // dashboard's list model. (Previously keyed by (key, target): editing a
-        // var's environment DUPLICATED the row, and the duplicate persisted —
-        // the "my variable disappeared/duplicated after I left the page" bug.)
-        if let Some(existing) = s.env.iter_mut().find(|e| e.key == v.key) {
-            *existing = v;
-        } else {
-            s.env.push(v);
-        }
+    pub fn put_env(&self, project: &str, value: EnvVar) {
+        let mut map = self.map.write();
+        upsert_env(self.touch(&mut map, project), value);
+    }
+
+    pub fn put_env_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        value: EnvVar,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| upsert_env(row, value))
     }
 
     pub fn delete_env(&self, project: &str, key: &str) {
-        if let Some(s) = self.map.write().get_mut(project) {
-            s.env.retain(|e| e.key != key);
+        let mut m = self.map.write();
+        let Some(s) = m.get(project) else {
+            return;
+        };
+        if !s.env.iter().any(|e| e.key == key) {
+            return;
         }
+        self.touch(&mut m, project).env.retain(|e| e.key != key);
+    }
+
+    pub fn delete_env_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        key: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.env.retain(|entry| entry.key != key)
+        })
     }
 
     pub fn set_team(&self, project: &str, team: &str) {
-        let root_dir = {
+        let (root_dir, updated_ms) = {
             let mut m = self.map.write();
-            let s = Self::touch(&mut m, project);
+            let s = self.touch(&mut m, project);
             s.team = team.to_string();
-            s.build.root_dir.clone()
+            (s.build.root_dir.clone(), s.updated_ms)
         };
         // Best-effort fleet-replicated mirror (see relational.rs's module doc):
         // the durable fix for a project being invisible on any node lacking
@@ -727,15 +1284,35 @@ impl ProjectStore {
         let (project, team, root_dir) = (project.to_string(), team.to_string(), root_dir);
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move {
-                crate::relational::set_project_team(&project, &team, &root_dir).await
+                crate::relational::set_project_team(&project, &team, &root_dir, updated_ms).await
             });
         }
+    }
+
+    pub fn set_team_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        team: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.team = team.to_string())
     }
 
     /// Persist the monorepo subdirectory so redeploys keep building it.
     pub fn set_root_dir(&self, project: &str, root_dir: &str) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).build.root_dir = root_dir.to_string();
+        self.touch(&mut m, project).build.root_dir = root_dir.to_string();
+    }
+
+    pub fn set_root_dir_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        root_dir: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.build.root_dir = root_dir.to_string()
+        })
     }
 
     /// The configured root/subdirectory for a project ("" if none).
@@ -760,17 +1337,37 @@ impl ProjectStore {
     /// project's first git deploy, or explicitly from project settings.
     pub fn set_production_branch(&self, project: &str, branch: &str) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).production_branch = branch.to_string();
+        self.touch(&mut m, project).production_branch = branch.to_string();
+    }
+
+    pub fn set_production_branch_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        branch: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.production_branch = branch.to_string()
+        })
     }
 
     pub fn set_preview_protection(&self, project: &str, on: bool) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).preview_protection = on;
+        self.touch(&mut m, project).preview_protection = on;
+    }
+
+    pub fn set_preview_protection_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        on: bool,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.preview_protection = on)
     }
 
     pub fn set_cron_enabled(&self, project: &str, on: bool) {
         let mut m = self.map.write();
-        Self::touch(&mut m, project).cron_enabled = on;
+        self.touch(&mut m, project).cron_enabled = on;
     }
 
     /// Whether this project's cron jobs are allowed to fire (default true —
@@ -815,10 +1412,17 @@ impl ProjectStore {
 
     pub fn add_domain(&self, project: &str, domain: String) {
         let mut m = self.map.write();
-        let s = Self::touch(&mut m, project);
+        let s = self.touch(&mut m, project);
         if !s.domains.contains(&domain) {
             s.domains.push(domain);
         }
+    }
+
+    /// Detach a domain from a project (idempotent).
+    pub fn remove_domain(&self, project: &str, domain: &str) {
+        let mut m = self.map.write();
+        let s = self.touch(&mut m, project);
+        s.domains.retain(|d| d != domain);
     }
 
     /// All (project, domain) pairs across projects.
@@ -867,39 +1471,36 @@ impl ProjectStore {
     }
 }
 
-/// Deterministic winner for two equal-`updated_ms` rows so replication
-/// converges instead of each node keeping its own. More env vars wins (a
-/// superset is the common real cause of an equal-stamp divergence); on an
-/// equal count, the larger content signature wins — both nodes compute the
-/// same, so they agree in one round.
-fn tie_break_take(local: &ProjectSettings, remote: &ProjectSettings) -> bool {
-    if remote.env.len() != local.env.len() {
-        return remote.env.len() > local.env.len();
-    }
-    // STABLE hash (FNV-1a), never `DefaultHasher`: two nodes on different
-    // binary versions must compute the IDENTICAL signature or they would pick
-    // different winners and oscillate. Order-independent (XOR-fold per row) so
-    // env-list ordering can't change the answer.
-    fn sig(s: &ProjectSettings) -> u64 {
-        let mut acc: u64 = 0;
-        for e in &s.env {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in e
-                .key
-                .bytes()
-                .chain([0])
-                .chain(e.value.bytes())
-                .chain([0])
-                .chain(e.target.bytes())
-            {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            acc ^= h;
+fn merge_take(local: &ProjectSettings, remote: &ProjectSettings) -> bool {
+    match (local.incarnation, remote.incarnation) {
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (Some(local_incarnation), Some(remote_incarnation))
+            if local_incarnation != remote_incarnation =>
+        {
+            (remote.incarnation_created_ms, remote_incarnation)
+                > (local.incarnation_created_ms, local_incarnation)
         }
-        acc
+        _ if remote.updated_ms != local.updated_ms => remote.updated_ms > local.updated_ms,
+        _ => tie_break_take(local, remote),
     }
-    sig(remote) > sig(local)
+}
+
+/// Deterministic winner for two equal-`updated_ms` rows so replication
+/// converges instead of each node keeping its own. Compare the canonical JSON
+/// encoding of the WHOLE row, not one field: equal-generation writes can differ
+/// in team, build config, domains, function policy, inference, database grants,
+/// or env. Both observers deserialize the same two rows and compute the same
+/// lexical winner, regardless of which one is local.
+fn tie_break_take(local: &ProjectSettings, remote: &ProjectSettings) -> bool {
+    match (serde_json::to_vec(local), serde_json::to_vec(remote)) {
+        (Ok(local), Ok(remote)) => remote > local,
+        // These structs contain no serialization-fallible values. Keep a
+        // deterministic direction even if a future field violates that
+        // invariant, rather than restoring the equal-version split brain.
+        (Err(_), Ok(_)) => true,
+        _ => false,
+    }
 }
 
 impl Default for ProjectStore {

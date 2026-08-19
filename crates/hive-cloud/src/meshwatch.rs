@@ -199,7 +199,7 @@ pub fn spawn(cloud: Arc<CloudState>) {
     static EVER_SAW_PEER: AtomicU64 = AtomicU64::new(0);
 
     tokio::spawn(async move {
-        let wedge_ms = wedge_secs().saturating_mul(1000);
+        let wedge_ms = wedge_secs().saturating_mul(1000) + node_stagger_ms(&cloud.node_name);
         let window_ms = degraded_window_ms();
         let trigger_ms = degraded_trigger_ms() + node_stagger_ms(&cloud.node_name);
         // Latched once this node was genuinely CONVERGED (visible above the
@@ -212,11 +212,24 @@ pub fn spawn(cloud: Arc<CloudState>) {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let h = cloud.mesh_health();
             let now = hive_core::now_ms();
+            // Service eligibility and direct outbound reachability are separate.
+            // Gossip restoration intentionally makes a live peer `healthy`
+            // again for DNS/placement, but keeps its observer-local cold mark
+            // until a direct exchange succeeds. Watch the latter here so the
+            // self-healer cannot erase its own wedge signal.
+            let direct_reachable_peers = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| {
+                    !n.is_self && n.healthy && !crate::health::is_cold(&cloud.registry, &n.id)
+                })
+                .count();
 
             // ---- Cumulative-degradation trigger (runs EVERY tick, before the
             // continuous-isolation logic's early continues) ----
             let degraded_now =
-                h.expected_peers > 0 && h.visible_healthy_peers < degraded_floor(h.expected_peers);
+                h.expected_peers > 0 && direct_reachable_peers < degraded_floor(h.expected_peers);
             samples.push_back((now, degraded_now));
             while samples
                 .front()
@@ -226,18 +239,19 @@ pub fn spawn(cloud: Arc<CloudState>) {
             }
             let degraded_ms: u64 = samples.iter().filter(|(_, d)| *d).count() as u64 * 30_000;
             let ever = EVER_SAW_PEER.load(Ordering::Relaxed) == 1;
-            if h.expected_peers > 0 && h.visible_healthy_peers > degraded_floor(h.expected_peers) {
+            if h.expected_peers > 0 && direct_reachable_peers > degraded_floor(h.expected_peers) {
                 ever_converged = true;
             }
             if degraded_now {
                 tracing::warn!(
-                    visible_healthy_peers = h.visible_healthy_peers,
+                    direct_reachable_peers,
+                    service_healthy_peers = h.visible_healthy_peers,
                     expected_peers = h.expected_peers,
                     floor = degraded_floor(h.expected_peers),
                     degraded_secs_in_window = degraded_ms / 1000,
                     trigger_secs = trigger_ms / 1000,
                     window_secs = window_ms / 1000,
-                    "mesh watchdog: node is severely DEGRADED (below the visible-peer floor)"
+                    "mesh watchdog: node is severely DEGRADED (direct reachability below the peer floor)"
                 );
             }
             if cumulative_should_restart(
@@ -255,30 +269,66 @@ pub fn spawn(cloud: Arc<CloudState>) {
                     );
                 } else {
                     tracing::error!(
-                        visible_healthy_peers = h.visible_healthy_peers,
+                        direct_reachable_peers,
+                        service_healthy_peers = h.visible_healthy_peers,
                         expected_peers = h.expected_peers,
                         degraded_secs_in_window = degraded_ms / 1000,
-                        "mesh watchdog: node is WEDGED BY FLAPPING — visible peers sat below                          the floor for the cumulative trigger within the window, the exact                          shape the continuous-isolation trigger structurally misses (every                          30s clear reset it; fc-bangkok rode that blind spot at 3/18 for 90                          minutes). Flushing state and exiting for a clean systemd restart.                          Set HIVE_MESH_DEGRADED_RESTART=0 to disable."
+                        "mesh watchdog: node is WEDGED BY FLAPPING — direct peer reachability sat below the floor for the cumulative trigger within the window, the exact shape the continuous-isolation trigger structurally misses. Flushing state and exiting for a clean systemd restart. Set HIVE_MESH_DEGRADED_RESTART=0 to disable."
                     );
                     crate::persist::flush_blocking();
                     std::process::exit(17);
                 }
             }
 
-            if h.visible_healthy_peers > 0 {
+            // ---- Boot-wedge arm: a node whose transport wedged BEFORE its
+            // first successful exchange never latches EVER_SAW_PEER, so both
+            // restart triggers stay disarmed forever while the node reports
+            // healthy — a permanent, invisible wedge (refutation finding F2).
+            // Distinguish it from a genuinely firewalled node by AUDIBILITY:
+            // hearing the fleet (audible >= floor) while never having
+            // reached anyone directly is a LOCAL wedge, which a restart
+            // heals; a firewalled node hears ~0 and correctly stays
+            // alone-and-loud. Fires at most once per process, past a
+            // convergence budget.
+            const BOOT_CONVERGENCE_BUDGET_MS: u64 = 15 * 60 * 1000;
+            if !ever
+                && h.expected_peers > 0
+                && h.uptime_ms > BOOT_CONVERGENCE_BUDGET_MS
+                && direct_reachable_peers == 0
+                && h.audible_peers >= degraded_floor(h.expected_peers)
+            {
+                if !restart_enabled() {
+                    tracing::error!(
+                        audible_peers = h.audible_peers,
+                        "mesh watchdog: BOOT WEDGE (fleet audible, zero direct exchanges since boot) — restart disabled by HIVE_MESH_WEDGE_RESTART=0"
+                    );
+                } else {
+                    tracing::error!(
+                        audible_peers = h.audible_peers,
+                        expected_peers = h.expected_peers,
+                        uptime_secs = h.uptime_ms / 1000,
+                        "mesh watchdog: node is BOOT-WEDGED — the fleet is gossip-audible but it has never completed a direct exchange since boot (transport wedged before first contact; the never-converged guards would otherwise leave it dark forever). Flushing state and exiting for a clean systemd restart. Set HIVE_MESH_WEDGE_RESTART=0 to disable."
+                    );
+                    crate::persist::flush_blocking();
+                    std::process::exit(17);
+                }
+            }
+
+            if direct_reachable_peers > 0 {
                 EVER_SAW_PEER.store(1, Ordering::Relaxed);
                 // Recovered (or never lost): clear the streak.
                 if ISOLATED_SINCE_MS.swap(0, Ordering::Relaxed) != 0 {
                     tracing::info!(
-                        visible_healthy_peers = h.visible_healthy_peers,
+                        direct_reachable_peers,
+                        service_healthy_peers = h.visible_healthy_peers,
                         expected_peers = h.expected_peers,
-                        "mesh watchdog: isolation cleared — peers visible again"
+                        "mesh watchdog: direct isolation cleared — peers reachable again"
                     );
                 }
                 continue;
             }
 
-            if !crate::state::mesh_isolated(h.expected_peers, h.visible_healthy_peers) {
+            if !crate::state::mesh_isolated(h.expected_peers, direct_reachable_peers) {
                 continue; // no peers expected: standalone node, nothing to do
             }
 
@@ -293,12 +343,14 @@ pub fn spawn(cloud: Arc<CloudState>) {
             let isolated_for_ms = now.saturating_sub(since);
 
             tracing::warn!(
+                direct_reachable_peers,
+                service_healthy_peers = h.visible_healthy_peers,
                 expected_peers = h.expected_peers,
                 isolated_secs = isolated_for_ms / 1000,
                 wedge_secs = wedge_ms / 1000,
                 ever_saw_peer = ever,
                 uptime_ms = h.uptime_ms,
-                "mesh watchdog: this node sees NONE of its expected peers"
+                "mesh watchdog: this node directly reaches NONE of its expected peers"
             );
 
             if !should_restart(h.expected_peers, ever, isolated_for_ms, wedge_ms) {

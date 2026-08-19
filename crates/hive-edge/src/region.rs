@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A node in the cloud (this machine or a peer MacBook).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,7 +114,8 @@ pub struct NodeInfo {
     pub last_seen_ms: u64,
     #[serde(default)]
     pub is_self: bool,
-    /// Measured round-trip latency to this node (ms); 0 for self.
+    /// Measured round-trip latency to this node (ms). Zero is local for self
+    /// and unknown for every non-self peer.
     #[serde(default)]
     pub latency_ms: u64,
     /// Health (responding to probes). Anycast skips unhealthy nodes.
@@ -343,9 +345,59 @@ pub fn continent_of(lat: f64, lon: f64) -> &'static str {
     "Other"
 }
 
+/// Maximum tolerated sender/receiver wall-clock skew for gossip liveness.
+/// Anything farther in the future is not freshness evidence: without this
+/// bound, `saturating_sub` reads an arbitrarily-future timestamp as age zero
+/// forever.
+pub const MAX_GOSSIP_FUTURE_SKEW_MS: u64 = 5_000;
+
+/// Is an origin timestamp both plausibly clocked and younger than `max_age_ms`?
+/// Shared by registry expiry and hive-cloud's health demotion/restoration so
+/// the three decisions cannot disagree on a poisoned future value.
+pub fn gossip_timestamp_fresh(last_seen_ms: u64, now_ms: u64, max_age_ms: u64) -> bool {
+    last_seen_ms <= now_ms.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS)
+        && now_ms.saturating_sub(last_seen_ms) < max_age_ms
+}
+
+/// Stable identity of a registry peer. `name` is the current mutable lookup
+/// label; `endpoint_id` is the immutable transport identity when the peer
+/// reports one.
+#[derive(Clone, Debug)]
+pub struct PeerIdentity {
+    pub name: String,
+    pub endpoint_id: Option<String>,
+}
+
+/// Receiver-time evidence from a peer's own direct gossip record. Health probes
+/// never update this clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerGossipEvidence {
+    pub endpoint_id: String,
+    pub last_received_ago: Duration,
+}
+
+/// Atomic outcome of a guarded health withdrawal.
+#[derive(Clone, Debug)]
+pub enum PeerDemotion {
+    Missing,
+    GossipAlive(PeerIdentity),
+    Demoted(PeerIdentity),
+}
+
+/// Sort key for a non-self peer latency. Zero and the restored sentinel mean
+/// "alive but unmeasured", so both follow every finite measured RTT.
+pub fn peer_latency_sort_key(latency_ms: u64) -> (u8, u64) {
+    if latency_ms == 0 || latency_ms >= NodeRegistry::RESTORED_LATENCY_MS {
+        (1, latency_ms)
+    } else {
+        (0, latency_ms)
+    }
+}
+
 pub struct NodeRegistry {
     me: RwLock<NodeInfo>,
     peers: RwLock<HashMap<String, NodeInfo>>,
+    gossip_received: RwLock<HashMap<String, Instant>>,
 }
 
 impl NodeRegistry {
@@ -353,6 +405,7 @@ impl NodeRegistry {
         Arc::new(NodeRegistry {
             me: RwLock::new(me),
             peers: RwLock::new(HashMap::new()),
+            gossip_received: RwLock::new(HashMap::new()),
         })
     }
 
@@ -514,76 +567,194 @@ impl NodeRegistry {
         me.last_oom_ms = last_oom_ms;
     }
 
-    /// When this peer was last heard from by gossip, epoch-ms. `None` for an
-    /// unknown id (self included — self is never in `peers`).
-    ///
-    /// Read as INDEPENDENT liveness evidence: `upsert_peer` refreshes this from
-    /// every gossip announce while deliberately leaving `healthy` alone, so a
-    /// fresh timestamp proves the peer is alive even while some local transport
-    /// to it is failing. `hive-cloud`'s `health::demote` gates every withdrawal
-    /// on it.
-    pub fn peer_last_seen_ms(&self, id: &str) -> Option<u64> {
-        self.peers.read().get(id).map(|p| p.last_seen_ms)
+    fn peer_name_for(peers: &HashMap<String, NodeInfo>, id: &str) -> Option<String> {
+        peers
+            .iter()
+            .find(|(_, peer)| peer.peer_id.as_deref() == Some(id))
+            .map(|(name, _)| name.clone())
+            .or_else(|| peers.contains_key(id).then(|| id.to_string()))
     }
 
-    /// Latency stamped on a peer restored by [`restore_health_if_gossip_fresh`].
-    ///
-    /// Deliberately NOT 0 (which sorts FIRST on the `anycast`/placement latency
-    /// key, so an unmeasured peer would out-rank every genuinely-probed one) and
-    /// not `u64::MAX` (`demote`'s value, which sorts last and is what we are
-    /// undoing). A restored peer is known-alive but unmeasured, so it ranks
-    /// behind every peer with a real RTT and ahead of the withdrawn.
-    pub const RESTORED_LATENCY_MS: u64 = 999;
+    fn identity(peer: &NodeInfo) -> PeerIdentity {
+        PeerIdentity {
+            name: peer.id.clone(),
+            endpoint_id: peer.peer_id.clone().filter(|id| !id.is_empty()),
+        }
+    }
 
-    /// Restore a peer's `healthy` flag when gossip proves it alive, WITHOUT
-    /// touching `last_seen_ms`.
-    ///
-    /// The counterpart to `hive-cloud`'s `health::demote`, and the half that was
-    /// missing: `demote` refuses to withdraw a peer whose gossip is fresh, but
-    /// nothing ever REVERSED a withdrawal once made, and only a successful probe
-    /// could clear it. A peer whose probe path is broken (stale cached addr,
-    /// wedged trunk) while its gossip keeps arriving therefore stayed unhealthy
-    /// for the life of the process — measured live as `audible_peers=15` beside
-    /// `visible_healthy_peers=6` on nine nodes at once, which is a fleet that has
-    /// heard from 15 peers in the last few seconds while reporting 6. Unhealthy
-    /// peers leave DNS and placement, so this silently shrank the fleet until an
-    /// operator restarted each node by hand.
-    ///
-    /// Applying the SAME evidence in both directions is what makes the state
-    /// self-healing: still gossiping ⇒ still served; gone quiet ⇒ aged out by
-    /// `nodes()`'s own staleness drop.
-    ///
-    /// `last_seen_ms` is deliberately preserved rather than refreshed (unlike
-    /// `set_health`): bumping it here would make this restore its OWN proof of
-    /// liveness on the next tick, so a peer that went silent would be kept
-    /// artificially alive forever instead of aging out.
-    ///
-    /// Returns `true` only when a withdrawal was actually reversed.
-    pub fn restore_health_if_gossip_fresh(&self, id: &str, max_age_ms: u64) -> bool {
+    pub fn peer_identity(&self, id: &str) -> Option<PeerIdentity> {
+        let peers = self.peers.read();
+        let name = Self::peer_name_for(&peers, id)?;
+        peers.get(&name).map(Self::identity)
+    }
+
+    pub fn gossip_evidence_snapshot(&self) -> Vec<PeerGossipEvidence> {
+        let received = self.gossip_received.read();
+        let now = Instant::now();
+        let mut snapshot = received
+            .iter()
+            .map(|(endpoint_id, at)| PeerGossipEvidence {
+                endpoint_id: endpoint_id.clone(),
+                last_received_ago: now.saturating_duration_since(*at),
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        snapshot
+    }
+
+    /// When this peer was last heard from by gossip, epoch-ms. Accepts either
+    /// the current registry name or the canonical endpoint id.
+    pub fn peer_last_seen_ms(&self, id: &str) -> Option<u64> {
+        let peers = self.peers.read();
+        let name = Self::peer_name_for(&peers, id)?;
+        peers.get(&name).map(|peer| peer.last_seen_ms)
+    }
+
+    /// Latency stamped on a peer restored by indirect gossip. It is an
+    /// impossible RTT sentinel and must remain behind every finite measurement.
+    pub const RESTORED_LATENCY_MS: u64 = u64::MAX - 1;
+
+    /// Apply a failed transport observation against the peer identity that was
+    /// actually attempted. Current registry evidence and mutation share one
+    /// write lock, so a concurrent refresh wins and a renamed/replaced peer is
+    /// never withdrawn by an old completion.
+    pub fn demote_if_gossip_stale(
+        &self,
+        id: &str,
+        expected_endpoint_id: Option<&str>,
+        observed_last_seen_ms: Option<u64>,
+        max_age_ms: u64,
+    ) -> PeerDemotion {
         let now = now_ms();
         let mut peers = self.peers.write();
-        let Some(p) = peers.get_mut(id) else {
-            return false;
+        let name = if let Some(expected) = expected_endpoint_id {
+            let Some(peer) = peers.get(id) else {
+                return PeerDemotion::Missing;
+            };
+            if peer.peer_id.as_deref() != Some(expected) {
+                return PeerDemotion::Missing;
+            }
+            id.to_string()
+        } else {
+            let Some(name) = Self::peer_name_for(&peers, id) else {
+                return PeerDemotion::Missing;
+            };
+            name
         };
-        if p.healthy || now.saturating_sub(p.last_seen_ms) >= max_age_ms {
-            return false;
+        let Some(peer) = peers.get_mut(&name) else {
+            return PeerDemotion::Missing;
+        };
+        let identity = Self::identity(peer);
+        let current_fresh = gossip_timestamp_fresh(peer.last_seen_ms, now, max_age_ms);
+        let observed_fresh =
+            observed_last_seen_ms.is_some_and(|seen| gossip_timestamp_fresh(seen, now, max_age_ms));
+        if current_fresh || observed_fresh {
+            return PeerDemotion::GossipAlive(identity);
         }
-        p.healthy = true;
-        if p.latency_ms == u64::MAX || p.latency_ms == 0 {
-            p.latency_ms = Self::RESTORED_LATENCY_MS;
-        }
-        true
+        peer.latency_ms = u64::MAX;
+        peer.healthy = false;
+        PeerDemotion::Demoted(identity)
     }
 
-    /// Record a peer's measured latency + health (from probing).
-    pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
-        if let Some(p) = self.peers.write().get_mut(id) {
-            p.latency_ms = latency_ms;
-            p.healthy = healthy;
-            if healthy {
-                p.last_seen_ms = now_ms();
+    /// Restore every currently-fresh withdrawn peer and capture each immutable
+    /// endpoint id while the same registry write lock still protects the change.
+    pub fn restore_gossip_fresh(&self, max_age_ms: u64) -> Vec<String> {
+        let now = now_ms();
+        let mut peers = self.peers.write();
+        let mut restored = Vec::new();
+        for peer in peers.values_mut() {
+            if peer.healthy || !gossip_timestamp_fresh(peer.last_seen_ms, now, max_age_ms) {
+                continue;
+            }
+            let Some(endpoint_id) = peer.peer_id.clone().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            peer.healthy = true;
+            if peer.latency_ms == u64::MAX || peer.latency_ms == 0 {
+                peer.latency_ms = Self::RESTORED_LATENCY_MS;
+            }
+            restored.push(endpoint_id);
+        }
+        restored
+    }
+
+    /// Read-only view of the peers `restore_gossip_fresh` WOULD restore
+    /// (unhealthy but gossip-fresh) — the candidate input to the restore
+    /// hysteresis in hive-cloud's health loop: a single fresh packet must
+    /// not reverse a withdrawal, or a lossy-announce peer flaps
+    /// DNS/placement on every round (refutation finding F5).
+    pub fn gossip_fresh_unhealthy(&self, max_age_ms: u64) -> Vec<String> {
+        let now = now_ms();
+        let peers = self.peers.read();
+        peers
+            .values()
+            .filter(|p| !p.healthy && gossip_timestamp_fresh(p.last_seen_ms, now, max_age_ms))
+            .filter_map(|p| p.peer_id.clone().filter(|id| !id.is_empty()))
+            .collect()
+    }
+
+    /// Restore ONLY the named candidates — the hysteresis-gated half of
+    /// `restore_gossip_fresh` (the streak gate lives in hive-cloud's health
+    /// loop, so the two paths apply the identical verdict mutation).
+    pub fn restore_only(&self, ids: &[String]) -> Vec<String> {
+        let mut peers = self.peers.write();
+        let mut restored = Vec::new();
+        for id in ids {
+            for peer in peers.values_mut() {
+                if peer.peer_id.as_deref() == Some(id.as_str()) && !peer.healthy {
+                    peer.healthy = true;
+                    if peer.latency_ms == u64::MAX || peer.latency_ms == 0 {
+                        peer.latency_ms = Self::RESTORED_LATENCY_MS;
+                    }
+                    restored.push(id.clone());
+                    break;
+                }
             }
         }
+        restored
+    }
+
+    fn update_health(peer: &mut NodeInfo, latency_ms: u64, healthy: bool) {
+        peer.latency_ms = if healthy && latency_ms == u64::MAX {
+            Self::RESTORED_LATENCY_MS
+        } else {
+            latency_ms
+        };
+        peer.healthy = healthy;
+        if healthy {
+            peer.last_seen_ms = now_ms();
+        }
+    }
+
+    /// Record measured health by current name or canonical endpoint id.
+    pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
+        let mut peers = self.peers.write();
+        let Some(name) = Self::peer_name_for(&peers, id) else {
+            return;
+        };
+        if let Some(peer) = peers.get_mut(&name) {
+            Self::update_health(peer, latency_ms, healthy);
+        }
+    }
+
+    /// Record a probe completion only while the captured name still denotes the
+    /// captured immutable endpoint.
+    pub fn set_health_if_endpoint(
+        &self,
+        name: &str,
+        expected_endpoint_id: &str,
+        latency_ms: u64,
+        healthy: bool,
+    ) -> bool {
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(name) else {
+            return false;
+        };
+        if peer.peer_id.as_deref() != Some(expected_endpoint_id) {
+            return false;
+        }
+        Self::update_health(peer, latency_ms, healthy);
+        true
     }
 
     /// Anycast selection: the optimal node to serve a request — the lowest-latency
@@ -591,7 +762,13 @@ impl NodeRegistry {
     /// falls through to the next-best healthy node).
     pub fn anycast(&self, preferred: Option<&str>) -> Option<NodeInfo> {
         let mut healthy: Vec<NodeInfo> = self.nodes().into_iter().filter(|n| n.healthy).collect();
-        healthy.sort_by_key(|n| n.latency_ms);
+        healthy.sort_by_key(|n| {
+            if n.is_self {
+                (0, 0)
+            } else {
+                peer_latency_sort_key(n.latency_ms)
+            }
+        });
         if let Some(region) = preferred {
             if let Some(n) = healthy.iter().find(|n| n.region == region) {
                 return Some(n.clone());
@@ -603,10 +780,13 @@ impl NodeRegistry {
     /// The full anycast routing table (healthy first, by latency).
     pub fn routing_table(&self) -> Vec<NodeInfo> {
         let mut nodes = self.nodes();
-        nodes.sort_by(|a, b| {
-            b.healthy
-                .cmp(&a.healthy)
-                .then(a.latency_ms.cmp(&b.latency_ms))
+        nodes.sort_by_key(|n| {
+            let latency = if n.is_self {
+                (0, 0)
+            } else {
+                peer_latency_sort_key(n.latency_ms)
+            };
+            (!n.healthy, latency)
         });
         nodes
     }
@@ -643,14 +823,46 @@ impl NodeRegistry {
     /// letting a relay evict-and-rename made the two names fight (last relay
     /// wins each gossip round, also live-witnessed: the mesh settled on the
     /// GHOST name while the process itself was announcing the real one).
-    pub fn upsert_peer_self_report(&self, peer: NodeInfo) {
-        if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
-            let pid = pid.to_string();
-            self.peers
-                .write()
-                .retain(|k, v| k == &peer.id || v.peer_id.as_deref() != Some(pid.as_str()));
+    pub fn upsert_peer_self_report(&self, mut peer: NodeInfo) {
+        let now = now_ms();
+        if peer.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
+            tracing::warn!(
+                node = %peer.id,
+                claimed_last_seen_ms = peer.last_seen_ms,
+                receiver_now_ms = now,
+                "peer self-report carried an implausibly future liveness timestamp; using direct receiver time"
+            );
+        } else if now.saturating_sub(peer.last_seen_ms) >= 30_000 {
+            tracing::warn!(
+                node = %peer.id,
+                claimed_last_seen_ms = peer.last_seen_ms,
+                receiver_now_ms = now,
+                "peer self-report clock is behind the registry freshness window; using direct receiver time"
+            );
         }
-        self.upsert_peer(peer);
+        // This exchange came from the peer itself, so receipt is stronger
+        // liveness evidence than either host's wall clock. Stamp exactly once at
+        // this direct boundary. Relayed copies never re-stamp (see `upsert_peer`),
+        // so a dead peer's last direct receipt still freezes and ages out.
+        peer.last_seen_ms = now;
+        if let Some(pid) = peer.peer_id.clone().filter(|s| !s.is_empty()) {
+            self.peers.write().retain(|name, existing| {
+                if name == &peer.id {
+                    existing.peer_id.as_deref() == Some(pid.as_str())
+                } else {
+                    existing.peer_id.as_deref() != Some(pid.as_str())
+                }
+            });
+            self.upsert_peer(peer);
+            let received_at = Instant::now();
+            let mut received = self.gossip_received.write();
+            received.retain(|_, at| {
+                received_at.saturating_duration_since(*at) <= Duration::from_secs(24 * 60 * 60)
+            });
+            received.insert(pid, received_at);
+        } else {
+            self.upsert_peer(peer);
+        }
     }
 
     /// Upsert a peer from a RELAYED copy (any non-self entry of another
@@ -661,6 +873,21 @@ impl NodeRegistry {
     /// pre-rename name and is dropped (see `upsert_peer_self_report`).
     pub fn upsert_peer(&self, mut peer: NodeInfo) {
         peer.is_self = false;
+        let now = now_ms();
+        if peer.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
+            // A relayed copy is not direct evidence from the named peer. If its
+            // clock is impossible, dropping it is safer than clamping on every
+            // relay hop (which would re-stamp a dead cached record to `now`
+            // forever). Direct reports use `upsert_peer_self_report`, which can
+            // safely clamp because the exchange itself proves current life.
+            tracing::warn!(
+                node = %peer.id,
+                claimed_last_seen_ms = peer.last_seen_ms,
+                receiver_now_ms = now,
+                "dropping relayed peer record with implausibly future liveness timestamp"
+            );
+            return;
+        }
         let mut peers = self.peers.write();
         if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
             let renamed_elsewhere = peers
@@ -671,20 +898,46 @@ impl NodeRegistry {
             }
         }
         if let Some(existing) = peers.get(&peer.id) {
+            let existing_endpoint = existing.peer_id.as_deref().filter(|id| !id.is_empty());
+            let incoming_endpoint = peer.peer_id.as_deref().filter(|id| !id.is_empty());
+            if existing_endpoint.is_some()
+                && incoming_endpoint.is_some()
+                && existing_endpoint != incoming_endpoint
+            {
+                return;
+            }
+            if incoming_endpoint.is_none() {
+                peer.peer_id.clone_from(&existing.peer_id);
+            }
             // Health + latency are owned by our OWN direct probes, never second-hand gossip.
             peer.healthy = existing.healthy;
             peer.latency_ms = existing.latency_ms;
+            // A poisoned value already resident from a pre-fix binary must not
+            // win this max forever. Normalize it once when any valid update for
+            // the peer arrives; `nodes()` also refuses it before then.
+            let existing_last_seen =
+                if existing.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
+                    tracing::warn!(
+                        node = %peer.id,
+                        claimed_last_seen_ms = existing.last_seen_ms,
+                        receiver_now_ms = now,
+                        "normalizing previously-stored future peer timestamp"
+                    );
+                    now
+                } else {
+                    existing.last_seen_ms
+                };
             // DNS attestations are only as good as the record they rode in on.
             // A STALER relayed copy must not overwrite a fresher self-report:
             // attestations change every prober round, so the same
             // last-relay-wins race that used to flap `guardian_iroh_addr`
             // Some -> None would here silently un-attest a working nameserver
             // and pull it out of a live delegation. Freshness decides.
-            if peer.last_seen_ms < existing.last_seen_ms {
+            if peer.last_seen_ms < existing_last_seen {
                 peer.dns_attest = existing.dns_attest.clone();
             }
-            // Keep the freshest origin timestamp seen (a relayed copy may arrive stale).
-            peer.last_seen_ms = peer.last_seen_ms.max(existing.last_seen_ms);
+            // Keep the freshest plausible origin timestamp seen.
+            peer.last_seen_ms = peer.last_seen_ms.max(existing_last_seen);
             // Never regress guardian_iroh_addr to None. A peer's OWN direct
             // announce carries its current value; a THIRD peer's relayed
             // /v1/nodes response (this same round, processed concurrently)
@@ -699,6 +952,9 @@ impl NodeRegistry {
                 peer.guardian_iroh_addr = existing.guardian_iroh_addr.clone();
             }
         }
+        if peer.healthy && peer.latency_ms == u64::MAX {
+            peer.latency_ms = Self::RESTORED_LATENCY_MS;
+        }
         peers.insert(peer.id.clone(), peer);
     }
 
@@ -710,7 +966,7 @@ impl NodeRegistry {
             .peers
             .read()
             .values()
-            .filter(|p| now.saturating_sub(p.last_seen_ms) < 30_000)
+            .filter(|p| gossip_timestamp_fresh(p.last_seen_ms, now, 30_000))
             .cloned()
             .collect();
         peers.sort_by(|a, b| a.region.cmp(&b.region).then(a.name.cmp(&b.name)));

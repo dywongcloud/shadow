@@ -1539,10 +1539,59 @@ export interface DomainRecord {
   nameservers: string[];
   ssl: SslCert;
   records: DnsRecord[];
+  /** Ownership-verification state for custom-domain attachment (null for
+   *  DNS-only records and pre-verification attachments). */
+  verify?: DomainVerify | null;
+}
+/** TXT-challenge ownership proof for a custom domain attach. The alias only
+ *  activates once `_hive-verify.<domain>` answers `txt_value` — re-proven at
+ *  every activation, never trusted from the UI. */
+export interface DomainVerify {
+  status: "pending" | "verified";
+  txt_name: string;
+  txt_value: string;
+  project: string;
+  created_ms: number;
+  checked_ms: number;
+  verified_ms: number;
+  last_probe: string;
 }
 export interface DomainDetail {
   domain: DomainRecord;
   connected: { project: string; domain: string }[];
+}
+
+/** Attach result from `POST /v1/projects/:p/domains` — attached immediately
+ *  (already verified) or pending with the TXT instructions. */
+export interface DomainAttachResult {
+  domain: string;
+  project: string;
+  attached: boolean;
+  status: "pending" | "verified";
+  verify?: DomainVerify;
+  instructions?: string;
+  probe?: string;
+}
+
+export function attachDomain(project: string, domain: string): Promise<DomainAttachResult> {
+  return apiSend<DomainAttachResult>("POST", `/v1/projects/${encodeURIComponent(project)}/domains`, { domain });
+}
+export function verifyDomainNow(domain: string): Promise<DomainAttachResult> {
+  return apiSend<DomainAttachResult>("POST", `/v1/domains/${encodeURIComponent(domain)}/verify`);
+}
+export function detachDomain(project: string, domain: string): Promise<{ detached: boolean }> {
+  return apiSend("DELETE", `/v1/projects/${encodeURIComponent(project)}/domains/${encodeURIComponent(domain)}`);
+}
+export interface NsRoster {
+  nameservers: string[];
+  /** False while the peer-attested nameserver set is still converging —
+   *  `nameservers` must not be presented to users until this is true. */
+  delegation_ready?: boolean;
+  edge_ipv4: string[];
+  edge_ipv6: string[];
+}
+export function fetchNsRoster(): Promise<NsRoster> {
+  return apiGet<NsRoster>("/v1/domains-nameserver-roster");
 }
 
 // ---- Billing & compute credits ----

@@ -188,6 +188,7 @@ pub struct CloudState {
     /// replicated to followers via `store_sync` so ANY advertised nameserver
     /// node can answer Let's Encrypt's TXT query. See [`crate::acme::AcmeChallengeStore`].
     pub acme_challenges: crate::acme::AcmeChallengeStore,
+    pub acme_http01: crate::acme::Http01Store,
     /// Hive's own native Queue backend for the Vercel WDK `World` interface
     /// (managed-world service) -- no external queue dependency.
     pub world_queue: Arc<crate::world_queue::WorldQueue>,
@@ -211,12 +212,14 @@ pub struct CloudState {
     /// node name -> that node's admin URL (learned via gossip). Lets the placement
     /// scheduler dispatch a deploy to a specific target node's admin.
     pub node_admins: RwLock<std::collections::HashMap<String, String>>,
-    /// Trusted peer iroh `EndpointId`s for P2P admission (#20). Seeded from
-    /// `HIVE_TRUSTED_NODE_IDS` and augmented from the gossip roster (whose iroh
-    /// addrs arrive over the operator-controlled, SSH-tunneled admin channel — a
-    /// sound trust root). The iroh accept loop rejects any peer not in here when
-    /// `HIVE_PEER_TRUST` enforcement is on.
+    /// Mutable P2P admission allowlist. Seeded from the canonical boot trust
+    /// roster; proof-gated hot joins may add identities at runtime.
     pub trusted_peer_ids: hive_p2p::TrustSet,
+    /// Boot-immutable active membership used by mesh liveness policy.
+    pub expected_peer_ids: std::collections::HashSet<iroh::EndpointId>,
+    /// Mixed-rollout bridge allowing relayed roster records to expand only the
+    /// mutable admission allowlist. Never affects expected membership.
+    pub relayed_trust_compat: bool,
     /// Gossip transport map: peer admin URL -> (node_id, iroh addr_json), learned
     /// from each roster exchange. Lets the gossip loop reach a peer over the iroh
     /// QUIC mesh (when `HIVE_GOSSIP_IROH` is set) instead of HTTP-over-SSH, once it
@@ -411,9 +414,9 @@ pub fn cp_degraded(last_ok_ms: u64, peer_count: usize, now_ms: u64, ttl_ms: u64)
 /// Live mesh-membership health, as reported by `CloudState::mesh_health`.
 #[derive(Clone, Serialize)]
 pub struct MeshHealth {
-    /// Peers this node is CONFIGURED to expect (from `HIVE_TRUSTED_NODE_IDS`,
-    /// excluding self) — static ground truth, independent of how this node was
-    /// launched.
+    /// Boot-configured active peers, excluding this node. A nonempty
+    /// `HIVE_EXPECTED_NODE_IDS` supplies the roster; otherwise the validated
+    /// boot `HIVE_TRUSTED_NODE_IDS` snapshot is used.
     pub expected_peers: usize,
     /// Of those, how many are visible + healthy in the LIVE gossip-derived
     /// registry right now.
@@ -421,8 +424,16 @@ pub struct MeshHealth {
     /// Gossip-fresh expected peers regardless of health verdict — see
     /// `mesh_health` for why this exists (wedge vs outage discrimination).
     pub audible_peers: usize,
-    /// True iff peers were expected but NONE are currently visible — the exact
-    /// shape of the node-a/node-b isolation incident (see `mesh_isolated`).
+    /// Healthy expected peers this node can DIRECTLY exchange with (not
+    /// observer-local cold). Gossip restoration keeps a wedged peer
+    /// service-`healthy`, so `visible_healthy_peers` alone reports a
+    /// transport-wedged node as converged — this is the field the
+    /// never-converged boot wedge hides behind (refutation finding F2), and
+    /// `isolated` derives from it, not from the restorable count.
+    pub direct_reachable_peers: usize,
+    /// True iff peers were expected but NONE are currently directly
+    /// reachable — the exact shape of the node-a/node-b isolation incident
+    /// (see `mesh_isolated`).
     pub isolated: bool,
     /// ms since this process started. Turns "sees only self" from an opaque
     /// log line into an answerable question: still within the normal
@@ -436,8 +447,8 @@ pub struct MeshHealth {
 
 /// Pure core of mesh-isolation detection (unit-testable without a node). Compares
 /// the LIVE, gossip-derived set of healthy peer identities actually visible right
-/// now against the EXPECTED trusted peer set, rather than this node's own
-/// self-reported `--peer` CLI list.
+/// now against the boot-immutable expected active peer set, rather than this node's
+/// own self-reported `--peer` CLI list.
 ///
 /// `cp_degraded` above is structurally blind to a specific failure class: a node
 /// launched with zero `--peer` args (peers "announce themselves" to it instead,
@@ -449,12 +460,46 @@ pub struct MeshHealth {
 /// packets on every OTHER node (logged only on the REJECTING side), and nothing
 /// ever surfaced "node-a can see zero of its expected fleet."
 ///
-/// `expected_peers` here comes from static config (`HIVE_TRUSTED_NODE_IDS`,
-/// present regardless of how the node was launched) instead of the dynamic peer
-/// list, so this closes the blind spot: a node with peers configured that
-/// currently sees none of them is isolated, full stop.
+/// `expected_peers` comes from `HIVE_EXPECTED_NODE_IDS` when nonempty, otherwise
+/// from an immutable boot snapshot of `HIVE_TRUSTED_NODE_IDS`. It never follows
+/// runtime authorization or discovery state, so a node that should have peers but
+/// currently sees none is isolated, full stop.
 pub fn mesh_isolated(expected_peers: usize, visible_healthy_peers: usize) -> bool {
     expected_peers > 0 && visible_healthy_peers == 0
+}
+
+fn configured_endpoint_ids(
+    name: &str,
+) -> anyhow::Result<std::collections::HashSet<iroh::EndpointId>> {
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(std::collections::HashSet::new()),
+        Err(error) => return Err(anyhow::anyhow!("{name} is not valid UTF-8: {error}")),
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry.parse::<iroh::EndpointId>().map_err(|error| {
+                anyhow::anyhow!("{name} contains invalid endpoint id {entry:?}: {error}")
+            })
+        })
+        .collect()
+}
+
+fn configured_bool_default_true(name: &str) -> anyhow::Result<bool> {
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(true),
+        Err(error) => return Err(anyhow::anyhow!("{name} is not valid UTF-8: {error}")),
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "{name} must be one of 1,true,yes,on,0,false,no,off"
+        )),
+    }
 }
 
 impl CloudState {
@@ -533,6 +578,23 @@ impl CloudState {
         hive: Arc<Hive>,
         firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
     ) -> Arc<CloudState> {
+        let configured_trusted_peer_ids = configured_endpoint_ids("HIVE_TRUSTED_NODE_IDS")
+            .unwrap_or_else(|error| panic!("invalid mesh trust configuration: {error}"));
+        let configured_expected_peer_ids = configured_endpoint_ids("HIVE_EXPECTED_NODE_IDS")
+            .unwrap_or_else(|error| panic!("invalid mesh membership configuration: {error}"));
+        let expected_peer_ids = if configured_expected_peer_ids.is_empty() {
+            configured_trusted_peer_ids.clone()
+        } else {
+            configured_expected_peer_ids
+        };
+        let relayed_trust_compat = configured_bool_default_true("HIVE_RELAYED_TRUST_COMPAT")
+            .unwrap_or_else(|error| panic!("invalid mesh trust compatibility configuration: {error}"));
+        if relayed_trust_compat {
+            tracing::warn!(
+                "relayed peer records may expand mutable authorization during mixed rollout; \
+                 set HIVE_RELAYED_TRUST_COMPAT=0 after every node has the complete trust roster"
+            );
+        }
         let cluster = crate::cluster::Cluster::new(node_name.clone());
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
@@ -636,6 +698,7 @@ impl CloudState {
             dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
             dns_probes: Arc::new(crate::dns_probe::NsProbes::new()),
             acme_challenges: crate::acme::AcmeChallengeStore::new(),
+            acme_http01: crate::acme::Http01Store::new(),
             world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
@@ -646,16 +709,14 @@ impl CloudState {
             git_index: crate::gitops::GitRepoIndex::new(),
             peers: RwLock::new(Vec::new()),
             node_admins: RwLock::new(std::collections::HashMap::new()),
-            trusted_peer_ids: {
-                // Seed the P2P trust allowlist from HIVE_TRUSTED_NODE_IDS (#20).
-                let mut set = std::collections::HashSet::new();
-                if let Ok(ids) = std::env::var("HIVE_TRUSTED_NODE_IDS") {
-                    for id in ids.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                        set.insert(id.to_string());
-                    }
-                }
-                std::sync::Arc::new(std::sync::RwLock::new(set))
-            },
+            trusted_peer_ids: std::sync::Arc::new(std::sync::RwLock::new(
+                configured_trusted_peer_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+            )),
+            expected_peer_ids,
+            relayed_trust_compat,
             peer_iroh: RwLock::new(std::collections::HashMap::new()),
             last_gossip_ok_ms: std::sync::atomic::AtomicU64::new(0),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
@@ -723,40 +784,61 @@ impl CloudState {
     /// Live mesh-membership health (see `mesh_isolated`'s doc for why this exists
     /// alongside `control_plane_degraded`, which a zero-`--peer` launch fools).
     pub fn mesh_health(&self) -> MeshHealth {
-        let self_pid = self.registry.me().peer_id;
-        let expected: std::collections::HashSet<String> = self
-            .trusted_peer_ids
-            .read()
-            .map(|g| {
-                g.iter()
-                    .filter(|id| Some((*id).as_str()) != self_pid.as_deref())
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let self_id = self
+            .registry
+            .me()
+            .peer_id
+            .and_then(|id| id.parse::<iroh::EndpointId>().ok());
+        let mut expected = self.expected_peer_ids.clone();
+        if let Some(self_id) = self_id {
+            expected.remove(&self_id);
+        }
         let fresh_nodes = self.registry.nodes();
-        // AUDIBLE peers: gossip-fresh (the registry drops >30s-stale rows)
-        // regardless of the healthy flag — the discriminator between "the
-        // fleet is alive and talking to us but our transport to it is broken"
-        // (a restart can help) and "the fleet is dark to us entirely"
-        // (partition/outage; a restart conjures nothing).
-        let audible = fresh_nodes
+        let audible: std::collections::HashSet<iroh::EndpointId> = fresh_nodes
             .iter()
-            .filter(|n| !n.is_self)
-            .filter_map(|n| n.peer_id.as_ref())
-            .filter(|pid| expected.contains(*pid))
-            .count();
-        let visible: std::collections::HashSet<String> = fresh_nodes
-            .into_iter()
-            .filter(|n| !n.is_self && n.healthy)
-            .filter_map(|n| n.peer_id)
-            .filter(|pid| expected.contains(pid))
+            .filter(|node| !node.is_self)
+            .filter_map(|node| node.peer_id.as_deref())
+            .filter_map(|id| id.parse().ok())
             .collect();
+        let healthy: std::collections::HashSet<iroh::EndpointId> = fresh_nodes
+            .iter()
+            .filter(|node| !node.is_self && node.healthy)
+            .filter_map(|node| node.peer_id.as_deref())
+            .filter_map(|id| id.parse().ok())
+            .collect();
+        let direct_freshness = std::time::Duration::from_secs(
+            std::env::var("HIVE_MESH_DIRECT_FRESH_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(120),
+        );
+        let direct: std::collections::HashSet<iroh::EndpointId> = self
+            .mesh
+            .read()
+            .clone()
+            .map(|pool| pool.dial_evidence_snapshot())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|evidence| {
+                evidence.last_success_ago.is_some_and(|success| {
+                    success <= direct_freshness
+                        && evidence
+                            .last_failure_ago
+                            .is_none_or(|failure| success < failure)
+                })
+            })
+            .filter_map(|evidence| evidence.endpoint_id.parse().ok())
+            .collect();
+        let audible_peers = expected.intersection(&audible).count();
+        let visible_healthy_peers = expected.intersection(&healthy).count();
+        let direct_reachable_peers = expected.intersection(&direct).count();
         MeshHealth {
-            audible_peers: audible,
+            audible_peers,
             expected_peers: expected.len(),
-            visible_healthy_peers: visible.len(),
-            isolated: mesh_isolated(expected.len(), visible.len()),
+            visible_healthy_peers,
+            direct_reachable_peers,
+            isolated: mesh_isolated(expected.len(), direct_reachable_peers),
             uptime_ms: hive_core::now_ms().saturating_sub(self.boot_ms),
         }
     }
@@ -822,8 +904,13 @@ impl CloudState {
             //    next gossip cycle and can admit + mesh-proxy it too.
             || self.gw.serves_host(host)
             || {
-                let sub = host.split(':').next().unwrap_or(host).split('.').next().unwrap_or(host);
-                self.peer_routes.read().contains_key(sub)
+                let h = host.split(':').next().unwrap_or(host);
+                let routes = self.peer_routes.read();
+                // Full-host first (custom domains), then the platform label
+                // scheme — a peer publishing `numo.gg` admits exactly that
+                // host, never the whole `numo.*` label space.
+                routes.contains_key(&h.to_ascii_lowercase())
+                    || routes.contains_key(h.split('.').next().unwrap_or(h))
             }
     }
 

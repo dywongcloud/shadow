@@ -2830,6 +2830,7 @@ async fn run_build(
         },
         tenant,
     );
+    crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
 
     // Record deployment ownership of each browser artifact now that the
     // deployment id exists (`deploy_full` mints it). The bytes are already
@@ -7286,6 +7287,7 @@ async fn register_building_placeholder(
         DeployState::Building,
         cloud.projects.team_of(project),
     );
+    crate::admin::causal_stamp_new_deployment(cloud, project, &info.id.0);
     crate::persist::persist(cloud);
     Some(info.id.to_string())
 }
@@ -7625,6 +7627,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         commit: Some(head.clone()),
         head_repo_url: None, // polling only ever tracks the project's own repo
         project: Some(project.clone()),
+        project_incarnation: None,
         creator: Some("git-poll".into()),
         production: true, // legacy field; classification uses target/branch
         target: None,     // branch-classified: production branch => production

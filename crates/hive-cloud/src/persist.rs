@@ -23,7 +23,7 @@ use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::project_settings::ProjectSettings;
+use crate::project_settings::{ProjectSettings, SyncedProjects};
 use crate::state::CloudState;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -52,6 +52,10 @@ pub struct PlatformSnapshot {
     pub rewrites: Vec<Rewrite>,
     #[serde(default)]
     pub teams: HashMap<String, crate::teams::Team>,
+    /// Permanent causal deletions for team aggregates. Absence cannot encode a
+    /// deletion because a peer may return after any bounded retention window.
+    #[serde(default)]
+    pub team_tombstones: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     pub webhooks: Vec<crate::webhooks::Webhook>,
     #[serde(default)]
@@ -68,6 +72,11 @@ pub struct PlatformSnapshot {
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub project_incarnation_tombstones: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
+    >,
     /// Hour/day consumption-breakdown rollups (Weekly/Monthly chart data) —
     /// minute-resolution buckets are excluded (short retention, refill within
     /// minutes; see metrics.rs's module doc comment for why).
@@ -156,15 +165,12 @@ fn peer_iroh_path() -> PathBuf {
 /// across restarts, so the SSH tunnels are no longer required for rendezvous.
 pub fn save_peer_iroh(map: &std::collections::HashMap<String, (String, String)>) {
     let dir = data_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
     let tmp = dir.join("peer_iroh.json.tmp");
-    let Ok(json) = serde_json::to_string(map) else {
+    let Ok(json) = serde_json::to_vec(map) else {
         return;
     };
-    if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, peer_iroh_path());
+    if let Err(error) = write_sidecar_atomic(&peer_iroh_path(), &tmp, &json) {
+        tracing::warn!(%error, "failed to persist mesh peer addresses");
     }
 }
 
@@ -193,15 +199,12 @@ fn peer_guardian_addr_path() -> PathBuf {
 /// this file, is when boot-seeding actually has something to work with.
 pub fn save_peer_guardian_addr(map: &std::collections::HashMap<String, String>) {
     let dir = data_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
     let tmp = dir.join("peer_guardian_addr.json.tmp");
-    let Ok(json) = serde_json::to_string(map) else {
+    let Ok(json) = serde_json::to_vec(map) else {
         return;
     };
-    if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, peer_guardian_addr_path());
+    if let Err(error) = write_sidecar_atomic(&peer_guardian_addr_path(), &tmp, &json) {
+        tracing::warn!(%error, "failed to persist Guardian peer addresses");
     }
 }
 
@@ -211,6 +214,30 @@ pub fn load_peer_guardian_addr() -> std::collections::HashMap<String, String> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn write_sidecar_atomic(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sidecar path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(dir)?;
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(tmp)?;
+        let mut writer = std::io::BufWriter::new(&file);
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn dirs_home() -> PathBuf {
@@ -247,6 +274,10 @@ pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, state_path())?;
+    // The rename is not crash-durable until the directory entry itself reaches
+    // stable storage. A power loss must not resurrect a row whose tombstone was
+    // already acknowledged and written.
+    std::fs::File::open(&dir)?.sync_all()?;
     // Write per-tenant namespace documents (the multi-tenant schema partition).
     let _ = save_namespaces(snap);
     // Replicate into the always-on GuardianDB (durable + peer-replicated copy).
@@ -324,8 +355,22 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for g in &snap.gitops {
         push(ns_norm(&g.tenant), "gitops", json!(g));
     }
-    // Note: teams are intentionally NOT a guardian-db collection — orgs/users
-    // (synced from the identity provider) are the source of truth for tenancy.
+    // Team aggregates are authoritative for membership/plan gates even though
+    // orgs/users mirror the identity provider. Include both rows and deletion
+    // generations in the namespace signature so a team-only mutation also
+    // refreshes GuardianDB's full rollback snapshot.
+    for (slug, team) in &snap.teams {
+        if !team.synthetic_seed {
+            push(ns_norm(slug), "teams", json!(team));
+        }
+    }
+    for (slug, deleted_ms) in &snap.team_tombstones {
+        push(
+            ns_norm(slug),
+            "team_tombstones",
+            json!({ "slug": slug, "deleted_ms": deleted_ms }),
+        );
+    }
 
     // Platform-level config under the reserved global namespace.
     let global = docs.entry("_global".into()).or_default();
@@ -372,10 +417,22 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
     // therefore write an account balance from before a ledger entry that is
     // already in the same file.
     let (billing_accounts, billing_ledger) = cloud.billing.snapshot();
+    let SyncedProjects {
+        rows: projects,
+        tombstones: project_tombstones,
+        incarnation_tombstones: project_incarnation_tombstones,
+    } = cloud.projects.snapshot_synced();
+    // ONE team read: live rows and tombstones share a lock and must describe one
+    // causal instant. Splitting the reads could persist a tombstone without the
+    // recreation that already superseded it (or vice versa).
+    let crate::teams::SyncedTeams {
+        rows: team_rows,
+        tombstones: team_tombstones,
+    } = cloud.teams.snapshot_synced();
     PlatformSnapshot {
         saved_ms: hive_core::now_ms(),
         deployments: cloud.gw.deployment_records(),
-        projects: cloud.projects.snapshot(),
+        projects: projects.into_iter().collect(),
         waf_rules: cloud.waf.rules(),
         ratelimit: {
             let s = cloud.ratelimit.stats();
@@ -384,12 +441,14 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         cron: cloud.cron.list(),
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
-        teams: cloud.teams.snapshot(),
+        teams: team_rows.into_iter().collect(),
+        team_tombstones,
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
         database_tombstones: cloud.databases.tombstones_snapshot(),
-        project_tombstones: cloud.projects.tombstones_snapshot(),
+        project_tombstones,
+        project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
         builds: cloud.builds.snapshot(),
         incidents: cloud.incidents.snapshot(),
@@ -530,9 +589,38 @@ pub fn flush_blocking() {
 
 /// Apply a loaded snapshot to a freshly constructed CloudState (boot restore).
 pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
+    cloud.projects.merge_synced(SyncedProjects {
+        rows: snap.projects.into_iter().collect(),
+        tombstones: snap.project_tombstones,
+        incarnation_tombstones: snap.project_incarnation_tombstones,
+    });
+    let project_authority = cloud.projects.snapshot_synced();
     let mut deployments = snap.deployments;
     // Restore in chronological order so the newest becomes the default.
     deployments.sort_by_key(|d| d.created_at_ms);
+    let before_authority_filter = deployments.len();
+    deployments.retain(|record| match record.project_incarnation {
+        Some(expected) => project_authority
+            .rows
+            .get(&record.project)
+            .is_some_and(|row| row.incarnation == Some(expected)),
+        None => match project_authority.rows.get(&record.project) {
+            Some(row) => row.incarnation.is_none(),
+            None => {
+                !project_authority.tombstones.contains_key(&record.project)
+                    && !project_authority
+                        .incarnation_tombstones
+                        .contains_key(&record.project)
+            }
+        },
+    });
+    let authority_rejected = before_authority_filter - deployments.len();
+    if authority_rejected > 0 {
+        tracing::warn!(
+            count = authority_rejected,
+            "persist::restore: skipped deployment records that lack active project-incarnation authority"
+        );
+    }
     let n = deployments.len();
     // Reconcile orphaned in-flight builds. A deployment/build persisted with
     // state Queued/Building was mid-flight in an async task on the PREVIOUS
@@ -615,7 +703,6 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             cloud.gw.restore(rec);
         }
     }
-    cloud.projects.load(snap.projects);
     // Re-apply every persisted custom-domain alias into the just-restored
     // `cloud.gw` — a runtime `POST /v1/projects/:p/domains` call only ever
     // mutated the in-memory alias table (`cloud.gw.add_alias`), never
@@ -629,6 +716,20 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // case once the real host's own restore re-adds it).
     let mut healed_domains = 0u32;
     for (project, domain) in cloud.projects.all_domains() {
+        // The heal must honor the ownership-verification gate exactly like a
+        // fresh activation: a pending (never-proven) attach is settings
+        // intent, not a route. Without this check every restart re-stole
+        // routing for unproven attaches fleet-wide (adversarial finding:
+        // attach-then-wait-for-a-roll hijacked any domain with zero proof).
+        // Attachments from before the gate existed have NO verify record —
+        // they are the deliberate grandfather clause and keep routing.
+        let routable = match cloud.domains.verify_of(&domain) {
+            Some(v) => v.status == "verified" && v.project == project,
+            None => true, // grandfathered pre-verification attach
+        };
+        if !routable {
+            continue;
+        }
         if cloud.gw.add_alias(&domain, &project) {
             healed_domains += 1;
         }
@@ -666,14 +767,18 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.cron.replace_all(snap.cron);
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
-    if !snap.teams.is_empty() {
-        cloud.teams.load(snap.teams);
-    }
+    // `restore` also runs from the asynchronous Guardian rollback guard, after
+    // this process may already have accepted newer writes. Merge by the Team
+    // aggregate's own generations; global snapshot `saved_ms` is not a causal
+    // order for an individual team and must never wholesale-regress it.
+    cloud.teams.merge_recovered(crate::teams::SyncedTeams {
+        rows: snap.teams.into_iter().collect(),
+        tombstones: snap.team_tombstones,
+    });
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.databases.tombstones_load(snap.database_tombstones);
-    cloud.projects.tombstones_load(snap.project_tombstones);
     cloud.metrics.rollup_load(snap.metrics_rollup);
     // BuildStore::load() already reconciles Queued/Building -> Error for its
     // own per-build log records internally (git.rs) -- no duplicate needed

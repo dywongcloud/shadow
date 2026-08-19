@@ -487,6 +487,7 @@ async fn restore_prefers_production_deployment_for_alias() {
             "preview".into()
         },
         state: fluid_core::DeployState::Ready,
+        project_incarnation: None,
         tenant: "personal".into(),
     };
 

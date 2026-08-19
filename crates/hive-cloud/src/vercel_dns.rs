@@ -602,6 +602,15 @@ pub fn desired_apps_affinity(
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (label, node) in owners {
+        // Custom full-host keys (a tenant's own domain, e.g. `api.example.com`)
+        // must never enter this computation at all: normalized to their first
+        // label they would squat platform-critical labels (`api`, `mail`,
+        // `status`…) with a specific record that beats the wildcard — the
+        // adversarial-review squat. Custom domains route via `peer_routes`/
+        // SNI; they need no apps-zone record.
+        if label.contains('.') {
+            continue;
+        }
         // Normalise to the FIRST DNS label: `served_hosts()` keys are already
         // bare labels, but a full host slipping in must not become a record
         // named `app.example.com` inside the apps zone.

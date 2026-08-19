@@ -150,7 +150,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // other arm here); team data carries no secrets beyond member emails,
         // which already ride /v1/nodes-adjacent surfaces mesh-wide.
         "/v1/teams/snapshot" if method == hive_p2p::GOSSIP_GET => {
-            serde_json::to_vec(&cloud.teams.snapshot()).unwrap_or_default()
+            // Rolling-upgrade shim expects the old bare-map shape. Feed it only
+            // authoritative rows; publishing the synthetic local fallback lets
+            // an older peer strip its provenance and relay it back as real.
+            serde_json::to_vec(&cloud.teams.snapshot_synced().rows).unwrap_or_default()
         }
         // Full IncidentStore snapshot for the same leader->follower sync
         // (identical shape and rationale as /v1/teams/snapshot above): incident
@@ -386,6 +389,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             )
             .await)
         }
+        "/v1/project-delete/capabilities" if method == hive_p2p::GOSSIP_GET => {
+            serde_json::to_vec(&serde_json::json!({ "delete_generation": "v1" }))
+                .unwrap_or_default()
+        }
         // Relocation reap (single hop): remove THIS node's superseded
         // PRODUCTION-lane records of the project — previews and settings stay.
         // A deliberately separate arm from the full delete below so a
@@ -426,6 +433,115 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             serde_json::to_vec(&serde_json::json!({ "project": project, "reaped": reaped }))
                 .unwrap_or_default()
         }
+        // Mesh domain activation / detach for owner nodes reachable only over
+        // iroh (the HTTP-admin-less fleet reality). Ordered LONGEST-PREFIX-
+        // FIRST so the /detach arm can't shadow the /activate one. Both run
+        // the same local helpers as the HTTP arms; team must own the project
+        // on this node's evidence (settings tag or a deployment record).
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.contains("/domains/")
+            && p.ends_with("/detach") =>
+        {
+            let rest = p
+                .trim_start_matches("/v1/projects/")
+                .trim_end_matches("/detach")
+                .trim_end_matches('/');
+            let mut parts = rest.splitn(2, "/domains/");
+            let project = parts.next().unwrap_or("").to_string();
+            let domain = parts
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
+                .unwrap_or_default();
+            let owner = cloud.projects.team_of(&project);
+            let owns = !team.is_empty()
+                && (crate::admin::norm(&owner) == team
+                    || cloud.gw.list().iter().any(|d| {
+                        d.project == project && crate::admin::record_tenant(&d.tenant) == team
+                    }));
+            if project.is_empty() || domain.is_empty() || !owns {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
+            }
+            cloud.gw.remove_alias(&domain);
+            crate::persist::persist(&cloud);
+            serde_json::to_vec(&serde_json::json!({
+                "domain": domain,
+                "project": project,
+                "detached": true,
+            }))
+            .unwrap_or_default()
+        }
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.contains("/domains/")
+            && p.ends_with("/activate") =>
+        {
+            let rest = p
+                .trim_start_matches("/v1/projects/")
+                .trim_end_matches("/activate")
+                .trim_end_matches('/');
+            let mut parts = rest.splitn(2, "/domains/");
+            let project = parts.next().unwrap_or("").to_string();
+            let domain = parts
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
+                .unwrap_or_default();
+            let owner = cloud.projects.team_of(&project);
+            let owns = !team.is_empty()
+                && (crate::admin::norm(&owner) == team
+                    || cloud.gw.list().iter().any(|d| {
+                        d.project == project && crate::admin::record_tenant(&d.tenant) == team
+                    }));
+            if project.is_empty() || domain.is_empty() || !owns {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
+            }
+            // The stored challenge must belong to THIS attach — the arm
+            // applies routing for whatever challenge is stored, and a
+            // mismatched one would pin another attach's proof onto this
+            // project (the HTTP arm's binding, applied fleet-side too).
+            if !cloud
+                .domains
+                .verify_of(&domain)
+                .is_some_and(|v| v.project == project)
+            {
+                return serde_json::to_vec(&serde_json::json!({
+                    "error": "no verification challenge links domain to project"
+                }))
+                .unwrap_or_default();
+            }
+            serde_json::to_vec(
+                &crate::admin::domain_activate_local(&cloud, &project, &domain).await,
+            )
+            .unwrap_or_default()
+        }
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
         // project on THIS node (or the project must be absent — idempotent).
@@ -460,13 +576,51 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 && cloud.gw.list().iter().any(|d| {
                     d.project == project && crate::admin::record_tenant(&d.tenant) == team
                 });
-            if project.is_empty() || !(owns_settings || owns_deploys) {
+            let owns_relational = !team.is_empty()
+                && crate::relational::projects_for_team(&team)
+                    .await
+                    .iter()
+                    .any(|p| p == &project);
+            if project.is_empty() || !(owns_settings || owns_deploys || owns_relational) {
                 return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
                     .unwrap_or_default();
             }
-            let removed = crate::admin::delete_project_local(&cloud, &project, &team).await;
-            serde_json::to_vec(&serde_json::json!({ "project": project, "removed": removed }))
-                .unwrap_or_default()
+            let delete_ms = match qparam(p, "delete_ms") {
+                Some(raw) => match raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|ms| crate::admin::valid_delete_generation(*ms))
+                {
+                    Some(ms) => ms,
+                    None => {
+                        return serde_json::to_vec(
+                            &serde_json::json!({ "error": "invalid delete generation" }),
+                        )
+                        .unwrap_or_default()
+                    }
+                },
+                None => {
+                    return serde_json::to_vec(
+                        &serde_json::json!({ "error": "delete generation required" }),
+                    )
+                    .unwrap_or_default()
+                }
+            };
+            let outcome =
+                crate::admin::delete_project_local(&cloud, &project, &team, delete_ms).await;
+            // Echo the STORED generation, never the requested one: a receiver
+            // that clamped an over-ceiling stamp must not let the coordinator
+            // record acceptance of a value this node did not store — the
+            // fleet would split on which records the generation dominates
+            // (adversarial finding).
+            let stored_ms = cloud.projects.tombstone_of(&project).unwrap_or(delete_ms);
+            serde_json::to_vec(&serde_json::json!({
+                "project": project,
+                "delete_ms": stored_ms,
+                "removed": outcome.removed.len(),
+                "recreated": outcome.recreated,
+            }))
+            .unwrap_or_default()
         }
         "/v1/fleet-deployments" => jb(crate::admin::fleet_deployments(State(cloud.clone())).await),
         "/v1/leases" => jb(crate::admin::leases_get(State(cloud.clone())).await),
@@ -1341,10 +1495,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 )),
             }
         }
-        // Mirror of the allocate arm above, for release — see
-        // `release_raw_ports_coordinated`'s doc for why release must also be
-        // leader-coordinated (a non-leader-only release would leak the claim
-        // in the leader's authoritative registry forever).
+        // Mirror of the allocate arm above, for permanent retirement — the
+        // `/release` path and additive `released` response field are retained
+        // for rolling compatibility, but the allocator never re-grants a
+        // retired number. See `release_raw_ports_coordinated`.
         "/v1/raw-ports/release" if method == hive_p2p::GOSSIP_POST => {
             if !cloud.is_control_plane_leader() {
                 return jb(axum::Json(
@@ -1357,8 +1511,24 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             }
             match serde_json::from_slice::<Req>(body) {
                 Ok(req) => {
-                    let released = crate::raw_ports::release_raw_ports(&req.project);
-                    jb(axum::Json(serde_json::json!({ "released": released })))
+                    // Retire only when this leader holds NO live settings row
+                    // for the project (tombstoned or absent): retirement is
+                    // PERMANENT (numbers are never re-granted), so releasing
+                    // a LIVE project's ports on any trusted peer's say-so
+                    // would force a port swap nobody asked for (adversarial
+                    // finding). The legitimate flow always reaches here after
+                    // the project's delete, so a live row is exactly the
+                    // attack/bug case.
+                    if cloud.projects.get_if_set(&req.project).is_some() {
+                        return jb(axum::Json(serde_json::json!({
+                            "error": "project is live on this leader — refusing permanent port retirement"
+                        })));
+                    }
+                    let retired = crate::raw_ports::release_raw_ports(&req.project);
+                    jb(axum::Json(serde_json::json!({
+                        "retired": &retired,
+                        "released": &retired,
+                    })))
                 }
                 Err(e) => jb(axum::Json(
                     serde_json::json!({ "error": format!("malformed request: {e}") }),

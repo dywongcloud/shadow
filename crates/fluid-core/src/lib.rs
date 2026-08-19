@@ -13,6 +13,40 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectIncarnation(Uuid);
+
+impl ProjectIncarnation {
+    pub fn mint() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn path_component(self) -> String {
+        self.0.simple().to_string()
+    }
+}
+
+impl std::str::FromStr for ProjectIncarnation {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+impl std::fmt::Display for ProjectIncarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.simple())
+    }
+}
+
+impl std::fmt::Debug for ProjectIncarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeploymentId(pub String);
 
@@ -2059,6 +2093,8 @@ impl Default for DeployState {
 pub struct DeployRecord {
     pub id: String,
     pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_incarnation: Option<ProjectIncarnation>,
     pub root: String,
     pub manifest: Manifest,
     pub created_at_ms: u64,
@@ -2086,6 +2122,7 @@ pub struct DeployRecord {
 pub struct Deployment {
     pub id: DeploymentId,
     pub project: String,
+    pub project_incarnation: Option<ProjectIncarnation>,
     /// Host path to deployment files (mock backend serves from here).
     pub root: std::path::PathBuf,
     pub manifest: Manifest,
@@ -2115,6 +2152,8 @@ pub struct Deployment {
 pub struct DeployRequest {
     pub root: String,
     pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_incarnation: Option<ProjectIncarnation>,
     #[serde(default)]
     pub creator: Option<String>,
     #[serde(default)]
@@ -2153,6 +2192,8 @@ pub struct GitDeployRequest {
     pub head_repo_url: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_incarnation: Option<ProjectIncarnation>,
     #[serde(default)]
     pub creator: Option<String>,
     #[serde(default = "default_prod")]
@@ -2296,6 +2337,8 @@ fn default_prod() -> bool {
 pub struct DeploymentInfo {
     pub id: DeploymentId,
     pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_incarnation: Option<ProjectIncarnation>,
     pub functions: Vec<String>,
     pub created_at_ms: u64,
     /// Convenience: the project (production-domain) Host alias `<project>.localhost`.

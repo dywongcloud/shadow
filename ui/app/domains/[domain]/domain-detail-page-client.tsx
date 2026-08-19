@@ -1,15 +1,16 @@
 "use client";
 
-import { useState, use } from "react";
+import { useState, use, useEffect } from "react";
 import Link from "next/link";
 import {
   ChevronRight, RefreshCw, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
-  Pencil, X, DownloadCloud, FileUp, Check,
+  Pencil, X, DownloadCloud, FileUp, Check, AlertTriangle, Link2,
 } from "lucide-react";
-import { Card, Button, Input, Triangle } from "@/components/ui";
+import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
 import { Switch } from "@/components/ui";
-import { apiGet, apiSend, usePoll, type DomainDetail, type DnsRecord, type Deployment } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type Deployment, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { toast } from "@/components/toast";
+import { timeAgo, copyText } from "@/lib/utils";
 
 interface ScanRecord { name: string; type: string; value: string; ttl: number; priority: number | null }
 
@@ -29,6 +30,10 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
     return <div className="py-20 text-center text-sm text-secondary"><Loader2 className="mx-auto h-5 w-5 animate-spin" /></div>;
   }
   const d = data.domain;
+  // A domain with a real attach flow (`verify`) has no registrar/renewal/SSL
+  // state on the platform — those record fields are legacy simulated
+  // placeholders and must not render next to the real verification card.
+  const attached = !!d.verify;
 
   return (
     <div className="pb-24">
@@ -45,7 +50,7 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       <div className="mb-6 flex items-start justify-between">
         <h1 className="text-3xl font-semibold tracking-tight">{domain}</h1>
         <div className="flex items-center gap-2">
-          <Button>Renew Domain</Button>
+          {!attached && <Button>Renew Domain</Button>}
           <button className="flex h-9 w-9 items-center justify-center rounded-md border border-border-strong text-muted hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
         </div>
       </div>
@@ -53,12 +58,17 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       {/* Meta row */}
       <div className="mb-8 grid grid-cols-2 gap-y-4 border-b border-border pb-6 text-sm sm:grid-cols-3 lg:grid-cols-6">
         <Meta label="Expiration Date" value={<span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span>} />
-        <Meta label="Renewal Price" value={d.renewal_price} />
-        <Meta label="Registrar" value={<span className="flex items-center gap-1.5"><Triangle className="h-4 w-4" /> {d.registrar}</span>} />
-        <Meta label="Auto Renewal" value={<AutoRenew domain={domain} on={d.auto_renew} onChange={refresh} />} />
+        {!attached && <Meta label="Renewal Price" value={d.renewal_price} />}
+        {!attached && <Meta label="Registrar" value={<span className="flex items-center gap-1.5"><Triangle className="h-4 w-4" /> {d.registrar}</span>} />}
+        {!attached && <Meta label="Auto Renewal" value={<AutoRenew domain={domain} on={d.auto_renew} onChange={refresh} />} />}
         <Meta label="Age" value={timeAgo(d.created_ms)} />
         <Meta label="OpenEdge CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
       </div>
+
+      {/* Ownership verification (custom-domain attachment) */}
+      {d.verify && (
+        <VerifyCard domain={domain} v={d.verify} onChange={refresh} />
+      )}
 
       {/* Connected Projects */}
       <Section title="Connected Projects" desc="Subdomains that are connected to projects on this team." action={<Button variant="outline" onClick={() => setConnectOpen(true)}>Connect</Button>}>
@@ -83,9 +93,11 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       <MigrateDns domain={domain} onChange={refresh} />
 
       {/* Nameservers */}
-      <Nameservers domain={domain} nameservers={d.nameservers} onChange={refresh} />
+      <Nameservers domain={domain} nameservers={d.nameservers} attached={attached} onChange={refresh} />
 
-      {/* SSL Certificates */}
+      {/* SSL Certificates — simulated placeholder data, only meaningful for
+          legacy DNS-only records (no attach flow). */}
+      {!attached && (
       <Section title="SSL Certificates" desc="By default, OpenEdge issues and auto-renews a free SSL certificate for your domains.">
         <Card className="p-0">
           <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
@@ -104,11 +116,14 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
           </div>
         </Card>
       </Section>
+      )}
 
-      {/* Registrant */}
+      {/* Registrant — simulated WHOIS/registrar copy, legacy DNS-only only. */}
+      {!attached && (
       <Section title="Registrant Information" desc="We collect this information to meet ICANN requirements and establish you as the legal domain holder." action={<Button variant="outline">Manage WHOIS Privacy</Button>}>
         <Card className="p-5 text-sm text-secondary">WHOIS privacy is enabled — your contact details are protected.</Card>
       </Section>
+      )}
 
       <ConnectDomain domain={domain} open={connectOpen} onClose={() => setConnectOpen(false)} onChange={refresh} />
     </div>
@@ -120,6 +135,99 @@ function Meta({ label, value }: { label: string; value: React.ReactNode }) {
     <div>
       <div className="text-xs text-muted">{label}</div>
       <div className="mt-1 text-sm">{value}</div>
+    </div>
+  );
+}
+
+/** The ownership-verification card for a custom-domain attachment: pending
+ *  shows the TXT to add (with copy + manual re-check); verified shows the
+ *  live state and offers detach. */
+function VerifyCard({ domain, v, onChange }: { domain: string; v: import("@/lib/api").DomainVerify; onChange: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const verified = v.status === "verified";
+
+  async function reVerify() {
+    setBusy(true);
+    try {
+      const r = await verifyDomainNow(domain);
+      if (r.status !== "verified") {
+        toast(`Not verified yet — ${r.probe ?? "DNS still propagating"}`, {});
+      } else {
+        toast(`${domain} verified and live`, { tone: "blue" });
+      }
+      onChange();
+    } catch (e) {
+      toast(`Verify failed: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function detach() {
+    if (!confirm(`Detach ${domain} from project "${v.project}"? The domain stops routing here immediately (its DNS records page stays).`)) return;
+    setBusy(true);
+    try {
+      await detachDomain(v.project, domain);
+      toast(`${domain} detached`, { tone: "blue" });
+      onChange();
+    } catch (e) {
+      toast(`Couldn't detach: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className={`mb-10 rounded-lg border p-4 ${verified ? "border-emerald-500/30 bg-emerald-500/5" : "border-amber-500/40 bg-amber-500/5"}`}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          {verified
+            ? <Badge tone="green"><ShieldCheck className="h-3.5 w-3.5" /> Verified — live on {v.project}</Badge>
+            : <Badge tone="amber"><AlertTriangle className="h-3.5 w-3.5" /> Ownership not proven yet</Badge>}
+        </div>
+        <div className="flex items-center gap-2">
+          {!verified && (
+            <Button variant="outline" onClick={reVerify} disabled={busy}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Verify now
+            </Button>
+          )}
+          <Button variant="danger" onClick={detach} disabled={busy}>
+            <Link2 className="h-4 w-4" /> Detach
+          </Button>
+        </div>
+      </div>
+      {!verified && (
+        <div className="mt-3">
+          <p className="text-xs text-secondary">
+            Routing stays off until this domain proves ownership. Add the TXT record below at your DNS provider —
+            verification then completes automatically (checked continuously).
+          </p>
+          <div className="mt-2 flex items-start gap-3 rounded-md border border-border bg-card p-3">
+            <div className="min-w-0 flex-1">
+              <div className="font-mono text-xs text-secondary">{v.txt_name}</div>
+              <div className="break-all font-mono text-xs text-fg">{v.txt_value}</div>
+              <div className="mt-0.5 text-[11px] text-muted">TXT · exact name and value · last check: {v.last_probe || "not yet"}</div>
+            </div>
+            <button
+              onClick={async () => {
+                if (await (await import("@/lib/utils")).copyText(`${v.txt_name}  ${v.txt_value}`)) {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1200);
+                }
+              }}
+              className="shrink-0 text-muted hover:text-fg"
+              title="Copy TXT"
+            >
+              {copied ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+            </button>
+          </div>
+        </div>
+      )}
+      {verified && v.verified_ms > 0 && (
+        <p className="mt-2 text-xs text-muted">Verified {timeAgo(v.verified_ms)} ago · attached to project {v.project}</p>
+      )}
     </div>
   );
 }
@@ -372,6 +480,8 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
   const [sub, setSub] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<DomainAttachResult | null>(null);
+  const [copied, setCopied] = useState(false);
   if (!open) return null;
   const fqdn = sub.trim() ? `${sub.trim()}.${domain}` : domain;
 
@@ -379,9 +489,55 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
     if (!project) { setErr("Pick a project."); return; }
     setBusy(true); setErr("");
     try {
-      await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/domains`, { domain: fqdn });
-      onClose(); setProject(""); setSub(""); onChange();
+      const r = await attachDomain(project, fqdn);
+      onChange();
+      if (r.status === "pending" && r.verify) {
+        // Attached but not live: ownership TXT is outstanding — show it
+        // instead of closing as if the domain were already routed.
+        setPending(r);
+      } else {
+        onClose(); setProject(""); setSub(""); setPending(null);
+      }
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
+  }
+
+  if (pending?.verify) {
+    return (
+      <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+        <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold">Verify ownership</h3>
+            <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button>
+          </div>
+          <p className="mt-1 text-sm text-secondary">
+            <span className="font-mono">{fqdn}</span> is attached to <span className="font-medium text-fg">{project}</span> but
+            not live yet — add this TXT record at your DNS provider to prove ownership. Verification then completes
+            automatically (checked continuously).
+          </p>
+          <div className="mt-3 flex items-start gap-3 rounded-md border border-border bg-subtle/30 p-3">
+            <div className="min-w-0 flex-1">
+              <div className="font-mono text-xs text-secondary">{pending.verify.txt_name}</div>
+              <div className="break-all font-mono text-xs text-fg">{pending.verify.txt_value}</div>
+            </div>
+            <button
+              onClick={async () => {
+                if (await copyText(`${pending.verify!.txt_name}  ${pending.verify!.txt_value}`)) {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1200);
+                }
+              }}
+              className="shrink-0 text-muted hover:text-fg"
+              title="Copy TXT"
+            >
+              {copied ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+            </button>
+          </div>
+          <div className="mt-5 flex justify-end">
+            <Button onClick={() => { onClose(); setProject(""); setSub(""); setPending(null); }}>Done</Button>
+          </div>
+        </Card>
+      </div>
+    );
   }
 
   return (
@@ -412,13 +568,40 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
   );
 }
 
-function Nameservers({ domain, nameservers, onChange }: { domain: string; nameservers: string[]; onChange: () => void }) {
+function Nameservers({ domain, nameservers, attached, onChange }: { domain: string; nameservers: string[]; attached: boolean; onChange: () => void }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(nameservers.join("\n"));
+  const [roster, setRoster] = useState<NsRoster | null>(null);
+  // Attached domains have no stored nameserver truth — the record's
+  // `nameservers` are simulated placeholders. The real, peer-attested
+  // platform set comes from the roster endpoint.
+  useEffect(() => {
+    if (attached) fetchNsRoster().then(setRoster).catch(() => setRoster(null));
+  }, [attached]);
   async function save() {
     const ns = text.split("\n").map((s) => s.trim()).filter(Boolean);
     await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
     setEditing(false); onChange();
+  }
+  if (attached) {
+    const ns = roster?.nameservers ?? [];
+    const ready = roster?.delegation_ready === true && ns.length > 0;
+    return (
+      <Section
+        title="Nameservers"
+        desc="Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone."
+      >
+        <Card className="p-0">
+          {ready ? (
+            ns.map((n) => (
+              <div key={n} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{n}</div>
+            ))
+          ) : (
+            <div className="px-4 py-3 text-sm text-secondary">Not yet ready — the platform nameserver set is still converging.</div>
+          )}
+        </Card>
+      </Section>
+    );
   }
   return (
     <Section
