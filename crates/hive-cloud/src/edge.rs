@@ -503,11 +503,20 @@ async fn edge_pipeline_inner(
         .flatten();
     let prefer_peer = serve_local
         && !matches!(local_state, Some(fluid_core::DeployState::Ready))
-        && cloud
-            .peer_routes
-            .read()
-            .get(&sub)
-            .is_some_and(|rs| rs.iter().any(|r| r.healthy));
+        && {
+            // Full-host key first, same as the route lookup below (custom
+            // tenant domains are keyed by full hostname in served_hosts).
+            let routes = cloud.peer_routes.read();
+            let host_key = host
+                .split(':')
+                .next()
+                .unwrap_or(&host)
+                .to_ascii_lowercase();
+            routes
+                .get(&host_key)
+                .or_else(|| routes.get(&sub))
+                .is_some_and(|rs| rs.iter().any(|r| r.healthy))
+        };
     if prefer_peer {
         tracing::warn!(
             host = %host,
@@ -528,15 +537,33 @@ async fn edge_pipeline_inner(
             .filter(|n| n.healthy)
             .map(|n| n.id)
             .collect();
-        let raw: Vec<crate::state::PeerRoute> = cloud
-            .peer_routes
-            .read()
-            .get(&sub)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.healthy && healthy_ids.contains(&r.node_id))
-            .collect();
+        let raw: Vec<crate::state::PeerRoute> = {
+            // A full-host alias (custom tenant domain) is keyed in
+            // served_hosts — and therefore in this table — by its FULL
+            // hostname, so the label-only lookup missed it entirely and every
+            // custom domain 404'd on every non-owner edge (live witness:
+            // domwit on the owner returned its alias answer while the leader
+            // 404'd). Full-host key first, label second, deduped — the
+            // `aliases_full`-before-label rule applied to the mesh route
+            // table, so a custom host can never fall through to a same-named
+            // project's label routes.
+            let routes = cloud.peer_routes.read();
+            let host_key = host
+                .split(':')
+                .next()
+                .unwrap_or(&host)
+                .to_ascii_lowercase();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            routes
+                .get(&host_key)
+                .into_iter()
+                .chain(routes.get(&sub))
+                .flatten()
+                .filter(|r| seen.insert(r.node_id.clone()))
+                .filter(|r| r.healthy && healthy_ids.contains(&r.node_id))
+                .cloned()
+                .collect()
+        };
         let had_routes = !raw.is_empty();
 
         // Candidate ordering: container → ONLY the elected lease owner (single-owner),
