@@ -1655,16 +1655,23 @@ async fn project_domain_detach(
     // not the first registry entry (adversarial finding: fanout/static
     // projects kept serving on the other hosts while the UI said
     // "detached"). Local first, then every hosting peer; the route dies
-    // everywhere `serve_hosts` stops carrying it. The alias itself is only
-    // touched when NO project still lists the domain — a second project's
-    // live attach must survive this detach.
+    // everywhere `serve_hosts` stops carrying it. The alias dies whenever it
+    // names a deployment of the DETACHED project — the rebind case, where
+    // "no project still lists the domain" is false but the previous project's
+    // binding must still go (live witness: numo0's stale binding kept
+    // serving the old version on bkk after the re-attach to numo). A second
+    // project's live attach survives: the alias then names THAT project's
+    // deployment, and the watcher re-asserts it within one tick regardless.
     let still_attached = c
         .projects
         .all_domains()
         .into_iter()
         .any(|(_, d)| d == domain);
-    if !still_attached {
+    let alias_revoked = !still_attached || c.gw.alias_points_at_project(&domain, &project);
+    if alias_revoked {
         c.gw.remove_alias(&domain);
+    }
+    if !still_attached {
         // A fully-detached domain's zone stops claiming the platform edge —
         // the pinned system records (apex A/AAAA + www CNAME) would
         // otherwise keep resolving to the fleet forever, serving 404s on a
@@ -1681,7 +1688,7 @@ async fn project_domain_detach(
             .map(|(node, _)| node.clone())
             .collect()
     };
-    if !still_attached {
+    if alias_revoked {
         for node in hosts {
             let body = json!({});
             // Best-effort per peer: an unreachable peer stops publishing the host
@@ -1728,13 +1735,21 @@ async fn domain_detach_owner(
         ));
     }
     c.projects.remove_domain(&project, &domain);
-    if !c
+    let still_attached = c
         .projects
         .all_domains()
         .into_iter()
-        .any(|(_, d)| d == domain)
-    {
+        .any(|(_, d)| d == domain);
+    // The alias dies whenever it names a deployment of the DETACHED project —
+    // "no other project lists the domain" alone misses the rebind case (the
+    // domain was just re-attached elsewhere, and the previous project's
+    // binding kept serving the OLD version on every node that held it; live
+    // witness: numo0's stale binding on bkk). The watcher re-asserts the
+    // alias for any project still attached within one tick.
+    if !still_attached || c.gw.alias_points_at_project(&domain, &project) {
         c.gw.remove_alias(&domain);
+    }
+    if !still_attached {
         c.domains
             .set_system_address_records(&domain, vec![], vec![]);
     }

@@ -887,6 +887,22 @@ impl Gateway {
         st.aliases.get(sub).map(|id| id.as_str().to_string())
     }
 
+    /// Does this node's full-host alias for `domain` resolve to a deployment
+    /// of `project`? The detach rule: an alias must die when it names a
+    /// deployment of the DETACHED project (the rebind case — a domain moved
+    /// to a different project otherwise leaves the previous project's binding
+    /// live forever, serving the OLD version on every node that held it),
+    /// never when it names a deployment of a project still attached (the
+    /// two-projects-one-domain case, where the live attachment must survive).
+    pub fn alias_points_at_project(&self, domain: &str, project: &str) -> bool {
+        let h = domain.split(':').next().unwrap_or(domain).to_ascii_lowercase();
+        let st = self.state.lock();
+        st.aliases_full
+            .get(&h)
+            .and_then(|id| st.deployments.get(id))
+            .is_some_and(|d| d.project == project)
+    }
+
     /// EXACT host attribution for event/log tagging: the `(deployment id,
     /// project)` the host's subdomain alias actually names — with NO
     /// default-deployment fallback. `select`'s fallback is correct for SERVING
