@@ -133,6 +133,24 @@ history).
 - Verify the fix by writing through the public round-robin host and reading it
   back several times, AND directly against a node still running the previous
   binary — the old node must still fail. That contrast is the proof.
+- **Store-sync adoption is WHOLESALE-REPLACE under a per-observer owner
+  election, so an owner flap can churn a fresh leader write away fleet-wide.**
+  `store_sync::REGISTRY`'s leader-pull entries (teams, billing, projects, …)
+  replace the whole store from whatever node the follower's
+  `control_plane_leader()` returns THIS tick, and that computation flaps when
+  a chain candidate's health verdict oscillates (post-roll churn, an
+  overloaded leader, transport failures). Witnessed 2026-08-18: an
+  enterprise plan write landed on fc-sanjose, then spent 40 minutes being
+  reverted to `pro` everywhere — va's transport to sj/bkk was wedged, so va
+  elected itself and served its stale store to every follower electing it,
+  and sj's own pull could have reverted sj too. Two operational rules fall
+  out: (1) a critical write must land on EVERY owner-chain candidate (the
+  idempotent PUT retried across the flap epochs covers each), never just
+  the moment's leader; (2) a node serving everyone else from its stale store
+  because ITS pulls fail is a transport-wedge signature (zero
+  `follower-sync: adopted` lines + `mesh transport is failing against live
+  peers` in the journal) — restart the node's hive-node, exactly the
+  meshwatch remedy; with `KillMode=process` containers survive it.
 
 ## Secrets
 
