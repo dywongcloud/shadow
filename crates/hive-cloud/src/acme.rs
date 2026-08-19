@@ -1223,8 +1223,14 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
             bundle: bundle.clone(),
         };
         {
-            let (fails, next_at) = streaks.read().get(&bundle).copied().unwrap_or((0, 0));
-            if fails >= 12 || hive_core::now_ms() < next_at {
+            let (_fails, next_at) = streaks.read().get(&bundle).copied().unwrap_or((0, 0));
+            // No permanent park: a tenant very often points DNS at the fleet
+            // only AFTER attaching/verifying, so a hard `fails >= 12` skip
+            // would strand the bundle unissued until a leader restart. The
+            // backoff ceiling alone (~64min) keeps chronically-unpointed
+            // domains far inside LE's failed-validation rate limit while
+            // letting a late DNS fix issue on its own.
+            if hive_core::now_ms() < next_at {
                 continue;
             }
         }
@@ -1314,7 +1320,7 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
                         severity: crate::incidents::Severity::Minor,
                         affected: names.clone(),
                         message: format!(
-                            "HTTP-01 issuance for {bundle} ({}) has failed 12 consecutive times — the domain is parked (its DNS likely doesn't point at the platform). Last error: {msg}",
+                            "HTTP-01 issuance for {bundle} ({}) has failed 12 consecutive times — the domain's DNS likely doesn't point at the platform. Retries continue at the backoff ceiling and issuance completes on its own once DNS points here. Last error: {msg}",
                             names.join(", ")
                         ),
                     });

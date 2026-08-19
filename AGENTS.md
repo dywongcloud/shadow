@@ -756,8 +756,12 @@ releases).
   replication cadence. `custom_cert_pass` is internally leader-gated (the
   kick paths spawn it everywhere), checks the guardian replica before
   issuing (a fresh leader adopts, never duplicate-issues), and backs off
-  per-bundle to a 6h ceiling, parking after 12 consecutive failures with a
-  deduped incident.
+  per-bundle to a ~64min ceiling. There is NO permanent park: tenants
+  routinely point DNS at the fleet only after attaching/verifying, and a
+  hard park stranded exactly those bundles until a leader restart; retries
+  at the ceiling stay far inside LE's failed-validation rate limit, and
+  the 12th consecutive failure opens a deduped incident saying retries
+  continue.
 - **Detach and project death both revoke TLS, not just routing.**
   `spawn_cert_sync` prunes any installed `dom-*` bundle no longer in
   `custom_domain_bundles` (SNI map entries keyed exactly as
