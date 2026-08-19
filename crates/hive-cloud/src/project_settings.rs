@@ -1370,6 +1370,15 @@ impl ProjectStore {
         self.touch(&mut m, project).cron_enabled = on;
     }
 
+    pub fn set_cron_enabled_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        on: bool,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| row.cron_enabled = on)
+    }
+
     /// Whether this project's cron jobs are allowed to fire (default true —
     /// an unknown/never-configured project is not disabled).
     pub fn cron_enabled(&self, project: &str) -> bool {
@@ -1418,11 +1427,35 @@ impl ProjectStore {
         }
     }
 
+    pub fn add_domain_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        domain: String,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            if !row.domains.contains(&domain) {
+                row.domains.push(domain);
+            }
+        })
+    }
+
     /// Detach a domain from a project (idempotent).
     pub fn remove_domain(&self, project: &str, domain: &str) {
         let mut m = self.map.write();
         let s = self.touch(&mut m, project);
         s.domains.retain(|d| d != domain);
+    }
+
+    pub fn remove_domain_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        domain: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.domains.retain(|candidate| candidate != domain)
+        })
     }
 
     /// All (project, domain) pairs across projects.
@@ -1468,6 +1501,28 @@ impl ProjectStore {
             })
             .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
             .collect()
+    }
+}
+
+fn upsert_env(row: &mut ProjectSettings, mut value: EnvVar) {
+    value.updated_ms = now_ms();
+    if !value.sensitive && looks_like_secret(&value.value) {
+        value.sensitive = true;
+    }
+    if value.value.is_empty() {
+        if let Some(previous) = row.env.iter().find(|entry| entry.key == value.key) {
+            value.value = previous.value.clone();
+            if value.sensitive && !previous.sensitive && !value.value.is_empty() {
+                value.value = crate::secrets::encrypt(&value.value);
+            }
+        }
+    } else if value.sensitive {
+        value.value = crate::secrets::encrypt(&value.value);
+    }
+    if let Some(existing) = row.env.iter_mut().find(|entry| entry.key == value.key) {
+        *existing = value;
+    } else {
+        row.env.push(value);
     }
 }
 
