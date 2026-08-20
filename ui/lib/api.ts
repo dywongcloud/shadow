@@ -40,6 +40,26 @@ export function currentTeam(): string {
   return CLERK_ON ? "__pending__" : "personal";
 }
 
+/** Platform-operator status of the current session, exactly as the backend
+ *  derived it into the minted JWT (`platform_admin` claim, decoded by
+ *  `/api/token` and mirrored to `hive_platform_admin` here). `null` = not yet
+ *  known (pre-mint, or an older UI server that never reports the field) —
+ *  callers must treat null as UNKNOWN and leave operator surfaces untouched,
+ *  never as "not an operator". Re-reads on every `hive-session-changed`. */
+export function usePlatformAdmin(): boolean | null {
+  const [v, setV] = useState<boolean | null>(null);
+  useEffect(() => {
+    const read = () => {
+      const s = localStorage.getItem("hive_platform_admin");
+      setV(s === null ? null : s === "1");
+    };
+    read();
+    window.addEventListener("hive-session-changed", read);
+    return () => window.removeEventListener("hive-session-changed", read);
+  }, []);
+  return v;
+}
+
 function teamHeaders(): Record<string, string> {
   return { "x-hive-team": currentTeam() };
 }
@@ -92,8 +112,16 @@ async function mintOnce(team?: string): Promise<string | null> {
       console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
       return null;
     }
-    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean } | null;
+    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean } | null;
     if (!d?.ok) return null;
+    // Mirror the backend-derived operator status for operator-only surfaces
+    // (e.g. /cdn) so they can disclose the boundary instead of failing with a
+    // bare 403. An ABSENT field (an older UI server mid-rollout) is UNKNOWN —
+    // leave any previous flag untouched rather than locking an operator out.
+    if (typeof d.platform_admin === "boolean") {
+      localStorage.setItem("hive_platform_admin", d.platform_admin ? "1" : "0");
+      window.dispatchEvent(new Event("hive-session-changed"));
+    }
     // enforced:false = dev/no-Clerk backend: no cookie is set (unenforced), but
     // that is not a failure — every `/cloud` call is unauthenticated by design.
     if (d.enforced === false) return t;

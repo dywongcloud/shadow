@@ -7,7 +7,7 @@ import {
   AlertTriangle, Check, X,
 } from "lucide-react";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
-import { apiSend, usePoll } from "@/lib/api";
+import { apiSend, usePlatformAdmin, usePoll } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 interface Routing {
@@ -16,7 +16,30 @@ interface Routing {
 }
 interface Cdn { hits: number; misses: number; stale: number; entries: number; hit_ratio: number }
 
+/** CDN routing/redirect/purge endpoints mutate the GLOBAL edge tables (every
+ *  hostname of every tenant) and are platform-operator-only on the backend.
+ *  Anyone else used to reach the create forms and eat a raw 403 ("platform-level
+ *  change requires a platform operator"). Gate the whole page on the
+ *  backend-derived session claim instead: `false` = definitely not an operator
+ *  (show the boundary honestly), `null` = unknown (render normally; the backend
+ *  still enforces). */
 export default function CdnPage() {
+  const platformAdmin = usePlatformAdmin();
+  if (platformAdmin === false) {
+    return (
+      <div className="space-y-12">
+        <PageHeader title="CDN" desc="Edge routing, redirects, and cache controls — applied instantly without a new deployment." />
+        <Card className="flex flex-col items-center gap-3 py-14 text-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-xl border border-border"><AlertTriangle className="h-5 w-5 text-muted" /></span>
+          <div className="text-base font-semibold">Platform operators only</div>
+          <p className="max-w-sm text-sm text-secondary">
+            CDN routing rules, redirects, and cache purges apply to every hostname on the edge, so they are
+            restricted to platform operator sessions. Sign in with a platform operator account to manage them.
+          </p>
+        </Card>
+      </div>
+    );
+  }
   return (
     <div className="space-y-12">
       <PageHeader title="CDN" desc="Edge routing, redirects, and cache controls — applied instantly without a new deployment." />

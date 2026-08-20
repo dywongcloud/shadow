@@ -22,6 +22,23 @@ const OWNER_EMAILS = new Set(
     .filter(Boolean),
 );
 
+/** Read the `platform_admin` claim out of the JWT the backend just minted for
+ * this session. The claim is derived by the BACKEND from its own
+ * owner/admin-email config at mint time, so decoding it here (no verification —
+ * this server trusts its own backend's response) mirrors the operator status
+ * the enforced endpoints will actually apply. `null` = undecodable/absent, and
+ * callers must treat that as UNKNOWN, never as "not an operator". */
+function jwtPlatformAdmin(token: string): boolean | null {
+  try {
+    const part = token.split(".")[1];
+    if (!part) return null;
+    const claims = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as { platform_admin?: unknown };
+    return claims.platform_admin === true;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Mint a short-lived platform JWT for the signed-in user and set it as an
  * httpOnly `hive_jwt` cookie, so the dashboard's same-origin `/cloud` calls are
@@ -75,7 +92,7 @@ export async function POST(req: NextRequest) {
       if (!token) {
         return NextResponse.json({ ok: true, tenant: team, enforced: false });
       }
-      const res = NextResponse.json({ ok: true, tenant: team, role: "owner", dev: true });
+      const res = NextResponse.json({ ok: true, tenant: team, role: "owner", dev: true, platform_admin: jwtPlatformAdmin(token) ?? true });
       res.cookies.set("hive_jwt", token, {
         httpOnly: true,
         secure: false, // local-only branch (NODE_ENV !== "production" above)
@@ -184,7 +201,8 @@ export async function POST(req: NextRequest) {
   }
   if (!token) {
     // Dev backend (no secret) mints nothing meaningful / not enforced → no cookie.
-    return NextResponse.json({ ok: true, tenant, enforced: false });
+    // Unenforced means every operator gate passes, so report operator status UP.
+    return NextResponse.json({ ok: true, tenant, enforced: false, platform_admin: true });
   }
 
   // Best-effort: record identity on the backend NOW that we hold a bearer (the
@@ -204,7 +222,12 @@ export async function POST(req: NextRequest) {
     /* identity record is non-critical for auth */
   }
 
-  const res = NextResponse.json({ ok: true, tenant, role });
+  // Surface the backend-derived operator status (decoded from the JWT we just
+  // minted) so operator-only surfaces can disclose the boundary instead of
+  // failing with a bare 403. Omitted when the claim is undecodable — the client
+  // treats an absent field as UNKNOWN and leaves those surfaces untouched.
+  const platformAdmin = jwtPlatformAdmin(token);
+  const res = NextResponse.json({ ok: true, tenant, role, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
   res.cookies.set("hive_jwt", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",

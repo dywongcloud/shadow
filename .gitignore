@@ -56,3 +56,9 @@ ansible/.vault_pass
 /1
 /wqall
 /error.txt_*
+# Agent session transcripts/digests — local-only, may contain live credentials
+# captured during sessions (a bulk `git add -A` once swept these into a commit
+# and GitHub push protection blocked the push on real secrets).
+.claude-history-*.md
+.kimi-claude-history-*.md
+.claude-history-digests/

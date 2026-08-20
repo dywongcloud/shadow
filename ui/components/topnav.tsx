@@ -345,8 +345,10 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     if (prev && firstIdentity) {
       // `hive_pending_builds` rides along: the previous account's in-flight build
       // rows (project names + build ids, with live Cancel links) must not carry
-      // into the next signed-in user's session on a shared browser.
-      for (const k of ["hive_team", "hive_is_owner", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
+      // into the next signed-in user's session on a shared browser. Neither may
+      // `hive_platform_admin` — a stale operator flag would open operator-only
+      // surfaces (e.g. /cdn) to the next, non-operator account on this browser.
+      for (const k of ["hive_team", "hive_is_owner", "hive_platform_admin", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;

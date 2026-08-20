@@ -3,9 +3,9 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Sparkles } from "lucide-react";
-import { Button } from "@/components/ui";
-import { apiSend } from "@/lib/api";
+import { ArrowLeft, Sparkles, AlertTriangle } from "lucide-react";
+import { Button, Card } from "@/components/ui";
+import { apiSend, usePlatformAdmin } from "@/lib/api";
 
 type Op = "Equals" | "Starts with" | "Matches";
 type ActionKind = "" | "Redirect" | "Rewrite";
@@ -21,6 +21,7 @@ export default function NewRulePage() {
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
+  const platformAdmin = usePlatformAdmin();
 
   // Lightweight NL → rule generator: "redirect /old to /new with a 301".
   function generate() {
@@ -47,6 +48,27 @@ export default function NewRulePage() {
       }
       router.push("/cdn");
     } catch (e) { alert(String(e)); setBusy(false); }
+  }
+
+  // Operator-only surface (the endpoints mutate the GLOBAL edge tables and are
+  // gated by require_operator on the backend). A definitive non-operator session
+  // gets the boundary stated plainly instead of a raw 403 on submit; an UNKNOWN
+  // session (null) renders the form as before and the backend still enforces.
+  if (platformAdmin === false) {
+    return (
+      <div>
+        <Link href="/cdn" className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"><ArrowLeft className="h-4 w-4" /> All Routes</Link>
+        <h1 className="mb-8 mt-3 text-3xl font-semibold tracking-tight">New Rule</h1>
+        <Card className="flex flex-col items-center gap-3 py-14 text-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-xl border border-border"><AlertTriangle className="h-5 w-5 text-muted" /></span>
+          <div className="text-base font-semibold">Platform operators only</div>
+          <p className="max-w-sm text-sm text-secondary">
+            Routing rules execute at the edge for every hostname on the platform, so creating one requires a
+            platform operator session. Sign in with a platform operator account and try again.
+          </p>
+        </Card>
+      </div>
+    );
   }
 
   const code = JSON.stringify(
