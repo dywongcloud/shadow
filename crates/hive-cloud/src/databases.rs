@@ -2143,8 +2143,28 @@ async fn supa_set_service_role_passwords(c_db: &str, pg_password: &str) -> bool 
         pg = pg_password
     );
     for _ in 0..10 {
+        // `supabase_admin`, not `postgres`: the supautils extension in the
+        // supabase/postgres image marks the sidecar roles RESERVED — "only
+        // superusers can modify" — and `postgres` there is a limited admin.
+        // supabase_admin's password IS the stack's POSTGRES_PASSWORD (the
+        // image entrypoint's superuser), and its local pg_hba line requires
+        // password auth, hence PGPASSWORD + TCP loopback.
         let out = Command::new("podman")
-            .args(["exec", c_db, "psql", "-U", "postgres", "-d", "postgres", "-c", &sql])
+            .args([
+                "exec",
+                "-e",
+                &format!("PGPASSWORD={pg_password}"),
+                c_db,
+                "psql",
+                "-U",
+                "supabase_admin",
+                "-h",
+                "127.0.0.1",
+                "-d",
+                "postgres",
+                "-c",
+                &sql,
+            ])
             .env("PATH", augmented_path())
             .output()
             .await;
