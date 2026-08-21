@@ -105,6 +105,13 @@ hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode
 hive_platform_domain: "shadw.cloud"
 hive_apps_domain: "shadw.app"
+# Managed-database gateway zone (Postgres/Redis/Supabase Studio wire + REST).
+# Empty disables the whole `db_rest`/`db_gateway` surface fleet-wide; set to
+# match the live zone (downstash.xyz) so every node — not just whichever ones
+# were hand-configured — presents the `*.{hive_db_domain}` TLS cert and can
+# serve/owner-forward `<slug>.{hive_db_domain}` requests. See the template's
+# own comment for the incident this closes.
+hive_db_domain: "downstash.xyz"
 hive_deploy_zone: "deploy.{{ hive_apps_domain }}"
 hive_public_dashboard_url: "https://{{ hive_platform_domain }}"
 hive_dashboard_url: "http://localhost:3002"

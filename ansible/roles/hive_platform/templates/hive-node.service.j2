@@ -19,6 +19,18 @@ Environment=HIVE_DASHBOARD_URL={{ hive_dashboard_url }}
 Environment=HIVE_DASHBOARD_UPSTREAM={{ hive_dashboard_upstream | default('http://127.0.0.1:3002') }}
 Environment=HIVE_APPS_DOMAIN={{ hive_apps_domain }}
 Environment=HIVE_PLATFORM_DOMAIN={{ hive_platform_domain }}
+{% if hive_db_domain %}
+# Enables the per-tenant DB gateway (managed Postgres/Redis/Supabase wire +
+# REST + Studio) AND makes acme.rs's cert-sync fetch the `*.{db_domain}`
+# wildcard bundle. Live-witnessed 2026-08-21: this var was hand-applied to
+# only some nodes (no automation set it), so once db_host DNS started
+# publishing the full healthy node set instead of one fixed owner IP,
+# clients round-robinning onto an unset node got a hard TLS handshake
+# rejection (SNI resolve() returns None -> "tlsv1 alert access denied") —
+# a real user's managed Supabase URL was unreachable ~1/3 of the time. Never
+# let this var drift out of sync across the fleet again.
+Environment=HIVE_DB_DOMAIN={{ hive_db_domain }}
+{% endif %}
 Environment=HIVE_DEPLOY_ZONE={{ hive_deploy_zone }}
 Environment=HIVE_CP_LEADER={{ hive_cp_leader }}
 Environment=HIVE_CP_OWNER_CHAIN={{ hive_cp_owner_chain }}
