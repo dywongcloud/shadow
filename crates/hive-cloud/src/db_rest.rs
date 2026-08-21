@@ -810,6 +810,17 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
             Some(("storage_port", strip(rest)))
         } else if raw_path == "/graphql/v1" {
             Some(("rest_port", format!("/rpc/graphql{raw_q}")))
+        } else if (raw_path.starts_with("/favicon/") || raw_path == "/favicon.ico")
+            && (req.method() == axum::http::Method::GET
+                || req.method() == axum::http::Method::HEAD)
+        {
+            // PWA branding assets: Chrome fetches `<link rel="manifest">`
+            // (and the icons it names, all under /favicon/) WITHOUT
+            // credentials by spec, so they can never pass the Basic gate —
+            // every page load logged a 401 console error. They are static
+            // Studio-image bytes ("Supabase Studio" + icons), disclosing
+            // nothing the 401's own realm string didn't already.
+            Some(("studio_port", format!("{raw_path}{raw_q}")))
         } else {
             None
         };
