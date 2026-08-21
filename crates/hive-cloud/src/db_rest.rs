@@ -885,8 +885,22 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
     };
 
     let url = format!("http://127.0.0.1:{port}{path_q}");
-    let mut rb = cloud
-        .http
+    // A reverse proxy must RELAY redirects, never follow them. `cloud.http`
+    // (reqwest's default policy) follows up to 10 server-side, so Studio's
+    // own `GET / -> 307 /project/default` was swallowed and the browser
+    // received the project page's static-export HTML at URL `/` — Next.js
+    // hydration then calls router.replace("/project/[ref]", "/"), which
+    // throws `incompatible href/as` before first paint and the app never
+    // renders (live-witnessed; the Location-rewrite arm below existed for
+    // exactly these redirects but never saw one).
+    static NO_REDIRECT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let http = NO_REDIRECT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client")
+    });
+    let mut rb = http
         .request(method, &url)
         .header("host", &host)
         .header("x-forwarded-host", &host)
