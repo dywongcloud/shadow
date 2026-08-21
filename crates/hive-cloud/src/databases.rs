@@ -1864,6 +1864,29 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         format!("AUTH_JWT_SECRET={}", p.jwt_secret),
         "-e".into(),
         "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
+        // Required at MODULE-LOAD time by a shared config loader this pinned
+        // Studio image imports from unrelated API routes — omitting it threw
+        // `AssertionError: EDGE_FUNCTIONS_MANAGEMENT_FOLDER is required` on
+        // every request touching that module, including the SQL Editor's
+        // saved-query listing (`/api/platform/projects/:ref/content/*`),
+        // which is why an unrelated feature 500'd. This platform doesn't run
+        // the Edge Functions container (deliberately deferred, same as
+        // GoTrue/PostgREST/Realtime/Storage), so the path is never actually
+        // read for a real functions folder — it only needs to be non-empty
+        // to satisfy the assertion.
+        "-e".into(),
+        "EDGE_FUNCTIONS_MANAGEMENT_FOLDER=/tmp/hive-supabase-edge-functions-unused".into(),
+        // Backs the SQL Editor's saved-query ("snippet") storage — unlike
+        // EDGE_FUNCTIONS_MANAGEMENT_FOLDER above, this one is actually read
+        // from/written to for a real, user-visible feature (the file the
+        // "content/folders" and "content/count" API routes list), so it
+        // must be a real writable directory inside the container, not a
+        // dummy placeholder. `/tmp` is writable by the studio image's
+        // default user and survives the container's own lifetime (which is
+        // all snippets need — they are not meant to survive a container
+        // replace any more than any other unpersisted container state).
+        "-e".into(),
+        "SNIPPETS_MANAGEMENT_FOLDER=/tmp/hive-supabase-snippets".into(),
         "-p".into(),
         format!("127.0.0.1:{}:3000", p.port_studio),
         "--network".into(),
