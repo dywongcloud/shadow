@@ -1743,6 +1743,9 @@ struct SupaStack {
     short: String,
     port_pg: String,
     port_studio: String,
+    port_auth: String,
+    port_rest: String,
+    port_storage: String,
     pg_password: String,
     jwt_secret: String,
     crypto_key: String,
@@ -1757,9 +1760,12 @@ struct SupaStack {
     volume: String,
 }
 
-/// The deterministic sibling IPs of a stack, derived from the db id + the
-/// db container's IP — recomputed identically at provision and at rebuild.
-fn supabase_ips(id: &str, db_ip: &str) -> (String, String) {
+/// The deterministic sibling IPs of a stack (meta, studio, auth, rest,
+/// storage), derived from the db id + the db container's IP — recomputed
+/// identically at provision and at rebuild. Bands are disjoint from each
+/// other and clear of the managed-DB `.200+` band: meta 150-194,
+/// studio 100-144, auth 50-64, rest 65-79, storage 80-94.
+fn supabase_ips(id: &str, db_ip: &str) -> (String, String, String, String, String) {
     let prefix = db_ip
         .rsplit_once('.')
         .map(|(p, _)| p.to_string())
@@ -1773,15 +1779,61 @@ fn supabase_ips(id: &str, db_ip: &str) -> (String, String) {
             "{prefix}.{}",
             100 + (fnv1a(format!("{id}studio").as_bytes()) % 45)
         ),
+        format!(
+            "{prefix}.{}",
+            50 + (fnv1a(format!("{id}auth").as_bytes()) % 15)
+        ),
+        format!(
+            "{prefix}.{}",
+            65 + (fnv1a(format!("{id}rest").as_bytes()) % 15)
+        ),
+        format!(
+            "{prefix}.{}",
+            80 + (fnv1a(format!("{id}storage").as_bytes()) % 15)
+        ),
     )
 }
 
 /// (container-name, run-args) for each member of the stack, in start order.
+///
+/// Six members since 2026-08-22: db, meta, auth (GoTrue), rest (PostgREST),
+/// storage (storage-api), studio. The last three exist because "Studio's
+/// Authentication and Data-API pages degrade" turned out to mean hard 500s a
+/// real tenant hit on the Storage, API-docs and (partially) Edge Functions
+/// pages — the platform's edge proxy plays Kong's routing role for them
+/// (`db_rest`'s `/auth/v1` / `/rest/v1` / `/storage/v1` / `/graphql/v1`
+/// arms), and Studio's own server side reaches that same public base via an
+/// `--add-host` of the public hostname onto the podman bridge gateway (the
+/// project net is DNS-less, so the public name is otherwise unresolvable
+/// from inside — the witnessed `TypeError: fetch failed`). Deliberately
+/// still NOT run: realtime (heavy BEAM app for a rarely-used inspector
+/// page), analytics/Logflare (its own ingestion subsystem — the Log Drains
+/// settings page stays degraded), imgproxy (image transforms are toggled
+/// off on storage), edge-runtime (the Functions page lists/writes the
+/// management folder, but functions do not EXECUTE).
 fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
-    let (meta_ip, studio_ip) = supabase_ips(&p.id, &p.db_ip);
+    let (meta_ip, studio_ip, auth_ip, rest_ip, storage_ip) = supabase_ips(&p.id, &p.db_ip);
     let c_db = format!("hive-supa-{}-db", p.short);
     let c_meta = format!("hive-supa-{}-meta", p.short);
     let c_studio = format!("hive-supa-{}-studio", p.short);
+    let c_auth = format!("hive-supa-{}-auth", p.short);
+    let c_rest = format!("hive-supa-{}-rest", p.short);
+    let c_storage = format!("hive-supa-{}-storage", p.short);
+    // The podman bridge gateway (`<subnet>.1`) reaches the HOST — including
+    // the edge's 0.0.0.0:443 TLS listener — from inside the DNS-less project
+    // net. Mapping the stack's own public hostname onto it lets Studio's
+    // server side (and storage's public-URL rendering) call the SAME
+    // public base browsers use, TLS/SNI and path-routing included.
+    let gw_ip = p
+        .db_ip
+        .rsplit_once('.')
+        .map(|(pre, _)| format!("{pre}.1"))
+        .unwrap_or_default();
+    let public_host = p
+        .public_base
+        .strip_prefix("https://")
+        .unwrap_or_default()
+        .to_string();
     let db_args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
@@ -1828,7 +1880,7 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         format!("db:{}", p.db_ip),
         "docker.io/supabase/postgres-meta:v0.95.2".into(),
     ];
-    let studio_args: Vec<String> = vec![
+    let mut studio_args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
         "--name".into(),
@@ -1868,14 +1920,13 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         // Studio image imports from unrelated API routes — omitting it threw
         // `AssertionError: EDGE_FUNCTIONS_MANAGEMENT_FOLDER is required` on
         // every request touching that module, including the SQL Editor's
-        // saved-query listing (`/api/platform/projects/:ref/content/*`),
-        // which is why an unrelated feature 500'd. This platform doesn't run
-        // the Edge Functions container (deliberately deferred, same as
-        // GoTrue/PostgREST/Realtime/Storage), so the path is never actually
-        // read for a real functions folder — it only needs to be non-empty
-        // to satisfy the assertion.
+        // saved-query listing. The functions API additionally SCANDIRS the
+        // path with no mkdir (ENOENT = 500 on the Functions page), so it
+        // must EXIST: the tmpfs mount below guarantees that on every
+        // rebuild. Functions listed/created here do not EXECUTE — there is
+        // deliberately no edge-runtime container.
         "-e".into(),
-        "EDGE_FUNCTIONS_MANAGEMENT_FOLDER=/tmp/hive-supabase-edge-functions-unused".into(),
+        "EDGE_FUNCTIONS_MANAGEMENT_FOLDER=/srv/edge-functions".into(),
         // Backs the SQL Editor's saved-query ("snippet") storage — unlike
         // EDGE_FUNCTIONS_MANAGEMENT_FOLDER above, this one is actually read
         // from/written to for a real, user-visible feature (the file the
@@ -1887,6 +1938,11 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         // replace any more than any other unpersisted container state).
         "-e".into(),
         "SNIPPETS_MANAGEMENT_FOLDER=/tmp/hive-supabase-snippets".into(),
+        // The functions API route scandirs this path with no mkdir (unlike
+        // the snippets route) — a tmpfs mount guarantees it EXISTS in every
+        // rebuild. Function files are container-lifetime state like snippets.
+        "--tmpfs".into(),
+        "/srv/edge-functions".into(),
         "-p".into(),
         format!("127.0.0.1:{}:3000", p.port_studio),
         "--network".into(),
@@ -1897,13 +1953,209 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         format!("db:{}", p.db_ip),
         "--add-host".into(),
         format!("meta:{meta_ip}"),
-        "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
     ];
+    // Only meaningful with a real public hostname (HIVE_DB_DOMAIN set):
+    // map it onto the bridge gateway so Studio's server side can call
+    // auth/rest/storage through the platform's own TLS edge. Without a db
+    // domain the loopback-honest public_base stays, and those pages remain
+    // degraded exactly as before.
+    if !public_host.is_empty() && !gw_ip.is_empty() {
+        studio_args.push("--add-host".into());
+        studio_args.push(format!("{public_host}:{gw_ip}"));
+    }
+    studio_args.push("docker.io/supabase/studio:2026.02.16-sha-26c615c".into());
+
+    let auth_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_auth.clone(),
+        "--replace".into(),
+        "-e".into(),
+        "GOTRUE_API_HOST=0.0.0.0".into(),
+        "-e".into(),
+        "GOTRUE_API_PORT=9999".into(),
+        "-e".into(),
+        format!("API_EXTERNAL_URL={}", p.public_base),
+        "-e".into(),
+        "GOTRUE_DB_DRIVER=postgres".into(),
+        "-e".into(),
+        format!(
+            "GOTRUE_DB_DATABASE_URL=postgres://supabase_auth_admin:{}@db:5432/{}",
+            p.pg_password, p.dbname
+        ),
+        "-e".into(),
+        format!("GOTRUE_SITE_URL={}", p.public_base),
+        "-e".into(),
+        "GOTRUE_DISABLE_SIGNUP=false".into(),
+        "-e".into(),
+        "GOTRUE_JWT_ADMIN_ROLES=service_role".into(),
+        "-e".into(),
+        "GOTRUE_JWT_AUD=authenticated".into(),
+        "-e".into(),
+        "GOTRUE_JWT_DEFAULT_GROUP_NAME=authenticated".into(),
+        "-e".into(),
+        "GOTRUE_JWT_EXP=3600".into(),
+        "-e".into(),
+        format!("GOTRUE_JWT_SECRET={}", p.jwt_secret),
+        "-e".into(),
+        "GOTRUE_EXTERNAL_EMAIL_ENABLED=true".into(),
+        // No SMTP service in the stack: autoconfirm keeps email signup
+        // usable instead of stranding users waiting for mail nobody sends.
+        "-e".into(),
+        "GOTRUE_MAILER_AUTOCONFIRM=true".into(),
+        "-e".into(),
+        "GOTRUE_EXTERNAL_PHONE_ENABLED=false".into(),
+        "-p".into(),
+        format!("127.0.0.1:{}:9999", p.port_auth),
+        "--network".into(),
+        p.netname.clone(),
+        "--ip".into(),
+        auth_ip,
+        "--add-host".into(),
+        format!("db:{}", p.db_ip),
+        "docker.io/supabase/gotrue:v2.189.0".into(),
+    ];
+
+    let rest_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_rest.clone(),
+        "--replace".into(),
+        "-e".into(),
+        format!(
+            "PGRST_DB_URI=postgres://authenticator:{}@db:5432/{}",
+            p.pg_password, p.dbname
+        ),
+        "-e".into(),
+        "PGRST_DB_SCHEMAS=public,storage,graphql_public".into(),
+        "-e".into(),
+        "PGRST_DB_ANON_ROLE=anon".into(),
+        "-e".into(),
+        format!("PGRST_JWT_SECRET={}", p.jwt_secret),
+        "-e".into(),
+        "PGRST_DB_USE_LEGACY_GUCS=false".into(),
+        "-e".into(),
+        format!("PGRST_APP_SETTINGS_JWT_SECRET={}", p.jwt_secret),
+        "-e".into(),
+        "PGRST_APP_SETTINGS_JWT_EXP=3600".into(),
+        "-p".into(),
+        format!("127.0.0.1:{}:3000", p.port_rest),
+        "--network".into(),
+        p.netname.clone(),
+        "--ip".into(),
+        rest_ip.clone(),
+        "--add-host".into(),
+        format!("db:{}", p.db_ip),
+        "docker.io/postgrest/postgrest:v14.12".into(),
+    ];
+
+    let storage_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_storage.clone(),
+        "--replace".into(),
+        "-e".into(),
+        format!("ANON_KEY={}", p.anon_key),
+        "-e".into(),
+        format!("SERVICE_KEY={}", p.service_key),
+        "-e".into(),
+        "POSTGREST_URL=http://rest:3000".into(),
+        "-e".into(),
+        format!("AUTH_JWT_SECRET={}", p.jwt_secret),
+        "-e".into(),
+        format!(
+            "DATABASE_URL=postgres://supabase_storage_admin:{}@db:5432/{}",
+            p.pg_password, p.dbname
+        ),
+        "-e".into(),
+        format!("STORAGE_PUBLIC_URL={}", p.public_base),
+        "-e".into(),
+        "REQUEST_ALLOW_X_FORWARDED_PATH=true".into(),
+        "-e".into(),
+        "FILE_SIZE_LIMIT=52428800".into(),
+        "-e".into(),
+        "STORAGE_BACKEND=file".into(),
+        "-e".into(),
+        "FILE_STORAGE_BACKEND_PATH=/var/lib/storage".into(),
+        // "directory name when using 'file'" per upstream — and TENANT_ID /
+        // REGION are required-nonempty config, not meaningful here.
+        "-e".into(),
+        "GLOBAL_S3_BUCKET=stub".into(),
+        "-e".into(),
+        "TENANT_ID=stub".into(),
+        "-e".into(),
+        "REGION=stub".into(),
+        // No imgproxy container: transforms off, plain up/download full.
+        "-e".into(),
+        "ENABLE_IMAGE_TRANSFORMATION=false".into(),
+        "-v".into(),
+        format!("{}:/var/lib/storage", storage_volume(&p.short)),
+        "-p".into(),
+        format!("127.0.0.1:{}:5000", p.port_storage),
+        "--network".into(),
+        p.netname.clone(),
+        "--ip".into(),
+        storage_ip,
+        "--add-host".into(),
+        format!("db:{}", p.db_ip),
+        "--add-host".into(),
+        format!("rest:{rest_ip}"),
+        "docker.io/supabase/storage-api:v1.60.4".into(),
+    ];
+
     vec![
         (c_db, db_args),
         (c_meta, meta_args),
+        (c_auth, auth_args),
+        (c_rest, rest_args),
+        (c_storage, storage_args),
         (c_studio, studio_args),
     ]
+}
+
+/// The storage-api member's named volume — bucket bytes are customer data
+/// with the same lifecycle as the engine volume (survives rebuilds, removed
+/// explicitly at delete).
+fn storage_volume(short: &str) -> String {
+    format!("hive-vol-supast-{short}")
+}
+
+/// Idempotently set the Supabase service-role passwords the sidecar services
+/// authenticate with. The supabase/postgres image BAKES the roles
+/// (supabase_auth_admin, supabase_storage_admin, authenticator) but their
+/// passwords come from a compose-mounted roles.sql this stack never mounts —
+/// without this, GoTrue/PostgREST/storage-api can never log in. Runs via
+/// `podman exec` as the in-container superuser (local trust), with retries
+/// because first-boot migrations keep initializing after the port answers.
+async fn supa_set_service_role_passwords(c_db: &str, pg_password: &str) -> bool {
+    // pg_password is always a uuid simple-format hex string (provision) —
+    // no quote-escaping hazard — but refuse anything else outright.
+    if !pg_password.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let sql = format!(
+        "ALTER ROLE supabase_auth_admin WITH LOGIN PASSWORD '{pg}'; \
+         ALTER ROLE supabase_storage_admin WITH LOGIN PASSWORD '{pg}'; \
+         ALTER ROLE authenticator WITH LOGIN PASSWORD '{pg}';",
+        pg = pg_password
+    );
+    for _ in 0..10 {
+        let out = Command::new("podman")
+            .args(["exec", c_db, "psql", "-U", "postgres", "-d", "postgres", "-c", &sql])
+            .env("PATH", augmented_path())
+            .output()
+            .await;
+        if let Ok(o) = out {
+            if o.status.success() {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    false
 }
 
 /// Rebuild a SupaStack from the stored record (reconcile rebuild path) —
@@ -1917,6 +2169,12 @@ fn supa_stack_from_record(d: &Database) -> Option<SupaStack> {
         short: d.id[3..11.min(d.id.len())].to_string(),
         port_pg: get("local_port").or_else(|| get("port"))?,
         port_studio: get("studio_port")?,
+        // Pre-2026-08-22 records lack these three; the reconcile backfill
+        // (`supa_backfill_sidecar_ports`) adds them before any rebuild that
+        // needs them, so `?` is the correct completeness gate here.
+        port_auth: get("auth_port")?,
+        port_rest: get("rest_port")?,
+        port_storage: get("storage_port")?,
         pg_password: get("password")?,
         jwt_secret: get("JWT_SECRET")?,
         crypto_key: get("PG_META_CRYPTO_KEY")?,
@@ -1941,6 +2199,9 @@ async fn provision_supabase(
     let short = &id[3..11.min(id.len())];
     let port_pg = store.next_port(54320);
     let port_studio = store.next_port(23000);
+    let port_auth = store.next_port(24100);
+    let port_rest = store.next_port(24600);
+    let port_storage = store.next_port(25100);
     let pg_password = uuid::Uuid::new_v4().simple().to_string();
     let jwt_secret = format!(
         "{}{}",
@@ -1963,6 +2224,9 @@ async fn provision_supabase(
     conn.insert("host".into(), "127.0.0.1".into());
     conn.insert("port".into(), port_pg.to_string());
     conn.insert("studio_port".into(), port_studio.to_string());
+    conn.insert("auth_port".into(), port_auth.to_string());
+    conn.insert("rest_port".into(), port_rest.to_string());
+    conn.insert("storage_port".into(), port_storage.to_string());
     conn.insert("database".into(), dbname.into());
     conn.insert("user".into(), "postgres".into());
     conn.insert("password".into(), pg_password.clone());
@@ -2014,6 +2278,9 @@ async fn provision_supabase(
         "docker.io/supabase/postgres:15.8.1.085",
         "docker.io/supabase/postgres-meta:v0.95.2",
         "docker.io/supabase/studio:2026.02.16-sha-26c615c",
+        "docker.io/supabase/gotrue:v2.189.0",
+        "docker.io/postgrest/postgrest:v14.12",
+        "docker.io/supabase/storage-api:v1.60.4",
     ] {
         if !podman_pull_retry(image).await {
             tracing::warn!(db = %id, image, "supabase image pull failed — simulating");
@@ -2026,6 +2293,9 @@ async fn provision_supabase(
         short: short.to_string(),
         port_pg: port_pg.to_string(),
         port_studio: port_studio.to_string(),
+        port_auth: port_auth.to_string(),
+        port_rest: port_rest.to_string(),
+        port_storage: port_storage.to_string(),
         pg_password,
         jwt_secret,
         crypto_key,
@@ -2044,14 +2314,12 @@ async fn provision_supabase(
     };
     let members = supabase_stack_args(&stack);
     let c_db = members[0].0.clone();
-    let c_meta = members[1].0.clone();
-    let c_studio = members[2].0.clone();
     let mut started: Vec<String> = Vec::new();
 
-    // db — the engine. The supabase/postgres image bakes the Supabase role set;
-    // meta and studio both connect as the `postgres` superuser with this
-    // password, so the vendored roles/jwt init SQL is not needed for this
-    // dependency set.
+    // db first — the engine everything else authenticates against. The
+    // supabase/postgres image bakes the Supabase role set but NOT the
+    // sidecar roles' passwords (that is a compose-mounted roles.sql this
+    // stack replaces with the ALTERs below).
     match podman_run_detached(&members[0].1).await {
         Ok(()) => started.push(c_db.clone()),
         Err(e) => {
@@ -2062,24 +2330,19 @@ async fn provision_supabase(
     if !wait_tcp_ready(port_pg).await {
         tracing::warn!(db = %id, %port_pg, "supabase postgres up but loopback port not reachable");
     }
-
-    // meta — pg-meta, Studio's management API. Internal only: no host publish.
-    match podman_run_detached(&members[1].1).await {
-        Ok(()) => started.push(c_meta.clone()),
-        Err(e) => {
-            tracing::warn!(db = %id, error = %e, "supabase meta container failed — simulating");
-            cleanup(&started).await;
-            return Ok(("simulated".into(), conn, None));
-        }
+    if !supa_set_service_role_passwords(&c_db, stack.pg_password.as_str()).await {
+        tracing::warn!(db = %id, "supabase service-role passwords could not be set — auth/rest/storage sidecars will fail to connect until db-reconcile retries");
     }
 
-    // studio — the dashboard itself, published on loopback for the edge proxy.
-    match podman_run_detached(&members[2].1).await {
-        Ok(()) => started.push(c_studio.clone()),
-        Err(e) => {
-            tracing::warn!(db = %id, error = %e, "supabase studio container failed — simulating");
-            cleanup(&started).await;
-            return Ok(("simulated".into(), conn, None));
+    // Remaining members in builder order (meta, auth, rest, storage, studio).
+    for (cname, args) in &members[1..] {
+        match podman_run_detached(args).await {
+            Ok(()) => started.push(cname.clone()),
+            Err(e) => {
+                tracing::warn!(db = %id, container = %cname, error = %e, "supabase member failed — simulating");
+                cleanup(&started).await;
+                return Ok(("simulated".into(), conn, None));
+            }
         }
     }
     // Studio (Next.js) takes a few seconds to come up; warn-only like the
@@ -2087,11 +2350,8 @@ async fn provision_supabase(
     if !wait_tcp_ready(port_studio).await {
         tracing::warn!(db = %id, %port_studio, "supabase studio up but loopback port not reachable yet");
     }
-    Ok((
-        "live".into(),
-        conn,
-        Some(format!("{c_db},{c_meta},{c_studio}")),
-    ))
+    let names: Vec<String> = members.iter().map(|(n, _)| n.clone()).collect();
+    Ok(("live".into(), conn, Some(names.join(","))))
 }
 
 async fn provision_redis(
@@ -2208,6 +2468,26 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     let Some(field) = d.container.clone() else {
                         continue;
                     };
+                    // Pre-2026-08-22 Supabase records know nothing of the
+                    // auth/rest/storage sidecars. Upgrade the record ONCE
+                    // (ports + container-field members + service-role
+                    // passwords on the live engine); the ordinary GONE
+                    // logic below then builds the new members from the
+                    // shared builder on the next pass. Gated on local
+                    // evidence exactly like the rebuild path.
+                    if kind == DbKind::Supabase
+                        && d.connection.get("auth_port").is_none()
+                        && d.connection.get("JWT_SECRET").is_some()
+                        && (hosted_here
+                            || field
+                                .split(',')
+                                .next()
+                                .map(|c| db_container_seen_local(c.trim()))
+                                .unwrap_or(false))
+                    {
+                        supa_backfill_sidecar_upgrade(&cloud, &d).await;
+                        continue;
+                    }
                     // A Supabase record carries its whole stack comma-joined;
                     // every member is reconciled independently.
                     for cname in field.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -2449,6 +2729,47 @@ async fn supa_backfill_record_secrets(
     });
     crate::persist::persist(cloud);
     tracing::info!(db = %id, "db-reconcile: backfilled supabase record secrets from the live stack (rebuild now possible)");
+}
+
+/// One-time in-place upgrade of a pre-sidecar Supabase record: allocate the
+/// three sidecar loopback ports, append the auth/rest/storage member names to
+/// the record's container field, and set the service-role passwords on the
+/// LIVE engine (idempotent ALTERs — the volume keeps them thereafter).
+/// Self-eliminating: the caller gates on `auth_port` being absent.
+async fn supa_backfill_sidecar_upgrade(cloud: &Arc<crate::state::CloudState>, d: &Database) {
+    let short = d.id[3..11.min(d.id.len())].to_string();
+    let c_db = format!("hive-supa-{short}-db");
+    let Some(pw) = d.connection.get("password").cloned() else {
+        return;
+    };
+    if !supa_set_service_role_passwords(&c_db, &pw).await {
+        tracing::warn!(db = %d.id, "supabase sidecar upgrade: service-role password set failed (engine not ready?) — retrying next pass");
+        return;
+    }
+    let port_auth = cloud.databases.next_port(24100).to_string();
+    let port_rest = cloud.databases.next_port(24600).to_string();
+    let port_storage = cloud.databases.next_port(25100).to_string();
+    let new_members = format!(
+        "hive-supa-{short}-auth,hive-supa-{short}-rest,hive-supa-{short}-storage"
+    );
+    cloud.databases.update(&d.id, |d| {
+        d.connection
+            .entry("auth_port".into())
+            .or_insert(port_auth.clone());
+        d.connection
+            .entry("rest_port".into())
+            .or_insert(port_rest.clone());
+        d.connection
+            .entry("storage_port".into())
+            .or_insert(port_storage.clone());
+        if let Some(field) = d.container.as_mut() {
+            if !field.contains("-auth") {
+                *field = format!("{field},{new_members}");
+            }
+        }
+    });
+    crate::persist::persist(cloud);
+    tracing::info!(db = %d.id, "db-reconcile: supabase record upgraded with auth/rest/storage sidecars — members build on the next pass");
 }
 
 async fn podman_available() -> bool {

@@ -4303,20 +4303,27 @@ async fn purge_project_resources(
                     .await;
             }
             if d.kind == crate::databases::DbKind::Supabase {
-                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
-                let _ = tokio::process::Command::new("podman")
-                    .args(["volume", "rm", "-f", &vol])
-                    .env(
-                        "PATH",
-                        format!(
-                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                            std::env::var("PATH").unwrap_or_default()
-                        ),
-                    )
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
+                let short = &d.id[3..11.min(d.id.len())];
+                // engine volume + the storage-api member's bucket volume —
+                // delete = data destroyed for BOTH, same semantics.
+                for vol in [
+                    format!("hive-vol-supa-{short}"),
+                    format!("hive-vol-supast-{short}"),
+                ] {
+                    let _ = tokio::process::Command::new("podman")
+                        .args(["volume", "rm", "-f", &vol])
+                        .env(
+                            "PATH",
+                            format!(
+                                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                                std::env::var("PATH").unwrap_or_default()
+                            ),
+                        )
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
             }
         }
         c.databases.remove_db_and_purge_data(&d.id, &d.team);
@@ -10742,23 +10749,28 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
             .await;
     }
     if d.kind == crate::databases::DbKind::Supabase {
-        // Deleting the database IS deleting its data — the stack's
-        // named volume is platform-templated (`hive-vol-supa-<id8>`),
-        // never tenant-named, so this cannot touch another volume.
-        let vol = format!("hive-vol-supa-{short}");
-        let _ = tokio::process::Command::new("podman")
-            .args(["volume", "rm", "-f", &vol])
-            .env(
-                "PATH",
-                format!(
-                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        // Deleting the database IS deleting its data — the stack's named
+        // volumes (engine + storage-api buckets) are platform-templated
+        // (`hive-vol-supa[st]-<id8>`), never tenant-named, so this cannot
+        // touch another volume.
+        for vol in [
+            format!("hive-vol-supa-{short}"),
+            format!("hive-vol-supast-{short}"),
+        ] {
+            let _ = tokio::process::Command::new("podman")
+                .args(["volume", "rm", "-f", &vol])
+                .env(
+                    "PATH",
+                    format!(
+                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
     }
 }
 
@@ -10780,6 +10792,9 @@ async fn teardown_db_backing_blind(id: &str) {
         format!("hive-db-{short}"),
         format!("hive-supa-{short}-db"),
         format!("hive-supa-{short}-meta"),
+        format!("hive-supa-{short}-auth"),
+        format!("hive-supa-{short}-rest"),
+        format!("hive-supa-{short}-storage"),
         format!("hive-supa-{short}-studio"),
     ] {
         let _ = tokio::process::Command::new("podman")
@@ -10790,13 +10805,18 @@ async fn teardown_db_backing_blind(id: &str) {
             .status()
             .await;
     }
-    let _ = tokio::process::Command::new("podman")
-        .args(["volume", "rm", "-f", &format!("hive-vol-supa-{short}")])
-        .env("PATH", &path_env)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    for vol in [
+        format!("hive-vol-supa-{short}"),
+        format!("hive-vol-supast-{short}"),
+    ] {
+        let _ = tokio::process::Command::new("podman")
+            .args(["volume", "rm", "-f", &vol])
+            .env("PATH", &path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 /// Internal-only: run [`teardown_db_backing`] for `id` on THIS node. Reached

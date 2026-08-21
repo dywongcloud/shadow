@@ -783,8 +783,39 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// security boundary is unchanged: an edge forwards bytes, it never
 /// authenticates on the tenant's behalf.
 async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Request) -> Response {
+    // ---- Data plane (/auth/v1, /rest/v1, /storage/v1, /graphql/v1) ---------
+    // The platform edge IS this stack's Kong: these prefixes route to the
+    // GoTrue/PostgREST/storage-api sidecars' loopback ports with the prefix
+    // STRIPPED (upstream kong.yml's strip_path semantics; /graphql/v1 maps to
+    // PostgREST's /rpc/graphql exactly as upstream routes it). AuthN here is
+    // the services' own apikey/JWT validation — the same public data-plane
+    // model as hosted Supabase — so the Studio Basic gate deliberately does
+    // not apply; it keeps guarding everything else (the dashboard).
+    let raw_path = req.uri().path().to_string();
+    let raw_q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let strip = |rest: &str| {
+        let p = if rest.is_empty() { "/" } else { rest };
+        format!("{p}{raw_q}")
+    };
+    let data_plane: Option<(&str, String)> =
+        if let Some(rest) = raw_path.strip_prefix("/auth/v1") {
+            Some(("auth_port", strip(rest)))
+        } else if let Some(rest) = raw_path.strip_prefix("/rest/v1") {
+            Some(("rest_port", strip(rest)))
+        } else if let Some(rest) = raw_path.strip_prefix("/storage/v1") {
+            Some(("storage_port", strip(rest)))
+        } else if raw_path == "/graphql/v1" {
+            Some(("rest_port", format!("/rpc/graphql{raw_q}")))
+        } else {
+            None
+        };
+
     // ---- AuthN: HTTP Basic against this database's generated studio creds ---
-    let ok = req
+    let ok = data_plane.is_some() || req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -829,24 +860,39 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         return resp;
     }
 
-    // ---- Proxy target: this node's loopback studio port ---------------------
+    // ---- Proxy target: the member's loopback port on this node --------------
+    let port_key = data_plane
+        .as_ref()
+        .map(|(k, _)| *k)
+        .unwrap_or("studio_port");
     let Some(port) = db
         .connection
-        .get("studio_port")
+        .get(port_key)
         .filter(|p| !p.is_empty())
         .and_then(|p| p.parse::<u16>().ok())
     else {
+        if data_plane.is_some() {
+            // Pre-sidecar record still awaiting the db-reconcile upgrade
+            // (`supa_backfill_sidecar_upgrade`) — honest and temporary.
+            return err(
+                StatusCode::NOT_IMPLEMENTED,
+                "this Supabase stack's API sidecars are still being provisioned — retry shortly",
+            );
+        }
         return err(
             StatusCode::MISDIRECTED_REQUEST,
             "this Supabase database is not hosted on this node (stale DNS?) or has no live Studio",
         );
     };
     let method = req.method().clone();
-    let path_q = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".into());
+    let path_q = match &data_plane {
+        Some((_, stripped)) => stripped.clone(),
+        None => req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".into()),
+    };
     let host = req
         .headers()
         .get(header::HOST)
@@ -858,7 +904,11 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         .iter()
         .filter_map(|(k, v)| {
             let name = k.as_str().to_lowercase();
-            // Hop-by-hop + the gate itself: Kong's hide_credentials equivalent.
+            // Hop-by-hop + the gate itself: Kong's hide_credentials
+            // equivalent. The Basic gate's Authorization header is stripped
+            // ONLY on the Studio plane — data-plane requests carry the
+            // Bearer JWT the sidecar services themselves validate, and
+            // stripping it would 401 every authenticated REST/Storage call.
             if matches!(
                 name.as_str(),
                 "host"
@@ -867,10 +917,10 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
                     | "transfer-encoding"
                     | "keep-alive"
                     | "upgrade"
-                    | "authorization"
                     | "x-hive-proxied"
                     | "x-hive-request-id"
-            ) {
+            ) || (name == "authorization" && data_plane.is_none())
+            {
                 return None;
             }
             v.to_str().ok().map(|s| (name, s.to_string()))
