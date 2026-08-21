@@ -96,6 +96,12 @@
   changed_when: "'CHANGED' in _crsqlite.stdout"
   notify: restart hive-node
 
+- name: Ensure the hive-node systemd drop-in directory exists (fresh nodes lack it until the unit lands)
+  ansible.builtin.file:
+    path: /etc/systemd/system/hive-node.service.d
+    state: directory
+    mode: "0755"
+
 - name: Drop in HIVE_CRSQL_EXTENSION_PATH for hive-node
   ansible.builtin.copy:
     dest: /etc/systemd/system/hive-node.service.d/crsqlite.conf

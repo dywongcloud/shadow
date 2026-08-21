@@ -287,6 +287,8 @@ mod tests {
             oom_restarts_24h: 0,
             last_oom_ms: None,
             backend: "mock".into(),
+            provider: None,
+            private_addr: None,
         }
     }
 

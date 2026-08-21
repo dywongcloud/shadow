@@ -80,6 +80,55 @@
         name: mesh_bootstrap
         tasks_from: capture_id
 
+- name: Read an existing member's LIVE allowlist as the fleet base set
+  hosts: "{{ (groups['platform'] | difference([new_node])) | first }}"
+  become: true
+  tasks:
+    - name: Slurp the current peer-trust drop-in
+      ansible.builtin.slurp:
+        src: /etc/systemd/system/hive-node.service.d/peer-trust.conf
+      register: _fleet_trust_conf
+      # A member provisioned before peer-trust existed may legitimately have
+      # no drop-in; the join-proof self-admit path covers that fleet shape.
+      failed_when: false
+
+    - name: Publish the fleet's current id set for the later plays
+      ansible.builtin.set_fact:
+        # Extract every 64-hex id from the drop-in; empty when absent.
+        fleet_base_trust_ids: "{{ (_fleet_trust_conf.content | default('', true) | b64decode | regex_findall('[0-9a-f]{64}')) | unique }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+- name: Write the new node's OWN peer-trust allowlist (fleet set + its own id)
+  hosts: "{{ new_node }}"
+  become: true
+  vars:
+    # Without this the new node boots with an EMPTY allowlist while every
+    # existing node enforces HIVE_PEER_TRUST=1: its own gossip is accepted
+    # (self-admit carried the join) but it can never validate REPLIES, so its
+    # registry stays empty and /v1/mesh reads 0 peers with trunks open —
+    # witnessed live on phx (fc-phoenix, 2026-08-21).
+    hive_trusted_node_ids: "{{ ((hostvars['localhost'].fleet_base_trust_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: mesh_bootstrap
+      when: hive_peer_trust_enabled | bool
+
+    - name: Flush handlers (restart hive-node with its own allowlist)
+      ansible.builtin.meta: flush_handlers
+      when: hive_peer_trust_enabled | bool
+
+    - name: Health-check the new node before touching existing members
+      ansible.builtin.uri:
+        url: "http://{{ hive_admin }}/v1/mesh"
+        method: GET
+        status_code: 200
+      register: _mesh
+      retries: 12
+      delay: 5
+      until: _mesh.status == 200
+      when: hive_peer_trust_enabled | bool
+
 - name: Propagate the new node's id to every OTHER node's peer-trust allowlist
   hosts: platform:!{{ new_node }}
   become: true
@@ -87,8 +136,11 @@
   vars:
     # unique keeps this idempotent -- re-running node-join.yml for the same
     # new_node (or after a partial failure) must not accumulate duplicate
-    # entries in HIVE_TRUSTED_NODE_IDS on every re-run.
-    hive_trusted_node_ids: "{{ ((hive_trusted_node_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
+    # entries in HIVE_TRUSTED_NODE_IDS on every re-run. Base = the fleet's
+    # LIVE set captured above: building from the inventory default ([] here)
+    # would overwrite a 15+-id allowlist with just the new id and lock every
+    # node out of every peer.
+    hive_trusted_node_ids: "{{ ((hostvars['localhost'].fleet_base_trust_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
   tasks:
     - name: Update peer-trust.conf on this existing node
       ansible.builtin.include_role:

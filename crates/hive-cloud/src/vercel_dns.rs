@@ -2654,12 +2654,12 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 // NOT this DNS leader, and DB records are not gossiped. The peer
                 // fan-out is the non-secret `/v1/db-directory` (routing metadata
                 // only). Local wins on slug collision (first insert kept).
-                let mut dir: Vec<(String, String)> = cloud
+                let mut dir: Vec<(String, String, bool)> = cloud
                     .databases
                     .list(None)
                     .into_iter()
                     .filter(|d| !d.db_host.is_empty() && !d.host_node.is_empty())
-                    .map(|d| (d.db_host, d.host_node))
+                    .map(|d| (d.db_host, d.host_node, d.kind == crate::databases::DbKind::Supabase))
                     .collect();
                 // Fan out CONCURRENTLY, each under its own tight budget — this loop
                 // shares the single reconciler task with the apps/platform zones
@@ -2696,23 +2696,56 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                             .get("host_node")
                             .and_then(|x| x.as_str())
                             .unwrap_or_default();
+                        let is_supabase = e.get("kind").and_then(|x| x.as_str()) == Some("supabase");
                         if !host.is_empty() && !hn.is_empty() {
-                            dir.push((host.to_string(), hn.to_string()));
+                            dir.push((host.to_string(), hn.to_string(), is_supabase));
                         }
                     }
                 }
                 let mut seen = std::collections::HashSet::new();
-                for (db_host, host_node) in dir {
+                for (db_host, host_node, is_supabase) in dir {
                     let Some(slug) = db_host.strip_suffix(&suffix) else {
                         continue;
                     };
                     if !seen.insert(slug.to_string()) {
                         continue;
                     }
+                    managed.push(slug.to_string());
+                    // Raw wire-protocol kinds (Postgres/Redis/etc.) MUST land
+                    // directly on the owner: `db_gateway`'s TLS SNI splice has
+                    // no forward hop, so any other node would answer
+                    // MISDIRECTED_REQUEST. Supabase Studio is plain HTTPS with
+                    // a real owner-forward proxy (`db_rest::studio_mesh_serve`,
+                    // the `hrana::forward_to_owner` pattern) — publish the FULL
+                    // healthy node set like the apps zone does, so a client
+                    // landing on any edge still gets served (forwarded if
+                    // that edge isn't the owner) instead of depending on one
+                    // fixed node's continued reachability, and so a nearer
+                    // edge can terminate the client's TLS handshake locally.
+                    if is_supabase {
+                        for n in all_nodes.iter().filter(|n| n.healthy) {
+                            if let Some(ip) = &n.public_ip {
+                                db_desired.push(DesiredRecord {
+                                    name: slug.into(),
+                                    rtype: "A".into(),
+                                    value: ip.clone(),
+                                    ttl: 60,
+                                });
+                            }
+                            if let Some(ip) = &n.public_ip6 {
+                                db_desired.push(DesiredRecord {
+                                    name: slug.into(),
+                                    rtype: "AAAA".into(),
+                                    value: ip.clone(),
+                                    ttl: 60,
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else {
                         continue;
                     };
-                    managed.push(slug.to_string());
                     if let Some(ip) = &node.public_ip {
                         db_desired.push(DesiredRecord {
                             name: slug.into(),

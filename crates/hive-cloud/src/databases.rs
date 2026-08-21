@@ -24,6 +24,44 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 
+/// Teardown requests observed for database ids whose provisioning may still be
+/// in flight. A delete's teardown can legitimately run BEFORE the backing
+/// container exists (the record's `container` field is stamped only when
+/// provisioning completes), and the template `rm` then no-ops while the
+/// in-flight provision starts the container AFTERWARDS — orphaned, with no
+/// record left for any reconcile to key on (witnessed live 2026-08-21:
+/// `hive-db-bbd13406` on fc-bangkok started ~65s after its delete and outlived
+/// the catalog entry; same shape twice). Noting the request here lets the
+/// provision completion path tear the fresh backing down instead of marking a
+/// deleted database Ready. Ids are uuids and never reused; the TTL only bounds
+/// the map's size.
+static TEARDOWN_REQUESTS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, u64>>> =
+    std::sync::OnceLock::new();
+
+const TEARDOWN_REQUEST_TTL_MS: u64 = 15 * 60 * 1000;
+
+/// Record that a delete's teardown ran for `id` on THIS node. Called from
+/// every teardown entry point (`teardown_db_backing` and the blind template
+/// arm in admin.rs) so the provision completion guard can see it regardless
+/// of which transport or arm handled the delete.
+pub fn note_teardown_request(id: &str) {
+    let m = TEARDOWN_REQUESTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let now = now_ms();
+    let mut m = m.lock();
+    m.retain(|_, ts| now.saturating_sub(*ts) < TEARDOWN_REQUEST_TTL_MS);
+    m.insert(id.to_string(), now);
+}
+
+/// Whether a teardown was requested for `id` within the TTL on THIS node.
+pub fn teardown_requested(id: &str) -> bool {
+    let Some(m) = TEARDOWN_REQUESTS.get() else {
+        return false;
+    };
+    m.lock()
+        .get(id)
+        .is_some_and(|ts| now_ms().saturating_sub(*ts) < TEARDOWN_REQUEST_TTL_MS)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DbKind {
@@ -801,7 +839,7 @@ fn token(prefix: &str) -> String {
 }
 
 /// Request to provision a new database.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProvisionReq {
     pub name: String,
     pub project: String,
@@ -1165,6 +1203,51 @@ pub fn provision(
 
     tokio::spawn(async move {
         let outcome = provision_backing(&store, &id, &req, &api_base, &db_host).await;
+        // A delete that landed while the backing was being created has already
+        // removed the catalog record — writing the Ready status into it is a
+        // no-op on a missing id, and the just-started backing would leak
+        // (witnessed live: the delete's teardown read `container` as still
+        // None, skipped, and the provision then started the container seconds
+        // later). The record being GONE here is one signal; the other is a
+        // teardown that already ran on this node against a record whose
+        // `container` was not yet stamped — its template `rm` no-op'd on a
+        // container that did not exist yet (`teardown_requested`, noted by
+        // every teardown entry point). Either way: tear the fresh backing
+        // down by name and skip the status write entirely.
+        if store.get_raw(&id).is_none() || teardown_requested(&id) {
+            if let Ok((_, _, container)) = &outcome {
+                if let Some(container) = container.as_deref() {
+                    tracing::warn!(
+                        db = %id,
+                        "database deleted while provisioning was in flight — tearing down the just-created backing"
+                    );
+                    let path_env = format!(
+                        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                        std::env::var("PATH").unwrap_or_default()
+                    );
+                    for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let _ = tokio::process::Command::new("podman")
+                            .args(["rm", "-f", "-v", one])
+                            .env("PATH", &path_env)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                    }
+                    if req.kind == DbKind::Supabase {
+                        let short = &id[3..11.min(id.len())];
+                        let _ = tokio::process::Command::new("podman")
+                            .args(["volume", "rm", "-f", &format!("hive-vol-supa-{short}")])
+                            .env("PATH", &path_env)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                    }
+                }
+            }
+            return;
+        }
         store.update(&id, |d| {
             match outcome {
                 Ok((mode, conn, container)) => {

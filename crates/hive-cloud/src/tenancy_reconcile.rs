@@ -81,6 +81,21 @@ pub async fn reconcile_once(cloud: &Arc<CloudState>) -> usize {
 
     let mut repaired = 0usize;
     for (project, team) in desired {
+        // A tombstoned project is DELETED, not untagged: the relational
+        // `project_teams` row can outlive the delete (its `deleted_ms` write
+        // rides guardian replication, which lags or fails behind the projects
+        // store_sync that already carried the tombstone here). Repairing such
+        // a project via the touch-stamping setter RESURRECTS it with
+        // `updated_ms = tombstone+1` — a row the merge then keeps forever as a
+        // post-delete "recreation" and re-gossips fleet-wide, which is exactly
+        // how a deleted project reappeared in listings minutes after its
+        // delete (witnessed live on `meinkampf`, 2026-08-21: rows re-stamped
+        // 1-4 min after the tombstone on three nodes). Never repair what was
+        // deliberately deleted; a genuine recreation returns with its own
+        // tagged row and never reaches this guard.
+        if cloud.projects.tombstone_of(&project).is_some() {
+            continue;
+        }
         let own = cloud.projects.team_of(&project);
         if tagged(&own) {
             continue; // already tagged — NEVER overwritten, even on disagreement

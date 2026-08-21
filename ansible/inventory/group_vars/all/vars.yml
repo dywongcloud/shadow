@@ -62,6 +62,35 @@ hive_gossip_iroh: "1"
 hive_gossip_sign: "1"
 hive_gossip_verify: "enforce"
 
+# ---------- Tencent CCN private-path preference (hive-p2p private_path.rs) ----------
+# `HIVE_CCN_REGIONS`/`HIVE_PRIVATE_ADDR`/`HIVE_PROVIDER` are NOT yet wired into
+# this playbook (no vars/templates below reference them) -- this block is
+# operator documentation for the manual opt-in only, not evidence the feature
+# is deployed. When a node opts in, its private-path candidate is dialed on
+# the SAME port as every other iroh QUIC peer: `resolve_private_addr()`
+# (crates/hive-cloud/src/main.rs) requires HIVE_IROH_PORT to build the
+# `ip:port` candidate from a bare IP, and that is the identical port
+# `hive_p2p::lib.rs` pins the endpoint's QUIC bind to (see the DHT block
+# above) -- there is no separate CCN port to open.
+#
+# CONSEQUENCE FOR THE TENCENT SECURITY GROUP: two Tencent-CCN peers dialing
+# each other over the VPC-private path need inbound UDP/HIVE_IROH_PORT open
+# between them -- this is ADDITIONAL to the existing rule the raw TCP port
+# range (20000-29999, see AGENTS.md "Compose published ports") already needs
+# at the VPC edge, because CCN peer-to-peer traffic crosses a different
+# boundary (inter-VPC via CCN, not host-to-internet). The source CIDR for
+# that rule MUST be the Tencent VPC/CCN CIDR range the fleet's private
+# subnets actually live in (e.g. the CCN instance's route-table CIDR) --
+# NEVER 0.0.0.0/0: `is_private_path_candidate` (private_path.rs) already
+# gates dial eligibility on both peers declaring `provider=tencent` and a
+# configured region pair, but the SG rule is the network-layer half of that
+# same "Tencent-only" intent, and an open-to-the-world UDP/HIVE_IROH_PORT
+# rule would let ANY host on the internet attempt the same handshake this
+# private path is meant to keep off the public internet. This is
+# documentation only -- no Tencent SG resource is created or modified by
+# this repo; apply the rule by hand (or via your own Tencent IaC) scoped to
+# exactly the CCN CIDR, per node pair that opts in via HIVE_PRIVATE_ADDR.
+
 # Opt-in static peer-trust allowlist (see roles/mesh_bootstrap). Off by
 # default; the join-proof self-admit mechanism (RUNBOOK.md) is sufficient
 # for most fleets. Turn on only if you need an explicit pre-authorized list.

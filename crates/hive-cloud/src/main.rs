@@ -910,6 +910,11 @@ async fn main() -> anyhow::Result<()> {
         wasm_runtime: wasm_rt,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
+        provider: std::env::var("HIVE_CLOUD_PROVIDER")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| !v.is_empty()),
+        private_addr: resolve_private_addr(),
     };
     tracing::info!(
         cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name,
@@ -1979,6 +1984,7 @@ async fn main() -> anyhow::Result<()> {
 fn owner_routed(path: &str) -> bool {
     path.starts_with("/v1/sqlite/")
         || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
+        || (path.starts_with("/v1/databases/") && path.ends_with("/studio-mesh"))
         || path.starts_with("/v1/drive/")
         // browser_db's libsql/Hrana + Upstash REST surface (bn-browser-db-rest):
         // owner-ROUTED to the elected REST owner (`browser_db::rest_owner_for_project`),
@@ -2770,6 +2776,44 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
     }
 }
 
+/// Resolve this node's Tencent VPC-private address for CCN inter-region
+/// traffic, from `HIVE_PRIVATE_ADDR` ONLY — deliberately never sniffed off an
+/// interface (spec: "do not hardcode `eth0`", and this fleet already learned
+/// the hard way, via `dht`'s seed-address OOM incident, that an RFC1918
+/// address existing on a host says nothing about whether it is dialable by
+/// anyone else — a Docker/k8s/bridge/TUN interface can produce a private
+/// address that is NOT the Tencent VPC NIC). An explicit operator value is
+/// the only source of truth this repo already has for "this address is the
+/// one meant for CCN", the same posture `HIVE_PUBLIC_IP` takes for the public
+/// side.
+///
+/// Accepts either a bare IPv4 (`10.20.0.15`, paired with `HIVE_IROH_PORT` —
+/// falling back to iroh's default ephemeral-port convention is NOT safe here
+/// since the private candidate must name a real port a peer can dial, so a
+/// missing `HIVE_IROH_PORT` makes a bare-IP override inert rather than
+/// guessing) or a full `ip:port` pair. Unset ⇒ `None` — the safe default:
+/// this node never becomes a CCN-private dial target, byte-identical to
+/// pre-feature behavior.
+fn resolve_private_addr() -> Option<String> {
+    let raw = std::env::var("HIVE_PRIVATE_ADDR").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(sa) = raw.parse::<std::net::SocketAddr>() {
+        return hive_p2p::private_path::is_safe_private_candidate(sa.ip()).then(|| sa.to_string());
+    }
+    let ip = raw.parse::<std::net::IpAddr>().ok()?;
+    if !hive_p2p::private_path::is_safe_private_candidate(ip) {
+        return None;
+    }
+    let port = std::env::var("HIVE_IROH_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)?;
+    Some(std::net::SocketAddr::new(ip, port).to_string())
+}
+
 /// Periodic re-geolocation so a machine that MOVES (a laptop node, or a cloud
 /// host whose ISP re-homes its IP) doesn't report a stale location until the
 /// next restart — the exact drift observed live on the LA-boot/San-Jose-now
@@ -3326,6 +3370,14 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 .as_ref()
                 .and_then(|n| n.peer_id.clone())
                 .filter(|id| !id.is_empty());
+            // Tencent CCN private-path eligibility: computed once per gossip
+            // round (not per peer) since the topology/self-info are stable
+            // within it. `ccn_topology`/`self_provider`/`self_region` cost
+            // nothing when `HIVE_CCN_REGIONS`/`HIVE_CLOUD_PROVIDER` are unset
+            // — every check below then trivially returns `false` and this
+            // whole block is a no-op, byte-identical to pre-feature behavior.
+            let ccn_topology = hive_p2p::private_path::CcnTopology::from_env();
+            let self_info = cloud.registry.me();
             for n in nodes {
                 if n.id != cloud.node_name {
                     if cloud.relayed_trust_compat {
@@ -3340,6 +3392,44 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     // Converge the control-plane fencing epoch on the max
                     // witnessed anywhere in the fleet (monotonic; see cluster.rs).
                     cloud.cluster.adopt_epoch(n.cp_epoch);
+                    // Tencent CCN private-path: register/clear this peer's
+                    // private-VPC candidate on the live `PeerPool` so the
+                    // NEXT `acquire()` for it (reused trunks are untouched —
+                    // this never tears down a live connection, only informs
+                    // the next fresh dial) tries the private address
+                    // alongside its normal public/relay candidates. Gated
+                    // end-to-end by `is_private_path_candidate`: both sides
+                    // must declare `provider = tencent` and the region pair
+                    // must be configured, so a peer with no provider/region
+                    // match is a no-op here, exactly as before this feature
+                    // existed.
+                    // Unconditional on `eid` alone (not also gated on
+                    // `private_addr` being present) — a peer that stays
+                    // gossiped but stops reporting a private address (e.g.
+                    // `provider` flipped away from tencent) must still reach
+                    // the `else` branch and get cleared; gating on both
+                    // `Some`s left that case leaked forever (adversarial
+                    // review finding).
+                    if let Some(eid) = n.peer_id.as_deref() {
+                        let private_ip = n
+                            .private_addr
+                            .as_deref()
+                            .and_then(|a| a.parse::<std::net::SocketAddr>().ok());
+                        let eligible = hive_p2p::private_path::is_private_path_candidate(
+                            self_info.provider.as_deref(),
+                            &self_info.region,
+                            n.provider.as_deref(),
+                            &n.region,
+                            private_ip.map(|sa| sa.ip()),
+                            &ccn_topology,
+                        );
+                        if let Some(pool) = cloud.mesh.read().clone() {
+                            match (eligible, private_ip) {
+                                (true, Some(sa)) => pool.set_private_candidate(eid, sa),
+                                _ => pool.clear_private_candidate(eid),
+                            }
+                        }
+                    }
                     // The response's first entry is the answering peer's OWN
                     // self-report — the only copy allowed to rename it (see
                     // upsert_peer_self_report); everything after it is a
@@ -3349,6 +3439,24 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     } else {
                         cloud.registry.upsert_peer(n);
                     }
+                }
+                // Reap private-candidate entries for any peer no longer in
+                // the registry's own live set (decommissioned/evicted) — the
+                // per-peer loop above only ever touches peers THIS round's
+                // gossip response actually mentioned, so a peer that stops
+                // being gossiped entirely (rather than merely losing its
+                // private_addr) would otherwise leak its entry forever
+                // (adversarial review finding). Cheap: the registry is the
+                // whole fleet, at most low hundreds of entries, and this is
+                // per-gossip-round, not per-peer.
+                if let Some(pool) = cloud.mesh.read().clone() {
+                    let live: std::collections::HashSet<String> = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .filter_map(|n| n.peer_id)
+                        .collect();
+                    pool.retain_private_candidates(&live);
                 }
             }
             if let Some(pid) = peer_self_id {

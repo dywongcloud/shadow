@@ -240,6 +240,27 @@ pub struct NodeInfo {
     /// `None` = never observed (or not reported).
     #[serde(default)]
     pub last_oom_ms: Option<u64>,
+    /// Cloud provider this node runs on, e.g. `"tencent"` — set from
+    /// `HIVE_CLOUD_PROVIDER`. `None` (the default for every pre-upgrade peer
+    /// and every non-cloud/dev node) means Tencent-CCN private-path
+    /// preference never applies to this node, in either direction —
+    /// `hive_p2p::private_path::is_private_path_candidate` requires BOTH
+    /// sides to declare the same recognized provider, so an unset value is
+    /// always safe, never "assume Tencent."
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// This node's Tencent VPC-private address (`ip:port`), for CCN inter-
+    /// region traffic — set from `HIVE_PRIVATE_ADDR` (explicit operator
+    /// config only; never sniffed off an interface, since not every RFC1918
+    /// address on a host is CCN-reachable — see `main.rs`'s
+    /// `resolve_private_addr`). Gossiped alongside the existing filtered
+    /// `iroh_addr`/`public_ip` — this field is NEVER folded into those, so a
+    /// peer that doesn't understand it (pre-upgrade, or ineligible) simply
+    /// never sees it used; `dht`'s existing public-only publish filter is
+    /// untouched. `None` = no private address configured (the default), and
+    /// this node is never a CCN-private dial target.
+    #[serde(default)]
+    pub private_addr: Option<String>,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -1040,6 +1061,8 @@ mod tests {
             oom_restarts_24h: 0,
             last_oom_ms: None,
             backend: String::new(),
+            provider: None,
+            private_addr: None,
         }
     }
 

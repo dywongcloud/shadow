@@ -64,6 +64,15 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
     // proxied to the studio container's loopback port. Branch BEFORE the
     // bearer check: Studio speaks basic-auth, not the DB REST bearer.
     if db.kind == DbKind::Supabase {
+        if !db.host_node.is_empty() && db.host_node != cloud.node_name {
+            return match studio_forward_to_owner(&cloud, &db, req).await {
+                Some(resp) => resp,
+                None => err(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "this Supabase database's owner node is unreachable",
+                ),
+            };
+        }
         return supabase_studio_proxy(&cloud, &db, req).await;
     }
 
@@ -762,9 +771,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// included: the Authorization header is checked here and never forwarded),
 /// then a streaming reverse proxy to the studio container's loopback port.
 ///
-/// Runs on the database's host node (per-DB DNS points the slug there), so
-/// the proxy target is always loopback — no cross-node forwarding in v1; a
-/// stale-DNS landing gets an honest 421 like the engine arms.
+/// Runs on the database's host node when reached directly. A request landing
+/// on any OTHER node — the normal case once per-DB DNS publishes the full
+/// healthy node set instead of a single fixed IP (see `vercel_dns.rs`) —
+/// is forwarded to the owner by `studio_forward_to_owner` below, which wraps
+/// the whole HTTP exchange (method/path/headers/body, then status/headers/
+/// body back) in a base64 JSON envelope over the SAME dual-transport (HTTP
+/// admin, else gossip mesh) `hrana::forward_to_owner` already uses for
+/// managed SQLite — the owner still runs this exact function and performs
+/// the SAME Basic-auth check against its own generated credentials, so the
+/// security boundary is unchanged: an edge forwards bytes, it never
+/// authenticates on the tenant's behalf.
 async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Request) -> Response {
     // ---- AuthN: HTTP Basic against this database's generated studio creds ---
     let ok = req
@@ -926,6 +943,200 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
             )
         }
     }
+}
+
+// ---- Studio owner proxy (mirrors hrana::forward_to_owner) -----------------
+
+/// Cap on the buffered body in either direction of a mesh-relayed Studio
+/// exchange — the mesh envelope can't stream, so both the forwarded request
+/// body and the owner's response are fully buffered; matches the existing
+/// `STUDIO_BODY_CAP` request-side cap used on the direct-serve path.
+const STUDIO_MESH_BODY_CAP: usize = 64 * 1024 * 1024;
+
+async fn studio_forward_to_owner(cloud: &Arc<CloudState>, db: &Database, req: Request) -> Option<Response> {
+    let node = db.host_node.clone();
+    if node.is_empty() {
+        return None;
+    }
+    let method = req.method().clone();
+    let path_q = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let hdrs: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .collect();
+    let (_parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, STUDIO_MESH_BODY_CAP).await.ok()?;
+    let body_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    };
+    let env = json!({
+        "method": method.as_str(),
+        "path": path_q,
+        "headers": hdrs,
+        "body_b64": body_b64,
+    });
+    let route = format!("/v1/databases/{}/studio-mesh", db.id);
+
+    // HTTP admin first (same two-tier shape as `hrana::forward_to_owner` /
+    // `admin::fetch_from_host`) — in practice almost always empty, since
+    // fleet admin ports are loopback-only, but cheap to try.
+    let admin = cloud.node_admins.read().get(&node).cloned();
+    if let Some(admin) = admin {
+        let mut rb = cloud
+            .http
+            .post(format!("{admin}{route}"))
+            .json(&env)
+            .timeout(std::time::Duration::from_secs(60));
+        if crate::auth::enforced() {
+            if let Ok(tok) = crate::auth::issue("mesh-internal", "", "service", false, 60) {
+                rb = rb.bearer_auth(tok);
+            }
+        }
+        if let Ok(r) = rb.send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    if let Some(resp) = studio_decode_envelope(&v) {
+                        return Some(resp);
+                    }
+                }
+            }
+        }
+    }
+
+    // Mesh fallback: the real path on this fleet (loopback-only admin ports).
+    let target = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)))?;
+    let payload = serde_json::to_vec(&env).ok()?;
+    let bytes = crate::gossip::request_to(
+        cloud,
+        &target.0,
+        &target.1,
+        hive_p2p::GOSSIP_POST,
+        &route,
+        &payload,
+        60,
+    )
+    .await?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    studio_decode_envelope(&v)
+}
+
+fn studio_decode_envelope(v: &Value) -> Option<Response> {
+    use base64::Engine;
+    let status = v.get("status")?.as_u64()? as u16;
+    let status = StatusCode::from_u16(status).ok()?;
+    let mut builder = Response::builder().status(status);
+    if let Some(hdrs) = v.get("headers").and_then(|h| h.as_array()) {
+        for h in hdrs {
+            let (Some(k), Some(val)) = (
+                h.get(0).and_then(|x| x.as_str()),
+                h.get(1).and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            if let (Ok(name), Ok(hv)) = (
+                header::HeaderName::from_bytes(k.as_bytes()),
+                header::HeaderValue::from_str(val),
+            ) {
+                builder = builder.header(name, hv);
+            }
+        }
+    }
+    let body = v
+        .get("body_b64")
+        .and_then(|b| b.as_str())
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .unwrap_or_default();
+    builder.body(axum::body::Body::from(body)).ok()
+}
+
+/// Owner-side handler for a forwarded Studio exchange (mesh + HTTP-admin
+/// entry points both call this). Re-validates that THIS node is still the
+/// owner before touching the container — a stale caller-side record must
+/// never cause a second node to answer for a database it doesn't host.
+pub(crate) async fn studio_mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value {
+    use base64::Engine;
+    let Some(db) = cloud.databases.get_raw(id) else {
+        return json!({ "status": 404, "headers": [], "body_b64": "" });
+    };
+    if db.host_node != cloud.node_name {
+        return json!({
+            "status": 421,
+            "headers": [],
+            "body_b64": base64::engine::general_purpose::STANDARD
+                .encode(b"not the current owner (stale forward)"),
+        });
+    }
+    if db.kind != DbKind::Supabase {
+        return json!({ "status": 400, "headers": [], "body_b64": "" });
+    }
+    let method_str = env.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+    let method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
+    let path_q = env.get("path").and_then(|p| p.as_str()).unwrap_or("/").to_string();
+    let body = env
+        .get("body_b64")
+        .and_then(|b| b.as_str())
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .unwrap_or_default();
+    let mut builder = Request::builder().method(method).uri(path_q);
+    if let Some(hdrs) = env.get("headers").and_then(|h| h.as_array()) {
+        for h in hdrs {
+            let (Some(k), Some(v)) = (
+                h.get(0).and_then(|x| x.as_str()),
+                h.get(1).and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            builder = builder.header(k, v);
+        }
+    }
+    let req = match builder.body(axum::body::Body::from(body)) {
+        Ok(r) => r,
+        Err(_) => return json!({ "status": 400, "headers": [], "body_b64": "" }),
+    };
+    let resp = supabase_studio_proxy(cloud, &db, req).await;
+    let status = resp.status().as_u16();
+    let hdrs: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .collect();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), STUDIO_MESH_BODY_CAP)
+        .await
+        .unwrap_or_default();
+    json!({
+        "status": status,
+        "headers": hdrs,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(&body_bytes),
+    })
+}
+
+async fn studio_mesh_route(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(env): axum::Json<Value>,
+) -> axum::Json<Value> {
+    axum::Json(studio_mesh_serve(&cloud, &id, &env).await)
+}
+
+/// `/v1/databases/:id/studio-mesh` — the owner-proxy mount, mirroring
+/// `hrana::routes()`'s `/hrana-mesh` mount exactly (same `owner_routed`
+/// exemption in `main.rs`, same gossip dispatch-arm shape in `gossip.rs`).
+pub fn routes() -> axum::Router<Arc<CloudState>> {
+    axum::Router::new().route(
+        "/v1/databases/:id/studio-mesh",
+        axum::routing::post(studio_mesh_route),
+    )
 }
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {

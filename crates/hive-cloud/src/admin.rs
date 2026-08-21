@@ -244,6 +244,14 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         )
         // ---- Databases / storage ----
         .route("/v1/databases", get(databases_list).post(database_create))
+        .route(
+            "/v1/internal/databases/provision-local",
+            post(database_provision_local),
+        )
+        .route(
+            "/v1/internal/databases/teardown-local",
+            post(database_teardown_local),
+        )
         .route("/v1/db-directory", get(db_directory))
         .route("/v1/admin/databases", get(admin_databases_all))
         .route(
@@ -362,6 +370,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::storage_api::routes())
         // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
+        .merge(crate::db_rest::routes())
         // ---- shadw drive v1: REST + WebDAV (relational metadata, owner-routed bytes) ----
         .merge(crate::drive_api::routes())
         .merge(crate::drive_webdav::routes())
@@ -10487,6 +10496,81 @@ async fn database_create(
             return Ok(Json(json!(existing)));
         }
     }
+    // Region-aware placement: `provision()` used to always run on THIS node
+    // (whichever one the admin request happened to land on after leader-
+    // forwarding), so a tenant requesting `region=sao-paulo` from anywhere
+    // got a database really provisioned wherever the control-plane leader
+    // currently was — measured live: every Supabase database on the fleet
+    // landed on `fc-sanjose` regardless of its requested region. Reuses
+    // `schedule::place`'s existing health/region/reachability picker (the
+    // same one function deploys already go through). Only overrides when a
+    // region was actually requested and a healthy, reachable, public
+    // candidate exists there; any miss (unknown region, nothing eligible)
+    // falls through to self — this must never turn an empty placement into
+    // a failed database create, only an occasionally-suboptimal one.
+    let host_node = req
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(|region| {
+            let regions = [region.to_string()];
+            crate::schedule::place(&c, &regions, true, true, false, false)
+                .into_iter()
+                .next()
+        })
+        .map(|t| t.node)
+        .unwrap_or_else(|| c.node_name.clone());
+
+    if host_node != c.node_name {
+        // The chosen node is a PEER, never this node: dispatch the actual
+        // provisioning work there (podman containers only ever run where the
+        // process that spawns them lives — relabeling `host_node` alone
+        // without also routing the work there would create a record
+        // claiming to live on a node that never actually got any
+        // containers). Mirrors the `post_body_to_host` pattern this file
+        // already uses for run-event forwarding. The target's own
+        // `database_provision_local` handler does provisioning +
+        // egress/replication/persist/webhooks locally and its result
+        // replicates back fleet-wide through the existing `databases`
+        // store-sync path (the same one that already carries every other
+        // node's database records into this node's own `state.json`).
+        if let Some(v) = post_body_to_host(
+            &c,
+            &host_node,
+            "/v1/internal/databases/provision-local",
+            &req.team,
+            &json!(req),
+        )
+        .await
+        {
+            // Adopt the authoritative record into THIS node's own local store
+            // immediately, rather than waiting on `store_sync`'s replication
+            // tick — otherwise a delete that arrives back on THIS node (the one
+            // the client actually talks to) moments later finds nothing in
+            // `c.databases` yet and silently no-ops while still reporting
+            // `removed: true`, leaking the remote container. Witnessed live:
+            // create dispatched sj->bkk, immediate delete issued on sj, bkk
+            // container survived with no warn logged at all — the outer lookup
+            // itself was returning `None`. `upsert_replica` is the existing
+            // insert-or-replace-by-id primitive for exactly this shape.
+            if let Ok(db) = serde_json::from_value::<crate::databases::Database>(v.clone()) {
+                c.databases.upsert_replica(db);
+            }
+            return Ok(Json(v));
+        }
+        // Dispatch failed (node unreachable over both HTTP admin and mesh) —
+        // fall through to local provisioning rather than failing the create
+        // outright. A database on the WRONG node beats no database at all;
+        // the same "admit and let the floor catch it" direction placement
+        // already takes elsewhere in this codebase (AGENTS.md's disk-floor
+        // section).
+        tracing::warn!(
+            node = %host_node,
+            "database create: chosen region node unreachable, provisioning locally instead"
+        );
+    }
+
     let db = crate::databases::provision(
         c.databases.clone(),
         c.region.clone(),
@@ -10524,6 +10608,225 @@ async fn database_create(
     Ok(Json(json!(db)))
 }
 
+/// Internal-only mirror of [`database_create`]'s local-provisioning tail,
+/// reached via [`post_body_to_host`] when that handler's own region-aware
+/// placement chose a DIFFERENT node than the one that received the client's
+/// request. Runs the exact same `provision()` + egress/replication/persist/
+/// webhooks sequence, just always locally (never re-dispatches — the caller
+/// already resolved placement, and re-resolving here on a `req.region` this
+/// node might interpret differently would risk a dispatch loop). Gated by
+/// [`require_operator_or_internal`]: the forwarded hop carries
+/// `x-hive-internal`, never the original caller's Authorization header,
+/// mirroring every other internal node-to-node forward in this file.
+pub(crate) async fn database_provision_local(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(req): Json<crate::databases::ProvisionReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator_or_internal(&headers, claims.as_ref().map(|e| &e.0))?;
+    let cloud = c.clone();
+    let project = req.project.clone();
+    let db = crate::databases::provision(
+        c.databases.clone(),
+        c.region.clone(),
+        req,
+        c.db_domain.clone(),
+        c.node_name.clone(),
+        c.api_base(),
+        move |d| {
+            if !d.project.is_empty() && matches!(d.status, crate::databases::DbStatus::Ready) {
+                apply_db_egress(&cloud, &d);
+            }
+            if !d.replicas.is_empty() {
+                crate::db_replicate::ensure_replicas(cloud.clone(), d.clone());
+            }
+            crate::persist::persist(&cloud);
+            crate::webhooks::dispatch(
+                &cloud.webhooks,
+                &project,
+                "database.ready",
+                json!({ "id": d.id, "name": d.name, "kind": d.kind, "status": d.status }),
+            );
+        },
+    );
+    crate::persist::persist(&c);
+    crate::webhooks::dispatch(
+        &c.webhooks,
+        &db.project,
+        "database.created",
+        json!({ "id": db.id, "name": db.name, "kind": db.kind }),
+    );
+    Ok(Json(json!(db)))
+}
+
+/// Best-effort teardown of a database's backing containers/volume/SQLite
+/// file — the part of delete that only means anything ON THE NODE THAT
+/// ACTUALLY HOSTS THEM. Split out of `database_delete` so it can run either
+/// locally (the common case: this node IS `d.host_node`) or be dispatched to
+/// the real owner over the mesh (`database_teardown_local`) when it isn't —
+/// the exact gap `database_create`'s region-aware placement opened: before
+/// that change every database's `host_node` was always the node handling the
+/// request, so local-only teardown was correct by construction; a database
+/// now genuinely living on a peer node would otherwise leak its containers
+/// and (for Supabase) its data volume forever, since a podman `rm` for a
+/// name that doesn't exist locally just silently no-ops — witnessed live the
+/// first time this fix was tested: a deleted database's container kept
+/// running on its real host node with no error anywhere.
+async fn teardown_db_backing(d: &crate::databases::Database) {
+    let id = &d.id;
+    crate::databases::note_teardown_request(id);
+    // Managed SQLite: no container, so the teardown is its own. Streams
+    // first (each holds a pooled connection, and one mid-`BEGIN` holds the
+    // file's write lock), then the pool, then the file — in that order, or
+    // the unlink races a live writer.
+    if d.kind == crate::databases::DbKind::Sqlite {
+        crate::hrana::close_streams(id);
+        crate::sqlite_pool::close(id);
+        if let Some(path) = crate::databases::sqlite_file_path(id) {
+            for suffix in ["", "-wal", "-shm"] {
+                let p = if suffix.is_empty() {
+                    path.clone()
+                } else {
+                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+                };
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove SQLite database file");
+                    }
+                }
+            }
+        }
+    }
+    // Best-effort teardown of the backing container(s): the record's
+    // comma-joined `container` field when set (a Supabase record carries its
+    // whole stack db,meta,studio), else the platform-templated names by kind —
+    // a delete that races an IN-FLIGHT provision reads `container` while it is
+    // still None, and skipping there leaks the container the provision starts
+    // seconds later (witnessed live: redis on fc-bangkok outlived its catalog
+    // entry). `-v` is the podman lock-pool rule (anonymous volumes leak locks
+    // forever); the stack's NAMED data volume is removed explicitly below.
+    let short = &id[3..11.min(id.len())];
+    let names: Vec<String> = match d.container.as_deref() {
+        Some(container) => container
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => {
+            if d.kind == crate::databases::DbKind::Supabase {
+                vec![
+                    format!("hive-supa-{short}-db"),
+                    format!("hive-supa-{short}-meta"),
+                    format!("hive-supa-{short}-studio"),
+                ]
+            } else {
+                vec![format!("hive-db-{short}")]
+            }
+        }
+    };
+    for one in names {
+        let _ = tokio::process::Command::new("podman")
+            .args(["rm", "-f", "-v", &one])
+            .env(
+                "PATH",
+                format!(
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+    if d.kind == crate::databases::DbKind::Supabase {
+        // Deleting the database IS deleting its data — the stack's
+        // named volume is platform-templated (`hive-vol-supa-<id8>`),
+        // never tenant-named, so this cannot touch another volume.
+        let vol = format!("hive-vol-supa-{short}");
+        let _ = tokio::process::Command::new("podman")
+            .args(["volume", "rm", "-f", &vol])
+            .env(
+                "PATH",
+                format!(
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+}
+
+/// Record-free teardown by platform template: kind is unknowable without the
+/// catalog record, so cover both naming families (single-container
+/// `hive-db-<id8>` and the Supabase trio + its named volume). Every removal is
+/// idempotent best-effort; a name that never existed is a no-op.
+async fn teardown_db_backing_blind(id: &str) {
+    if id.len() <= 3 {
+        return;
+    }
+    crate::databases::note_teardown_request(id);
+    let short = &id[3..11.min(id.len())];
+    let path_env = format!(
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for one in [
+        format!("hive-db-{short}"),
+        format!("hive-supa-{short}-db"),
+        format!("hive-supa-{short}-meta"),
+        format!("hive-supa-{short}-studio"),
+    ] {
+        let _ = tokio::process::Command::new("podman")
+            .args(["rm", "-f", "-v", &one])
+            .env("PATH", &path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = tokio::process::Command::new("podman")
+        .args(["volume", "rm", "-f", &format!("hive-vol-supa-{short}")])
+        .env("PATH", &path_env)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
+/// Internal-only: run [`teardown_db_backing`] for `id` on THIS node. Reached
+/// via [`post_body_to_host`] from `database_delete` when the record's
+/// `host_node` is a peer. Gated by [`require_operator_or_internal`], same as
+/// [`database_provision_local`].
+pub(crate) async fn database_teardown_local(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(id): Json<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator_or_internal(&headers, claims.as_ref().map(|e| &e.0))?;
+    if let Some(d) = c.databases.get_raw(&id) {
+        teardown_db_backing(&d).await;
+    } else {
+        // The catalog delete's store_sync can beat this dispatch to the peer —
+        // no record here means the old arm removed NOTHING and still answered
+        // `torn_down`, which is exactly how the witness container kept running
+        // after its catalog entry vanished. The backing names are platform
+        // templates, so a missing record does not blind the teardown.
+        tracing::warn!(
+            db = %id,
+            "database teardown-local: no local record (catalog removal replicated first) — tearing down by platform template"
+        );
+        teardown_db_backing_blind(&id).await;
+    }
+    Ok(Json(json!({ "torn_down": id })))
+}
+
 async fn database_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10531,7 +10834,30 @@ async fn database_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some(d) = c.databases.get_raw(&id) {
+    // Replication-lag guard, same reasoning as the inner `host_node`-empty
+    // retry below but for the OUTER lookup itself: a database created via
+    // `database_provision_local` on a PEER (this node's own region-aware
+    // placement dispatch) has not necessarily replicated into THIS node's
+    // local `databases` store yet by the time a fast-following delete
+    // arrives — witnessed live: `get_raw` returned `None` here, so the
+    // whole teardown block below (including its own host_node retry) never
+    // ran at all, `remove_db_and_purge_data` no-op'd on an id it had never
+    // heard of, and the API still answered `{"removed": true}` while the
+    // real container kept running on the peer forever. A few hundred ms of
+    // retry closes this for any delete within a couple of store-sync
+    // rounds of the create; a delete on a database that never existed
+    // still 404s after these attempts exhaust, unchanged from before.
+    let mut record = c.databases.get_raw(&id);
+    if record.is_none() {
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            record = c.databases.get_raw(&id);
+            if record.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(d) = record {
         if norm(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
@@ -10545,72 +10871,69 @@ async fn database_delete(
         if !d.replicas.is_empty() {
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
         }
-        // Managed SQLite: no container, so the teardown is its own. Streams
-        // first (each holds a pooled connection, and one mid-`BEGIN` holds the
-        // file's write lock), then the pool, then the file — in that order, or
-        // the unlink races a live writer. Only ever on the OWNING node: a peer
-        // has no file to remove and must not invent a path.
-        if d.kind == crate::databases::DbKind::Sqlite && d.host_node == c.node_name {
-            crate::hrana::close_streams(&id);
-            crate::sqlite_pool::close(&id);
-            if let Some(path) = crate::databases::sqlite_file_path(&id) {
-                for suffix in ["", "-wal", "-shm"] {
-                    let p = if suffix.is_empty() {
-                        path.clone()
-                    } else {
-                        std::path::PathBuf::from(format!("{}{suffix}", path.display()))
-                    };
-                    if let Err(e) = std::fs::remove_file(&p) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove SQLite database file");
-                        }
+        // A replication-lag guard for the delete-moments-after-create case:
+        // if this node's own copy of the record has no `host_node` yet
+        // (created on a peer via `database_provision_local`, whose write
+        // hasn't finished propagating back here through the ordinary
+        // `databases` store-sync path), briefly re-fetch rather than
+        // immediately concluding "unknown, give up" — closes the race for
+        // any delete landing within a couple of store-sync rounds of the
+        // create, which is the overwhelming common case (a delete seconds
+        // or minutes later already has a fully-replicated `host_node`).
+        let mut d = d;
+        if d.host_node.is_empty() {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                if let Some(fresh) = c.databases.get_raw(&id) {
+                    if !fresh.host_node.is_empty() {
+                        d = fresh;
+                        break;
                     }
                 }
             }
         }
-        if let Some(container) = d.container {
-            // Best-effort teardown of the backing container(s). A Supabase
-            // record carries its whole stack comma-joined (db,meta,studio);
-            // single-container kinds are unaffected by the split. `-v` is the
-            // podman lock-pool rule (anonymous volumes leak locks forever);
-            // the stack's NAMED data volume is removed explicitly below.
-            for one in container
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+        if d.host_node == c.node_name {
+            teardown_db_backing(&d).await;
+        } else if d.host_node.is_empty() {
+            // NEVER treat an unset `host_node` as "must be local" — that is
+            // exactly the trap that leaked a real container live: a delete
+            // landing on a node whose replicated copy of the record hasn't
+            // finished catching up from wherever `database_provision_local`
+            // actually created it reads `host_node` as its zero-value, not
+            // as the true owner, and the container silently outlives the
+            // catalog entry with no error anywhere. Loud and honest instead:
+            // this node genuinely does not know where the backing container
+            // lives, so it cannot tear it down — surfaced so an operator can
+            // find it via the orphan-reap sweep rather than trusting a
+            // "removed: true" response that only removed the catalog row.
+            tracing::warn!(
+                db = %id,
+                "database delete: host_node unknown on this node (stale replication?) — \
+                 backing container/volume was NOT torn down; catalog entry removed regardless"
+            );
+        } else {
+            // The containers/volume/file live on a PEER — dispatch there
+            // rather than silently no-op'ing a local `podman rm` against a
+            // name that was never created on this host. Best-effort: an
+            // unreachable peer must not block the catalog delete below (the
+            // customer asked for this database gone; a stranded container
+            // on an unreachable node is a leak to catch via the normal
+            // orphan-reap sweep, not a reason to refuse the delete).
+            if post_body_to_host(
+                &c,
+                &d.host_node,
+                "/v1/internal/databases/teardown-local",
+                &t,
+                &json!(id),
+            )
+            .await
+            .is_none()
             {
-                let _ = tokio::process::Command::new("podman")
-                    .args(["rm", "-f", "-v", one])
-                    .env(
-                        "PATH",
-                        format!(
-                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                            std::env::var("PATH").unwrap_or_default()
-                        ),
-                    )
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-            }
-            if d.kind == crate::databases::DbKind::Supabase {
-                // Deleting the database IS deleting its data — the stack's
-                // named volume is platform-templated (`hive-vol-supa-<id8>`),
-                // never tenant-named, so this cannot touch another volume.
-                let vol = format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]);
-                let _ = tokio::process::Command::new("podman")
-                    .args(["volume", "rm", "-f", &vol])
-                    .env(
-                        "PATH",
-                        format!(
-                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                            std::env::var("PATH").unwrap_or_default()
-                        ),
-                    )
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
+                tracing::warn!(
+                    db = %id,
+                    node = %d.host_node,
+                    "database delete: host node unreachable, backing container/volume may be leaked (catalog entry removed regardless)"
+                );
             }
         }
     }

@@ -31,6 +31,7 @@ pub use iroh::Endpoint;
 /// and `GET /v1/mesh/discovery` read it). See the module docs for what becomes
 /// publicly resolvable and every env flag that gates it.
 pub mod dht;
+pub mod private_path;
 
 /// Connection-level QUIC idle timeout for trunked connections.
 ///
@@ -2214,6 +2215,20 @@ pub struct PeerPool {
     /// dead-looking peer (bootstrap seeds included) is always re-tried within
     /// three minutes, and any success clears the memo.
     neg_discovery: Mutex<HashMap<String, (u64, u64)>>,
+    /// Tencent-CCN private-path candidates: canonical endpoint id → the
+    /// peer's VPC-private address, populated ONLY by this node's own trusted
+    /// gossip-merge code (`set_private_candidate`), never from raw peer
+    /// input. Consulted by [`acquire`](Self::acquire) to prepend a private
+    /// `TransportAddr::Ip` candidate onto the normal dial set for exactly
+    /// the peers that earned eligibility via `private_path::
+    /// is_private_path_candidate` — every other peer (non-Tencent, no CCN
+    /// pair, no override) has no entry here and dials exactly as before this
+    /// feature existed. A single extra candidate per already-known peer, not
+    /// a bulk unfiltered address set — the incident `dht`'s seed-address
+    /// filter guards against (an unbounded `pending_open_paths` queue from
+    /// throwing every RFC1918 seed address at iroh) cannot recur here: this
+    /// table only ever grows by one entry per already-authenticated peer.
+    private_candidates: StdMutex<HashMap<String, std::net::SocketAddr>>,
 }
 
 impl PeerPool {
@@ -2227,7 +2242,66 @@ impl PeerPool {
             timeouts: Arc::new(TimeoutCounters::default()),
             warm_backoff: Mutex::new(HashMap::new()),
             neg_discovery: Mutex::new(HashMap::new()),
+            private_candidates: StdMutex::new(HashMap::new()),
         })
+    }
+
+    fn lock_private_candidates(&self) -> std::sync::MutexGuard<'_, HashMap<String, std::net::SocketAddr>> {
+        self.private_candidates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register (or update) `endpoint_id`'s Tencent-CCN private-VPC address
+    /// as a preferred dial candidate. Callers (the NodeInfo gossip-merge
+    /// path) are expected to have already run `private_path::
+    /// is_private_path_candidate` — this method itself re-validates the
+    /// address with `is_safe_private_candidate` as a second, independent
+    /// gate (defense in depth) and silently no-ops on an unsafe address
+    /// rather than trusting the caller alone.
+    pub fn set_private_candidate(&self, endpoint_id: &str, addr: std::net::SocketAddr) {
+        if !private_path::is_safe_private_candidate(addr.ip()) {
+            tracing::warn!(
+                endpoint_id,
+                addr = %addr,
+                "refused to register unsafe private-path candidate"
+            );
+            return;
+        }
+        self.lock_private_candidates()
+            .insert(endpoint_id.to_string(), addr);
+    }
+
+    /// Drop a peer's private-path candidate — called when a peer stops being
+    /// CCN-eligible (region/provider changed, or it aged out of the
+    /// registry). Absence is always safe: `acquire` simply dials without a
+    /// private candidate, exactly as before this feature existed.
+    pub fn clear_private_candidate(&self, endpoint_id: &str) {
+        self.lock_private_candidates()
+            .remove(endpoint_id);
+    }
+
+    /// The private candidate currently registered for `endpoint_id`, if any
+    /// — used by callers wanting to classify an established connection's
+    /// path (`private_path::classify_remote_addr`) without re-deriving it.
+    pub fn private_candidate(&self, endpoint_id: &str) -> Option<std::net::SocketAddr> {
+        self.lock_private_candidates()
+            .get(endpoint_id)
+            .copied()
+    }
+
+    /// Reap private-candidate entries for peers no longer present in `keep`
+    /// (the current full gossiped fleet). Fixes the leak the per-peer
+    /// eligibility check alone cannot: a peer that stops being GOSSIPED at
+    /// all (decommissioned, offline, evicted) never runs through the
+    /// set/clear branch in the merge loop — its entry survives forever with
+    /// no TTL otherwise. Called once per gossip round after the per-peer
+    /// pass, over the round's full node-id set, so entries are naturally
+    /// re-affirmed rather than reaped as long as the peer keeps gossiping —
+    /// only genuine departures ever hit this.
+    pub fn retain_private_candidates(&self, keep: &std::collections::HashSet<String>) {
+        self.lock_private_candidates()
+            .retain(|eid, _| keep.contains(eid));
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PeerPoolState> {
@@ -2403,9 +2477,34 @@ impl PeerPool {
     /// (possibly slow, holepunching) `connect`, so a slow first-contact to one peer
     /// can't serialize requests to the others.
     async fn acquire(&self, node_id: &str, addr_json: &str) -> Result<AcquiredPeer> {
-        let addr: EndpointAddr = serde_json::from_str(addr_json)?;
+        let mut addr: EndpointAddr = serde_json::from_str(addr_json)?;
         let id = addr.id;
         let key = id.to_string();
+
+        // Tencent-CCN private path preference: if this peer has an
+        // eligibility-proven private candidate registered (see
+        // `set_private_candidate`), add it to the dial candidate set.
+        // `EndpointAddr::addrs` is a `BTreeSet`, not a `Vec` — iroh 1.0.2
+        // exposes no deterministic try-order knob here, so there is no
+        // "prepend to try first" lever without forking iroh (confirmed by
+        // the type, not assumed); the achievable, non-forking preference is
+        // getting the private candidate INTO the race at all, which iroh's
+        // own address-probing/hole-punching then attempts alongside the
+        // public/relay candidates that were already in `addr_json`. Set
+        // semantics give dedup for free — a peer that already advertises its
+        // private addr publicly (`HIVE_SEED_ALLOW_PRIVATE=1`) never gets a
+        // duplicate entry.
+        if let Some(private) = self.private_candidate(&key) {
+            let inserted = addr.addrs.insert(iroh::TransportAddr::Ip(private));
+            if inserted {
+                tracing::debug!(
+                    node_id,
+                    key = %key,
+                    private_addr = %private,
+                    "added Tencent CCN private-path candidate to dial set"
+                );
+            }
+        }
 
         let (signal, generation, leader) = {
             let mut state = self.lock_state();
@@ -2551,7 +2650,29 @@ impl PeerPool {
                     drop(state);
                     leader_guard.disarm();
                     self.opened.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(node_id, key = %key, "trunk opened");
+                    // Path observability (mandatory per the CCN-preference
+                    // spec): classify which transport this trunk's SELECTED
+                    // path actually landed on, from iroh's own live per-path
+                    // state (`Connection::paths`) — never inferred from "a
+                    // private IP appeared in the dial candidate set" alone.
+                    // `private_hint` is whatever candidate THIS acquire tried
+                    // to add for this peer, so a match against the selected
+                    // path's real remote addr proves the private path was
+                    // actually used.
+                    let private_hint = self.private_candidate(&key).map(|sa| sa.ip());
+                    let path = conn
+                        .paths()
+                        .iter()
+                        .find(|p| p.is_selected())
+                        .map(|p| match p.remote_addr() {
+                            iroh::TransportAddr::Ip(sa) => {
+                                private_path::classify_remote_addr(sa.ip(), private_hint).as_str()
+                            }
+                            iroh::TransportAddr::Relay(_) => private_path::PathKind::Relay.as_str(),
+                            _ => "custom",
+                        })
+                        .unwrap_or("unknown");
+                    tracing::info!(node_id, key = %key, path, "trunk opened");
                     Ok(acquired)
                 } else {
                     if same_channel {

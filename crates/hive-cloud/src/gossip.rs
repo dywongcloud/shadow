@@ -693,6 +693,76 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err(_) => Vec::new(),
             }
         }
+        // Region-aware database placement fanout: `admin::database_create`
+        // proxies the actual provisioning work here when it chose a DIFFERENT
+        // node than the one that received the client's request (see that
+        // function's doc — podman containers only run where the process that
+        // spawns them lives, so relabeling `host_node` alone would create a
+        // record claiming a node that never got any containers). No re-proxy
+        // loop: `database_provision_local` always provisions locally. Reached
+        // here (not just via `post_body_to_host`'s HTTP-first attempt) because
+        // admin ports are loopback-only fleet-wide — cross-node dispatch for
+        // this path is mesh-only in practice. Gated by the mesh's own peer-
+        // trust boundary (this arm only runs for an already-authenticated
+        // gossip peer), same as every other arm here — `x-hive-internal` is
+        // set anyway so `require_operator_or_internal` passes without relying
+        // on synthesized claims.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/internal/databases/provision-local") =>
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+                    headers.insert("x-hive-internal", hv);
+                }
+            }
+            match serde_json::from_slice::<crate::databases::ProvisionReq>(body) {
+                Ok(req) => match crate::admin::database_provision_local(
+                    State(cloud.clone()),
+                    headers,
+                    None,
+                    axum::Json(req),
+                )
+                .await
+                {
+                    Ok(j) => jb(j),
+                    Err((_, msg)) => {
+                        serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default()
+                    }
+                },
+                Err(_) => Vec::new(),
+            }
+        }
+        // Companion to the provision-local arm above: `admin::database_delete`
+        // proxies backing-container/volume teardown here when the record's
+        // `host_node` is a peer (the same gap the create-side fix opened —
+        // see `teardown_db_backing`'s doc). No re-proxy loop.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/internal/databases/teardown-local") =>
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+                    headers.insert("x-hive-internal", hv);
+                }
+            }
+            match serde_json::from_slice::<String>(body) {
+                Ok(id) => match crate::admin::database_teardown_local(
+                    State(cloud.clone()),
+                    headers,
+                    None,
+                    axum::Json(id),
+                )
+                .await
+                {
+                    Ok(j) => jb(j),
+                    Err((_, msg)) => {
+                        serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default()
+                    }
+                },
+                Err(_) => Vec::new(),
+            }
+        }
         // Instant rollback to a placed deployment: the coordinator proxies the
         // promote (a mutation) to the host node over the mesh. The host runs it
         // locally (it holds the deployment), so there's no re-proxy loop.
@@ -1390,6 +1460,31 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 .trim_end_matches("/hrana-mesh");
             match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(env) => jb(axum::Json(crate::hrana::mesh_serve(&cloud, id, &env).await)),
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+            }
+        }
+        // Supabase Studio OWNER PROXY: the container lives on one node, and
+        // per-DB DNS now publishes the full healthy node set (not a single
+        // fixed IP) so any other edge forwards here rather than answering
+        // MISDIRECTED_REQUEST. Same envelope/re-check shape as the
+        // `/hrana-mesh` arm just above.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/databases/")
+            && p.split('?')
+                .next()
+                .unwrap_or_default()
+                .ends_with("/studio-mesh") =>
+        {
+            let id = p
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("/v1/databases/")
+                .trim_end_matches("/studio-mesh");
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(env) => jb(axum::Json(
+                    crate::db_rest::studio_mesh_serve(cloud, id, &env).await,
+                )),
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
