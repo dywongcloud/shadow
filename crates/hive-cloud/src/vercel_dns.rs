@@ -2654,12 +2654,12 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 // NOT this DNS leader, and DB records are not gossiped. The peer
                 // fan-out is the non-secret `/v1/db-directory` (routing metadata
                 // only). Local wins on slug collision (first insert kept).
-                let mut dir: Vec<(String, String, bool)> = cloud
+                let mut dir: Vec<(String, String)> = cloud
                     .databases
                     .list(None)
                     .into_iter()
                     .filter(|d| !d.db_host.is_empty() && !d.host_node.is_empty())
-                    .map(|d| (d.db_host, d.host_node, d.kind == crate::databases::DbKind::Supabase))
+                    .map(|d| (d.db_host, d.host_node))
                     .collect();
                 // Fan out CONCURRENTLY, each under its own tight budget — this loop
                 // shares the single reconciler task with the apps/platform zones
@@ -2696,14 +2696,13 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                             .get("host_node")
                             .and_then(|x| x.as_str())
                             .unwrap_or_default();
-                        let is_supabase = e.get("kind").and_then(|x| x.as_str()) == Some("supabase");
                         if !host.is_empty() && !hn.is_empty() {
-                            dir.push((host.to_string(), hn.to_string(), is_supabase));
+                            dir.push((host.to_string(), hn.to_string()));
                         }
                     }
                 }
                 let mut seen = std::collections::HashSet::new();
-                for (db_host, host_node, is_supabase) in dir {
+                for (db_host, host_node) in dir {
                     let Some(slug) = db_host.strip_suffix(&suffix) else {
                         continue;
                     };
@@ -2711,38 +2710,27 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                         continue;
                     }
                     managed.push(slug.to_string());
-                    // Raw wire-protocol kinds (Postgres/Redis/etc.) MUST land
-                    // directly on the owner: `db_gateway`'s TLS SNI splice has
-                    // no forward hop, so any other node would answer
-                    // MISDIRECTED_REQUEST. Supabase Studio is plain HTTPS with
-                    // a real owner-forward proxy (`db_rest::studio_mesh_serve`,
-                    // the `hrana::forward_to_owner` pattern) — publish the FULL
-                    // healthy node set like the apps zone does, so a client
-                    // landing on any edge still gets served (forwarded if
-                    // that edge isn't the owner) instead of depending on one
-                    // fixed node's continued reachability, and so a nearer
-                    // edge can terminate the client's TLS handshake locally.
-                    if is_supabase {
-                        for n in all_nodes.iter().filter(|n| n.healthy) {
-                            if let Some(ip) = &n.public_ip {
-                                db_desired.push(DesiredRecord {
-                                    name: slug.into(),
-                                    rtype: "A".into(),
-                                    value: ip.clone(),
-                                    ttl: 60,
-                                });
-                            }
-                            if let Some(ip) = &n.public_ip6 {
-                                db_desired.push(DesiredRecord {
-                                    name: slug.into(),
-                                    rtype: "AAAA".into(),
-                                    value: ip.clone(),
-                                    ttl: 60,
-                                });
-                            }
-                        }
-                        continue;
-                    }
+                    // EVERY kind's slug record points at the OWNER, Supabase
+                    // included — affinity first, exactly the apps-zone rule.
+                    // Raw wire-protocol kinds (Postgres/Redis/etc.) have no
+                    // choice (`db_gateway`'s TLS SNI splice has no forward
+                    // hop). Supabase Studio DOES have an owner-forward
+                    // (`db_rest::studio_mesh_serve`), and an earlier shape
+                    // published the FULL healthy set for it on a
+                    // "nearer-edge TLS termination" rationale — measured
+                    // wrong on 2026-08-21: this zone is flat Vercel DNS with
+                    // no geo routing, so the client picks a RANDOM edge, and
+                    // a non-owner edge pays a fully-buffered iroh mesh
+                    // forward per request — 0.9–2.0s vs the owner's
+                    // 0.14–0.28s from the same client, ×~70 assets on a
+                    // Studio first load, at ~14/15 odds. The owner-forward
+                    // stays as the safety net for exactly the windows it was
+                    // built for (stale DNS after a DB migration, a client
+                    // pinning an old record), and if the owner ever leaves
+                    // the registry the slug record is simply omitted, so
+                    // resolution falls back to the wildcard `*` (all
+                    // publishable nodes + forward) — full-set behavior
+                    // returns automatically in the one case it helps.
                     let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else {
                         continue;
                     };
