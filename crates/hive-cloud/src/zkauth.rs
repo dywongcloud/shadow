@@ -601,14 +601,16 @@ async fn project_team(
     if team == crate::admin::UNTAGGED_TENANT {
         let mut best: Option<(u64, String)> = None;
         for r in cloud.gw.deployment_records() {
-            if r.project == project && !r.tenant.trim().is_empty() {
+            // Case-insensitive, mirroring admin::project_owned_by — records
+            // legitimately carry case-variant project references.
+            if r.project.eq_ignore_ascii_case(&project) && !r.tenant.trim().is_empty() {
                 if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
                     best = Some((r.created_at_ms, r.tenant.clone()));
                 }
             }
         }
         for d in cloud.peer_deployments.read().values().flatten() {
-            if d.project == project && !d.tenant.trim().is_empty() {
+            if d.project.eq_ignore_ascii_case(&project) && !d.tenant.trim().is_empty() {
                 if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
                     best = Some((d.created_at_ms, d.tenant.clone()));
                 }

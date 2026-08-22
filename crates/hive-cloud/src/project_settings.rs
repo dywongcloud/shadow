@@ -745,6 +745,22 @@ impl ProjectStore {
                 Some(local) => merge_take(local, &remote_row),
             };
             if take {
+                // Mixed-version strip guard: a pre-`framework_auto` binary
+                // deserializes the row dropping the field (serde default =
+                // false), and any local mutation there re-serializes a newer
+                // row that would demote our AUTO marker to "explicit" —
+                // permanently freezing framework re-detection. When the
+                // framework string itself is unchanged, the auto marker is a
+                // fact about how that string was WRITTEN and cannot be
+                // legitimately revoked by a row that didn't change it.
+                if let Some(local) = map.get(&name) {
+                    if local.build.framework_auto
+                        && !remote_row.build.framework_auto
+                        && remote_row.build.framework.trim() == local.build.framework.trim()
+                    {
+                        remote_row.build.framework_auto = true;
+                    }
+                }
                 map.insert(name, remote_row);
             }
         }

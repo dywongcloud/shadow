@@ -730,6 +730,12 @@ async fn project_build_put(
     // an explicit override (which would freeze re-detection). Only an actual
     // framework CHANGE through this PUT is an explicit user choice.
     let mut build = build;
+    // framework_auto is SERVER-owned: the dashboard round-trips the whole
+    // serialized BuildConfig, so a client-sent true would survive an explicit
+    // framework CHANGE and let the next build's auto-refresh clobber the
+    // user's choice. Clear it unconditionally, then re-promote only for an
+    // unchanged auto value.
+    build.framework_auto = false;
     if let Some(cur) = c.projects.get_if_set(&project).map(|s| s.build) {
         if cur.framework_auto && build.framework.trim() == cur.framework.trim() {
             build.framework_auto = true;
@@ -5179,9 +5185,19 @@ fn source_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
 ) -> Option<(fluid_core::GitSource, bool)> {
+    // The LIVE promoted deployment (production == true) outranks the lane
+    // heuristic entirely: `target` is immutable while promote/rollback flips
+    // only `production`, so after promoting a preview the current production
+    // deployment is stamped target="preview" — sourcing the newest
+    // target="production" record instead would rebuild (and re-promote) the
+    // very deployment the operator just rolled back from.
+    let mut best_live: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_prod: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_any: Option<(u64, fluid_core::GitSource)> = None;
     let mut consider = |ts: u64, g: fluid_core::GitSource, target: &str, production: bool| {
+        if production && best_live.as_ref().map_or(true, |(t, _)| ts >= *t) {
+            best_live = Some((ts, g.clone()));
+        }
         // `target` is immutable ("production"/"preview"); empty = pre-target
         // snapshot, fall back to the live promoted flag.
         let prod_lane = match target.trim() {
@@ -5210,7 +5226,8 @@ fn source_for_project_fleet(
             }
         }
     }
-    best_prod
+    best_live
+        .or(best_prod)
         .map(|(_, g)| (g, true))
         .or(best_any.map(|(_, g)| (g, false)))
 }
@@ -5250,7 +5267,12 @@ fn image_port_spec_for_project_fleet(
         }
         None
     }
-    let mut best: Option<(u64, fluid_core::PortSpec)> = None;
+    // Mirror source_for_project_fleet's lane preference: the redeploy sources
+    // the live/production record, so restoring the port spec from a NEWER
+    // preview record would pair a production source with a preview's ports.
+    let mut best_live: Option<(u64, fluid_core::PortSpec)> = None;
+    let mut best_prod: Option<(u64, fluid_core::PortSpec)> = None;
+    let mut best_any: Option<(u64, fluid_core::PortSpec)> = None;
     for r in c.gw.deployment_records() {
         if r.project != project {
             continue;
@@ -5259,11 +5281,22 @@ fn image_port_spec_for_project_fleet(
             continue;
         };
         let Some(spec) = spec_from(f) else { continue };
-        if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
-            best = Some((r.created_at_ms, spec));
+        if r.production && best_live.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+            best_live = Some((r.created_at_ms, spec.clone()));
+        }
+        let prod_lane = match r.target.trim() {
+            "production" => true,
+            "preview" => false,
+            _ => r.production,
+        };
+        if prod_lane && best_prod.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+            best_prod = Some((r.created_at_ms, spec.clone()));
+        }
+        if best_any.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+            best_any = Some((r.created_at_ms, spec));
         }
     }
-    best.map(|(_, spec)| spec)
+    best_live.or(best_prod).or(best_any).map(|(_, spec)| spec)
 }
 
 /// Build a placement `Target` addressing a specific node by NAME: self (both None),

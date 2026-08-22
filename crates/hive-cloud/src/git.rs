@@ -3517,6 +3517,14 @@ async fn fanout_remote(
                                 .map(|s| s.build)
                                 .unwrap_or_default();
                             let mut changed = false;
+                            // Filling framework from the remote must carry its
+                            // AUTO marker too — copying only the string persisted
+                            // the target's auto-detected slug here as if
+                            // user-explicit, and the next fanout forwarded that
+                            // frozen value back, permanently pinning a first-build
+                            // misdetection (the exact defect framework_auto fixes).
+                            let fw_fill = cur.framework.trim().is_empty()
+                                && !remote_bc.framework.trim().is_empty();
                             for (cf, rf) in [
                                 (&mut cur.framework, &remote_bc.framework),
                                 (&mut cur.install_command, &remote_bc.install_command),
@@ -3527,6 +3535,9 @@ async fn fanout_remote(
                                     *cf = rf.clone();
                                     changed = true;
                                 }
+                            }
+                            if fw_fill {
+                                cur.framework_auto = remote_bc.framework_auto;
                             }
                             if changed {
                                 cloud.projects.set_build(project, cur);

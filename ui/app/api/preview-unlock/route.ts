@@ -123,6 +123,13 @@ export async function GET(req: NextRequest) {
       const td = await tr.json();
       const resolved = String(td?.team || "").trim();
       if (resolved && resolved !== "__untagged__") team = resolved;
+    } else if (tr.status === 403) {
+      // The node is reachable but REFUSING (missing/mismatched
+      // HIVE_INTERNAL_TOKEN) — an operator misconfiguration, not a network
+      // blip. Falling back to the untrusted query param here would silently
+      // reopen the exact spoofing surface server-side resolution closes.
+      console.error(`[preview-unlock] project-team resolution refused (403) for ${project}; check HIVE_INTERNAL_TOKEN`);
+      return NextResponse.json({ ok: false, error: unlockError(403, "enroll") }, { status: 502 });
     }
   } catch {
     // Node unreachable: fall back to the param rather than locking everyone out.
