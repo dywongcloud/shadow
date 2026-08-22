@@ -98,7 +98,7 @@ export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const host = sp.get("host") || "";
   const project = sp.get("project") || "";
-  const team = sp.get("team") || "personal";
+  const paramTeam = sp.get("team") || "personal";
   const next = sp.get("next") || "/";
   if (!host || !project) return NextResponse.json({ ok: false, error: "missing deployment info" }, { status: 400 });
   if (!isKnownDeploymentHost(host)) {
@@ -107,6 +107,26 @@ export async function GET(req: NextRequest) {
 
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ ok: false, signin: true, error: "sign in required" }, { status: 401 });
+
+  // AUTHORITATIVE ownership: never trust the `team` query param the edge
+  // redirect carried — a project whose team tag was lost/empty arrived here as
+  // `team=` (falsy -> "personal"), which is the OWNER-ONLY namespace, so the
+  // project's real owner was denied with "belongs to another user's personal
+  // workspace". Resolve the owning team server-side on the node; the param is
+  // only a fallback when the node can't answer.
+  let team = paramTeam;
+  try {
+    const th: Record<string, string> = {};
+    if (TOKEN) th["x-hive-internal"] = TOKEN;
+    const tr = await fetch(`${ADMIN}/v1/zkauth/project-team?project=${encodeURIComponent(project)}`, { headers: th });
+    if (tr.ok) {
+      const td = await tr.json();
+      const resolved = String(td?.team || "").trim();
+      if (resolved && resolved !== "__untagged__") team = resolved;
+    }
+  } catch {
+    // Node unreachable: fall back to the param rather than locking everyone out.
+  }
 
   // Org-team previews require verified Clerk org membership; personal
   // namespaces require being the user that namespace belongs to.

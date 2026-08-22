@@ -449,6 +449,7 @@ pub fn routes(cloud: Arc<crate::state::CloudState>) -> Router {
     Router::new()
         .route("/v1/zkauth/register", post(register))
         .route("/v1/zkauth/preview-proof", post(preview_proof))
+        .route("/v1/zkauth/project-team", get(project_team))
         .route("/v1/zkauth/roster", get(roster))
         .route("/v1/zkauth/roster-export", get(roster_export))
         .with_state(cloud)
@@ -573,6 +574,53 @@ struct ProveReq {
     #[serde(default)]
     host: String,
 }
+#[derive(Deserialize)]
+struct ProjectTeamQuery {
+    project: String,
+}
+/// Server-to-server (dashboard preview-unlock only, `internal_ok`-gated):
+/// resolve the AUTHORITATIVE owning team for a project so the unlock check
+/// never trusts the `team` query param the edge redirect carried. That param
+/// collapsed to the owner-only "personal" namespace whenever a project's team
+/// tag was lost/empty, denying the real owner ("belongs to another user's
+/// personal workspace"). Local settings row first; fall back to the newest
+/// deployment record's stamped tenant (local, then gossiped peers).
+async fn project_team(
+    State(cloud): State<Arc<crate::state::CloudState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ProjectTeamQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !internal_ok(&headers) {
+        return Err((StatusCode::FORBIDDEN, "team resolution is server-only".into()));
+    }
+    let project = q.project.trim().to_string();
+    if project.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "project required".into()));
+    }
+    let mut team = crate::admin::record_tenant(&cloud.projects.team_of(&project)).to_string();
+    if team == crate::admin::UNTAGGED_TENANT {
+        let mut best: Option<(u64, String)> = None;
+        for r in cloud.gw.deployment_records() {
+            if r.project == project && !r.tenant.trim().is_empty() {
+                if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+                    best = Some((r.created_at_ms, r.tenant.clone()));
+                }
+            }
+        }
+        for d in cloud.peer_deployments.read().values().flatten() {
+            if d.project == project && !d.tenant.trim().is_empty() {
+                if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
+                    best = Some((d.created_at_ms, d.tenant.clone()));
+                }
+            }
+        }
+        if let Some((_, t)) = best {
+            team = crate::admin::record_tenant(&t).to_string();
+        }
+    }
+    Ok(Json(json!({ "team": team })))
+}
+
 async fn preview_proof(
     State(cloud): State<Arc<crate::state::CloudState>>,
     headers: HeaderMap,

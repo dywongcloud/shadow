@@ -205,6 +205,7 @@ pub async fn require_auth(
         || path == "/v1/billing/webhook"
         || path == "/v1/zkauth/register"
         || path == "/v1/zkauth/preview-proof"
+        || path == "/v1/zkauth/project-team"
         // This exact collection POST still fails closed in `admit()` via
         // `fresh_user_claims`. Letting it reach that gate is what gives a
         // missing/expired browser session the same structured

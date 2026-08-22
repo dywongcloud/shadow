@@ -4155,8 +4155,16 @@ async fn build_via_fdi(
     let bld = vc_pick(|c| c.build_command.as_ref()).or_else(|| pick(|b| &b.build_command));
     let outd = vc_pick(|c| c.output_directory.as_ref()).or_else(|| pick(|b| &b.output_dir));
     // An explicit framework choice (vercel.json, else project settings) overrides
-    // auto-detection.
-    let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| pick(|b| &b.framework));
+    // auto-detection. A settings framework stamped by a PREVIOUS build's
+    // auto-detection (`framework_auto`) is NOT an explicit choice: honoring it
+    // here permanently pinned a first-build misdetection (monorepo scanned at
+    // the wrong root -> "static") so the real framework was never re-detected.
+    let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| {
+        bc.as_ref()
+            .filter(|b| !b.framework_auto)
+            .map(|b| b.framework.clone())
+            .filter(|s| !s.trim().is_empty())
+    });
 
     // Explicit RUNTIME resolution — orthogonal to package-manager detection below.
     // Precedence: vercel.json's native `runtime` field > vercel.json's `bunVersion`
@@ -4245,9 +4253,13 @@ async fn build_via_fdi(
     // fill in a field the user hasn't explicitly set, so we never clobber overrides.
     {
         let cur = bc.clone().unwrap_or_default();
-        if cur.framework.trim().is_empty() {
+        // Fill an empty slot, or REFRESH a previously auto-detected value —
+        // an auto stamp must track what detection actually says now, never
+        // fossilize the first build's answer.
+        if cur.framework.trim().is_empty() || cur.framework_auto {
             let mut nb = cur;
             nb.framework = plan.framework.slug.to_string();
+            nb.framework_auto = true;
             if nb.install_command.trim().is_empty() {
                 nb.install_command = plan.install_command.clone();
             }

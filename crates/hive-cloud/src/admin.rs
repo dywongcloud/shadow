@@ -725,6 +725,16 @@ async fn project_build_put(
     // here with the tenant require_project already verified.
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_team(&project, &t);
+    // The dashboard round-trips the whole BuildConfig; a save where the user
+    // did NOT change the framework must not promote an auto-detected slug to
+    // an explicit override (which would freeze re-detection). Only an actual
+    // framework CHANGE through this PUT is an explicit user choice.
+    let mut build = build;
+    if let Some(cur) = c.projects.get_if_set(&project).map(|s| s.build) {
+        if cur.framework_auto && build.framework.trim() == cur.framework.trim() {
+            build.framework_auto = true;
+        }
+    }
     c.projects.set_build(&project, build);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -5158,27 +5168,51 @@ pub(crate) fn git_for_project_fleet(
 /// lookups), this powers REDEPLOY, which must reconstruct a build for zip- and
 /// image-based projects too — those return `None` from the git-only helper and were
 /// the exact cause of redeploy 404ing for every non-git project.
-fn source_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::GitSource> {
-    let mut best: Option<(u64, fluid_core::GitSource)> = None;
+/// Returns the source plus whether it came from the PRODUCTION lane. A redeploy
+/// must rebuild from the newest PRODUCTION deployment when one exists — picking
+/// the newest record across ALL environments meant any preview (PR branch) that
+/// landed after the last production deploy hijacked "Redeploy": the rebuild
+/// cloned the preview's branch, branch-vs-production_branch classification then
+/// filed the result as a preview, and the project's production alias kept
+/// serving whatever was there before (or a failed preview).
+fn source_for_project_fleet(
+    c: &Arc<CloudState>,
+    project: &str,
+) -> Option<(fluid_core::GitSource, bool)> {
+    let mut best_prod: Option<(u64, fluid_core::GitSource)> = None;
+    let mut best_any: Option<(u64, fluid_core::GitSource)> = None;
+    let mut consider = |ts: u64, g: fluid_core::GitSource, target: &str, production: bool| {
+        // `target` is immutable ("production"/"preview"); empty = pre-target
+        // snapshot, fall back to the live promoted flag.
+        let prod_lane = match target.trim() {
+            "production" => true,
+            "preview" => false,
+            _ => production,
+        };
+        if prod_lane && best_prod.as_ref().map_or(true, |(t, _)| ts >= *t) {
+            best_prod = Some((ts, g.clone()));
+        }
+        if best_any.as_ref().map_or(true, |(t, _)| ts >= *t) {
+            best_any = Some((ts, g));
+        }
+    };
     for r in c.gw.deployment_records() {
         if r.project == project {
-            if let Some(g) = r.git {
-                if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
-                    best = Some((r.created_at_ms, g));
-                }
+            if let Some(g) = r.git.clone() {
+                consider(r.created_at_ms, g, &r.target, r.production);
             }
         }
     }
     for d in c.peer_deployments.read().values().flatten() {
         if d.project == project {
             if let Some(g) = d.git.clone() {
-                if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
-                    best = Some((d.created_at_ms, g));
-                }
+                consider(d.created_at_ms, g, &d.target, d.production);
             }
         }
     }
-    best.map(|(_, g)| g)
+    best_prod
+        .map(|(_, g)| (g, true))
+        .or(best_any.map(|(_, g)| (g, false)))
 }
 
 /// The port + protocol the newest deployment for `project` was actually running with
@@ -5608,12 +5642,18 @@ async fn project_redeploy(
     // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
     // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
     // zip-uploaded or image-based project (the reported bug).
-    let Some(src) = source_for_project_fleet(&c, &project) else {
+    let Some((src, prod_lane)) = source_for_project_fleet(&c, &project) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Project '{project}' has no deployment to redeploy yet."),
         ));
     };
+    // No explicit environment in the modal: a redeploy rebuilds the deployment
+    // it sourced from into that deployment's OWN environment (Vercel's model).
+    // Leaving `target: None` fell through to branch-vs-production_branch
+    // guessing at build time, which misfiled production redeploys as previews
+    // whenever the sourced branch string didn't exactly match.
+    let target = target.or_else(|| Some(if prod_lane { "production" } else { "preview" }.into()));
     // Original port/protocol to restore on an image redeploy (see `redeploy_request`'s
     // doc comment) — resolved once, reused across every branch below.
     let image_spec = image_port_spec_for_project_fleet(&c, &project);

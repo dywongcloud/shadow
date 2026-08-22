@@ -95,6 +95,16 @@ pub struct BuildConfig {
     /// (written before this field existed) still deserializes.
     #[serde(default)]
     pub runtime: String,
+    /// True when `framework` was written by build-time auto-detection rather
+    /// than an explicit user choice. An auto-detected slug must never be
+    /// treated as an override: detection re-runs on every build while this is
+    /// set, so a first-build misdetection (e.g. a monorepo scanned at the
+    /// wrong root reading as "static") cannot permanently pin the project to
+    /// the wrong framework. `#[serde(default)]` = false, so every
+    /// already-persisted framework (which may have been user-set) keeps its
+    /// explicit-override behavior.
+    #[serde(default)]
+    pub framework_auto: bool,
 }
 impl Default for BuildConfig {
     fn default() -> Self {
@@ -109,6 +119,7 @@ impl Default for BuildConfig {
             output_dir: String::new(),
             root_dir: String::new(),
             runtime: String::new(),
+            framework_auto: false,
         }
     }
 }
@@ -1393,10 +1404,16 @@ impl ProjectStore {
     /// `set_team`'d) is UNOWNED — resolves to `UNTAGGED_TENANT`, never the
     /// owner's real "personal" namespace (see `default_team`).
     pub fn team_of(&self, project: &str) -> String {
+        // A row whose team was stored EMPTY (tag loss during a gossip/restore
+        // race) is just as unowned as a missing row — returning "" verbatim
+        // let downstream consumers (preview-unlock's team query param, JS's
+        // falsy-string fallback) silently collapse it into the owner-only
+        // "personal" namespace and deny the real owner.
         self.map
             .read()
             .get(project)
-            .map(|s| s.team.clone())
+            .map(|s| s.team.trim().to_string())
+            .filter(|t| !t.is_empty())
             .unwrap_or_else(default_team)
     }
 
