@@ -202,15 +202,18 @@ pub async fn live() -> LiveUsage {
 /// disk number.
 pub fn disk_free_gb() -> u64 {
     let disks = Disks::new_with_refreshed_list();
-    disks
-        .list()
-        .iter()
-        .map(|d| d.available_space())
-        .max()
-        .unwrap_or(0)
-        / 1024
-        / 1024
-        / 1024
+    match disks.list().iter().map(|d| d.available_space()).max() {
+        // 0 is the UNKNOWN sentinel (pre-upgrade peer / failed probe), so a
+        // MEASURED value must never collide with it: a genuinely full disk
+        // truncates to 0 GiB, gossips as "unknown", and placement's
+        // admit-on-unknown rule then routes deployments and builds onto a
+        // node with zero bytes free — live-witnessed on all three san-jose
+        // GPU nodes (28 KB free, disk_free_gb=0, still admitted). Clamping a
+        // real measurement to >=1 keeps the honest value under any sane
+        // placement floor while the sentinel stays reserved for "no probe".
+        Some(bytes) => (bytes / 1024 / 1024 / 1024).max(1),
+        None => 0,
+    }
 }
 
 /// MEASURED free VRAM on this host, MiB — summed across every GPU, straight
