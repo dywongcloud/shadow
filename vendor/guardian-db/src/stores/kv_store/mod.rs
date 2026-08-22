@@ -461,11 +461,13 @@ impl Store for GuardianDBKeyValue {
             }
         }
 
-        // Create a synthetic Entry for compatibility.
+        // Create a synthetic Entry for compatibility. LOCAL hash only:
+        // `Entry::create` persisted a second full copy of the value into the
+        // blob store just to learn its (blake3) hash, and every caller
+        // discards the entry — a permanently-orphaned duplicate per put.
         let payload = crate::guardian::serializer::serialize(&op).unwrap_or_default();
         let clock = LamportClock::new(self.identity.pub_key());
-        let entry_arc = crate::log::entry::Entry::create(
-            &self.client,
+        let entry_arc = crate::log::entry::Entry::create_local(
             (*self.identity).clone(),
             "",
             &payload,

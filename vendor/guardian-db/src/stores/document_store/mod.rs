@@ -426,11 +426,12 @@ impl Store for GuardianDBDocumentStore {
             }
         }
 
-        // Create a synthetic Entry for compatibility.
+        // Create a synthetic Entry for compatibility. LOCAL hash only — see
+        // kv_store's add_operation: `Entry::create` persisted an orphaned
+        // second copy of the whole value per put.
         let payload = crate::guardian::serializer::serialize(&op).unwrap_or_default();
         let clock = LamportClock::new(self.identity.pub_key());
-        let entry_arc = crate::log::entry::Entry::create(
-            &self.client,
+        let entry_arc = crate::log::entry::Entry::create_local(
             (*self.identity).clone(),
             "",
             &payload,

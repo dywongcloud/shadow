@@ -178,6 +178,39 @@ impl Entry {
         }
     }
 
+    /// Like [`Entry::create`], but computes the hash LOCALLY without storing
+    /// anything.
+    ///
+    /// `Entry::create` persists the canonical JSON into the iroh blob store
+    /// purely to learn its hash — but the blob hash IS blake3 over the bytes,
+    /// so hashing locally yields the identical value with zero storage. For
+    /// the synthetic compatibility entries `add_operation` builds (whose
+    /// return value every caller discards), the stored copy was a
+    /// permanently-orphaned duplicate of the whole payload: nothing
+    /// referenced it, no doc entry named it, and no GC existed to reap it —
+    /// measured at ~12.5 GB/day of pure garbage per node on the hive fleet.
+    /// This also avoids `create`'s thread + throwaway tokio Runtime per put.
+    pub fn create_local(
+        identity: Identity,
+        log_id: &str,
+        data: &[u8],
+        nexts: &[EntryOrHash],
+        clock: Option<LamportClock>,
+    ) -> Arc<Entry> {
+        let mut e = Entry::new(identity, log_id, data, nexts, clock);
+        let canonical = json!({
+            "hash": "null",
+            "id": e.id,
+            "payload": String::from_utf8_lossy(&e.payload),
+            "next": e.next.iter().map(|h| hex::encode(h.as_bytes())).collect::<Vec<_>>(),
+            "v": e.v,
+            "clock": e.clock,
+        })
+        .to_string();
+        e.hash = Hash::new(canonical.as_bytes());
+        Arc::new(e)
+    }
+
     /// Locally creates an entry owned by `identity` .
     ///
     ///  The created entry is part of the [log] with the id `log_id`,

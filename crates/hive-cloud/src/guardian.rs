@@ -631,7 +631,20 @@ fn remove_siem_delivery_counters(value: &mut serde_json::Value) {
     }
 }
 
-fn shared_snapshot_digest(snap: &PlatformSnapshot) -> anyhow::Result<SnapshotDigest> {
+/// The canonical SHARED form of a snapshot: exclusions + volatile counters
+/// stripped, keys canonicalized. This is BOTH what the change gate digests
+/// AND (since 2026-08-22) the exact bytes written to guardian. They used to
+/// disagree — the gate digested the stripped form while the payload carried
+/// the full snapshot (deployments, builds, metrics_rollup included), so
+/// every admitted write was a unique 9-10 MB blob even when the shared
+/// state was byte-identical: the single biggest feeder of the fleet-wide
+/// guardian disk growth (~16 GB/day/node in this class alone). Every field
+/// in SHARED_SNAPSHOT_EXCLUSIONS is #[serde(default)] on PlatformSnapshot,
+/// so the total-loss restore path (`fetch_node_snapshot` -> persist::restore)
+/// deserializes the stripped form cleanly; node-local detail it no longer
+/// carries (deployments/builds) re-converges from fleet gossip and the
+/// relational mirror, which is where peers were already told to read it.
+fn shared_snapshot_canonical(snap: &PlatformSnapshot) -> anyhow::Result<Vec<u8>> {
     let mut value = serde_json::to_value(snap)?;
     let root = value
         .as_object_mut()
@@ -640,7 +653,7 @@ fn shared_snapshot_digest(snap: &PlatformSnapshot) -> anyhow::Result<SnapshotDig
         root.remove(field);
     }
     remove_siem_delivery_counters(&mut value);
-    Ok(sha256(&canonical_json_bytes(value)?))
+    canonical_json_bytes(value)
 }
 
 fn prepare_replication(
@@ -659,13 +672,18 @@ fn prepare_replication(
         );
     }
     let full = match snapshot_key() {
-        Some(key) => Some(KeyedPreparedValue {
-            key,
-            value: PreparedValue {
-                change_digest: shared_snapshot_digest(snap)?,
-                bytes: Arc::new(serde_json::to_vec(snap)?),
-            },
-        }),
+        Some(key) => {
+            // Digest and payload are the SAME bytes — see
+            // shared_snapshot_canonical for why they must never diverge.
+            let bytes = shared_snapshot_canonical(snap)?;
+            Some(KeyedPreparedValue {
+                key,
+                value: PreparedValue {
+                    change_digest: sha256(&bytes),
+                    bytes: Arc::new(bytes),
+                },
+            })
+        }
         None => None,
     };
     Ok(Arc::new(DesiredReplication {

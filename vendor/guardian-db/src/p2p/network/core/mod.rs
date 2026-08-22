@@ -606,8 +606,38 @@ impl IrohBackend {
             .await
             .map_err(|e| GuardianError::Other(format!("Error creating store directory: {}", e)))?;
 
-        // Initialize the FsStore with persistence.
-        let fs_store = FsStore::load(&store_dir)
+        // Blob garbage collection. Without it the store keeps EVERY blob
+        // ever added — every superseded doc version, forever — which filled
+        // fleet disks at ~44 GB/day/node while the live key set stayed under
+        // 50 MB. The two halves below are UNSAFE APART and must always ship
+        // together: the GcConfig's protect callback comes from iroh-docs'
+        // ProtectCallbackHandler, and the handler half must reach
+        // `Docs::persistent(..).protect_handler(..)` further down — GC with
+        // no protect wiring would sweep doc-referenced (live) blobs.
+        // `GUARDIAN_GC_SECS` env tunes the interval; 0 disables both halves
+        // (paired opt-out, never a lone one).
+        let gc_secs: u64 = std::env::var("GUARDIAN_GC_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(21_600);
+        let mut docs_protect_handler = None;
+        let mut store_opts = iroh_blobs::store::fs::options::Options::new(&store_dir);
+        if gc_secs > 0 {
+            let (handler, protect_cb) = iroh_docs::engine::ProtectCallbackHandler::new();
+            store_opts.gc = Some(iroh_blobs::store::GcConfig {
+                interval: std::time::Duration::from_secs(gc_secs),
+                add_protected: Some(protect_cb),
+            });
+            docs_protect_handler = Some(handler);
+            info!(interval_secs = gc_secs, "guardian blob GC enabled (doc-protected)");
+        } else {
+            warn!("guardian blob GC DISABLED (GUARDIAN_GC_SECS=0) — the store will grow without bound");
+        }
+
+        // Initialize the FsStore with persistence (same path derivation as
+        // `FsStore::load`, which is exactly `load_with_opts(root/blobs.db,
+        // Options::new(root))` — only `gc` differs here).
+        let fs_store = FsStore::load_with_opts(store_dir.join("blobs.db"), store_opts)
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing FsStore: {}", e)))?;
 
@@ -704,8 +734,15 @@ impl IrohBackend {
         };
         drop(store_lock);
 
-        // Create Docs using the Builder pattern.
-        let docs = Docs::persistent(docs_dir)
+        // Create Docs using the Builder pattern. The protect handler is the
+        // OTHER half of the GC wiring above: it answers each GC run with the
+        // set of blob hashes still referenced by doc entries, which is what
+        // makes sweeping the rest safe.
+        let mut docs_builder = Docs::persistent(docs_dir);
+        if let Some(handler) = docs_protect_handler {
+            docs_builder = docs_builder.protect_handler(handler);
+        }
+        let docs = docs_builder
             .spawn(endpoint.clone(), blobs_store, gossip.clone())
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing Docs: {}", e)))?;
