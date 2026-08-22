@@ -203,7 +203,7 @@ export default function NewProjectPage() {
           // Surface the FIRST restricting org's approval link (only an org actually
           // blocking the app warrants a CTA — a live, working connection stays quiet).
           if (res?.restricted && res?.approve_url && !restrictedCta) {
-            restrictedCta = { text: "An organization restricts OpenEdge. Approve the app to import its repositories.", approveUrl: res.approve_url };
+            restrictedCta = { text: "An organization restricts DevHub. Approve the app to import its repositories.", approveUrl: res.approve_url };
           }
           for (const r of (res?.repos as GhRepo[]) || []) {
             if (r?.full_name && !seen.has(r.full_name)) { seen.add(r.full_name); merged.push(r); }
@@ -571,7 +571,7 @@ export default function NewProjectPage() {
         )}
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
-        Paste a Git repo URL, or a container image from Docker Hub / Quay / any registry — OpenEdge
+        Paste a Git repo URL, or a container image from Docker Hub / Quay / any registry — DevHub
         creates the project and builds → deploys it (clone &amp; build, or pull the image).{" "}
         <Link href="/new/upload" className="text-secondary underline decoration-dotted underline-offset-2 hover:text-fg">
           No repository? Upload a .zip instead

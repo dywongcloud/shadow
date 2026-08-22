@@ -221,12 +221,12 @@ export default function UsageView() {
             <span>Product</span><span className="text-right">Usage</span><span className="text-right">Charge</span>
           </div>
 
-          <GroupHeader name="OpenEdge Delivery Network" />
+          <GroupHeader name="DevHub Delivery Network" />
           <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={`${fmt(requests)}`} charge={edgeCharge} />
           <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={`${fmt(cacheHits)}`} charge={0} />
           <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={blockedS} usage={`${fmt(blocked)}`} charge={wafCharge} />
 
-          <GroupHeader name="OpenEdge Functions (Fluid · Active CPU pricing)" />
+          <GroupHeader name="DevHub Functions (Fluid · Active CPU pricing)" />
           <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
           <Row color="bg-purple-500" name="Active CPU" spark={flat(activeCpuMs, N)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
           <Row color="bg-teal-500" name="Provisioned Memory" spark={flat(Math.round(memGbHrs * 1000), N)} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />

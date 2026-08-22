@@ -25,7 +25,7 @@ export function Footer() {
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <span>© {new Date().getFullYear()} OpenEdge</span>
+          <span>© {new Date().getFullYear()} Autheo DevHub</span>
           <Link href="/network" className="hover:text-fg">Status</Link>
           <Link href="/settings" className="hover:text-fg">Privacy</Link>
           <Link href="/settings" className="hover:text-fg">Terms</Link>

@@ -9,7 +9,7 @@ import { GlobeWireframe } from "@/components/globe-wireframe";
 import Image from "next/image";
 
 /* ------------------------------------------------------------------ *
- * shadw — public landing page. Renders inside the shared MarketingShell
+ * autheo — public landing page. Renders inside the shared MarketingShell
  * (top nav + footer) and forces a dark palette regardless of app theme.
  * ------------------------------------------------------------------ */
 
@@ -59,8 +59,8 @@ function GlowRing({
 // so SSR always renders the overlay and hydration stays consistent.
 let introPlayed = false;
 
-/** Intro loading animation (reference video 1): a full-screen black overlay with
- *  the shadw ghost logo centered inside the rotating GlowRing. ~2s of spin, then
+/** Intro loading animation (reference video 1): a full-screen dark overlay with
+ *  the autheo ghost logo centered inside the rotating GlowRing. ~2s of spin, then
  *  the overlay fades to reveal the hero. Plays once per PAGE LOAD (a client-side
  *  remount of <Landing> — e.g. an auth-state flip — must NOT replay it); skipped
  *  entirely for prefers-reduced-motion. Rendered from first paint (SSR) so
@@ -114,7 +114,7 @@ function IntroLoader() {
         right: 0,
         height: "100vh",
         zIndex: 100,
-        background: "#0c0d10",
+        background: "#050b07",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -134,20 +134,20 @@ function IntroLoader() {
         }}
       >
         <GlowRing style={{ position: "absolute", inset: 0 }} />
-        <Image
-          src="/shadw-logo-dark.png"
-          alt="shadw"
-          width={274}
-          height={91}
-          priority
-          style={{
-            position: "relative",
-            zIndex: 1,
-            height: "2.4rem",
-            width: "auto",
-            animation: "intro-logo-pan 2.2s ease-in-out infinite",
-          }}
-        />
+        <span
+         style={{
+           position: "relative",
+           zIndex: 1,
+           fontSize: "2.2rem",
+           lineHeight: 1,
+           letterSpacing: "-0.04em",
+           fontWeight: 700,
+           color: "#bbf7d0",
+           animation: "intro-logo-pan 2.2s ease-in-out infinite",
+         }}
+        >
+         autheo.dev
+        </span>
       </div>
     </div>
   );
@@ -173,15 +173,15 @@ export function Landing() {
             already viewport-relative and stay as-is. */}
         <div className="pointer-events-none absolute inset-x-0 top-0 z-0 h-[min(32rem,40vw)]">
           {/* Left source — leans toward centre. */}
-          <div className="absolute top-[max(-8rem,-10vw)] left-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-teal-400/14 blur-[min(130px,10.16vw)]" />
-          <div className="absolute top-[max(-6rem,-7.5vw)] left-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-indigo-600/14 blur-[min(140px,10.94vw)]" />
+          <div className="absolute top-[max(-8rem,-10vw)] left-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-emerald-400/18 blur-[min(130px,10.16vw)]" />
+          <div className="absolute top-[max(-6rem,-7.5vw)] left-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-lime-500/14 blur-[min(140px,10.94vw)]" />
           {/* Right source — mirror of the left, leans toward centre. */}
-          <div className="absolute top-[max(-8rem,-10vw)] right-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-cyan-400/14 blur-[min(130px,10.16vw)]" />
-          <div className="absolute top-[max(-6rem,-7.5vw)] right-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-fuchsia-600/14 blur-[min(140px,10.94vw)]" />
+          <div className="absolute top-[max(-8rem,-10vw)] right-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-green-400/16 blur-[min(130px,10.16vw)]" />
+          <div className="absolute top-[max(-6rem,-7.5vw)] right-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-emerald-500/14 blur-[min(140px,10.94vw)]" />
           {/* Convergence into the navbar centre (top-centre blend of the two sides). */}
-          <div className="absolute top-[max(-7rem,-8.75vw)] left-1/2 h-[min(20rem,25vw)] w-[min(42rem,52.5vw)] -translate-x-1/2 rounded-full bg-indigo-500/12 blur-[min(150px,11.72vw)]" />
+          <div className="absolute top-[max(-7rem,-8.75vw)] left-1/2 h-[min(20rem,25vw)] w-[min(42rem,52.5vw)] -translate-x-1/2 rounded-full bg-emerald-500/14 blur-[min(150px,11.72vw)]" />
           {/* Lower-horizon convergence — a wide, flat band the two sides melt into. */}
-          <div className="absolute bottom-0 left-1/2 h-[min(8rem,10vw)] w-[72%] -translate-x-1/2 rounded-[100%] bg-sky-500/12 blur-[min(130px,10.16vw)]" />
+          <div className="absolute bottom-0 left-1/2 h-[min(8rem,10vw)] w-[72%] -translate-x-1/2 rounded-[100%] bg-lime-500/12 blur-[min(130px,10.16vw)]" />
         </div>
 
         {/* Solutions-page hero glows, copied 1:1 from <MarketingHero>: a left
@@ -194,19 +194,18 @@ export function Landing() {
               conic ring anchored off-screen top-left so only its lower-right arc
               sweeps the corner, its colors cycling rose↔violet↔teal as it spins. */}
           <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
-          <div className="absolute right-[max(-10rem,-12.5vw)] top-[min(10rem,12.5vw)] h-[min(34rem,42.5vw)] w-[min(34rem,42.5vw)] rounded-full bg-cyan-500/15 blur-[min(140px,10.94vw)]" />
-          <div className="absolute right-[max(-4rem,-5vw)] top-[min(13rem,16.25vw)] h-[min(20rem,25vw)] w-[min(20rem,25vw)] rounded-full bg-sky-400/30 blur-[min(110px,8.59vw)]" />
+          <div className="absolute right-[max(-10rem,-12.5vw)] top-[min(10rem,12.5vw)] h-[min(34rem,42.5vw)] w-[min(34rem,42.5vw)] rounded-full bg-emerald-500/18 blur-[min(140px,10.94vw)]" />
+          <div className="absolute right-[max(-4rem,-5vw)] top-[min(13rem,16.25vw)] h-[min(20rem,25vw)] w-[min(20rem,25vw)] rounded-full bg-green-400/24 blur-[min(110px,8.59vw)]" />
         </div>
 
         <div className="relative z-10 mx-auto max-w-5xl px-6 pb-2 pt-[3.15rem] text-center sm:pt-[4.2rem]">
           <h1 className="text-balance text-5xl font-normal leading-[1.05] tracking-tight text-white sm:text-7xl">
-            <span className="font-bold">The compute market</span>
+            <span className="font-bold">Autheo DevHub</span>
             <br />
-            for every service on Earth
+            electric cloud for modern builders
           </h1>
           <p className="mx-auto mt-7 max-w-xl text-lg leading-relaxed text-zinc-400">
-            Unleash the Power of Peer-to-Peer: Seamlessly Connect, Collaborate, and Conquer with Our
-            Cutting-Edge Cloud
+            A simplified, lightning-fast green platform for deploying functions, containers, and edge workloads on your own mesh.
           </p>
           <div className="mt-10 flex items-center justify-center gap-4">
             <Link
@@ -235,8 +234,8 @@ export function Landing() {
       {/* ---------------- Device showcase (dead space above for contrast) ---------------- */}
       <section id="demo" className="relative scroll-mt-20 px-6 pb-28 pt-36 sm:pt-44">
         <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-0 top-1/3 h-[30rem] w-[30rem] rounded-full bg-violet-700/20 blur-[150px]" />
-          <div className="absolute right-0 top-1/4 h-[30rem] w-[30rem] rounded-full bg-cyan-500/15 blur-[150px]" />
+          <div className="absolute left-0 top-1/3 h-[30rem] w-[30rem] rounded-full bg-lime-700/20 blur-[150px]" />
+          <div className="absolute right-0 top-1/4 h-[30rem] w-[30rem] rounded-full bg-emerald-500/15 blur-[150px]" />
         </div>
         <div className="relative mx-auto max-w-5xl" style={{ perspective: "2200px" }}>
           <div
@@ -247,8 +246,8 @@ export function Landing() {
               <span className="h-1.5 w-1.5 rounded-full bg-white/25" />
             </div>
             <Image
-              src="/shadw-device.png"
-              alt="shadw Command Center"
+              src="/autheo-device.png"
+              alt="autheo Command Center"
               width={1562}
               height={1078}
               sizes="(max-width: 1024px) 100vw, 1024px"

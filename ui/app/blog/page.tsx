@@ -8,23 +8,23 @@ export const dynamic = "force-static";
 export const revalidate = 3600;
 
 export const metadata: Metadata = {
-  title: "Blog — shadw",
+  title: "Blog — autheo",
   description:
-    "Product news and engineering deep-dives from the shadw team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
+    "Product news and engineering deep-dives from the autheo team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
   alternates: { canonical: "/blog" },
   openGraph: {
-    title: "Blog — shadw",
+    title: "Blog — autheo",
     description:
-      "Product news and engineering deep-dives from the shadw team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
+      "Product news and engineering deep-dives from the autheo team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
     url: "/blog",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Blog — shadw",
+    title: "Blog — autheo",
     description:
-      "Product news and engineering deep-dives from the shadw team on the peer-to-peer cloud: the deploy pipeline, GuardianDB, ZK previews, Fluid compute, and instant rollback.",
+      "Product news and engineering deep-dives from the autheo team on the peer-to-peer cloud: the deploy pipeline, GuardianDB, ZK previews, Fluid compute, and instant rollback.",
   },
 };
 
@@ -32,7 +32,7 @@ export const metadata: Metadata = {
 const FEATURED = {
   title: "Introducing the Vercel-style deploy pipeline",
   excerpt:
-    "Push to a branch and watch shadw fan your build out across the peer-to-peer mesh — atomic builds, immutable deployments, and preview URLs for every commit. No build servers to babysit, no cold infrastructure to provision. Here's how we made instant, global deploys feel native to a self-hosted cloud.",
+    "Push to a branch and watch autheo fan your build out across the peer-to-peer mesh — atomic builds, immutable deployments, and preview URLs for every commit. No build servers to babysit, no cold infrastructure to provision. Here's how we made instant, global deploys feel native to a self-hosted cloud.",
   tag: "Product",
   date: "Jun 16, 2026",
   readTime: "8 min read",
@@ -68,7 +68,7 @@ const POSTS: {
   {
     title: "Fluid compute: serverless that scales to zero",
     excerpt:
-      "Functions that spin up in milliseconds on the nearest peer and disappear when idle. A look at the scheduler behind shadw's fluid compute layer.",
+      "Functions that spin up in milliseconds on the nearest peer and disappear when idle. A look at the scheduler behind autheo's fluid compute layer.",
     tag: "Engineering",
     date: "May 28, 2026",
     readTime: "7 min read",
@@ -77,7 +77,7 @@ const POSTS: {
   {
     title: "Bring your own domain: end-to-end DNS",
     excerpt:
-      "Point your domain at the mesh and shadw handles certificates, propagation, and routing automatically — with verifiable, end-to-end control of your records.",
+      "Point your domain at the mesh and autheo handles certificates, propagation, and routing automatically — with verifiable, end-to-end control of your records.",
     tag: "Product",
     date: "May 20, 2026",
     readTime: "6 min read",
@@ -95,7 +95,7 @@ const POSTS: {
   {
     title: "Designing a control plane with no central server",
     excerpt:
-      "Coordination without a coordinator. How shadw reaches consensus on deployments, leases, and routing using only the peers in your network.",
+      "Coordination without a coordinator. How autheo reaches consensus on deployments, leases, and routing using only the peers in your network.",
     tag: "Engineering",
     date: "May 5, 2026",
     readTime: "10 min read",

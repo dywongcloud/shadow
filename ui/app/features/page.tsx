@@ -25,21 +25,21 @@ export const dynamic = "force-static";
 export const revalidate = 3600;
 
 export const metadata: Metadata = {
-  title: "Features — shadw",
+  title: "Features — autheo",
   description:
-    "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
+    "Explore autheo's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
   alternates: { canonical: "/features" },
   openGraph: {
-    title: "Features — shadw",
+    title: "Features — autheo",
     description:
-      "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
+      "Explore autheo's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
     url: "/features",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Features — shadw",
+    title: "Features — autheo",
     description:
       "Git deploys, immutable builds, instant rollback, previews, custom domains, secrets, serverless functions, containers, edge, durable data, cron, and observability over a peer-to-peer mesh.",
   },
@@ -170,7 +170,7 @@ export default function FeaturesPage() {
           <div>
             <h2 className="text-3xl font-bold tracking-tight text-white">Deploy in seconds</h2>
             <p className="mt-3 text-zinc-400">
-              Connect a repository and push. shadw detects your framework, builds an immutable deployment,
+              Connect a repository and push. autheo detects your framework, builds an immutable deployment,
               and serves it across the mesh — no pipelines to wire up, no servers to provision.
             </p>
             <ul className="mt-6 space-y-3">

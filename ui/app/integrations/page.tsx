@@ -256,8 +256,8 @@ export default function IntegrationsPage() {
   // The managed hive-cloud data services (always active). GitHub is rendered by the
   // dedicated <GithubCard/> which carries full connection/scope/org management.
   const otherConnected = [
-    { kind: "postgres", name: "OpenEdge Postgres", desc: "Serverless SQL database built for the edge", active: true },
-    { kind: "kv", name: "OpenEdge KV", desc: "Durable Redis database for caching", active: true },
+    { kind: "postgres", name: "DevHub Postgres", desc: "Serverless SQL database built for the edge", active: true },
+    { kind: "kv", name: "DevHub KV", desc: "Durable Redis database for caching", active: true },
   ];
 
   return (
@@ -392,7 +392,7 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
   }
 
   async function disconnect() {
-    if (!window.confirm("Disconnect GitHub? This removes the authorization from OpenEdge. You can reconnect anytime.")) return;
+    if (!window.confirm("Disconnect GitHub? This removes the authorization from DevHub. You can reconnect anytime.")) return;
     setBusy("disconnect");
     try {
       await fetch("/api/github/disconnect", { method: "POST" });
