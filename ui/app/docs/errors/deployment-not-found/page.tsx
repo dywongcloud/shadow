@@ -56,7 +56,7 @@ export default function DeploymentNotFoundPage() {
         <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">DEPLOYMENT_NOT_FOUND</h1>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           A request was made for a deployment that does not exist. The hostname resolved and reached
-          a autheo edge node, but that node found no deployment to serve for it. The response is{" "}
+          an autheo edge node, but that node found no deployment to serve for it. The response is{" "}
           <code className="font-mono text-sm">404</code> with the header{" "}
           <code className="font-mono text-sm">x-hive-error: DEPLOYMENT_NOT_FOUND</code>.
         </p>
@@ -136,7 +136,7 @@ export default function DeploymentNotFoundPage() {
         <p>
           <code className="font-mono text-sm">x-hive-error</code> confirms the classification and{" "}
           <code className="font-mono text-sm">x-hive-region</code> names the serving region. If the
-          header is absent entirely, the response did not come from a autheo edge node at all — check
+          header is absent entirely, the response did not come from an autheo edge node at all — check
           that the hostname&apos;s DNS still points here before debugging anything else.
         </p>
       </Section>

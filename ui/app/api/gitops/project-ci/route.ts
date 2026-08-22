@@ -16,7 +16,7 @@ function parseRepo(input: string): { owner: string; repo: string } | null {
 }
 
 /**
- * Install the DevHub deploy workflow + the OPENEDGE_WEBHOOK_URL Actions variable
+ * Install the DevHub deploy workflow + the legacy OPENEDGE_WEBHOOK_URL Actions variable
  * into a PROJECT's source repo, so pushes to it auto-trigger build+deploy. Called
  * after a Git import. No-ops gracefully ONLY when GitHub genuinely isn't part of
  * this deployment (not configured / unparseable repo).

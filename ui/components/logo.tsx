@@ -35,14 +35,14 @@ export function VercelMark({ className = "h-5 w-auto" }: { className?: string })
 export function LogoWhite({ className = "h-6 w-auto" }: { className?: string }) {
   return (
     <span className={`inline-flex items-center font-display font-bold tracking-tight text-white ${className}`} aria-label="autheo.dev" style={{ lineHeight: 1 }}>
-      autheo.dev
+      autheo<span className="text-emerald-300">.dev</span>
     </span>
   );
 }
 export function LogoBlack({ className = "h-6 w-auto" }: { className?: string }) {
   return (
     <span className={`inline-flex items-center font-display font-bold tracking-tight text-black ${className}`} aria-label="autheo.dev" style={{ lineHeight: 1 }}>
-      autheo.dev
+      autheo<span className="text-emerald-700">.dev</span>
     </span>
   );
 }
