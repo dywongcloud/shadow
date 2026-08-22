@@ -1,14 +1,11 @@
-import Image from "next/image";
-
-// The official shadw wordmark — theme-aware. The black logo shows on light
-// backgrounds, the white logo on dark ones, toggled purely with CSS (`dark:`)
-// so there's no hydration flash. Size it with a height utility (e.g. `h-6`);
-// width auto-scales to preserve the ~3:1 aspect ratio.
 export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
   return (
-    <span className="inline-flex items-center" aria-label="shadw">
-      <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={`${className} block dark:hidden`} />
-      <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={`${className} hidden dark:block`} />
+    <span
+      className={`inline-flex items-center font-display font-bold tracking-tight text-fg ${className}`}
+      aria-label="autheo.dev"
+      style={{ lineHeight: 1 }}
+    >
+      autheo<span className="text-green">.dev</span>
     </span>
   );
 }
@@ -20,14 +17,14 @@ export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
 // platform fonts and sizes cleanly with a height utility (e.g. `h-5`).
 export function VercelMark({ className = "h-5 w-auto" }: { className?: string }) {
   return (
-    <svg viewBox="0 0 76 65" className={`${className} text-fg`} fill="currentColor" aria-label="Delta" role="img">
-      {/* Uppercase delta: an open (outlined) equilateral triangle, its stroke
-          weight built from the difference of the outer and inner triangles so
-          the fill (currentColor) forms the letterform. */}
+    <svg viewBox="0 0 32 32" className={`${className} text-green`} fill="none" aria-label="Autheo DevHub" role="img">
       <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M38 0 76 65H0L38 0Zm0 13.6L12.9 56.6H63.1L38 13.6Z"
+        d="M16 2 29 26h-6.8l-1.8-3.9h-8.7L10 26H3L16 2Z"
+        fill="currentColor"
+      />
+      <path
+        d="m15.9 10.2-2.9 6.1h5.8l-2.9-6.1Z"
+        fill="hsl(var(--background))"
       />
     </svg>
   );
@@ -36,8 +33,16 @@ export function VercelMark({ className = "h-5 w-auto" }: { className?: string })
 // Forced-color variants for surfaces that are always one theme (e.g. the
 // always-dark landing page uses <LogoWhite/>).
 export function LogoWhite({ className = "h-6 w-auto" }: { className?: string }) {
-  return <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={className} />;
+  return (
+    <span className={`inline-flex items-center font-display font-bold tracking-tight text-white ${className}`} aria-label="autheo.dev" style={{ lineHeight: 1 }}>
+      autheo.dev
+    </span>
+  );
 }
 export function LogoBlack({ className = "h-6 w-auto" }: { className?: string }) {
-  return <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={className} />;
+  return (
+    <span className={`inline-flex items-center font-display font-bold tracking-tight text-black ${className}`} aria-label="autheo.dev" style={{ lineHeight: 1 }}>
+      autheo.dev
+    </span>
+  );
 }

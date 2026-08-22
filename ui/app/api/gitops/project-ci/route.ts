@@ -16,7 +16,7 @@ function parseRepo(input: string): { owner: string; repo: string } | null {
 }
 
 /**
- * Install the OpenEdge deploy workflow + the OPENEDGE_WEBHOOK_URL Actions variable
+ * Install the DevHub deploy workflow + the OPENEDGE_WEBHOOK_URL Actions variable
  * into a PROJECT's source repo, so pushes to it auto-trigger build+deploy. Called
  * after a Git import. No-ops gracefully ONLY when GitHub genuinely isn't part of
  * this deployment (not configured / unparseable repo).
@@ -94,7 +94,7 @@ export async function POST(req: NextRequest) {
         variableSet,
         error: writeErrors.length
           ? writeErrors.join("; ")
-          : "no OpenEdge webhook URL configured and the workflow install did not run",
+          : "no DevHub webhook URL configured and the workflow install did not run",
       },
       { status: 502 }
     );

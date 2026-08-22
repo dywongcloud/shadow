@@ -184,7 +184,7 @@ export async function GET(req: NextRequest) {
     }
     const d = await r.json();
     const scheme = host.includes("localhost") ? "http" : "https";
-    const url = `${scheme}://${host}/_shadw/zk?p=${encodeURIComponent(d.proof)}&m=${encodeURIComponent(d.message)}&t=${encodeURIComponent(d.team)}&next=${encodeURIComponent(next)}`;
+    const url = `${scheme}://${host}/_autheo/zk?p=${encodeURIComponent(d.proof)}&m=${encodeURIComponent(d.message)}&t=${encodeURIComponent(d.team)}&next=${encodeURIComponent(next)}`;
     // Expose proof metadata so the page can visualize it (the proof itself stays
     // server↔deployment; we only surface a short fingerprint + size).
     const proof: string = d.proof || "";

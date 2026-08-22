@@ -68,7 +68,7 @@ export function DeploymentCanvas({ project, prod }: { project: string; prod: Dep
               <span className="flex h-5 w-5 items-center justify-center rounded bg-fg text-bg">
                 <svg width="9" height="8" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
               </span>
-              OpenEdge
+              DevHub
             </div>
             <Row label={<><Shield className="h-3.5 w-3.5" /> DDoS protection</>} on={!!ddos} />
             <Row label={<><Globe className="h-3.5 w-3.5" /> CDN</>} on={cdnActive} />

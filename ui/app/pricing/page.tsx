@@ -8,23 +8,23 @@ export const dynamic = "force-static";
 export const revalidate = 3600;
 
 export const metadata: Metadata = {
-  title: "Pricing — shadw",
+  title: "Pricing — autheo",
   description:
-    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+    "autheo pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
   alternates: { canonical: "/pricing" },
   openGraph: {
-    title: "Pricing — shadw",
+    title: "Pricing — autheo",
     description:
-      "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+      "autheo pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
     url: "/pricing",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Pricing — shadw",
+    title: "Pricing — autheo",
     description:
-      "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
+      "autheo pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
   },
 };
 
@@ -96,7 +96,7 @@ const TIERS: Tier[] = [
 const FAQS: { q: string; a: string }[] = [
   {
     q: "Can I self-host?",
-    a: "Yes. The Enterprise tier lets you run shadw across your own global mesh of self-hosted nodes, with full control over data residency and leases.",
+    a: "Yes. The Enterprise tier lets you run autheo across your own global mesh of self-hosted nodes, with full control over data residency and leases.",
   },
   {
     q: "What counts as a build?",

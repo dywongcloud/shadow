@@ -35,8 +35,8 @@ export function WebhooksSettings({ paramsPromise }: { paramsPromise: Promise<{ p
     <div className="space-y-6">
       <SettingCard
         title="Webhooks"
-        desc="Send a signed HTTP POST to your services when platform events happen — deployment status, database provisioning and more. Verify the X-OpenEdge-Signature (HMAC-SHA256) header with the webhook secret."
-        footer="Each delivery includes an X-OpenEdge-Event header and a signed JSON body."
+        desc="Send a signed HTTP POST to your services when platform events happen — deployment status, database provisioning and more. Verify the X-DevHub-Signature (HMAC-SHA256) header with the webhook secret."
+        footer="Each delivery includes an X-DevHub-Event header and a signed JSON body."
       >
         <div className="space-y-4">
           <div>

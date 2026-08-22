@@ -10,33 +10,33 @@
 
 /* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {
-  --background: 0 0% 98%; /* #FAFAFA — root page background */
-  --subtle: 0 0% 98%;
+  --background: 120 38% 98%;
+  --subtle: 120 30% 96%;
   --card: 0 0% 100%; /* cards/components stay pure white */
-  --foreground: 0 0% 4%;
-  --secondary: 0 0% 40%;
-  --muted: 0 0% 56%;
-  --border: 0 0% 92%;
-  --border-strong: 0 0% 80%;
-  --accent: 0 0% 0%;
+  --foreground: 140 42% 8%;
+  --secondary: 140 22% 34%;
+  --muted: 140 14% 45%;
+  --border: 130 24% 86%;
+  --border-strong: 130 20% 72%;
+  --accent: 132 93% 32%;
   --accent-foreground: 0 0% 100%;
-  --link: 212 100% 47%;
-  --green: 145 80% 42%;
+  --link: 134 86% 34%;
+  --green: 132 93% 32%;
 }
 
 .dark {
-  --background: 0 0% 4%;
-  --subtle: 0 0% 8%;
-  --card: 0 0% 7%;
-  --foreground: 0 0% 93%;
-  --secondary: 0 0% 63%;
-  --muted: 0 0% 50%;
-  --border: 0 0% 16%;
-  --border-strong: 0 0% 28%;
-  --accent: 0 0% 100%;
-  --accent-foreground: 0 0% 4%;
-  --link: 212 100% 62%;
-  --green: 145 65% 49%;
+  --background: 144 44% 5%;
+  --subtle: 145 32% 9%;
+  --card: 145 30% 8%;
+  --foreground: 130 40% 94%;
+  --secondary: 130 22% 72%;
+  --muted: 132 12% 62%;
+  --border: 140 28% 19%;
+  --border-strong: 140 22% 30%;
+  --accent: 132 96% 49%;
+  --accent-foreground: 144 44% 5%;
+  --link: 132 96% 62%;
+  --green: 132 96% 49%;
 }
 
 /* High-contrast mode (bn-ui-accessibility): the OS-level `forced-colors`

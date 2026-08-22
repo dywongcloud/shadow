@@ -69,7 +69,7 @@ function CheckoutInner() {
       <div className="w-full max-w-[420px] overflow-hidden rounded-2xl border border-border bg-card shadow-pop">
         <div className="border-b border-border px-6 py-4">
           <div className="flex items-center gap-2 text-sm text-muted">
-            <Lock className="h-3.5 w-3.5" /> Mock secure checkout · OpenEdge
+            <Lock className="h-3.5 w-3.5" /> Mock secure checkout · DevHub
           </div>
         </div>
         {err ? (

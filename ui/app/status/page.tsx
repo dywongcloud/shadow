@@ -72,7 +72,7 @@ export default function StatusPage() {
               <svg width="13" height="11" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
             </span>
             <div>
-              <div className="text-base font-semibold leading-tight">OpenEdge Status</div>
+              <div className="text-base font-semibold leading-tight">DevHub Status</div>
               <div className="text-xs text-muted">Real-time platform health</div>
             </div>
           </div>
@@ -142,7 +142,7 @@ export default function StatusPage() {
         </section>
 
         <div className="mt-12 text-center text-xs text-muted">
-          Powered by OpenEdge · This page refreshes automatically.
+          Powered by DevHub · This page refreshes automatically.
         </div>
       </div>
     </div>
