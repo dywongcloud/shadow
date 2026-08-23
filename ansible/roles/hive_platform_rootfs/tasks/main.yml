@@ -1,0 +1,310 @@
+---
+# Shared by hardware-KVM and PVM hosts. This role installs the exact builder on
+# every converge but replaces no rootfs unless both explicit operator gates are
+# true. Ordinary backend rolls install the cell agent; this separate role owns
+# the later drained bake.
+
+- name: Ensure the production rootfs directory exists
+  ansible.builtin.file:
+    path: /var/lib/hive/rootfs
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the exact atomic Hive rootfs builder
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../scripts/build-rootfs.sh"
+    dest: /usr/local/sbin/hive-build-rootfs
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Rebuild the drained production rootfs from the packaged cell agent (explicit opt-in)
+  when: hive_runtime_artifact_rootfs_rebuild | bool
+  block:
+    - name: Require explicit drain and bounded recovery settings
+      ansible.builtin.assert:
+        that:
+          - hive_runtime_artifact_rootfs_drained | bool
+          - (hive_cell_agent_protocol_timeout_seconds | int) >= 1
+          - (hive_cell_agent_protocol_timeout_seconds | int) <= 30
+          - (hive_runtime_rootfs_build_timeout_seconds | int) >= 60
+          - (hive_runtime_rootfs_restart_guard_seconds | int) >=
+            ((hive_runtime_rootfs_build_timeout_seconds | int) + 300)
+        fail_msg: >-
+          Refusing the rootfs migration. The node must be removed from placement
+          and drained, the agent probe must stay bounded to 1..30 seconds, and
+          the remote restart guard must outlive the bounded builder by at least
+          five minutes (covering its 30-second hard kill plus the bounded stop
+          and drained-cell checks). Set hive_runtime_artifact_rootfs_rebuild=true and
+          hive_runtime_artifact_rootfs_drained=true only after verifying drain.
+
+    # Deliberately BEFORE the Wasmer download, restart guard, and service stop. A
+    # bootstrap-vintage agent interprets the unknown flag as "serve";
+    # build-rootfs kills that probe on its own deadline and exits while hive-node
+    # is still untouched.
+    - name: Preflight the installed cell-agent release before any service stop
+      ansible.builtin.command:
+        argv:
+          - /usr/local/sbin/hive-build-rootfs
+          - --preflight-agent
+      environment:
+        AGENT_BIN: "{{ hive_cell_agent_install_path }}"
+        AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path }}"
+        RUNTIME_ARTIFACT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | string }}"
+        CELL_AGENT_RELEASE_SCHEMA_EXPECTED: "{{ hive_cell_agent_release_schema_expected | string }}"
+        AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | string }}"
+      register: hive_runtime_rootfs_agent_preflight
+      changed_when: false
+
+    - name: Require the expected parseable cell-agent release fact
+      vars:
+        _agent_fact: "{{ hive_runtime_rootfs_agent_preflight.stdout | from_json }}"
+      ansible.builtin.assert:
+        that:
+          - _agent_fact.keys() | sort == ['agent_sha256', 'runtime_artifact_protocol', 'schema']
+          - (_agent_fact.schema | int) == (hive_cell_agent_release_schema_expected | int)
+          - (_agent_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | int)
+          - _agent_fact.agent_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          The bounded agent preflight did not return the exact release-fact
+          schema/protocol/digest expected by this migration. hive-node was not stopped.
+
+    - name: Download the Wasmer guest tarball when this rootfs must retain Wasmer
+      ansible.builtin.get_url:
+        url: "https://github.com/wasmerio/wasmer/releases/download/v7.2.1/wasmer-linux-amd64.tar.gz"
+        dest: /tmp/wasmer-guest-v7.2.1.tar.gz
+        checksum: "sha256:c46d6ff34a12b40d2e57bfc2ccbb8b9e209b0987ab305233619798b264a6bae5"
+      when: hive_wasmer_in_rootfs | default(false) | bool
+
+    # A controller-side cancellation cannot run Ansible's `always:` section.
+    # Arm a remote systemd timer first; the bounded builder is guaranteed dead
+    # before this timer fires. A normal run starts the service immediately and
+    # disarms the timer after health is proven.
+    - name: Arm a remote cancellation-safe hive-node restart guard
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          unit="hive-rootfs-restart-guard-$(date +%s)-$$"
+          systemd-run --quiet --collect --unit="$unit" \
+            --on-active={{ hive_runtime_rootfs_restart_guard_seconds | int }}s \
+            --timer-property=AccuracySec=1s \
+            /usr/bin/systemctl start hive-node
+          systemctl is-active --quiet "${unit}.timer"
+          printf '%s\n' "$unit"
+        executable: /bin/bash
+      register: hive_runtime_rootfs_restart_guard
+      changed_when: true
+
+    - name: Stop hive-node under a hard bound so the restart guard cannot race the builder
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --signal=TERM
+          - --kill-after=5s
+          - 120s
+          - systemctl
+          - stop
+          - hive-node
+      register: hive_runtime_rootfs_service_stopped
+      changed_when: true
+
+    - name: Terminate only drained Hive-owned Firecracker cells left after the host stopped
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          pattern='^/usr/local/bin/firecracker --api-sock /var/lib/hive/run/'
+          pids="$(pgrep -f "$pattern" || true)"
+          count="$(printf '%s\n' "$pids" | awk 'NF { n++ } END { print n+0 }')"
+          if [ -n "$pids" ]; then
+            kill -TERM $pids
+            for _ in $(seq 1 50); do
+              [ -z "$(pgrep -f "$pattern" || true)" ] && break
+              sleep 0.1
+            done
+            pids="$(pgrep -f "$pattern" || true)"
+            [ -z "$pids" ] || kill -KILL $pids
+          fi
+          printf 'terminated=%s\n' "$count"
+        executable: /bin/bash
+      register: hive_runtime_rootfs_cells
+      changed_when: hive_runtime_rootfs_cells.stdout != 'terminated=0'
+
+    - name: Prove no Hive Firecracker cell remains before rebuilding its shared base
+      ansible.builtin.command:
+        argv:
+          - pgrep
+          - -f
+          - "^/usr/local/bin/firecracker --api-sock /var/lib/hive/run/"
+      register: hive_runtime_rootfs_live_cells
+      failed_when: hive_runtime_rootfs_live_cells.rc not in [0, 1]
+      changed_when: false
+
+    - name: Refuse the rootfs rebuild while any Hive Firecracker cell is still live
+      ansible.builtin.assert:
+        that:
+          - hive_runtime_rootfs_live_cells.rc == 1
+        fail_msg: >-
+          Hive-owned Firecracker processes are still live after the drained
+          hive-node stopped; the production rootfs was not touched. Investigate
+          the listed PIDs, finish the drain, and retry.
+
+    # Refresh the remote guard in the SAME process that starts the bounded
+    # builder. If the controller was paused long enough for the first timer to
+    # fire, hive-node is no longer inactive and this refuses before mutation.
+    - name: Atomically refresh recovery ownership and rebuild under a hard wall-clock bound
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          unit={{ hive_runtime_rootfs_restart_guard.stdout | quote }}
+          [ -n "$unit" ] || { echo 'restart guard unit is missing' >&2; exit 1; }
+          systemctl restart "${unit}.timer"
+          systemctl is-active --quiet "${unit}.timer"
+          service_state="$(systemctl show -p ActiveState --value hive-node)"
+          [ "$service_state" = inactive ] || {
+            echo "hive-node became $service_state before the rootfs builder; refusing mutation" >&2
+            exit 1
+          }
+          exec timeout --signal=TERM --kill-after=30s \
+            {{ ((hive_runtime_rootfs_build_timeout_seconds | int | string) ~ 's') | quote }} \
+            /usr/local/sbin/hive-build-rootfs \
+            {{ hive_runtime_rootfs_image | quote }} \
+            {{ hive_runtime_rootfs_logical_name | quote }} \
+            {{ hive_runtime_rootfs_size_mib | string | quote }}
+        executable: /bin/bash
+      environment:
+        ROOTFS_DIR: /var/lib/hive/rootfs
+        AGENT_BIN: "{{ hive_cell_agent_install_path }}"
+        AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path }}"
+        CONTAINER_CLI: podman
+        RUNTIME_ARTIFACT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | string }}"
+        CELL_AGENT_RELEASE_SCHEMA_EXPECTED: "{{ hive_cell_agent_release_schema_expected | string }}"
+        AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | string }}"
+        WASMER_TARBALL: >-
+          {{ '/tmp/wasmer-guest-v7.2.1.tar.gz'
+             if (hive_wasmer_in_rootfs | default(false) | bool)
+             else '' }}
+
+    - name: Inspect the exact-image runtime-artifact proof
+      ansible.builtin.stat:
+        path: "/var/lib/hive/rootfs/{{ hive_runtime_rootfs_logical_name }}.ext4.runtime-artifact-protocol.json"
+      register: hive_runtime_rootfs_marker
+
+    - name: Require a root-owned immutable runtime-artifact proof
+      ansible.builtin.assert:
+        that:
+          - hive_runtime_rootfs_marker.stat.exists
+          - hive_runtime_rootfs_marker.stat.isreg
+          - hive_runtime_rootfs_marker.stat.pw_name == 'root'
+          - hive_runtime_rootfs_marker.stat.gr_name == 'root'
+          - hive_runtime_rootfs_marker.stat.mode == '0444'
+        fail_msg: >-
+          The rebuilt rootfs did not publish a root-owned mode-0444 protocol
+          proof; this node must remain ineligible.
+
+    - name: Re-hash the image and baked agent against both committed proofs
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          python3 - \
+            "/var/lib/hive/rootfs/{{ hive_runtime_rootfs_logical_name }}.ext4" \
+            "{{ hive_cell_agent_install_path }}" \
+            "{{ hive_cell_agent_release_fact_path }}" \
+            "{{ hive_runtime_artifact_protocol_expected | int }}" <<'PYVERIFY'
+          import hashlib, json, os, sys
+          image, agent, release_path, required_protocol = sys.argv[1:]
+          required_protocol = int(required_protocol)
+          proof_path = image + '.runtime-artifact-protocol.json'
+          with open(proof_path, 'rb') as handle:
+              proof = json.load(handle)
+          with open(release_path, 'rb') as handle:
+              release = json.load(handle)
+          def digest(path):
+              value = hashlib.sha256()
+              with open(path, 'rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      value.update(chunk)
+              return value.hexdigest()
+          if release != {
+              'schema': 1,
+              'runtime_artifact_protocol': required_protocol,
+              'agent_sha256': digest(agent),
+          }:
+              raise SystemExit('installed agent release fact no longer matches installed bytes')
+          if proof.get('schema') != 1 or proof.get('protocol') != required_protocol:
+              raise SystemExit('rootfs proof schema/protocol mismatch')
+          if proof.get('agent_sha256') != release['agent_sha256']:
+              raise SystemExit('rootfs proof was baked from a different cell agent')
+          if proof.get('image_sha256') != digest(image):
+              raise SystemExit('rootfs proof image digest mismatch')
+          if proof.get('image_bytes') != os.stat(image).st_size:
+              raise SystemExit('rootfs proof image length mismatch')
+          PYVERIFY
+        executable: /bin/bash
+      changed_when: false
+
+  always:
+    - name: Start hive-node after the explicit rootfs attempt
+      ansible.builtin.systemd:
+        name: hive-node
+        state: started
+      when: hive_runtime_rootfs_service_stopped is defined
+
+    - name: Wait for hive-node health after the explicit rootfs attempt
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8786/healthz
+        status_code: 200
+      register: hive_runtime_rootfs_health
+      retries: 30
+      delay: 2
+      until: >-
+        hive_runtime_rootfs_health.status is defined and
+        hive_runtime_rootfs_health.status == 200
+      when: hive_runtime_rootfs_service_stopped is defined
+
+    - name: Disarm the remote restart guard after recovery is proven
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          unit={{ hive_runtime_rootfs_restart_guard.stdout | default('') | quote }}
+          [ -n "$unit" ] || exit 0
+          systemctl stop "${unit}.timer" "${unit}.service" 2>/dev/null || true
+          systemctl reset-failed "${unit}.timer" "${unit}.service" 2>/dev/null || true
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - hive_runtime_rootfs_restart_guard is defined
+        - >-
+          hive_runtime_rootfs_service_stopped is not defined or
+          (hive_runtime_rootfs_health is defined and
+           hive_runtime_rootfs_health.status is defined and
+           hive_runtime_rootfs_health.status == 200)
+
+# Verification-only on ordinary converges. Wasmer adds ~200 MiB and can only be
+# introduced by the explicit drained migration above; a routine role run never
+# replaces the rootfs to satisfy this request.
+- name: Verify Wasmer is present in the protocol-proven guest rootfs (opt-in)
+  when: hive_wasmer_in_rootfs | default(false) | bool
+  block:
+    - name: Inspect the Wasmer guest capability marker
+      ansible.builtin.stat:
+        path: "/var/lib/hive/rootfs/{{ hive_runtime_rootfs_logical_name }}.wasmer"
+      register: hive_wasmer_marker
+
+    - name: Refuse an undrained Wasmer rootfs rebuild
+      ansible.builtin.assert:
+        that:
+          - hive_wasmer_marker.stat.exists
+          - hive_wasmer_marker.stat.isreg
+        fail_msg: >-
+          Wasmer is requested but the installed rootfs has not been rebuilt with
+          it. Remove this node from placement, drain tenant traffic, then rerun
+          with hive_runtime_artifact_rootfs_rebuild=true,
+          hive_runtime_artifact_rootfs_drained=true, and
+          hive_wasmer_in_rootfs=true. Routine converges never replace a live rootfs.
+
+    - name: Remove the guest-staging tarball
+      ansible.builtin.file:
+        path: /tmp/wasmer-guest-v7.2.1.tar.gz
+        state: absent

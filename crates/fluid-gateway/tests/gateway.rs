@@ -473,6 +473,7 @@ async fn restore_prefers_production_deployment_for_alias() {
         id: id.into(),
         project: "ctr-demo".into(),
         root: "/nonexistent".into(),
+        runtime_workdir: None,
         manifest: Manifest {
             project: "ctr-demo".into(),
             ..Default::default()

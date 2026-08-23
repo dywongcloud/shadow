@@ -37,9 +37,9 @@
 //! visible within 35s). Converting a permanent, human-paged outage into a
 //! ~30-second automatic blip is a real improvement even though it does not fix
 //! iroh; when the underlying transport bug is fixed this watchdog simply stops
-//! firing. `memwatch`'s RSS self-restart is the same trade and the same
-//! mechanism (`exit(17)` under the unit's `Restart=always`), deliberately
-//! reused rather than reinvented.
+//! firing. `memwatch`'s RSS self-restart is the same trade and the same shared
+//! controlled-restart path (`exit(17)` under the unit's `Restart=always`),
+//! deliberately reused rather than reinvented.
 //!
 //! ## Guards, so this can never become a restart loop
 //!
@@ -191,7 +191,7 @@ fn degraded_restart_enabled() -> bool {
 }
 
 /// Spawn the watchdog loop. Cheap: one registry read every 30s.
-pub fn spawn(cloud: Arc<CloudState>) {
+pub fn spawn(cloud: Arc<CloudState>, restart: crate::ControlledRestart) {
     // ms timestamp of the first tick of the CURRENT isolation streak; 0 = not
     // isolated. Reset to 0 the moment any healthy peer is visible again.
     static ISOLATED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
@@ -273,10 +273,10 @@ pub fn spawn(cloud: Arc<CloudState>) {
                         service_healthy_peers = h.visible_healthy_peers,
                         expected_peers = h.expected_peers,
                         degraded_secs_in_window = degraded_ms / 1000,
-                        "mesh watchdog: node is WEDGED BY FLAPPING — direct peer reachability sat below the floor for the cumulative trigger within the window, the exact shape the continuous-isolation trigger structurally misses. Flushing state and exiting for a clean systemd restart. Set HIVE_MESH_DEGRADED_RESTART=0 to disable."
+                        "mesh watchdog: node is WEDGED BY FLAPPING — direct peer reachability sat below the floor for the cumulative trigger within the window, the exact shape the continuous-isolation trigger structurally misses. Requesting the shared graceful restart path. Set HIVE_MESH_DEGRADED_RESTART=0 to disable."
                     );
-                    crate::persist::flush_blocking();
-                    std::process::exit(17);
+                    restart.request(crate::RestartReason::MeshDegradation);
+                    return;
                 }
             }
 
@@ -307,10 +307,10 @@ pub fn spawn(cloud: Arc<CloudState>) {
                         audible_peers = h.audible_peers,
                         expected_peers = h.expected_peers,
                         uptime_secs = h.uptime_ms / 1000,
-                        "mesh watchdog: node is BOOT-WEDGED — the fleet is gossip-audible but it has never completed a direct exchange since boot (transport wedged before first contact; the never-converged guards would otherwise leave it dark forever). Flushing state and exiting for a clean systemd restart. Set HIVE_MESH_WEDGE_RESTART=0 to disable."
+                        "mesh watchdog: node is BOOT-WEDGED — the fleet is gossip-audible but it has never completed a direct exchange since boot (transport wedged before first contact; the never-converged guards would otherwise leave it dark forever). Requesting the shared graceful restart path. Set HIVE_MESH_WEDGE_RESTART=0 to disable."
                     );
-                    crate::persist::flush_blocking();
-                    std::process::exit(17);
+                    restart.request(crate::RestartReason::MeshIsolation);
+                    return;
                 }
             }
 
@@ -373,15 +373,11 @@ pub fn spawn(cloud: Arc<CloudState>) {
                 "mesh watchdog: node is WEDGED — it converged earlier in this process's life \
                  and has now seen zero healthy peers for the full threshold, which is the \
                  measured signature of the iroh transport wedge (relay reconnect storm, gossip \
-                 dead, process otherwise healthy). Flushing state and exiting for a clean \
-                 systemd restart (Restart=always); the node rejoins in ~30s. Set \
-                 HIVE_MESH_WEDGE_RESTART=0 to disable."
+                 dead, process otherwise healthy). Requesting the shared graceful restart path; \
+                 the node rejoins in ~30s. Set HIVE_MESH_WEDGE_RESTART=0 to disable."
             );
-            // Same ordering as memwatch's restart arm: the background persister
-            // writes on its own cadence, so without this flush everything since
-            // its last tick is lost on exit.
-            crate::persist::flush_blocking();
-            std::process::exit(17);
+            restart.request(crate::RestartReason::MeshIsolation);
+            return;
         }
     });
 }

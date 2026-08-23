@@ -32,9 +32,23 @@
       tags: [guest_kernel]
       when: not (pvm_already_provisioned | default(false))
 
+    # This is the SSH smoke-test image under /root/pvm, not Hive's production
+    # /var/lib/hive/rootfs image. Keep its bring-up-only lifecycle separate.
     - import_tasks: 50-rootfs.yml
       tags: [rootfs]
       when: not (pvm_already_provisioned | default(false))
+
+    # PVM previously had no production-rootfs migration at all. Use the exact
+    # same manual, digest-bound path as hardware KVM; on ordinary runs this only
+    # installs the builder and never replaces a rootfs.
+    - name: Install and optionally run the production rootfs migration
+      ansible.builtin.include_role:
+        name: hive_platform_rootfs
+        apply:
+          tags:
+            - rootfs
+            - runtime_rootfs
+      tags: [rootfs, runtime_rootfs]
 
     - import_tasks: 60-boot.yml
       tags: [boot]

@@ -1,0 +1,149 @@
+---
+- name: Validate immutable inputs before changing the host
+  ansible.builtin.import_tasks: 00-preflight.yml
+
+- name: Provision the fail-closed BuildExecutor capability
+  block:
+    - name: Acquire the serialized root flock before any host mutation
+      ansible.builtin.import_tasks: 25-lock.yml
+
+    - name: Revoke capability while provisioning is in progress
+      ansible.builtin.file:
+        path: "{{ build_executor_capability_path }}"
+        state: absent
+
+    - name: Install BuildExecutor host prerequisites
+      ansible.builtin.dnf:
+        name: "{{ build_executor_packages }}"
+        state: present
+
+    - name: Create root-owned BuildExecutor directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ build_executor_state_dir }}", mode: "0700" }
+        - { path: "{{ build_executor_builder_context_dir }}", mode: "0700" }
+        - { path: "{{ build_executor_libexec_dir }}", mode: "0755" }
+        - { path: "/etc/nftables.d", mode: "0755" }
+
+    - name: Install and verify the pinned runsc release bundle
+      ansible.builtin.import_tasks: 10-runsc.yml
+
+    - name: Install dedicated Podman policy and assert the existing host backend
+      ansible.builtin.import_tasks: 15-runtime-policy.yml
+
+    - name: Reap stale probes from an interrupted previous run under this flock
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_reap_helper_path }}"
+          - --lock-held
+      changed_when: false
+
+    - name: Build or load and resolve the immutable builder image
+      ansible.builtin.import_tasks: 20-image.yml
+
+    - name: Validate collision-free network and derive canonical policy identity
+      ansible.builtin.import_tasks: 30-network.yml
+
+    # iifname/oifname string rules are valid before the bridge exists. Loading
+    # both inet and bridge-family policy first closes the create-before-filter gap.
+    - name: Install and activate policy before creating the network
+      ansible.builtin.import_tasks: 40-firewall.yml
+
+    - name: Create and verify the policy-labeled Netavark network
+      ansible.builtin.import_tasks: 45-network.yml
+
+    - name: Run destructive functional probes with guaranteed cleanup
+      ansible.builtin.import_tasks: 50-probe.yml
+
+    - name: Atomically publish the verified BuildExecutor capability
+      ansible.builtin.template:
+        src: build-executor.json.j2
+        dest: "{{ build_executor_capability_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+        unsafe_writes: false
+
+    - name: Reapply and prove policy, runtime, config, and network label
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_nft_apply_path }}"
+      changed_when: false
+
+    - name: Verify the just-published capability against live host state
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_nft_verify_path }}"
+          - --lock-held
+      changed_when: false
+
+    - name: Release the serialized root flock after verified publication
+      ansible.builtin.import_tasks: 55-release-lock.yml
+
+  rescue:
+    - name: Revoke capability before releasing this invocation's held flock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/rm
+          - --force
+          - "{{ build_executor_capability_path }}"
+      register: _build_executor_direct_revoke
+      changed_when: false
+      failed_when: false
+      when: _build_executor_lock_held | default(false) | bool
+
+    - name: Stop this invocation's provisioning-lock waiter or holder
+      ansible.builtin.systemd:
+        name: "{{ _build_executor_lock_unit }}"
+        state: stopped
+      when: _build_executor_lock_unit is defined
+      failed_when: false
+
+    - name: Revoke capability under the serialized root flock when acquisition failed
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/bash
+          - -c
+          - |
+            set -euo pipefail
+            umask 077
+            lock=$1
+            capability=$2
+            exec 9>>"$lock"
+            /usr/bin/flock --exclusive 9
+            /usr/bin/rm --force -- "$capability"
+          - hive-build-failed-revoke
+          - "{{ build_executor_lock_path }}"
+          - "{{ build_executor_capability_path }}"
+      changed_when: false
+      when: >-
+        not (_build_executor_lock_held | default(false) | bool)
+        or (_build_executor_direct_revoke.rc | default(1) | int) != 0
+
+    - name: Remove a stale lock receipt after failure
+      ansible.builtin.file:
+        path: "{{ _build_executor_lock_ready | default('/run/nonexistent-build-executor-lock') }}"
+        state: absent
+
+    - name: Prove capability revocation after failure
+      ansible.builtin.stat:
+        path: "{{ build_executor_capability_path }}"
+        follow: false
+      register: _build_executor_failed_capability_stat
+
+    - name: Require failed provisioning to leave no capability
+      ansible.builtin.assert:
+        that:
+          - not _build_executor_failed_capability_stat.stat.exists
+
+    - name: Stop after fail-closed capability revocation
+      ansible.builtin.fail:
+        msg: >-
+          BuildExecutor provisioning failed and
+          {{ build_executor_capability_path }} is absent. Cause:
+          {{ ansible_failed_result.msg | default(ansible_failed_result | string) }}

@@ -249,8 +249,8 @@ static RESTORE_STREAKS: std::sync::OnceLock<
 /// mutation and immutable endpoint capture happen under one registry lock,
 /// so callers can close only the trunks that were actually restored.
 pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<String> {
-    let streaks = RESTORE_STREAKS
-        .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let streaks =
+        RESTORE_STREAKS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
     let candidates: std::collections::HashSet<String> = registry
         .gossip_fresh_unhealthy(GOSSIP_ALIVE_MS)
         .into_iter()

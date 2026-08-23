@@ -277,6 +277,185 @@ pub struct TcpPublish {
     pub host_port: u16,
 }
 
+pub const RUNTIME_ARTIFACT_PROTOCOL_VERSION: u16 = 1;
+
+/// Complete host-to-guest wire contract. This version covers every
+/// AgentRequest and AgentEvent variant plus every serialized field and semantic
+/// of FunctionLaunch. Adding, removing, defaulting, or reinterpreting any of
+/// those is a protocol change and MUST monotonically increment this constant;
+/// runtime-artifact identity remains independently versioned above.
+pub const AGENT_WIRE_PROTOCOL_VERSION: u16 = 1;
+/// The peer implements the complete AgentRequest/AgentEvent v1 schema.
+pub const AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA: u64 = 1 << 0;
+/// The peer implements every FunctionLaunch v1 field and its launch semantics.
+pub const AGENT_WIRE_CAPABILITY_FUNCTION_LAUNCH: u64 = 1 << 1;
+/// The peer validates and returns the exact rootfs/agent boot proof during the
+/// challenge handshake, before it accepts a tenant launch.
+pub const AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT: u64 = 1 << 2;
+/// Exact capability set for AGENT_WIRE_PROTOCOL_VERSION. Peers require equality,
+/// not subset negotiation, so an unknown launch shape is never silently dropped.
+pub const AGENT_WIRE_CAPABILITIES: u64 = AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA
+    | AGENT_WIRE_CAPABILITY_FUNCTION_LAUNCH
+    | AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT;
+pub const AGENT_HANDSHAKE_NONCE_BYTES: usize = 32;
+pub const AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN: &[u8] = b"hive-agent-wire-handshake-v1\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWireProtocol {
+    pub protocol: u16,
+    pub capabilities: u64,
+}
+
+impl AgentWireProtocol {
+    pub const fn current() -> Self {
+        Self {
+            protocol: AGENT_WIRE_PROTOCOL_VERSION,
+            capabilities: AGENT_WIRE_CAPABILITIES,
+        }
+    }
+}
+
+pub const RUNTIME_ARTIFACT_MARKER_FILE: &str = ".hive-runtime-artifact-v1.json";
+/// Read-only marker baked into the guest rootfs beside the exact cell-agent
+/// binary that implements both independently-versioned protocols.
+pub const RUNTIME_ARTIFACT_ROOTFS_MARKER_PATH: &str = "/etc/hive/runtime-artifact-protocol.json";
+/// Host-side content proof written next to <image>.ext4. The host verifies this
+/// descriptor against the exact image bytes before advertising or booting work;
+/// existence or printable version text alone is never a capability.
+pub const RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX: &str = ".runtime-artifact-protocol.json";
+pub const RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION: u16 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeArtifactRootfsMarker {
+    pub schema: u16,
+    /// Runtime-artifact identity protocol, independent from agent wire protocol.
+    pub protocol: u16,
+    pub agent_wire_protocol: u16,
+    pub agent_wire_capabilities: u64,
+    pub agent_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeArtifactRootfsMetadata {
+    pub schema: u16,
+    /// Runtime-artifact identity protocol, independent from agent wire protocol.
+    pub protocol: u16,
+    pub agent_wire_protocol: u16,
+    pub agent_wire_capabilities: u64,
+    pub agent_sha256: String,
+    pub image_sha256: String,
+    pub image_bytes: u64,
+}
+
+/// Exact boot fact authenticated by the host's whole-image verification, the
+/// guest's running-executable digest check, and a fresh same-connection nonce.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBootProof {
+    pub rootfs_schema: u16,
+    pub runtime_artifact_protocol: u16,
+    pub agent_wire_protocol: u16,
+    pub agent_wire_capabilities: u64,
+    pub agent_sha256: String,
+    pub rootfs_image_sha256: String,
+    pub rootfs_image_bytes: u64,
+}
+
+impl RuntimeArtifactRootfsMetadata {
+    pub fn agent_boot_proof(&self) -> AgentBootProof {
+        AgentBootProof {
+            rootfs_schema: self.schema,
+            runtime_artifact_protocol: self.protocol,
+            agent_wire_protocol: self.agent_wire_protocol,
+            agent_wire_capabilities: self.agent_wire_capabilities,
+            agent_sha256: self.agent_sha256.clone(),
+            rootfs_image_sha256: self.image_sha256.clone(),
+            rootfs_image_bytes: self.image_bytes,
+        }
+    }
+}
+
+/// First application frame on a versioned host-to-guest connection. The nonce
+/// prevents replay; expected_boot is independently verified from exact image
+/// bytes by the host and against the running executable by the guest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHandshake {
+    pub nonce: String,
+    pub expected_boot: AgentBootProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHandshakeReady {
+    pub nonce: String,
+    pub proof: AgentBootProof,
+    pub transcript_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProtocolFaultCode {
+    Malformed,
+    HandshakeRequired,
+    UnsupportedWireProtocol,
+    CapabilityMismatch,
+    RuntimeArtifactProtocolMismatch,
+    InvalidNonce,
+    Replay,
+    DuplicateHandshake,
+    OutOfOrder,
+    RootfsProofMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProtocolFault {
+    pub code: AgentProtocolFaultCode,
+    pub message: String,
+}
+
+impl AgentProtocolFault {
+    pub fn new(code: AgentProtocolFaultCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Canonical bytes hashed into AgentHandshakeReady::transcript_sha256. The
+/// transcript binds freshness, exact rootfs bytes, packaged agent digest, and
+/// both independently-versioned protocols without adding a hash dependency to
+/// hive-core itself.
+pub fn agent_handshake_transcript(nonce: &str, proof: &AgentBootProof) -> Vec<u8> {
+    let nonce = nonce.as_bytes();
+    let agent = proof.agent_sha256.as_bytes();
+    let image = proof.rootfs_image_sha256.as_bytes();
+    let mut transcript = Vec::with_capacity(
+        AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN.len() + nonce.len() + agent.len() + image.len() + 64,
+    );
+    transcript.extend_from_slice(AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&(nonce.len() as u64).to_be_bytes());
+    transcript.extend_from_slice(nonce);
+    transcript.extend_from_slice(&proof.rootfs_schema.to_be_bytes());
+    transcript.extend_from_slice(&proof.runtime_artifact_protocol.to_be_bytes());
+    transcript.extend_from_slice(&proof.agent_wire_protocol.to_be_bytes());
+    transcript.extend_from_slice(&proof.agent_wire_capabilities.to_be_bytes());
+    transcript.extend_from_slice(&(agent.len() as u64).to_be_bytes());
+    transcript.extend_from_slice(agent);
+    transcript.extend_from_slice(&(image.len() as u64).to_be_bytes());
+    transcript.extend_from_slice(image);
+    transcript.extend_from_slice(&proof.rootfs_image_bytes.to_be_bytes());
+    transcript
+}
+
+/// Immutable identity of the exact runtime tree attached to an isolated cell.
+/// The host derives it while materializing the build and the guest echoes it
+/// only after validating the marker inside the mounted artifact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeArtifactIdentity {
+    pub protocol: u16,
+    pub id: String,
+    pub content_sha256: String,
+}
+
 /// How to launch a long-lived function server inside a cell (Fluid compute).
 /// The process MUST listen on `$PORT` (Vercel/Heroku convention).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,6 +466,13 @@ pub struct FunctionLaunch {
     /// Working dir. For the mock backend this is a host path; inside a microVM
     /// it is the guest path where the deployment was delivered.
     pub workdir: Option<String>,
+    /// Exact isolated-runtime artifact expected by the host. `None` is normal for
+    /// same-host/container paths. An upgraded guest also accepts the exact frozen
+    /// pre-v1 frame with `runtime_artifact` absent and `workdir` either absent/null
+    /// or set; upgraded isolated hosts always send `Some` and require validation
+    /// and echo it before `FunctionReady` is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_artifact: Option<RuntimeArtifactIdentity>,
     /// Port the function server should bind ($PORT). Chosen by the backend.
     pub port: u16,
     /// Max concurrent requests one instance handles (tunnel server uses it to nack).
@@ -385,6 +571,8 @@ pub struct ExecRequest {
 /// Message the box daemon (host) sends to the cell daemon (guest) over vsock.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentRequest {
+    /// Mandatory first frame for the versioned launch path.
+    Handshake(AgentHandshake),
     /// Run this build inside the cell.
     Run(BuildJob),
     /// Start a long-lived function server (Fluid compute serving path).
@@ -407,9 +595,17 @@ pub enum AgentRequest {
 /// Messages the cell daemon streams back to the box daemon over vsock.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// Exact boot proof for the immediately preceding fresh handshake.
+    HandshakeReady(AgentHandshakeReady),
+    /// Typed fail-closed refusal; host classifies this as a node/guest fault.
+    ProtocolFault(AgentProtocolFault),
     Pong,
     Log(LogLine),
     Done(BuildResult),
+    /// Guest proof that the mounted runtime tree matches the exact protocol/id/
+    /// content identity requested by the host. A host must receive this before
+    /// accepting `FunctionReady`; old agents therefore fail closed.
+    RuntimeArtifactReady(RuntimeArtifactIdentity),
     /// Function server is up and accepting requests on its port; the agent is
     /// now bridging `CELL_FUNCTION_PORT` -> the function.
     FunctionReady,
@@ -539,6 +735,7 @@ mod runtime_tests {
             start_cmd: vec!["bun".into(), "run".into(), "server.js".into()],
             env: Default::default(),
             workdir: None,
+            runtime_artifact: None,
             port: 3000,
             max_concurrency: 10,
             memory_mib: 0,

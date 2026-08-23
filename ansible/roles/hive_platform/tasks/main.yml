@@ -1,11 +1,8 @@
 ---
-# Deploy the hive-cloud binary + systemd unit to one node. Source is pushed
-# via rsync from the Ansible CONTROL host's own checkout of this repo (this
-# playbook lives inside the hive monorepo, so "the source" is always right
-# here) -- this mirrors exactly how every node in this session's real fleet
-# was actually built (scp/rsync crates/+Cargo.toml/lock+vendor, then `cargo
-# build --release` on the target), rather than depending on a git remote
-# existing/being reachable from every node.
+# Deploy the hive-cloud controller and its exact hive-cell-agent companion to one
+# node. Source is pushed from the Ansible control host's checkout; both binaries
+# are compiled in one Cargo invocation, so a later manual rootfs bake cannot
+# consume bootstrap-vintage guest code.
 
 - name: Ensure the source directory exists on the target
   ansible.builtin.file:
@@ -25,8 +22,7 @@
 # vendor/ needs the SAME excludes as crates/ above. Without them this ships
 # vendor/guardian-db/target — 2.9GB of local build artifacts (gitignored, so
 # invisible in the repo) plus a 155MB tmp/ — to every node on every deploy,
-# against 4.3MB of actual source. Measured live: a five-node roll spent over an
-# hour transferring that to bandwidth-limited hosts before any build started.
+# against 4.3MB of actual source.
 - name: Sync vendor/ (patched crates, e.g. guardian-db)
   ansible.posix.synchronize:
     src: "{{ playbook_dir }}/../../vendor/"
@@ -46,9 +42,9 @@
     - Cargo.toml
     - Cargo.lock
 
-- name: Build hive-cloud (release) -- long-running, first build is the slow one
+- name: Build hive-cloud + hive-cell-agent from one release source snapshot
   ansible.builtin.command:
-    cmd: cargo build --release -p hive-cloud
+    cmd: cargo build --release -p hive-cloud -p hive-cell-agent
     chdir: "{{ hive_src_dir }}"
   environment:
     PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
@@ -58,20 +54,113 @@
   register: _build
   notify: restart hive-node
 
-- name: Confirm the binary was produced
+- name: Confirm the controller binary was produced
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
   register: _bin
   failed_when: not _bin.stat.exists
 
+- name: Confirm and checksum the companion cell-agent binary
+  ansible.builtin.stat:
+    path: "{{ hive_cargo_target_dir }}/release/hive-cell-agent"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _cell_agent_build
+  failed_when: >-
+    not (_cell_agent_build.stat.exists | default(false)) or
+    not (_cell_agent_build.stat.isreg | default(false)) or
+    (_cell_agent_build.stat.checksum | default('') | length) != 64
+
+- name: Install the fail-closed cell-agent release publisher
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/install-cell-agent.sh"
+    dest: /usr/local/sbin/hive-install-cell-agent
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect the previously installed cell-agent package
+  ansible.builtin.stat:
+    path: "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _cell_agent_before
+
+- name: Inspect the previously installed cell-agent release fact
+  ansible.builtin.stat:
+    path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+  register: _cell_agent_fact_before
+
+# The publisher copies into /usr/local/bin first, SHA-verifies it, then gives the
+# candidate a hard-bounded CLI probe. Only a strict integer protocol result is
+# converted into the schema-1 JSON release fact and atomically switched into
+# place. The previous binary remains at hive-cell-agent.old.
+- name: Preflight and atomically install the exact built cell-agent
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/hive-install-cell-agent
+      - "{{ hive_cargo_target_dir }}/release/hive-cell-agent"
+      - "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+  environment:
+    CELL_AGENT_EXPECTED_SHA256: "{{ _cell_agent_build.stat.checksum }}"
+    CELL_AGENT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | default(1) | string }}"
+    CELL_AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | default(5) | string }}"
+    CELL_AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+  register: _cell_agent_install
+  changed_when: >-
+    (_cell_agent_before.stat.checksum | default('')) != _cell_agent_build.stat.checksum or
+    not (_cell_agent_fact_before.stat.exists | default(false))
+
+- name: Require the installer to return the exact parseable release fact
+  vars:
+    _fact: "{{ _cell_agent_install.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _fact.keys() | sort == ['agent_sha256', 'runtime_artifact_protocol', 'schema']
+      - (_fact.schema | int) == 1
+      - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - _fact.agent_sha256 == _cell_agent_build.stat.checksum
+    fail_msg: >-
+      The installed cell-agent did not attest the exact digest and runtime-artifact
+      protocol built alongside hive-cloud; no rootfs may consume it.
+
+- name: Verify the installed cell-agent bytes and release-fact ownership
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    get_checksum: "{{ item.checksum }}"
+    checksum_algorithm: sha256
+  loop:
+    - path: "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+      checksum: true
+    - path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+      checksum: false
+  register: _cell_agent_installed_files
+
+- name: Fail closed unless the installed package is exact and immutable
+  vars:
+    _installed: "{{ _cell_agent_installed_files.results[0].stat }}"
+    _release: "{{ _cell_agent_installed_files.results[1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _installed.exists
+      - _installed.isreg
+      - _installed.pw_name == 'root'
+      - _installed.gr_name == 'root'
+      - _installed.mode == '0755'
+      - _installed.checksum == _cell_agent_build.stat.checksum
+      - _release.exists
+      - _release.isreg
+      - _release.pw_name == 'root'
+      - _release.gr_name == 'root'
+      - _release.mode == '0444'
+    fail_msg: >-
+      Cell-agent publication did not leave root-owned mode-0755 bytes plus a
+      root-owned mode-0444 release fact matching the canonical build.
+
 # The browser_db lanes (CRR exchange + browser_db_rest) hard-refuse every
 # round when the cr-sqlite loadable extension is missing — and nothing in a
 # backend-only roll ships it (the binary's baked default path points into the
-# source tree, which only full hive_platform runs sync). Witnessed
-# 2026-08-18: fleet-wide "replica open failed" while records looked healthy.
-# Build it here (top-level `make` — the `loadable` target exists only in
-# core/) and install to a stable path the drop-in names. `make` is a no-op
-# when the vendored pin hasn't moved, so this costs seconds on re-runs.
+# source tree, which only full hive_platform runs sync).
 - name: Build the cr-sqlite loadable extension (no-op when current)
   ansible.builtin.command:
     cmd: make
@@ -111,12 +200,14 @@
       Environment=HIVE_CRSQL_EXTENSION_PATH=/var/lib/hive/crsqlite.so
   notify: [reload systemd, restart hive-node]
 
-- name: Template the hive-node systemd unit
-  ansible.builtin.template:
-    src: hive-node.service.j2
-    dest: /etc/systemd/system/hive-node.service
-    mode: "0644"
-  notify: [reload systemd, restart hive-node]
+- name: Reconcile the hive-node unit and GitHub App credentials
+  ansible.builtin.include_tasks:
+    file: github_app_credentials.yml
+    apply:
+      tags:
+        - github_app_credentials
+  tags:
+    - github_app_credentials
 
 - name: Flush handlers now (so the health check below sees the final state)
   ansible.builtin.meta: flush_handlers

@@ -1,0 +1,126 @@
+---
+- name: Render the reviewed builder Containerfile
+  ansible.builtin.template:
+    src: Containerfile.j2
+    dest: "{{ build_executor_builder_context_dir }}/Containerfile"
+    owner: root
+    group: root
+    mode: "0600"
+  when: build_executor_builder_source == "build"
+
+- name: Pull the immutable builder base by digest
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_podman_path }}"
+      - pull
+      - --quiet
+      - "{{ build_executor_builder_base_image }}"
+  register: _build_executor_base_pull
+  changed_when: false
+  when: build_executor_builder_source == "build"
+
+- name: Remove a stale builder image ID handoff
+  ansible.builtin.file:
+    path: "{{ build_executor_state_dir }}/builder.iid"
+    state: absent
+  when: build_executor_builder_source == "build"
+
+- name: Build the reviewed builder without network or mutable pulls
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_podman_path }}"
+      - build
+      - --pull=never
+      - --network=none
+      - --iidfile={{ build_executor_state_dir }}/builder.iid
+      - --tag={{ build_executor_builder_tag }}
+      - --file={{ build_executor_builder_context_dir }}/Containerfile
+      - "{{ build_executor_builder_context_dir }}"
+  when: build_executor_builder_source == "build"
+
+- name: Read the built image ID handoff
+  ansible.builtin.slurp:
+    src: "{{ build_executor_state_dir }}/builder.iid"
+  register: _build_executor_builder_iid
+  when: build_executor_builder_source == "build"
+
+- name: Resolve the built image to its immutable ID
+  ansible.builtin.set_fact:
+    build_executor_builder_image_id: "{{ _build_executor_builder_iid.content | b64decode | trim }}"
+  when: build_executor_builder_source == "build"
+
+- name: Recheck the reviewed OCI archive immediately before loading
+  ansible.builtin.stat:
+    path: "{{ build_executor_builder_oci_archive_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  register: _build_executor_archive_load_stat
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Refuse an OCI archive changed after preflight
+  ansible.builtin.assert:
+    that:
+      - _build_executor_archive_load_stat.stat.exists
+      - _build_executor_archive_load_stat.stat.isreg
+      - not _build_executor_archive_load_stat.stat.islnk
+      - _build_executor_archive_load_stat.stat.uid == 0
+      - _build_executor_archive_load_stat.stat.gid == 0
+      - _build_executor_archive_load_stat.stat.mode in ["0400", "0440", "0444", "0600", "0640", "0644"]
+      - _build_executor_archive_load_stat.stat.checksum == build_executor_builder_oci_archive_sha256
+    fail_msg: "The reviewed OCI archive changed after immutable-input preflight."
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Load the checksum-reviewed local OCI archive
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_podman_path }}"
+      - load
+      - --input
+      - "{{ build_executor_builder_oci_archive_path }}"
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Select the archive's reviewed immutable image ID
+  ansible.builtin.set_fact:
+    build_executor_builder_image_id: "{{ build_executor_builder_expected_image_id }}"
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Require the resolved builder ID to be content-addressed
+  ansible.builtin.assert:
+    that:
+      - build_executor_builder_image_id is match('^sha256:[0-9a-f]{64}$')
+      - >-
+        build_executor_builder_expected_image_id | length == 0 or
+        build_executor_builder_image_id == build_executor_builder_expected_image_id
+    fail_msg: "The builder did not resolve to the reviewed immutable image ID."
+
+- name: Inspect the immutable builder image directly by ID
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_podman_path }}"
+      - image
+      - inspect
+      - "{{ build_executor_builder_image_id }}"
+  register: _build_executor_builder_inspect_raw
+  changed_when: false
+
+- name: Decode immutable builder metadata
+  ansible.builtin.set_fact:
+    _build_executor_builder_inspect: "{{ (_build_executor_builder_inspect_raw.stdout | from_json)[0] }}"
+
+- name: Require image identity, non-root default, and protocol label
+  ansible.builtin.assert:
+    that:
+      - _build_executor_builder_inspect.Id == build_executor_builder_image_id
+      - _build_executor_builder_inspect.Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
+      - (_build_executor_builder_inspect.Config.Volumes | default({}, true)) | length == 0
+      - (_build_executor_builder_inspect.Config.Labels | default({})).get('org.hive.build-executor.protocol', '') == build_executor_protocol
+    fail_msg: >-
+      The reviewed builder metadata is inconsistent: it must be the exact image
+      ID, declare no implicit volumes, and default to the configured non-root
+      numeric uid:gid.
+
+- name: Remove the transient builder image ID handoff
+  ansible.builtin.file:
+    path: "{{ build_executor_state_dir }}/builder.iid"
+    state: absent

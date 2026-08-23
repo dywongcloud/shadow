@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 hive-core = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

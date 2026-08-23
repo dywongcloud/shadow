@@ -94,10 +94,11 @@ impl KeyValueIndex {
     }
 }
 
-
 /// True for iroh-docs events that mean REMOTE state changed and the local index
 /// must be rebuilt. Local inserts are already applied by put_impl/delete_impl.
-fn is_remote_event(event: &std::result::Result<iroh_docs::engine::LiveEvent, impl std::fmt::Debug>) -> bool {
+fn is_remote_event(
+    event: &std::result::Result<iroh_docs::engine::LiveEvent, impl std::fmt::Debug>,
+) -> bool {
     use iroh_docs::engine::LiveEvent;
     matches!(
         event,
@@ -423,7 +424,6 @@ impl Store for GuardianDBKeyValue {
         // Canonical write path for the public KeyValueStore API: enforce read-only here too,
         // not just in put_impl/delete_impl.
         self.ensure_writable()?;
-
         let key = op.key().cloned().unwrap_or_default();
 
         match op.op() {
@@ -522,6 +522,15 @@ impl KeyValueStore for GuardianDBKeyValue {
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<Operation> {
         self.put_impl(key, value).await
+    }
+
+    async fn put_gc_protected(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _protection: &crate::p2p::network::core::BlobProtection,
+    ) -> Result<Operation> {
+        self.put_impl_inner(key, value).await
     }
 
     async fn delete(&self, key: &str) -> Result<Operation> {
@@ -774,6 +783,10 @@ impl GuardianDBKeyValue {
     /// Synchronization with other peers is automatic via Willow.
     #[instrument(level = "debug", skip(self, value))]
     pub async fn put_impl(&self, key: &str, value: Vec<u8>) -> Result<Operation> {
+        self.put_impl_inner(key, value).await
+    }
+
+    async fn put_impl_inner(&self, key: &str, value: Vec<u8>) -> Result<Operation> {
         self.ensure_writable()?;
 
         if key.is_empty() {
@@ -811,6 +824,29 @@ impl GuardianDBKeyValue {
         ))
     }
 
+    async fn metadata_contains_key(&self, key: &str) -> Result<bool> {
+        let entries = self
+            .docs
+            .get_many(
+                &self.doc_handle,
+                Query::single_latest_per_key()
+                    .key_exact(key.as_bytes())
+                    .limit(1)
+                    .build(),
+            )
+            .await
+            .map_err(|e| {
+                GuardianError::Store(format!(
+                    "Error checking key '{}' metadata in iroh-docs: {}",
+                    key, e
+                ))
+            })?;
+        match entries.into_iter().next() {
+            Some(entry) => Ok(entry.content_len() != 0),
+            None => Ok(false),
+        }
+    }
+
     /// Removes the value associated with a specific key.
     ///
     /// Removes the key from the iroh-docs document via `del()`.
@@ -823,8 +859,9 @@ impl GuardianDBKeyValue {
             return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
 
-        // Check whether the key exists in the local index.
-        if !self.contains_key(key) {
+        // Metadata is authoritative even when this node does not have the value
+        // blob yet and the materialized value index therefore omits the key.
+        if !self.metadata_contains_key(key).await? {
             return Err(GuardianError::Store(format!("Key '{}' not found", key)));
         }
 

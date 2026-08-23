@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[containers]
+env_host = false
+http_proxy = false
+
+[engine]
+hooks_dir = ["{{ build_executor_oci_hooks_dir }}"]
+
+[network]
+network_backend = "netavark"
+firewall_driver = "nftables"

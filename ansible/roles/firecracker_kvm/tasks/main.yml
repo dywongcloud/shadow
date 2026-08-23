@@ -1,6 +1,7 @@
 ---
 # Firecracker on a host with REAL hardware /dev/kvm -- no kernel work needed,
-# just install the binary + a guest kernel + build the default rootfs.
+# just install the binary + a guest kernel. The production Hive rootfs is a
+# separate, explicitly drained migration owned by hive_platform_rootfs below.
 
 - name: Assert /dev/kvm is present
   ansible.builtin.stat:
@@ -34,7 +35,7 @@
     # (no firecracker installed yet) turned this guard into a provisioning
     # failure instead of an allow. Caught by running the expression against a
     # real empty string, not by reading it.
-    _found: "{{ hive_fc_installed.stdout | default('') | regex_findall('[0-9]+\\.[0-9]+\\.[0-9]+') }}"
+    _found: "{{ hive_fc_installed.stdout | default('') | regex_findall('[0-9]+[.][0-9]+[.][0-9]+') }}"
     _cur: "{{ _found[0] if (_found | length) > 0 else '' }}"
     _want: "{{ firecracker_version | regex_replace('^v', '') }}"
   ansible.builtin.assert:
@@ -70,116 +71,14 @@
     dest: /var/lib/hive/vmlinux
     mode: "0644"
 
-- name: Ensure rootfs dir exists
-  ansible.builtin.file:
-    path: /var/lib/hive/rootfs
-    state: directory
-    mode: "0755"
-
-- name: docker -> podman shim (build-rootfs.sh expects `docker`; the fleet runs podman)
-  ansible.builtin.copy:
-    dest: /usr/local/bin/docker
-    mode: "0755"
-    content: |
-      #!/usr/bin/env bash
-      exec podman "$@"
-  when: hive_container_runtime == "runc"
-
-- name: Build the default rootfs (node:20-slim + hive-cell-agent) if not already present
-  ansible.builtin.command:
-    cmd: bash {{ hive_src_dir }}/scripts/build-rootfs.sh node:20-slim default 4096
-    creates: /var/lib/hive/rootfs/default.ext4
-  environment:
-    ROOTFS_DIR: /var/lib/hive/rootfs
-    AGENT_BIN: /usr/local/bin/hive-cell-agent
-  # Requires hive-cell-agent already built+installed -- see roles/hive_platform
-  # (this repo's cargo workspace also builds hive-cell-agent as part of the
-  # same `cargo build --release` when -p is omitted; add
-  # `-p hive-cell-agent` to hive_platform's build task if you need it here
-  # and it isn't already installed).
-
-# ---------------------------------------------------------------------------
-# Wasmer inside the GUEST (hive_core::Runtime::Wasmer on a Firecracker node)
-# ---------------------------------------------------------------------------
-# `hive-cell-agent` runs as PID1 INSIDE the microVM and execs the function's
-# `start_cmd[0]` against the GUEST PATH, so the host's /usr/local/bin/wasmer
-# (installed by roles/prerequisites) is invisible to a Firecracker cell. Wasmer
-# functions on these nodes therefore require the CLI baked into the rootfs
-# IMAGE, which is what this block does.
-#
-# OPT-IN (`hive_wasmer_in_rootfs`, default false) on purpose, for two reasons:
-#   1. It adds ~200 MiB to a 4096 MiB image every cell on the node boots from.
-#   2. Enabling it REBUILDS default.ext4 on an already-provisioned host. The
-#      task above is guarded by `creates: default.ext4` and so is inert
-#      forever once a node is provisioned -- deliberately, because that image
-#      is the base every running microVM boots from. Rebuilding it is an
-#      operator decision, not something a routine converge should do silently.
-#
-# Doing nothing is SAFE, not broken: without the marker file the node's
-# `detect_wasm_runtime` probe reports `wasm_runtime: None`, placement's hard
-# filter never selects it for a Wasmer deployment, and the tenant gets an
-# honest "no capable node" refusal instead of a permanent cold-start crash
-# loop misattributed to their application.
-- name: Wasmer in the guest rootfs (opt-in; rebuilds default.ext4)
-  when: hive_wasmer_in_rootfs | default(false) | bool
-  block:
-    - name: Download wasmer v7.2.1 tarball for guest staging (sha256-verified)
-      ansible.builtin.get_url:
-        url: "https://github.com/wasmerio/wasmer/releases/download/v7.2.1/wasmer-linux-amd64.tar.gz"
-        dest: /tmp/wasmer-guest-v7.2.1.tar.gz
-        checksum: "sha256:c46d6ff34a12b40d2e57bfc2ccbb8b9e209b0987ab305233619798b264a6bae5"
-
-    # `creates:` is the capability MARKER, not the image: the image already
-    # exists on every provisioned node, so guarding on it would make this
-    # permanently inert -- the exact trap that made the host-only install
-    # useless. build-rootfs.sh writes the marker only after a clean unmount.
-    - name: Rebuild the default rootfs with the wasmer CLI staged into the guest
-      ansible.builtin.command:
-        cmd: bash {{ hive_src_dir }}/scripts/build-rootfs.sh node:20-slim default 4096
-        creates: /var/lib/hive/rootfs/default.wasmer
-      environment:
-        ROOTFS_DIR: /var/lib/hive/rootfs
-        AGENT_BIN: /usr/local/bin/hive-cell-agent
-        WASMER_TARBALL: /tmp/wasmer-guest-v7.2.1.tar.gz
-
-    - name: Remove the guest-staging tarball
-      ansible.builtin.file:
-        path: /tmp/wasmer-guest-v7.2.1.tar.gz
-        state: absent
-
-    # The marker is what hive-cloud's detect_wasm_runtime stats to decide
-    # whether this node may advertise the capability at all.
-    - name: Confirm the wasm capability marker exists
-      ansible.builtin.stat:
-        path: /var/lib/hive/rootfs/default.wasmer
-      register: hive_wasmer_marker
-
-    - name: Fail if the rootfs rebuild did not produce a capability marker
-      ansible.builtin.fail:
-        msg: >-
-          build-rootfs.sh completed but /var/lib/hive/rootfs/default.wasmer is
-          missing — the node would boot advertising no wasm capability. Check
-          the build output before retrying.
-      when: not hive_wasmer_marker.stat.exists
-
-    # The marker on disk is not the advertised capability. `hive-node` gossips
-    # `NodeInfo::wasm_runtime`, and a build predating the refresh loop probes it
-    # ONCE at boot — so on such a binary the bake completes, ansible reports
-    # `changed`, the assertion above passes, and the node still advertises
-    # `false` forever with nothing saying "restart me". Newer builds re-probe on
-    # the disk-refresh tick and pick it up within ~30s on their own; the restart
-    # makes the bake land immediately and correctly on BOTH, which matters
-    # because this role has no way to know which binary the node is running.
-    - name: Restart hive-node so the capability probe re-runs
-      ansible.builtin.systemd:
-        name: hive-node
-        state: restarted
-
-    - name: Wait for hive-node to come back healthy after the restart
-      ansible.builtin.uri:
-        url: http://127.0.0.1:8786/healthz
-        status_code: 200
-      register: hive_wasmer_health
-      retries: 30
-      delay: 2
-      until: hive_wasmer_health.status is defined and hive_wasmer_health.status == 200
+# No bootstrap-vintage agent is ever baked here. Ordinary role runs install the
+# builder only; an operator first rolls the controller+agent package, drains the
+# node, then opts into the shared migration. The same role is included by PVM.
+- name: Install and optionally run the production rootfs migration
+  ansible.builtin.include_role:
+    name: hive_platform_rootfs
+    apply:
+      tags:
+        - rootfs
+        - runtime_rootfs
+  tags: [rootfs, runtime_rootfs]

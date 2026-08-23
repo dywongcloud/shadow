@@ -973,6 +973,8 @@ mod tests {
         NodeInfo {
             gpu_count: 0,
             wasm_runtime: None,
+            runtime_artifact_protocol: None,
+            build_isolation_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

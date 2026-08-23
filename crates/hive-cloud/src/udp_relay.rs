@@ -220,100 +220,99 @@ pub fn spawn(cloud: Arc<CloudState>) {
 }
 
 async fn relay_manager(cloud: Arc<CloudState>) {
-        let mut running = RelayHandles(HashMap::new());
-        loop {
-            let desired = desired_routes(&cloud);
-            let mut blocked_ports = Vec::new();
-            let finished: Vec<u16> = running
-                .iter()
-                .filter(|(_, h)| h.task.is_finished())
-                .map(|(port, _)| *port)
-                .collect();
-            for port in finished {
-                if let Some(h) = running.remove(&port) {
-                    if let Err(e) = h.task.await {
-                        blocked_ports.push(port);
-                        tracing::warn!(port, error = %e, "udp relay: task failed; delaying rebind");
-                    }
+    let mut running = RelayHandles(HashMap::new());
+    loop {
+        let desired = desired_routes(&cloud);
+        let mut blocked_ports = Vec::new();
+        let finished: Vec<u16> = running
+            .iter()
+            .filter(|(_, h)| h.task.is_finished())
+            .map(|(port, _)| *port)
+            .collect();
+        for port in finished {
+            if let Some(h) = running.remove(&port) {
+                if let Err(e) = h.task.await {
+                    blocked_ports.push(port);
+                    tracing::warn!(port, error = %e, "udp relay: task failed; delaying rebind");
                 }
             }
-
-            let stale: Vec<u16> = running
-                .iter()
-                .filter(|(port, h)| {
-                    matches!(&h.state, RelayState::Running(_))
-                        && desired.get(port).map(|r| r != &h.route).unwrap_or(true)
-                })
-                .map(|(port, _)| *port)
-                .collect();
-            for port in &stale {
-                if let Some(h) = running.get_mut(port) {
-                    tracing::info!(port, project = %h.route.project, "udp relay: stopping (allocation released/re-pointed)");
-                    if let RelayState::Running(stop) =
-                        std::mem::replace(&mut h.state, RelayState::Stopping)
-                    {
-                        stop.notify_one();
-                    }
-                }
-            }
-            let teardown_deadline = tokio::time::Instant::now() + TEARDOWN_TIMEOUT;
-            for port in stale {
-                let Some(mut h) = running.remove(&port) else {
-                    continue;
-                };
-                match tokio::time::timeout_at(teardown_deadline, &mut h.task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        blocked_ports.push(port);
-                        tracing::warn!(port, error = %e, "udp relay: teardown task failed; delaying rebind");
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            port,
-                            "udp relay: teardown timed out; replacement remains unbound"
-                        );
-                        running.insert(port, h);
-                    }
-                }
-            }
-
-            // Teardown can consume the whole deadline. Never bind from the
-            // pre-teardown snapshot: the claim may have moved again while the
-            // old socket and sessions were draining.
-            let desired = desired_routes(&cloud);
-            for (port, route) in desired {
-                if running.contains_key(&port) || blocked_ports.contains(&port) {
-                    continue;
-                }
-                let sock = match UdpSocket::bind(("0.0.0.0", port)).await {
-                    Ok(sock) => sock,
-                    Err(e) => {
-                        tracing::warn!(port, error = %e, "udp relay: cannot bind public port");
-                        continue;
-                    }
-                };
-                if desired_routes(&cloud).get(&port) != Some(&route) {
-                    tracing::info!(
-                        port,
-                        "udp relay: allocation changed during bind; dropping obsolete socket"
-                    );
-                    continue;
-                }
-                let sock = Arc::new(sock);
-                let stop = Arc::new(Notify::new());
-                let task =
-                    tokio::spawn(run_relay(cloud.clone(), route.clone(), sock, stop.clone()));
-                running.insert(
-                    port,
-                    RelayHandle {
-                        route,
-                        state: RelayState::Running(stop),
-                        task,
-                    },
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(RECONCILE_SECS)).await;
         }
+
+        let stale: Vec<u16> = running
+            .iter()
+            .filter(|(port, h)| {
+                matches!(&h.state, RelayState::Running(_))
+                    && desired.get(port).map(|r| r != &h.route).unwrap_or(true)
+            })
+            .map(|(port, _)| *port)
+            .collect();
+        for port in &stale {
+            if let Some(h) = running.get_mut(port) {
+                tracing::info!(port, project = %h.route.project, "udp relay: stopping (allocation released/re-pointed)");
+                if let RelayState::Running(stop) =
+                    std::mem::replace(&mut h.state, RelayState::Stopping)
+                {
+                    stop.notify_one();
+                }
+            }
+        }
+        let teardown_deadline = tokio::time::Instant::now() + TEARDOWN_TIMEOUT;
+        for port in stale {
+            let Some(mut h) = running.remove(&port) else {
+                continue;
+            };
+            match tokio::time::timeout_at(teardown_deadline, &mut h.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    blocked_ports.push(port);
+                    tracing::warn!(port, error = %e, "udp relay: teardown task failed; delaying rebind");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        port,
+                        "udp relay: teardown timed out; replacement remains unbound"
+                    );
+                    running.insert(port, h);
+                }
+            }
+        }
+
+        // Teardown can consume the whole deadline. Never bind from the
+        // pre-teardown snapshot: the claim may have moved again while the
+        // old socket and sessions were draining.
+        let desired = desired_routes(&cloud);
+        for (port, route) in desired {
+            if running.contains_key(&port) || blocked_ports.contains(&port) {
+                continue;
+            }
+            let sock = match UdpSocket::bind(("0.0.0.0", port)).await {
+                Ok(sock) => sock,
+                Err(e) => {
+                    tracing::warn!(port, error = %e, "udp relay: cannot bind public port");
+                    continue;
+                }
+            };
+            if desired_routes(&cloud).get(&port) != Some(&route) {
+                tracing::info!(
+                    port,
+                    "udp relay: allocation changed during bind; dropping obsolete socket"
+                );
+                continue;
+            }
+            let sock = Arc::new(sock);
+            let stop = Arc::new(Notify::new());
+            let task = tokio::spawn(run_relay(cloud.clone(), route.clone(), sock, stop.clone()));
+            running.insert(
+                port,
+                RelayHandle {
+                    route,
+                    state: RelayState::Running(stop),
+                    task,
+                },
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(RECONCILE_SECS)).await;
+    }
 }
 
 /// The desired `public_port → route` set. Sources, most-authoritative first

@@ -15,6 +15,12 @@ import {
 } from "../db-model";
 import { SqliteDatabaseDetail } from "./sqlite-detail";
 
+type StudioOpenResponse = {
+  action: string;
+  ticket: string;
+  expires_in_secs: number;
+};
+
 /**
  * One storage detail route for every database. The id decides which backend
  * answers — `sqlite_<project>` is a browser-replicated database (the
@@ -40,6 +46,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
   }, [db]);
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
+  const [openingStudio, setOpeningStudio] = useState(false);
 
   // The list/detail poll returns the connection with secrets MASKED (any key with
   // url/password/token/secret). Copying that yields "••••" junk. So both Reveal
@@ -81,6 +88,107 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
       toast(`Couldn't copy: ${String(e).replace(/^Error:\s*/, "")}`, {});
     }
   }
+  async function openStudio() {
+    // Open synchronously inside the click gesture; opening after the API await
+    // is treated as an unsolicited popup by browsers.
+    const popup = window.open("about:blank", "_blank");
+    if (!popup) {
+      toast("Your browser blocked the Studio popup. Allow popups and try again.", {});
+      return;
+    }
+    popup.opener = null;
+    popup.document.title = "Opening Supabase Studio…";
+    popup.document.body.textContent = "Opening Supabase Studio…";
+    setOpeningStudio(true);
+    try {
+      const login = await apiSend<StudioOpenResponse>(
+        "POST",
+        `/v1/databases/${id}/studio-open`,
+      );
+      const action = new URL(login.action);
+      const expectedHost = (db?.db_host || db?.connection?.host || "")
+        .trim()
+        .toLowerCase();
+      // UI and backend roll independently. Accept the legacy ticket only so the
+      // UI can land first; the v3 issuer binds its immutable consume authority.
+      const legacyTicket = /^\d{1,20}\.[0-9a-f]{32}\.[0-9a-f]{64}$/;
+      const authorityTicket =
+        /^v3\.\d{1,20}\.[0-9a-f]{32}\.[A-Za-z0-9_-]{1,172}\.[0-9a-f]{64}$/;
+      if (
+        action.protocol !== "https:" ||
+        action.port !== "" ||
+        action.hostname.toLowerCase() !== expectedHost ||
+        action.pathname !== "/_hive/studio-login" ||
+        action.search !== "" ||
+        action.hash !== "" ||
+        !Number.isInteger(login.expires_in_secs) ||
+        login.expires_in_secs < 1 ||
+        login.expires_in_secs > 60 ||
+        (!legacyTicket.test(login.ticket) && !authorityTicket.test(login.ticket))
+      ) {
+        throw new Error("the server returned an invalid Studio login exchange");
+      }
+      // The dashboard enforces `form-action 'self'`, so an inherited
+      // about:blank document cannot post directly to the database origin. Load
+      // the database host's credential-free bootstrap and deliver the ticket to
+      // that exact origin with postMessage; the bootstrap performs the
+      // same-origin form POST. The ticket never enters a URL.
+      await new Promise<void>((resolve, reject) => {
+        let postTimer: number | undefined;
+        let expiryTimer: number | undefined;
+        let settled = false;
+        const cleanup = () => {
+          if (postTimer !== undefined) window.clearInterval(postTimer);
+          if (expiryTimer !== undefined) window.clearTimeout(expiryTimer);
+          window.removeEventListener("message", onMessage);
+        };
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error) reject(error);
+          else resolve();
+        };
+        const onMessage = (event: MessageEvent) => {
+          if (
+            event.source === popup &&
+            event.origin === action.origin &&
+            event.data?.type === "hive-studio-login-received"
+          ) {
+            finish();
+          }
+        };
+        const postTicket = () => {
+          if (popup.closed) {
+            finish(new Error("the Studio popup was closed before login completed"));
+            return;
+          }
+          try {
+            popup.postMessage(
+              { type: "hive-studio-login-ticket", ticket: login.ticket },
+              action.origin,
+            );
+          } catch {
+            // The initial about:blank document is not the target origin yet.
+          }
+        };
+        window.addEventListener("message", onMessage);
+        popup.location.replace(action.toString());
+        postTimer = window.setInterval(postTicket, 200);
+        expiryTimer = window.setTimeout(
+          () => finish(new Error("the Studio login ticket expired before exchange")),
+          login.expires_in_secs * 1000,
+        );
+        postTicket();
+      });
+    } catch (e) {
+      popup.close();
+      toast(`Couldn't open Studio: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    } finally {
+      setOpeningStudio(false);
+    }
+  }
+
   async function destroy() {
     if (!confirm(`Delete ${db?.name}? This tears down the backing service.`)) return;
     await apiSend("DELETE", `/v1/databases/${id}`);
@@ -143,9 +251,27 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
             <KindBadge kind={db.kind} />
           </div>
           <p className="mb-3 text-xs text-secondary">
-            The dashboard for this database — table editor, SQL editor, schema views. Sign in with the
-            generated credentials below (HTTP basic auth at the edge, the upstream stack&apos;s
-            DASHBOARD_USERNAME/PASSWORD mechanism).
+            Open a passwordless Studio session in one click. A short-lived ticket is exchanged by the
+            database host and never placed in the URL.
+          </p>
+          <div className="mb-3 flex flex-wrap items-center gap-3">
+            <Button onClick={openStudio} disabled={openingStudio}>
+              {openingStudio ? "Opening Studio…" : "Open Studio"}
+            </Button>
+            {endpoint?.reach === "external" && (
+              <a
+                href={revealed?.STUDIO_URL ?? `https://${endpoint.address}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-blue hover:underline"
+              >
+                Open raw URL (Basic auth fallback)
+              </a>
+            )}
+          </div>
+          <p className="mb-3 text-xs text-muted">
+            Fallback credentials are STUDIO_USERNAME and STUDIO_PASSWORD. Use Reveal secrets in the
+            Connection section below to view them, then enter them in the browser&apos;s Basic auth prompt.
           </p>
           <div className="divide-y divide-border border-t border-border">
             {(["STUDIO_URL", "STUDIO_USERNAME", "STUDIO_PASSWORD"] as const).map((k) => (
@@ -161,7 +287,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
                     rel="noreferrer"
                     className="shrink-0 text-xs text-blue hover:underline"
                   >
-                    Open
+                    Open raw
                   </a>
                 )}
                 <button onClick={() => copy(k)} className="shrink-0 text-muted hover:text-fg" title={`Copy ${k}`}>

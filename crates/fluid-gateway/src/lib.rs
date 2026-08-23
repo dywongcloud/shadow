@@ -10,6 +10,8 @@
 //! concurrent requests (stream-id framing) plus in-band metrics and nack. The
 //! gateway keeps one tunnel per instance and reuses it for every request.
 
+mod static_files;
+
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
@@ -19,9 +21,12 @@ use axum::{
     Json, Router,
 };
 use fluid_compute::{func_key, Fluid, FunctionStats, Lease};
-use fluid_core::{DeployRequest, Deployment, DeploymentId, DeploymentInfo, Manifest, RouteTarget};
+use fluid_core::{
+    BuildOutputV3Evaluator, BuildOutputV3Refusal, BuildOutputV3Target, DeployRequest, Deployment,
+    DeploymentId, DeploymentInfo, Manifest, ProjectIncarnation, RouteTarget,
+};
 use fluid_tunnel::TunnelClient;
-use hive_backend::connect_endpoint;
+use hive_backend::{connect_endpoint, RuntimeArtifactPaths, RuntimeArtifactSpec};
 use hive_core::{now_ms, CellId};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -36,6 +41,9 @@ use tracing::warn;
 
 struct GwState {
     deployments: HashMap<DeploymentId, Deployment>,
+    /// Open directory identities held for each deployment's whole registered
+    /// lifetime. Static reads never re-resolve a replaceable root pathname.
+    static_roots: HashMap<DeploymentId, static_files::StaticRoot>,
     /// project name -> current deployment id.
     aliases: HashMap<String, DeploymentId>,
     /// FULL hostname (lowercased, e.g. `numo.gg`, `www.numo.gg`) -> deployment
@@ -44,7 +52,31 @@ struct GwState {
     /// nothing else — first-label keying would also serve `numo.attacker.tld`
     /// and let `www.numo.gg` shadow the platform's own `www` label.
     aliases_full: HashMap<String, DeploymentId>,
+    /// Compiled, authoritative Build Output v3 route state. A refusal is retained
+    /// beside the deployment so no request can fall through to legacy routing.
+    build_output_v3: HashMap<DeploymentId, BuildOutputV3RouteState>,
     default: Option<DeploymentId>,
+}
+
+#[derive(Clone)]
+enum BuildOutputV3RouteState {
+    Ready(Arc<BuildOutputV3Evaluator>),
+    Refused(BuildOutputV3Refusal),
+}
+
+#[derive(Clone)]
+struct SelectedDeployment {
+    deployment: Deployment,
+    static_root: Option<static_files::StaticRoot>,
+    build_output_v3: Option<BuildOutputV3RouteState>,
+}
+
+impl std::ops::Deref for SelectedDeployment {
+    type Target = Deployment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.deployment
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +150,311 @@ struct BrowserRoutes {
     invoke_quota: HashMap<String, (u64, u32)>,
 }
 
+/// Validate and compile a manifest's authoritative Build Output v3 route table.
+/// This is public so the build planner can fail before registration and direct
+/// executable witnesses can exercise the same capability gate as deployment.
+pub fn build_output_v3_evaluator(
+    manifest: &Manifest,
+) -> Result<Option<BuildOutputV3Evaluator>, BuildOutputV3Refusal> {
+    let Some(descriptor) = manifest.build_output_v3.as_ref() else {
+        return Ok(None);
+    };
+    let evaluator = descriptor.compile()?;
+    let config = descriptor.config_view()?;
+    if !descriptor.assets.is_empty() && manifest.static_dir.is_none() {
+        return Err(BuildOutputV3Refusal::invalid(
+            "manifest.static_dir",
+            "indexed Build Output assets require a server-derived static_dir",
+        ));
+    }
+    if config.images.is_some() && manifest.images.is_none() {
+        return Err(BuildOutputV3Refusal::invalid(
+            "manifest.images",
+            "Build Output image configuration was not projected into the executable manifest",
+        ));
+    }
+    if let Some(images) = manifest.images.as_ref() {
+        validate_build_output_v3_image_capabilities(images)?;
+    }
+    if !config.crons.is_empty() && manifest.crons.is_empty() {
+        return Err(BuildOutputV3Refusal::invalid(
+            "manifest.crons",
+            "Build Output cron configuration was not projected into the executable manifest",
+        ));
+    }
+    if manifest.functions.len() != descriptor.functions.len() {
+        return Err(BuildOutputV3Refusal::invalid(
+            "manifest.functions",
+            "must contain exactly the validated Build Output function set",
+        ));
+    }
+    for function in &descriptor.functions {
+        let runtime = function.runtime().ok_or_else(|| {
+            BuildOutputV3Refusal::invalid(
+                format!("functions[{:?}].config.runtime", function.name),
+                "is missing",
+            )
+        })?;
+        if !is_supported_build_output_runtime(runtime) {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "function runtime {runtime:?} for {:?}",
+                function.name
+            )));
+        }
+        let projected = manifest.function(&function.name).ok_or_else(|| {
+            BuildOutputV3Refusal::invalid(
+                format!("manifest.functions[{:?}]", function.name),
+                "the v3 function was not provisioned into the executable manifest",
+            )
+        })?;
+        validate_build_output_v3_function_projection(function, projected)?;
+    }
+    Ok(Some(evaluator))
+}
+
+fn is_supported_build_output_runtime(runtime: &str) -> bool {
+    let Some(version) = runtime
+        .strip_prefix("nodejs")
+        .and_then(|value| value.strip_suffix(".x"))
+    else {
+        return false;
+    };
+    !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn validate_build_output_v3_function_projection(
+    function: &fluid_core::BuildOutputV3Function,
+    projected: &fluid_core::FunctionConfig,
+) -> Result<(), BuildOutputV3Refusal> {
+    let object = function.config.as_object().ok_or_else(|| {
+        BuildOutputV3Refusal::invalid(
+            format!("functions[{:?}].config", function.name),
+            "must be an object",
+        )
+    })?;
+    const KNOWN: &[&str] = &[
+        "runtime",
+        "handler",
+        "memory",
+        "architecture",
+        "maxDuration",
+        "environment",
+        "regions",
+        "supportsWrapper",
+        "supportsResponseStreaming",
+        "launcherType",
+        "shouldAddHelpers",
+        "shouldAddSourcemapSupport",
+        "awsLambdaHandler",
+    ];
+    if let Some(field) = object.keys().find(|field| !KNOWN.contains(&field.as_str())) {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "function {:?} runtime field {field:?}",
+            function.name
+        )));
+    }
+    if !matches!(projected.runtime.as_str(), "node" | "bun") {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "function {:?} projected runtime {:?}",
+            function.name, projected.runtime
+        )));
+    }
+    if projected.start_cmd.is_empty() {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "function {:?} has no real HTTP launcher",
+            function.name
+        )));
+    }
+    if let Some(launcher) = object.get("launcherType") {
+        if launcher.as_str() != Some("Nodejs") {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "function {:?} launcherType {:?}",
+                function.name, launcher
+            )));
+        }
+    }
+    for field in ["supportsWrapper", "shouldAddHelpers"] {
+        if object
+            .get(field)
+            .is_some_and(|value| value.as_bool() != Some(false))
+        {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "function {:?} runtime capability {field}",
+                function.name
+            )));
+        }
+    }
+    for field in ["supportsResponseStreaming", "shouldAddSourcemapSupport"] {
+        if object
+            .get(field)
+            .is_some_and(|value| value.as_bool().is_none())
+        {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{:?}].config.{field}", function.name),
+                "must be a boolean",
+            ));
+        }
+    }
+    if object
+        .get("awsLambdaHandler")
+        .is_some_and(|value| value.as_str().is_none_or(|value| !value.is_empty()))
+    {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "function {:?} AWS Lambda handler launcher",
+            function.name
+        )));
+    }
+    if let Some(architecture) = object.get("architecture") {
+        let Some(architecture) = architecture.as_str() else {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{:?}].config.architecture", function.name),
+                "must be a string",
+            ));
+        };
+        if architecture != "x86_64" {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "function {:?} architecture {architecture:?}",
+                function.name
+            )));
+        }
+    }
+    if let Some(memory) = object.get("memory") {
+        let memory = memory.as_u64().and_then(|value| u32::try_from(value).ok());
+        if memory != Some(projected.memory_mib) {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("manifest.functions[{:?}].memory_mib", function.name),
+                "does not preserve .vc-config.json memory",
+            ));
+        }
+    }
+    if let Some(duration) = object.get("maxDuration") {
+        let duration = duration.as_u64();
+        if duration != Some(projected.max_duration_secs) {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("manifest.functions[{:?}].max_duration_secs", function.name),
+                "does not preserve .vc-config.json maxDuration",
+            ));
+        }
+    }
+    if let Some(regions) = object.get("regions") {
+        let Some(regions) = regions.as_array() else {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{:?}].config.regions", function.name),
+                "must be an array for a Node.js function",
+            ));
+        };
+        let raw: Option<Vec<&str>> = regions.iter().map(serde_json::Value::as_str).collect();
+        let projected_regions: Vec<&str> = projected.regions.iter().map(String::as_str).collect();
+        if raw.as_deref() != Some(projected_regions.as_slice()) {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("manifest.functions[{:?}].regions", function.name),
+                "does not preserve .vc-config.json regions",
+            ));
+        }
+    }
+    if let Some(environment) = object.get("environment") {
+        let Some(environment) = environment.as_object() else {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{:?}].config.environment", function.name),
+                "must be an object of string values",
+            ));
+        };
+        for (name, value) in environment {
+            let Some(value) = value.as_str() else {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("functions[{:?}].config.environment", function.name),
+                    "must contain only string values",
+                ));
+            };
+            if projected.env.get(name).map(String::as_str) != Some(value) {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("manifest.functions[{:?}].env", function.name),
+                    format!("does not preserve runtime variable {name:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_output_v3_image_capabilities(
+    images: &fluid_core::ImagesConfig,
+) -> Result<(), BuildOutputV3Refusal> {
+    if images.formats.iter().any(|format| format != "image/webp") {
+        return Err(BuildOutputV3Refusal::unsupported(
+            "Build Output image format other than image/webp",
+        ));
+    }
+    for pattern in &images.remote_patterns {
+        let hostname = pattern.hostname.as_str();
+        let wildcard = hostname
+            .strip_prefix("**.")
+            .or_else(|| hostname.strip_prefix("*."));
+        let hostname = wildcard.unwrap_or(hostname);
+        if hostname.is_empty()
+            || hostname
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
+        {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "image remote hostname pattern {:?}",
+                pattern.hostname
+            )));
+        }
+        if pattern
+            .pathname
+            .as_deref()
+            .is_some_and(|pattern| !supported_build_output_image_path_pattern(pattern))
+        {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "image remote pathname pattern {:?}",
+                pattern.pathname
+            )));
+        }
+    }
+    for pattern in &images.local_patterns {
+        if pattern
+            .pathname
+            .as_deref()
+            .is_some_and(|pattern| !supported_build_output_image_path_pattern(pattern))
+        {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "image local pathname pattern {:?}",
+                pattern.pathname
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn supported_build_output_image_path_pattern(pattern: &str) -> bool {
+    let stripped = pattern
+        .strip_prefix('^')
+        .unwrap_or(pattern)
+        .strip_suffix('$')
+        .unwrap_or(pattern);
+    let literal = stripped
+        .strip_suffix(".*")
+        .or_else(|| stripped.strip_suffix("/**"))
+        .or_else(|| stripped.strip_suffix("/*"))
+        .unwrap_or(stripped);
+    literal.starts_with('/')
+        && !literal.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'+' | b'?' | b'|'
+            )
+        })
+}
+
+fn build_output_v3_route_state(manifest: &Manifest) -> Option<BuildOutputV3RouteState> {
+    match build_output_v3_evaluator(manifest) {
+        Ok(Some(evaluator)) => Some(BuildOutputV3RouteState::Ready(Arc::new(evaluator))),
+        Ok(None) => None,
+        Err(refusal) => Some(BuildOutputV3RouteState::Refused(refusal)),
+    }
+}
+
 pub struct Gateway {
     fluid: Arc<Fluid>,
     /// Image/rootfs used for function cells (matters for the firecracker backend).
@@ -150,8 +487,10 @@ impl Gateway {
             image,
             state: Mutex::new(GwState {
                 deployments: HashMap::new(),
+                static_roots: HashMap::new(),
                 aliases: HashMap::new(),
                 aliases_full: HashMap::new(),
+                build_output_v3: HashMap::new(),
                 default: None,
             }),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
@@ -369,12 +708,22 @@ impl Gateway {
         self.fluid.backend_name()
     }
 
-    /// Where the active backend expects a DELIVERED build inside a cell, or
-    /// `None` when its cells read the host build dir directly. Branch on THIS,
-    /// not on `backend_name()`, to decide whether `deliver_build` must run — a
-    /// name comparison silently excludes any backend added later.
-    pub fn delivered_workdir(&self) -> Option<&'static str> {
-        self.fluid.delivered_workdir()
+    /// Derive the host static root and function runtime workdir together. Callers
+    /// must retain both; an isolated guest path must never replace the host root.
+    pub fn runtime_artifact_paths(
+        &self,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<RuntimeArtifactPaths> {
+        self.fluid.runtime_artifact_paths(artifact)
+    }
+
+    /// Legacy guest-path query retained for callers that have not yet adopted
+    /// [`Gateway::runtime_artifact_paths`].
+    pub fn delivered_workdir(
+        &self,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<Option<String>> {
+        self.fluid.delivered_workdir(artifact)
     }
 
     /// Pack a built deployment's output so the serving cells can reach it (only
@@ -382,14 +731,15 @@ impl Gateway {
     pub async fn deliver_build(
         &self,
         image: &str,
-        build_dir: &std::path::Path,
+        artifact: &RuntimeArtifactSpec,
     ) -> anyhow::Result<()> {
-        self.fluid.deliver_build(image, build_dir).await
+        self.fluid.deliver_build(image, artifact).await
     }
 
-    /// Full deploy with creator + git provenance + production flag + owning tenant.
-    /// `tenant` (empty = "personal") tags the deployment and every function pool /
-    /// cell it spawns, so compute is partitioned and quota'd per team.
+    /// Full deploy for callers that do not already hold a paired runtime-artifact
+    /// descriptor. Reuse the host path only when the active backend proves that it
+    /// executes on the same host; isolated backends retain static serving but never
+    /// guess a guest cwd from a host path.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full(
         &self,
@@ -401,6 +751,124 @@ impl Gateway {
         state: fluid_core::DeployState,
         tenant: String,
     ) -> DeploymentInfo {
+        let runtime_workdir = self
+            .legacy_same_host_workdir(&root)
+            .map(|path| path.to_string_lossy().into_owned());
+        self.deploy_full_with_runtime(
+            root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            state,
+            tenant,
+        )
+    }
+
+    /// Register one same-host deployment under exact project-incarnation
+    /// authority. This is the direct-deploy twin of
+    /// [`Self::deploy_full_with_runtime_exact`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn deploy_full_exact(
+        &self,
+        root: String,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        state: fluid_core::DeployState,
+        tenant: String,
+        project_incarnation: ProjectIncarnation,
+    ) -> DeploymentInfo {
+        let runtime_workdir = self
+            .legacy_same_host_workdir(&root)
+            .map(|path| path.to_string_lossy().into_owned());
+        self.deploy_full_with_runtime_exact(
+            root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            state,
+            tenant,
+            project_incarnation,
+        )
+    }
+
+    /// Register one deployment with distinct host-static and function-runtime
+    /// locations. `host_static_root` is pinned for the deployment lifetime;
+    /// `runtime_workdir` is passed only to function pools and persisted for restore.
+    /// `None` is static-only and never authorizes an isolated backend to infer a
+    /// guest path from the host path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deploy_full_with_runtime(
+        &self,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        state: fluid_core::DeployState,
+        tenant: String,
+    ) -> DeploymentInfo {
+        self.deploy_full_with_runtime_incarnation(
+            host_static_root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            state,
+            tenant,
+            None,
+        )
+    }
+
+    /// Register a deployment owned by one server-issued project incarnation.
+    /// Production demotion and alias movement are scoped to the same identity,
+    /// so a delayed record from a deleted incarnation cannot become current.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deploy_full_with_runtime_exact(
+        &self,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        state: fluid_core::DeployState,
+        tenant: String,
+        project_incarnation: ProjectIncarnation,
+    ) -> DeploymentInfo {
+        self.deploy_full_with_runtime_incarnation(
+            host_static_root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            state,
+            tenant,
+            Some(project_incarnation),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deploy_full_with_runtime_incarnation(
+        &self,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        mut state: fluid_core::DeployState,
+        tenant: String,
+        project_incarnation: Option<ProjectIncarnation>,
+    ) -> DeploymentInfo {
         // Normalize the owner once at the boundary so the stored record, the
         // function pools, and every cell agree on the tenant (empty => "personal").
         let tenant = if tenant.trim().is_empty() {
@@ -409,23 +877,45 @@ impl Gateway {
             tenant
         };
         let id = DeploymentId::new();
-        let workdir_root = root.clone();
         let cell_image = manifest.image.clone().unwrap_or_else(|| self.image.clone());
-        for f in &manifest.functions {
-            let key = func_key(id.as_str(), &f.name);
-            self.fluid.register(
-                key,
-                f.clone(),
-                cell_image.clone(),
-                workdir_root.clone(),
-                tenant.clone(),
+        let build_output_v3 = build_output_v3_route_state(&manifest);
+        let build_output_refused =
+            matches!(&build_output_v3, Some(BuildOutputV3RouteState::Refused(_)));
+        if let Some(BuildOutputV3RouteState::Refused(ref refusal)) = build_output_v3 {
+            warn!(
+                deployment = %id,
+                code = refusal.code(),
+                error = %refusal,
+                "Build Output v3 provisioning refused"
             );
+            state = fluid_core::DeployState::Error;
+        }
+        if !build_output_refused {
+            if let Some(function_workdir) = runtime_workdir.as_ref() {
+                for f in &manifest.functions {
+                    let key = func_key(id.as_str(), &f.name);
+                    self.fluid.register(
+                        key,
+                        f.clone(),
+                        cell_image.clone(),
+                        function_workdir.clone(),
+                        tenant.clone(),
+                    );
+                }
+            } else if !manifest.functions.is_empty() {
+                warn!(
+                    deployment = %id,
+                    "function registration refused: isolated backend has no server-derived runtime workdir"
+                );
+                state = fluid_core::DeployState::Error;
+            }
         }
         let dep = Deployment {
             id: id.clone(),
             project: manifest.project.clone(),
-            project_incarnation: None,
-            root: PathBuf::from(root),
+            project_incarnation,
+            root: PathBuf::from(host_static_root),
+            runtime_workdir: runtime_workdir.map(PathBuf::from),
             manifest: manifest.clone(),
             created_at_ms: now_ms(),
             state,
@@ -443,21 +933,33 @@ impl Gateway {
         let info = view_of(&dep);
         let project = dep.project.clone();
         let mut st = self.state.lock();
+        if let Ok(root) = static_files::StaticRoot::open(&dep.root) {
+            st.static_roots.insert(id.clone(), root);
+        }
+        if let Some(routes) = build_output_v3 {
+            st.build_output_v3.insert(id.clone(), routes);
+        }
         // Does this project already have a (different) production deployment? If
         // not, this deploy claims the bare production domain even when it isn't
         // itself a production deploy — so the very first deploy and the "Building…"
         // placeholder are reachable at <project>.<host> right away.
-        let has_production = st
-            .deployments
-            .values()
-            .any(|d| d.project == project && d.production && d.id != id);
+        let has_production = st.deployments.values().any(|d| {
+            d.project == project
+                && d.production
+                && d.id != id
+                && project_incarnation
+                    .is_none_or(|incarnation| d.project_incarnation == Some(incarnation))
+        });
         // Invariant: at most ONE production deployment per project. Promoting this
         // one to production demotes any prior production deployment of the same
         // project, so the production alias can't later resolve to a stale deployment
         // after a restart (which would serve the OLD build).
         if production {
             for d in st.deployments.values_mut() {
-                if d.project == project {
+                if d.project == project
+                    && project_incarnation
+                        .is_none_or(|incarnation| d.project_incarnation == Some(incarnation))
+                {
                     d.production = false;
                 }
             }
@@ -474,7 +976,13 @@ impl Gateway {
             // their whole point is to be the production URL, so a redeploy or
             // promote must not strand them on the superseded build. The old
             // production id is simply the project alias's previous target.
-            let old_production = st.aliases.get(&project).cloned();
+            let old_production = st.aliases.get(&project).cloned().filter(|old| {
+                project_incarnation.is_none_or(|incarnation| {
+                    st.deployments.get(old).is_some_and(|deployment| {
+                        deployment.project_incarnation == Some(incarnation)
+                    })
+                })
+            });
             st.aliases.insert(project, id.clone());
             st.default = Some(id.clone());
             if let Some(old) = old_production {
@@ -506,7 +1014,7 @@ impl Gateway {
     /// Resolve which project serves a given request host (the same way the
     /// public router selects), so events can be attributed to a project.
     pub fn project_for_host(&self, host: &str) -> Option<String> {
-        self.select(Some(host)).map(|d| d.project)
+        self.select(Some(host)).map(|d| d.project.clone())
     }
 
     /// The full deployment a request `host` resolves to (same alias resolution the
@@ -563,16 +1071,40 @@ impl Gateway {
     /// Promote an existing deployment to be its project's production (rollback /
     /// instant promote). Re-points the project alias + default to it.
     pub fn promote(&self, id: &str) -> Option<DeploymentInfo> {
+        self.promote_incarnation(id, None)
+    }
+
+    pub fn promote_exact(&self, id: &str, expected: ProjectIncarnation) -> Option<DeploymentInfo> {
+        self.promote_incarnation(id, Some(expected))
+    }
+
+    fn promote_incarnation(
+        &self,
+        id: &str,
+        expected: Option<ProjectIncarnation>,
+    ) -> Option<DeploymentInfo> {
         let did = DeploymentId::from(id.to_string());
         let mut st = self.state.lock();
-        let project = st.deployments.get(&did)?.project.clone();
-        // Flip production flags within the project.
+        let selected = st.deployments.get(&did)?;
+        if expected.is_some_and(|incarnation| selected.project_incarnation != Some(incarnation)) {
+            return None;
+        }
+        let project = selected.project.clone();
+        let incarnation = selected.project_incarnation;
+        // Flip production flags only within the selected incarnation.
         for d in st.deployments.values_mut() {
-            if d.project == project {
+            if d.project == project && expected.is_none_or(|_| d.project_incarnation == incarnation)
+            {
                 d.production = d.id == did;
             }
         }
-        let old_production = st.aliases.get(&project).cloned();
+        let old_production = st.aliases.get(&project).cloned().filter(|old| {
+            expected.is_none_or(|_| {
+                st.deployments
+                    .get(old)
+                    .is_some_and(|deployment| deployment.project_incarnation == incarnation)
+            })
+        });
         st.aliases.insert(project, did.clone());
         st.default = Some(did.clone());
         // Custom domains follow the promote too (see deploy_full's note).
@@ -607,11 +1139,24 @@ impl Gateway {
         let mut st = self.state.lock();
         let dep = st.deployments.get_mut(&did)?;
         mutate(&mut dep.manifest);
+        let build_output_v3 = build_output_v3_route_state(&dep.manifest);
+        if matches!(&build_output_v3, Some(BuildOutputV3RouteState::Refused(_))) {
+            dep.state = fluid_core::DeployState::Error;
+        }
         for f in &dep.manifest.functions {
             self.fluid
                 .update_config(&func_key(did.as_str(), &f.name), f.clone());
         }
-        Some(view_of(dep))
+        let info = view_of(dep);
+        match build_output_v3 {
+            Some(routes) => {
+                st.build_output_v3.insert(did, routes);
+            }
+            None => {
+                st.build_output_v3.remove(&did);
+            }
+        }
+        Some(info)
     }
 
     /// Keep-warm reconciliation: only the PRODUCTION deployment of each project
@@ -650,6 +1195,8 @@ impl Gateway {
         }
         let mut st = self.state.lock();
         st.deployments.remove(&did);
+        st.static_roots.remove(&did);
+        st.build_output_v3.remove(&did);
         // Drop any aliases that pointed at this deployment.
         st.aliases.retain(|_, v| *v != did);
         st.aliases_full.retain(|_, v| *v != did);
@@ -671,6 +1218,154 @@ impl Gateway {
             st.aliases.insert(project.clone(), newest);
         }
         Some(project)
+    }
+
+    /// Stamp only legacy records whose exact platform-issued ids were captured
+    /// while an existing settings row was upgraded under the lifecycle writer.
+    /// Names and timestamps are deliberately insufficient: either can overlap a
+    /// deleted predecessor or a prefix-sharing tenant.
+    pub fn adopt_legacy_deployments(
+        &self,
+        project: &str,
+        incarnation: ProjectIncarnation,
+        allowed_ids: &[String],
+    ) -> Vec<String> {
+        if allowed_ids.is_empty() {
+            return Vec::new();
+        }
+        let allowed: std::collections::HashSet<&str> =
+            allowed_ids.iter().map(String::as_str).collect();
+        let mut adopted = Vec::new();
+        let mut st = self.state.lock();
+        for deployment in st.deployments.values_mut() {
+            if deployment.project == project
+                && deployment.project_incarnation.is_none()
+                && allowed.contains(deployment.id.as_str())
+            {
+                deployment.project_incarnation = Some(incarnation);
+                adopted.push(deployment.id.to_string());
+            }
+        }
+        adopted.sort();
+        adopted
+    }
+
+    /// Delete one deployment only when it still belongs to `expected`. The
+    /// identity is re-checked after async pool teardown, before any gateway
+    /// mutation, so a stale request cannot remove a same-id replacement.
+    pub async fn remove_exact(
+        &self,
+        id: &str,
+        expected: ProjectIncarnation,
+    ) -> Option<fluid_core::DeployRecord> {
+        let did = DeploymentId::from(id.to_string());
+        let record = self
+            .deployment_records()
+            .into_iter()
+            .find(|record| record.id == id && record.project_incarnation == Some(expected))?;
+        let keys: Vec<String> = record
+            .manifest
+            .functions
+            .iter()
+            .map(|function| func_key(&record.id, &function.name))
+            .collect();
+        for key in keys {
+            self.fluid.unregister(&key).await;
+        }
+        let mut st = self.state.lock();
+        let still_owned = st
+            .deployments
+            .get(&did)
+            .is_some_and(|deployment| deployment.project_incarnation == Some(expected));
+        if !still_owned {
+            return None;
+        }
+        st.deployments.remove(&did);
+        st.static_roots.remove(&did);
+        st.build_output_v3.remove(&did);
+        st.aliases.retain(|_, target| *target != did);
+        st.aliases_full.retain(|_, target| *target != did);
+        if st.default.as_ref() == Some(&did) {
+            st.default = st
+                .deployments
+                .values()
+                .max_by_key(|deployment| deployment.created_at_ms)
+                .map(|deployment| deployment.id.clone());
+        }
+        if let Some(newest) = st
+            .deployments
+            .values()
+            .filter(|deployment| {
+                deployment.project == record.project
+                    && deployment.project_incarnation == Some(expected)
+            })
+            .max_by_key(|deployment| deployment.created_at_ms)
+            .map(|deployment| deployment.id.clone())
+        {
+            st.aliases.insert(record.project.clone(), newest);
+        }
+        Some(record)
+    }
+
+    /// Snapshot the records proved to belong to one project incarnation.
+    pub fn deployment_records_for_incarnation(
+        &self,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Vec<fluid_core::DeployRecord> {
+        self.deployment_records()
+            .into_iter()
+            .filter(|record| {
+                record.project == project && record.project_incarnation == Some(incarnation)
+            })
+            .collect()
+    }
+
+    /// Remove only deployments owned by `incarnation`, then clear every route
+    /// still pointing at this project. The caller holds the project lifecycle
+    /// writer and has proved this is the active incarnation, so a legacy record
+    /// may be retained for safety but can never remain reachable by accident.
+    pub async fn remove_project_incarnation(
+        &self,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Vec<fluid_core::DeployRecord> {
+        let records = self.deployment_records_for_incarnation(project, incarnation);
+        for record in &records {
+            self.remove_exact(&record.id, incarnation).await;
+        }
+        let mut st = self.state.lock();
+        let project_ids: std::collections::HashSet<DeploymentId> = st
+            .deployments
+            .values()
+            .filter(|deployment| deployment.project == project)
+            .map(|deployment| deployment.id.clone())
+            .collect();
+        st.aliases
+            .retain(|label, target| label != project && !project_ids.contains(target));
+        st.aliases_full
+            .retain(|_, target| !project_ids.contains(target));
+        if st
+            .default
+            .as_ref()
+            .is_some_and(|target| project_ids.contains(target))
+        {
+            st.default = st
+                .deployments
+                .values()
+                .filter(|deployment| deployment.project != project)
+                .max_by_key(|deployment| deployment.created_at_ms)
+                .map(|deployment| deployment.id.clone());
+        }
+        records
+    }
+
+    pub fn image_is_referenced(&self, image: &str) -> bool {
+        self.state
+            .lock()
+            .deployments
+            .values()
+            .any(|deployment| deployment.manifest.image.as_deref() == Some(image))
     }
 
     /// Delete every deployment for a project. Returns the removed deployment ids.
@@ -755,6 +1450,10 @@ impl Gateway {
                 project: d.project.clone(),
                 project_incarnation: d.project_incarnation,
                 root: d.root.to_string_lossy().into_owned(),
+                runtime_workdir: d
+                    .runtime_workdir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
                 manifest: d.manifest.clone(),
                 created_at_ms: d.created_at_ms,
                 creator: d.creator.clone(),
@@ -771,29 +1470,62 @@ impl Gateway {
     /// re-register its functions with the Fluid pool. Used on boot.
     pub fn restore(&self, rec: fluid_core::DeployRecord) {
         let id = DeploymentId::from(rec.id.clone());
-        let cell_image = rec
-            .manifest
-            .image
-            .clone()
-            .unwrap_or_else(|| self.image.clone());
-        for f in &rec.manifest.functions {
-            let key = func_key(id.as_str(), &f.name);
-            self.fluid.register(
-                key,
-                f.clone(),
-                cell_image.clone(),
-                rec.root.clone(),
-                rec.tenant.clone(),
+        let runtime_workdir = rec
+            .runtime_workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| self.legacy_same_host_workdir(&rec.root));
+        let restored_tenant = if rec.tenant.trim().is_empty() {
+            "__untagged__".to_string()
+        } else {
+            rec.tenant.clone()
+        };
+        let manifest = rec.manifest;
+        let cell_image = manifest.image.clone().unwrap_or_else(|| self.image.clone());
+        let build_output_v3 = build_output_v3_route_state(&manifest);
+        let build_output_refused =
+            matches!(&build_output_v3, Some(BuildOutputV3RouteState::Refused(_)));
+        let mut restored_state = rec.state;
+        if let Some(BuildOutputV3RouteState::Refused(ref refusal)) = build_output_v3 {
+            warn!(
+                deployment = %id,
+                code = refusal.code(),
+                error = %refusal,
+                "restored Build Output v3 provisioning refused"
             );
+            restored_state = fluid_core::DeployState::Error;
+        }
+        if !build_output_refused {
+            if let Some(workdir) = runtime_workdir.as_ref() {
+                for f in &manifest.functions {
+                    let key = func_key(id.as_str(), &f.name);
+                    self.fluid.register(
+                        key,
+                        f.clone(),
+                        cell_image.clone(),
+                        workdir.to_string_lossy().into_owned(),
+                        restored_tenant.clone(),
+                    );
+                }
+            } else if !manifest.functions.is_empty() {
+                warn!(
+                    deployment = %id,
+                    "restore refused function registration: legacy record has no runtime workdir and this backend requires delivered artifacts"
+                );
+                if manifest.build_output_v3.is_some() {
+                    restored_state = fluid_core::DeployState::Error;
+                }
+            }
         }
         let dep = Deployment {
             id: id.clone(),
             project: rec.project.clone(),
             project_incarnation: rec.project_incarnation,
             root: PathBuf::from(&rec.root),
-            manifest: rec.manifest,
+            runtime_workdir,
+            manifest,
             created_at_ms: rec.created_at_ms,
-            state: rec.state,
+            state: restored_state,
             creator: rec.creator,
             git: rec.git,
             production: rec.production,
@@ -811,28 +1543,29 @@ impl Gateway {
             // generic single-tenant convenience for callers that don't use
             // tenancy at all), a RESTORED record's empty tag is tag LOSS — a
             // pre-tenancy snapshot, or one written by a stale/rolling-upgrade
-            // binary. Collapsing that into the literal "personal" slug handed
-            // another tenant's deployment to the platform owner's real
-            // namespace on every restart of a node holding a stale snapshot.
-            // Fail closed: never adopt an untagged record into a live tenant.
-            tenant: if rec.tenant.trim().is_empty() {
-                "__untagged__".to_string()
-            } else {
-                rec.tenant
-            },
+            // binary. Fail closed: never adopt it into a live tenant.
+            tenant: restored_tenant,
         };
         let project = dep.project.clone();
+        let static_root = static_files::StaticRoot::open(&dep.root).ok();
         let mut st = self.state.lock();
+        if let Some(root) = static_root {
+            st.static_roots.insert(id.clone(), root);
+        }
+        if let Some(routes) = build_output_v3 {
+            st.build_output_v3.insert(id.clone(), routes);
+        }
         st.deployments.insert(id.clone(), dep);
-        // The project (production) alias must resolve to the project's CURRENT
-        // deployment, not whichever record happens to restore last. Prefer the
-        // production deployment, and among equals the newest — so a stale prior
-        // deployment (e.g. a superseded build) never wins the alias after a reboot.
         set_alias_if_newer(&mut st, &project, &id);
-        // The per-deployment preview URL + commit/branch URLs (branch tracks the
-        // newest deployment on that branch — set_alias_if_newer handles ordering).
         insert_deploy_aliases(&mut st, &id);
         st.default.get_or_insert(id);
+    }
+
+    fn legacy_same_host_workdir(&self, root: &str) -> Option<PathBuf> {
+        let artifact = RuntimeArtifactSpec::new(root, ".");
+        let paths = self.fluid.runtime_artifact_paths(&artifact).ok()?;
+        (!paths.delivery_required && paths.guest_workdir == paths.host_static_root)
+            .then_some(paths.guest_workdir)
     }
 
     /// Pick the deployment for a request: `<project>.<host>` subdomain, else the
@@ -850,28 +1583,47 @@ impl Gateway {
     /// the caller falls back to its normal mesh path on a miss.
     pub async fn lease_for_path(&self, host: Option<&str>, path: &str) -> Option<Lease> {
         let dep = self.select(host)?;
-        let RouteTarget::Function(name) = dep.manifest.resolve(path) else {
-            return None;
+        let name = match dep.build_output_v3.as_ref() {
+            Some(BuildOutputV3RouteState::Ready(evaluator)) => {
+                match evaluator.resolve("GET", path).ok()?.target? {
+                    BuildOutputV3Target::Function { name } => name,
+                    _ => return None,
+                }
+            }
+            Some(BuildOutputV3RouteState::Refused(_)) => return None,
+            None if dep.manifest.build_output_v3.is_some() => return None,
+            None => match dep.manifest.resolve(path) {
+                RouteTarget::Function(name) => name,
+                RouteTarget::Static => return None,
+            },
         };
         let key = func_key(dep.id.as_str(), &name);
         self.fluid.lease(&key).await.ok()
     }
 
-    fn select(&self, host: Option<&str>) -> Option<Deployment> {
+    fn select(&self, host: Option<&str>) -> Option<SelectedDeployment> {
         let st = self.state.lock();
+        let selected = |id: &DeploymentId| {
+            st.deployments
+                .get(id)
+                .cloned()
+                .map(|deployment| SelectedDeployment {
+                    static_root: st.static_roots.get(id).cloned(),
+                    build_output_v3: st.build_output_v3.get(id).cloned(),
+                    deployment,
+                })
+        };
         if let Some(h) = host {
             let h = h.split(':').next().unwrap_or(h); // strip port
             if let Some(id) = st.aliases_full.get(&h.to_ascii_lowercase()) {
-                return st.deployments.get(id).cloned();
+                return selected(id);
             }
             let sub = h.split('.').next().unwrap_or(h);
             if let Some(id) = st.aliases.get(sub) {
-                return st.deployments.get(id).cloned();
+                return selected(id);
             }
         }
-        st.default
-            .as_ref()
-            .and_then(|id| st.deployments.get(id).cloned())
+        st.default.as_ref().and_then(selected)
     }
 
     /// The deployment id a request `host` resolves to (its subdomain alias), if
@@ -895,7 +1647,11 @@ impl Gateway {
     /// never when it names a deployment of a project still attached (the
     /// two-projects-one-domain case, where the live attachment must survive).
     pub fn alias_points_at_project(&self, domain: &str, project: &str) -> bool {
-        let h = domain.split(':').next().unwrap_or(domain).to_ascii_lowercase();
+        let h = domain
+            .split(':')
+            .next()
+            .unwrap_or(domain)
+            .to_ascii_lowercase();
         let st = self.state.lock();
         st.aliases_full
             .get(&h)
@@ -1058,6 +1814,16 @@ impl Gateway {
     }
 }
 
+fn static_dir_path(dep: &Deployment) -> PathBuf {
+    let path = dep
+        .manifest
+        .static_dir
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(".");
+    PathBuf::from(path)
+}
+
 // ---- routers ---------------------------------------------------------------
 
 pub fn public_router(gw: Arc<Gateway>) -> Router {
@@ -1166,6 +1932,49 @@ async fn admin_stats(State(gw): State<Arc<Gateway>>) -> Json<Vec<FunctionStats>>
 
 // ---- public request handling ----------------------------------------------
 
+fn build_output_v3_refusal_response(refusal: &BuildOutputV3Refusal) -> Response {
+    let status = match refusal {
+        BuildOutputV3Refusal::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        BuildOutputV3Refusal::Invalid { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut response = (status, refusal.to_string()).into_response();
+    response
+        .headers_mut()
+        .insert("x-hive-error", HeaderValue::from_static(refusal.code()));
+    response
+}
+
+fn build_output_v3_miss_response(path: &str) -> Response {
+    let mut response = (
+        StatusCode::NOT_FOUND,
+        format!("BUILD_OUTPUT_V3_NO_MATCH: no declared output serves {path:?}"),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "x-hive-error",
+        HeaderValue::from_static("BUILD_OUTPUT_V3_NO_MATCH"),
+    );
+    response
+}
+
+fn build_output_v3_status_response(status: u16, location: Option<&str>) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = Response::builder().status(status);
+    if let Some(location) = location {
+        let Ok(location) = HeaderValue::from_str(location) else {
+            return build_output_v3_refusal_response(&BuildOutputV3Refusal::invalid(
+                "route location",
+                "expanded redirect location is not a valid HTTP header value",
+            ));
+        };
+        response = response.header(header::LOCATION, location);
+    }
+    response
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+        .into_response()
+}
+
 async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let host = parts
@@ -1221,6 +2030,29 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     // Image Optimization API (`vercel.json` `images`). Next.js' `<Image>` loader
     // hits `/_next/image`; the Vercel runtime endpoint is `/_vercel/image`.
     if path == "/_vercel/image" || path == "/_next/image" {
+        if dep.manifest.build_output_v3.is_some() {
+            match dep.build_output_v3.as_ref() {
+                Some(BuildOutputV3RouteState::Ready(_)) => {}
+                Some(BuildOutputV3RouteState::Refused(refusal)) => {
+                    return build_output_v3_refusal_response(refusal)
+                }
+                None => {
+                    return build_output_v3_refusal_response(&BuildOutputV3Refusal::invalid(
+                        "gateway route state",
+                        "descriptor is present but no compiled route state exists",
+                    ))
+                }
+            }
+            if dep.manifest.images.is_none() {
+                let mut response =
+                    (StatusCode::NOT_FOUND, "BUILD_OUTPUT_V3_IMAGE_CONFIG_ABSENT").into_response();
+                response.headers_mut().insert(
+                    "x-hive-error",
+                    HeaderValue::from_static("BUILD_OUTPUT_V3_IMAGE_CONFIG_ABSENT"),
+                );
+                return response;
+            }
+        }
         return serve_optimized_image(&dep, parts.uri.query().unwrap_or(""), &parts.headers).await;
     }
 
@@ -1288,6 +2120,78 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     //    path) are injected onto whatever the route produces.
     let extra_headers = dep.manifest.headers_for(&orig_path, &ctx);
 
+    // A Build Output v3 descriptor is authoritative. Evaluate its ordered regex
+    // routes and exact output inventory directly; a miss/refusal never falls
+    // through to longest-prefix legacy routing or the SPA index fallback.
+    if dep.manifest.build_output_v3.is_some() {
+        let resolution = match dep.build_output_v3.as_ref() {
+            Some(BuildOutputV3RouteState::Ready(evaluator)) => {
+                match evaluator.resolve(parts.method.as_str(), &path) {
+                    Ok(resolution) => resolution,
+                    Err(refusal) => return build_output_v3_refusal_response(&refusal),
+                }
+            }
+            Some(BuildOutputV3RouteState::Refused(refusal)) => {
+                return build_output_v3_refusal_response(refusal)
+            }
+            None => {
+                return build_output_v3_refusal_response(&BuildOutputV3Refusal::invalid(
+                    "gateway route state",
+                    "descriptor is present but no compiled route state exists",
+                ))
+            }
+        };
+        let fluid_core::BuildOutputV3Resolution {
+            target,
+            rewritten_path,
+            headers: route_headers,
+            ..
+        } = resolution;
+        let mut response_headers: Vec<(String, String)> = route_headers.into_iter().collect();
+        // Explicit vercel.json overlays are applied by the caller into the
+        // legacy header layer and win duplicate names by being inserted last.
+        response_headers.extend(extra_headers);
+        let response = match target {
+            Some(BuildOutputV3Target::Static { path, content_type }) => {
+                serve_build_output_v3_asset(
+                    &dep,
+                    &path,
+                    content_type.as_deref(),
+                    &orig_path,
+                    accepted_encodings(&parts.headers),
+                )
+                .await
+            }
+            Some(BuildOutputV3Target::Function { name }) => {
+                let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
+                };
+                let function_path = if rewritten_path.contains('?') || query.is_empty() {
+                    rewritten_path
+                } else {
+                    format!("{rewritten_path}?{query}")
+                };
+                proxy_function(
+                    &gw,
+                    &dep,
+                    &name,
+                    &parts.method,
+                    &function_path,
+                    &parts.headers,
+                    body_bytes,
+                )
+                .await
+            }
+            Some(BuildOutputV3Target::Response { status, location }) => {
+                build_output_v3_status_response(status, location.as_deref())
+            }
+            None => build_output_v3_miss_response(&rewritten_path),
+        };
+        let response = apply_route_policy(response, &dep, &orig_path);
+        return inject_headers(response, &response_headers);
+    }
+
     let resp = match dep.manifest.resolve(&path) {
         RouteTarget::Static => {
             // Adapter frameworks (OpenNext / vinext): immutable assets serve from
@@ -1348,8 +2252,8 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             } else {
                 match dep.manifest.origin_function.clone() {
                     Some(origin) => match read_static_file(&dep, &path, enc).await {
-                        Some(r) => r,
-                        None => {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
                             let body_bytes =
                                 match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
                                     Ok(b) => b,
@@ -1369,6 +2273,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                             )
                             .await
                         }
+                        Err(error) => static_read_error(error),
                     },
                     None => serve_static(&dep, &path, enc).await,
                 }
@@ -1933,23 +2838,30 @@ fn is_compressible(ctype: &str) -> bool {
 /// Below this, framing overhead outweighs any saving.
 const MIN_COMPRESS_BYTES: usize = 1024;
 /// Above this we serve identity rather than block a request on a large inline
-/// compress; the build-time precompression path (which has no request waiting
-/// on it) is what covers very large assets.
+/// compression; a pre-generated `.br`/`.gz` sibling can still cover large assets.
 const MAX_INLINE_COMPRESS_BYTES: usize = 8 * 1024 * 1024;
 
-/// Is `sibling` a usable precompressed copy of `src` — i.e. present and not
-/// older than the source? An asset rebuilt in place without its sibling being
-/// refreshed must never be served as stale bytes under a fresh URL.
-async fn fresh_sibling(src: &std::path::Path, sibling: &std::path::Path) -> Option<Vec<u8>> {
-    let (sm, bm) = (
-        tokio::fs::metadata(src).await.ok()?,
-        tokio::fs::metadata(sibling).await.ok()?,
-    );
-    let (st, bt) = (sm.modified().ok()?, bm.modified().ok()?);
-    if bt < st {
-        return None;
+/// Is `relative` a usable precompressed copy of `src`? The sidecar must be at
+/// least as new, and the source is reopened after the sidecar read to prove it
+/// still names the generation whose identity bytes we selected.
+async fn fresh_sibling(
+    root: &static_files::StaticRoot,
+    static_dir: &Path,
+    relative: &Path,
+    source_relative: &Path,
+    source: &static_files::ContainedFile,
+) -> Result<Option<Vec<u8>>, static_files::ReadError> {
+    let sibling =
+        match static_files::read_variant(root, static_dir, relative, source_relative, source).await
+        {
+            Ok(sibling) => sibling,
+            Err(static_files::ReadError::Missing) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    match (source.modified, sibling.modified) {
+        (Some(source), Some(precompressed)) if precompressed >= source => Ok(Some(sibling.bytes)),
+        _ => Ok(None),
     }
-    tokio::fs::read(sibling).await.ok()
 }
 
 fn compress_bytes(bytes: &[u8], br: bool) -> Option<Vec<u8>> {
@@ -1973,21 +2885,23 @@ fn compress_bytes(bytes: &[u8], br: bool) -> Option<Vec<u8>> {
 
 /// Build the response for a static asset, negotiating `Content-Encoding`.
 ///
-/// Order: an on-disk precompressed sibling (`<file>.br`, then `<file>.gz`) is
-/// preferred — zero CPU per request, which is the whole point of Vercel's
-/// precompress-at-build-time model. Failing that, the bytes are compressed
-/// ONCE inline and the sibling is written next to the source (tmp+rename, so a
-/// concurrent request never observes a partial file), making every subsequent
-/// request of that asset free. `Vary: Accept-Encoding` is always set, including
-/// on identity responses, because the same URL genuinely varies by request
-/// header and a shared cache must not reuse one client's answer for another.
+/// An on-disk precompressed sibling (`<file>.br`, then `<file>.gz`) is
+/// preferred. Failing that, the response is compressed inline. The request path
+/// never writes into a tenant checkout: doing so safely under concurrent tenant
+/// mutation requires the same directory-fd boundary as reads, and a cache is an
+/// optimization rather than a reason to widen the filesystem authority here.
+/// `Vary: Accept-Encoding` is always set, including on identity responses,
+/// because the same URL genuinely varies by request header.
 async fn static_asset_response(
-    file: &std::path::Path,
-    bytes: Vec<u8>,
+    root: &static_files::StaticRoot,
+    static_dir: &Path,
+    relative: &Path,
+    source: static_files::ContainedFile,
     ctype: &str,
     cache_control: &str,
+    allow_precompressed: bool,
     enc: AcceptedEncodings,
-) -> Response {
+) -> Result<Response, static_files::ReadError> {
     let mut headers = HeaderMap::new();
     if let Ok(v) = HeaderValue::from_str(ctype) {
         headers.insert(header::CONTENT_TYPE, v);
@@ -1998,50 +2912,43 @@ async fn static_asset_response(
     headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     let want_br = enc.br;
     let want_gz = enc.gzip;
-    if (want_br || want_gz) && is_compressible(ctype) && bytes.len() >= MIN_COMPRESS_BYTES {
-        // 1) Precompressed sibling.
-        for (want, ext, label) in [(want_br, "br", "br"), (want_gz, "gz", "gzip")] {
-            if !want {
-                continue;
-            }
-            let sib = std::path::PathBuf::from(format!("{}.{ext}", file.display()));
-            if let Some(pre) = fresh_sibling(file, &sib).await {
-                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(label));
-                return (headers, pre).into_response();
+    if (want_br || want_gz) && is_compressible(ctype) && source.bytes.len() >= MIN_COMPRESS_BYTES {
+        // 1) Precompressed sibling, bound to the source generation selected above.
+        // Descriptor-authoritative v3 serving disables this probe: only an output
+        // selected by the compiled descriptor may supply bytes.
+        if allow_precompressed {
+            for (want, ext, label) in [(want_br, "br", "br"), (want_gz, "gz", "gzip")] {
+                if !want {
+                    continue;
+                }
+                let sibling = PathBuf::from(format!("{}.{ext}", relative.display()));
+                if let Some(pre) =
+                    fresh_sibling(root, static_dir, &sibling, relative, &source).await?
+                {
+                    headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(label));
+                    return Ok((headers, pre).into_response());
+                }
             }
         }
-        // 2) Compress once inline, then persist for next time.
-        if bytes.len() <= MAX_INLINE_COMPRESS_BYTES {
+        // 2) Compress inline without mutating the tenant checkout.
+        if source.bytes.len() <= MAX_INLINE_COMPRESS_BYTES {
             let use_br = want_br;
-            let src = bytes.clone();
+            let src = source.bytes.clone();
             if let Ok(Some(out)) =
                 tokio::task::spawn_blocking(move || compress_bytes(&src, use_br)).await
             {
                 // Only worth serving if it actually got smaller.
-                if out.len() < bytes.len() {
-                    let ext = if use_br { "br" } else { "gz" };
-                    let sib = std::path::PathBuf::from(format!("{}.{ext}", file.display()));
-                    let tmp = std::path::PathBuf::from(format!(
-                        "{}.{}.tmp",
-                        sib.display(),
-                        std::process::id()
-                    ));
-                    let payload = out.clone();
-                    tokio::spawn(async move {
-                        if tokio::fs::write(&tmp, &payload).await.is_ok() {
-                            let _ = tokio::fs::rename(&tmp, &sib).await;
-                        }
-                    });
+                if out.len() < source.bytes.len() {
                     headers.insert(
                         header::CONTENT_ENCODING,
                         HeaderValue::from_static(if use_br { "br" } else { "gzip" }),
                     );
-                    return (headers, out).into_response();
+                    return Ok((headers, out).into_response());
                 }
             }
         }
     }
-    (headers, bytes).into_response()
+    Ok((headers, source.bytes).into_response())
 }
 
 /// True if a filename carries a content hash (a `.`/`-`-delimited hex token of
@@ -2054,54 +2961,134 @@ fn is_hashed_asset(file: &str) -> bool {
     })
 }
 
-/// Try to read a concrete static asset for `path` from the deployment's
-/// `static_dir`. Returns `Some(response)` only when an actual file (or its
-/// cleanUrls `.html` sibling) exists; returns `None` on a miss WITHOUT the
-/// SPA-index/404 fallback, so the caller can fall through to an origin function.
-async fn read_static_file(
-    dep: &Deployment,
-    path: &str,
+/// Serve one descriptor-indexed static file exactly. No clean-url probe, index
+/// synthesis, or SPA fallback is permitted on this authoritative path.
+async fn serve_build_output_v3_asset(
+    dep: &SelectedDeployment,
+    asset: &str,
+    content_type_override: Option<&str>,
+    request_path: &str,
     enc: AcceptedEncodings,
-) -> Option<Response> {
-    let static_dir = dep
-        .manifest
-        .static_dir
-        .clone()
-        .unwrap_or_else(|| ".".into());
-    let base = dep.root.join(static_dir);
-    let rel = path.trim_start_matches('/');
-    let mut file = base.join(rel);
-    if path.ends_with('/') || rel.is_empty() {
-        file = file.join("index.html");
-    }
-    if !is_within(&base, &file) {
-        return None;
-    }
-    if let Ok(bytes) = tokio::fs::read(&file).await {
-        let ctype = content_type(&file);
-        return Some(
-            static_asset_response(&file, bytes, ctype, static_cache_control(path), enc).await,
-        );
-    }
-    // cleanUrls: `/about` -> `about.html`.
-    if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
-        let html = base.join(format!("{rel}.html"));
-        if is_within(&base, &html) {
-            if let Ok(bytes) = tokio::fs::read(&html).await {
-                return Some(
-                    static_asset_response(
-                        &html,
-                        bytes,
-                        "text/html; charset=utf-8",
-                        "public, max-age=0, must-revalidate",
-                        enc,
-                    )
-                    .await,
-                );
+) -> Response {
+    let Some(root) = dep.static_root.as_ref() else {
+        return static_read_error(static_files::ReadError::Unavailable);
+    };
+    let static_dir = static_dir_path(dep);
+    let relative = Path::new(asset);
+    match static_files::read(root, &static_dir, relative).await {
+        Ok(source) => {
+            let logical_file = dep.root.join(&static_dir).join(relative);
+            let content_type = content_type_override.unwrap_or_else(|| content_type(&logical_file));
+            match static_asset_response(
+                root,
+                &static_dir,
+                relative,
+                source,
+                content_type,
+                static_cache_control(request_path),
+                false,
+                enc,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => static_read_error(error),
             }
         }
+        Err(static_files::ReadError::Missing) => {
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BUILD_OUTPUT_V3_OUTPUT_MISSING",
+            )
+                .into_response();
+            response.headers_mut().insert(
+                "x-hive-error",
+                HeaderValue::from_static("BUILD_OUTPUT_V3_OUTPUT_MISSING"),
+            );
+            response
+        }
+        Err(error) => static_read_error(error),
     }
-    None
+}
+
+/// Try to read a concrete static asset for `path` from the deployment's
+/// `static_dir`. Only `Ok(None)` is an origin fallthrough; authorization and
+/// availability failures retain their type.
+async fn read_static_file(
+    dep: &SelectedDeployment,
+    path: &str,
+    enc: AcceptedEncodings,
+) -> Result<Option<Response>, static_files::ReadError> {
+    let root = dep
+        .static_root
+        .as_ref()
+        .ok_or(static_files::ReadError::Unavailable)?;
+    let static_dir = static_dir_path(dep);
+    let rel = path.trim_start_matches('/');
+    let mut relative = PathBuf::from(rel);
+    if path.ends_with('/') || rel.is_empty() {
+        relative = relative.join("index.html");
+    }
+    match static_files::read(root, &static_dir, &relative).await {
+        Ok(source) => {
+            let logical_file = dep.root.join(&static_dir).join(&relative);
+            let response = static_asset_response(
+                root,
+                &static_dir,
+                &relative,
+                source,
+                content_type(&logical_file),
+                static_cache_control(path),
+                true,
+                enc,
+            )
+            .await?;
+            return Ok(Some(response));
+        }
+        Err(static_files::ReadError::Missing) => {}
+        Err(error) => return Err(error),
+    }
+    if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
+        let relative = PathBuf::from(format!("{rel}.html"));
+        match static_files::read(root, &static_dir, &relative).await {
+            Ok(source) => {
+                return static_asset_response(
+                    root,
+                    &static_dir,
+                    &relative,
+                    source,
+                    "text/html; charset=utf-8",
+                    "public, max-age=0, must-revalidate",
+                    true,
+                    enc,
+                )
+                .await
+                .map(Some);
+            }
+            Err(static_files::ReadError::Missing) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn static_read_error(error: static_files::ReadError) -> Response {
+    let (status, body, code) = match error {
+        static_files::ReadError::Missing => (StatusCode::NOT_FOUND, "not found", "NOT_FOUND"),
+        static_files::ReadError::Forbidden => {
+            (StatusCode::FORBIDDEN, "forbidden", "STATIC_FORBIDDEN")
+        }
+        static_files::ReadError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "static asset unavailable",
+            "STATIC_UNAVAILABLE",
+        ),
+    };
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert("x-hive-error", HeaderValue::from_static(code));
+    response
 }
 
 /// The 404 for "no static file here", made to distinguish its two very
@@ -2157,60 +3144,85 @@ fn no_static_file(dep: &Deployment, path: &str) -> Response {
     resp
 }
 
-async fn serve_static(dep: &Deployment, path: &str, enc: AcceptedEncodings) -> Response {
-    let static_dir = dep
-        .manifest
-        .static_dir
-        .clone()
-        .unwrap_or_else(|| ".".into());
-    let base = dep.root.join(static_dir);
+async fn serve_static(dep: &SelectedDeployment, path: &str, enc: AcceptedEncodings) -> Response {
+    let Some(root) = dep.static_root.as_ref() else {
+        return static_read_error(static_files::ReadError::Unavailable);
+    };
+    let static_dir = static_dir_path(dep);
     let rel = path.trim_start_matches('/');
-    let mut file = base.join(rel);
-    // Directory or root -> index.html.
+    let mut relative = PathBuf::from(rel);
     if path.ends_with('/') || rel.is_empty() {
-        file = file.join("index.html");
+        relative = relative.join("index.html");
     }
-    // Path-traversal guard: resolved file must stay under base.
-    if !is_within(&base, &file) {
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-    match tokio::fs::read(&file).await {
-        Ok(bytes) => {
-            let ctype = content_type(&file);
-            static_asset_response(&file, bytes, ctype, static_cache_control(path), enc).await
+    match static_files::read(root, &static_dir, &relative).await {
+        Ok(source) => {
+            let logical_file = dep.root.join(&static_dir).join(&relative);
+            return match static_asset_response(
+                root,
+                &static_dir,
+                &relative,
+                source,
+                content_type(&logical_file),
+                static_cache_control(path),
+                true,
+                enc,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => static_read_error(error),
+            };
         }
-        Err(_) => {
-            // cleanUrls: serve `about.html` for a request to `/about`.
-            if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
-                let html = base.join(format!("{rel}.html"));
-                if is_within(&base, &html) {
-                    if let Ok(bytes) = tokio::fs::read(&html).await {
-                        return static_asset_response(
-                            &html,
-                            bytes,
-                            "text/html; charset=utf-8",
-                            "public, max-age=0, must-revalidate",
-                            enc,
-                        )
-                        .await;
-                    }
-                }
-            }
-            // SPA-ish fallback: try index.html at the static root.
-            let idx = base.join("index.html");
-            if let Ok(bytes) = tokio::fs::read(&idx).await {
-                static_asset_response(
-                    &idx,
-                    bytes,
-                    "text/html",
+        Err(static_files::ReadError::Missing) => {}
+        Err(error) => return static_read_error(error),
+    }
+
+    // cleanUrls: serve `about.html` for a request to `/about`.
+    if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
+        let relative = PathBuf::from(format!("{rel}.html"));
+        match static_files::read(root, &static_dir, &relative).await {
+            Ok(source) => {
+                return match static_asset_response(
+                    root,
+                    &static_dir,
+                    &relative,
+                    source,
+                    "text/html; charset=utf-8",
                     "public, max-age=0, must-revalidate",
+                    true,
                     enc,
                 )
                 .await
-            } else {
-                no_static_file(dep, path)
+                {
+                    Ok(response) => response,
+                    Err(error) => static_read_error(error),
+                };
             }
+            Err(static_files::ReadError::Missing) => {}
+            Err(error) => return static_read_error(error),
         }
+    }
+
+    // SPA-ish fallback: try index.html at the static root only after typed misses.
+    let index = Path::new("index.html");
+    match static_files::read(root, &static_dir, index).await {
+        Ok(source) => match static_asset_response(
+            root,
+            &static_dir,
+            index,
+            source,
+            "text/html",
+            "public, max-age=0, must-revalidate",
+            true,
+            enc,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => static_read_error(error),
+        },
+        Err(static_files::ReadError::Missing) => no_static_file(dep, path),
+        Err(error) => static_read_error(error),
     }
 }
 
@@ -2218,7 +3230,11 @@ async fn serve_static(dep: &Deployment, path: &str, enc: AcceptedEncodings) -> R
 /// Validates the request against the deployment's `images` config, fetches the
 /// source (local asset or allow-listed remote), and re-encodes it at the
 /// requested width/quality. Resizing uses the pure-Rust `image` crate.
-async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &HeaderMap) -> Response {
+async fn serve_optimized_image(
+    dep: &SelectedDeployment,
+    query: &str,
+    req_headers: &HeaderMap,
+) -> Response {
     let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string()).into_response();
 
     // ---- parse query ----
@@ -2292,30 +3308,71 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
             _ => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
         }
     } else {
-        // Local asset: validate localPatterns (when set), read from static dir.
-        if let Some(c) = cfg {
-            if !c.local_patterns.is_empty() && !local_allowed(c, &url) {
-                return bad("local url not allowed by images.localPatterns");
+        // Local asset: validate localPatterns (when set), preserving the v3
+        // distinction between undefined (allow all) and an explicit empty array
+        // (deny all), which the legacy manifest vector cannot represent alone.
+        let v3_local_allowed = dep
+            .manifest
+            .build_output_v3
+            .as_ref()
+            .and_then(|descriptor| descriptor.config_view().ok())
+            .and_then(|config| config.images)
+            .and_then(|images| images.local_patterns)
+            .map(|patterns| {
+                let (pathname, search) = url
+                    .split_once('?')
+                    .map(|(path, query)| (path, format!("?{query}")))
+                    .unwrap_or((url.as_str(), String::new()));
+                patterns.iter().any(|pattern| {
+                    pattern
+                        .pathname
+                        .as_deref()
+                        .map(|pattern| pattern_matches(pattern, pathname))
+                        .unwrap_or(true)
+                        && pattern
+                            .search
+                            .as_deref()
+                            .map(|expected| expected.is_empty() || expected == search)
+                            .unwrap_or(true)
+                })
+            });
+        if v3_local_allowed == Some(false) {
+            return bad("local url not allowed by images.localPatterns");
+        }
+        if v3_local_allowed.is_none() {
+            if let Some(c) = cfg {
+                if !c.local_patterns.is_empty() && !local_allowed(c, &url) {
+                    return bad("local url not allowed by images.localPatterns");
+                }
             }
         }
-        let static_dir = dep
-            .manifest
-            .static_dir
-            .clone()
-            .unwrap_or_else(|| ".".into());
-        let base = dep.root.join(static_dir);
-        let rel = url
-            .split('?')
-            .next()
-            .unwrap_or(&url)
-            .trim_start_matches('/');
-        let file = base.join(rel);
-        if !is_within(&base, &file) {
-            return bad("forbidden");
-        }
-        match tokio::fs::read(&file).await {
-            Ok(b) => (b, rel.ends_with(".svg")),
-            Err(_) => return (StatusCode::NOT_FOUND, "image not found").into_response(),
+        let Some(root) = dep.static_root.as_ref() else {
+            return static_read_error(static_files::ReadError::Unavailable);
+        };
+        let static_dir = static_dir_path(dep);
+        let requested = url.split('?').next().unwrap_or(&url);
+        let rel = if dep.manifest.build_output_v3.is_some() {
+            let Some(BuildOutputV3RouteState::Ready(evaluator)) = dep.build_output_v3.as_ref()
+            else {
+                return build_output_v3_refusal_response(&BuildOutputV3Refusal::invalid(
+                    "gateway route state",
+                    "Build Output image source has no compiled evaluator",
+                ));
+            };
+            match evaluator.resolve("GET", requested) {
+                Ok(resolution) => match resolution.target {
+                    Some(BuildOutputV3Target::Static { path, .. }) => path,
+                    _ => return bad("local image source is not a declared static output"),
+                },
+                Err(refusal) => return build_output_v3_refusal_response(&refusal),
+            }
+        } else {
+            requested.trim_start_matches('/').to_string()
+        };
+        let relative = PathBuf::from(&rel);
+        match static_files::read(root, &static_dir, &relative).await {
+            Ok(source) => (source.bytes, rel.ends_with(".svg")),
+            Err(error) => return static_read_error(error),
         }
     };
 
@@ -3564,17 +4621,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
     }
 }
 
-fn is_within(base: &Path, candidate: &Path) -> bool {
-    // `candidate` is `base.join(rel)`; if it stays under `base` with no `..`
-    // components, it's safe.
-    match candidate.strip_prefix(base) {
-        Ok(rest) => !rest
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir)),
-        Err(_) => false,
-    }
-}
-
 fn content_type(file: &Path) -> &'static str {
     match file.extension().and_then(|e| e.to_str()) {
         Some("html") | Some("htm") => "text/html; charset=utf-8",
@@ -3602,6 +4648,7 @@ mod route_policy_tests {
             id: DeploymentId::from("dpl-test".to_string()),
             project: "p".into(),
             root: PathBuf::from("/tmp"),
+            runtime_workdir: Some(PathBuf::from("/tmp")),
             manifest: Manifest {
                 project: "p".into(),
                 route_policies: policies,

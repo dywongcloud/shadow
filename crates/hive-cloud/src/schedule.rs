@@ -2,8 +2,10 @@
 //! the project's configured regions (or none) plus live mesh state.
 //!
 //! Policy (see the placement plan):
-//!   * eligible node = healthy + Firecracker backend + meets a memory floor. This
-//!     excludes the resource-poor local/mock Mac nodes from *automatic* selection.
+//!   * eligible node = healthy + an advertised production isolation backend +
+//!     meets a memory floor. Firecracker is intrinsically eligible; Litebox is
+//!     eligible only while it advertises the current runtime-artifact protocol.
+//!     Mock is never silently treated as isolated.
 //!   * explicit regions → one target per selected region; the explicit choice
 //!     overrides the eligibility filter (so picking `los-angeles` deploys to the
 //!     local nodes on purpose). Ties broken by least current load.
@@ -35,7 +37,9 @@ pub struct Target {
 }
 
 fn eligible(n: &NodeInfo) -> bool {
-    n.healthy && n.backend == "firecracker" && n.mem_total_mb >= MEM_FLOOR_MB
+    let isolated =
+        n.backend == "firecracker" || (n.backend == "litebox" && runtime_artifact_capable(n, true));
+    n.healthy && isolated && n.mem_total_mb >= MEM_FLOOR_MB
 }
 
 /// Per-node count of hosted deployments (a cheap "load" proxy): how many serve
@@ -73,6 +77,8 @@ pub fn place_for_project(
     stateful: bool,
     needs_gpu: bool,
     needs_wasm: bool,
+    needs_runtime_artifact: bool,
+    needs_build_isolation: bool,
 ) -> Vec<Target> {
     if let Some(holder) = cloud.leases.owner_of(project) {
         let nodes = cloud.registry.nodes();
@@ -90,7 +96,16 @@ pub fn place_for_project(
             // every redeploy to a node that cannot execute it. Same predicate
             // `place` uses, by construction — see `wasm_capable`.
             let wasm_ok = wasm_capable(n, needs_wasm);
-            if n.healthy && region_ok && reachable && gpu_ok && wasm_ok {
+            let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
+            let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
+            if n.healthy
+                && region_ok
+                && reachable
+                && gpu_ok
+                && wasm_ok
+                && runtime_artifact_ok
+                && build_isolation_ok
+            {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 // Carry BOTH transports whenever both are known. They are
                 // complementary, not alternatives: a security group that blocks
@@ -129,6 +144,8 @@ pub fn place_for_project(
         stateful,
         needs_gpu,
         needs_wasm,
+        needs_runtime_artifact,
+        needs_build_isolation,
     )
 }
 
@@ -149,6 +166,22 @@ pub fn place_for_project(
 /// `gpu_count == 0` already makes.
 pub fn wasm_capable(n: &NodeInfo, needs_wasm: bool) -> bool {
     !needs_wasm || n.wasm_runtime == Some(true)
+}
+
+/// Source-built functions use the split host-static-root / guest-workdir
+/// runtime-artifact contract. A node that does not advertise protocol v1 is a
+/// pre-upgrade peer whose interpretation is incompatible, so both ordinary
+/// placement and lease stickiness must fail closed rather than route around the
+/// gate.
+pub fn runtime_artifact_capable(n: &NodeInfo, needed: bool) -> bool {
+    !needed || n.runtime_artifact_protocol == Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION)
+}
+
+/// Repository-controlled commands may run only on nodes whose boot-time live
+/// probe proved the complete BuildExecutor v1 contract. An absent field is an
+/// old node that still builds on the host and is therefore known-incapable.
+pub fn build_isolation_capable(n: &NodeInfo, needed: bool) -> bool {
+    !needed || n.build_isolation_protocol == Some(1)
 }
 
 /// Minimum free disk (GiB) a node must report to be eligible for new placement.
@@ -201,7 +234,7 @@ pub fn place(
     needs_gpu: bool,
     // The project's functions run on `Runtime::Wasmer`: only nodes ADVERTISING
     // a reachable wasmer binary (`NodeInfo::wasm_runtime == Some(true)`, from
-    // the boot `detect_wasm_runtime` probe) are capable. Same rule and same
+    // the active-backend resource probe) are capable. Same rule and same
     // reasoning as `needs_gpu` directly above, and it is not hypothetical: the
     // first cut of Wasmer support installed the binary on the HOST while every
     // fleet node is Firecracker, which execs `start_cmd` inside the microVM
@@ -209,6 +242,12 @@ pub fn place(
     // cold start, forever, and the tenant was told to debug their own app.
     // Empty placement plus an honest error is strictly better.
     needs_wasm: bool,
+    // Source-built functions require the split host/guest runtime-artifact v1
+    // contract. Pre-upgrade nodes must not receive them.
+    needs_runtime_artifact: bool,
+    // Any repository-controlled command requires the live-probed outer
+    // BuildExecutor contract. Old peers and failed probes are ineligible.
+    needs_build_isolation: bool,
 ) -> Vec<Target> {
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
@@ -247,10 +286,10 @@ pub fn place(
             || cloud.node_admins.read().contains_key(&n.name)
             || (n.peer_id.is_some() && n.iroh_addr.is_some())
     };
-    // Capability filter. Firecracker nodes now run CONTAINERS via host podman
-    // (outside the microVM), so a container is eligible on any healthy real node —
-    // a Firecracker node (preferred: more resources) OR the mock/podman backend.
-    // Non-container functions still want a Firecracker microVM node.
+    // Capability filter. Containers run through host podman on every backend;
+    // ordinary functions require a production isolation backend. Firecracker is
+    // intrinsically eligible, verified Litebox proves that status by advertising
+    // the current runtime-artifact protocol, and Mock remains container-only.
     let capable = |n: &NodeInfo| -> bool {
         if needs_gpu && n.gpu_count == 0 {
             return false;
@@ -258,6 +297,12 @@ pub fn place(
         // Wasmer capability, same hard-filter shape as the GPU gate above.
         // See `wasm_capable` for why `None` excludes rather than admits.
         if !wasm_capable(n, needs_wasm) {
+            return false;
+        }
+        if !runtime_artifact_capable(n, needs_runtime_artifact) {
+            return false;
+        }
+        if !build_isolation_capable(n, needs_build_isolation) {
             return false;
         }
         // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
@@ -374,6 +419,14 @@ pub fn place(
                 tracing::warn!(region = %region, "placement: no wasm-capable node in this region — not widening (wasmer runtime)");
                 continue;
             }
+            if needs_runtime_artifact && eligibles.is_empty() {
+                tracing::warn!(region = %region, "placement: no runtime-artifact-v1 node in this region — not widening (source build)");
+                continue;
+            }
+            if needs_build_isolation && eligibles.is_empty() {
+                tracing::warn!(region = %region, "placement: no build-isolation-v1 node in this region — not widening (repository build)");
+                continue;
+            }
             let mut pool = if eligibles.is_empty() {
                 cands
             } else {
@@ -432,6 +485,16 @@ pub fn place(
                 "placement: wasmer runtime requested but no healthy wasm-capable node is reachable"
             );
         }
+        if needs_runtime_artifact {
+            tracing::warn!(
+                "placement: source build requested but no healthy runtime-artifact-v1 node is reachable"
+            );
+        }
+        if needs_build_isolation {
+            tracing::warn!(
+                "placement: repository build requested but no healthy build-isolation-v1 node is reachable"
+            );
+        }
         return Vec::new();
     }
     let dist = |n: &NodeInfo| -> f64 {
@@ -484,6 +547,8 @@ mod tests {
             // means "this node CAN run wasm" must set `Some(true)` explicitly,
             // the same rule `disk_free_gb` already carries.
             wasm_runtime: None,
+            runtime_artifact_protocol: None,
+            build_isolation_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+# {{ ansible_managed }}
+set -euo pipefail
+umask 077
+
+nft={{ build_executor_nft_binary | quote }}
+policy={{ build_executor_nft_policy_path | quote }}
+inet_table={{ build_executor_nft_table | quote }}
+bridge_table={{ build_executor_nft_bridge_table | quote }}
+transaction="$(mktemp /run/hive-build-executor-nft.XXXXXX)"
+trap 'rm -f "$transaction"' EXIT
+
+if "$nft" list table inet "$inet_table" >/dev/null 2>&1; then
+    printf 'delete table inet %s\n' "$inet_table" >>"$transaction"
+fi
+if "$nft" list table bridge "$bridge_table" >/dev/null 2>&1; then
+    printf 'delete table bridge %s\n' "$bridge_table" >>"$transaction"
+fi
+cat "$policy" >>"$transaction"
+"$nft" --check --file "$transaction"
+"$nft" --file "$transaction"

@@ -1,4 +1,4 @@
-//! Typed model of **`vercel.json`** (and best-effort `vercel.ts` / `vercel.js`) —
+//! Typed model of inert **`vercel.json`** configuration —
 //! the *user-facing* project configuration format, as documented at
 //! <https://vercel.com/docs/project-configuration/vercel-json>.
 //!
@@ -11,8 +11,9 @@
 //! vercel.json  >  Project Settings (dashboard)  >  framework auto-detection
 //! ```
 //!
-//! Parsing is intentionally **tolerant**: every field is optional, unknown keys
-//! are ignored, and a malformed file yields `None` rather than failing a build.
+//! Model parsing remains tolerant for read-only analysis callers: every field is
+//! optional and unknown keys are ignored. Build admission uses the checked loader,
+//! which rejects malformed JSON and executable JS/TS configuration loudly.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -237,88 +238,93 @@ impl ConditionValue {
     }
 }
 
-/// Load a project's hand-written config. Reads `vercel.json` first; if absent,
-/// best-effort-evaluates `vercel.ts` / `vercel.js` via Node (so a project that
-/// only ships the TS form still works). Returns `None` if nothing is found or
-/// parsing fails — callers treat that as "no overrides".
-pub fn load_vercel_config(repo: &Path) -> Option<VercelConfig> {
-    let json = repo.join("vercel.json");
-    if json.is_file() {
-        match std::fs::read_to_string(&json) {
-            Ok(s) => match VercelConfig::from_json(&s) {
-                Ok(c) => return Some(c),
-                Err(e) => {
-                    // A malformed vercel.json should not kill the build.
-                    eprintln!("vercel.json parse error (ignored): {e}");
-                    return None;
-                }
-            },
-            Err(_) => return None,
-        }
-    }
-    // Best-effort TS/JS config.
+const MAX_VERCEL_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Load the inert JSON configuration without executing repository modules.
+/// Malformed, oversized, symlinked, or dynamic JS/TS configuration is a loud
+/// build-input error for callers that execute repository builds.
+pub fn load_vercel_config_checked(repo: &Path) -> anyhow::Result<Option<VercelConfig>> {
+    use anyhow::{ensure, Context};
+    use std::io::Read;
+
     for name in ["vercel.ts", "vercel.js", "vercel.mjs"] {
-        let p = repo.join(name);
-        if p.is_file() {
-            if let Some(c) = eval_config_via_node(&p) {
-                return Some(c);
-            }
+        match std::fs::symlink_metadata(repo.join(name)) {
+            Ok(_) => anyhow::bail!(
+                "BUILD_ISOLATION_UNSUPPORTED_CONFIG: {name} is executable repository configuration; use inert vercel.json"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {name}")),
         }
     }
-    None
+
+    let json = repo.join("vercel.json");
+    match std::fs::symlink_metadata(&json) {
+        Ok(initial) => {
+            ensure!(
+                initial.file_type().is_file() && !initial.file_type().is_symlink(),
+                "vercel.json must be a regular file, not a symlink or directory"
+            );
+            ensure!(
+                initial.len() <= MAX_VERCEL_CONFIG_BYTES,
+                "vercel.json exceeds the {}-byte limit",
+                MAX_VERCEL_CONFIG_BYTES
+            );
+            let mut file = std::fs::File::open(&json).context("open vercel.json")?;
+            let opened = file.metadata().context("inspect opened vercel.json")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                ensure!(
+                    initial.dev() == opened.dev() && initial.ino() == opened.ino(),
+                    "vercel.json changed identity while it was opened"
+                );
+            }
+            ensure!(
+                opened.is_file() && opened.len() <= MAX_VERCEL_CONFIG_BYTES,
+                "opened vercel.json is not a bounded regular file"
+            );
+            let mut bytes = Vec::with_capacity(opened.len() as usize);
+            (&mut file)
+                .take(MAX_VERCEL_CONFIG_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .context("read vercel.json")?;
+            ensure!(
+                bytes.len() as u64 <= MAX_VERCEL_CONFIG_BYTES,
+                "vercel.json grew beyond the {}-byte limit while reading",
+                MAX_VERCEL_CONFIG_BYTES
+            );
+            let after = file.metadata().context("reinspect vercel.json")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                ensure!(
+                    opened.dev() == after.dev()
+                        && opened.ino() == after.ino()
+                        && opened.len() == after.len()
+                        && opened.mtime() == after.mtime()
+                        && opened.mtime_nsec() == after.mtime_nsec(),
+                    "vercel.json changed while it was read"
+                );
+            }
+            ensure!(
+                after.len() == bytes.len() as u64,
+                "vercel.json length changed while it was read"
+            );
+            let text = std::str::from_utf8(&bytes).context("vercel.json is not UTF-8")?;
+            let config = VercelConfig::from_json(text).context("parse vercel.json")?;
+            return Ok(Some(config));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect vercel.json"),
+    }
+
+    Ok(None)
 }
 
-/// Evaluate a `vercel.ts`/`vercel.js` module with Node and parse its default
-/// export as JSON. Best-effort: tries a couple of invocations and gives up
-/// quietly if Node is unavailable or the module can't be loaded.
-fn eval_config_via_node(path: &Path) -> Option<VercelConfig> {
-    use std::process::Command;
-    let abs = path.canonicalize().ok()?;
-    let url = format!("file://{}", abs.to_string_lossy());
-    // A tiny ESM loader: import the module, take `.default` (or the namespace),
-    // and print it as JSON. `withConfig`/helper wrappers from Vercel just return
-    // the object, so this captures them too.
-    let script = format!(
-        "const m = await import('{url}'); \
-         const c = m.default ?? m.config ?? m; \
-         process.stdout.write(JSON.stringify(c));"
-    );
-    // Candidate runners, in order of preference. `--experimental-strip-types`
-    // lets modern Node import `.ts` directly; `tsx` is the common fallback.
-    let attempts: &[(&str, Vec<&str>)] = &[
-        (
-            "node",
-            vec![
-                "--experimental-strip-types",
-                "--input-type=module",
-                "-e",
-                &script,
-            ],
-        ),
-        ("node", vec!["--input-type=module", "-e", &script]),
-        ("npx", vec!["--yes", "tsx", "-e", &script]),
-    ];
-    for (bin, args) in attempts {
-        let Ok(out) = Command::new(bin)
-            .args(args)
-            .current_dir(path.parent().unwrap_or(Path::new(".")))
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(c) = VercelConfig::from_json(trimmed) {
-            return Some(c);
-        }
-    }
-    None
+/// Compatibility wrapper for read-only analysis callers. Production build
+/// admission uses [`load_vercel_config_checked`] so invalid input stays loud.
+pub fn load_vercel_config(repo: &Path) -> Option<VercelConfig> {
+    load_vercel_config_checked(repo).ok().flatten()
 }
 
 #[cfg(test)]

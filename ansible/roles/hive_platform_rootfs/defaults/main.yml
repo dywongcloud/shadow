@@ -1,0 +1,17 @@
+---
+# Rootfs replacement is an operator-owned migration, never an ordinary converge.
+hive_runtime_artifact_rootfs_rebuild: false
+hive_runtime_artifact_rootfs_drained: false
+hive_runtime_artifact_protocol_expected: 1
+# Packaging release-fact envelope only; not the Rust host/guest wire schema.
+hive_cell_agent_release_schema_expected: 1
+hive_cell_agent_protocol_timeout_seconds: 5
+# The remote restart guard must outlive the bounded builder. If the Ansible
+# controller disappears after stopping hive-node, systemd still starts it.
+hive_runtime_rootfs_build_timeout_seconds: 3600
+hive_runtime_rootfs_restart_guard_seconds: 3900
+hive_runtime_rootfs_image: "node:20-slim"
+hive_runtime_rootfs_logical_name: "default"
+hive_runtime_rootfs_size_mib: 4096
+hive_cell_agent_install_path: "/usr/local/bin/hive-cell-agent"
+hive_cell_agent_release_fact_path: "/usr/local/bin/hive-cell-agent.release.json"

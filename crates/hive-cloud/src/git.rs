@@ -6,15 +6,16 @@
 //! registers the routable deployment via the gateway. The dashboard polls
 //! `GET /v1/builds/:id` to stream the logs as they appear.
 
+use anyhow::Context as _;
 use base64::Engine;
 use futures::StreamExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fluid_core::{
-    DeployState, FunctionConfig, GitDeployRequest, GitSource, Manifest, PortSpec, Route,
-    RouteTarget, ServiceProtocol,
+    DeployState, FunctionConfig, GitDeployRequest, GitSource, Manifest, PortSpec,
+    ProjectIncarnation, Route, RouteTarget, ServiceProtocol,
 };
 use hive_core::now_ms;
 use parking_lot::Mutex;
@@ -35,6 +36,8 @@ pub struct LogLine {
 pub struct Build {
     pub id: String,
     pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_incarnation: Option<ProjectIncarnation>,
     pub repo_url: String,
     pub branch: String,
     pub commit: String,
@@ -89,6 +92,10 @@ const MEMORY_BUILD_CAP: usize = 400;
 /// embeds subprocess output) — a byte bound belongs at the store boundary too,
 /// so no future caller can reintroduce an unbounded line.
 const MAX_BUILD_LOG_LINE_BYTES: usize = 16 * 1024;
+
+/// Fanout capability boundary for paired host-static/runtime-artifact semantics.
+/// Its location deliberately cannot match the legacy mesh prefix arm.
+const RUNTIME_ARTIFACT_FANOUT_PATH: &str = "/v1/runtime-artifact/v1/git/deploy";
 
 #[derive(Default)]
 pub struct BuildStore {
@@ -204,16 +211,38 @@ impl BuildStore {
             f(b);
         }
     }
-    /// Remove every build record for `project` — there was previously no
-    /// removal path at all (unbounded retention, including full log lines
-    /// that can carry commit-author/env/config content), so a deleted
-    /// project's build history stayed fully queryable via `GET /v1/builds/:id`
-    /// for as long as the process kept running. Returns the count removed.
-    pub fn remove_for_project(&self, project: &str) -> usize {
-        let mut m = self.map.lock();
-        let before = m.len();
-        m.retain(|_, b| b.project != project);
-        before - m.len()
+    /// Remove build records proved to belong to one deleted incarnation. Legacy
+    /// records carry no identity and are retained rather than guessed from a
+    /// project-name prefix.
+    pub fn remove_for_incarnation(
+        &self,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Vec<Build> {
+        let mut map = self.map.lock();
+        let ids: Vec<String> = map
+            .values()
+            .filter(|build| {
+                build.project == project && build.project_incarnation == Some(incarnation)
+            })
+            .map(|build| build.id.clone())
+            .collect();
+        ids.into_iter().filter_map(|id| map.remove(&id)).collect()
+    }
+
+    pub fn ids_for_incarnation(
+        &self,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Vec<String> {
+        self.map
+            .lock()
+            .values()
+            .filter(|build| {
+                build.project == project && build.project_incarnation == Some(incarnation)
+            })
+            .map(|build| build.id.clone())
+            .collect()
     }
 }
 
@@ -247,19 +276,37 @@ struct MirrorTarget {
     target_bid: String,
 }
 
-#[derive(Default)]
 struct BuildCancelSlot {
+    project: String,
+    incarnation: ProjectIncarnation,
     /// Process-GROUP id of whatever child THIS build is currently blocked on.
     /// `None` between steps (no command in flight right now).
     pgid: Mutex<Option<u32>>,
-    /// Set true the instant `cancel_build` runs — checked at step boundaries
-    /// so a step that finishes just as the kill signal goes out never starts
-    /// the next command.
+    /// Set true the instant cancellation begins — checked at step boundaries.
     cancelled: std::sync::atomic::AtomicBool,
     /// Set while this build mirrors a remote fanned-out build.
     mirror: Mutex<Option<MirrorTarget>>,
     /// The task actually driving this build.
     task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Completion is released only by `BuildCompletionGuard::drop`, including
+    /// task abort and panic. Deletion waits on this before touching checkouts.
+    completed: std::sync::atomic::AtomicBool,
+    completion: tokio::sync::Notify,
+}
+
+impl BuildCancelSlot {
+    fn new(project: String, incarnation: ProjectIncarnation) -> Self {
+        Self {
+            project,
+            incarnation,
+            pgid: Mutex::new(None),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            mirror: Mutex::new(None),
+            task: Mutex::new(None),
+            completed: std::sync::atomic::AtomicBool::new(false),
+            completion: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 /// Registry of in-flight builds' cancellation handles, keyed by build id.
@@ -277,14 +324,18 @@ impl BuildCancelRegistry {
         Self::default()
     }
 
-    /// Register a fresh slot for a build about to start — called
-    /// synchronously in `start_build`, BEFORE the driving task is even
-    /// spawned, so a cancel arriving in the first instant of a build's life
-    /// (before any child has spawned) still has somewhere to record itself.
-    fn register(&self, bid: &str) {
-        self.map
-            .lock()
-            .insert(bid.to_string(), Arc::new(BuildCancelSlot::default()));
+    /// Register a fresh slot before the driving task is spawned. Returning the
+    /// exact Arc lets the task's Drop guard remove only its own slot, never a
+    /// later replacement that reused the same build id.
+    fn register(
+        &self,
+        bid: &str,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Arc<BuildCancelSlot> {
+        let slot = Arc::new(BuildCancelSlot::new(project.to_string(), incarnation));
+        self.map.lock().insert(bid.to_string(), slot.clone());
+        slot
     }
 
     fn attach_task(&self, bid: &str, task: tokio::task::AbortHandle) {
@@ -323,10 +374,32 @@ impl BuildCancelRegistry {
         }
     }
 
-    /// Drop the bookkeeping for a finished build — nothing can spawn under
-    /// this id anymore once it's terminal.
-    fn forget(&self, bid: &str) {
-        self.map.lock().remove(bid);
+    fn complete(&self, bid: &str, slot: &Arc<BuildCancelSlot>) {
+        slot.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        slot.completion.notify_waiters();
+        let mut map = self.map.lock();
+        if map
+            .get(bid)
+            .is_some_and(|registered| Arc::ptr_eq(registered, slot))
+        {
+            map.remove(bid);
+        }
+    }
+
+    async fn wait_completed(slot: &Arc<BuildCancelSlot>, deadline: tokio::time::Instant) -> bool {
+        loop {
+            if slot.completed.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            let notified = slot.completion.notified();
+            if slot.completed.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return slot.completed.load(std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 
     /// Cancel an in-flight build: mark it cancelled, SIGKILL whatever OS
@@ -376,10 +449,61 @@ impl BuildCancelRegistry {
                 task.abort();
             }
         }
-        // The task's own tail (if it got to run) already called `forget` —
-        // this is a no-op then, and the necessary cleanup for the abort path.
-        self.forget(bid);
+        // Completion is owned by the task's Drop guard. Never erase the slot
+        // here: deletion may already hold this Arc and must observe the task and
+        // every checkout guard unwind before reclaiming source.
+        let _ =
+            Self::wait_completed(&slot, tokio::time::Instant::now() + Duration::from_secs(2)).await;
         true
+    }
+
+    /// Cancel every active build owned by one exact incarnation and wait for
+    /// their Drop-owned completion. The returned residual ids are observable
+    /// cleanup failures; callers must not reclaim source while it is non-empty.
+    pub async fn cancel_project_and_drain(
+        &self,
+        cloud: &Arc<CloudState>,
+        project: &str,
+        incarnation: ProjectIncarnation,
+        timeout: Duration,
+    ) -> Result<Vec<String>, Vec<String>> {
+        let slots: Vec<(String, Arc<BuildCancelSlot>)> = self
+            .map
+            .lock()
+            .iter()
+            .filter(|(_, slot)| slot.project == project && slot.incarnation == incarnation)
+            .map(|(id, slot)| (id.clone(), slot.clone()))
+            .collect();
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (id, _) in &slots {
+            let _ = self.cancel(cloud, id).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut residual = Vec::new();
+        for (id, slot) in &slots {
+            if !Self::wait_completed(slot, deadline).await {
+                residual.push(id.clone());
+            }
+        }
+        if residual.is_empty() {
+            Ok(slots.into_iter().map(|(id, _)| id).collect())
+        } else {
+            Err(residual)
+        }
+    }
+}
+
+struct BuildCompletionGuard {
+    cloud: Arc<CloudState>,
+    bid: String,
+    slot: Arc<BuildCancelSlot>,
+}
+
+impl Drop for BuildCompletionGuard {
+    fn drop(&mut self) {
+        self.cloud.build_cancels.complete(&self.bid, &self.slot);
     }
 }
 
@@ -437,6 +561,102 @@ async fn run_cancellable_output(
     out
 }
 
+/// Feed a GitHub token to a git subprocess without ever putting it on the
+/// command line, in an environment variable, or into `.git/config`. Standard
+/// `git credential.helper` mechanism: the helper is a FIXED shell one-liner
+/// that reads a pre-formatted `username=...\npassword=...\n` credential
+/// response off an inherited file descriptor. The descriptor backs a 0600 temp
+/// file that is `unlink()`-ed the instant after it opens — the fd stays valid
+/// and readable, but the path is gone immediately, so no other process can
+/// reach it by name, and root-owns it by construction (this daemon runs as
+/// root) — with FD_CLOEXEC explicitly cleared so it survives into git's
+/// `exec()` (`std::fs::File` sets FD_CLOEXEC by default; git must not lose the
+/// fd at the very step that needs it). `-c credential.helper=` is applied
+/// FIRST to clear any inherited helper — a base image's `osxkeychain`/
+/// `libsecret`/`store` entry would otherwise be consulted ahead of ours and
+/// could leak an unrelated stored credential into a tenant's build (witnessed
+/// directly while prototyping this fix: `git credential fill` silently filled
+/// in a real, unrelated macOS-keychain-stored PAT before a custom helper ever
+/// ran, because nothing had cleared the existing helper chain first) — and the
+/// replacement is scoped to `credential.https://github.com.helper`, never the
+/// blanket `credential.helper` slot, so it is offered only for github.com
+/// HTTPS, matching every existing token resolver (`resolve_git_poll_token`,
+/// `git_webhook`'s installation-token minting), which are github.com-only.
+/// Every caller MUST keep the returned `File` alive until `Command::spawn`
+/// returns: `fork()` copies the parent's fd table before `spawn()` returns, so
+/// the child already holds its own reference by then and the parent's copy
+/// (dropped when the `File` goes out of scope — including on cancellation,
+/// this repo's Drop-releases-on-abort discipline) can close right after.
+fn credential_feed(token: &str) -> anyhow::Result<(std::fs::File, [String; 4])> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+        ".hive-git-cred-{}-{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open credential feed {}", path.display()))?;
+    // Unlink immediately: the fd stays valid and readable, but the path is gone
+    // the instant after open — never a file with a persistent path.
+    let _ = std::fs::remove_file(&path);
+    write!(file, "username=x-access-token\npassword={token}\n").context("write credential feed")?;
+    file.flush().context("flush credential feed")?;
+    file.seek(SeekFrom::Start(0))
+        .context("rewind credential feed")?;
+    let raw = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    anyhow::ensure!(
+        flags >= 0,
+        "fcntl(F_GETFD) on credential feed failed: {}",
+        std::io::Error::last_os_error()
+    );
+    anyhow::ensure!(
+        unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == 0,
+        "fcntl(F_SETFD) on credential feed failed: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok((
+        file,
+        [
+            "-c".to_string(),
+            "credential.helper=".to_string(),
+            "-c".to_string(),
+            format!("credential.https://github.com.helper=!f() {{ cat <&{raw}; }}; f"),
+        ],
+    ))
+}
+
+/// Apply credential config to a git subprocess: always clears any inherited
+/// `credential.helper` first (see `credential_feed`'s doc — this alone closes
+/// the "ambient stored credential leaks into a tenant build" surface even for
+/// an anonymous/public clone), then wires the fixed FD-backed helper when a
+/// token is present. Returns the open `File` the caller must hold alive until
+/// the command has actually been spawned.
+fn apply_credential(
+    cmd: &mut Command,
+    token: Option<&str>,
+) -> anyhow::Result<Option<std::fs::File>> {
+    match token {
+        Some(t) if !t.is_empty() => {
+            let (file, args) = credential_feed(t)?;
+            cmd.args(args);
+            Ok(Some(file))
+        }
+        _ => {
+            cmd.arg("-c").arg("credential.helper=");
+            Ok(None)
+        }
+    }
+}
+
 /// Marker error: `run_build` returned `Err` because the user cancelled it, not
 /// because a step genuinely failed. Lets the outer catch (in `start_build`'s
 /// driving task) set `DeployState::Cancelled` instead of `Error` without
@@ -474,6 +694,77 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     } else {
         out
     }
+}
+
+pub(crate) fn project_volume_name(
+    project: &str,
+    incarnation: ProjectIncarnation,
+    service: Option<&str>,
+) -> String {
+    let mut name = format!(
+        "hive-vol-{}-{}",
+        sanitize_tag(project),
+        incarnation.path_component()
+    );
+    if let Some(service) = service.filter(|service| !service.is_empty()) {
+        name.push('-');
+        name.push_str(&sanitize_tag(service));
+    }
+    name
+}
+
+/// Extract only current-incarnation volume names that the server-authored
+/// container run configuration will actually hand to podman. A stored legacy
+/// or malformed configuration is not cleanup authority: callers either reject
+/// registration or retain it as an observable cleanup residual.
+pub(crate) fn project_volume_names(
+    project: &str,
+    incarnation: ProjectIncarnation,
+    functions: &[fluid_core::FunctionConfig],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let base = project_volume_name(project, incarnation, None);
+    let mut names = std::collections::BTreeSet::new();
+    for function in functions
+        .iter()
+        .filter(|function| function.runtime == "container")
+    {
+        if function.start_cmd.first().map(String::as_str) != Some("__container__") {
+            return Err(format!(
+                "container function {:?} has no platform container marker",
+                function.name
+            ));
+        }
+        let config = function.start_cmd.get(3).ok_or_else(|| {
+            format!(
+                "container function {:?} has no platform run configuration",
+                function.name
+            )
+        })?;
+        let config: serde_json::Value = serde_json::from_str(config).map_err(|error| {
+            format!(
+                "container function {:?} has malformed platform run configuration: {error}",
+                function.name
+            )
+        })?;
+        let volume = config
+            .get("vol")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "container function {:?} has no platform volume name",
+                    function.name
+                )
+            })?;
+        let service = project_volume_name(project, incarnation, Some(&function.name));
+        if volume != base && volume != service {
+            return Err(format!(
+                "container function {:?} volume is not owned by project incarnation {}",
+                function.name, incarnation
+            ));
+        }
+        names.insert(volume.to_string());
+    }
+    Ok(names)
 }
 
 pub fn project_name_from_url(url: &str) -> String {
@@ -548,6 +839,121 @@ pub(crate) fn checkout_prefixes(project: &str) -> Vec<String> {
     v
 }
 
+/// Checkout directories currently being created or read by a build. The GC
+/// and source-selector share this one lock: either a build owns a directory or
+/// the reaper owns its deletion, never both. Counts keep nested/reentrant reads
+/// honest without making the path registry a set with premature release.
+#[derive(Default)]
+struct ActiveCheckoutOwners {
+    total: usize,
+    by_incarnation: HashMap<(String, ProjectIncarnation), usize>,
+}
+
+static ACTIVE_CHECKOUTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, ActiveCheckoutOwners>>> =
+    std::sync::OnceLock::new();
+
+fn active_checkouts() -> &'static Mutex<HashMap<PathBuf, ActiveCheckoutOwners>> {
+    ACTIVE_CHECKOUTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ActiveCheckoutGuard {
+    path: PathBuf,
+    project: String,
+    incarnation: ProjectIncarnation,
+}
+
+impl ActiveCheckoutGuard {
+    fn new(path: PathBuf, project: &str, incarnation: ProjectIncarnation) -> Self {
+        let mut active = active_checkouts().lock();
+        let owners = active.entry(path.clone()).or_default();
+        owners.total += 1;
+        *owners
+            .by_incarnation
+            .entry((project.to_string(), incarnation))
+            .or_default() += 1;
+        drop(active);
+        Self {
+            path,
+            project: project.to_string(),
+            incarnation,
+        }
+    }
+
+    fn register_locked(
+        active: &mut HashMap<PathBuf, ActiveCheckoutOwners>,
+        path: PathBuf,
+        project: &str,
+        incarnation: ProjectIncarnation,
+    ) -> Self {
+        let owners = active.entry(path.clone()).or_default();
+        owners.total += 1;
+        *owners
+            .by_incarnation
+            .entry((project.to_string(), incarnation))
+            .or_default() += 1;
+        Self {
+            path,
+            project: project.to_string(),
+            incarnation,
+        }
+    }
+}
+
+impl Drop for ActiveCheckoutGuard {
+    fn drop(&mut self) {
+        let mut active = active_checkouts().lock();
+        let Some(owners) = active.get_mut(&self.path) else {
+            return;
+        };
+        owners.total = owners.total.saturating_sub(1);
+        let owner = (self.project.clone(), self.incarnation);
+        if let Some(count) = owners.by_incarnation.get_mut(&owner) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                owners.by_incarnation.remove(&owner);
+            }
+        }
+        if owners.total == 0 {
+            active.remove(&self.path);
+        }
+    }
+}
+
+pub(crate) fn active_checkout_paths(
+    project: &str,
+    incarnation: ProjectIncarnation,
+) -> Vec<PathBuf> {
+    let owner = (project.to_string(), incarnation);
+    active_checkouts()
+        .lock()
+        .iter()
+        .filter(|(_, owners)| owners.by_incarnation.contains_key(&owner))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Wait until every checkout reader/writer for one deleted incarnation has
+/// released its Drop-owned reservation. The bounded error names the exact paths
+/// that remain owned, so deletion can retain and report them rather than race a
+/// reader or claim complete cleanup.
+pub(crate) async fn wait_for_checkout_drain(
+    project: &str,
+    incarnation: ProjectIncarnation,
+    timeout: Duration,
+) -> Result<(), Vec<PathBuf>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let active = active_checkout_paths(project, incarnation);
+        if active.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(active);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// The newest on-disk deploy checkout for a project (`<deploy_root>/<tag>-*`),
 /// preferring a completed checkout with a package.json/Dockerfile. Lets a node that
 /// holds the SOURCE derive the service graph even when it holds no deployment
@@ -586,6 +992,83 @@ pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
     cands.pop().map(|(_, p)| p)
 }
 
+fn checkout_matches_source_id(name: &str, prefixes: &[String], id: &str) -> bool {
+    if !valid_source_build_id(id) {
+        return false;
+    }
+    let suffix = format!("-{id}");
+    let Some(stem) = name.strip_suffix(&suffix) else {
+        return false;
+    };
+    prefixes.iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|stamp| {
+            !stamp.is_empty() && stamp.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+/// `newest_deploy_dir` restricted to checkouts belonging to specific
+/// BUILD ids: dirs are named `{tag}-{ms}-{build_id}`. An empty allowlist is
+/// never an upload-redeploy wildcard; absent provenance fails closed.
+pub(crate) fn newest_deploy_dir_for_ids(project: &str, ids: &[String]) -> Option<PathBuf> {
+    newest_deploy_dir_for_ids_inner(project, ids)
+}
+
+fn newest_deploy_dir_for_ids_inner(project: &str, ids: &[String]) -> Option<PathBuf> {
+    if ids.is_empty() {
+        return None;
+    }
+    let prefixes = checkout_prefixes(project);
+    let mut cands: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for base in [deploy_root(), legacy_deploy_root()] {
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+                continue;
+            }
+            if !ids
+                .iter()
+                .any(|id| checkout_matches_source_id(&name, &prefixes, id))
+            {
+                continue;
+            }
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if !p.join("package.json").exists()
+                && !p.join("Dockerfile").exists()
+                && !p.join("Containerfile").exists()
+            {
+                continue;
+            }
+            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                cands.push((m, p));
+            }
+        }
+    }
+    cands.sort_by_key(|(m, _)| *m);
+    cands.pop().map(|(_, p)| p)
+}
+
+/// Select and pin retained source under the same lock the reaper takes before
+/// deletion. The selector can therefore never hand a path to `copy_dir_into`
+/// after GC has decided to remove it, nor can GC claim it after selection.
+fn acquire_deploy_dir_for_ids(
+    project: &str,
+    incarnation: ProjectIncarnation,
+    ids: &[String],
+) -> Option<(PathBuf, ActiveCheckoutGuard)> {
+    let mut active = active_checkouts().lock();
+    let path = newest_deploy_dir_for_ids_inner(project, ids)?;
+    let guard =
+        ActiveCheckoutGuard::register_locked(&mut active, path.clone(), project, incarnation);
+    Some((path, guard))
+}
+
 /// Whether `project` already has a deployment ANYWHERE in the fleet — the local
 /// gateway OR a peer node (via gossiped `peer_deployments`). This distinguishes a
 /// FIRST deploy from a REDEPLOY. Critical for remotely-placed projects: the
@@ -607,6 +1090,38 @@ fn project_has_deployment(cloud: &Arc<CloudState>, project: &str) -> bool {
         .any(|d| d.project == project)
 }
 
+fn checkout_paths_overlap(left: &Path, right: &Path) -> bool {
+    if left == right || left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right || left.starts_with(&right) || right.starts_with(&left)
+}
+
+/// Claim and remove one stale candidate under the same lock used to register
+/// active checkouts. A completed build registers its deployment before its
+/// guard drops, so checking active owners first and current deployment roots
+/// second leaves no gap where neither can protect the directory.
+fn reap_build_dir_if_unprotected(cloud: &Arc<CloudState>, path: &Path) -> bool {
+    let active = active_checkouts().lock();
+    if active
+        .keys()
+        .any(|active_path| checkout_paths_overlap(path, active_path))
+    {
+        return false;
+    }
+    if cloud
+        .gw
+        .deployment_records()
+        .iter()
+        .any(|record| checkout_paths_overlap(path, Path::new(&record.root)))
+    {
+        return false;
+    }
+    std::fs::remove_dir_all(path).is_ok()
+}
+
 /// Self-management GC: reap stale clone/build working dirs under the deploy
 /// roots. Each build clones a repo into `<root>/<tag>-<stamp>-<bid>` (and
 /// `-building-<ms>-<bid>`); these are NOT removed after the build, so they
@@ -618,14 +1133,6 @@ fn project_has_deployment(cloud: &Arc<CloudState>, project: &str) -> bool {
 /// BOTH the durable root and the legacy /tmp root (pre-durability checkouts
 /// still age out there). Best-effort; returns the number of dirs removed.
 pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize {
-    // Never reap a dir that currently backs a deployment (its `root`), canonicalized
-    // so symlink/relative differences don't cause a false "not live".
-    let live_roots: std::collections::HashSet<PathBuf> = cloud
-        .gw
-        .deployment_records()
-        .iter()
-        .map(|r| std::fs::canonicalize(&r.root).unwrap_or_else(|_| PathBuf::from(&r.root)))
-        .collect();
     let now = std::time::SystemTime::now();
     let mut removed = 0usize;
     for root in [deploy_root(), legacy_deploy_root()] {
@@ -638,10 +1145,6 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
             if !p.is_dir() {
                 continue;
             }
-            let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-            if live_roots.contains(&canon) {
-                continue; // backs a live deployment — keep it
-            }
             let stale = e
                 .metadata()
                 .await
@@ -650,7 +1153,17 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
                 .and_then(|t| now.duration_since(t).ok())
                 .map(|age| age > max_age)
                 .unwrap_or(false);
-            if stale && tokio::fs::remove_dir_all(&p).await.is_ok() {
+            if !stale {
+                continue;
+            }
+            let candidate = p.clone();
+            let cloud = cloud.clone();
+            let reaped = tokio::task::spawn_blocking(move || {
+                reap_build_dir_if_unprotected(&cloud, &candidate)
+            })
+            .await
+            .unwrap_or(false);
+            if reaped {
                 removed += 1;
                 tracing::info!(dir = %p.display(), "gc: reaped stale build dir");
             }
@@ -671,6 +1184,7 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
 struct PlaceholderGuard {
     cloud: Arc<CloudState>,
     id: Option<String>,
+    incarnation: ProjectIncarnation,
 }
 
 impl PlaceholderGuard {
@@ -689,29 +1203,80 @@ impl Drop for PlaceholderGuard {
             return;
         };
         let cloud = self.cloud.clone();
+        let incarnation = self.incarnation;
         handle.spawn(async move {
-            cloud.gw.remove(&id).await;
+            cloud.gw.remove_exact(&id, incarnation).await;
             crate::persist::persist(&cloud);
             tracing::warn!(deployment = %id, "removed Building… placeholder after its build task ended without finishing (cancel/panic)");
         });
     }
 }
 
-/// Start a build; returns its id immediately. The build runs in the background.
-pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
+/// Start a build and return its id after its lifecycle reservations exist.
+/// `expected_incarnation` is authority passed separately by the authenticated
+/// fanout receiver; the identically-named request field is never trusted here.
+pub async fn start_build(
+    cloud: Arc<CloudState>,
+    mut req: GitDeployRequest,
+    expected_incarnation: Option<ProjectIncarnation>,
+    admission_team: Option<String>,
+) -> anyhow::Result<String> {
+    // Reject a credential-bearing or structurally-unsafe source BEFORE any of
+    // it can reach a `Build` row, a webhook payload, a log line, or process
+    // argv — everything below this line persists/emits `req.repo_url`.
+    validate_deploy_source(&req)?;
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
     let project = req
         .project
         .clone()
         .unwrap_or_else(|| project_name_from_url(&req.repo_url));
-    // Latest-push-wins coalescing (bn-launch-sequencing-rebuild-before-deploy):
-    // any in-flight build of the same project is now stale — mark it superseded
-    // so it vetoes its own production flip just before `deploy_full`. Without
-    // this, two rapid pushes race to the production alias and the LAST FINISH
-    // wins regardless of commit freshness (an older commit's slow build could
-    // regress production indefinitely).
+    req.project_incarnation = None;
+    // Non-Git sources carry no Git credential need; strip it here so it can
+    // never ride a fanout/mirror payload for a source that never clones.
+    if req.image_ref.is_some() || req.zip_b64.is_some() {
+        req.git_token = None;
+    }
+
+    let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
+    let legacy_deployment_ids = admission_team
+        .as_deref()
+        .map(|team| crate::admin::legacy_deployment_ids_for_owner(&cloud, &project, team))
+        .unwrap_or_default();
+    let incarnation = match expected_incarnation {
+        Some(expected) => cloud
+            .projects
+            .ensure_incarnation_exact(&project, expected)?,
+        None => cloud.projects.ensure_incarnation(&project)?,
+    };
+    if let Some(team) = admission_team.as_deref() {
+        cloud.projects.set_team_exact(&project, incarnation, team)?;
+    }
+    if let Some(root) = req
+        .root_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        cloud
+            .projects
+            .set_root_dir_exact(&project, incarnation, root)?;
+    }
+    crate::admin::adopt_authorized_legacy_deployments(
+        &cloud,
+        &project,
+        incarnation,
+        legacy_deployment_ids,
+    )?;
+    cloud.git_index.set_project_repo(&project, &req.repo_url);
+    req.project_incarnation = Some(incarnation);
+
+    // Latest-push-wins is incarnation-scoped: a new same-name project cannot
+    // supersede work retained from a deleted predecessor.
     for b in cloud.builds.list() {
-        if b.project == project && matches!(b.state, DeployState::Queued | DeployState::Building) {
+        if b.project == project
+            && b.project_incarnation == Some(incarnation)
+            && matches!(b.state, DeployState::Queued | DeployState::Building)
+        {
             cloud.builds.update(&b.id, |old| {
                 old.superseded_by = Some(id.clone());
                 old.lines.push(LogLine {
@@ -724,20 +1289,9 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     cloud.builds.insert(Build {
         id: id.clone(),
         project: project.clone(),
+        project_incarnation: Some(incarnation),
         repo_url: req.repo_url.clone(),
         branch: req.branch.clone().unwrap_or_default(),
-        // Pre-seeded from the request's PINNED commit when the caller already
-        // knows it (the webhook and git-poll paths both set `req.commit` to
-        // the exact target SHA) — never left empty until `run_build` resolves
-        // it post-clone. `commit_eq` treats an empty string as "never equal"
-        // by design (an unpinned build has no target to compare against), so
-        // leaving this at `""` made every already-building-this-commit guard
-        // (the webhook dup-delivery guard in admin.rs, and this function's
-        // own `already_building` check in `git_poll_one`) dead code for the
-        // whole window between build creation and clone completion —
-        // precisely when a near-simultaneous duplicate delivery is most
-        // likely to land. `run_build` still overwrites this with the
-        // resolved commit later (line ~1771), a no-op when it already matches.
         commit: req.commit.clone().unwrap_or_default(),
         commit_message: String::new(),
         state: DeployState::Building,
@@ -749,14 +1303,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         error: None,
         lines: Vec::new(),
     });
-    // Durability: a redeploy never registers a placeholder (`disarm()` below
-    // returns None for it), so without this the Build record above lives only
-    // in `cloud.builds`' in-memory Mutex until the next periodic
-    // `spawn_metrics_persist_loop` tick (default 120s) — a crash/OOM-kill in
-    // that window loses the record entirely rather than leaving it reconcilable
-    // on boot. Cheap: `persist` only bumps a dirty flag for a background writer.
     crate::persist::persist(&cloud);
-
     crate::webhooks::dispatch(
         &cloud.webhooks,
         &project,
@@ -764,48 +1311,29 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         serde_json::json!({ "id": id, "project": project, "repo": req.repo_url, "state": "building" }),
     );
 
-    // Register cancellation bookkeeping BEFORE spawning the driving task, so a
-    // cancel arriving in the first instant of this build's life (before any
-    // child process even exists) still has somewhere to record itself — see
-    // `BuildCancelRegistry`.
-    cloud.build_cancels.register(&id);
-
+    let slot = cloud.build_cancels.register(&id, &project, incarnation);
+    let completion = BuildCompletionGuard {
+        cloud: cloud.clone(),
+        bid: id.clone(),
+        slot,
+    };
     let bid = id.clone();
     let wh_project = project.clone();
     let cloud_for_registry = cloud.clone();
     let handle = tokio::spawn(async move {
-        // Whether this is the project's FIRST deployment — captured BEFORE the
-        // placeholder registers an alias (which would otherwise make it look like a
-        // redeploy). Drives `npm ci` on the initial build (Task 1). Fleet-aware so a
-        // redeploy of a remotely-placed project isn't mistaken for a first deploy.
+        let _completion = completion;
         let first_deploy = !project_has_deployment(&cloud, &project);
-        // First-deploy only: serve a "Building…" page at the domain immediately so
-        // the URL resolves throughout the build (a slow Next.js build no longer
-        // 404s). The real deployment supersedes it; we then remove the placeholder.
-        // The placeholder is a RESERVATION (it holds the project's host alias),
-        // so it is released by a Drop guard, not by a line at the end of the
-        // happy path: a user cancel ABORTS this task, and an aborted future
-        // never reaches its remaining statements — which is how a shell that
-        // owns `<project>` outlived its build and made this node answer for a
-        // deployment it does not have. Same discipline as `ColdStartGuard`.
         let mut placeholder = PlaceholderGuard {
             cloud: cloud.clone(),
-            id: register_building_placeholder(&cloud, &project, &req, &bid).await,
+            id: register_building_placeholder(&cloud, &project, incarnation, &req, &bid).await,
+            incarnation,
         };
-        let result = run_build(&cloud, &bid, req, project, first_deploy).await;
+        let result = run_build(&cloud, &bid, req, project, incarnation, first_deploy).await;
         if let Some(pid) = placeholder.disarm() {
-            // The real deploy (or the build-failed page) has taken over the alias;
-            // drop the placeholder so it doesn't linger. On a hard error this also
-            // clears the "Building…" page (matching prior no-deployment behavior).
-            let _ = cloud.gw.remove(&pid).await;
+            let _ = cloud.gw.remove_exact(&pid, incarnation).await;
             crate::persist::persist(&cloud);
         }
         if let Err(e) = result {
-            // A cancel already stamped the record + fired the kill (see
-            // `BuildCancelRegistry::cancel`, called from the admin handler) —
-            // distinguish that from a genuine build failure so we don't
-            // overwrite `Cancelled` with `Error` nor fire a spurious
-            // `deployment.error` webhook for a user-requested stop.
             let cancelled = e.downcast_ref::<BuildCancelled>().is_some()
                 || cloud.build_cancels.is_cancelled(&bid);
             if cancelled {
@@ -818,10 +1346,6 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                         b.finished_ms.get_or_insert_with(now_ms);
                     }
                 });
-                // Same durability gap as the insert above: a redeploy's failure/
-                // cancel never runs the placeholder-disarm persist either, so this
-                // terminal state would otherwise sit in-memory-only until the next
-                // periodic flush.
                 crate::persist::persist(&cloud);
             } else {
                 let err_text = e.to_string();
@@ -840,25 +1364,48 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                 );
             }
         }
-        cloud.build_cancels.forget(&bid);
     });
     cloud_for_registry
         .build_cancels
         .attach_task(&id, handle.abort_handle());
-    id
+    Ok(id)
 }
 
-/// True when THIS node holds the retained source for `project` — a durable
-/// `<tag>.src.zip` OR a prior build checkout — i.e. a zip redeploy can rebuild
-/// here without re-fetching from a peer.
-pub(crate) fn has_local_source(project: &str) -> bool {
-    retained_source_path(project).is_some() || newest_deploy_dir(project).is_some()
+/// True when THIS node holds retained source that can rebuild one of `ids`.
+/// `ids` are platform-issued BUILD ids stamped into upload GitSource.commit;
+/// empty/legacy provenance fails closed instead of selecting a different lane.
+pub(crate) fn has_local_source_for_ids(project: &str, ids: &[String]) -> bool {
+    retained_source_path_for_ids(project, ids).is_some()
+        || newest_deploy_dir_for_ids(project, ids).is_some()
 }
 
-/// The durable retained-source archive for a zip-uploaded project
-/// (`<deploy_root>/<tag>.src.zip`). Writes always target this path.
-fn retained_source_write_path(project: &str) -> PathBuf {
-    deploy_root().join(format!("{}.src.zip", checkout_tag(project)))
+fn valid_source_build_id(id: &str) -> bool {
+    id.strip_prefix("dpl-").is_some_and(|suffix| {
+        suffix.len() == 10
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+pub(crate) fn upload_source_build_id(source: &fluid_core::GitSource) -> Option<String> {
+    (source.repo_url.starts_with("upload://") && valid_source_build_id(&source.commit))
+        .then(|| source.commit.clone())
+}
+
+/// Durable retained source for one upload lineage. The build id is platform-
+/// issued and validated before it becomes a path component; previews and
+/// production uploads therefore never overwrite one project-wide archive.
+fn retained_source_write_path(project: &str, build_id: &str) -> PathBuf {
+    debug_assert!(valid_source_build_id(build_id));
+    deploy_root().join(format!("{}-{build_id}.src.zip", checkout_tag(project)))
+}
+
+fn retained_source_path_for_ids(project: &str, ids: &[String]) -> Option<PathBuf> {
+    ids.iter()
+        .filter(|id| valid_source_build_id(id))
+        .map(|id| retained_source_write_path(project, id))
+        .find(|path| path.is_file())
 }
 
 /// Find a browser-handler file for a function that did NOT opt in via
@@ -959,38 +1506,45 @@ async fn fluid_json_browser_optins(build_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The retained-source archive to READ: the durable location first, then the
-/// pre-durability /tmp locations (sanitized and raw-name) so a zip project
-/// deployed by an older binary can still redeploy after the upgrade.
-fn retained_source_path(project: &str) -> Option<PathBuf> {
-    let tag = checkout_tag(project);
-    [
-        retained_source_write_path(project),
-        legacy_deploy_root().join(format!("{tag}.src.zip")),
-        legacy_deploy_root().join(format!("{project}.src.zip")),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
-}
-
 /// Redeploy a project whose retained source lives on a SPECIFIC host node (not this
 /// coordinator). Dispatch the rebuild to that node over the existing fanout transport
 /// (HTTP admin or iroh mesh); the target, receiving an `upload://` request with no
 /// archive, rebuilds from ITS OWN retained source. The remote build is mirrored into a
 /// local build record so the dashboard shows a single build. Returns the build id.
-pub(crate) fn redeploy_on_host(
+pub(crate) async fn redeploy_on_host(
     cloud: Arc<CloudState>,
     project: String,
-    req: GitDeployRequest,
+    mut req: GitDeployRequest,
     host: crate::schedule::Target,
-) -> String {
+    expected_incarnation: Option<ProjectIncarnation>,
+) -> anyhow::Result<String> {
+    // Same gate as `start_build` — every `cloud.builds.insert` site validates
+    // first. This path's `repo_url` normally comes from an already-validated
+    // stored project record, but validating again is cheap and keeps the
+    // invariant absolute rather than trust-dependent on the caller.
+    validate_deploy_source(&req)?;
+    // Same non-Git-source token strip as `start_build` — this path exists
+    // specifically for retained upload/image redeploys, which never clone.
+    if req.image_ref.is_some() || req.zip_b64.is_some() {
+        req.git_token = None;
+    }
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
+    req.project_incarnation = None;
+    let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
+    let incarnation = match expected_incarnation {
+        Some(expected) => cloud
+            .projects
+            .ensure_incarnation_exact(&project, expected)?,
+        None => cloud.projects.ensure_incarnation(&project)?,
+    };
+    req.project_incarnation = Some(incarnation);
     cloud.builds.insert(Build {
         id: id.clone(),
         project: project.clone(),
+        project_incarnation: Some(incarnation),
         repo_url: req.repo_url.clone(),
         branch: req.branch.clone().unwrap_or_default(),
-        commit: String::new(),
+        commit: req.commit.clone().unwrap_or_default(),
         commit_message: String::new(),
         state: DeployState::Building,
         started_ms: now_ms(),
@@ -1001,29 +1555,31 @@ pub(crate) fn redeploy_on_host(
         error: None,
         lines: Vec::new(),
     });
-    cloud.build_cancels.register(&id);
+    crate::persist::persist(&cloud);
+    let slot = cloud.build_cancels.register(&id, &project, incarnation);
+    let completion = BuildCompletionGuard {
+        cloud: cloud.clone(),
+        bid: id.clone(),
+        slot,
+    };
     let bid = id.clone();
     let cloud_for_registry = cloud.clone();
     let handle = tokio::spawn(async move {
+        let _completion = completion;
         cloud.builds.log(
             &bid,
             format!("Redeploy: dispatching to host node {}", host.node),
         );
-        // Single pinned host = the deploy's one-and-only (primary) target — never
-        // a secondary replica of a multi-region fanout. `fanout_remote` publishes
-        // it as this build's cancel mirror target as soon as dispatch succeeds.
         let ok = fanout_remote(
             &cloud,
             &bid,
             &req,
             &project,
+            incarnation,
             std::slice::from_ref(&host),
             true,
         )
         .await;
-        // Single pinned host: promotable == that one host is Ready. The
-        // outcome type still matters here for the REASON reported — an
-        // unreachable pinned host is a fleet fault, not a build failure.
         let promotable = ok.promotable();
         let cancelled = (!promotable && ok.cancelled())
             || (!promotable && cloud.build_cancels.is_cancelled(&bid));
@@ -1032,16 +1588,11 @@ pub(crate) fn redeploy_on_host(
             cloud.builds.log(
                 &bid,
                 if unreachable.is_empty() {
-                    // Reachable, but it declined to host (stateful single-writer
-                    // guard). Not a fleet fault and not a build failure.
-                    "✗ the pinned host declined to run this deploy as a stateful single-writer \
-                     service — nothing was built there and the existing deployment is untouched."
+                    "✗ the pinned host declined to run this deploy as a stateful single-writer service — nothing was built there and the existing deployment is untouched."
                         .to_string()
                 } else {
                     format!(
-                        "✗ could not reach {unreachable} to run this deploy — nothing was built \
-                         there, so the existing deployment is untouched. This is a \
-                         fleet-reachability fault, not a build failure; retry once the node is back."
+                        "✗ could not reach {unreachable} to run this deploy — nothing was built there, so the existing deployment is untouched. This is a fleet-reachability fault, not a build failure; retry once the node is back."
                     )
                 },
             );
@@ -1057,12 +1608,281 @@ pub(crate) fn redeploy_on_host(
             b.finished_ms = Some(now_ms());
         });
         crate::persist::persist(&cloud);
-        cloud.build_cancels.forget(&bid);
     });
     cloud_for_registry
         .build_cancels
         .attach_task(&id, handle.abort_handle());
-    id
+    Ok(id)
+}
+
+async fn resolve_checkout_dir(
+    checkout: &Path,
+    configured_root: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let checkout = tokio::fs::canonicalize(checkout).await.map_err(|error| {
+        anyhow::anyhow!(
+            "could not resolve deployment checkout '{}': {error}",
+            checkout.display()
+        )
+    })?;
+    let Some(configured_root) = configured_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    else {
+        return Ok(checkout);
+    };
+    anyhow::ensure!(
+        configured_root.len() <= 4096 && !configured_root.chars().any(char::is_control),
+        "root directory {:?} contains control characters or exceeds 4096 bytes",
+        configured_root
+    );
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(configured_root).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => relative.push(name),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "root directory {:?} must be a relative path inside the repository",
+                    configured_root
+                );
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Ok(checkout);
+    }
+
+    let mut cursor = checkout.clone();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        let metadata = tokio::fs::symlink_metadata(&cursor)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "root directory {:?} was not found in the repository: {error}",
+                    configured_root
+                )
+            })?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "root directory {:?} traverses a symbolic link; choose a real repository directory",
+            configured_root
+        );
+    }
+
+    let candidate = tokio::fs::canonicalize(&cursor).await.map_err(|error| {
+        anyhow::anyhow!(
+            "could not resolve root directory {:?}: {error}",
+            configured_root
+        )
+    })?;
+    let metadata = tokio::fs::metadata(&candidate).await?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "root directory {:?} is not a directory",
+        configured_root
+    );
+    anyhow::ensure!(
+        candidate.starts_with(&checkout),
+        "root directory {:?} escapes the repository checkout",
+        configured_root
+    );
+    Ok(candidate)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildTrustLane {
+    Production,
+    PreviewBase,
+    PreviewFork,
+}
+
+impl BuildTrustLane {
+    fn environment(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::PreviewBase | Self::PreviewFork => "preview",
+        }
+    }
+
+    fn cache_label(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::PreviewBase => "preview-base",
+            Self::PreviewFork => "preview-fork",
+        }
+    }
+
+    fn is_production(self) -> bool {
+        self == Self::Production
+    }
+
+    fn is_fork(self) -> bool {
+        self == Self::PreviewFork
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BuildTrustContext {
+    lane: BuildTrustLane,
+    canonical_repo: String,
+    actual_repo: String,
+}
+
+fn repository_identity(raw: &str) -> anyhow::Result<String> {
+    let raw = raw.trim();
+    anyhow::ensure!(!raw.is_empty(), "repository URL is empty");
+    anyhow::ensure!(
+        !raw.chars().any(char::is_control),
+        "repository URL contains control characters"
+    );
+    // A value starting with '-' could be parsed as a git OPTION instead of a
+    // positional URL/pathspec by any downstream `git` invocation that forwards
+    // it verbatim (clone/fetch/ls-remote all take the url as a bare arg) —
+    // reject it here, once, rather than trusting every call site to guard
+    // argv order.
+    anyhow::ensure!(
+        !raw.starts_with('-'),
+        "repository URL may not begin with '-'"
+    );
+    if let Some(rest) = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+    {
+        let authority = rest.split('/').next().unwrap_or_default();
+        anyhow::ensure!(
+            !authority.contains('@'),
+            "repository URLs must not contain embedded credentials; connect GitHub or use the server-side git credential"
+        );
+        anyhow::ensure!(!authority.is_empty(), "repository URL has no host");
+        let path = rest.splitn(2, '/').nth(1).unwrap_or_default();
+        anyhow::ensure!(
+            !path.trim_matches('/').is_empty(),
+            "repository URL has no path"
+        );
+    }
+    Ok(raw
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(raw.trim_end_matches('/'))
+        .to_string())
+}
+
+/// An OCI reference may contain at most one `@`, and only ever as a content
+/// digest pin (`@sha256:<hex>`, or another registered digest algorithm) — that
+/// is the ONLY place `@` is valid in OCI reference grammar. A crafted string
+/// shaped like HTTP userinfo (`user:token@registry/...`) is not valid OCI
+/// syntax, but nothing downstream re-validates it before it reaches
+/// `podman pull`'s argv and every log line that names the image verbatim
+/// (`image_container_manifest`) — reject it here, before either happens.
+fn reject_credential_bearing_image_ref(image: &str) -> anyhow::Result<()> {
+    let image = image.trim();
+    anyhow::ensure!(!image.is_empty(), "image reference is empty");
+    anyhow::ensure!(
+        !image.chars().any(char::is_control),
+        "image reference contains control characters"
+    );
+    anyhow::ensure!(
+        !image.starts_with('-'),
+        "image reference may not begin with '-'"
+    );
+    let mut parts = image.splitn(3, '@');
+    let _reference = parts.next().unwrap_or_default();
+    if let Some(digest) = parts.next() {
+        anyhow::ensure!(
+            parts.next().is_none(),
+            "image reference contains more than one '@'; credential-bearing image references are rejected"
+        );
+        let valid_digest = digest.split_once(':').is_some_and(|(algo, hex)| {
+            !algo.is_empty()
+                && algo
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'.' | b'-'))
+                && hex.len() >= 32
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        anyhow::ensure!(
+            valid_digest,
+            "image reference '@' suffix is not a valid content digest; credential-bearing image references are rejected"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a credential-bearing or structurally-unsafe deploy source before it
+/// can reach a `Build` row, a webhook payload, a log line, or process argv.
+/// Callers MUST run this before `cloud.builds.insert` — the two insertion
+/// sites in this file (`start_build`, `redeploy_on_host`) both call it first.
+fn validate_deploy_source(req: &GitDeployRequest) -> anyhow::Result<()> {
+    repository_identity(&req.repo_url).context("repository URL")?;
+    if let Some(head) = req.head_repo_url.as_deref().filter(|s| !s.is_empty()) {
+        repository_identity(head).context("fork repository URL")?;
+    }
+    if let Some(image) = req.image_ref.as_deref() {
+        reject_credential_bearing_image_ref(image).context("image reference")?;
+    }
+    Ok(())
+}
+
+fn resolve_build_trust(
+    cloud: &Arc<CloudState>,
+    req: &GitDeployRequest,
+    project: &str,
+    incarnation: ProjectIncarnation,
+) -> anyhow::Result<BuildTrustContext> {
+    let canonical_repo = repository_identity(&req.repo_url)?;
+    let actual_repo = match req.head_repo_url.as_deref().map(str::trim) {
+        Some(url) if !url.is_empty() => repository_identity(url)?,
+        _ => canonical_repo.clone(),
+    };
+    let source_is_fork = !same_repository(&actual_repo, &canonical_repo);
+    let requested_target = req.target.as_deref().map(str::trim);
+    anyhow::ensure!(
+        !(source_is_fork && requested_target == Some("production")),
+        "a fork source cannot deploy directly to production; build it as a protected preview first"
+    );
+
+    let branch = req.branch.as_deref().unwrap_or("").trim();
+    let production_branch = cloud
+        .projects
+        .get_exact(project, incarnation)?
+        .production_branch;
+    if requested_target == Some("production") && !production_branch.is_empty() && !branch.is_empty()
+    {
+        anyhow::ensure!(
+            branch == production_branch,
+            "production target contradicts the server-owned production branch: branch {branch:?} is not {production_branch:?}"
+        );
+    }
+
+    let lane = if source_is_fork {
+        BuildTrustLane::PreviewFork
+    } else {
+        match requested_target {
+            Some("preview") => BuildTrustLane::PreviewBase,
+            Some("production") => BuildTrustLane::Production,
+            _ if !production_branch.is_empty() && !branch.is_empty() => {
+                if branch == production_branch {
+                    BuildTrustLane::Production
+                } else {
+                    BuildTrustLane::PreviewBase
+                }
+            }
+            // First source deploy establishes its branch as production. A
+            // branch-less request for an existing project cannot prove that it
+            // targets production and therefore fails toward preview.
+            _ if production_branch.is_empty() => BuildTrustLane::Production,
+            _ => BuildTrustLane::PreviewBase,
+        }
+    };
+
+    Ok(BuildTrustContext {
+        lane,
+        canonical_repo,
+        actual_repo,
+    })
 }
 
 async fn run_build(
@@ -1070,37 +1890,71 @@ async fn run_build(
     bid: &str,
     mut req: GitDeployRequest,
     project: String,
+    incarnation: ProjectIncarnation,
     first_deploy: bool,
 ) -> anyhow::Result<()> {
+    cloud.projects.get_exact(&project, incarnation)?;
     let region = &cloud.region;
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
 
-    // Persist any env vars supplied with the deploy (e.g. from the New Project
-    // screen) onto the project BEFORE building, so they're available to BOTH the
-    // build commands (via env_map below) and the runtime (function configs).
-    if let Some(env) = &req.env {
-        for (k, v) in env {
-            if k.trim().is_empty() {
-                continue;
-            }
-            cloud.projects.put_env(
-                &project,
-                crate::project_settings::EnvVar {
-                    key: k.trim().to_string(),
-                    value: v.clone(),
-                    target: "all".into(),
-                    sensitive: false,
-                    updated_ms: 0,
-                },
-            );
+    // This is the first operation in the build driver. It runs before fanout,
+    // source acquisition, Git metadata reads, ignoreCommand, install, build,
+    // warmup, or cache access, and is recomputed independently on every target.
+    // The request's target is only an assertion checked against server state;
+    // fork provenance and the stored production branch remain authoritative.
+    let trust = resolve_build_trust(cloud, &req, &project, incarnation)?;
+    req.target = Some(trust.lane.environment().to_string());
+    if trust.lane.is_production() {
+        let branch = req.branch.as_deref().unwrap_or("").trim();
+        if cloud
+            .projects
+            .get_exact(&project, incarnation)?
+            .production_branch
+            .is_empty()
+            && !branch.is_empty()
+        {
+            cloud
+                .projects
+                .set_production_branch_exact(&project, incarnation, branch)?;
+            log(format!("Production branch set to '{branch}'."));
         }
-        if !env.is_empty() {
-            log(format!(
-                "Set {} environment variable(s) for the project.",
-                env.iter().filter(|(k, _)| !k.trim().is_empty()).count()
-            ));
-            crate::persist::persist(cloud);
+    }
+
+    // Persist env supplied by a DIRECT deploy as runtime-only and only for the
+    // selected environment. A fanout sub-build receives an already-filtered
+    // ephemeral runtime map from its coordinator; writing that map back would
+    // widen its provenance. A fork request is never allowed to mutate durable
+    // project env, even when it landed on the coordinator directly.
+    if let Some(env) = &req.env {
+        if !req.no_fanout && !trust.lane.is_fork() {
+            for (k, v) in env {
+                if k.trim().is_empty() {
+                    continue;
+                }
+                cloud.projects.put_env_exact(
+                    &project,
+                    incarnation,
+                    crate::project_settings::EnvVar {
+                        key: k.trim().to_string(),
+                        value: v.clone(),
+                        target: trust.lane.environment().into(),
+                        scope: "runtime".into(),
+                        sensitive: false,
+                        updated_ms: 0,
+                    },
+                )?;
+            }
+            if !env.is_empty() {
+                log(format!(
+                    "Set {} runtime environment variable(s) for {}.",
+                    env.iter().filter(|(k, _)| !k.trim().is_empty()).count(),
+                    trust.lane.environment(),
+                ));
+                crate::persist::persist(cloud);
+            }
+        } else if trust.lane.is_fork() && !env.is_empty() {
+            log("Fork preview: request environment was not persisted.".into());
         }
     }
 
@@ -1108,15 +1962,34 @@ async fn run_build(
     // FunctionSettings so this target builds with the user's configured framework/
     // commands + compute tier (not just auto-detect). Direct user deploys omit
     // these (the coordinator reads its own store).
-    if let Some(bc) = req.build_config.as_ref().and_then(|v| {
-        serde_json::from_value::<crate::project_settings::BuildConfig>(v.clone()).ok()
-    }) {
-        cloud.projects.set_build(&project, bc);
+    if let Some(value) = req.build_config.as_ref() {
+        let build_config = serde_json::from_value::<crate::project_settings::BuildConfig>(
+            value.clone(),
+        )
+        .map_err(|error| {
+            fluid_build::BuildContractError::new(
+                fluid_build::BuildContractErrorCode::InvalidForwardedSettings,
+                "adopt forwarded BuildConfig",
+                error.to_string(),
+            )
+        })?;
+        cloud
+            .projects
+            .set_build_exact(&project, incarnation, build_config)?;
     }
-    if let Some(fs) = req.function_settings.as_ref().and_then(|v| {
-        serde_json::from_value::<crate::project_settings::FunctionSettings>(v.clone()).ok()
-    }) {
-        cloud.projects.set_functions(&project, fs);
+    if let Some(value) = req.function_settings.as_ref() {
+        let function_settings =
+            serde_json::from_value::<crate::project_settings::FunctionSettings>(value.clone())
+                .map_err(|error| {
+                    fluid_build::BuildContractError::new(
+                        fluid_build::BuildContractErrorCode::InvalidForwardedSettings,
+                        "adopt forwarded FunctionSettings",
+                        error.to_string(),
+                    )
+                })?;
+        cloud
+            .projects
+            .set_functions_exact(&project, incarnation, function_settings)?;
     }
 
     // ---- Placement scheduler / fanout (coordinator only) -------------------
@@ -1125,7 +1998,8 @@ async fn run_build(
     // place it there rather than always building on this (the coordinator) node —
     // which is the resource-poor local Mac. See `schedule::place`.
     if !req.no_fanout {
-        let regions = cloud.projects.get(&project).functions.regions;
+        let placement_settings = cloud.projects.get_exact(&project, incarnation)?;
+        let regions = placement_settings.functions.regions.clone();
         // is_container is unknown until the repo is built (Dockerfile detection),
         // so default to firecracker placement here; a container is re-homed to a
         // podman-capable node after the build (see the capability re-dispatch below).
@@ -1150,7 +2024,7 @@ async fn run_build(
         // branch, which never reaches the tail here and whose `no_fanout`
         // sub-builds skip both of this coordinator's gates.
         let known_container = req.image_ref.is_some();
-        let needs_gpu = cloud.projects.get(&project).functions.gpu;
+        let needs_gpu = placement_settings.functions.gpu;
         // Pre-build placement, so there is no manifest yet — the only Wasmer
         // signal available this early is an explicit runtime in Project
         // Settings. A project that declares `runtime: "wasmer"` ONLY in a
@@ -1158,11 +2032,9 @@ async fn run_build(
         // is caught by the post-build fanout gate and the cold-start refusal
         // instead. Partial knowledge used honestly: it can only ever REMOVE
         // incapable nodes, never add one.
-        let known_wasm = cloud
-            .projects
-            .get_if_set(&project)
-            .map(|s| hive_core::Runtime::from_config_str(&s.build.runtime))
-            == Some(Some(hive_core::Runtime::Wasmer));
+        let known_wasm = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
+            == Some(hive_core::Runtime::Wasmer);
+        let needs_build_isolation = !known_container;
         let targets = crate::schedule::place_for_project(
             cloud,
             &project,
@@ -1171,7 +2043,21 @@ async fn run_build(
             known_container,
             needs_gpu,
             known_wasm,
+            !known_container,
+            needs_build_isolation,
         );
+        let build_isolation_nodes = cloud
+            .registry
+            .nodes()
+            .into_iter()
+            .filter(|n| n.build_isolation_protocol == Some(1))
+            .count();
+        if needs_build_isolation && targets.is_empty() && build_isolation_nodes == 0 {
+            let msg = "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no node advertises build-isolation protocol v1. No repository-controlled command was run on the host.".to_string();
+            log(msg.clone());
+            tracing::warn!(project = %project, "deploy refused: no isolated builder capability");
+            return Err(anyhow::anyhow!(msg));
+        }
         // A GPU deployment must NEVER fall through to this node when placement
         // found no GPU-capable target. Everywhere else an empty `targets` means
         // "host locally", which is the right default — but for a GPU request that
@@ -1230,6 +2116,14 @@ async fn run_build(
             tracing::warn!(project = %project, capable_nodes, "deploy refused: wasmer requested, no wasm-capable target");
             return Err(anyhow::anyhow!(msg));
         }
+        if needs_build_isolation && targets.is_empty() {
+            let msg = format!(
+                "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh). No repository-controlled command was run on the host."
+            );
+            log(msg.clone());
+            tracing::warn!(project = %project, build_isolation_nodes, "deploy refused: isolated builder unavailable");
+            return Err(anyhow::anyhow!(msg));
+        }
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
@@ -1248,9 +2142,11 @@ async fn run_build(
             placed.sort();
             placed.dedup();
             if !placed.is_empty() {
-                let mut fs = cloud.projects.get(&project).functions;
+                let mut fs = cloud.projects.get_exact(&project, incarnation)?.functions;
                 fs.regions = placed.clone();
-                cloud.projects.set_functions(&project, fs);
+                cloud
+                    .projects
+                    .set_functions_exact(&project, incarnation, fs)?;
                 crate::persist::persist(cloud);
                 log(format!(
                     "Default region(s) set in Function Settings: {}",
@@ -1297,7 +2193,7 @@ async fn run_build(
             // `run_build`), collapsing the deploy to the primary region only —
             // while a STATELESS multi-region fanout proceeds on every target
             // exactly as before.
-            let ok = fanout_remote(cloud, bid, &req, &project, &remote, true).await;
+            let ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
             // Atomic promotion (Vercel convention): only relocate — i.e. remove the
             // project from nodes that still host the PREVIOUS deployment — once the
             // new placement actually built & is serving. A FAILED build must never
@@ -1423,7 +2319,6 @@ async fn run_build(
                 b.finished_ms = Some(now_ms());
             });
             crate::persist::persist(cloud);
-            cloud.build_cancels.forget(bid);
             return Ok(());
         }
         if local_selected && !remote.is_empty() {
@@ -1456,6 +2351,10 @@ async fn run_build(
     // tenant-controlled name is never a path component verbatim.
     let stamp = now_ms();
     let dir = deploy_root().join(format!("{}-{}-{}", checkout_tag(&project), stamp, bid));
+    // Register before the path can become visible to the reaper. Drop releases
+    // it on every return, panic, task abort, and client cancellation; successful
+    // builds have already registered their deployment root before that release.
+    let _active_checkout = ActiveCheckoutGuard::new(dir.clone(), &project, incarnation);
     tokio::fs::create_dir_all(deploy_root()).await?;
     let branch = req.branch.clone().unwrap_or_default();
 
@@ -1492,14 +2391,13 @@ async fn run_build(
             "Extracted {files} file(s) in {}ms",
             now_ms().saturating_sub(t0)
         ));
-        // Retain the ORIGINAL archive durably so a later Redeploy can rebuild this
-        // zip-uploaded project from source. Stored as a FILE beside the checkouts —
-        // `gc_build_dirs` only reaps directories, so this survives build-dir GC and,
-        // living under the durable deploy root, host reboots; the redeploy path
-        // re-extracts it. Written via tmp+rename: two concurrent builds of the same
-        // project (or a concurrent redeploy re-extracting it) otherwise truncate/
-        // rewrite this shared file mid-read — a torn zip fails the OTHER build.
-        let retained = retained_source_write_path(&project);
+        // Retain the ORIGINAL archive under this build's immutable lineage id so
+        // a later Redeploy can rebuild exactly the selected production/preview
+        // source. A project-wide archive let a newer preview overwrite the bytes
+        // a production redeploy would consume. Stored as a FILE beside checkouts —
+        // `gc_build_dirs` only reaps directories, so it survives build-dir GC and
+        // host reboots. Written via tmp+rename so readers never observe a torn zip.
+        let retained = retained_source_write_path(&project, bid);
         let retained_tmp = deploy_root().join(format!(
             "{}.{}.tmp",
             retained
@@ -1521,7 +2419,7 @@ async fn run_build(
             )),
         }
         (
-            "upload".to_string(),
+            bid.to_string(),
             String::new(),
             format!(
                 "Uploaded {}",
@@ -1534,13 +2432,26 @@ async fn run_build(
         )
     } else if req.repo_url.starts_with("upload://") {
         // REDEPLOY of a zip-uploaded project: no git remote to clone and the request
-        // carries no fresh archive. Rebuild from RETAINED source on THIS node — the
-        // durable `<tag>.src.zip` if present (clean original; `retained_source_path`
-        // also falls back to the pre-durability /tmp locations), else a copy of the
-        // prior build's on-disk checkout. The redeploy handler pins the rebuild to the
-        // node that holds this source, so a missing source here is a real error.
+        // carries no fresh archive. Rebuild only from source carrying the selected
+        // deployment's immutable build-lineage id: its per-build retained archive,
+        // else that exact prior checkout. Legacy records with no lineage fail closed
+        // and ask for re-upload rather than guessing across production/preview lanes.
         let name = req.repo_url.trim_start_matches("upload://").to_string();
-        let retained = retained_source_path(&project);
+        let mut source_build_ids = req
+            .source_deployment_ids
+            .iter()
+            .filter(|id| valid_source_build_id(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        source_build_ids.sort();
+        source_build_ids.dedup();
+        anyhow::ensure!(
+            source_build_ids.len() == 1,
+            "uploaded source has no unique build-lineage id — re-upload the archive to deploy again"
+        );
+        let source_build_id = source_build_ids.remove(0);
+        let retained =
+            retained_source_path_for_ids(&project, std::slice::from_ref(&source_build_id));
         let t0 = now_ms();
         if let Some(retained) = retained {
             log(format!(
@@ -1557,7 +2468,11 @@ async fn run_build(
                 "Extracted {files} file(s) in {}ms",
                 now_ms().saturating_sub(t0)
             ));
-        } else if let Some(src) = newest_deploy_dir(&project) {
+        } else if let Some((src, _source_checkout)) = acquire_deploy_dir_for_ids(
+            &project,
+            incarnation,
+            std::slice::from_ref(&source_build_id),
+        ) {
             log("Redeploy: reusing retained source from the prior build".to_string());
             let (s, d) = (src.clone(), dir.clone());
             tokio::task::spawn_blocking(move || copy_dir_into(&s, &d))
@@ -1573,7 +2488,7 @@ async fn run_build(
             );
         }
         (
-            "upload".to_string(),
+            source_build_id,
             String::new(),
             format!(
                 "Redeploy of {}",
@@ -1615,10 +2530,11 @@ async fn run_build(
         // (interactive deploys), or a freshly minted GitHub App installation
         // token attached by `admin::git_webhook` (webhook-triggered deploys have
         // no user session, see `github_app_auth`) — else a node-level
-        // `GITHUB_TOKEN`. It is injected ONLY into a local clone URL as
-        // `x-access-token` basic auth — `req.repo_url` stays tokenless everywhere it
-        // is logged/persisted, and the token is scrubbed out of any clone stderr.
-        // Applied to `clone_source_url` (the fork, when this is a fork PR): the same
+        // `GITHUB_TOKEN`. Fed to the git process ONLY through `credential_feed`'s
+        // fixed FD-backed helper — never embedded in a clone URL — so
+        // `clone_source_url`/`req.repo_url` stay tokenless everywhere: argv,
+        // `.git/config`, logs, the Build row, webhooks, and fanout. Applied when
+        // cloning `clone_source_url` (the fork, when this is a fork PR): the same
         // installation/token resolution as the base repo is reused verbatim (no new
         // auth flow) — it may not grant access to an arbitrary fork, but a public
         // fork still clones fine anonymously, and a rejected token falls back to the
@@ -1627,12 +2543,8 @@ async fn run_build(
             .git_token
             .clone()
             .filter(|t| !t.is_empty())
-            .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()));
-        let tokenized_url = git_token.as_ref().and_then(|t| {
-            clone_source_url
-                .strip_prefix("https://github.com/")
-                .map(|rest| format!("https://x-access-token:{t}@github.com/{rest}"))
-        });
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()))
+            .filter(|_| clone_source_url.starts_with("https://github.com/"));
 
         // Run `git clone <url>` into `dir`; returns (success, token-scrubbed stderr).
         // Never let git open an interactive credential prompt (GIT_TERMINAL_PROMPT=0 /
@@ -1655,14 +2567,15 @@ async fn run_build(
         // branch. When `req.commit` is None (manual deploy, redeploy, import — no
         // specific commit to pin to), behavior is EXACTLY the prior shallow
         // branch-tip clone.
-        let run_clone = |clone_url: String| {
-            let (dir, branch, token, commit, ccloud, cbid) = (
+        let run_clone = |use_token: bool| {
+            let (dir, branch, token, commit, ccloud, cbid, clone_url) = (
                 dir.clone(),
                 branch.clone(),
-                git_token.clone(),
+                if use_token { git_token.clone() } else { None },
                 pinned_commit.clone(),
                 cloud.clone(),
                 bid.to_string(),
+                clone_source_url.clone(),
             );
             async move {
                 let scrub = |raw: &[u8]| {
@@ -1676,6 +2589,7 @@ async fn run_build(
                     // Fast path: fetch the exact commit directly into a fresh repo.
                     if tokio::fs::create_dir_all(&dir).await.is_ok() {
                         let mut init = Command::new("git");
+                        init.arg("-c").arg("credential.helper=");
                         init.env("GIT_TERMINAL_PROMPT", "0")
                             .env("GIT_ASKPASS", "/bin/echo");
                         init.arg("init").arg("-q").arg(&dir);
@@ -1685,6 +2599,7 @@ async fn run_build(
                             .unwrap_or(false);
                         if init_ok {
                             let mut remote = Command::new("git");
+                            remote.arg("-c").arg("credential.helper=");
                             remote
                                 .env("GIT_TERMINAL_PROMPT", "0")
                                 .env("GIT_ASKPASS", "/bin/echo");
@@ -1701,6 +2616,10 @@ async fn run_build(
                             fetch
                                 .env("GIT_TERMINAL_PROMPT", "0")
                                 .env("GIT_ASKPASS", "/bin/echo");
+                            let _cred = match apply_credential(&mut fetch, token.as_deref()) {
+                                Ok(cred) => cred,
+                                Err(e) => return (false, format!("credential setup failed: {e}")),
+                            };
                             fetch
                                 .arg("-C")
                                 .arg(&dir)
@@ -1713,6 +2632,8 @@ async fn run_build(
                                 Ok(out) if out.status.success() => {
                                     let mut checkout = Command::new("git");
                                     checkout
+                                        .arg("-c")
+                                        .arg("credential.helper=")
                                         .env("GIT_TERMINAL_PROMPT", "0")
                                         .env("GIT_ASKPASS", "/bin/echo")
                                         .arg("-C")
@@ -1754,6 +2675,10 @@ async fn run_build(
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
                         .env("GIT_ASKPASS", "/bin/echo");
+                    let _cred = match apply_credential(&mut cmd, token.as_deref()) {
+                        Ok(cred) => cred,
+                        Err(e) => return (false, format!("credential setup failed: {e}")),
+                    };
                     cmd.arg("clone");
                     if !branch.is_empty() {
                         cmd.arg("--branch").arg(&branch);
@@ -1763,6 +2688,8 @@ async fn run_build(
                         Ok(out) if out.status.success() => {
                             let mut checkout = Command::new("git");
                             checkout
+                                .arg("-c")
+                                .arg("credential.helper=")
                                 .env("GIT_TERMINAL_PROMPT", "0")
                                 .env("GIT_ASKPASS", "/bin/echo")
                                 .arg("-C")
@@ -1784,6 +2711,10 @@ async fn run_build(
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
                         .env("GIT_ASKPASS", "/bin/echo");
+                    let _cred = match apply_credential(&mut cmd, token.as_deref()) {
+                        Ok(cred) => cred,
+                        Err(e) => return (false, format!("credential setup failed: {e}")),
+                    };
                     cmd.arg("clone").arg("--depth").arg("1");
                     if !branch.is_empty() {
                         cmd.arg("--branch").arg(&branch);
@@ -1807,18 +2738,15 @@ async fn run_build(
                 || s.contains("Repository not found")
         };
 
-        let first_url = tokenized_url
-            .clone()
-            .unwrap_or_else(|| clone_source_url.clone());
-        let used_token = tokenized_url.is_some();
-        let (mut ok, mut stderr) = run_clone(first_url).await;
+        let used_token = git_token.is_some();
+        let (mut ok, mut stderr) = run_clone(used_token).await;
         // A stored token that is expired / lacks access must never break a repo that
         // would clone fine anonymously (public repos, token rotation): retry once
         // without the credential before surfacing an error.
         if !ok && used_token && auth_failed(&stderr) {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             log("Retrying clone without the stored GitHub credential…".into());
-            let (ok2, stderr2) = run_clone(clone_source_url.clone()).await;
+            let (ok2, stderr2) = run_clone(false).await;
             ok = ok2;
             stderr = stderr2;
         }
@@ -1845,6 +2773,9 @@ async fn run_build(
                 format!("git clone failed: {stderr}")
             }
         );
+        // `.git/config`'s origin URL was ALWAYS `clone_source_url` (tokenless) —
+        // the credential only ever lived in the FD-backed helper, never in a
+        // clone URL — so there is nothing to scrub here anymore.
         // The token has done its job; drop it so no build/deploy record, gossip frame,
         // or displayed field constructed from `req` beyond this point can retain it.
         req.git_token = None;
@@ -1884,39 +2815,164 @@ async fn run_build(
         b.branch = actual_branch.clone();
     });
 
+    // Verify the pre-command trust decision against the branch Git resolved. A
+    // branch-less first deploy can only learn its default branch after clone; it
+    // may establish that branch, but it may not silently change a pre-existing
+    // production branch.
+    let mut prod_branch = cloud
+        .projects
+        .get_exact(&project, incarnation)?
+        .production_branch;
+    if trust.lane.is_production() && prod_branch.is_empty() && !actual_branch.is_empty() {
+        prod_branch = actual_branch.clone();
+        cloud
+            .projects
+            .set_production_branch_exact(&project, incarnation, &prod_branch)?;
+        log(format!("Production branch set to '{prod_branch}'."));
+    }
+    anyhow::ensure!(
+        !trust.lane.is_production()
+            || prod_branch.is_empty()
+            || actual_branch.is_empty()
+            || actual_branch == prod_branch,
+        "resolved branch {actual_branch:?} contradicts the server-owned production branch {prod_branch:?}"
+    );
+    let is_production = trust.lane.is_production();
+    let allow_all_environment = !trust.lane.is_fork();
+    let build_env = cloud.projects.env_map_for_execution_exact(
+        &project,
+        incarnation,
+        trust.lane.environment(),
+        crate::project_settings::EnvExecutionScope::Build,
+        allow_all_environment,
+    )?;
+    let stored_runtime_env = cloud.projects.env_map_for_execution_exact(
+        &project,
+        incarnation,
+        trust.lane.environment(),
+        crate::project_settings::EnvExecutionScope::Runtime,
+        allow_all_environment,
+    )?;
+    let runtime_env = if req.no_fanout {
+        // Coordinator-filtered, ephemeral runtime values. Build variables are
+        // always re-selected locally by explicit environment + build scope and
+        // can never hitchhike in this compatibility map.
+        req.env.clone().unwrap_or(stored_runtime_env)
+    } else {
+        stored_runtime_env
+    };
+    if trust.lane.is_fork() {
+        log(format!(
+            "Fork preview: only explicitly preview-scoped variables are eligible ({} build, {} runtime); all-environment and production values are withheld.",
+            build_env.len(),
+            runtime_env.len(),
+        ));
+    }
+    let build_cache_enabled = req.use_cache;
+
     // Build from a subdirectory for monorepo templates (e.g. `examples/nextjs`).
-    // Use the request's root_dir, falling back to the project's persisted one so
-    // redeploys keep building the right subdirectory.
-    let persisted_root = cloud.projects.root_dir_of(&project);
+    // This is the one chokepoint for request, persisted, webhook, redeploy and
+    // fanout roots: old stored rows are untrusted input too, not a reason to
+    // bypass the checkout boundary.
+    let persisted_root = cloud
+        .projects
+        .get_exact(&project, incarnation)?
+        .build
+        .root_dir;
     let effective_root = req
         .root_dir
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| Some(persisted_root.clone()).filter(|s| !s.trim().is_empty() && s != "./"));
-    let build_dir = match effective_root
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(root) => {
-            log(format!("Root directory: {root}"));
-            dir.join(root)
-        }
-        None => dir.clone(),
+        .filter(|root| !root.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            Some(persisted_root.trim())
+                .filter(|root| !root.is_empty())
+                .map(str::to_string)
+        });
+    let checkout_dir = resolve_checkout_dir(&dir, None).await?;
+    let (build_dir, workspace_member) = if let Some(root) = effective_root.as_deref() {
+        log(format!("Root directory: {root}"));
+        let selected = resolve_checkout_dir(&checkout_dir, Some(root)).await?;
+        let member = if selected == checkout_dir {
+            false
+        } else {
+            crate::app_discovery::is_member(&checkout_dir, &selected).await?
+        };
+        (selected, member)
+    } else if req.image_ref.is_some() {
+        (checkout_dir.clone(), false)
+    } else if let Some(selection) = crate::app_discovery::select(&checkout_dir).await? {
+        let relative = if selection.relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            selection.relative.to_string_lossy().replace('\\', "/")
+        };
+        log(format!(
+            "Auto-detected workspace app: {relative} ({}; evidence: {}).",
+            selection.workspace_source,
+            selection.evidence.join(", ")
+        ));
+        let selected = if selection.relative.as_os_str().is_empty() {
+            checkout_dir.clone()
+        } else {
+            resolve_checkout_dir(&checkout_dir, Some(&relative)).await?
+        };
+        (selected, !selection.relative.as_os_str().is_empty())
+    } else {
+        (checkout_dir.clone(), false)
     };
-    anyhow::ensure!(
-        build_dir.exists(),
-        "root directory '{}' not found in repo",
-        effective_root.unwrap_or_default()
-    );
+    let vercel_config = fluid_build::load_vercel_config_checked(&build_dir).map_err(|error| {
+        fluid_build::BuildContractError::invalid_metadata("load selected-app vercel.json", error)
+    })?;
+    // Package/workspace metadata and outputDirectory are interpreted only after
+    // application selection, and before the executor receives the checkout.
+    let mut fdi_preparation = if req.image_ref.is_none()
+        && tokio::fs::read_to_string(build_dir.join("fluid.json"))
+            .await
+            .is_err()
+    {
+        Some(
+            prepare_fdi(
+                cloud,
+                &checkout_dir,
+                &build_dir,
+                &project,
+                vercel_config.as_ref(),
+                workspace_member,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if fdi_preparation.is_none() {
+        if let Some(output) = vercel_config
+            .as_ref()
+            .and_then(|config| config.output_directory.as_deref())
+            .filter(|output| !output.trim().is_empty())
+        {
+            fluid_build::OutputDirectory::parse(output)?;
+        }
+    }
+    let mut isolated = if req.image_ref.is_none() {
+        Some(IsolatedBuild::begin(&checkout_dir).await?)
+    } else {
+        None
+    };
+
+    if let Some(warning) = fdi_preparation
+        .as_ref()
+        .and_then(|preparation| preparation.package_manager.conflict_warning.as_ref())
+    {
+        log(format!("WARN: {warning}"));
+    }
 
     // ---- Ignored Build Step (vercel.json `ignoreCommand`) ----
     // Vercel semantics: run the command in the project root; exit 0 => skip this
     // build entirely (no new deployment — the prior one keeps serving), non-zero
     // => continue. Lets a repo short-circuit commits that don't need a rebuild.
-    if let Some(vc) = fluid_build::load_vercel_config(&build_dir) {
+    if let Some(vc) = vercel_config.as_ref() {
         if let Some(cmd) = vc
             .ignore_command
             .as_ref()
@@ -1924,14 +2980,19 @@ async fn run_build(
             .filter(|s| !s.is_empty())
         {
             log(format!("Running Ignored Build Step: {cmd}"));
-            if let Ok(st) = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&build_dir)
-                .status()
-                .await
+            match run_ignored_command(
+                isolated
+                    .as_mut()
+                    .expect("source deployments always have an isolated build session"),
+                &build_dir,
+                &cmd,
+                cloud,
+                bid,
+                &build_env,
+            )
+            .await
             {
-                if st.success() {
+                Ok(true) => {
                     log(
                         "Ignored Build Step exited 0 — skipping this build (no changes to deploy)."
                             .into(),
@@ -1942,10 +3003,8 @@ async fn run_build(
                     });
                     return Ok(());
                 }
-                log(format!(
-                    "Ignored Build Step exited {} — continuing build.",
-                    st.code().unwrap_or(-1)
-                ));
+                Ok(false) => log("Ignored Build Step exited non-zero — continuing build.".into()),
+                Err(error) => return Err(error),
             }
         }
         // devCommand / bunVersion are recorded for parity but not executed: the
@@ -1977,12 +3036,19 @@ async fn run_build(
     let mut manifest = match produce_manifest(
         cloud,
         bid,
-        &dir,
+        isolated.as_mut(),
+        &checkout_dir,
         &build_dir,
         &project,
+        incarnation,
         &commit,
         first_deploy,
-        req.use_cache,
+        build_cache_enabled,
+        &build_env,
+        &trust,
+        vercel_config.as_ref(),
+        fdi_preparation.take(),
+        workspace_member,
         req.image_ref.as_deref(),
         req.image_port,
         req.image_protocol,
@@ -1994,6 +3060,15 @@ async fn run_build(
     .await
     {
         Ok(m) => m,
+        Err(error) if error.downcast_ref::<BuildCancelled>().is_some() => return Err(error),
+        Err(error)
+            if error
+                .downcast_ref::<fluid_build::BuildContractError>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(error) if build_executor_platform_fault(&error) => return Err(error),
         Err(e) => {
             build_failed = true;
             log(format!("Build failed: {e}"));
@@ -2001,21 +3076,28 @@ async fn run_build(
                 "Keeping the deployment — serving a build-status page so the project still exists."
                     .into(),
             );
-            let index = build_dir.join("index.html");
-            let _ = tokio::fs::create_dir_all(&build_dir).await;
-            let _ = tokio::fs::write(
-                &index,
+            drop(isolated.take());
+            tokio::fs::remove_dir_all(&build_dir)
+                .await
+                .context("clearing failed build output")?;
+            tokio::fs::create_dir(&build_dir)
+                .await
+                .context("creating failed build output")?;
+            tokio::fs::write(
+                build_dir.join("index.html"),
                 build_failed_page(&project, &commit, &e.to_string(), &req.repo_url),
             )
-            .await;
+            .await
+            .context("writing failed build page")?;
             static_manifest(&project, ".")
         }
     };
     manifest.project = project.clone();
 
-    // Map framework build features (redirects/rewrites/middleware/edge) onto the
-    // deployment so the gateway honors them and the UI can surface them.
-    if !build_failed {
+    // Build Output carries its own compiled feature contract. Never let a second
+    // framework heuristic pass overwrite it; vercel.json's explicit overlay below
+    // remains the only higher-precedence source.
+    if !build_failed && !fluid_build::has_build_output(&build_dir) {
         let feats = fluid_build::detect_features(&build_dir);
         if !feats.is_empty() {
             manifest.redirects = feats
@@ -2079,7 +3161,10 @@ async fn run_build(
                 .unwrap_or(None),
             Err(_) => None,
         };
-        let current = cloud.projects.get(&manifest.project).inference;
+        let current = cloud
+            .projects
+            .get_exact(&manifest.project, incarnation)?
+            .inference;
         if current != spec {
             if let Some(s) = &spec {
                 log(format!(
@@ -2089,7 +3174,9 @@ async fn run_build(
             } else if current.is_some() {
                 log("Managed inference removed (no inference block in fluid.json).".into());
             }
-            cloud.projects.set_inference(&manifest.project, spec);
+            cloud
+                .projects
+                .set_inference_exact(&manifest.project, incarnation, spec)?;
         }
     }
 
@@ -2109,12 +3196,17 @@ async fn run_build(
     //     UI-managed one). This is what lets the Storages page's "Deploy a
     //     replicated SQLite database" flow take effect with no git push.
     {
-        let current = cloud.projects.get(&manifest.project).browser_db;
+        let current = cloud
+            .projects
+            .get_exact(&manifest.project, incarnation)?
+            .browser_db;
         if manifest.browser_db.is_some() {
             if current != manifest.browser_db {
-                cloud
-                    .projects
-                    .set_browser_db(&manifest.project, manifest.browser_db.clone());
+                cloud.projects.set_browser_db_exact(
+                    &manifest.project,
+                    incarnation,
+                    manifest.browser_db.clone(),
+                )?;
             }
         } else if let Some(settings_spec) = current {
             log(
@@ -2124,38 +3216,15 @@ async fn run_build(
         }
     }
 
-    // ---- Classify production vs preview (Vercel's model) ----
-    // A project's production branch is recorded on its first deploy (the imported
-    // branch). Pushes to it are PRODUCTION; every other branch / PR is a PREVIEW.
-    // An explicit target on the request (webhook PR events) overrides the branch.
-    let mut prod_branch = cloud.projects.production_branch_of(&project);
-    if prod_branch.is_empty() && !actual_branch.is_empty() {
-        prod_branch = actual_branch.clone();
-        cloud.projects.set_production_branch(&project, &prod_branch);
-        log(format!("Production branch set to '{prod_branch}'."));
-    }
-    let is_production = match req.target.as_deref().map(str::trim) {
-        Some("preview") => false,
-        Some("production") => true,
-        // No explicit target -> classify from the branch.
-        _ => !actual_branch.is_empty() && actual_branch == prod_branch,
-    };
-    let deploy_env = if is_production {
-        "production"
-    } else {
-        "preview"
-    };
-
     // Stamp the framework slug onto the manifest so the deployment record
     // (and the dashboard's project grid) carries the real framework for its
     // logo — the build already detected it into BuildConfig.framework
     // (auto-detect saves it there), empty stays empty (UI falls back).
     if manifest.framework.is_empty() {
-        if let Some(bc) = cloud.projects.get_if_set(&project).map(|s| s.build) {
-            let fw = bc.framework.trim();
-            if !fw.is_empty() {
-                manifest.framework = fw.to_string();
-            }
+        let bc = cloud.projects.get_exact(&project, incarnation)?.build;
+        let fw = bc.framework.trim();
+        if !fw.is_empty() {
+            manifest.framework = fw.to_string();
         }
     }
 
@@ -2164,8 +3233,8 @@ async fn run_build(
     // deployment launching with the project's production secrets is exactly
     // the isolation the dashboard's Production/Preview selector promises and
     // nothing enforced.
-    let env = cloud.projects.env_map_for(&manifest.project, deploy_env);
-    let project_settings = cloud.projects.get(&manifest.project);
+    let env = runtime_env;
+    let project_settings = cloud.projects.get_exact(&manifest.project, incarnation)?;
     let dedicated_ipv4_alloc = project_settings.dedicated_ipv4;
     let fsettings = project_settings.functions;
     if !env.is_empty() {
@@ -2278,27 +3347,8 @@ async fn run_build(
     // Applied AFTER project defaults so vercel.json per-function overrides win,
     // and its redirects/rewrites are evaluated before framework-derived ones.
     if !build_failed {
-        if let Some(vc) = fluid_build::load_vercel_config(&build_dir) {
-            apply_vercel_config(&mut manifest, &vc, &|s| log(s));
-        }
-    }
-
-    // Ensure static deployments always have something to serve at "/". Some
-    // repos (plain static, monorepos) have no index.html — generate a landing
-    // page so the deployed URL returns 200 instead of 404.
-    if manifest.functions.is_empty() {
-        let static_dir = manifest.static_dir.clone().unwrap_or_else(|| ".".into());
-        let base = if static_dir == "." {
-            build_dir.clone()
-        } else {
-            build_dir.join(&static_dir)
-        };
-        let index = base.join("index.html");
-        if !index.exists() {
-            let _ = tokio::fs::create_dir_all(&base).await;
-            let html = landing_page(&project, &commit, &commit_message, &req.repo_url);
-            let _ = tokio::fs::write(&index, html).await;
-            log("No index.html found — generated a default landing page.".into());
+        if let Some(vc) = vercel_config.as_ref() {
+            apply_vercel_config(&mut manifest, vc, &|s| log(s));
         }
     }
 
@@ -2421,21 +3471,12 @@ async fn run_build(
     // `warmup_bun_bytecode`'s doc comment for why the two mechanisms can't share
     // one code path). Best-effort either way. Must happen BEFORE deliver_build so
     // the cache/bundle is packed into the image.
+    // Build-time server warmups execute the repository's production entrypoint.
+    // They are intentionally disabled until they have a dedicated executor API;
+    // a performance hint can never justify escaping the mandatory isolation
+    // boundary after install/build already ran inside it.
     if !build_failed && !is_container {
-        if let Some(node_fn) = manifest.functions.iter().find(|f| {
-            hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Node
-        }) {
-            let start_cmd = node_fn.start_cmd.clone();
-            let warm_env = cloud.projects.env_map(&project);
-            warmup_node_cache(&build_dir, &start_cmd, &warm_env, cloud, bid).await;
-        }
-        if let Some(idx) = manifest.functions.iter().position(|f| {
-            hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Bun
-        }) {
-            let start_cmd = manifest.functions[idx].start_cmd.clone();
-            let rewritten = warmup_bun_bytecode(&build_dir, &start_cmd, cloud, bid).await;
-            manifest.functions[idx].start_cmd = rewritten;
-        }
+        log("Compile-cache warmup skipped under isolated builds.".into());
     }
 
     // Browser-executable artifacts (browser-function-artifact-build-contract):
@@ -2573,6 +3614,18 @@ async fn run_build(
         }
     }
 
+    let _finalization = crate::project_settings::lifecycle_write(&project).await;
+    let final_settings = cloud.projects.get_exact(&project, incarnation)?;
+    if let Some(newer) = cloud.builds.get(bid).and_then(|build| {
+        (build.project_incarnation == Some(incarnation))
+            .then_some(build.superseded_by)
+            .flatten()
+    }) {
+        return Err(anyhow::anyhow!(
+            "build superseded by newer build {newer} for project {project}; skipping deployment registration"
+        ));
+    }
+
     let mut browser_bundles: Vec<(String, fluid_core::BrowserArtifact)> = Vec::new();
     if !build_failed {
         for f in manifest.functions.iter_mut() {
@@ -2640,31 +3693,58 @@ async fn run_build(
         }
     }
 
-    // An ISOLATED backend cannot see the host build dir the mock backend serves
-    // from, so the build output has to be packed into a per-deployment artifact
-    // the cell reads instead, with the function pool pointed at that image.
+    // No repository process survives an isolated step. Re-seal once after every
+    // platform-authored adaptation so the host static tree and the runtime
+    // artifact are derived from the same bounded immutable snapshot.
+    if !build_failed && !is_container {
+        reseal_platform_output(&checkout_dir).await?;
+    }
+
+    // An isolated backend cannot read the host checkout directly, so derive the
+    // host static root and guest function cwd together from one server-built
+    // descriptor. The host path must remain the deployment's static root; only
+    // the guest path enters the function pool.
     //
-    // Gated on the backend's OWN declared capability, `delivered_workdir()`, not
-    // on its NAME. The name test hardcoded "firecracker", which silently made
-    // this whole block dead for LiteboxBackend — and litebox's `start_function`
-    // hard-requires it (`ensure_combined_tar` bails with "no delivered build
-    // staged for image …"), so a litebox node could not serve a non-container
-    // function deployment AT ALL. fc-frankfurt runs backend=litebox with real
-    // tenant traffic, which is exactly the node that could least afford it.
-    // `delivered_workdir()` is the right discriminator by construction: it is
-    // `Some` precisely for the backends whose cells cannot see the host build
-    // dir (firecracker's fixed guest path, litebox's "/"), and `None` for the
-    // same-host mock, which needs no delivery.
-    //
-    // SKIP for containers: they serve from the OCI image (podman), not from a
-    // delivered artifact, so there is nothing to deliver.
-    if !build_failed && !is_container && cloud.gw.delivered_workdir().is_some() {
+    // Containers serve from their OCI image and failed builds do not launch, so
+    // neither needs the transitive runtime closure or artifact delivery.
+    let artifact_relative = build_dir.strip_prefix(&checkout_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "selected application {} is outside checkout {}",
+            build_dir.display(),
+            checkout_dir.display()
+        )
+    })?;
+    let runtime_artifact = if !build_failed && !is_container {
+        hive_backend::RuntimeArtifactSpec::with_includes(
+            checkout_dir.clone(),
+            artifact_relative.to_path_buf(),
+            crate::app_discovery::runtime_include_rel(&checkout_dir, &build_dir).await?,
+        )
+    } else {
+        hive_backend::RuntimeArtifactSpec::new(
+            checkout_dir.clone(),
+            artifact_relative.to_path_buf(),
+        )
+    };
+    let runtime_paths = cloud.gw.runtime_artifact_paths(&runtime_artifact)?;
+    let host_static_root = runtime_paths
+        .host_static_root
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("validated host static root is not UTF-8"))?;
+    let runtime_workdir = runtime_paths
+        .guest_workdir
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("validated runtime workdir is not UTF-8"))?;
+    if !build_failed && !is_container && runtime_paths.delivery_required {
         let image = format!("dpl-{}", sanitize_tag(bid));
-        match cloud.gw.deliver_build(&image, &build_dir).await {
+        match cloud.gw.deliver_build(&image, &runtime_artifact).await {
             Ok(()) => {
                 log(format!(
-                    "Delivered build output to an isolated-cell image ({}).",
-                    cloud.gw.backend_name()
+                    "Delivered closed runtime artifact to an isolated-cell image ({}; cwd {}).",
+                    cloud.gw.backend_name(),
+                    runtime_workdir
                 ));
                 manifest.image = Some(image);
             }
@@ -2738,16 +3818,6 @@ async fn run_build(
     // they're registered (production only) after the deployment is live.
     let cron_specs = manifest.crons.clone();
 
-    // Build-inversion veto (bn-launch-sequencing-rebuild-before-deploy): the
-    // newer build marked this one superseded at `start_build`; honor it just
-    // before the production flip so the newest push's record is the one that
-    // lands, never merely the last-finishing build.
-    if let Some(newer) = cloud.builds.get(bid).and_then(|b| b.superseded_by) {
-        return Err(anyhow::anyhow!(
-            "build superseded by newer build {newer} for project {project}; skipping the production flip"
-        ));
-    }
-
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
     let tenant = {
@@ -2759,7 +3829,7 @@ async fn run_build(
         // "the project disappeared from the account". Inherit from the newest
         // record that knows (local, then gossiped peers) before accepting
         // untagged as truth.
-        let own = cloud.projects.team_of(&manifest.project);
+        let own = final_settings.team.clone();
         if crate::admin::record_tenant(&own) != crate::admin::UNTAGGED_TENANT {
             own
         } else {
@@ -2767,7 +3837,9 @@ async fn run_build(
                 .gw
                 .list()
                 .into_iter()
-                .filter(|d| d.project == manifest.project)
+                .filter(|d| {
+                    d.project == manifest.project && d.project_incarnation == Some(incarnation)
+                })
                 .max_by_key(|d| d.created_at_ms)
                 .map(|d| d.tenant.clone())
                 .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
@@ -2777,7 +3849,10 @@ async fn run_build(
                         .read()
                         .values()
                         .flatten()
-                        .filter(|d| d.project == manifest.project)
+                        .filter(|d| {
+                            d.project == manifest.project
+                                && d.project_incarnation == Some(incarnation)
+                        })
                         .max_by_key(|d| d.created_at_ms)
                         .map(|d| d.tenant.clone())
                         .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
@@ -2786,7 +3861,9 @@ async fn run_build(
                 Some(t) => {
                     // Repair the local settings row too, so the NEXT build (and
                     // every listing served from this node) has the tag directly.
-                    cloud.projects.set_team(&manifest.project, &t);
+                    cloud
+                        .projects
+                        .set_team_exact(&manifest.project, incarnation, &t)?;
                     t
                 }
                 None => own,
@@ -2817,8 +3894,20 @@ async fn run_build(
                 .to_string(),
         );
     }
-    let info = cloud.gw.deploy_full(
-        build_dir.to_string_lossy().into_owned(),
+    if is_container {
+        let volume_names = project_volume_names(&project, incarnation, &manifest.functions)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            !volume_names.is_empty(),
+            "container deployment has no exact current-incarnation volume claim"
+        );
+        cloud
+            .projects
+            .claim_volumes_exact(&project, incarnation, volume_names)?;
+    }
+    let info = cloud.gw.deploy_full_with_runtime_exact(
+        host_static_root,
+        Some(runtime_workdir),
         manifest,
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
@@ -2828,7 +3917,8 @@ async fn run_build(
         } else {
             DeployState::Ready
         },
-        tenant,
+        tenant.clone(),
+        incarnation,
     );
     crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
 
@@ -2867,7 +3957,7 @@ async fn run_build(
                 next_run_ms: None,
                 runs: 0,
                 source: "vercel.json".into(),
-                tenant: crate::admin::norm(&cloud.projects.team_of(&project)).to_string(),
+                tenant: crate::admin::norm(&tenant).to_string(),
             })
             .collect();
         let n = cloud.cron.set_source_jobs(&project, "vercel.json", jobs);
@@ -2916,7 +4006,7 @@ async fn run_build(
         {
             let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
-            let team = crate::admin::norm(&cloud.projects.team_of(&info.project)).to_string();
+            let team = crate::admin::norm(&tenant).to_string();
             if let Ok(queue_token) = crate::auth::issue(
                 "world-queue-client",
                 &team,
@@ -2924,26 +4014,30 @@ async fn run_build(
                 false,
                 365 * 24 * 3600,
             ) {
-                cloud.projects.put_env(
+                cloud.projects.put_env_exact(
                     &info.project,
+                    incarnation,
                     crate::project_settings::EnvVar {
                         key: "HIVE_QUEUE_ENDPOINT".into(),
                         value: queue_url,
                         target: "all".into(),
+                        scope: "runtime".into(),
                         sensitive: false,
                         updated_ms: now_ms(),
                     },
-                );
-                cloud.projects.put_env(
+                )?;
+                cloud.projects.put_env_exact(
                     &info.project,
+                    incarnation,
                     crate::project_settings::EnvVar {
                         key: "HIVE_QUEUE_TOKEN".into(),
                         value: queue_token,
                         target: "all".into(),
+                        scope: "runtime".into(),
                         sensitive: true,
                         updated_ms: now_ms(),
                     },
-                );
+                )?;
             }
             let req = crate::databases::ProvisionReq {
                 name: "workflow-storage".into(),
@@ -2955,7 +4049,15 @@ async fn run_build(
                 replicas: Vec::new(),
             };
             let cloud_ready = cloud.clone();
-            crate::databases::provision(
+            let ready_project = info.project.clone();
+            // Provisioning completes after this build returns. Keep it in the
+            // exact-incarnation drain set so project deletion cannot inventory
+            // storage until this callback has either committed under lifecycle
+            // authority or yielded to the delete.
+            let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
+                ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
+            )));
+            let workflow_database = crate::databases::provision(
                 cloud.databases.clone(),
                 cloud.region.clone(),
                 req,
@@ -2963,12 +4065,51 @@ async fn run_build(
                 cloud.node_name.clone(),
                 cloud.api_base(),
                 move |d| {
-                    if matches!(d.status, crate::databases::DbStatus::Ready) {
-                        crate::admin::apply_db_egress(&cloud_ready, &d);
-                    }
-                    crate::persist::persist(&cloud_ready);
+                    let cloud_ready = cloud_ready.clone();
+                    let ready_project = ready_project.clone();
+                    let completion_guard = completion_guard.clone();
+                    tokio::spawn(async move {
+                        // `provision` accepts `Fn`, not `FnOnce`, so transfer
+                        // the single reservation out exactly once. Never hold
+                        // it while awaiting the lifecycle writer: deletion owns
+                        // the writer while it drains this exact reservation.
+                        let completion_guard = completion_guard.lock().take();
+                        drop(completion_guard);
+                        let _lifecycle =
+                            crate::project_settings::lifecycle_write(&ready_project).await;
+                        if cloud_ready
+                            .projects
+                            .get_exact(&ready_project, incarnation)
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                project = %ready_project,
+                                %incarnation,
+                                database = %d.id,
+                                "discarded delayed workflow-storage completion for a deleted project incarnation"
+                            );
+                            return;
+                        }
+                        if matches!(d.status, crate::databases::DbStatus::Ready) {
+                            crate::admin::apply_db_egress(&cloud_ready, &d);
+                        }
+                        crate::persist::persist(&cloud_ready);
+                    });
                 },
             );
+            if let Err(error) = cloud.projects.claim_database_exact(
+                &info.project,
+                incarnation,
+                workflow_database.id.clone(),
+            ) {
+                crate::databases::note_teardown_request(&workflow_database.id);
+                cloud
+                    .databases
+                    .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
+                return Err(anyhow::anyhow!(
+                    "workflow storage lost project-incarnation authority before admission: {error}"
+                ));
+            }
             log(format!(
                 "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
                 if ingested > 0 { "JS/TS" } else { "Python" }
@@ -3038,6 +4179,7 @@ async fn run_build(
         let bd = build_dir.clone();
         let proj = info.project.clone();
         let dep_id = info.id.to_string();
+        let checkout_guard = ActiveCheckoutGuard::new(bd.clone(), &proj, incarnation);
         tokio::spawn(async move {
             let fw = fluid_build::detect(&bd);
             let (fw_slug, fw_name) = (fw.slug.to_string(), fw.name.to_string());
@@ -3053,13 +4195,20 @@ async fn run_build(
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let env_keys: Vec<String> = cloud2
-                .projects
-                .get_masked(&proj)
-                .env
-                .iter()
-                .map(|e| e.key.clone())
-                .collect();
+            // Release source ownership before waiting for the lifecycle writer.
+            // Project deletion holds that writer while draining checkout owners;
+            // retaining this guard across the await would deadlock the two.
+            drop(checkout_guard);
+            let _lifecycle = crate::project_settings::lifecycle_write(&proj).await;
+            let Ok(settings) = cloud2.projects.get_exact(&proj, incarnation) else {
+                return;
+            };
+            if !cloud2.gw.deployment_records().iter().any(|record| {
+                record.id == dep_id && record.project_incarnation == Some(incarnation)
+            }) {
+                return;
+            }
+            let env_keys: Vec<String> = settings.env.iter().map(|e| e.key.clone()).collect();
             let graph = crate::svcgraph::build_graph(&proj, &dep_id, &scan, &env_keys);
             let n = graph.nodes.len();
             cloud2.svcgraph.put(graph);
@@ -3079,7 +4228,7 @@ async fn run_build(
     );
     cloud.record(ev);
     cloud.audit.record(
-        &cloud.projects.team_of(&info.project),
+        &tenant,
         &req.creator.clone().unwrap_or_else(|| "you".into()),
         if build_failed {
             "create_failed"
@@ -3131,15 +4280,24 @@ async fn run_build(
     // also replicate the deploy to any OTHER selected region node(s), then drop
     // the project from nodes that are no longer targets. Only on a clean build.
     if !req.no_fanout && !build_failed {
-        let regions = cloud.projects.get(&project).functions.regions;
+        let tail_settings = cloud.projects.get_exact(&project, incarnation)?;
+        let regions = tail_settings.functions.regions.clone();
         // `stateful = is_stateful` (captured above, before `manifest` moved into
         // `deploy_full`): this is THE fanout hazard site — a container built and
         // hosted here would otherwise be replicated to every other selected region
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
-        let needs_gpu = cloud.projects.get(&project).functions.gpu;
-        let targets =
-            crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu, is_wasm);
+        let needs_gpu = tail_settings.functions.gpu;
+        let targets = crate::schedule::place(
+            cloud,
+            &regions,
+            false,
+            is_stateful,
+            needs_gpu,
+            is_wasm,
+            true,
+            true,
+        );
         if targets
             .iter()
             .any(|t| t.admin.is_none() && t.iroh.is_none())
@@ -3155,7 +4313,8 @@ async fn run_build(
                 // Defense-in-depth: for a stateful deploy `place` above already
                 // constrained the targets to one region, so remotes only exist
                 // for stateless deploys, where the secondary flag is inert.
-                let _ = fanout_remote(cloud, bid, &req, &project, &remote, false).await;
+                let _ =
+                    fanout_remote(cloud, bid, &req, &project, incarnation, &remote, false).await;
             }
             if is_production {
                 let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
@@ -3277,20 +4436,35 @@ async fn fanout_remote(
     bid: &str,
     req: &GitDeployRequest,
     project: &str,
+    incarnation: ProjectIncarnation,
     remote: &[crate::schedule::Target],
     primary_first: bool,
 ) -> FanoutOutcome {
     let log = |s: String| cloud.builds.log(bid, s);
-    let team = cloud.projects.team_of(project);
-    let env = cloud.projects.env_map(project);
+    let settings = match cloud.projects.get_exact(project, incarnation) {
+        Ok(settings) => settings,
+        Err(error) => {
+            log(format!(
+                "remote dispatch cancelled: project incarnation {incarnation} is no longer active ({error})"
+            ));
+            return FanoutOutcome {
+                per_target: remote
+                    .iter()
+                    .map(|target| (target.node.clone(), TargetOutcome::Cancelled))
+                    .collect(),
+            };
+        }
+    };
+    let team = settings
+        .team
+        .trim()
+        .is_empty()
+        .then(|| crate::admin::UNTAGGED_TENANT.to_string())
+        .unwrap_or_else(|| settings.team.trim().to_string());
     // Forward the user's configured build settings + compute tier so the target
     // builds identically to the coordinator (not just from auto-detect).
-    let build_config = cloud
-        .projects
-        .get_if_set(project)
-        .map(|s| s.build)
-        .and_then(|b| serde_json::to_value(b).ok());
-    let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
+    let build_config = serde_json::to_value(settings.build.clone()).ok();
+    let function_settings = serde_json::to_value(settings.functions.clone()).ok();
     // PHASE 1 — dispatch every target CONCURRENTLY, then PHASE 2 mirrors them
     // all concurrently (below). This loop used to do both serially per target:
     // dispatch region A, then await A's ENTIRE remote build (clone + npm
@@ -3302,23 +4476,26 @@ async fn fanout_remote(
     let dispatch_futs = remote.iter().enumerate().map(|(idx, t)| {
         let mut dreq = req.clone();
         dreq.no_fanout = true;
-        // Stamp the ENVIRONMENT before dispatch whenever this node can resolve
-        // it: the remote's classification uses ITS node-local production_branch
-        // — never gossiped, never previously forwarded — so a fresh node (or
-        // one whose settings a pre-fix reaper wiped) classified a preview
-        // branch as production, claimed the production domain, and poisoned its
-        // own production_branch with the preview branch. With the target
-        // explicit, the remote's branch heuristic never runs.
-        if dreq.target.is_none() {
-            if let Some(is_prod) = request_is_production(cloud, &dreq, project) {
-                dreq.target = Some(if is_prod { "production" } else { "preview" }.into());
-            }
+        // Recompute and stamp the server-derived lane at the dispatch boundary;
+        // the target recomputes it again before doing any work. A contradictory
+        // production assertion carries no env and is rejected by the target.
+        let dispatch_trust = resolve_build_trust(cloud, &dreq, project, incarnation).ok();
+        if let Some(context) = &dispatch_trust {
+            dreq.target = Some(context.lane.environment().into());
         }
         // Everyone but the designated primary is a secondary replica — see this
         // fn's doc + the stateful fanout-replica guard in `run_build`.
         dreq.fanout_secondary = !(primary_first && idx == 0);
         dreq.project = Some(project.to_string());
-        dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
+        dreq.project_incarnation = Some(incarnation);
+        dreq.env = dispatch_trust.as_ref().map(|context| {
+            crate::project_settings::env_map_from_settings(
+                &settings,
+                context.lane.environment(),
+                crate::project_settings::EnvExecutionScope::Runtime,
+                !context.lane.is_fork(),
+            )
+        });
         dreq.build_config = build_config.clone();
         dreq.function_settings = function_settings.clone();
         let team = team.clone();
@@ -3348,7 +4525,7 @@ async fn fanout_remote(
             // authenticates identically to a normal request.
             let mut rb = cloud
                 .http
-                .post(format!("{admin}/v1/git/deploy"))
+                .post(format!("{admin}{RUNTIME_ARTIFACT_FANOUT_PATH}"))
                 .header("x-hive-team", team.clone());
             if crate::auth::enforced() {
                 if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
@@ -3376,7 +4553,10 @@ async fn fanout_remote(
                     cloud.builds.log(bid, format!("→ {}: HTTP dispatch failed, retrying via iroh", t.node));
                 }
                 let body = serde_json::to_vec(&dreq).unwrap_or_default();
-                let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
+                let path = format!(
+                    "{RUNTIME_ARTIFACT_FANOUT_PATH}?{}",
+                    crate::admin::mesh_team_qs(&team)
+                );
                 match crate::gossip::request_to(
                     cloud,
                     id,
@@ -3511,11 +4691,15 @@ async fn fanout_remote(
                             crate::project_settings::BuildConfig,
                         >(rb.clone())
                         {
-                            let mut cur = cloud
-                                .projects
-                                .get_if_set(project)
-                                .map(|s| s.build)
-                                .unwrap_or_default();
+                            let mut cur = match cloud.projects.get_exact(project, incarnation) {
+                                Ok(settings) => settings.build,
+                                Err(error) => {
+                                    log(format!(
+                                        "skipped remote build-settings adoption: project incarnation {incarnation} is no longer active ({error})"
+                                    ));
+                                    return FanoutOutcome { per_target };
+                                }
+                            };
                             let mut changed = false;
                             // Filling framework from the remote must carry its
                             // AUTO marker too — copying only the string persisted
@@ -3540,7 +4724,14 @@ async fn fanout_remote(
                                 cur.framework_auto = remote_bc.framework_auto;
                             }
                             if changed {
-                                cloud.projects.set_build(project, cur);
+                                if let Err(error) =
+                                    cloud.projects.set_build_exact(project, incarnation, cur)
+                                {
+                                    log(format!(
+                                        "skipped remote build-settings adoption: project incarnation {incarnation} is no longer active ({error})"
+                                    ));
+                                    return FanoutOutcome { per_target };
+                                }
                                 crate::persist::persist(cloud);
                             }
                         }
@@ -3886,15 +5077,39 @@ async fn report_github_status(
 fn parse_owner_repo(repo_url: &str) -> Option<(String, String)> {
     let s = repo_url.trim().trim_end_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s);
-    let tail = s.rsplit("github.com").next()?;
-    let tail = tail.trim_start_matches(['/', ':']);
-    let mut parts = tail.split('/').filter(|p| !p.is_empty());
+    let tail = s
+        .strip_prefix("https://github.com/")
+        .or_else(|| s.strip_prefix("http://github.com/"))
+        .or_else(|| s.strip_prefix("git@github.com:"))
+        .or_else(|| s.strip_prefix("ssh://git@github.com/"))?;
+    let mut parts = tail.split('/');
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.to_string();
-    if owner.is_empty() || repo.is_empty() {
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
         return None;
     }
     Some((owner, repo))
+}
+
+fn same_repository(left: &str, right: &str) -> bool {
+    match (parse_owner_repo(left), parse_owner_repo(right)) {
+        (Some((left_owner, left_repo)), Some((right_owner, right_repo))) => {
+            left_owner.eq_ignore_ascii_case(&right_owner)
+                && left_repo.eq_ignore_ascii_case(&right_repo)
+        }
+        _ => {
+            fn normalize(value: &str) -> String {
+                value
+                    .trim()
+                    .trim_end_matches('/')
+                    .strip_suffix(".git")
+                    .unwrap_or_else(|| value.trim().trim_end_matches('/'))
+                    .to_string()
+            }
+            let left = normalize(left);
+            !left.is_empty() && left == normalize(right)
+        }
+    }
 }
 
 fn region_label(region: &str) -> String {
@@ -3908,18 +5123,212 @@ fn region_label(region: &str) -> String {
     .to_string()
 }
 
+struct FdiPreparation {
+    build_config: Option<crate::project_settings::BuildConfig>,
+    settings_are_auto: bool,
+    install_override: Option<String>,
+    build_override: Option<String>,
+    runtime_override: Option<hive_core::Runtime>,
+    framework: fluid_build::FrameworkPreset,
+    root_workspace: Option<crate::workspace::Workspace>,
+    install_dir: PathBuf,
+    foreign_subdir: bool,
+    is_monorepo: bool,
+    package_manager: fluid_build::PackageManagerDetection,
+    plan: fluid_build::BuildPlan,
+    build_output: Option<fluid_build::BuildOutput>,
+    vercel_config_present: bool,
+}
+
+async fn prepare_fdi(
+    cloud: &Arc<CloudState>,
+    repo_root: &Path,
+    dir: &Path,
+    project: &str,
+    vercel_config: Option<&fluid_build::VercelConfig>,
+    workspace_member: bool,
+) -> anyhow::Result<FdiPreparation> {
+    let build_config = cloud
+        .projects
+        .get_if_set(project)
+        .map(|settings| settings.build);
+    let settings_are_auto = build_config.as_ref().is_some_and(|build| {
+        build.framework_auto
+            || matches!(
+                build.framework.trim().to_ascii_lowercase().as_str(),
+                "other" | "auto" | "auto-detect"
+            )
+    });
+    let project_pick = |field: fn(&crate::project_settings::BuildConfig) -> &String| {
+        build_config
+            .as_ref()
+            .map(field)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+    };
+    let vercel_pick = |field: fn(&fluid_build::VercelConfig) -> Option<&String>| {
+        vercel_config
+            .and_then(field)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let vercel_command_pick = |field: fn(&fluid_build::VercelConfig) -> Option<&String>| {
+        vercel_config
+            .and_then(field)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+    };
+    let install_override = vercel_command_pick(|config| config.install_command.as_ref())
+        .or_else(|| project_pick(|build| &build.install_command));
+    let build_override = vercel_command_pick(|config| config.build_command.as_ref())
+        .or_else(|| project_pick(|build| &build.build_command));
+    let output_override = vercel_pick(|config| config.output_directory.as_ref())
+        .or_else(|| project_pick(|build| &build.output_dir));
+    let framework_override = vercel_pick(|config| config.framework.as_ref()).or_else(|| {
+        build_config
+            .as_ref()
+            .filter(|build| !build.framework_auto)
+            .map(|build| build.framework.clone())
+            .filter(|framework| {
+                let framework = framework.trim();
+                !framework.is_empty()
+                    && !framework.eq_ignore_ascii_case("other")
+                    && !framework.eq_ignore_ascii_case("auto")
+                    && !framework.eq_ignore_ascii_case("auto-detect")
+            })
+    });
+    let runtime_override = vercel_pick(|config| config.runtime.as_ref())
+        .and_then(|runtime| hive_core::Runtime::from_config_str(&runtime))
+        .or_else(|| {
+            vercel_config
+                .and_then(|config| config.bun_version.as_ref())
+                .map(|_| hive_core::Runtime::Bun)
+        })
+        .or_else(|| {
+            build_config
+                .as_ref()
+                .map(|build| build.runtime.as_str())
+                .filter(|runtime| !runtime.trim().is_empty())
+                .and_then(hive_core::Runtime::from_config_str)
+        });
+
+    let root_workspace = crate::workspace::load(repo_root).await.map_err(|error| {
+        fluid_build::BuildContractError::invalid_metadata("load checkout workspace metadata", error)
+    })?;
+    let root_is_workspace = root_workspace.is_some();
+    let is_monorepo = dir != repo_root && workspace_member && root_is_workspace;
+    let install_dir = if is_monorepo {
+        repo_root.to_path_buf()
+    } else {
+        dir.to_path_buf()
+    };
+    let foreign_subdir = !is_monorepo && dir != repo_root && root_is_workspace;
+    let package_manager =
+        fluid_build::detect_package_manager_checked(&install_dir).map_err(|error| {
+            fluid_build::BuildContractError::invalid_metadata(
+                "resolve package-manager metadata",
+                error,
+            )
+        })?;
+
+    // A workspace root owns command selection, but a selected member's own
+    // package/workspace declarations are still untrusted metadata. Validate them
+    // without allowing them to override the root package manager.
+    if dir != install_dir {
+        let selected_package_manager =
+            fluid_build::detect_package_manager_checked(dir).map_err(|error| {
+                fluid_build::BuildContractError::invalid_metadata(
+                    "validate selected-application package-manager metadata",
+                    error,
+                )
+            })?;
+        let selected_workspace = crate::workspace::load(dir).await.map_err(|error| {
+            fluid_build::BuildContractError::invalid_metadata(
+                "validate selected-application workspace metadata",
+                error,
+            )
+        })?;
+        crate::workspace::validate(dir, selected_workspace.as_ref(), &selected_package_manager)
+            .await
+            .map_err(|error| {
+                fluid_build::BuildContractError::invalid_metadata(
+                    "validate selected-application workspace metadata",
+                    error,
+                )
+            })?;
+    }
+
+    let nested_workspace;
+    let install_workspace = if install_dir == repo_root {
+        root_workspace.as_ref()
+    } else {
+        nested_workspace = crate::workspace::load(&install_dir)
+            .await
+            .map_err(|error| {
+                fluid_build::BuildContractError::invalid_metadata(
+                    "load selected-root workspace metadata",
+                    error,
+                )
+            })?;
+        nested_workspace.as_ref()
+    };
+    crate::workspace::validate(&install_dir, install_workspace, &package_manager)
+        .await
+        .map_err(|error| {
+            fluid_build::BuildContractError::invalid_metadata(
+                "validate package workspace metadata",
+                error,
+            )
+        })?;
+
+    let resolution = fluid_build::resolve_build_checked(
+        dir,
+        &package_manager,
+        framework_override.as_deref(),
+        install_override.as_deref(),
+        build_override.as_deref(),
+        output_override.as_deref(),
+    )?;
+    let framework = resolution.plan.framework.clone();
+
+    Ok(FdiPreparation {
+        build_config,
+        settings_are_auto,
+        install_override,
+        build_override,
+        runtime_override,
+        framework,
+        root_workspace,
+        install_dir,
+        foreign_subdir,
+        is_monorepo,
+        package_manager,
+        plan: resolution.plan,
+        build_output: resolution.build_output,
+        vercel_config_present: vercel_config.is_some(),
+    })
+}
+
 /// Produce the deployment manifest from a cloned repo: Dockerfile (podman),
 /// explicit `fluid.json`, or Framework-Defined Infrastructure. Any error here is
 /// recoverable by the caller (the deployment is still created with a fallback).
 async fn produce_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
+    isolated: Option<&mut IsolatedBuild>,
     repo_root: &Path,
     dir: &Path,
     project: &str,
-    commit: &str,
+    incarnation: ProjectIncarnation,
+    _commit: &str,
     first_deploy: bool,
     use_cache: bool,
+    build_env: &std::collections::BTreeMap<String, String>,
+    trust: &BuildTrustContext,
+    vercel_config: Option<&fluid_build::VercelConfig>,
+    fdi_preparation: Option<FdiPreparation>,
+    workspace_member: bool,
     image_ref: Option<&str>,
     image_port: Option<u16>,
     image_protocol: Option<ServiceProtocol>,
@@ -3942,6 +5351,7 @@ async fn produce_manifest(
             cloud,
             bid,
             project,
+            incarnation,
             image,
             image_port,
             image_protocol,
@@ -3952,118 +5362,28 @@ async fn produce_manifest(
         )
         .await;
     }
+    let isolated = isolated.ok_or_else(|| {
+        anyhow::anyhow!(
+            "BUILD_ISOLATION_UNAVAILABLE: source deployment has no isolated build session"
+        )
+    })?;
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
     // full topology). Single-Dockerfile projects are unaffected.
-    if let Some(compose_path) = crate::compose::compose_file(dir) {
-        return build_compose_manifest(cloud, bid, dir, project, commit, &compose_path).await;
-    }
-    if let Some(dockerfile) = container_build_file(dir) {
-        let fname = dockerfile
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Dockerfile")
-            .to_string();
-        log(format!("Detected {fname} — building container image."));
-        let safe_project = sanitize_tag(project);
-        let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
-        // Railway-style overrides from an optional `fluid.json` { "container": {...} }:
-        // explicit listen port + wire protocol (http/grpc/tcp/…). Falls back to the
-        // Dockerfile `EXPOSE`/`ENV PORT` (then 8080) and protocol "http". Per field,
-        // an explicit fluid.json value wins outright; where fluid.json leaves a field
-        // unset, the dashboard-managed `ProjectSettings::container` applies instead
-        // (the `inference`/`browser_db` precedent) — lets a container project be
-        // configured from the dashboard alone, no git push required.
-        let ovr = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
-            Ok(s) => parse_container_override(&s),
-            Err(_) => ContainerOverride::default(),
-        };
-        let settings = cloud.projects.get(project).container;
-        let exposed = match ovr.port.or_else(|| settings.as_ref().and_then(|s| s.port)) {
-            Some(p) => p,
-            None => parse_expose(&dockerfile).await.unwrap_or(8080),
-        };
-        let protocol = ovr
-            .protocol
-            .or_else(|| settings.as_ref().and_then(|s| s.protocol.clone()))
-            .unwrap_or_else(|| "http".to_string());
-        // Memory/cpus/pids ceilings: an explicit fluid.json `container.memory`/
-        // `cpus`/`pids`, else the dashboard-managed setting, else 0/0.0 = "use the
-        // node's generous default" (never the old hardcoded 512m that OOM-killed
-        // real monolith containers). These are baked into the manifest.
-        let mem_mib = ovr
-            .memory
-            .as_deref()
-            .or_else(|| settings.as_ref().and_then(|s| s.memory.as_deref()))
-            .map(parse_mem_mib)
-            .unwrap_or(0);
-        let cpus = ovr
-            .cpus
-            .as_deref()
-            .or_else(|| settings.as_ref().and_then(|s| s.cpus.as_deref()))
-            .map(parse_cpus_quota)
-            .unwrap_or(0.0);
-        let pids = ovr
-            .pids
-            .or_else(|| settings.as_ref().and_then(|s| s.pids))
-            .unwrap_or(0);
-        // Volume mount path has no fluid.json equivalent — dashboard-only.
-        let volume_path = settings.as_ref().and_then(|s| s.volume_mount_path.clone());
-        let t1 = now_ms();
-        // Single-image build, no compose networking involved (unlike
-        // `build_compose_manifest`, which stays on podman — see that
-        // function's own comment) — safe to use Apple's `container` on
-        // macOS. The image this produces is later RUN via the same OS
-        // default (`podman_run_container`/mock.rs's `__container__` path),
-        // so build and run always share one image store.
-        let apple = hive_backend::container_cli::is_apple_default();
-        let bin = hive_backend::container_cli::bin(apple);
-        let mut build = Command::new(bin);
-        // `-f` so the detected file (Dockerfile OR Containerfile) is used explicitly,
-        // regardless of the builder's own default-file precedence.
-        build
-            .arg("build")
-            .arg("-t")
-            .arg(&image)
-            .arg("-f")
-            .arg(&dockerfile);
-        // Resolve the container CLI on both Linux Firecracker hosts (/usr/bin,
-        // podman) and macOS (/opt/homebrew/bin, either CLI) regardless of the
-        // service's inherited PATH.
-        let base_path = std::env::var("PATH").unwrap_or_default();
-        build.env(
-            "PATH",
-            format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"),
+    let compose_path = crate::compose::compose_file(dir);
+    if compose_path.is_some() {
+        anyhow::bail!(
+            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Compose source builds; no repository command was run on the host"
         );
-        // Pass project env as --build-arg so a Dockerfile `ARG`/`ENV` can use them.
-        for (k, v) in cloud.projects.env_map(project) {
-            build.arg("--build-arg").arg(format!("{k}={v}"));
-        }
-        let out = build.arg(".").current_dir(dir).output().await?;
-        for line in String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .chain(String::from_utf8_lossy(&out.stdout).lines())
-            .filter(|l| !l.trim().is_empty())
-            .take(40)
-        {
-            log(format!("  {line}"));
-        }
-        anyhow::ensure!(out.status.success(), "{bin} build failed");
-        log(format!(
-            "Image built: {image} ({}ms), port {exposed} ({protocol})",
-            now_ms().saturating_sub(t1)
-        ));
-        Ok(container_manifest(
-            project,
-            &image,
-            exposed,
-            &protocol,
-            mem_mib,
-            cpus,
-            pids,
-            volume_path.as_deref(),
-        ))
-    } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
+    }
+    let dockerfile = container_build_file(dir);
+    if dockerfile.is_some() {
+        anyhow::bail!(
+            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Dockerfile and Containerfile source builds; no repository command was run on the host"
+        );
+    }
+    if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
+        isolated.finish().await?;
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
             m.project = project.to_string();
@@ -4071,29 +5391,40 @@ async fn produce_manifest(
         log("Detected fluid.json — using project configuration.".into());
         Ok(m)
     } else {
-        build_via_fdi(cloud, bid, repo_root, dir, project, first_deploy, use_cache).await
+        let preparation = match fdi_preparation {
+            Some(preparation) => preparation,
+            None => {
+                let preparation = prepare_fdi(
+                    cloud,
+                    repo_root,
+                    dir,
+                    project,
+                    vercel_config,
+                    workspace_member,
+                )
+                .await?;
+                if let Some(warning) = preparation.package_manager.conflict_warning.as_ref() {
+                    log(format!("WARN: {warning}"));
+                }
+                preparation
+            }
+        };
+        build_via_fdi(
+            cloud,
+            bid,
+            isolated,
+            repo_root,
+            dir,
+            preparation,
+            project,
+            incarnation,
+            first_deploy,
+            use_cache,
+            build_env,
+            trust,
+        )
+        .await
     }
-}
-
-/// Does a package.json in `dir` reference workspace-protocol deps (`workspace:*`)
-/// — i.e. it's a package inside a monorepo workspace that must be installed from
-/// the workspace root?
-async fn uses_workspace_protocol(dir: &Path) -> bool {
-    let Ok(s) = tokio::fs::read_to_string(dir.join("package.json")).await else {
-        return false;
-    };
-    s.contains("\"workspace:") || s.contains("workspace:*")
-}
-
-/// Is `root` a workspace root (pnpm-workspace.yaml or a `workspaces` field)?
-async fn is_workspace_root(root: &Path) -> bool {
-    if root.join("pnpm-workspace.yaml").exists() {
-        return true;
-    }
-    if let Ok(s) = tokio::fs::read_to_string(root.join("package.json")).await {
-        return s.contains("\"workspaces\"");
-    }
-    false
 }
 
 /// Whether to use `npm ci` (a clean, lockfile-exact install) instead of
@@ -4110,20 +5441,94 @@ fn should_use_npm_ci(
     pm == "npm" && has_package_lock && (first_deploy || !use_cache)
 }
 
-/// Ensure a `yarn`/`pnpm` command's binary exists before running it (Issue #2).
-/// yarn/pnpm are provisioned by corepack — but corepack itself is missing from
-/// some distro Node packages, so a bare `corepack enable` is a no-op and the
-/// command fails with "yarn: command not found". This self-heals: install
-/// corepack via npm if absent, enable the shims (which respect the project's
-/// `packageManager` field → correct yarn/pnpm version, classic or berry), then
-/// run the command. npm always ships with Node. npm/bun/other commands pass
-/// through unchanged.
-fn corepack_wrap(cmd: &str) -> String {
-    match cmd.split_whitespace().next().unwrap_or("") {
-        "yarn" | "pnpm" => format!(
-            "(command -v corepack >/dev/null 2>&1 || npm i -g corepack >/dev/null 2>&1); corepack enable >/dev/null 2>&1; {cmd}"
-        ),
-        _ => cmd.to_string(),
+struct PackageManagerLauncher<'a> {
+    detection: &'a fluid_build::PackageManagerDetection,
+}
+
+impl<'a> PackageManagerLauncher<'a> {
+    fn new(detection: &'a fluid_build::PackageManagerDetection) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            detection.validation_error.is_none()
+                && matches!(detection.manager, "npm" | "pnpm" | "yarn" | "bun"),
+            "invalid package-manager snapshot: {}",
+            detection
+                .validation_error
+                .as_deref()
+                .unwrap_or(detection.manager)
+        );
+        Ok(Self { detection })
+    }
+
+    fn invoke(&self, arguments: &str) -> String {
+        let manager = self.detection.manager;
+        match self.detection.declaration.as_ref() {
+            Some(declaration) if manager == "bun" => format!(
+                "actual=$(bun --version 2>/dev/null) || {{ printf '%s\\n' 'BUILD_TOOLCHAIN_MISSING: bun' >&2; exit 127; }}; [ \"$actual\" = \"{}\" ] || {{ printf '%s\\n' \"BUILD_TOOLCHAIN_MISMATCH: packageManager requires bun@{}, builder has bun@$actual\" >&2; exit 42; }}; bun {arguments}",
+                declaration.version, declaration.version
+            ),
+            Some(declaration) => format!(
+                "command -v corepack >/dev/null 2>&1 || {{ printf '%s\\n' 'BUILD_TOOLCHAIN_MISSING: corepack' >&2; exit 127; }}; actual=$(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack {} --version 2>/dev/null) || {{ printf '%s\\n' 'BUILD_TOOLCHAIN_MISSING: exact packageManager tool {} is unavailable through corepack' >&2; exit 127; }}; [ \"$actual\" = \"{}\" ] || {{ printf '%s\\n' \"BUILD_TOOLCHAIN_MISMATCH: packageManager requires {}, builder resolved {}@$actual\" >&2; exit 42; }}; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack {} {arguments}",
+                declaration.raw,
+                declaration.raw,
+                declaration.version,
+                declaration.raw,
+                manager,
+                declaration.raw
+            ),
+            None => format!(
+                "command -v {manager} >/dev/null 2>&1 || {{ printf '%s\\n' 'BUILD_TOOLCHAIN_MISSING: {manager}' >&2; exit 127; }}; {manager} {arguments}"
+            ),
+        }
+    }
+
+    fn install(&self, use_npm_ci: bool) -> String {
+        let arguments = match (self.detection.manager, self.detection.lockfile) {
+            ("npm", Some(fluid_build::PackageManagerLockfile::Npm)) if use_npm_ci => {
+                "ci --no-audit --no-fund"
+            }
+            ("npm", _) => "install --no-audit --no-fund",
+            ("pnpm", Some(fluid_build::PackageManagerLockfile::Pnpm)) => {
+                "install --frozen-lockfile"
+            }
+            ("pnpm", _) => "install",
+            ("yarn", Some(fluid_build::PackageManagerLockfile::YarnClassic)) => {
+                "install --frozen-lockfile"
+            }
+            ("yarn", Some(fluid_build::PackageManagerLockfile::YarnModern)) => {
+                "install --immutable"
+            }
+            ("yarn", _) => "install",
+            ("bun", Some(fluid_build::PackageManagerLockfile::Bun)) => "install --frozen-lockfile",
+            ("bun", _) => "install",
+            _ => unreachable!("launcher validates package-manager name"),
+        };
+        self.invoke(arguments)
+    }
+
+    fn run_script(&self, script: &str) -> String {
+        self.invoke(&format!("run {script}"))
+    }
+
+    fn exec(&self, command: &str, bun_runtime: bool) -> String {
+        let arguments = match self.detection.manager {
+            "npm" => format!("exec --offline -- {command}"),
+            "pnpm" | "yarn" => format!("exec {command}"),
+            "bun" if bun_runtime => format!("x --bun --no-install {command}"),
+            "bun" => format!("x --no-install {command}"),
+            _ => unreachable!("launcher validates package-manager name"),
+        };
+        self.invoke(&arguments)
+    }
+
+    fn add_svelte_adapter(&self) -> String {
+        let arguments = match self.detection.manager {
+            "npm" => "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\"",
+            "pnpm" => "add -D --lockfile=false --config.strict-peer-dependencies=false \"$spec\"",
+            "yarn" => "add -D \"$spec\"",
+            "bun" => "add -d \"$spec\"",
+            _ => unreachable!("launcher validates package-manager name"),
+        };
+        self.invoke(arguments)
     }
 }
 
@@ -4134,75 +5539,59 @@ fn corepack_wrap(cmd: &str) -> String {
 async fn build_via_fdi(
     cloud: &Arc<CloudState>,
     bid: &str,
+    isolated: &mut IsolatedBuild,
     repo_root: &Path,
     dir: &Path,
+    preparation: FdiPreparation,
     project: &str,
+    incarnation: ProjectIncarnation,
     first_deploy: bool,
     use_cache: bool,
+    build_env: &std::collections::BTreeMap<String, String>,
+    _trust: &BuildTrustContext,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
 
-    // Build-config overrides ONLY when the user explicitly set a non-empty value
-    // (defaults are empty — see BuildConfig::default). Detection drives the rest.
-    let bc = cloud.projects.get_if_set(project).map(|s| s.build);
-    let pick = |f: fn(&crate::project_settings::BuildConfig) -> &String| {
-        bc.as_ref().map(f).filter(|s| !s.trim().is_empty()).cloned()
-    };
-    // `vercel.json` (loaded from the project root) takes precedence over Project
-    // Settings, which in turn override framework auto-detection — exactly Vercel's
-    // resolution order. A non-empty vercel.json value wins; otherwise fall back.
-    let vc = fluid_build::load_vercel_config(dir);
-    if vc.is_some() {
+    let FdiPreparation {
+        build_config,
+        settings_are_auto,
+        install_override,
+        build_override,
+        runtime_override,
+        framework,
+        root_workspace,
+        install_dir,
+        foreign_subdir,
+        is_monorepo,
+        package_manager,
+        plan,
+        build_output,
+        vercel_config_present,
+    } = preparation;
+    if vercel_config_present {
         log("Detected vercel.json — applying configuration overrides.".into());
     }
-    let vc_pick = |sel: fn(&fluid_build::VercelConfig) -> Option<&String>| {
-        vc.as_ref()
-            .and_then(sel)
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let inst = vc_pick(|c| c.install_command.as_ref()).or_else(|| pick(|b| &b.install_command));
-    let bld = vc_pick(|c| c.build_command.as_ref()).or_else(|| pick(|b| &b.build_command));
-    let outd = vc_pick(|c| c.output_directory.as_ref()).or_else(|| pick(|b| &b.output_dir));
-    // An explicit framework choice (vercel.json, else project settings) overrides
-    // auto-detection. A settings framework stamped by a PREVIOUS build's
-    // auto-detection (`framework_auto`) is NOT an explicit choice: honoring it
-    // here permanently pinned a first-build misdetection (monorepo scanned at
-    // the wrong root -> "static") so the real framework was never re-detected.
-    let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| {
-        bc.as_ref()
-            .filter(|b| !b.framework_auto)
-            .map(|b| b.framework.clone())
-            .filter(|s| !s.trim().is_empty())
-    });
-
-    // Explicit RUNTIME resolution — orthogonal to package-manager detection below.
-    // Precedence: vercel.json's native `runtime` field > vercel.json's `bunVersion`
-    // presence (Vercel's own Bun-beta selector) > Project Settings' explicit
-    // override > None (defer to `detect_start_cmd`/`adapter_manifest` inferring
-    // from the framework's own start command — today's behavior, unchanged, so
-    // every existing Node deployment and every Bun-as-package-manager-only
-    // project — a `bun.lock` with no explicit runtime choice — keeps running on
-    // Node exactly as before; a bun.lock alone must NEVER force the runtime).
-    let runtime_override: Option<hive_core::Runtime> = vc_pick(|c| c.runtime.as_ref())
-        .and_then(|s| hive_core::Runtime::from_config_str(&s))
-        .or_else(|| {
-            vc.as_ref()
-                .and_then(|c| c.bun_version.as_ref())
-                .map(|_| hive_core::Runtime::Bun)
-        })
-        .or_else(|| {
-            bc.as_ref()
-                .map(|b| b.runtime.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .and_then(hive_core::Runtime::from_config_str)
-        });
-    if let Some(rt) = runtime_override {
+    if let Some(runtime) = runtime_override {
         log(format!(
             "Explicit runtime: {} (vercel.json/project settings).",
-            rt.as_str()
+            runtime.as_str()
         ));
+    }
+
+    // Auto-detected framework provenance is persisted independently from package
+    // planning so package-less static and Wasmer lanes retain their bypasses.
+    if runtime_override != Some(hive_core::Runtime::Wasmer) {
+        let current = build_config.clone().unwrap_or_default();
+        if current.framework.trim().is_empty() || settings_are_auto {
+            let mut next = current;
+            next.framework = framework.slug.to_string();
+            next.framework_auto = true;
+            cloud.projects.set_build_exact(project, incarnation, next)?;
+            log(format!(
+                "Auto-detected framework: {} (saved to Build settings).",
+                framework.name
+            ));
+        }
     }
 
     // An explicit Wasmer runtime is a precompiled `.wasm` artifact: no `npm
@@ -4225,15 +5614,21 @@ async fn build_via_fdi(
         // build`, `wasm-pack`. Discarding it without a word would leave the
         // deployment serving a stale committed artifact, or nothing at all,
         // with a green build and no explanation.
-        let wasm_env = cloud.projects.env_map(project);
-        if let Some(cmd) = inst.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(cmd) = install_override
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+        {
             log(format!("Running configured install command: `{cmd}`."));
-            run_streamed(dir, cmd, cloud, bid, &wasm_env).await?;
+            run_streamed(isolated, dir, cmd, cloud, bid, build_env).await?;
         }
-        if let Some(cmd) = bld.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(cmd) = build_override
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+        {
             log(format!("Running configured build command: `{cmd}`."));
-            run_streamed(dir, cmd, cloud, bid, &wasm_env).await?;
+            run_streamed(isolated, dir, cmd, cloud, bid, build_env).await?;
         }
+        isolated.finish().await?;
         // Resolved AFTER the build step above, so a `.wasm` the build just
         // produced is found rather than only one committed to the repo.
         let Some(start) = detect_wasmer_start_cmd(dir).await else {
@@ -4248,138 +5643,38 @@ async fn build_via_fdi(
             "Provisioning Wasmer server: `{}`.",
             start.join(" ")
         ));
-        return Ok(function_manifest(project, start, runtime_override));
+        let mut manifest = function_manifest(project, start, runtime_override);
+        manifest.framework = "wasmer".to_string();
+        return Ok(manifest);
     }
 
-    let plan = fluid_build::plan_build(
-        dir,
-        fwo.as_deref(),
-        inst.as_deref(),
-        bld.as_deref(),
-        outd.as_deref(),
-    );
+    let launcher = PackageManagerLauncher::new(&package_manager)?;
 
-    // Persist the auto-detected framework back into Project Settings so the
-    // dashboard's Build settings reflect what was actually built (Issue #3). Only
-    // fill in a field the user hasn't explicitly set, so we never clobber overrides.
-    {
-        let cur = bc.clone().unwrap_or_default();
-        // Fill an empty slot, or REFRESH a previously auto-detected value —
-        // an auto stamp must track what detection actually says now, never
-        // fossilize the first build's answer.
-        if cur.framework.trim().is_empty() || cur.framework_auto {
-            let mut nb = cur;
-            nb.framework = plan.framework.slug.to_string();
-            nb.framework_auto = true;
-            if nb.install_command.trim().is_empty() {
-                nb.install_command = plan.install_command.clone();
-            }
-            if nb.build_command.trim().is_empty() {
-                nb.build_command = plan.build_command.clone();
-            }
-            if nb.output_dir.trim().is_empty() {
-                nb.output_dir = plan.output_dir.clone();
-            }
-            cloud.projects.set_build(project, nb);
-            log(format!(
-                "Auto-detected framework: {} (saved to Build settings).",
-                plan.framework.name
-            ));
-        }
-    }
-
-    // Generic "Static" framework = publish the files as-is: no install, no build.
-    // This honors the user's explicit choice and, crucially, never runs `npm
-    // install` — so repos with a build-y `postinstall` (e.g. jor1k's `./compile`)
-    // deploy as plain static sites instead of failing the install. Serve the
-    // configured output dir, else the repo root (where index.html lives).
-    if plan.framework.slug == "static" {
-        let sd = outd.clone().unwrap_or_else(|| ".".to_string());
-        log(format!(
-            "Static project (framework override) — skipping install/build; serving \"{sd}\" as-is."
-        ));
-        return Ok(static_manifest(project, &sd));
-    }
-
-    // Monorepo detection: only when THIS package actually uses `workspace:*` deps
-    // (which resolve only from a root install). A standalone example that merely
-    // lives inside a workspace repo (e.g. vercel/vercel's examples/* have normal
-    // deps) is installed in place — installing at the root would match no project.
-    let root_is_workspace = is_workspace_root(repo_root).await;
-    let is_monorepo = dir != repo_root && uses_workspace_protocol(dir).await && root_is_workspace;
-    let install_dir = if is_monorepo { repo_root } else { dir };
-    // A standalone app that merely LIVES inside a workspace repo it is NOT a member
-    // of (e.g. vercel/vercel's `examples/*`): the workspace package manager
-    // (pnpm/yarn) walks UP to the repo root and installs the workspace WITHOUT this
-    // subdir's deps — so its framework binary (`vite`, …) is never installed and the
-    // build dies with "command not found". Force npm here: npm doesn't traverse up
-    // to a pnpm/yarn workspace, so it installs THIS dir's package.json in place.
-    let foreign_subdir = !is_monorepo && dir != repo_root && root_is_workspace;
-    let pm_detection = fluid_build::detect_package_manager(install_dir);
-    let pm = if foreign_subdir {
-        "npm"
-    } else {
-        pm_detection.manager
-    };
-
+    let pm = package_manager.manager;
     log(format!(
-        "Detected framework: {} — primitive: {:?}, package manager: {} ({:?}){}",
+        "Detected framework: {} — primitive: {:?}, package manager: {} ({:?}){}{}",
         plan.framework.name,
         plan.framework.primitive,
-        pm,
-        if foreign_subdir {
-            fluid_build::PackageManagerSource::Default
-        } else {
-            pm_detection.source
-        },
+        package_manager.manager,
+        package_manager.source,
         if is_monorepo {
             " (workspace monorepo — installing at root)"
         } else {
             ""
+        },
+        if foreign_subdir {
+            " (standalone non-member — installing in selected root)"
+        } else {
+            ""
         }
     ));
-    // Package-manager choice never forces the RUNTIME (see `runtime_override`
-    // above) — a bun.lock/packageManager:"bun" alone only picks `bun install`.
-    // A conflicting lockfile (e.g. both bun.lock and pnpm-lock.yaml committed)
-    // is never silently dropped — always logged, deterministic winner.
-    if !foreign_subdir {
-        if let Some(w) = &pm_detection.conflict_warning {
-            log(format!("WARN: {w}"));
-        }
-    }
-    if let Some(nd) = preferred_node_bin() {
-        log(format!("Node runtime: {nd}"));
-    }
 
     let has_pkg = install_dir.join("package.json").exists();
-    // Build cache key (lockfile + package manager) for restore/save.
-    // Tenant-scoped: the cache executes what it restores, so it must never
-    // cross a tenant boundary (see `compute_cache_key`). `team_of` is the same
-    // resolver every tenant-scoped surface uses; an untagged project falls back
-    // to its own name, which is still a scope — never a fleet-wide bucket.
-    let cache_tenant = {
-        let t = cloud.projects.team_of(project);
-        if crate::admin::record_tenant(&t) == crate::admin::UNTAGGED_TENANT {
-            format!("project:{project}")
-        } else {
-            format!("team:{t}")
-        }
-    };
-    let cache_key = compute_cache_key(install_dir, pm, &cache_tenant).await;
 
-    // For a pnpm workspace, scope the install to just this package + its deps
-    // (`--filter`) so we don't install the entire monorepo.
-    let rel = dir
-        .strip_prefix(repo_root)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    let pnpm_filter = if is_monorepo && !rel.is_empty() {
-        format!(" --filter \"{{./{rel}}}...\"")
-    } else {
-        String::new()
-    };
-
+    // Generated install commands contain no repository-controlled path text.
+    // Installing the declared workspace whole is more work than a filter, but it
+    // preserves the package manager's graph semantics and removes a shell-
+    // injection boundary from hostile workspace directory names.
     // `npm ci` is the clean, lockfile-exact install. We use it ONLY for an npm
     // project with a committed package-lock.json (never yarn/pnpm — those have
     // their own lockfiles), and ONLY when:
@@ -4389,19 +5684,15 @@ async fn build_via_fdi(
     // `npm ci` wipes node_modules, so it never benefits from a restored cache.
     let use_npm_ci = should_use_npm_ci(
         pm,
-        install_dir.join("package-lock.json").exists(),
+        package_manager.lockfile == Some(fluid_build::PackageManagerLockfile::Npm),
         first_deploy,
         use_cache,
     );
-    // Install command: honor an explicit override, else the right command for the
-    // detected package manager (pnpm/yarn via corepack so the binary is present).
-    let install_cmd: String = corepack_wrap(&inst.unwrap_or_else(|| match pm {
-        "pnpm" => format!("pnpm install --no-frozen-lockfile{pnpm_filter}"),
-        "yarn" => "yarn install --network-timeout 600000".into(),
-        "bun" => "bun install".into(),
-        _ if use_npm_ci => "npm ci --no-audit --no-fund".into(),
-        _ => "npm install --no-audit --no-fund".into(),
-    }));
+    // Explicit commands are repository authority and remain byte-for-byte
+    // unchanged. Only platform-generated installs enter the checked launcher.
+    let install_cmd = install_override
+        .clone()
+        .unwrap_or_else(|| launcher.install(use_npm_ci));
     if use_npm_ci {
         log(format!(
             "Using `npm ci` (package-lock.json present, {}).",
@@ -4420,171 +5711,271 @@ async fn build_via_fdi(
     // "vite: command not found" (exit 127). Run framework build commands through
     // the package manager's `exec` so it resolves the bin from the hoisted/virtual
     // store. A `npm run …` style command is just re-pointed to the active PM.
-    let build_cmd = corepack_wrap(&{
-        let bc = plan.build_command.clone();
-        let first = bc.split_whitespace().next().unwrap_or("");
-        let is_pm_invocation = matches!(
-            first,
-            "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx" | "corepack"
-        );
-        if first == "npm" && pm != "npm" {
-            bc.replacen("npm", pm, 1)
-        } else if !bc.trim().is_empty() && !is_pm_invocation {
-            match pm {
-                "pnpm" => format!("pnpm exec {bc}"),
-                "yarn" => format!("yarn exec {bc}"),
-                // When the RUNTIME (not just the package manager) is explicitly
-                // Bun, add `--bun` so the framework's own internally-spawned
-                // Node-shebang child processes (e.g. Next.js's build workers)
-                // also run under Bun instead of silently falling back to Node —
-                // this is exactly Vercel's documented `bun run --bun next build`
-                // requirement. Plain `bunx {bc}` (no `--bun`) only resolves the
-                // LOCAL binary through Bun's package-runner; it does not affect
-                // what runtime that binary's own children use. Orthogonal to
-                // package-manager choice: a bun.lock with no explicit runtime
-                // override keeps today's plain `bunx {bc}`.
-                "bun" if runtime_override == Some(hive_core::Runtime::Bun) => {
-                    format!("bunx --bun {bc}")
-                }
-                "bun" => format!("bunx {bc}"),
-                // npm: the raw binary resolves via node_modules/.bin on PATH.
-                _ => bc,
-            }
+    let build_contract = if has_pkg {
+        Some(
+            crate::app_discovery::build_contract(
+                repo_root,
+                dir,
+                is_monorepo,
+                root_workspace.as_ref(),
+                build_override.is_some(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let build_exec_dir = if matches!(
+        build_contract.as_ref(),
+        Some(crate::app_discovery::BuildContract::WorkspaceRoot { .. })
+    ) {
+        repo_root
+    } else {
+        dir
+    };
+    let build_cmd = if let Some(explicit) = build_override.as_ref() {
+        explicit.clone()
+    } else if let Some(crate::app_discovery::BuildContract::WorkspaceRoot {
+        orchestrator: crate::app_discovery::WorkspaceOrchestrator::Turbo,
+        package_name,
+    }) = build_contract.as_ref()
+    {
+        let turbo = format!("turbo run build --filter={package_name}");
+        let command = launcher.exec(&turbo, pm == "bun");
+        log(format!(
+            "Workspace Turbo build contract: running exact package filter {package_name:?} while preserving declared task dependency edges ({command})."
+        ));
+        command
+    } else if build_contract.as_ref() == Some(&crate::app_discovery::BuildContract::SelectedApp) {
+        let command = launcher.run_script("build");
+        log(format!(
+            "Selected application build contract: running its package build lifecycle, including prebuild hooks ({command})."
+        ));
+        command
+    } else {
+        let generated = plan.framework.build_command.trim();
+        if let Some(script) = generated.strip_prefix("npm run ") {
+            launcher.run_script(script)
+        } else if generated.is_empty() {
+            String::new()
         } else {
-            bc
+            launcher.exec(generated, runtime_override == Some(hive_core::Runtime::Bun))
         }
-    });
-
-    // 0) Restore cached dependencies (local, else pull from a mesh peer). Skipped
-    // when the cache is disabled (redeploy opt-out) or when `npm ci` will wipe
-    // node_modules anyway — a restore would just be thrown away.
-    if use_cache && !use_npm_ci {
-        if let Some(k) = &cache_key {
-            restore_cache(cloud, bid, install_dir, k).await;
-        }
-    } else if !use_cache {
+    };
+    // Host tar extraction/creation would put repository-controlled cache bytes
+    // back outside the executor. Do not inspect repository toolchains on the host
+    // while isolated cache import/export is disabled; future cache identity must
+    // come from the pinned builder capability and sealed artifact protocol.
+    if use_cache {
+        log("Build cache bypassed: isolated cache import/export is not yet enabled.".into());
+    } else {
         log("Build cache disabled — installing dependencies fresh.".into());
     }
-    // Project env vars (already persisted at build start) — injected into both
-    // the install and build steps so framework builds can read them.
-    let proj_env = cloud.projects.env_map(project);
     // 1) Install dependencies at the install dir (root for monorepos). With a
     // restored node_modules this is a fast verify; otherwise a clean install.
-    if has_pkg && !install_cmd.trim().is_empty() {
+    if (has_pkg || install_override.is_some()) && !install_cmd.trim().is_empty() {
         log(format!(
             "Running \"{}\"{}",
             install_cmd,
             if is_monorepo { " (workspace root)" } else { "" }
         ));
-        run_streamed(install_dir, &install_cmd, cloud, bid, &proj_env)
+        run_streamed(isolated, &install_dir, &install_cmd, cloud, bid, build_env)
             .await
-            .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
+            .context("install command failed")?;
     }
-    // 1.5) SvelteKit: the default `@sveltejs/adapter-auto` only emits output for
-    // managed hosts (Vercel/Netlify/Cloudflare/…); on a self-hosted node it
-    // produces NO runnable server, so the function never binds its port. Swap it
-    // for `@sveltejs/adapter-node`, which emits a standalone `build/` server that
-    // listens on $HOST:$PORT — run later with `node build`. Done after install
-    // (node_modules present) and before the build.
-    let is_sveltekit = plan.framework.slug == "sveltekit";
+    // 1.5) SvelteKit: perform both dependency adaptation and config rewrite in
+    // the same isolated workspace as install/build. No installed package or
+    // repository path is read or mutated on the host between build steps.
+    let is_sveltekit = has_pkg && plan.framework.slug == "sveltekit";
     if is_sveltekit {
-        let cfg = dir.join("svelte.config.js");
-        if let Ok(src) = tokio::fs::read_to_string(&cfg).await {
-            if !src.contains("@sveltejs/adapter-node") && src.contains("@sveltejs/adapter-auto") {
-                // Pin adapter-node to the installed SvelteKit major (kit 1.x →
-                // adapter-node 1.x; kit ≥2 → latest), or modern adapter-node's
-                // `@sveltejs/kit@^2` peer dep clashes with an old kit and `npm`
-                // aborts (ERESOLVE). `--legacy-peer-deps` tolerates prereleases.
-                let kit_major =
-                    tokio::fs::read_to_string(dir.join("node_modules/@sveltejs/kit/package.json"))
-                        .await
-                        .ok()
-                        .and_then(|s| s.split("\"version\"").nth(1).map(|x| x.to_string()))
-                        .and_then(|x| x.split('"').nth(1).map(|v| v.to_string()))
-                        .and_then(|ver| ver.split('.').next().map(|m| m.to_string()));
-                let spec = match kit_major.as_deref() {
-                    Some("1") => "@sveltejs/adapter-node@^1",
-                    _ => "@sveltejs/adapter-node",
-                };
-                log(format!("SvelteKit detected with adapter-auto — switching to {spec} so it serves on a self-hosted node."));
-                let add = corepack_wrap(&match pm {
-                    "pnpm" => format!("pnpm add -D --config.strict-peer-dependencies=false {spec}"),
-                    "yarn" => format!("yarn add -D {spec}"),
-                    "bun" => format!("bun add -d {spec}"),
-                    _ => format!("npm install -D --no-audit --no-fund --legacy-peer-deps {spec}"),
-                });
-                run_streamed(dir, &add, cloud, bid, &proj_env)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("installing adapter-node failed: {e}"))?;
-                let patched = src.replace("@sveltejs/adapter-auto", "@sveltejs/adapter-node");
-                let _ = tokio::fs::write(&cfg, patched).await;
-            }
-        }
-    }
-    // 1.6) OpenNext: its default AWS wrapper emits a Lambda-style handler, which
-    // won't bind a port on a self-hosted node. Force the `node` wrapper+converter
-    // so `.open-next/server-functions/default/index.mjs` boots a standalone HTTP
-    // server on $PORT (run later with `node …index.mjs`) — giving it Fluid compute.
-    // Only synthesized when the user hasn't supplied their own open-next config.
-    if plan.framework.slug == "opennext" {
-        let has_cfg = [
-            "open-next.config.ts",
-            "open-next.config.js",
-            "open-next.config.mjs",
-        ]
-        .iter()
-        .any(|f| dir.join(f).exists());
-        if !has_cfg {
-            let cfg = "// Auto-generated by OpenEdge: run OpenNext's server function as a\n\
-                       // standalone Node HTTP server on $PORT so it runs on Fluid compute.\n\
-                       export default {\n  default: {\n    override: {\n      wrapper: \"node\",\n      converter: \"node\",\n    },\n  },\n};\n";
-            let _ = tokio::fs::write(dir.join("open-next.config.ts"), cfg).await;
-            log("OpenNext detected — generated open-next.config.ts (node wrapper) so the server runs on $PORT under Fluid.".into());
+        let add_adapter = launcher.add_svelte_adapter();
+        let selected_relative = dir.strip_prefix(&install_dir).map_err(|_| {
+            anyhow::anyhow!(
+                "selected application {} is outside package-manager root {}",
+                dir.display(),
+                install_dir.display()
+            )
+        })?;
+        let depth = selected_relative.components().count();
+        let install_root_argument = if depth == 0 {
+            ".".to_string()
         } else {
-            log("OpenNext detected — using your open-next.config (ensure the default server uses the `node` wrapper to serve on $PORT).".into());
+            std::iter::repeat("..")
+                .take(depth)
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let script = format!(
+            r#"set -eu
+root=$1
+cfg=svelte.config.js
+if [ -L "$cfg" ]; then
+  printf '%s\n' 'UNSAFE_BUILD_INPUT: svelte.config.js may not be a symlink' >&2
+  exit 41
+fi
+[ -f "$cfg" ] || exit 0
+grep -Fq '@sveltejs/adapter-auto' "$cfg" || exit 0
+grep -Fq '@sveltejs/adapter-node' "$cfg" && exit 0
+backup=$(mktemp -d .hive-svelte-inputs.XXXXXX)
+restore_inputs() {{
+  if [ -f "$backup/package.json" ]; then cp -- "$backup/package.json" package.json; fi
+  if [ -f "$backup/root-package.json" ]; then cp -- "$backup/root-package.json" "$root/package.json"; fi
+  for name in package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
+    if [ -f "$backup/$name" ]; then
+      cp -- "$backup/$name" "$root/$name"
+    else
+      rm -f -- "$root/$name"
+    fi
+  done
+  rm -rf -- "$backup"
+}}
+trap restore_inputs EXIT HUP INT TERM
+cp -- package.json "$backup/package.json"
+if [ "$root" != . ] && [ -f "$root/package.json" ]; then
+  cp -- "$root/package.json" "$backup/root-package.json"
+fi
+for name in package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
+  if [ -f "$root/$name" ]; then cp -- "$root/$name" "$backup/$name"; fi
+done
+major=$(node -e 'try {{ process.stdout.write(String(require("./node_modules/@sveltejs/kit/package.json").version).split(".")[0]) }} catch {{}}')
+if [ "$major" = 1 ]; then
+  spec='@sveltejs/adapter-node@^1'
+else
+  spec='@sveltejs/adapter-node'
+fi
+{add_adapter}
+restore_inputs
+trap - EXIT HUP INT TERM
+node -e 'const fs=require("fs"); const p="svelte.config.js"; const s=fs.readFileSync(p,"utf8"); if (!s.includes("@sveltejs/adapter-auto") || s.includes("@sveltejs/adapter-node")) process.exit(42); fs.writeFileSync(p,s.split("@sveltejs/adapter-auto").join("@sveltejs/adapter-node"));'
+printf '%s\n' "SvelteKit adapter switched to $spec"
+"#
+        );
+        isolated
+            .run(
+                dir,
+                &script,
+                "adapt SvelteKit for self-hosting",
+                &[install_root_argument],
+                false,
+                cloud,
+                bid,
+                build_env,
+            )
+            .await
+            .context("adapting SvelteKit failed")?;
+    }
+    // 1.6) OpenNext's default wrapper is Lambda-shaped. Generate the fixed Node
+    // wrapper inside the isolated workspace, refusing repository symlinks rather
+    // than letting a platform write follow one.
+    if has_pkg && plan.framework.slug == "opennext" {
+        let script = r#"set -eu
+for cfg in open-next.config.ts open-next.config.js open-next.config.mjs; do
+  if [ -L "$cfg" ]; then
+    printf '%s\n' "UNSAFE_BUILD_INPUT: $cfg may not be a symlink" >&2
+    exit 41
+  fi
+  if [ -e "$cfg" ]; then
+    printf '%s\n' 'OpenNext: using repository configuration'
+    exit 0
+  fi
+done
+umask 022
+set -C
+cat >open-next.config.ts <<'HIVE_OPENNEXT_CONFIG'
+// Generated by the platform: run OpenNext as a standalone Node HTTP server.
+export default {
+  default: {
+    override: {
+      wrapper: "node",
+      converter: "node",
+    },
+  },
+};
+HIVE_OPENNEXT_CONFIG
+printf '%s\n' 'OpenNext: generated Node wrapper configuration'
+"#;
+        isolated
+            .run(
+                dir,
+                script,
+                "configure OpenNext self-hosting",
+                &[],
+                false,
+                cloud,
+                bid,
+                build_env,
+            )
+            .await
+            .context("configuring OpenNext failed")?;
+    }
+    // 2) Build through the workspace root orchestrator when it exists; otherwise
+    // build in the selected project directory.
+    if (has_pkg || build_override.is_some()) && !build_cmd.trim().is_empty() {
+        log(format!("Running \"{}\"", build_cmd));
+        run_streamed(isolated, build_exec_dir, &build_cmd, cloud, bid, build_env)
+            .await
+            .context("build command failed")?;
+    }
+    if matches!(
+        &plan.framework.primitive,
+        fluid_build::Primitive::Serverless | fluid_build::Primitive::Hybrid
+    ) && runtime_override != Some(hive_core::Runtime::Bun)
+    {
+        let script = r#"set -eu
+p=.hive-after-shim.cjs
+[ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: after shim path may not be a symlink' >&2; exit 41; }
+tmp=$(mktemp .hive-after-shim.XXXXXX)
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+printf '%s' "$1" >"$tmp"
+chmod 0444 "$tmp"
+mv -f -- "$tmp" "$p"
+trap - EXIT HUP INT TERM
+"#;
+        isolated
+            .run(
+                dir,
+                script,
+                "stage platform after shim",
+                &[AFTER_SHIM_JS.to_string()],
+                false,
+                cloud,
+                bid,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .context("staging platform after shim failed")?;
+    }
+    // Seal once after the complete ordered command graph. A checked-in static
+    // Build Output has its own exact output directory; otherwise the normalized
+    // selected-app outputDirectory is the directory that must exist in the sealed
+    // volume before any bytes are materialized on the host.
+    let explicit_commands = install_override.is_some() || build_override.is_some();
+    if !explicit_commands {
+        if let Some(output) = build_output.as_ref() {
+            build_output_manifest(project, plan.framework.slug, output)?;
         }
     }
-    // 2) Build in the project directory.
-    if has_pkg && !build_cmd.trim().is_empty() {
-        log(format!("Running \"{}\"", build_cmd));
-        run_streamed(dir, &build_cmd, cloud, bid, &proj_env)
-            .await
-            .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
-    }
-    // 3) Save the warm cache for the next build (and for peers to pull).
-    //
-    // OFF the critical path: nothing downstream in THIS build reads the cache
-    // tar — it exists purely for future builds — yet tarring a multi-GB
-    // node_modules (hundreds of thousands of small files, single-threaded)
-    // was awaited here, between the build finishing and the deployment being
-    // delivered/registered. `save_cache` already writes to a build-id-suffixed
-    // temp path and atomically renames, so it is safe to run concurrently with
-    // the rest of the pipeline and with other builds.
-    if let Some(k) = &cache_key {
-        let c2 = cloud.clone();
-        let bid2 = bid.to_string();
-        let dir2 = install_dir.to_path_buf();
-        let k2 = k.clone();
-        // Detached on purpose: dropping the JoinHandle does not cancel a
-        // spawned task, so this runs to completion in the background.
-        tokio::spawn(async move { save_cache(&c2, &bid2, &dir2, &k2).await });
-    }
+    let expected_output = if build_output.is_some() && !explicit_commands {
+        fluid_build::OutputDirectory::parse(".vercel/output")?
+    } else {
+        plan.output_dir.clone()
+    };
+    isolated.finish_with_output(dir, &expected_output).await?;
 
-    let has_bo = fluid_build::has_build_output(dir);
-    if has_bo {
-        log("Build Output API detected (.vercel/output).".into());
+    let parsed_build_output = fluid_build::resolve_build_output_checked(dir)?;
+    if let Some(output) = parsed_build_output.as_ref() {
+        log("Build Output API v3 detected (.vercel/output).".into());
+        return Ok(build_output_manifest(project, plan.framework.slug, output)?);
     }
 
     use fluid_build::Primitive;
     match plan.framework.primitive {
         Primitive::Static => {
-            let sd = if has_bo {
-                ".vercel/output/static".to_string()
-            } else {
-                plan.output_dir.clone()
-            };
-            log(format!("Serving static assets from \"{sd}\"."));
-            Ok(static_manifest(project, &sd))
+            let static_dir = plan.output_dir.as_str();
+            log(format!("Serving static assets from \"{static_dir}\"."));
+            let mut manifest = static_manifest(project, static_dir);
+            manifest.framework = plan.framework.slug.to_string();
+            Ok(manifest)
         }
         Primitive::Serverless | Primitive::Hybrid => {
             // Next.js DEPLOYMENT ADAPTERS (OpenNext / vinext): the build emits a
@@ -4592,7 +5983,7 @@ async fn build_via_fdi(
             // the Fluid `api` function and serve assets from the CDN, falling
             // through to the function on a miss (the CDN→origin model). This is what
             // gives OpenNext/vinext apps Fluid compute (warm pool + concurrency).
-            if let Some(m) =
+            if let Some(mut m) =
                 adapter_manifest(project, plan.framework.slug, dir, runtime_override).await
             {
                 log(format!(
@@ -4604,6 +5995,7 @@ async fn build_via_fdi(
                         .unwrap_or_default(),
                     m.static_dir.clone().unwrap_or_default(),
                 ));
+                m.framework = plan.framework.slug.to_string();
                 return Ok(m);
             }
             // Node-server model: the framework was just built, so its production
@@ -4661,13 +6053,14 @@ async fn build_via_fdi(
                             revalidate: r.revalidate,
                         })
                         .collect();
-                    if let Ok(js) = serde_json::to_string_pretty(&prm) {
-                        let _ = tokio::fs::write(dir.join("shadow-per-route.json"), js).await;
-                        log(format!("per-route: wrote shadow-per-route.json + {} route policies into the manifest (cache/retry wiring). Serving still uses `next start` (fallback).", route_policies.len()));
-                    }
+                    log(format!(
+                        "per-route: attached {} route policies to the manifest. Serving still uses `next start` (fallback).",
+                        route_policies.len()
+                    ));
                 }
             }
             let mut m = function_manifest(project, start, runtime_override);
+            m.framework = plan.framework.slug.to_string();
             m.route_policies = route_policies;
             // after()/waitUntil runtime support for Node-runtime deployments: drop
             // the platform shim into the build dir and inject it via NODE_OPTIONS
@@ -4677,7 +6070,7 @@ async fn build_via_fdi(
             // x-fluid-wait-until-ms keep-alive convention. Skipped for Bun (doesn't
             // honor NODE_OPTIONS --require); harmless no-op if after() is never used.
             if runtime_override != Some(hive_core::Runtime::Bun) {
-                install_after_shim(dir, &mut m).await;
+                wire_after_shim(&mut m);
             }
             Ok(m)
         }
@@ -4689,17 +6082,10 @@ async fn build_via_fdi(
 const AFTER_SHIM_JS: &str = include_str!("../assets/after-shim.cjs");
 const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
 
-/// Write the after()-support shim into the build dir and wire it into the first
-/// function's serve env (NODE_OPTIONS=--require + HIVE_AFTER_MAX_MS = maxDuration).
-/// A relative `--require ./<file>` path so it resolves against the function's CWD
-/// on every backend (the FC microVM relocates the workdir to /build).
-async fn install_after_shim(dir: &Path, m: &mut Manifest) {
-    if tokio::fs::write(dir.join(AFTER_SHIM_FILE), AFTER_SHIM_JS)
-        .await
-        .is_err()
-    {
-        return; // best-effort: a shim write failure must never fail the deploy
-    }
+/// Wire the already-sealed after()-support shim into the first function's serve
+/// environment. The bytes themselves are staged inside `IsolatedBuild` before
+/// sealing; this function must remain metadata-only.
+fn wire_after_shim(m: &mut Manifest) {
     let Some(f) = m.functions.first_mut() else {
         return;
     };
@@ -4718,6 +6104,110 @@ async fn install_after_shim(dir: &Path, m: &mut Manifest) {
     f.env
         .entry("HIVE_AFTER_MAX_MS".to_string())
         .or_insert_with(|| max_ms.to_string());
+}
+
+fn build_output_contract_error(
+    operation: &'static str,
+    refusal: fluid_core::BuildOutputV3Refusal,
+) -> fluid_build::BuildContractError {
+    let code = match &refusal {
+        fluid_core::BuildOutputV3Refusal::Invalid { .. } => {
+            fluid_build::BuildContractErrorCode::InvalidBuildOutput
+        }
+        fluid_core::BuildOutputV3Refusal::Unsupported { .. } => {
+            fluid_build::BuildContractErrorCode::UnsupportedBuildOutput
+        }
+    };
+    fluid_build::BuildContractError::new(code, operation, refusal.to_string())
+}
+
+fn build_output_manifest(
+    project: &str,
+    framework: &str,
+    output: &fluid_build::BuildOutput,
+) -> Result<Manifest, fluid_build::BuildContractError> {
+    let descriptor = fluid_core::BuildOutputV3::from_parser_value(output.descriptor_value())
+        .map_err(|refusal| {
+            build_output_contract_error("convert Build Output API v3 descriptor", refusal)
+        })?;
+    if let Some(function) = descriptor.functions.first() {
+        return Err(build_output_contract_error(
+            "provision Build Output API v3 functions",
+            fluid_core::BuildOutputV3Refusal::unsupported(format!(
+                "function {:?} is a Vercel handler export, not a real HTTP $PORT launcher ({} function(s) in output)",
+                function.name,
+                descriptor.functions.len()
+            )),
+        ));
+    }
+
+    let config = descriptor.config_view().map_err(|refusal| {
+        build_output_contract_error("project Build Output API v3 configuration", refusal)
+    })?;
+    let mut manifest = if descriptor.assets.is_empty() {
+        Manifest {
+            project: project.to_string(),
+            ..Default::default()
+        }
+    } else {
+        static_manifest(project, ".vercel/output/static")
+    };
+    manifest.framework = framework.to_string();
+    manifest.images = config
+        .images
+        .as_ref()
+        .map(|images| fluid_core::ImagesConfig {
+            sizes: images.sizes.clone().unwrap_or_default(),
+            qualities: images.qualities.clone(),
+            formats: images.formats.clone(),
+            minimum_cache_ttl: images.minimum_cache_ttl,
+            domains: images.domains.clone().unwrap_or_default(),
+            remote_patterns: images
+                .remote_patterns
+                .iter()
+                .map(|pattern| fluid_core::RemotePattern {
+                    protocol: pattern.protocol.clone(),
+                    hostname: pattern.hostname.clone(),
+                    port: pattern.port.clone(),
+                    pathname: pattern.pathname.clone(),
+                    search: pattern.search.clone(),
+                })
+                .collect(),
+            local_patterns: images
+                .local_patterns
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|pattern| fluid_core::LocalPattern {
+                    pathname: pattern.pathname.clone(),
+                    search: pattern.search.clone(),
+                })
+                .collect(),
+            dangerously_allow_svg: images.dangerously_allow_svg,
+            content_security_policy: images.content_security_policy.clone(),
+            content_disposition_type: images.content_disposition_type.clone(),
+        });
+    manifest.crons = config
+        .crons
+        .iter()
+        .map(|cron| fluid_core::CronSpec {
+            path: cron.path.clone(),
+            schedule: cron.schedule.clone(),
+        })
+        .collect();
+    manifest.build_output_v3 = Some(descriptor);
+
+    let compiled = fluid_gateway::build_output_v3_evaluator(&manifest).map_err(|refusal| {
+        build_output_contract_error("compile Build Output API v3 deployment contract", refusal)
+    })?;
+    if compiled.is_none() {
+        return Err(fluid_build::BuildContractError::new(
+            fluid_build::BuildContractErrorCode::InvalidBuildOutput,
+            "compile Build Output API v3 deployment contract",
+            "server-derived descriptor was not authoritative",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn static_manifest(project: &str, static_dir: &str) -> Manifest {
@@ -5487,119 +6977,236 @@ fn find_workflow_manifest(dir: &Path) -> Option<std::path::PathBuf> {
     walk(dir, 0)
 }
 
+fn build_executor_platform_fault(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<crate::build_executor::BuildExecutorError>() else {
+        return false;
+    };
+    matches!(
+        error.code,
+        crate::build_executor::BuildExecutorErrorCode::InvalidConfig
+            | crate::build_executor::BuildExecutorErrorCode::InvalidRequest
+            | crate::build_executor::BuildExecutorErrorCode::CapabilityUnavailable
+            | crate::build_executor::BuildExecutorErrorCode::CapabilityMismatch
+            | crate::build_executor::BuildExecutorErrorCode::UnsupportedSurface
+            | crate::build_executor::BuildExecutorErrorCode::PodmanFailed
+            | crate::build_executor::BuildExecutorErrorCode::OutputLimitExceeded
+            | crate::build_executor::BuildExecutorErrorCode::OutputEntryLimitExceeded
+            | crate::build_executor::BuildExecutorErrorCode::UnsafeOutput
+            | crate::build_executor::BuildExecutorErrorCode::SealIntegrityMismatch
+            | crate::build_executor::BuildExecutorErrorCode::CleanupFailed
+    )
+}
+
+struct IsolatedBuild {
+    root: PathBuf,
+    session: Option<crate::build_executor::BuildSession>,
+}
+
+impl IsolatedBuild {
+    async fn begin(root: &Path) -> anyhow::Result<Self> {
+        let executor = crate::build_executor::get()
+            .map_err(anyhow::Error::new)
+            .context("BUILD_ISOLATION_UNAVAILABLE: acquire live-probed executor")?;
+        let session = executor
+            .begin(crate::build_executor::BuildRequest {
+                checkout: root.to_path_buf(),
+                surface: crate::build_executor::BuildSurface::RepositoryCommands,
+            })
+            .await
+            .map_err(anyhow::Error::new)
+            .context("BUILD_ISOLATION_UNAVAILABLE: begin isolated build")?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            session: Some(session),
+        })
+    }
+
+    fn workspace_path(&self, dir: &Path) -> anyhow::Result<crate::build_executor::WorkspacePath> {
+        let relative = dir.strip_prefix(&self.root).map_err(|_| {
+            anyhow::anyhow!(
+                "build command directory {} is outside isolated checkout {}",
+                dir.display(),
+                self.root.display()
+            )
+        })?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("build command directory is not valid UTF-8"))?;
+        crate::build_executor::WorkspacePath::parse(relative.replace('\\', "/"))
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn run(
+        &mut self,
+        dir: &Path,
+        command: &str,
+        label: &str,
+        args: &[String],
+        accept_nonzero: bool,
+        cloud: &Arc<CloudState>,
+        bid: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<i32> {
+        let cwd = self.workspace_path(dir)?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("isolated build session was already sealed"))?;
+        let mut step = crate::build_executor::BuildStep::shell(label, command);
+        step.args = args.to_vec();
+        step.cwd = cwd;
+        step.env = env.clone();
+        step.accept_nonzero = accept_nonzero;
+        let cancelled = async {
+            loop {
+                if cloud.build_cancels.is_cancelled(bid) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let result = tokio::select! {
+            result = session.run(step, |line| {
+                let stream = match line.stream {
+                    crate::build_executor::BuildLogStream::Stdout => "",
+                    crate::build_executor::BuildLogStream::Stderr => "stderr: ",
+                };
+                let suffix = if line.dropped_bytes == 0 {
+                    String::new()
+                } else {
+                    format!(" … [{} bytes dropped]", line.dropped_bytes)
+                };
+                cloud.builds.log(bid, format!("  {stream}{}{suffix}", line.text));
+            }) => result,
+            _ = cancelled => return Err(BuildCancelled.into()),
+        };
+        let result = result.map_err(anyhow::Error::new)?;
+        if cloud.build_cancels.is_cancelled(bid) {
+            return Err(BuildCancelled.into());
+        }
+        Ok(result.exit_code)
+    }
+
+    fn output_workspace_path(
+        &self,
+        dir: &Path,
+        output: &fluid_build::OutputDirectory,
+    ) -> anyhow::Result<crate::build_executor::WorkspacePath> {
+        let app = self.workspace_path(dir)?;
+        let path = match (app.as_str(), output.as_str()) {
+            (".", output) => output.to_string(),
+            (app, ".") => app.to_string(),
+            (app, output) => format!("{app}/{output}"),
+        };
+        crate::build_executor::WorkspacePath::parse(path).map_err(anyhow::Error::new)
+    }
+
+    async fn finish_with_output(
+        &mut self,
+        dir: &Path,
+        output: &fluid_build::OutputDirectory,
+    ) -> anyhow::Result<()> {
+        let expected = self.output_workspace_path(dir, output)?;
+        self.finish_inner(Some(&expected)).await
+    }
+
+    async fn finish(&mut self) -> anyhow::Result<()> {
+        self.finish_inner(None).await
+    }
+
+    async fn finish_inner(
+        &mut self,
+        expected: Option<&crate::build_executor::WorkspacePath>,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .session
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("isolated build session was already sealed"))?;
+        let sealed = session
+            .seal(crate::build_executor::WorkspacePath::root())
+            .await
+            .map_err(anyhow::Error::new)?;
+        if let Some(expected) = expected {
+            sealed
+                .require_directory(expected)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
+        sealed
+            .materialize_replace(&self.root)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+}
+
+async fn reseal_platform_output(root: &Path) -> anyhow::Result<()> {
+    let executor = crate::build_executor::get()
+        .map_err(anyhow::Error::new)
+        .context("BUILD_ISOLATION_UNAVAILABLE: acquire executor for final seal")?;
+    let session = executor
+        .begin(crate::build_executor::BuildRequest {
+            checkout: root.to_path_buf(),
+            surface: crate::build_executor::BuildSurface::RepositoryCommands,
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("BUILD_ISOLATION_UNAVAILABLE: import platform-finalized output")?;
+    let sealed = session
+        .seal(crate::build_executor::WorkspacePath::root())
+        .await
+        .map_err(anyhow::Error::new)
+        .context("seal platform-finalized output")?;
+    sealed
+        .materialize_replace(root)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("publish platform-finalized output")
+}
+
 async fn run_streamed(
+    isolated: &mut IsolatedBuild,
     dir: &Path,
     command: &str,
     cloud: &Arc<CloudState>,
     bid: &str,
     env: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    use std::process::Stdio;
-    use tokio::io::BufReader;
+    isolated
+        .run(
+            dir,
+            command,
+            "repository build command",
+            &[],
+            false,
+            cloud,
+            bid,
+            env,
+        )
+        .await
+        .map(|_| ())
+}
 
-    // Put the project's local CLIs (node_modules/.bin) first, then a STABLE Node
-    // 20–24, then system paths. This ensures `node`/`npm` are a supported version
-    // (not Homebrew's node 26 canary) so engine-gated frameworks build.
-    let local_bin = dir.join("node_modules/.bin");
-    let mut prefix = local_bin.to_string_lossy().into_owned();
-    if let Some(nd) = preferred_node_bin() {
-        prefix.push(':');
-        prefix.push_str(&nd);
-    }
-    let path = format!(
-        "{prefix}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-        std::env::var("PATH").unwrap_or_default()
-    );
-    // Non-login shell (`-c`, not `-lc`): a login shell re-runs macOS `path_helper`
-    // / profile scripts which reorder PATH and shove Homebrew's node (v26 canary)
-    // back in front of our chosen stable Node 20–24. `-c` preserves our PATH.
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
-        .env("PATH", &path)
-        .env("HOME", dir)
-        .env("CI", "1")
-        .env("NEXT_TELEMETRY_DISABLED", "1")
-        // Never fail a build on EBADENGINE — warn-only — and quiet npm noise.
-        .env("npm_config_engine_strict", "false")
-        .env("npm_config_fund", "false")
-        .env("npm_config_audit", "false")
-        // Project env vars — injected so the build can read them (last so they win).
-        .envs(env)
-        // Own process group (pgid == this pid): `npm install`/`npm run build`
-        // fork `npm`/`node`/framework-worker children that inherit this shell's
-        // group, so `cancel_build`'s group-kill (`kill -KILL -<pgid>`) reaches
-        // the whole tree, not just this one `/bin/sh`.
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    cloud.build_cancels.set_running(bid, child.id());
-    if cloud.build_cancels.is_cancelled(bid) {
-        // A cancel landed in the tiny window between the caller's last
-        // cooperative check and this spawn — kill it now.
-        let _ = child.start_kill();
-    }
-
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    // Redact every decrypted project env VALUE out of build output before it's
-    // persisted to the (team-readable, indefinitely-retained) build log. The
-    // build process runs the repo's OWN install/build commands with these
-    // values injected — a build script that echoes env (verbose npm/yarn
-    // dumps, a framework build failure printing `process.env`, or a
-    // one-line `"prebuild": "env"` in a PR from anyone with push access) used
-    // to leak every real secret in cleartext. Mirrors the identical
-    // `sandboxes_platform.rs` exec-output redaction (`secret_values`/
-    // `redact_secrets`) — same utility, same "redact every value, not just
-    // ones flagged sensitive" conservative default.
-    let secret_values: Vec<String> = env.values().filter(|v| !v.is_empty()).cloned().collect();
-    // BOUNDED capture. `BufReader::lines()`/`next_line()` splits only on `\n`
-    // and has no length limit, so a build that writes without newlines — a
-    // `\r`-only progress bar (npm/pnpm/pip/curl/`podman pull`), a single-line
-    // source map, a binary accidentally sent to stdout — grew ONE String until
-    // the node died, taking every other tenant on it. Worse here than at the
-    // other capture sites: each line is then `redact_secrets`'d (a second full
-    // copy) and `format!`'d (a third), so an N-byte line cost ~3N. The build
-    // command is tenant-supplied, which makes an unbounded read a
-    // multi-tenant availability hole, not just a leak.
-    //
-    // `read_capped_line` still DRAINS the pipe (the child must never block on
-    // us) but retains at most MAX_LOG_LINE_BYTES, and reports what it dropped.
-    let (c1, b1, s1) = (cloud.clone(), bid.to_string(), secret_values.clone());
-    let t1 = tokio::spawn(async move {
-        let mut r = BufReader::new(stdout);
-        while let Ok(Some(l)) =
-            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
-        {
-            c1.builds.log(
-                &b1,
-                format!("  {}", crate::sandboxes::redact_secrets(&l.text, &s1)),
-            );
-        }
-    });
-    let (c2, b2, s2) = (cloud.clone(), bid.to_string(), secret_values);
-    let t2 = tokio::spawn(async move {
-        let mut r = BufReader::new(stderr);
-        while let Ok(Some(l)) =
-            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
-        {
-            c2.builds.log(
-                &b2,
-                format!("  {}", crate::sandboxes::redact_secrets(&l.text, &s2)),
-            );
-        }
-    });
-    let status = child.wait().await;
-    cloud.build_cancels.set_running(bid, None);
-    let status = status?;
-    let _ = tokio::join!(t1, t2);
-    if !status.success() && cloud.build_cancels.is_cancelled(bid) {
-        return Err(BuildCancelled.into());
-    }
-    anyhow::ensure!(status.success(), "exited with {status}");
-    Ok(())
+async fn run_ignored_command(
+    isolated: &mut IsolatedBuild,
+    dir: &Path,
+    command: &str,
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<bool> {
+    isolated
+        .run(
+            dir,
+            command,
+            "ignored build command",
+            &[],
+            true,
+            cloud,
+            bid,
+            env,
+        )
+        .await
+        .map(|exit| exit == 0)
 }
 
 // ---- Build cache (content-addressed, P2P, fault-tolerant) ----
@@ -5617,45 +7224,121 @@ pub fn cache_root() -> PathBuf {
     crate::persist::data_dir().join("build-cache")
 }
 
-/// Content hash of the lockfile + package manager → cache key. None if there's
-/// nothing installable to key on.
-/// `tenant` SCOPES the key. Without it the key was SHA-256(package-manager +
-/// lockfile) truncated to 64 bits and shared fleet-wide, so every tenant who
-/// scaffolded the same `create-next-app` template collided on one key — and
-/// `save_cache` tars `node_modules` AFTER the tenant's arbitrary build command
-/// ran with write access to it, while `restore_cache` untars that blob into
-/// the NEXT tenant's build. That is a cross-tenant code-execution path into
-/// production builds. Sharing within a tenant is kept (the real hit rate);
-/// across tenants it is now impossible by construction. The digest is no
-/// longer truncated: 64 bits is a weak collision target for a cache that
-/// executes what it restores.
-async fn compute_cache_key(install_dir: &Path, pm: &str, tenant: &str) -> Option<String> {
+async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).env("CI", "1");
+    match tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stdout.is_empty() {
+                stderr
+            } else {
+                stdout
+            }
+        }
+        _ => "unavailable".to_string(),
+    }
+}
+
+async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
+    if let Ok(explicit) = std::env::var("HIVE_BUILD_TOOLCHAIN_ID") {
+        if !explicit.trim().is_empty() {
+            return explicit;
+        }
+    }
+    let node = preferred_node_bin()
+        .map(PathBuf::from)
+        .map(|dir| dir.join("node"))
+        .unwrap_or_else(|| PathBuf::from("node"));
+    let node_version = command_version(&node, &["--version"], install_dir).await;
+    let pm_program = if pm == "npm" {
+        node.parent()
+            .map(|dir| dir.join("npm"))
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| PathBuf::from("npm"))
+    } else {
+        PathBuf::from(pm)
+    };
+    let pm_version = command_version(&pm_program, &["--version"], install_dir).await;
+    format!(
+        "os={};arch={};node={};pm={pm}@{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        node_version,
+        pm_version,
+    )
+}
+
+fn cache_hash_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    use sha2::Digest;
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+/// Cache identity binds every authority and executable-input dimension. A
+/// production key cannot name a preview/fork artifact because the signed key
+/// commits to the lane as well as tenant, canonical and actual repositories,
+/// lock inputs, selected toolchain, and build policy.
+async fn compute_cache_key(
+    install_dir: &Path,
+    pm: &str,
+    tenant: &str,
+    trust: &BuildTrustContext,
+    toolchain: &str,
+    policy: &str,
+    build_env: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"tenant\x1f");
-    hasher.update(tenant.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(pm.as_bytes());
+    cache_hash_field(&mut hasher, "domain", b"hive-build-cache-v3");
+    cache_hash_field(&mut hasher, "tenant", tenant.as_bytes());
+    cache_hash_field(
+        &mut hasher,
+        "canonical-repo",
+        trust.canonical_repo.as_bytes(),
+    );
+    cache_hash_field(&mut hasher, "actual-repo", trust.actual_repo.as_bytes());
+    cache_hash_field(
+        &mut hasher,
+        "trust-lane",
+        trust.lane.cache_label().as_bytes(),
+    );
+    cache_hash_field(&mut hasher, "package-manager", pm.as_bytes());
+    cache_hash_field(&mut hasher, "toolchain", toolchain.as_bytes());
+    cache_hash_field(&mut hasher, "policy", policy.as_bytes());
+    for (key, value) in build_env {
+        cache_hash_field(&mut hasher, "build-env-key", key.as_bytes());
+        let value_digest = Sha256::digest(value.as_bytes());
+        cache_hash_field(&mut hasher, "build-env-value-sha256", &value_digest);
+    }
+
     let mut found = false;
     for name in [
         "pnpm-lock.yaml",
         "yarn.lock",
+        "bun.lock",
         "bun.lockb",
         "package-lock.json",
         "package.json",
     ] {
         if let Ok(bytes) = tokio::fs::read(install_dir.join(name)).await {
-            hasher.update(name.as_bytes());
-            hasher.update(&bytes);
+            cache_hash_field(&mut hasher, name, &bytes);
             found = true;
-            break;
         }
     }
     if !found {
         return None;
     }
-    let digest = hasher.finalize();
-    Some(digest.iter().take(16).map(|b| format!("{b:02x}")).collect())
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 // ---- #22 build-artifact integrity + authenticity --------------------------
@@ -5741,10 +7424,41 @@ pub fn artifact_sig_valid(secret: &str, bytes: &[u8], sig_hex: &str) -> bool {
     mac.verify_slice(&expected).is_ok() // constant-time comparison
 }
 
-/// Verify a pulled artifact against the peer's integrity/authenticity headers (#22).
-/// Returns Ok(()) if the bytes are trustworthy, Err(reason) otherwise. `sha`/`sig`
-/// are the header values the peer sent (None if absent).
+pub fn cache_artifact_sig(secret: &str, key: &str, bytes: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    mac.update(b"hive-build-cache-artifact-v1\0");
+    mac.update(&(key.len() as u64).to_le_bytes());
+    mac.update(key.as_bytes());
+    mac.update(bytes);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn cache_artifact_sig_valid(secret: &str, key: &str, bytes: &[u8], sig_hex: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let Some(expected) = hex_decode(sig_hex) else {
+        return false;
+    };
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    mac.update(b"hive-build-cache-artifact-v1\0");
+    mac.update(&(key.len() as u64).to_le_bytes());
+    mac.update(key.as_bytes());
+    mac.update(bytes);
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// Verify a pulled artifact against the requested cache identity as well as its
+/// content. A valid signature for key A cannot be replayed as key B.
 fn verify_pulled_artifact(
+    key: &str,
     bytes: &[u8],
     sha: Option<&str>,
     sig: Option<&str>,
@@ -5759,7 +7473,7 @@ fn verify_pulled_artifact(
     // REQUIRED — a peer that can't sign is not trusted to supply build inputs.
     if let Some(secret) = artifact_secret() {
         match sig {
-            Some(sig) if artifact_sig_valid(&secret, bytes, sig) => {}
+            Some(sig) if cache_artifact_sig_valid(&secret, key, bytes, sig) => {}
             Some(_) => return Err("artifact signature invalid (untrusted/forged)".into()),
             None => return Err("artifact signature missing (peer can't authenticate)".into()),
         }
@@ -5825,7 +7539,7 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
                     .map(String::from);
                 if let Ok(bytes) = resp.bytes().await {
                     if let Err(reason) =
-                        verify_pulled_artifact(&bytes, sha.as_deref(), sig.as_deref())
+                        verify_pulled_artifact(key, &bytes, sha.as_deref(), sig.as_deref())
                     {
                         tracing::warn!(peer = %peer, key = %key, %reason, "rejected untrusted build artifact (#22)");
                         continue; // never write unverified bytes; try the next peer
@@ -5910,15 +7624,15 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     if install_dir.join(".next/cache").exists() {
         args.push(".next/cache".into());
     }
-    let out = Command::new("tar")
-        .args(&args)
-        .current_dir(install_dir)
-        .output()
-        .await;
+    let mut tar = Command::new("tar");
+    tar.args(&args).current_dir(install_dir);
+    let out = run_cancellable_output(&mut tar, cloud, bid).await;
     if let Ok(o) = out {
-        if o.status.success() && tokio::fs::rename(&tmp, &final_).await.is_ok() {
-            cloud.builds.log(bid, "Saved build cache for next time.");
-            return;
+        if o.status.success() && !cloud.build_cancels.is_cancelled(bid) {
+            if tokio::fs::rename(&tmp, &final_).await.is_ok() {
+                cloud.builds.log(bid, "Saved build cache for next time.");
+                return;
+            }
         }
     }
     let _ = tokio::fs::remove_file(&tmp).await;
@@ -6230,12 +7944,13 @@ fn container_volume_path(project_override: Option<&str>) -> String {
 /// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
 /// (+ optional service suffix for compose), so a container's data survives instance
 /// restarts and redeploys. Merged into the compose network cfg when present.
-fn container_volume_cfg(project: &str, service: Option<&str>, volume_path: Option<&str>) -> String {
-    let mut name = format!("hive-vol-{}", sanitize_tag(project));
-    if let Some(svc) = service.filter(|s| !s.is_empty()) {
-        name.push('-');
-        name.push_str(&sanitize_tag(svc));
-    }
+fn container_volume_cfg(
+    project: &str,
+    incarnation: ProjectIncarnation,
+    service: Option<&str>,
+    volume_path: Option<&str>,
+) -> String {
+    let name = project_volume_name(project, incarnation, service);
     // TENANT/PROJECT NETWORK ISOLATION: standalone containers also get their own
     // per-project DNS-less podman network (same deterministic subnet scheme as
     // compose). Without this they land on podman's shared default bridge, where
@@ -6273,6 +7988,7 @@ pub(crate) fn project_net(project: &str) -> (String, String, String) {
 
 fn container_manifest(
     project: &str,
+    incarnation: ProjectIncarnation,
     image: &str,
     internal: u16,
     protocol: &str,
@@ -6301,7 +8017,7 @@ fn container_manifest(
                 "__container__".into(),
                 image.to_string(),
                 internal.to_string(),
-                container_volume_cfg(project, None, volume_path),
+                container_volume_cfg(project, incarnation, None, volume_path),
             ],
             env: Default::default(),
             vcpus: 1,
@@ -6394,6 +8110,7 @@ async fn image_container_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
     project: &str,
+    incarnation: ProjectIncarnation,
     image: &str,
     port_override: Option<u16>,
     protocol_override: Option<ServiceProtocol>,
@@ -6457,7 +8174,7 @@ async fn image_container_manifest(
     // Dockerfile-build path, which also honors an explicit fluid.json value).
     let volume_path = cloud
         .projects
-        .get(project)
+        .get_exact(project, incarnation)?
         .container
         .and_then(|s| s.volume_mount_path);
     log(format!(
@@ -6471,6 +8188,7 @@ async fn image_container_manifest(
     ));
     let mut manifest = container_manifest(
         project,
+        incarnation,
         image,
         port,
         protocol.as_str(),
@@ -6564,380 +8282,6 @@ fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
     udp_ports
         .first()
         .map(|p| PortSpec::single(*p, ServiceProtocol::Udp))
-}
-
-/// Build a MULTI-service container manifest from a docker-compose / compose.yaml.
-/// Each service becomes a `__container__` `FunctionConfig`; all share a per-project
-/// podman network (encoded as `start_cmd[3]`, with the service name as the alias in
-/// `start_cmd[4]`) so they reach each other by name. `min_instances=1` keeps every
-/// service warm so internal ones (db/redis) actually run. The PRIMARY public service
-/// always gets the `/` route; every other service stays internal-only UNLESS it opts
-/// in via `x-shadw-expose` (`ParsedService::expose` — see `compose.rs`), in which case
-/// it gets its own `/<service-name>` route plus a raw TCP/UDP proxy target
-/// (`FunctionConfig::ports`). Every service's `FunctionConfig::protocol` reflects its
-/// parsed (or expose-overridden) `ParsedService::protocol` — no service silently
-/// defaults to `http` just because the compose port suffix went unparsed.
-async fn build_compose_manifest(
-    cloud: &Arc<CloudState>,
-    bid: &str,
-    dir: &Path,
-    project: &str,
-    commit: &str,
-    compose_path: &Path,
-) -> anyhow::Result<Manifest> {
-    let log = |s: String| cloud.builds.log(bid, s);
-    let text = tokio::fs::read_to_string(compose_path).await?;
-    let services = crate::compose::parse_compose(&text)
-        .map_err(|e| anyhow::anyhow!("compose parse failed: {e}"))?;
-    let fname = compose_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("compose.yaml");
-    let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
-    log(format!(
-        "Detected {fname} — {} service(s): {}",
-        services.len(),
-        names.join(", ")
-    ));
-
-    let safe_project = sanitize_tag(project);
-    let net = format!("hive-net-{safe_project}");
-    let short = &commit[..commit.len().min(7)];
-    let primary = crate::compose::primary_service(&services).map(|s| s.name.clone());
-    let proj_env = cloud.projects.env_map(project);
-
-    // Per-project /24 (deterministic, in the 10.128-191/16 space to avoid the common
-    // 10.0/10.89 podman ranges) for the services' shared DNS-LESS network: each
-    // service gets a STATIC IP and every service's `/etc/hosts` maps all sibling
-    // names → IPs. This gives Compose name resolution WITHOUT podman's aardvark-dns,
-    // which would otherwise collide with the node's Seer DNS on :53.
-    let (o2, o3) = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        project.hash(&mut h);
-        let v = h.finish();
-        (128 + (v % 64) as u8, ((v >> 6) % 256) as u8)
-    };
-    let subnet = format!("10.{o2}.{o3}.0/24");
-    let gw = format!("10.{o2}.{o3}.1");
-    // Per-GENERATION block INSIDE that project /24. The host part used to be keyed on
-    // the project alone (`11 + i`), so every redeploy re-requested the exact addresses
-    // the still-running PREVIOUS generation held — old instances linger for
-    // `idle_ttl_secs` after the new deployment goes Ready, by design. podman refused
-    // the run ("requested ip address X is already allocated to container Y") and the
-    // IPAM self-heal in `hive-backend` then force-removed what it took for a leaked
-    // ghost but which was in fact the LIVE serving container — or escalated to
-    // removing the whole project network and every sibling on it, managed database
-    // containers included. That is the redeploy breakage: the new generation could not
-    // start, and the old one was destroyed trying.
-    //
-    // A block per BUILD lets the two generations coexist for the overlap window, which
-    // is exactly what a rolling redeploy needs. Blocks are sized to the service count
-    // so the whole /24 stays usable, and the offset is a stable FNV-1a over the build
-    // id — never `DefaultHasher`, whose output is not stable across rustc versions,
-    // and these addresses are written into a manifest that outlives this process.
-    let n_svc = services.len().max(1);
-    anyhow::ensure!(
-        n_svc <= 243,
-        "compose file declares {n_svc} services — more than the {} that fit one project /24",
-        243
-    );
-    let blocks = (243 / n_svc).max(1);
-    let gen_off = {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in bid.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        (h % blocks as u64) as usize * n_svc
-    };
-    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + gen_off + i);
-    let hosts: Vec<String> = services
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{}:{}", s.name, svc_ip(i)))
-        .collect();
-
-    let mut functions = Vec::new();
-    let mut routes = Vec::new();
-    for (idx, svc) in services.iter().enumerate() {
-        let image = if let Some(b) = &svc.build {
-            let ctx = dir.join(&b.context);
-            let image = format!(
-                "hive-{}-{}-{}",
-                safe_project,
-                sanitize_tag(&svc.name),
-                short
-            );
-            log(format!(
-                "Building service '{}' from {} …",
-                svc.name, b.context
-            ));
-            let mut build = Command::new("podman");
-            build.arg("build").arg("-t").arg(&image);
-            if let Some(df) = &b.dockerfile {
-                build.arg("-f").arg(ctx.join(df));
-            }
-            let base_path = std::env::var("PATH").unwrap_or_default();
-            build.env(
-                "PATH",
-                format!(
-                    "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"
-                ),
-            );
-            for (k, v) in &proj_env {
-                build.arg("--build-arg").arg(format!("{k}={v}"));
-            }
-            let out = build.arg(".").current_dir(&ctx).output().await?;
-            for line in String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .chain(String::from_utf8_lossy(&out.stdout).lines())
-                .filter(|l| !l.trim().is_empty())
-                .take(25)
-            {
-                log(format!("  [{}] {line}", svc.name));
-            }
-            anyhow::ensure!(
-                out.status.success(),
-                "podman build failed for service '{}'",
-                svc.name
-            );
-            image
-        } else if let Some(img) = &svc.image {
-            // FULLY QUALIFY the ref, exactly as the prebuilt-image deploy path
-            // does (`qualify_image_ref`, used at the `deploy_image` call site).
-            // A compose file names images the way Docker Hub users write them —
-            // `minio/minio:latest`, `redis:7`, `nginx` — and Linux podman runs
-            // with `short-name-mode=enforcing`, which cannot resolve a short
-            // name without an interactive registry prompt. Non-interactively it
-            // fails with "short-name resolution enforced but cannot prompt
-            // without a TTY", so the container NEVER starts, every cold start
-            // fails, and the deployment's circuit opens: measured live on
-            // fc-sanjose-2, `minio/minio:latest` at fail_streak=688 while
-            // `compose-yaml.shadw.app` served 503 DEPLOYMENT_CIRCUIT_OPEN.
-            //
-            // This was the exact "same image works one way, fails the other"
-            // inconsistency between deploy paths: `deploy_image` qualified its
-            // ref and compose did not, so an identical `minio/minio:latest`
-            // deployed fine as a single prebuilt image and was unstartable as a
-            // compose service.
-            let qualified = qualify_image_ref(img);
-            if qualified == *img {
-                log(format!("Service '{}' uses prebuilt image {img}", svc.name));
-            } else {
-                log(format!(
-                    "Service '{}' uses prebuilt image {img} (resolved to {qualified})",
-                    svc.name
-                ));
-            }
-            qualified
-        } else {
-            anyhow::bail!(
-                "compose service '{}' has neither `build` nor `image`",
-                svc.name
-            );
-        };
-
-        // Service env wins; project env fills gaps.
-        let mut env = svc.env.clone();
-        for (k, v) in &proj_env {
-            env.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        // start_cmd[3] = JSON network config the backend uses to join this service to
-        // the shared DNS-less podman network with a static IP + sibling host entries.
-        let netcfg = serde_json::json!({
-            "net": net,
-            "subnet": subnet,
-            "gw": gw,
-            "ip": svc_ip(idx),
-            "alias": svc.name,
-            "hosts": hosts,
-            // Automatic per-service persistent volume (keyed by project+service).
-            // Dashboard `ProjectSettings::container.volume_mount_path` is
-            // deliberately NOT consulted here — a compose stack can have
-            // several services with different mount-path needs, so a single
-            // project-level override wouldn't generalize; a compose service
-            // that needs a non-default path sets it directly in its own
-            // Dockerfile/image, same as any other compose deployment target.
-            "vol": format!("hive-vol-{}-{}", sanitize_tag(project), sanitize_tag(&svc.name)),
-            "volpath": container_volume_path(None),
-            // `command:` / `entrypoint:` from the compose file. Omitted entirely
-            // when absent so an existing manifest's JSON is byte-identical.
-            // Dropping these silently is what made a canonical MinIO compose
-            // (`image: minio/minio` + `command: server /data ...`) unstartable:
-            // run bare, the image's entrypoint prints usage and exits, so the
-            // container never listens and the circuit opens. See
-            // `compose::ParsedService::command`.
-            "cmd": svc.command,
-            "entrypoint": svc.entrypoint,
-        })
-        .to_string();
-        let is_primary = Some(&svc.name) == primary.as_ref();
-        // The `x-shadw-expose` opt-in may override the protocol/port a NON-PRIMARY
-        // service is reached on externally; absent an override, both fall back to
-        // the service's own parsed values. This is the single source of truth for
-        // `FunctionConfig::protocol` (drives cross-node raw-vs-HTTP proxying for
-        // every service, not just exposed ones) — `start_cmd[2]` (the container's
-        // REAL internal listen port) is never affected by the override.
-        let resolved_protocol = svc.expose.protocol.unwrap_or(svc.protocol);
-        // The raw TCP splice (`mesh_raw::resolve`'s TCP branch) always connects
-        // to the leased instance's PUBLISHED endpoint, which is derived from
-        // `start_cmd[2]` (= `svc.port`, the container's real listen port) —
-        // never from the PortSpec's `container_port`. An `x-shadw-expose` port
-        // override that DIFFERS from `svc.port` would therefore silently
-        // allocate/advertise a public port keyed to a container_port the
-        // splice never actually dials, so a client connecting expecting that
-        // stated port to be the real one would land on `svc.port` instead
-        // with no error. Refuse to honor a differing override — fall back to
-        // `svc.port` (the address the splice really uses) and say so loudly,
-        // rather than letting the two silently diverge.
-        let resolved_expose_port = match svc.expose.port {
-            Some(p) if p != svc.port => {
-                log(format!(
-                    "WARN: service '{}' declares x-shadw-expose port {p}, but its raw TCP splice always targets the real listen port {} — using {} for the public allocation instead of the mismatched override.",
-                    svc.name, svc.port, svc.port
-                ));
-                svc.port
-            }
-            Some(p) => p,
-            None => svc.port,
-        };
-        functions.push(FunctionConfig {
-            name: svc.name.clone(),
-            runtime: "container".into(),
-            // ["__container__", image, port, <netcfg-json>] — single container deploys
-            // omit the 4th arg (no network); compose deploys carry the shared-net cfg.
-            start_cmd: vec!["__container__".into(), image, svc.port.to_string(), netcfg],
-            env,
-            vcpus: 1,
-            memory_mib: 512,
-            max_concurrency: 20,
-            min_instances: 1, // keep every service warm so internal deps actually run
-            // ONE instance per compose service, structurally: every instance of a
-            // service shares the single static `--ip` in its start_cmd, so a second
-            // instance always collides with the first — before the live-holder
-            // guard existed, the "self-heal" then force-removed instance #1 (the
-            // service thrashed itself under scale-out); with the guard it is an
-            // honest failed start. Neither is scaling. Compose semantics are one
-            // container per service on a shared network — concurrency scales via
-            // max_concurrency, not replicas.
-            max_instances: 1,
-            idle_ttl_secs: 300,
-            max_duration_secs: 300,
-            protocol: resolved_protocol,
-            // Only an explicit `x-shadw-expose` opt-in publishes a raw external proxy
-            // target for a NON-PRIMARY service — every unopted-in secondary service
-            // stays internal-only (unchanged default behavior: a private DB sidecar
-            // never becomes public just because it declares `ports:`).
-            //
-            // The PRIMARY service is different: when it's a raw-protocol service
-            // (Minecraft, Postgres-wire, …), the block below skips its HTTP `/`
-            // route BECAUSE it expects the raw public port allocation to carry
-            // traffic instead — that allocation is driven by THIS `ports` list
-            // (`raw_ports::allocate_raw_ports_coordinated` only allocates for specs
-            // it finds here), so a primary raw service must get one even with no
-            // `x-shadw-expose` (which only makes sense for a NON-primary opt-in).
-            // Previously this case fell through to the `else` branch below and
-            // stayed permanently unallocated — the primary service's own log line
-            // a few lines down ("reachable through its allocated raw public port
-            // instead") was a promise the code never kept.
-            ports: {
-                // The primary allocation, exactly as before.
-                let mut specs = if svc.expose.enabled {
-                    vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
-                } else if is_primary && resolved_protocol.needs_raw_proxy() {
-                    vec![PortSpec::single(svc.port, resolved_protocol)]
-                } else {
-                    Vec::new()
-                };
-                // …plus every OTHER port the service declared. Only the first was
-                // ever read, so a service publishing several ports had the rest
-                // discarded in silence — MinIO's `["9000:9000", "9001:9001"]` lost
-                // its web console with nothing in the build output to say so.
-                //
-                // A `HOST:CONTAINER` entry is docker-compose's own PUBLISH request
-                // and is honored as one: the spec carries the declared host port as
-                // `preferred_public_port`, which makes it eligible for a public raw
-                // allocation even when its protocol is Http (served as plain-TCP
-                // passthrough — the same thing `docker compose up` publishes; TLS
-                // stays the shared 443 gateway's job). The allocator prefers the
-                // literal number and the build log names the outcome either way.
-                // A bare `PORT` entry keeps today's behavior: documented on the
-                // manifest, reachable from siblings, no public ingress.
-                for cp in svc.all_ports.iter().copied() {
-                    if let Some(existing) =
-                        specs.iter_mut().find(|s| s.container_port == cp.container)
-                    {
-                        // The primary/expose spec above already covers this
-                        // container port — carry the publish request onto it.
-                        if existing.preferred_public_port.is_none() {
-                            existing.preferred_public_port = cp.host;
-                        }
-                        continue;
-                    }
-                    let mut spec = PortSpec::single(cp.container, cp.protocol);
-                    spec.preferred_public_port = cp.host;
-                    specs.push(spec);
-                }
-                specs
-            },
-            ..Default::default()
-        });
-        if svc.all_ports.len() > 1 || svc.all_ports.iter().any(|p| p.host.is_some()) {
-            // Say out loud what is and is not publicly reachable. Dropping these
-            // silently is what made the MinIO console present as "the port just
-            // closes the connection", with no way to tell from the build output
-            // that the platform had never been told about that port at all.
-            let described: Vec<String> = svc
-                .all_ports
-                .iter()
-                .map(|p| match p.host {
-                    Some(h) => format!("{}/{} published on :{h}", p.container, p.protocol),
-                    None => format!("{}/{} internal-only", p.container, p.protocol),
-                })
-                .collect();
-            log(format!(
-                "Service '{}' ports: {}. Published entries get a public raw-TCP allocation \
-                 preferring the declared host port (exact outcome logged at allocation); \
-                 internal-only entries stay reachable from sibling services on the shared \
-                 network. '/' still routes over HTTPS to {}/{}.",
-                svc.name,
-                described.join(", "),
-                svc.port,
-                resolved_protocol,
-            ));
-        }
-        if is_primary && !resolved_protocol.needs_raw_proxy() {
-            routes.push(Route {
-                pattern: "/".into(),
-                target: RouteTarget::Function(svc.name.clone()),
-            });
-        } else if is_primary {
-            log(format!(
-                "Primary service '{}' is a raw {} service — no HTTP '/' route created (reachable through its allocated raw public port instead).",
-                svc.name, resolved_protocol
-            ));
-        } else if svc.expose.enabled && !resolved_protocol.needs_raw_proxy() {
-            // Explicit opt-in external route for a secondary service (e.g. a
-            // standalone Postgres/Redis meant to be reachable from outside) —
-            // namespaced under its own service name so it never collides with the
-            // primary's `/`.
-            routes.push(Route {
-                pattern: format!("/{}", sanitize_tag(&svc.name)),
-                target: RouteTarget::Function(svc.name.clone()),
-            });
-        }
-    }
-    log(format!(
-        "Compose deployment ready — public entrypoint: {} (services share network {net})",
-        primary.as_deref().unwrap_or("(none)")
-    ));
-    Ok(Manifest {
-        project: project.to_string(),
-        functions,
-        routes,
-        ..Default::default()
-    })
 }
 
 /// Railway-style per-service overrides for a CONTAINER project, read from an optional
@@ -7280,9 +8624,12 @@ fn building_page(project: &str) -> String {
 async fn register_building_placeholder(
     cloud: &Arc<CloudState>,
     project: &str,
+    incarnation: ProjectIncarnation,
     req: &GitDeployRequest,
     bid: &str,
 ) -> Option<String> {
+    let _lifecycle = crate::project_settings::lifecycle_write(project).await;
+    let settings = cloud.projects.get_exact(project, incarnation).ok()?;
     if project_has_deployment(cloud, project) {
         // Redeploy (the project already has a live deployment somewhere in the
         // fleet) — keep the live version serving until the new build is ready, and
@@ -7301,14 +8648,16 @@ async fn register_building_placeholder(
     tokio::fs::write(dir.join("index.html"), building_page(project))
         .await
         .ok()?;
-    let info = cloud.gw.deploy_full(
+    let info = cloud.gw.deploy_full_with_runtime_exact(
         dir.to_string_lossy().into_owned(),
+        None,
         static_manifest(project, "."),
         req.creator.clone().unwrap_or_else(|| "you".into()),
         None,
         false, // not production — superseded by the real deploy when it's ready
         DeployState::Building,
-        cloud.projects.team_of(project),
+        settings.team,
+        incarnation,
     );
     crate::admin::causal_stamp_new_deployment(cloud, project, &info.id.0);
     crate::persist::persist(cloud);
@@ -7362,7 +8711,7 @@ pub(crate) fn is_placeholder_record(rec: &fluid_core::DeployRecord) -> bool {
 /// records do not outlive a restart, and a placeholder for a build nobody
 /// remembers can never be superseded by it.
 pub async fn reap_orphan_placeholders(cloud: &Arc<CloudState>) -> usize {
-    let stale: Vec<(String, String)> = cloud
+    let stale: Vec<(String, String, Option<ProjectIncarnation>)> = cloud
         .gw
         .deployment_records()
         .into_iter()
@@ -7375,13 +8724,20 @@ pub async fn reap_orphan_placeholders(cloud: &Arc<CloudState>) -> usize {
                     .is_some_and(|b| matches!(b.state, DeployState::Queued | DeployState::Building))
             })
         })
-        .map(|rec| (rec.id, rec.project))
+        .map(|rec| (rec.id, rec.project, rec.project_incarnation))
         .collect();
     if stale.is_empty() {
         return 0;
     }
-    for (id, project) in &stale {
-        cloud.gw.remove(id).await;
+    for (id, project, incarnation) in &stale {
+        match incarnation {
+            Some(incarnation) => {
+                cloud.gw.remove_exact(id, *incarnation).await;
+            }
+            None => {
+                cloud.gw.remove(id).await;
+            }
+        }
         tracing::warn!(
             deployment = %id,
             project = %project,
@@ -7644,6 +9000,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
 
     let root_dir = Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
     let req = GitDeployRequest {
+        source_deployment_ids: Vec::new(),
         repo_url: src.repo_url.clone(),
         branch: Some(branch.clone()).filter(|b| !b.is_empty()),
         // Pin the EXACT polled SHA (same race protection as the webhook path).
@@ -7672,7 +9029,18 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_ports: None,
         git_token: token,
     };
-    let build_id = start_build(cloud.clone(), req);
+    let build_id = match start_build(cloud.clone(), req, None, None).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                project = %project,
+                repo = %src.repo_url,
+                error = %e,
+                "git_poll: start_build rejected the poll-triggered deploy — retrying next cycle"
+            );
+            return GitPollOutcome::RemoteUnreadable;
+        }
+    };
     let ev = cloud.event(
         &cloud.region,
         "DEPLOY",
@@ -7722,16 +9090,23 @@ pub(crate) fn commit_eq(a: &str, b: &str) -> bool {
 /// never prompts for credentials (a private repo without a token just fails and
 /// is skipped). Returns None on any failure or an absent branch.
 async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -> Option<String> {
-    let url = git_poll_authed_url(repo_url, token);
-    let fut = Command::new("git")
-        .arg("-c")
-        .arg("credential.helper=") // ignore any global credential helper
-        .arg("ls-remote")
-        .arg(&url)
+    // Same FD-backed credential helper as the clone path — never a token
+    // embedded in the URL (argv-visible), and only ever offered for
+    // github.com (the helper itself is scoped there; `token` is already
+    // resolved only for github.com callers, see `resolve_git_poll_token`).
+    let mut cmd = Command::new("git");
+    let _cred = apply_credential(&mut cmd, token).ok()?;
+    cmd.arg("ls-remote")
+        .arg(repo_url)
         .arg(format!("refs/heads/{branch}"))
         .env("GIT_TERMINAL_PROMPT", "0") // never block on an interactive prompt
-        .output();
-    let out = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        // Own the process group and reap on drop — `tokio::time::timeout` below
+        // drops (not cancels-and-waits) this future on expiry, and without
+        // these two the underlying `git` process would be orphaned rather than
+        // killed, silently leaking a hung process per timed-out poll.
+        .process_group(0)
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
         .await
         .ok()?
         .ok()?;
@@ -7744,19 +9119,6 @@ async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -
         .next()
         .filter(|s| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit()))
         .map(|s| s.to_string())
-}
-
-/// Inject a github token into an https github URL for a PRIVATE-repo read. Only
-/// `https://github.com/...` URLs are touched, so a token is never leaked to
-/// another forge; every other URL (public github, gitlab, self-hosted, ssh)
-/// passes through unchanged.
-fn git_poll_authed_url(repo_url: &str, token: Option<&str>) -> String {
-    match token {
-        Some(t) if !t.is_empty() && repo_url.starts_with("https://github.com/") => {
-            repo_url.replacen("https://", &format!("https://x-access-token:{t}@"), 1)
-        }
-        _ => repo_url.to_string(),
-    }
 }
 
 /// Token for polling/cloning a PRIVATE github repo: a GitHub App installation
@@ -7773,10 +9135,40 @@ async fn resolve_git_poll_token(repo_url: &str) -> Option<String> {
             .trim_start_matches("https://github.com/")
             .trim_end_matches(".git");
         if let Some((owner, repo)) = path.split_once('/') {
-            if let Ok(Some(tok)) =
-                crate::github_app_auth::installation_token_for_repo(owner, repo).await
-            {
-                return Some(tok);
+            match crate::github_app_auth::installation_token_for_repo(owner, repo).await {
+                Ok(Some(tok)) => return Some(tok),
+                // Name the failure instead of swallowing it: a working App key
+                // with the App simply NOT INSTALLED on the repo's org reads
+                // identically to "no credential configured" downstream
+                // (had_token=false), which mis-steered a real diagnosis toward
+                // installing keys that already existed. Live-witnessed: App
+                // 4658598 valid, installed on dywongcloud only —
+                // numo-gg/numo0 404s until that org installs the App.
+                Ok(None) => {
+                    static REPORTED: std::sync::OnceLock<
+                        parking_lot::Mutex<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let repo_key = format!("{owner}/{repo}");
+                    if REPORTED
+                        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+                        .lock()
+                        .insert(repo_key)
+                    {
+                        tracing::warn!(
+                            owner,
+                            repo,
+                            "GitHub App is configured but NOT INSTALLED on this repo's \
+                             owner — install the App on the org (Settings → GitHub Apps) \
+                             or set GITHUB_TOKEN"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    owner,
+                    repo,
+                    error = %e,
+                    "GitHub App installation-token mint failed (key/parse/API)"
+                ),
             }
         }
     }
@@ -7843,6 +9235,7 @@ mod tests {
         // per-project persistent volume encoded in start_cmd[3].
         let m = container_manifest(
             "my-proj",
+            fluid_core::ProjectIncarnation::mint(),
             "fruitbox12/simplifi:latest",
             8080,
             "http",
@@ -8041,17 +9434,22 @@ mod tests {
         let api_dir = repo_root.join("packages/api");
         assert!(api_dir.exists(), "fixture missing: {}", api_dir.display());
 
+        let root_is_workspace = crate::workspace::load(&repo_root)
+            .await
+            .expect("workspace manifest must parse")
+            .is_some();
         assert!(
-            is_workspace_root(&repo_root).await,
+            root_is_workspace,
             "root package.json has a \"workspaces\" field"
         );
+        let workspace_member = crate::app_discovery::is_member(&repo_root, &api_dir)
+            .await
+            .expect("membership check must not error");
         assert!(
-            uses_workspace_protocol(&api_dir).await,
-            "packages/api depends on shared via workspace:*"
+            workspace_member,
+            "packages/api must be recognized as a workspace member"
         );
-        let is_monorepo = api_dir != repo_root
-            && uses_workspace_protocol(&api_dir).await
-            && is_workspace_root(&repo_root).await;
+        let is_monorepo = api_dir != repo_root && workspace_member && root_is_workspace;
         assert!(
             is_monorepo,
             "must be recognized as a monorepo member, matching build_via_fdi's own condition"
@@ -8120,7 +9518,17 @@ mod tests {
 
     #[test]
     fn container_manifest_carries_protocol() {
-        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0, 0.0, 0, None);
+        let m = container_manifest(
+            "proj",
+            fluid_core::ProjectIncarnation::mint(),
+            "img:tag",
+            50051,
+            "grpc",
+            0,
+            0.0,
+            0,
+            None,
+        );
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].protocol_or_http(), "grpc");
         assert!(m.functions[0].needs_raw_proxy());
@@ -8156,7 +9564,17 @@ mod tests {
         assert_eq!(parse_mem_mib("512"), 512);
         assert_eq!(parse_mem_mib(""), 0);
         assert_eq!(parse_mem_mib("garbage"), 0);
-        let m = container_manifest("proj", "img:tag", 8080, "http", 4096, 0.0, 0, None);
+        let m = container_manifest(
+            "proj",
+            fluid_core::ProjectIncarnation::mint(),
+            "img:tag",
+            8080,
+            "http",
+            4096,
+            0.0,
+            0,
+            None,
+        );
         assert_eq!(m.functions[0].memory_mib, 4096);
     }
 
@@ -8183,7 +9601,17 @@ mod tests {
             0.0,
             "zero must not sneak through as a real override"
         );
-        let m = container_manifest("proj", "img:tag", 8080, "http", 0, 4.0, 2048, None);
+        let m = container_manifest(
+            "proj",
+            fluid_core::ProjectIncarnation::mint(),
+            "img:tag",
+            8080,
+            "http",
+            0,
+            4.0,
+            2048,
+            None,
+        );
         assert_eq!(m.functions[0].cpus, 4.0);
         assert_eq!(m.functions[0].pids, 2048);
     }
@@ -8242,6 +9670,7 @@ mod tests {
     // parallel would race), exercising both the no-secret and secret-set regimes.
     #[test]
     fn verify_pulled_artifact_integrity_and_authenticity() {
+        let key = "npm:team:acme:abc123";
         let bytes = b"the artifact";
         let good_sha = artifact_sha256(bytes);
 
@@ -8249,33 +9678,39 @@ mod tests {
         std::env::remove_var("HIVE_ARTIFACT_SECRET");
         std::env::remove_var("HIVE_JWT_SECRET");
         assert!(
-            verify_pulled_artifact(bytes, Some(&good_sha), None).is_ok(),
+            verify_pulled_artifact(key, bytes, Some(&good_sha), None).is_ok(),
             "good digest accepted"
         );
         assert!(
-            verify_pulled_artifact(bytes, Some("deadbeef"), None).is_err(),
+            verify_pulled_artifact(key, bytes, Some("deadbeef"), None).is_err(),
             "corruption rejected"
         );
         assert!(
-            verify_pulled_artifact(bytes, None, None).is_ok(),
+            verify_pulled_artifact(key, bytes, None, None).is_ok(),
             "legacy peer accepted in dev"
         );
 
         // --- Fleet secret configured (production) ---
         std::env::set_var("HIVE_ARTIFACT_SECRET", "s3cret");
-        let sig = artifact_sig("s3cret", bytes);
+        let sig = cache_artifact_sig("s3cret", key, bytes);
         assert!(
-            verify_pulled_artifact(bytes, Some(&good_sha), Some(&sig)).is_ok(),
+            verify_pulled_artifact(key, bytes, Some(&good_sha), Some(&sig)).is_ok(),
             "valid sha+sig accepted"
         );
         assert!(
-            verify_pulled_artifact(bytes, Some(&good_sha), None).is_err(),
+            verify_pulled_artifact(key, bytes, Some(&good_sha), None).is_err(),
             "missing sig rejected when secret set"
         );
-        let forged = artifact_sig("wrong", bytes);
+        let forged = cache_artifact_sig("wrong", key, bytes);
         assert!(
-            verify_pulled_artifact(bytes, Some(&good_sha), Some(&forged)).is_err(),
+            verify_pulled_artifact(key, bytes, Some(&good_sha), Some(&forged)).is_err(),
             "forged sig rejected"
+        );
+        // A signature minted for a different cache key must not verify under this one.
+        let other_key_sig = cache_artifact_sig("s3cret", "npm:team:other:abc123", bytes);
+        assert!(
+            verify_pulled_artifact(key, bytes, Some(&good_sha), Some(&other_key_sig)).is_err(),
+            "signature bound to a different key must not be replayable"
         );
         std::env::remove_var("HIVE_ARTIFACT_SECRET");
 
@@ -8608,35 +10043,119 @@ mod tests {
             .await
             .unwrap();
 
-        let k1 = compute_cache_key(&base, "npm", "team:acme").await;
-        let k2 = compute_cache_key(&base, "npm", "team:acme").await;
+        let trust = BuildTrustContext {
+            lane: BuildTrustLane::Production,
+            canonical_repo: "github.com/acme/app".into(),
+            actual_repo: "github.com/acme/app".into(),
+        };
+        let build_env: std::collections::BTreeMap<String, String> = Default::default();
+
+        let k1 = compute_cache_key(
+            &base,
+            "npm",
+            "team:acme",
+            &trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
+        let k2 = compute_cache_key(
+            &base,
+            "npm",
+            "team:acme",
+            &trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
         assert!(k1.is_some());
         assert_eq!(k1, k2, "same lockfile+pm must yield the same key");
 
         // Different package manager → different key.
-        let k_pnpm = compute_cache_key(&base, "pnpm", "team:acme").await;
+        let k_pnpm = compute_cache_key(
+            &base,
+            "pnpm",
+            "team:acme",
+            &trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
         assert_ne!(k1, k_pnpm);
 
         // Changed lockfile → different key.
         tokio::fs::write(base.join("package-lock.json"), b"{\"v\":2}")
             .await
             .unwrap();
-        let k3 = compute_cache_key(&base, "npm", "team:acme").await;
+        let k3 = compute_cache_key(
+            &base,
+            "npm",
+            "team:acme",
+            &trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
         assert_ne!(k1, k3, "changed lockfile must change the key");
 
         // TENANT SCOPING: identical lockfile + package manager must NOT collide
         // across tenants — the cache restores content a previous build could
         // write, so a shared key is a cross-tenant code path.
-        let k_other = compute_cache_key(&base, "npm", "team:other").await;
+        let k_other = compute_cache_key(
+            &base,
+            "npm",
+            "team:other",
+            &trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
         assert_ne!(
             k3, k_other,
             "the same lockfile must not share a key across tenants"
         );
 
+        // Different trust lane (e.g. a preview fork) must not share a key.
+        let fork_trust = BuildTrustContext {
+            lane: BuildTrustLane::PreviewFork,
+            ..trust.clone()
+        };
+        let k_fork = compute_cache_key(
+            &base,
+            "npm",
+            "team:acme",
+            &fork_trust,
+            "node-22",
+            "prod",
+            &build_env,
+        )
+        .await;
+        assert_ne!(
+            k3, k_fork,
+            "a preview-fork build must not share a cache key with a production build"
+        );
+
         // No lockfile/package.json → None.
         let empty = std::env::temp_dir().join(format!("oe-cachekey-empty-{}", now_ms()));
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        assert_eq!(compute_cache_key(&empty, "npm", "team:acme").await, None);
+        assert_eq!(
+            compute_cache_key(
+                &empty,
+                "npm",
+                "team:acme",
+                &trust,
+                "node-22",
+                "prod",
+                &build_env
+            )
+            .await,
+            None
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
         let _ = tokio::fs::remove_dir_all(&empty).await;
@@ -8648,6 +10167,7 @@ mod tests {
         store.insert(Build {
             id: "dpl-test".into(),
             project: "demo".into(),
+            project_incarnation: None,
             repo_url: "https://github.com/a/b".into(),
             branch: "main".into(),
             commit: String::new(),

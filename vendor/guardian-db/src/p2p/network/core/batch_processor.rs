@@ -731,26 +731,24 @@ impl BatchProcessor {
 
     /// Get operation using the IrohBackend.
     async fn get_operation(&self, hash: String) -> Result<Bytes> {
-        use tokio::io::AsyncReadExt;
-
         // Call the IrohBackend's cat method.
-        let mut async_read = self.backend.cat(&hash).await.map_err(|e| {
+        let async_read = self.backend.cat(&hash).await.map_err(|e| {
             GuardianError::Other(format!("Error in IrohBackend.cat({}): {}", hash, e))
         })?;
 
-        // Read all data from the stream.
-        let mut buffer = Vec::new();
-        async_read.read_to_end(&mut buffer).await.map_err(|e| {
-            GuardianError::Other(format!("Error reading data for Hash {}: {}", hash, e))
-        })?;
+        let data = super::read_to_end_bounded(async_read, "batch get result")
+            .await
+            .map_err(|e| {
+                GuardianError::Other(format!("Error reading data for Hash {}: {}", hash, e))
+            })?;
 
         debug!(
             "BatchProcessor: Content retrieved via IrohBackend - Hash: {}, Size: {} bytes",
             hash,
-            buffer.len()
+            data.len()
         );
 
-        Ok(Bytes::from(buffer))
+        Ok(data)
     }
 
     /// Pin operation using the IrohBackend (creates a permanent Tag).
@@ -1343,20 +1341,14 @@ impl BatchProcessor {
         hash: String,
         backend: &crate::p2p::network::core::IrohBackend,
     ) -> Result<Bytes> {
-        use tokio::io::AsyncReadExt;
-
-        let mut async_read = backend
+        let async_read = backend
             .cat(&hash)
             .await
             .map_err(|e| GuardianError::Other(format!("Error in cat for {}: {}", hash, e)))?;
 
-        let mut buffer = Vec::new();
-        async_read
-            .read_to_end(&mut buffer)
+        super::read_to_end_bounded(async_read, "static batch get result")
             .await
-            .map_err(|e| GuardianError::Other(format!("Error reading data: {}", e)))?;
-
-        Ok(Bytes::from(buffer))
+            .map_err(|e| GuardianError::Other(format!("Error reading data: {}", e)))
     }
 
     /// Static Pin operation using the IrohBackend.

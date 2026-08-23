@@ -1,0 +1,173 @@
+---
+# Fail-closed capability publication. The consumer must refuse to execute when
+# this file is absent or its protocol is unknown.
+build_executor_protocol: "hive-build-executor/v1"
+build_executor_capability_path: /var/lib/hive/build-executor.json
+build_executor_state_dir: /var/lib/hive/build-executor
+build_executor_libexec_dir: /usr/local/libexec/hive-build-executor
+
+# The role either builds the reviewed Containerfile in this role from an
+# immutable base, or loads a separately reviewed OCI archive. Deliberately no
+# base digest is guessed here: build mode will fail before provisioning until a
+# registry/repository@sha256:<64 lowercase hex> value is supplied.
+build_executor_builder_source: build       # build | oci_archive
+build_executor_builder_base_image: ""
+build_executor_builder_tag: localhost/hive-build-executor:reviewed
+build_executor_builder_oci_archive_path: ""
+build_executor_builder_oci_archive_sha256: ""
+# Required in oci_archive mode; optional extra assertion in build mode.
+build_executor_builder_expected_image_id: ""
+build_executor_builder_context_dir: "{{ build_executor_state_dir }}/builder-context"
+build_executor_container_uid: 65532
+build_executor_container_gid: 65532
+
+# runsc is independent of the fleet-wide runtime. Every BuildExecutor launch
+# must pass this absolute path to `podman --runtime`; there is no fallback.
+#
+# gVisor is installed as ONE atomic whole-bundle release, never a hand-picked
+# binary subset. Upstream ships the release as a single archive
+# (gvisor.tar.bz2 + gvisor.tar.bz2.sha512) containing exactly six members:
+# `runsc`, `containerd-shim-runsc-v1`, and four support binaries under
+# `gvisor-bin/` (checkpointgofer, gvisor_sentry, gvisor-sentry-prewarmer,
+# runsc-metric-server — confirmed live 2026-08-22 by downloading, sha512/
+# sha256-verifying, extracting, and independently re-hashing the exact
+# release below on a real Linux x86_64 host; every member's real CLI
+# behavior — not just `--version` — was also exercised live). The archive is
+# verified by BOTH its published SHA-512 sidecar and an independently pinned
+# SHA-256 before extraction; every one of the six extracted members is then
+# individually re-verified against build_executor_gvisor_members before any
+# of them may become live. `runsc` is never exposed without the rest of the
+# reviewed bundle: all six install together into one versioned release
+# directory, and only that whole directory is atomically switched live via
+# build_executor_gvisor_current_link, so a torn partial-version install is
+# structurally impossible and rollback is just re-pointing the link at a
+# still-present previous release directory.
+build_executor_gvisor_release: "20260817.0"
+build_executor_gvisor_arch: x86_64
+build_executor_gvisor_archive_url: >-
+  https://storage.googleapis.com/gvisor/releases/release/{{ build_executor_gvisor_release }}/{{ build_executor_gvisor_arch }}/gvisor.tar.bz2
+build_executor_gvisor_archive_sha256: ae345a8c1466586b3a163fb534301913da663a97b8ed446bc711b2e1963a32c5
+build_executor_gvisor_archive_sha512: >-
+  bd8271a7742f90e53373b2a8613f37f3ae2c765ff5e2e611a75a47167a323cab7519b149c50273307743491713525a14ad1b3e398651c93b16f3e248dfeff3dd
+# Exact six-member allowlist, path relative to the extracted archive root.
+# Any archive member outside this exact set fails the install; any member
+# missing from a real archive also fails it. Order is significant only for
+# readability; installation verifies the set, not the order.
+build_executor_gvisor_members:
+  - path: runsc
+    sha256: 048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
+  - path: containerd-shim-runsc-v1
+    sha256: cc9710d432998a3ce5df84d4224dd7f2ade0baaafa77ff7cc71d2da05ef0a065
+  - path: gvisor-bin/checkpointgofer
+    sha256: 7ed0791f1a43fe0cf884788a402a45356b7c94de08f5c3f35eb35d9b997d51b3
+  - path: gvisor-bin/gvisor_sentry
+    sha256: 7c7ecc30ad54f025eb89b57b74b1c91528d24bbdab4aed120812770d346a349a
+  - path: gvisor-bin/gvisor-sentry-prewarmer
+    sha256: 3315d7ad7c2d3751d349e4976fa02da1da6fd7e41746c35622304e5fabe4fce0
+  - path: gvisor-bin/runsc-metric-server
+    sha256: 54bb1c44cc2eda8d1b008d76b71f1cd39f4bfbda6262de73a3edf7e545fad538
+build_executor_runsc_version: "release-{{ build_executor_gvisor_release }}"
+# Recomputed post-install (10-runsc.yml) from the live installed files; these
+# defaults only seed the value used by the immutable-input preflight check
+# and are overwritten by set_fact before the capability is ever published.
+build_executor_runsc_sha256: "{{ (build_executor_gvisor_members | selectattr('path', 'equalto', 'runsc') | first).sha256 }}"
+build_executor_runsc_sidecar_sha256: "{{ (build_executor_gvisor_members | selectattr('path', 'equalto', 'containerd-shim-runsc-v1') | first).sha256 }}"
+# Versioned, root-owned release tree. Each release lives in its own
+# never-mutated directory; `gvisor-current` is a directory symlink swapped
+# atomically (temp-symlink + same-filesystem rename) onto the newly verified
+# release. Only the FINAL path component (`runsc`, `containerd-shim-runsc-v1`)
+# is ever read through the symlink, so intermediate-symlink resolution still
+# leaves the consumer looking at a real, non-symlink, root-owned regular
+# file — the exact contract crate::build_executor's validate_trusted_regular_file
+# requires.
+build_executor_gvisor_releases_dir: "{{ build_executor_libexec_dir }}/gvisor-releases"
+build_executor_gvisor_release_dir: "{{ build_executor_gvisor_releases_dir }}/{{ build_executor_gvisor_release }}"
+build_executor_gvisor_current_link: "{{ build_executor_libexec_dir }}/gvisor-current"
+# Previous releases are retained on disk (never deleted) up to this many
+# generations beyond the live one, so a rollback is just re-pointing
+# build_executor_gvisor_release at a prior value and re-running the role.
+build_executor_gvisor_retain_releases: 2
+build_executor_runsc_path: "{{ build_executor_gvisor_current_link }}/runsc"
+build_executor_runsc_sidecar_path: "{{ build_executor_gvisor_current_link }}/containerd-shim-runsc-v1"
+build_executor_runsc_runtime_flags:
+  - platform=systrap
+  - network=sandbox
+  - gvisor-marker-file=true
+  - directfs=false
+  - host-uds=none
+  - host-fifo=none
+  - net-raw=false
+  - allow-flag-override=false
+
+# Every untrusted-container lifecycle operation goes through this root-owned
+# wrapper. It empties the inherited environment, fixes the exact global runtime
+# and flags before the subcommand, and points Podman at an empty hook directory
+# and dedicated containers.conf.
+build_executor_podman_path: "{{ build_executor_libexec_dir }}/podman"
+build_executor_containers_conf_dir: /etc/hive/build-executor
+build_executor_containers_conf_path: "{{ build_executor_containers_conf_dir }}/containers.conf"
+build_executor_containers_conf_override_path: "{{ build_executor_containers_conf_dir }}/containers-override.conf"
+build_executor_oci_hooks_dir: "{{ build_executor_containers_conf_dir }}/oci-hooks.empty"
+
+# This subnet and gateway are intentionally required inventory inputs. The role
+# rejects overlap with every host route and every other Podman network before
+# creating anything. The Linux bridge name is limited to IFNAMSIZ-1.
+build_executor_network_name: hive-build-executor
+build_executor_network_bridge: hive-build0
+build_executor_network_subnet: ""
+build_executor_network_gateway: ""
+# Aardvark remains the only resolver visible in the container and forwards to
+# this exact reviewed public resolver set. Empty is a hard preflight failure.
+build_executor_dns_upstream_ipv4: []
+
+# Derived from the checked-in platform inventory by default, so adding a fleet
+# node automatically expands the deny set. Operators may override with another
+# exact list only when provisioning against a different authoritative inventory.
+build_executor_fleet_public_ipv4: >-
+  {{ groups['platform'] | map('extract', hostvars, 'hive_public_ip') | list }}
+
+# Distro package names can be overridden as a group for a new supported image.
+build_executor_packages:
+  - podman
+  - nftables
+  - python3
+  - util-linux
+
+build_executor_policy_revision: rfc6890-v2
+build_executor_nft_table: hive_build_executor
+build_executor_nft_bridge_table: hive_build_executor_bridge
+build_executor_nft_policy_path: /etc/nftables.d/hive-build-executor.nft
+build_executor_nft_apply_path: "{{ build_executor_libexec_dir }}/apply-firewall"
+build_executor_nft_verify_path: "{{ build_executor_libexec_dir }}/verify-firewall"
+build_executor_firewall_unit: hive-build-executor-firewall.service
+build_executor_nftables_dropin_dir: /etc/systemd/system/nftables.service.d
+build_executor_nftables_dropin_path: "{{ build_executor_nftables_dropin_dir }}/20-build-executor-restore.conf"
+build_executor_netavark_reload_unit: netavark-nftables-reload.service
+build_executor_netavark_reload_unit_path: /usr/lib/systemd/system/netavark-nftables-reload.service
+build_executor_netavark_reload_fallback_path: /etc/systemd/system/netavark-nftables-reload.service
+build_executor_netavark_reload_dropin_dir: /etc/systemd/system/netavark-nftables-reload.service.d
+build_executor_netavark_reload_dropin_path: "{{ build_executor_netavark_reload_dropin_dir }}/20-build-executor-policy.conf"
+build_executor_hive_node_dropin_dir: /etc/systemd/system/hive-node.service.d
+build_executor_hive_node_dropin_path: "{{ build_executor_hive_node_dropin_dir }}/20-build-executor-firewall.conf"
+build_executor_lock_path: /run/lock/hive-build-executor.lock
+build_executor_lock_wait_seconds: 300
+build_executor_reap_helper_path: "{{ build_executor_libexec_dir }}/reap-stale-probes"
+
+# Live probe settings. The registry endpoint must authenticate its TLS name; a
+# 200 or registry-standard 401 proves public HTTPS. The listener makes the host
+# gateway/private-address denial observable rather than relying on a closed port.
+build_executor_probe_registry_url: https://registry-1.docker.io/v2/
+build_executor_probe_connect_timeout_seconds: 3
+build_executor_probe_listener_port: 18080
+build_executor_probe_peer_port: 18081
+build_executor_probe_hairpin_port: 18082
+build_executor_probe_memory: 256m
+build_executor_probe_pids_limit: 128
+# Workspace is a named Podman local volume backed by tmpfs: the kernel enforces
+# this byte ceiling synchronously, and the explicit volume identity lets every
+# cancellation/failure path prove that both container and volume were reaped.
+build_executor_workspace_bytes: 4294967296
+build_executor_probe_workspace_bytes: 8388608
+# Optional exact RFC1918 host address for the denial probe. Empty selects one
+# from `ip -j address` and fails if the host has none.
+build_executor_probe_private_ipv4: ""

@@ -1,0 +1,78 @@
+#!/usr/bin/bash
+# {{ ansible_managed }}
+set -euo pipefail
+umask 077
+
+if [[ $# -gt 1 || ($# -eq 1 && $1 != --lock-held && $1 != --emergency) ]]; then
+    printf 'usage: %s [--lock-held|--emergency]\n' "$0" >&2
+    exit 64
+fi
+if [[ $# -eq 0 ]]; then
+    exec 9>>{{ build_executor_lock_path | quote }}
+    /usr/bin/flock --exclusive 9
+fi
+# --lock-held is used by the serialized provisioner. --emergency is used only
+# while systemd is stopping the firewall ahead of nftables, where waiting for a
+# build-held lock would let the policy disappear before its containers are gone.
+
+podman={{ build_executor_podman_path | quote }}
+declare -A containers=()
+for label in io.hive.build-executor.probe=true io.hive.build-executor.managed=true; do
+    found=$("$podman" ps --all --quiet --filter "label=$label")
+    while IFS= read -r container; do
+        [[ -n "$container" ]] && containers["$container"]=1
+    done <<<"$found"
+done
+for container in "${!containers[@]}"; do
+    "$podman" rm --force --volumes "$container"
+done
+
+declare -A volumes=()
+for label in io.hive.build-executor.probe=true io.hive.build-executor.managed=true; do
+    found=$("$podman" volume ls --quiet --filter "label=$label")
+    while IFS= read -r volume; do
+        [[ -n "$volume" ]] && volumes["$volume"]=1
+    done <<<"$found"
+done
+for volume in "${!volumes[@]}"; do
+    "$podman" volume rm --force "$volume"
+done
+
+units_raw=$(/usr/bin/systemctl list-units --all --plain --no-legend \
+    'hive-build-gateway-*.service' \
+    'hive-build-private-*.service' \
+    'hive-build-socket-*.service')
+while read -r unit _; do
+    [[ -n "$unit" ]] || continue
+    /usr/bin/systemctl stop "$unit"
+    /usr/bin/systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+done <<<"$units_raw"
+
+/usr/bin/python3 - {{ build_executor_state_dir | quote }} <<'PY'
+import pathlib, shutil, stat, sys, time
+root = pathlib.Path(sys.argv[1])
+for pattern in (".host-secret-*", ".host-fifo-*", ".host-socket-*"):
+    for path in root.glob(pattern):
+        path.unlink(missing_ok=True)
+for path in pathlib.Path("/dev/shm").glob("hive-build-probe-*"):
+    path.unlink(missing_ok=True)
+for path in pathlib.Path("/run").glob("hive-build-probe.*"):
+    if path.is_dir():
+        shutil.rmtree(path)
+now = time.time()
+for path in pathlib.Path("/tmp").glob(".hive-build-env-*"):
+    metadata = path.lstat()
+    trusted = (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
+    if not trusted:
+        raise SystemExit(f"refusing unexpected stale BuildExecutor env path: {path}")
+    age = now - metadata.st_mtime
+    if age < 0:
+        raise SystemExit(f"refusing future-dated BuildExecutor env path: {path}")
+    if age >= 3600:
+        path.unlink()
+PY

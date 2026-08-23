@@ -38,3 +38,15 @@ Goal (G): decide and drive to completion the Supabase Studio latency architectur
 What drifted / what went wrong: the shared gm-plugkit daemon's queue was 86-deep and its watcher log 96 minutes stale under concurrent-session load; the documented single-shot escape hatch (`~/.gm-tools/agentplug-runner dispatch gm <verb> ...`) itself failed with `plugin instantiate failed: unknown import: env::host_fs_cas_write has not been defined` -- a fresh instance of the same self-heal/pinned-version drift class already recorded 2026-07-18.
 Fix / resolution: did not keep retrying (already at bound per that entry's own precedent); proceeded with the actual engineering task directly via standard tools plus real parallel subagents instructed to follow this repo's own AGENTS.md discipline (live verification, no test files) since Skill(gm) inside a fresh subagent would hit the identical broken daemon.
 Generalizes to: under heavy concurrent multi-session load, do not assume the shared daemon is healthy just because `.status.json` exists -- check `ts` staleness AND actually dispatch before trusting it; a stale watcher plus a broken direct-dispatch fallback together mean "unavailable this session," not "retry once more."
+
+## 2026-08-22 -- pending-work CONSOLIDATE cannot legally re-enter PLAN
+Goal (G): restore a legal executable GM phase for all pending platform-reliability work without weakening any verification, git, CI, cleanliness, or COMPLETE gate.
+What drifted / what went wrong: the persisted phase remained CONSOLIDATE while 28 pending PRD rows existed; the graph has no CONSOLIDATE -> PLAN edge, the exact transition denial accumulated eight times, and three bounded `fsm-propose-override` attempts exposed undocumented body-schema requirements rather than creating a proposal.
+Fix / resolution: stopped retrying, preserved every PRD row and the graph, recorded `fsm-recover-consolidate-to-plan-stuck-loop`, and surfaced the one narrow recovery decision: add only CONSOLIDATE -> PLAN, remove no edges, and weaken no validation gates. No user confirmation is inferred or fabricated.
+Generalizes to: terminal-phase persistence and newly discovered work require an explicit re-entry edge. After a bounded schema/transition retry, surface the exact graph delta for human confirmation instead of continuing direct transition attempts or deleting work rows.
+
+## 2026-08-22 -- zsh `path` is tied to `PATH`
+Goal (G): probe several platform API routes without mutating the environment used by each command.
+What drifted / what went wrong: a zsh loop variable named `path` replaced the shell's special `path` array, which also rewrote `PATH`; subsequent `curl`, `python3`, and `rm` calls all failed as command-not-found.
+Fix / resolution: renamed the loop variable to `route` and reran the bounded read-only probe successfully.
+Generalizes to: in zsh scripts, never use `path` as an ordinary scalar; it is a special parameter tied to `PATH`. Use `route`, `target`, or another non-special name.

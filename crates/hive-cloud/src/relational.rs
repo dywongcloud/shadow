@@ -131,6 +131,24 @@ pub(crate) async fn init_schema() {
             created_ms BIGINT NOT NULL\
         )",
         ),
+        // DEPRECATED-PENDING-REMOVAL: retained until a separately witnessed
+        // fleet-wide backfill proves every legacy row is normalized.
+        (
+            "billing_ledger_snapshot",
+            "CREATE TABLE IF NOT EXISTS billing_ledger_snapshot (\
+            tenant TEXT PRIMARY KEY, \
+            ledger_json TEXT NOT NULL, \
+            updated_ms BIGINT NOT NULL\
+        )",
+        ),
+        (
+            "billing_invoices_snapshot",
+            "CREATE TABLE IF NOT EXISTS billing_invoices_snapshot (\
+            tenant TEXT PRIMARY KEY, \
+            invoices_json TEXT NOT NULL, \
+            updated_ms BIGINT NOT NULL\
+        )",
+        ),
         (
             "teams",
             "CREATE TABLE IF NOT EXISTS teams (\
@@ -228,23 +246,12 @@ pub(crate) async fn init_schema() {
     ] {
         ensure_table_exists(&mut session, table, ddl).await;
     }
-    // REMOVAL (not just deprecation): `billing_ledger_snapshot` /
-    // `billing_invoices_snapshot` were the old per-tenant single-JSON-blob
-    // tables, fully superseded by the real per-row `billing_ledger` /
-    // `billing_invoices` + `billing_invoice_lines` tables above -- nothing
-    // in the codebase writes OR reads them anymore on the live path (the
-    // admin `billing_ledger`/`billing_invoices` handlers were migrated to
-    // the new tables; see `admin.rs`). `DROP TABLE IF EXISTS` is idempotent
-    // -- a genuine no-op on a node that already dropped these on a prior
-    // boot, and a real drop on any node still carrying the legacy table
-    // from before this change. Run unconditionally on every boot, same as
-    // the DDL loop above, so this converges fleet-wide without a manual
-    // operator step per node.
-    for table in ["billing_ledger_snapshot", "billing_invoices_snapshot"] {
-        if let Err(e) = exec(&mut session, &format!("DROP TABLE IF EXISTS {table}")).await {
-            tracing::warn!(table, error = %e, "relational: drop of deprecated snapshot table failed (non-fatal, will retry next boot)");
-        }
-    }
+    // `billing_ledger_snapshot` / `billing_invoices_snapshot` are deprecated,
+    // but remain intact until a separately witnessed migration proves every
+    // legacy row has been normalized fleet-wide. Dropping them during ordinary
+    // schema bring-up would destroy the only copy of pre-normalization billing
+    // history before the backfill can read it, and would break mixed-version
+    // nodes that still expect the legacy tables.
     // `CREATE TABLE IF NOT EXISTS billing_accounts` above is a genuine no-op
     // against the OLD 3-column shape every real production node already has
     // (see `reconcile_billing_accounts_schema`'s doc comment for the full
@@ -430,7 +437,10 @@ pub(crate) async fn backfill_projects(projects: Vec<(String, String, String, u64
                             Some(SqlValue::Text(t)) => t.as_str(),
                             _ => "",
                         };
-                        rt == team && rr == root_dir && num(row, 2) == updated_ms && num(row, 3) == 0
+                        rt == team
+                            && rr == root_dir
+                            && num(row, 2) == updated_ms
+                            && num(row, 3) == 0
                     })
                 } else {
                     false
@@ -671,6 +681,36 @@ pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
         return Vec::new();
     };
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
+}
+
+/// The owning team for one project from a freshly-refreshed replica. `Ok(None)`
+/// means the refreshed mirror has no live row; `Err` means freshness could not
+/// be established and callers must use their lower-authority fallback rather
+/// than treating a stale index row as authoritative.
+pub(crate) async fn team_for_project(project: &str) -> Result<Option<String>, String> {
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("guardian relational database unavailable: {e}"))?;
+    match tokio::time::timeout(SQL_OP_TIMEOUT, db.storage().refresh()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("relational index refresh failed: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "relational index refresh timed out after {SQL_OP_TIMEOUT:?}"
+            ))
+        }
+    }
+    let mut s = Session::new(db, "hive");
+    reconcile_project_teams_schema(&mut s).await;
+    let query = format!(
+        "SELECT project, team FROM project_teams WHERE project = {} AND deleted_ms = 0",
+        q(project)
+    );
+    let res = exec(&mut s, &query).await?;
+    Ok(all_text_pairs(&res)
+        .into_iter()
+        .map(|(_, t)| t)
+        .find(|t| !t.trim().is_empty()))
 }
 
 /// EVERY (project, team) pair in this node's replica — the tenancy
@@ -987,10 +1027,11 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
 /// differently-named replacement. The other four tables this same migration
 /// introduced do NOT have this problem: `billing_ledger`/`billing_invoices`/
 /// `billing_invoice_lines`/`billing_checkouts` are all genuinely new,
-/// non-colliding table names (`billing_ledger`/`billing_invoices` sat next
+/// non-colliding table names (`billing_ledger`/`billing_invoices` sit next
 /// to their old `billing_ledger_snapshot`/`billing_invoices_snapshot`
-/// JSON-blob originals, now dropped by `init_schema`'s `DROP TABLE IF
-/// EXISTS` cleanup; `billing_invoice_lines`/`billing_checkouts` are net-new
+/// JSON-blob originals, retained deprecated-pending-removal until a witnessed
+/// fleet-wide backfill proves every legacy row normalized;
+/// `billing_invoice_lines`/`billing_checkouts` are net-new
 /// with no pre-migration table at all) — a
 /// plain `CREATE TABLE IF NOT EXISTS` is sufficient for all four and none of
 /// them need this ALTER-based treatment. `billing_accounts` is the ONLY
@@ -2244,6 +2285,22 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("target", "text"),
                 col("stripe_session_id", "text"),
                 col("created_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "billing_ledger_snapshot",
+            columns: vec![
+                col("tenant", "text"),
+                col("ledger_json", "text"),
+                col("updated_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "billing_invoices_snapshot",
+            columns: vec![
+                col("tenant", "text"),
+                col("invoices_json", "text"),
+                col("updated_ms", "bigint"),
             ],
         },
         // Audit trail + idempotency marker for `backfill_billing_normalize`

@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Fail-closed BuildExecutor network policy
+After=network-pre.target nftables.service
+Before={{ build_executor_netavark_reload_unit }} hive-node.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart={{ build_executor_nft_apply_path }}
+ExecReload={{ build_executor_nft_apply_path }}
+ExecReload={{ build_executor_podman_path }} network reload --all
+ExecStop={{ build_executor_reap_helper_path }} --emergency
+RemainAfterExit=yes
+# Match hive-node's load-bearing container lifecycle: a service operation must
+# never cgroup-kill conmon-managed containers. Build containers are reaped by
+# explicit podman rm --force --volumes paths instead.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target nftables.service

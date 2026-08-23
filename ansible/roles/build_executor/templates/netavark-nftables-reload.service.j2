@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# hive-build-executor-owned-fallback
+[Unit]
+Description=Restore Netavark nftables state after nftables restart
+PartOf=nftables.service
+After=nftables.service {{ build_executor_firewall_unit }}
+Requires={{ build_executor_firewall_unit }}
+
+[Service]
+Type=oneshot
+ExecStart={{ build_executor_podman_path }} network reload --all
+
+[Install]
+WantedBy=nftables.service

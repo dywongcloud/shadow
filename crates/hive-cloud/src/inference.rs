@@ -847,6 +847,7 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                                 key: "HIVE_INFERENCE_URL".into(),
                                 value: url.clone(),
                                 target: "all".into(),
+                                scope: "runtime".into(),
                                 sensitive: false,
                                 updated_ms: hive_core::now_ms(),
                             },

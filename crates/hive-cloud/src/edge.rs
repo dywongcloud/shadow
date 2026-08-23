@@ -501,17 +501,12 @@ async fn edge_pipeline_inner(
     let local_state = serve_local
         .then(|| cloud.gw.host_deploy_state(&host))
         .flatten();
-    let prefer_peer = serve_local
-        && !matches!(local_state, Some(fluid_core::DeployState::Ready))
-        && {
+    let prefer_peer =
+        serve_local && !matches!(local_state, Some(fluid_core::DeployState::Ready)) && {
             // Full-host key first, same as the route lookup below (custom
             // tenant domains are keyed by full hostname in served_hosts).
             let routes = cloud.peer_routes.read();
-            let host_key = host
-                .split(':')
-                .next()
-                .unwrap_or(&host)
-                .to_ascii_lowercase();
+            let host_key = host.split(':').next().unwrap_or(&host).to_ascii_lowercase();
             routes
                 .get(&host_key)
                 .or_else(|| routes.get(&sub))
@@ -548,11 +543,7 @@ async fn edge_pipeline_inner(
             // table, so a custom host can never fall through to a same-named
             // project's label routes.
             let routes = cloud.peer_routes.read();
-            let host_key = host
-                .split(':')
-                .next()
-                .unwrap_or(&host)
-                .to_ascii_lowercase();
+            let host_key = host.split(':').next().unwrap_or(&host).to_ascii_lowercase();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             routes
                 .get(&host_key)

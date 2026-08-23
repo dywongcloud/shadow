@@ -2246,7 +2246,9 @@ impl PeerPool {
         })
     }
 
-    fn lock_private_candidates(&self) -> std::sync::MutexGuard<'_, HashMap<String, std::net::SocketAddr>> {
+    fn lock_private_candidates(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, std::net::SocketAddr>> {
         self.private_candidates
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2277,17 +2279,14 @@ impl PeerPool {
     /// registry). Absence is always safe: `acquire` simply dials without a
     /// private candidate, exactly as before this feature existed.
     pub fn clear_private_candidate(&self, endpoint_id: &str) {
-        self.lock_private_candidates()
-            .remove(endpoint_id);
+        self.lock_private_candidates().remove(endpoint_id);
     }
 
     /// The private candidate currently registered for `endpoint_id`, if any
     /// — used by callers wanting to classify an established connection's
     /// path (`private_path::classify_remote_addr`) without re-deriving it.
     pub fn private_candidate(&self, endpoint_id: &str) -> Option<std::net::SocketAddr> {
-        self.lock_private_candidates()
-            .get(endpoint_id)
-            .copied()
+        self.lock_private_candidates().get(endpoint_id).copied()
     }
 
     /// Reap private-candidate entries for peers no longer present in `keep`
@@ -3131,6 +3130,29 @@ impl PeerPool {
         path: &str,
         body: &[u8],
     ) -> Result<Vec<u8>> {
+        self.gossip_request_with_response_cap(
+            node_id,
+            addr_json,
+            method,
+            path,
+            body,
+            GOSSIP_MAX_FRAME,
+        )
+        .await
+    }
+
+    /// Gossip request with a caller-selected response bound. Large-response
+    /// protocols opt in explicitly; ordinary control-plane calls retain the
+    /// strict default cap and cannot be made to allocate more by their peer.
+    pub async fn gossip_request_with_response_cap(
+        &self,
+        node_id: &str,
+        addr_json: &str,
+        method: u8,
+        path: &str,
+        body: &[u8],
+        response_cap: usize,
+    ) -> Result<Vec<u8>> {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
@@ -3191,7 +3213,13 @@ impl PeerPool {
             let _ = send.finish();
             // Response: [u32 len][bytes]. POST-SEND read bounded by the firstbyte
             // budget so a peer that accepts the stream but never answers can't hang.
-            let resp = match tokio::time::timeout(firstbyte_budget(), read_frame(&mut recv)).await {
+            // Allocation is additionally bounded by this protocol caller's cap.
+            let resp = match tokio::time::timeout(
+                firstbyte_budget(),
+                read_frame_max(&mut recv, response_cap),
+            )
+            .await
+            {
                 Ok(Ok(b)) => b,
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {

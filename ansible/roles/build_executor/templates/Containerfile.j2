@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# The toolchain is supplied by the reviewed, digest-pinned base. This file does
+# not contact a mutable package repository while building.
+FROM {{ build_executor_builder_base_image }}
+
+USER 0:0
+RUN set -eu; \
+    for path in /bin/sh /bin/sleep /bin/tar /usr/bin/awk /usr/bin/env /usr/bin/find /usr/bin/id /usr/bin/realpath /usr/bin/stat /usr/bin/wc; do test -x "$path"; done; \
+    for command in curl id sleep cp dd du cut grep tar git node npm corepack bun python3 go buildah; do command -v "$command" >/dev/null; done; \
+    if grep -Eq '^[^:]*:[^:]*:{{ build_executor_container_uid }}:' /etc/passwd; then \
+      grep -Eq '^[^:]*:[^:]*:{{ build_executor_container_uid }}:{{ build_executor_container_gid }}:' /etc/passwd; \
+    else \
+      printf 'hivebuild:x:{{ build_executor_container_uid }}:{{ build_executor_container_gid }}:Build Executor:/home/hivebuild:/bin/sh\n' >>/etc/passwd; \
+    fi; \
+    grep -Eq '^[^:]*:[^:]*:{{ build_executor_container_gid }}:' /etc/group || printf 'hivebuild:x:{{ build_executor_container_gid }}:\n' >>/etc/group; \
+    mkdir -p /workspace /home/hivebuild/.config/containers; \
+    printf '%s\n' '[storage]' 'driver = "vfs"' 'runroot = "/tmp/buildah-run"' 'graphroot = "/workspace/.buildah/storage"' > /home/hivebuild/.config/containers/storage.conf; \
+    chown -R {{ build_executor_container_uid }}:{{ build_executor_container_gid }} /workspace /home/hivebuild
+
+LABEL org.hive.build-executor.protocol="{{ build_executor_protocol }}"
+ENV HOME=/home/hivebuild
+WORKDIR /workspace
+USER {{ build_executor_container_uid }}:{{ build_executor_container_gid }}
+ENTRYPOINT []
+CMD ["/bin/sh"]

@@ -1,0 +1,28 @@
+---
+- name: Stop the serialized root-flock holder
+  ansible.builtin.systemd:
+    name: "{{ _build_executor_lock_unit }}"
+    state: stopped
+
+- name: Mark this invocation's lock released after holder exit
+  ansible.builtin.set_fact:
+    _build_executor_lock_held: false
+
+- name: Remove the lock-holder receipt
+  ansible.builtin.file:
+    path: "{{ _build_executor_lock_ready }}"
+    state: absent
+
+# A legitimate executor may acquire the flock immediately after capability
+# publication, so probing the global lock with flock --nonblock would race and
+# could revoke a valid capability. Prove only that this invocation's holder is
+# gone; systemd stopping its MainPID closes this invocation's lock fd.
+- name: Prove this invocation's lock holder is inactive
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ _build_executor_lock_unit }}"
+  register: _build_executor_lock_unit_active
+  changed_when: false
+  failed_when: _build_executor_lock_unit_active.rc == 0

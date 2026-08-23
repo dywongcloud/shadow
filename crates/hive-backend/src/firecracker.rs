@@ -17,12 +17,20 @@
 //! It compiles on all platforms; it only *works* where `/dev/kvm` and the
 //! `firecracker` binary exist.
 
-use crate::{CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink};
+use crate::{
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, RuntimeArtifactSpec,
+};
+use anyhow::Context;
 use async_trait::async_trait;
 use hive_core::{
-    now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, CellId, LogLine, LogStream,
-    CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
+    agent_handshake_transcript, now_ms, AgentBootProof, AgentEvent, AgentHandshake,
+    AgentHandshakeReady, AgentRequest, AgentWireProtocol, BuildJob, BuildResult, CellId, LogLine,
+    LogStream, RuntimeArtifactIdentity, RuntimeArtifactRootfsMetadata, AGENT_HANDSHAKE_NONCE_BYTES,
+    AGENT_WIRE_CAPABILITIES, AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT,
+    CELL_GUEST_CID, RUNTIME_ARTIFACT_PROTOCOL_VERSION, RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
+    RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,6 +40,279 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+const RUNTIME_ARTIFACT_PUBLICATION_SCHEMA: u16 = 1;
+const RUNTIME_ARTIFACT_LOCK_STRIPES: usize = 64;
+const RUNTIME_ARTIFACT_STALE_GRACE_SECS: u64 = 60 * 60;
+const RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES: usize = 8192;
+const RUNTIME_ARTIFACT_STALE_MAX_REAP_FRACTION: f64 = 0.6;
+static RUNTIME_ARTIFACT_LOCKS: std::sync::OnceLock<Vec<Mutex<()>>> = std::sync::OnceLock::new();
+static RUNTIME_ARTIFACT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RuntimeArtifactPublication {
+    schema: u16,
+    identity: RuntimeArtifactIdentity,
+    image_sha256: String,
+    image_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootfsFileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedRootfsProtocol {
+    image_stamp: RootfsFileStamp,
+    proof_stamp: RootfsFileStamp,
+    metadata: RuntimeArtifactRootfsMetadata,
+}
+
+struct RuntimeArtifactAuthorizationGuard {
+    cell: CellId,
+    authorizations: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactIdentity>>>,
+}
+
+impl RuntimeArtifactAuthorizationGuard {
+    fn install(
+        cell: CellId,
+        identity: RuntimeArtifactIdentity,
+        authorizations: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactIdentity>>>,
+    ) -> anyhow::Result<Self> {
+        let mut entries = authorizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        anyhow::ensure!(
+            !entries.contains_key(&cell),
+            "cell {cell} already has an in-flight runtime artifact authorization"
+        );
+        entries.insert(cell.clone(), identity);
+        drop(entries);
+        Ok(Self {
+            cell,
+            authorizations,
+        })
+    }
+}
+
+impl Drop for RuntimeArtifactAuthorizationGuard {
+    fn drop(&mut self) {
+        self.authorizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.cell);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicationFileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationLinkState {
+    Missing,
+    Owned,
+    Foreign,
+}
+
+struct PublicationTempGuard {
+    temporary_image: PathBuf,
+    temporary_identity: PathBuf,
+    image: PathBuf,
+    identity: PathBuf,
+    backup: PathBuf,
+    temporary_image_owner: PublicationFileIdentity,
+    temporary_identity_owner: PublicationFileIdentity,
+    backup_owner: Option<PublicationFileIdentity>,
+    publication_started: bool,
+    publication_committed: bool,
+    restore_legacy: bool,
+    armed: bool,
+}
+
+impl PublicationTempGuard {
+    fn new(
+        temporary_image: PathBuf,
+        temporary_identity: PathBuf,
+        image: PathBuf,
+        identity: PathBuf,
+        backup: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let temporary_image_owner = publication_file_identity(&temporary_image)?;
+        let temporary_identity_owner = publication_file_identity(&temporary_identity)?;
+        Ok(Self {
+            temporary_image,
+            temporary_identity,
+            image,
+            identity,
+            backup,
+            temporary_image_owner,
+            temporary_identity_owner,
+            backup_owner: None,
+            publication_started: false,
+            publication_committed: false,
+            restore_legacy: false,
+            armed: true,
+        })
+    }
+
+    fn begin_publication(&mut self, restore_legacy: bool) -> anyhow::Result<()> {
+        self.temporary_image_owner = publication_file_identity(&self.temporary_image)?;
+        self.temporary_identity_owner = publication_file_identity(&self.temporary_identity)?;
+        anyhow::ensure!(
+            publication_link_state(&self.temporary_image, &self.temporary_image_owner)?
+                == PublicationLinkState::Owned
+                && publication_link_state(
+                    &self.temporary_identity,
+                    &self.temporary_identity_owner
+                )? == PublicationLinkState::Owned,
+            "runtime artifact publication temporaries changed before publication"
+        );
+        if restore_legacy {
+            let backup_owner = publication_file_identity(&self.backup)?;
+            self.backup_owner = Some(backup_owner.clone());
+            anyhow::ensure!(
+                publication_file_identity(&self.image)? == backup_owner,
+                "runtime artifact legacy backup does not own the prior canonical image"
+            );
+        }
+        self.publication_started = true;
+        self.restore_legacy = restore_legacy;
+        Ok(())
+    }
+
+    fn mark_publication_committed(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            publication_link_state(&self.image, &self.temporary_image_owner)?
+                == PublicationLinkState::Owned
+                && publication_link_state(&self.identity, &self.temporary_identity_owner)?
+                    == PublicationLinkState::Owned,
+            "runtime artifact canonical pair changed before publication commit"
+        );
+        self.publication_committed = true;
+        Ok(())
+    }
+
+    fn remove_transients(&self) -> anyhow::Result<()> {
+        if self.publication_committed {
+            if let Some(backup_owner) = self.backup_owner.as_ref() {
+                remove_owned_publication_file(&self.backup, backup_owner)?;
+            }
+        }
+        remove_owned_publication_file(&self.temporary_image, &self.temporary_image_owner)?;
+        remove_owned_publication_file(&self.temporary_identity, &self.temporary_identity_owner)?;
+        if !self.publication_started {
+            if let Some(backup_owner) = self.backup_owner.as_ref() {
+                remove_owned_publication_file(&self.backup, backup_owner)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_publication(&self) -> anyhow::Result<()> {
+        if !self.publication_started || self.publication_committed {
+            return Ok(());
+        }
+
+        let image_state = publication_link_state(&self.image, &self.temporary_image_owner)?;
+        let identity_state =
+            publication_link_state(&self.identity, &self.temporary_identity_owner)?;
+        anyhow::ensure!(
+            image_state != PublicationLinkState::Foreign
+                && identity_state != PublicationLinkState::Foreign,
+            "refusing to roll back runtime artifact canonical links owned by another publisher"
+        );
+        if self.restore_legacy {
+            let backup_owner = self.backup_owner.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("runtime artifact legacy rollback has no owned backup")
+            })?;
+            anyhow::ensure!(
+                publication_link_state(&self.backup, backup_owner)? == PublicationLinkState::Owned,
+                "refusing runtime artifact rollback without its exact legacy backup"
+            );
+        }
+
+        // The image is the commit marker, so unlink and sync it first. Every
+        // durable prefix after this point is recoverable: sidecar+backup,
+        // backup alone, then the restored legacy image.
+        if image_state == PublicationLinkState::Owned {
+            remove_owned_publication_file(&self.image, &self.temporary_image_owner)?;
+        }
+        if identity_state == PublicationLinkState::Owned {
+            remove_owned_publication_file(&self.identity, &self.temporary_identity_owner)?;
+        }
+        if self.restore_legacy {
+            let backup_owner = self.backup_owner.as_ref().expect("checked above");
+            anyhow::ensure!(
+                publication_link_state(&self.image, &self.temporary_image_owner)?
+                    == PublicationLinkState::Missing
+                    && publication_link_state(&self.identity, &self.temporary_identity_owner)?
+                        == PublicationLinkState::Missing
+                    && publication_link_state(&self.backup, backup_owner)?
+                        == PublicationLinkState::Owned,
+                "runtime artifact rollback namespace changed before legacy restore"
+            );
+            std::fs::rename(&self.backup, &self.image).with_context(|| {
+                format!(
+                    "restore cancelled runtime artifact publication {}",
+                    self.image.display()
+                )
+            })?;
+            sync_parent_blocking(&self.image)?;
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.publication_committed,
+            "runtime artifact publication guard committed before its canonical pair"
+        );
+        self.remove_transients()?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PublicationTempGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.rollback_publication() {
+            tracing::error!(
+                image = %self.image.display(),
+                step = "rollback",
+                error = %error,
+                "runtime artifact cancellation cleanup failed; preserved paths require recovery"
+            );
+            return;
+        }
+        if let Err(error) = self.remove_transients() {
+            tracing::error!(
+                image = %self.image.display(),
+                step = "temporary cleanup",
+                error = %error,
+                "runtime artifact cancellation cleanup failed; preserved paths require recovery"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FirecrackerConfig {
@@ -86,6 +367,20 @@ pub struct FirecrackerBackend {
     /// Container cells run on the host and own their exact container identity and
     /// tunnel task here; they have no `Child` in `procs`.
     containers: Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>>,
+    /// Caller-authorized H1 identities scoped to one in-flight provision. The
+    /// synchronous mutex exists so the Drop guard can erase an authorization on
+    /// request cancellation; entries never survive the provision future.
+    artifact_authorizations: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactIdentity>>>,
+    /// Exact rootfs proofs, keyed by image path and invalidated by image or proof
+    /// inode/size/mtime changes. The multi-GiB image is hashed once at boot (or
+    /// first use), never on every cold start; an atomic rootfs/proof replacement
+    /// necessarily changes a stamp and forces re-verification before another
+    /// deployment VM can boot.
+    rootfs_protocols: Arc<Mutex<HashMap<PathBuf, VerifiedRootfsProtocol>>>,
+    /// Proof selected while the immutable base bytes for one deployment cell were
+    /// stable and copied. Launch consumes this per-cell fact rather than whatever
+    /// rootfs publication happens to be canonical later.
+    cell_rootfs_proofs: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactRootfsMetadata>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2): samples the per-cell
     /// Firecracker VMM host process, whose CPU tracks the guest's vCPU work
     /// (Firecracker is a thin VMM).
@@ -121,6 +416,9 @@ impl FirecrackerBackend {
             net_idx: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             containers,
+            artifact_authorizations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rootfs_protocols: Arc::new(Mutex::new(HashMap::new())),
+            cell_rootfs_proofs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
@@ -392,6 +690,255 @@ impl FirecrackerBackend {
             .join(format!("{}.ext4", crate::sanitize_image(image)))
     }
 
+    fn rootfs_protocol_sidecar_for(rootfs: &std::path::Path) -> PathBuf {
+        let mut path = rootfs.as_os_str().to_os_string();
+        path.push(RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    fn rootfs_stamp(path: &std::path::Path) -> anyhow::Result<RootfsFileStamp> {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stat rootfs image {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "rootfs image is not a regular file: {}",
+            path.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                metadata.uid() == 0 && metadata.nlink() == 1 && metadata.mode() & 0o022 == 0,
+                "rootfs image must be root-owned, single-link, and not group/world-writable: {}",
+                path.display()
+            );
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
+
+    fn rootfs_protocol_stamp(rootfs: &std::path::Path) -> anyhow::Result<RootfsFileStamp> {
+        let sidecar = Self::rootfs_protocol_sidecar_for(rootfs);
+        let parent = sidecar
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("rootfs protocol sidecar has no parent directory"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            parent_metadata.is_dir(),
+            "rootfs directory is not a directory"
+        );
+        let metadata = std::fs::symlink_metadata(&sidecar)
+            .with_context(|| format!("stat rootfs runtime-artifact proof {}", sidecar.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "rootfs runtime-artifact proof is not a regular file: {}",
+            sidecar.display()
+        );
+        anyhow::ensure!(
+            metadata.len() > 0 && metadata.len() <= 4096,
+            "rootfs runtime-artifact proof must be between 1 and 4096 bytes: {}",
+            sidecar.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
+                "rootfs directory must be root-owned and not group/world-writable: {}",
+                parent.display()
+            );
+            anyhow::ensure!(
+                metadata.uid() == 0 && metadata.nlink() == 1 && metadata.mode() & 0o222 == 0,
+                "rootfs runtime-artifact proof must be root-owned, single-link, and read-only: {}",
+                sidecar.display()
+            );
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
+
+    fn lowercase_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn read_rootfs_protocol_metadata(
+        rootfs: &std::path::Path,
+    ) -> anyhow::Result<RuntimeArtifactRootfsMetadata> {
+        let sidecar = Self::rootfs_protocol_sidecar_for(rootfs);
+        let parent = sidecar
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("rootfs protocol sidecar has no parent directory"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            parent_metadata.is_dir(),
+            "rootfs directory is not a directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            anyhow::ensure!(
+                parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
+                "rootfs directory must be root-owned and not group/world-writable: {}",
+                parent.display()
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&sidecar)
+                .with_context(|| {
+                    format!("open rootfs runtime-artifact proof {}", sidecar.display())
+                })?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.uid() == 0
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o222 == 0
+                    && metadata.len() > 0
+                    && metadata.len() <= 4096,
+                "rootfs runtime-artifact proof must be a root-owned, read-only, single-link regular file no larger than 4096 bytes: {}",
+                sidecar.display()
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            let mut limited =
+                std::io::Read::take(std::io::Read::by_ref(&mut file), metadata.len() + 1);
+            std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 == metadata.len(),
+                "rootfs runtime-artifact proof changed during exact-length read"
+            );
+            return serde_json::from_slice(&bytes).with_context(|| {
+                format!("parse rootfs runtime-artifact proof {}", sidecar.display())
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(&sidecar)?;
+            anyhow::ensure!(!bytes.is_empty() && bytes.len() <= 4096);
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!("parse rootfs runtime-artifact proof {}", sidecar.display())
+            })
+        }
+    }
+
+    async fn verified_rootfs_protocol(
+        &self,
+        rootfs: &std::path::Path,
+    ) -> anyhow::Result<RuntimeArtifactRootfsMetadata> {
+        let image_stamp = Self::rootfs_stamp(rootfs)?;
+        let proof_stamp = Self::rootfs_protocol_stamp(rootfs)?;
+        let mut proofs = self.rootfs_protocols.lock().await;
+        if let Some(proof) = proofs
+            .get(rootfs)
+            .filter(|proof| proof.image_stamp == image_stamp && proof.proof_stamp == proof_stamp)
+        {
+            return Ok(proof.metadata.clone());
+        }
+
+        let metadata = Self::read_rootfs_protocol_metadata(rootfs)?;
+        anyhow::ensure!(
+            metadata.schema == RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
+            "unsupported rootfs protocol proof schema {}",
+            metadata.schema
+        );
+        anyhow::ensure!(
+            metadata.protocol == RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            "rootfs implements runtime-artifact protocol {}, host requires {}",
+            metadata.protocol,
+            RUNTIME_ARTIFACT_PROTOCOL_VERSION
+        );
+        anyhow::ensure!(
+            metadata.agent_wire_protocol == AGENT_WIRE_PROTOCOL_VERSION,
+            "rootfs implements agent wire protocol {}, host requires {}",
+            metadata.agent_wire_protocol,
+            AGENT_WIRE_PROTOCOL_VERSION
+        );
+        anyhow::ensure!(
+            metadata.agent_wire_capabilities == AGENT_WIRE_CAPABILITIES,
+            "rootfs implements agent wire capabilities {:#x}, host requires {:#x}",
+            metadata.agent_wire_capabilities,
+            AGENT_WIRE_CAPABILITIES
+        );
+        anyhow::ensure!(
+            Self::lowercase_sha256(&metadata.agent_sha256)
+                && Self::lowercase_sha256(&metadata.image_sha256)
+                && metadata.image_bytes > 0,
+            "rootfs protocol proof has an invalid agent/image digest or byte count"
+        );
+        let (digest, bytes) = hash_file_sha256(rootfs).await?;
+        anyhow::ensure!(
+            digest == metadata.image_sha256 && bytes == metadata.image_bytes,
+            "rootfs image bytes do not match their protocol proof"
+        );
+        let final_image_stamp = Self::rootfs_stamp(rootfs)?;
+        let final_proof_stamp = Self::rootfs_protocol_stamp(rootfs)?;
+        anyhow::ensure!(
+            final_image_stamp == image_stamp && final_proof_stamp == proof_stamp,
+            "rootfs image or its proof changed while the agent protocols were verified"
+        );
+        proofs.insert(
+            rootfs.to_path_buf(),
+            VerifiedRootfsProtocol {
+                image_stamp,
+                proof_stamp,
+                metadata: metadata.clone(),
+            },
+        );
+        Ok(metadata)
+    }
+
+    async fn verified_rootfs_runtime_artifact_protocol(
+        &self,
+        rootfs: &std::path::Path,
+    ) -> anyhow::Result<u16> {
+        Ok(self.verified_rootfs_protocol(rootfs).await?.protocol)
+    }
+
+    /// Protocol proved by the exact shared base rootfs this backend will boot.
+    /// `hive-cloud` advertises only this result; a sidecar's existence alone is
+    /// intentionally insufficient.
+    pub async fn base_runtime_artifact_protocol(&self) -> anyhow::Result<u16> {
+        let rootfs = self.rootfs_for(&self.cfg.base_image);
+        self.verified_rootfs_runtime_artifact_protocol(&rootfs)
+            .await
+    }
+
+    /// Complete wire fact proved from the exact base-rootfs bytes. This is the
+    /// additive scheduler input for capability-gating later NodeInfo work.
+    pub async fn base_agent_wire_protocol(&self) -> anyhow::Result<AgentWireProtocol> {
+        let rootfs = self.rootfs_for(&self.cfg.base_image);
+        let metadata = self.verified_rootfs_protocol(&rootfs).await?;
+        Ok(AgentWireProtocol {
+            protocol: metadata.agent_wire_protocol,
+            capabilities: metadata.agent_wire_capabilities,
+        })
+    }
+
     /// Per-deployment build-output ext4 (the artifact `deliver_build` packs and
     /// `provision` attaches as the cell's second drive). Lives alongside the
     /// base rootfs images, keyed by the same logical image name.
@@ -399,6 +946,365 @@ impl FirecrackerBackend {
         self.cfg
             .rootfs_dir
             .join(format!("{}.data.ext4", crate::sanitize_image(image)))
+    }
+
+    fn data_identity_for(&self, image: &str) -> PathBuf {
+        let mut path = self.data_image_for(image).into_os_string();
+        path.push(".identity.json");
+        PathBuf::from(path)
+    }
+
+    fn publication_temp_token() -> String {
+        use std::sync::atomic::Ordering;
+        let sequence = RUNTIME_ARTIFACT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos:032x}-{sequence:016x}", std::process::id())
+    }
+
+    fn publication_temp_for(path: &std::path::Path, token: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(format!(".publishing.{token}"));
+        PathBuf::from(value)
+    }
+
+    fn publication_backup_for(path: &std::path::Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".legacy-unverified");
+        PathBuf::from(value)
+    }
+
+    fn cleanup_stale_publication_files(
+        rootfs_dir: &std::path::Path,
+        out: &std::path::Path,
+        sidecar: &std::path::Path,
+        keep: &std::collections::HashSet<PathBuf>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            !keep.is_empty(),
+            "refusing runtime artifact stale cleanup with an empty keep-set"
+        );
+        for path in keep {
+            let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                format!(
+                    "refusing runtime artifact stale cleanup without live keep path {}",
+                    path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "refusing runtime artifact stale cleanup with non-regular keep path {}",
+                path.display()
+            );
+        }
+
+        let out_name = out
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("runtime artifact image has no file name"))?
+            .to_string_lossy();
+        let sidecar_name = sidecar
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("runtime artifact sidecar has no file name"))?
+            .to_string_lossy();
+        let out_temp_prefix = format!("{out_name}.publishing");
+        let sidecar_temp_prefix = format!("{sidecar_name}.publishing");
+        let backup_name = format!("{out_name}.legacy-unverified");
+        let grace = Duration::from_secs(
+            std::env::var("HIVE_RUNTIME_ARTIFACT_STALE_GRACE_SECS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(RUNTIME_ARTIFACT_STALE_GRACE_SECS),
+        );
+        let max_fraction = std::env::var("HIVE_RUNTIME_ARTIFACT_STALE_MAX_REAP_FRACTION")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+            .unwrap_or(RUNTIME_ARTIFACT_STALE_MAX_REAP_FRACTION);
+        let now = std::time::SystemTime::now();
+        let mut matched = 0usize;
+        let mut candidates = Vec::new();
+        let entries = std::fs::read_dir(rootfs_dir)?;
+        for (scanned, entry) in entries.enumerate() {
+            anyhow::ensure!(
+                scanned < RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES,
+                "refusing runtime artifact stale cleanup after scanning more than {} entries",
+                RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES
+            );
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale_kind = if name == backup_name {
+                Some(2_u8)
+            } else if name == out_temp_prefix || name.starts_with(&format!("{out_temp_prefix}.")) {
+                Some(0_u8)
+            } else if name == sidecar_temp_prefix
+                || name.starts_with(&format!("{sidecar_temp_prefix}."))
+            {
+                Some(1_u8)
+            } else {
+                None
+            };
+            let Some(stale_kind) = stale_kind else {
+                continue;
+            };
+            matched += 1;
+            let path = entry.path();
+            if keep.contains(&path) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Some(modified) = metadata.modified().ok() else {
+                continue;
+            };
+            let old_enough = now
+                .duration_since(modified)
+                .map(|age| age >= grace)
+                .unwrap_or(false);
+            if old_enough {
+                candidates.push((path, metadata.len(), modified, stale_kind));
+            }
+        }
+
+        // A hard link inherits the legacy image's old inode mtime, so its mtime
+        // alone cannot prove the backup name is stale. Reap that link only when
+        // both unique files from the same maximum crash residue are themselves
+        // old enough. A lone backup is retained rather than guessed stale.
+        let old_image_temporary = candidates.iter().any(|candidate| candidate.3 == 0);
+        let old_identity_temporary = candidates.iter().any(|candidate| candidate.3 == 1);
+        if !old_image_temporary || !old_identity_temporary {
+            candidates.retain(|candidate| candidate.3 != 2);
+        }
+
+        let population = matched.saturating_add(keep.len());
+        if population > 0 {
+            let fraction = candidates.len() as f64 / population as f64;
+            anyhow::ensure!(
+                fraction <= max_fraction,
+                "refusing runtime artifact stale cleanup: {} of {} publication files ({fraction:.3}) exceed max reap fraction {max_fraction:.3}",
+                candidates.len(),
+                population
+            );
+        }
+
+        let mut removed = 0usize;
+        for (path, len, modified, _) in candidates {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != len
+                || metadata.modified().ok() != Some(modified)
+            {
+                continue;
+            }
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        }
+        if removed > 0 {
+            sync_parent_blocking(out)?;
+            tracing::warn!(
+                removed,
+                image = %out.display(),
+                "removed guarded stale runtime artifact publication files"
+            );
+        }
+        Ok(removed)
+    }
+
+    fn canonical_links_publication_temporary(
+        rootfs_dir: &std::path::Path,
+        canonical: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let canonical_owner = publication_file_identity(canonical)?;
+        let canonical_name = canonical
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("runtime artifact path has no file name"))?
+            .to_string_lossy();
+        let temporary_prefix = format!("{canonical_name}.publishing");
+        for (scanned, entry) in std::fs::read_dir(rootfs_dir)?.enumerate() {
+            anyhow::ensure!(
+                scanned < RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES,
+                "refusing runtime artifact recovery after scanning more than {} entries",
+                RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES
+            );
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != temporary_prefix && !name.starts_with(&format!("{temporary_prefix}.")) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            if publication_file_identity_from_metadata(&entry.path(), &metadata)? == canonical_owner
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn artifact_lock_for(path: &std::path::Path) -> anyhow::Result<&'static Mutex<()>> {
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime artifact publication path has no parent: {}",
+                path.display()
+            )
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime artifact publication path has no file name: {}",
+                path.display()
+            )
+        })?;
+        let canonical_path = std::fs::canonicalize(parent)
+            .with_context(|| {
+                format!(
+                    "canonicalize runtime artifact publication directory {}",
+                    parent.display()
+                )
+            })?
+            .join(file_name);
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in canonical_path.as_os_str().to_string_lossy().bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let locks = RUNTIME_ARTIFACT_LOCKS.get_or_init(|| {
+            (0..RUNTIME_ARTIFACT_LOCK_STRIPES)
+                .map(|_| Mutex::new(()))
+                .collect()
+        });
+        Ok(&locks[hash as usize % locks.len()])
+    }
+
+    fn validate_runtime_identity(
+        bytes: &[u8],
+        image: &str,
+    ) -> anyhow::Result<RuntimeArtifactIdentity> {
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() <= 4096,
+            "runtime artifact identity exceeds 4096 bytes for image {image:?}"
+        );
+        let identity: RuntimeArtifactIdentity = serde_json::from_slice(bytes)
+            .with_context(|| format!("invalid runtime artifact identity for image {image:?}"))?;
+        anyhow::ensure!(
+            identity.protocol == RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            "runtime artifact protocol {} is unsupported for image {image:?}",
+            identity.protocol
+        );
+        anyhow::ensure!(
+            identity.id == image,
+            "runtime artifact identity {:?} does not match requested image {image:?}",
+            identity.id
+        );
+        anyhow::ensure!(
+            identity.content_sha256.len() == 64
+                && identity
+                    .content_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "runtime artifact identity has an invalid content digest for image {image:?}"
+        );
+        Ok(identity)
+    }
+
+    fn validate_data_publication(
+        bytes: &[u8],
+        image: &str,
+    ) -> anyhow::Result<RuntimeArtifactPublication> {
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() <= 4096,
+            "runtime artifact publication exceeds 4096 bytes for image {image:?}"
+        );
+        let publication: RuntimeArtifactPublication = serde_json::from_slice(bytes)
+            .with_context(|| format!("invalid runtime artifact publication for image {image:?}"))?;
+        anyhow::ensure!(
+            publication.schema == RUNTIME_ARTIFACT_PUBLICATION_SCHEMA,
+            "runtime artifact publication schema {} is unsupported for image {image:?}",
+            publication.schema
+        );
+        let identity = &publication.identity;
+        anyhow::ensure!(
+            identity.protocol == RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            "runtime artifact protocol {} is unsupported for image {image:?}",
+            identity.protocol
+        );
+        anyhow::ensure!(
+            identity.id == image,
+            "runtime artifact identity {:?} does not match requested image {image:?}",
+            identity.id
+        );
+        for (label, digest) in [
+            ("content", identity.content_sha256.as_str()),
+            ("image", publication.image_sha256.as_str()),
+        ] {
+            anyhow::ensure!(
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "runtime artifact publication has an invalid {label} digest for image {image:?}"
+            );
+        }
+        anyhow::ensure!(
+            publication.image_bytes > 0,
+            "runtime artifact publication has an empty image for {image:?}"
+        );
+        Ok(publication)
+    }
+
+    async fn read_publication_at(
+        path: &std::path::Path,
+        image: &str,
+    ) -> anyhow::Result<RuntimeArtifactPublication> {
+        let bytes = tokio::fs::read(path).await.with_context(|| {
+            format!(
+                "runtime artifact publication is unavailable for image {image:?}: {}",
+                path.display()
+            )
+        })?;
+        Self::validate_data_publication(&bytes, image)
+    }
+
+    async fn verify_publication_image(
+        publication: &RuntimeArtifactPublication,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let (digest, bytes) = hash_file_sha256(path).await?;
+        anyhow::ensure!(
+            bytes == publication.image_bytes && digest == publication.image_sha256,
+            "runtime artifact image bytes do not match its committed publication ({})",
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+        Ok(())
+    }
+
+    async fn read_data_publication(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<RuntimeArtifactPublication> {
+        Self::read_publication_at(&self.data_identity_for(image), image).await
+    }
+
+    async fn verified_data_identity(
+        &self,
+        image: &str,
+        exact_copy: &std::path::Path,
+    ) -> anyhow::Result<RuntimeArtifactIdentity> {
+        let publication = self.read_data_publication(image).await?;
+        Self::verify_publication_image(&publication, exact_copy)
+            .await
+            .with_context(|| format!("verify copied runtime artifact for image {image:?}"))?;
+        Ok(publication.identity)
     }
 
     /// Locate a deployment's data image on disk for the storage broker
@@ -608,6 +1514,7 @@ struct FirecrackerProvisionGuard {
     root: PathBuf,
     procs: Arc<Mutex<HashMap<CellId, Child>>>,
     taps: Arc<Mutex<HashMap<CellId, String>>>,
+    cell_rootfs_proofs: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactRootfsMetadata>>>,
     armed: bool,
 }
 
@@ -617,12 +1524,14 @@ impl FirecrackerProvisionGuard {
         root: PathBuf,
         procs: Arc<Mutex<HashMap<CellId, Child>>>,
         taps: Arc<Mutex<HashMap<CellId, String>>>,
+        cell_rootfs_proofs: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactRootfsMetadata>>>,
     ) -> Self {
         Self {
             id,
             root,
             procs,
             taps,
+            cell_rootfs_proofs,
             armed: true,
         }
     }
@@ -637,6 +1546,10 @@ impl Drop for FirecrackerProvisionGuard {
         if !self.armed {
             return;
         }
+        self.cell_rootfs_proofs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
         let id = self.id.clone();
         let root = self.root.clone();
         let procs = self.procs.clone();
@@ -708,9 +1621,8 @@ async fn cleanup_firecracker_process_and_tap(
     }
 }
 
-/// Guest path the per-deployment build output is mounted at (the agent mounts
-/// `/dev/vdb` here; the function server runs with this as its working dir).
-pub const DELIVERED_WORKDIR: &str = "/build";
+/// Guest root where the validated checkout artifact is mounted.
+pub const DELIVERED_WORKDIR: &str = "/workspace";
 
 /// Copy `src` to `dst`, preferring a copy-on-write REFLINK clone over a full
 /// block-level copy when the host filesystem supports it (XFS formatted with
@@ -744,10 +1656,173 @@ async fn reflink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> std::i
     tokio::fs::copy(src, dst).await.map(|_| ())
 }
 
+async fn hash_file_sha256(path: &std::path::Path) -> anyhow::Result<(String, u64)> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open runtime artifact image {}", path.display()))?;
+    let before = file.metadata().await?;
+    anyhow::ensure!(before.is_file(), "runtime artifact image is not a file");
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    let after = file.metadata().await?;
+    #[cfg(unix)]
+    let stable = {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mode() == after.mode()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+    };
+    #[cfg(not(unix))]
+    let stable = before.len() == after.len() && before.modified().ok() == after.modified().ok();
+    anyhow::ensure!(
+        stable && bytes == before.len(),
+        "runtime artifact image changed during exact-byte hashing: {}",
+        path.display()
+    );
+    let digest = hasher.finalize();
+    let mut value = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(value, "{byte:02x}");
+    }
+    Ok((value, bytes))
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn publication_file_identity_from_metadata(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<PublicationFileIdentity> {
+    anyhow::ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "runtime artifact publication path is not a regular file: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(PublicationFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PublicationFileIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn publication_file_identity(path: &std::path::Path) -> anyhow::Result<PublicationFileIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    publication_file_identity_from_metadata(path, &metadata)
+}
+
+fn publication_link_state(
+    path: &std::path::Path,
+    owner: &PublicationFileIdentity,
+) -> anyhow::Result<PublicationLinkState> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PublicationLinkState::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let current = publication_file_identity_from_metadata(path, &metadata)?;
+    Ok(if &current == owner {
+        PublicationLinkState::Owned
+    } else {
+        PublicationLinkState::Foreign
+    })
+}
+
+fn remove_owned_publication_file(
+    path: &std::path::Path,
+    owner: &PublicationFileIdentity,
+) -> anyhow::Result<bool> {
+    match publication_link_state(path, owner)? {
+        PublicationLinkState::Missing => Ok(false),
+        PublicationLinkState::Owned => {
+            std::fs::remove_file(path)?;
+            sync_parent_blocking(path)?;
+            Ok(true)
+        }
+        PublicationLinkState::Foreign => anyhow::bail!(
+            "refusing to remove runtime artifact publication path owned by another writer: {}",
+            path.display()
+        ),
+    }
+}
+
+fn same_file_identity(left: &std::path::Path, right: &std::path::Path) -> anyhow::Result<bool> {
+    Ok(publication_file_identity(left)? == publication_file_identity(right)?)
+}
+
+fn sync_parent_blocking(path: &std::path::Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime artifact publication has no parent directory"))?;
+    let directory = std::fs::File::open(parent)?;
+    directory.sync_all()?;
+    Ok(())
+}
+
 #[async_trait]
 impl CellBackend for FirecrackerBackend {
     fn name(&self) -> &'static str {
         "firecracker"
+    }
+
+    fn requires_runtime_artifact_authorization(&self) -> bool {
+        true
+    }
+
+    async fn provision_runtime(
+        &self,
+        spec: &CellSpec,
+        expected: Option<&RuntimeArtifactIdentity>,
+    ) -> anyhow::Result<CellHandle> {
+        let authorization = match expected {
+            Some(identity) => {
+                anyhow::ensure!(
+                    spec.container.is_none() && spec.image.starts_with("dpl-"),
+                    "runtime artifact authorization was presented for a non-artifact cell {} ({})",
+                    spec.id,
+                    hive_core::fault::NODE_IMAGE_MISSING
+                );
+                Some(RuntimeArtifactAuthorizationGuard::install(
+                    spec.id.clone(),
+                    identity.clone(),
+                    self.artifact_authorizations.clone(),
+                )?)
+            }
+            None => None,
+        };
+        let result = self.provision(spec).await;
+        drop(authorization);
+        result
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
@@ -770,6 +1845,7 @@ impl CellBackend for FirecrackerBackend {
                 run_dir.clone(),
                 self.procs.clone(),
                 self.taps.clone(),
+                self.cell_rootfs_proofs.clone(),
             );
             tokio::fs::create_dir_all(&run_dir).await?;
             tracing::debug!(cell = %spec.id, image = %ctr.image, "provisioning container cell (host podman)");
@@ -819,6 +1895,7 @@ impl CellBackend for FirecrackerBackend {
             run_dir.clone(),
             self.procs.clone(),
             self.taps.clone(),
+            self.cell_rootfs_proofs.clone(),
         );
         tokio::fs::create_dir_all(&run_dir).await?;
 
@@ -827,10 +1904,13 @@ impl CellBackend for FirecrackerBackend {
         let log_file = run_dir.join("console.log");
         let overlay = run_dir.join("rootfs.ext4");
 
-        // Per-cell writable rootfs. Prefer a dedicated `<image>.ext4` but fall
-        // back to the shared base runtime rootfs — most deployments boot the
-        // base and get their code from the data drive below.
-        let base = {
+        // Per-cell writable rootfs. Platform deployment artifacts (`dpl-*`) always
+        // boot the one shared base whose exact bytes back NodeInfo capability; their
+        // tenant code is the separately-attached data drive. Build/sandbox cells may
+        // still select a dedicated rootfs and otherwise fall back to that base.
+        let base = if spec.image.starts_with("dpl-") {
+            self.rootfs_for(&self.cfg.base_image)
+        } else {
             let per_image = self.rootfs_for(&spec.image);
             if per_image.exists() {
                 per_image
@@ -867,18 +1947,123 @@ impl CellBackend for FirecrackerBackend {
             self.cfg.kernel_image.display(),
             hive_core::fault::NODE_IMAGE_MISSING
         );
+
+        // Platform deployment images are issued as `dpl-*`. Unlike build and
+        // sandbox cells, they MUST carry the immutable data image + publication
+        // sidecar and MUST boot a rootfs that proved the matching guest protocol.
+        // Perform every gate before Firecracker starts, so an old guest can never
+        // run tenant code and only then be rejected by the new host handshake.
+        let data_src = self.data_image_for(&spec.image);
+        let runtime_artifact_required = spec.image.starts_with("dpl-");
+        let mut selected_rootfs_proof = None;
+        let mut selected_rootfs_copy_stamp = None;
+        let expected_runtime_artifact = if runtime_artifact_required {
+            let expected = self
+                .artifact_authorizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&spec.id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "deployment {:?} reached provision without a caller-authorized runtime artifact identity ({})",
+                        spec.image,
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    )
+                })?;
+            anyhow::ensure!(
+                expected.id == spec.image && expected.protocol == RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+                "deployment {:?} has a mismatched caller-authorized runtime artifact identity ({})",
+                spec.image,
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            anyhow::ensure!(
+                data_src.is_file(),
+                "node is missing the required runtime artifact image for deployment {:?}: {} ({})",
+                spec.image,
+                data_src.display(),
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            let publication = self
+                .read_data_publication(&spec.image)
+                .await
+                .with_context(|| {
+                    format!(
+                        "node has no valid runtime artifact publication for deployment {:?} ({})",
+                        spec.image,
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    )
+                })?;
+            anyhow::ensure!(
+                publication.identity == expected,
+                "deployment {:?} publication changed after caller authorization; refusing to boot it ({})",
+                spec.image,
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            let copy_stamp = Self::rootfs_stamp(&base)?;
+            let rootfs_proof = self.verified_rootfs_protocol(&base).await.with_context(|| {
+                format!(
+                    "node rootfs {} does not prove the complete agent protocol; rebuild this exact rootfs before scheduling deployments here ({})",
+                    base.display(),
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                )
+            })?;
+            anyhow::ensure!(
+                Self::rootfs_stamp(&base)? == copy_stamp,
+                "base rootfs changed while its complete agent proof was selected ({})",
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+            selected_rootfs_copy_stamp = Some(copy_stamp);
+            selected_rootfs_proof = Some(rootfs_proof);
+            Some(expected)
+        } else {
+            None
+        };
         reflink_or_copy(&base, &overlay).await?;
+        if let Some(copy_stamp) = selected_rootfs_copy_stamp.as_ref() {
+            anyhow::ensure!(
+                Self::rootfs_stamp(&base)? == *copy_stamp,
+                "base rootfs changed while its proved bytes were copied into cell {} ({})",
+                spec.id,
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+        }
         // Give the guest working DNS for outbound fetch (per-cell overlay only).
         self.write_guest_resolv(&overlay).await;
 
-        // If this image has a delivered build artifact (packed by `deliver_build`),
-        // give the cell a private writable copy to attach as its second drive.
-        // The in-guest agent mounts it at DELIVERED_WORKDIR (/dev/vdb -> /build).
-        let data_src = self.data_image_for(&spec.image);
+        // A published build artifact carries a separately-committed exact
+        // identity. Copy both into this cell's private run directory so launch
+        // validates the image actually attached to this VM, not whatever may
+        // later appear at the shared publication path.
+        // The in-guest agent mounts /dev/vdb at DELIVERED_WORKDIR (/workspace).
         let data_overlay = run_dir.join("data.ext4");
-        let has_data = data_src.exists();
-        if has_data {
-            reflink_or_copy(&data_src, &data_overlay).await?;
+        let cell_identity_path = run_dir.join("runtime-artifact.identity.json");
+        let has_data;
+        {
+            let _artifact_guard = Self::artifact_lock_for(&data_src)?.lock().await;
+            has_data = data_src.is_file();
+            if has_data {
+                reflink_or_copy(&data_src, &data_overlay).await?;
+                let identity = self
+                    .verified_data_identity(&spec.image, &data_overlay)
+                    .await?;
+                if let Some(expected) = expected_runtime_artifact.as_ref() {
+                    anyhow::ensure!(
+                        &identity == expected,
+                        "deployment {:?} attached artifact differs from the caller-authorized identity ({})",
+                        spec.image,
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    );
+                }
+                let identity_bytes = serde_json::to_vec(&identity)?;
+                let mut identity_file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&cell_identity_path)
+                    .await?;
+                identity_file.write_all(&identity_bytes).await?;
+                identity_file.sync_all().await?;
+            }
         }
 
         // Spawn the Firecracker process bound to a fresh API socket, retrying
@@ -1021,6 +2206,18 @@ impl CellBackend for FirecrackerBackend {
         )
         .await?;
 
+        if let Some(rootfs_proof) = selected_rootfs_proof {
+            let mut proofs = self
+                .cell_rootfs_proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            anyhow::ensure!(
+                !proofs.contains_key(&spec.id),
+                "cell {} already has a selected rootfs proof",
+                spec.id
+            );
+            proofs.insert(spec.id.clone(), rootfs_proof);
+        }
         self.procs.lock().await.insert(spec.id.clone(), process);
         provision.commit();
         Ok(CellHandle {
@@ -1092,8 +2289,19 @@ impl CellBackend for FirecrackerBackend {
                         let _ = tokio::fs::create_dir_all(&cache_dir).await;
                         let _ = tokio::fs::write(cache_path(&cache_dir, &key), &tar).await;
                     }
+                    AgentEvent::ProtocolFault(fault) => anyhow::bail!(
+                        "{}: guest refused the build connection with protocol fault {:?}: {}",
+                        hive_core::fault::NODE_RUNTIME_MISSING,
+                        fault.code,
+                        fault.message
+                    ),
+                    AgentEvent::HandshakeReady(_) => anyhow::bail!(
+                        "{}: guest sent an out-of-order handshake reply during a build",
+                        hive_core::fault::NODE_RUNTIME_MISSING
+                    ),
                     // Not applicable during a build (Sandboxes-only events).
                     AgentEvent::Pong
+                    | AgentEvent::RuntimeArtifactReady(_)
                     | AgentEvent::FunctionReady
                     | AgentEvent::FunctionError(_)
                     | AgentEvent::ExecOutput { .. }
@@ -1199,34 +2407,130 @@ impl CellBackend for FirecrackerBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
 
-        // The control plane registers the pool's workdir as its own host build
-        // dir (correct for the same-host mock backend). Inside the guest that
-        // path doesn't exist; the delivered build is mounted at DELIVERED_WORKDIR.
-        let mut func = func.clone();
-        func.workdir = Some(DELIVERED_WORKDIR.to_string());
+        // Bind this launch to the identity copied alongside the exact data drive
+        // during provision. Reading the shared publication here would race a later
+        // replacement and would prove the wrong bytes.
+        let identity_path = cell.root.join("runtime-artifact.identity.json");
+        let identity_bytes = tokio::fs::read(&identity_path).await.with_context(|| {
+            format!(
+                "cell {} has no attached runtime artifact identity at {} ({})",
+                cell.id,
+                identity_path.display(),
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        let identity =
+            Self::validate_runtime_identity(&identity_bytes, &cell.image).with_context(|| {
+                format!(
+                    "cell {} has an invalid attached runtime artifact identity ({})",
+                    cell.id,
+                    hive_core::fault::NODE_IMAGE_MISSING
+                )
+            })?;
+        let authorized = func.runtime_artifact.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cell {} launch omitted the caller-authorized runtime artifact identity ({})",
+                cell.id,
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        anyhow::ensure!(
+            authorized == &identity,
+            "cell {} attached runtime artifact identity changed after launch authorization ({})",
+            cell.id,
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+
+        // The caller derives this guest cwd from the same RuntimeArtifactSpec
+        // delivered for the image. Never collapse a workspace app back to the
+        // checkout root here.
+        let func = func.clone();
+        anyhow::ensure!(
+            func.workdir
+                .as_deref()
+                .map(|workdir| workdir == DELIVERED_WORKDIR || workdir.starts_with("/workspace/"))
+                .unwrap_or(false),
+            "firecracker function is missing its validated runtime artifact workdir"
+        );
+
+        // Use the exact proof selected while this cell's immutable base bytes
+        // were stable and copied. Re-reading the canonical base here would bind a
+        // post-provision rootfs replacement to an already-running older guest.
+        let rootfs_proof = self
+            .cell_rootfs_proofs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cell {} has no proof for the exact rootfs bytes it booted ({})",
+                    cell.id,
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                )
+            })?;
 
         let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
+        perform_agent_handshake(&mut stream, &rootfs_proof).await?;
         let req = serde_json::to_vec(&AgentRequest::StartFunction(func.clone()))?;
         write_frame(&mut stream, &req).await?;
 
-        // Wait for the agent to report the function is up and bridged.
+        // H1: the authenticated boot transcript must already match the exact
+        // rootfs/agent proof. H2: the guest must now echo the exact mounted
+        // runtime-artifact identity before FunctionReady can be accepted.
+        let mut artifact_ready = false;
         loop {
             let frame = read_frame(&mut stream).await?;
-            match serde_json::from_slice::<AgentEvent>(&frame)? {
-                AgentEvent::FunctionReady => break,
-                // The microVM booted and the in-guest agent ran the app, which
-                // then failed to come up — an APP fault (bad entrypoint, missing
-                // env, never bound its port). Marked so the gateway reports the
-                // deployment instead of the host: unmarked, the first two of
-                // these were published as CAPACITY_EXHAUSTED before the pool's
-                // circuit had opened.
-                AgentEvent::FunctionError(e) => anyhow::bail!(
-                    "the deployment's own process failed to start inside its cell: {e} — check \
+            let event: AgentEvent = serde_json::from_slice(&frame).map_err(|error| {
+                anyhow::anyhow!(
+                    "{}: guest emitted malformed post-handshake event: {error}",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                )
+            })?;
+            match event {
+                AgentEvent::RuntimeArtifactReady(observed) => {
+                    anyhow::ensure!(
+                        !artifact_ready && observed == identity,
+                        "guest runtime artifact identity does not match the attached image ({})",
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    );
+                    artifact_ready = true;
+                }
+                AgentEvent::FunctionReady => {
+                    anyhow::ensure!(
+                        artifact_ready,
+                        "guest agent did not perform runtime artifact protocol v{} proof; rebuild the cell rootfs ({})",
+                        RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+                        hive_core::fault::NODE_RUNTIME_MISSING
+                    );
+                    break;
+                }
+                AgentEvent::ProtocolFault(fault) => anyhow::bail!(
+                    "{}: guest protocol fault {:?}: {}",
+                    hive_core::fault::NODE_RUNTIME_MISSING,
+                    fault.code,
+                    fault.message
+                ),
+                AgentEvent::HandshakeReady(_) => anyhow::bail!(
+                    "{}: guest sent a duplicate or out-of-order handshake reply",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+                AgentEvent::FunctionError(error)
+                    if error.contains(hive_core::fault::NODE_IMAGE_MISSING)
+                        || error.contains(hive_core::fault::NODE_RUNTIME_MISSING) =>
+                {
+                    anyhow::bail!(error)
+                }
+                AgentEvent::FunctionError(error) => anyhow::bail!(
+                    "the deployment's own process failed to start inside its cell: {error} — check \
                      this deployment's logs, entrypoint and required env; the node booted the \
                      cell fine ({})",
                     hive_core::fault::DEPLOYMENT_START_FAILED
                 ),
-                _ => continue,
+                unexpected => anyhow::bail!(
+                    "{}: guest emitted out-of-order launch event {unexpected:?}",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
             }
         }
         Ok(CellEndpoint::Vsock {
@@ -1235,53 +2539,294 @@ impl CellBackend for FirecrackerBackend {
         })
     }
 
-    fn delivered_workdir(&self) -> Option<&'static str> {
-        Some(DELIVERED_WORKDIR)
+    fn delivered_workdir(&self, artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+        artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
-    async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            build_dir.is_dir(),
-            "deliver_build: build dir does not exist: {}",
-            build_dir.display()
-        );
+    async fn deliver_build(
+        &self,
+        image: &str,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(&self.cfg.rootfs_dir).await?;
-        let out = self.data_image_for(image);
-        let tmp = out.with_extension("ext4.tmp");
+        let staged = crate::runtime_artifact::stage_runtime_artifact(
+            artifact,
+            &self.cfg.rootfs_dir.join(".artifact-staging"),
+        )
+        .await?;
+        let identity = RuntimeArtifactIdentity {
+            protocol: RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            id: image.to_string(),
+            content_sha256: staged.content_sha256().to_string(),
+        };
+        staged.write_identity(&identity)?;
 
-        // Pack the host build dir into an ext4 image WITHOUT a privileged loop
-        // mount: `mkfs.ext4 -d <dir>` populates the filesystem from a directory
-        // directly. Size it to the build dir plus generous headroom (node_modules
-        // etc.). Written to a temp path then atomically renamed so a serving cell
-        // never attaches a half-written image.
-        let script = format!(
-            r#"set -e
-            sz=$(du -sm "$BUILD" | cut -f1)
-            sz=$(( sz * 3 / 2 + 512 ))
-            rm -f "$OUT"
-            truncate -s "${{sz}}M" "$OUT"
-            mkfs.ext4 -F -q -d "$BUILD" "$OUT"
-            "#,
+        let out = self.data_image_for(image);
+        let sidecar = self.data_identity_for(image);
+        let backup = Self::publication_backup_for(&out);
+        let _artifact_guard = Self::artifact_lock_for(&out)?.lock().await;
+
+        // A complete publication is immutable. Reusing the exact same identity is
+        // idempotent; a platform-issued image id resolving to different content is
+        // a hard identity collision and must never overwrite the prior bytes.
+        if out.is_file() && sidecar.is_file() {
+            let publication = Self::read_publication_at(&sidecar, image).await?;
+            Self::verify_publication_image(&publication, &out).await?;
+            anyhow::ensure!(
+                publication.identity == identity,
+                "runtime artifact image id {image:?} is already bound to different immutable content"
+            );
+            let keep = std::collections::HashSet::from([out.clone(), sidecar.clone()]);
+            if let Err(error) =
+                Self::cleanup_stale_publication_files(&self.cfg.rootfs_dir, &out, &sidecar, &keep)
+            {
+                tracing::warn!(
+                    image,
+                    error = %error,
+                    "runtime artifact stale publication cleanup refused or failed"
+                );
+            }
+            return Ok(());
+        }
+
+        // Recover only namespace states whose predecessor is unambiguous. Old
+        // fixed-name `.publishing` files are never reused: a killed process may
+        // still hold their inode, so every new attempt gets unique names and the
+        // old paths are left to the guarded stale sweep after a complete pair
+        // exists again.
+        if !out.exists() && sidecar.exists() {
+            anyhow::ensure!(
+                Self::canonical_links_publication_temporary(
+                    &self.cfg.rootfs_dir,
+                    &sidecar
+                )?,
+                "runtime artifact has an incomplete sidecar not owned by a recoverable publication for image {image:?}"
+            );
+            remove_file_if_exists(&sidecar)?;
+            sync_parent_blocking(&sidecar)?;
+        }
+        if !out.exists() && backup.exists() {
+            let metadata = std::fs::symlink_metadata(&backup)?;
+            anyhow::ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "runtime artifact legacy backup is not a regular file for image {image:?}"
+            );
+            std::fs::rename(&backup, &out)?;
+            sync_parent_blocking(&out)?;
+        } else if out.is_file() && !sidecar.exists() && backup.exists() {
+            if same_file_identity(&out, &backup)? {
+                remove_file_if_exists(&backup)?;
+                sync_parent_blocking(&out)?;
+            } else {
+                anyhow::ensure!(
+                    Self::canonical_links_publication_temporary(
+                        &self.cfg.rootfs_dir,
+                        &out
+                    )?,
+                    "runtime artifact has ambiguous legacy and partial publications for image {image:?}"
+                );
+                remove_file_if_exists(&out)?;
+                sync_parent_blocking(&out)?;
+                std::fs::rename(&backup, &out)?;
+                sync_parent_blocking(&out)?;
+            }
+        } else if out.is_file()
+            && !sidecar.exists()
+            && !backup.exists()
+            && Self::canonical_links_publication_temporary(&self.cfg.rootfs_dir, &out)?
+        {
+            remove_file_if_exists(&out)?;
+            sync_parent_blocking(&out)?;
+        }
+        anyhow::ensure!(
+            !backup.exists(),
+            "runtime artifact has ambiguous legacy and partial publications for image {image:?}"
         );
-        let status = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
-            .env("BUILD", build_dir)
-            .env("OUT", &tmp)
+
+        let legacy = out.is_file() && !sidecar.exists();
+        anyhow::ensure!(
+            legacy || (!out.exists() && !sidecar.exists()),
+            "runtime artifact publication is incomplete or corrupt for image {image:?}"
+        );
+
+        let mut allocated = None;
+        for _ in 0..32 {
+            let token = Self::publication_temp_token();
+            let tmp = Self::publication_temp_for(&out, &token);
+            let tmp_sidecar = Self::publication_temp_for(&sidecar, &token);
+            let image_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let publication_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&tmp_sidecar)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    remove_file_if_exists(&tmp)?;
+                    sync_parent_blocking(&tmp)?;
+                    continue;
+                }
+                Err(error) => {
+                    remove_file_if_exists(&tmp)?;
+                    sync_parent_blocking(&tmp)?;
+                    return Err(error.into());
+                }
+            };
+            let guard = match PublicationTempGuard::new(
+                tmp.clone(),
+                tmp_sidecar.clone(),
+                out.clone(),
+                sidecar.clone(),
+                backup.clone(),
+            ) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    remove_file_if_exists(&tmp)?;
+                    remove_file_if_exists(&tmp_sidecar)?;
+                    sync_parent_blocking(&tmp)?;
+                    return Err(error);
+                }
+            };
+            sync_parent_blocking(&tmp)?;
+            allocated = Some((tmp, image_file, publication_file, guard));
+            break;
+        }
+        let (tmp, image_file, publication_file, mut temp_guard) = allocated.ok_or_else(|| {
+            anyhow::anyhow!("could not allocate a unique runtime artifact publication temporary")
+        })?;
+
+        // Selection, symlink resolution and all size/count limits completed before
+        // this private image is created. The stage reports bytes from its held
+        // descriptor, so sizing never reopens a repository-controlled pathname.
+        let source_mib = staged.materialized_size_mib();
+        let image_mib = source_mib
+            .saturating_mul(3)
+            .saturating_div(2)
+            .saturating_add(512);
+        let image_bytes = image_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("runtime artifact image size overflow"))?;
+        let image_file = tokio::fs::File::from_std(image_file);
+        image_file.set_len(image_bytes).await?;
+        image_file.sync_all().await?;
+        drop(image_file);
+        let mut mkfs = Command::new("mkfs.ext4");
+        let staged_path = staged.inherited_path(&mut mkfs)?;
+        let status = mkfs
+            .args(["-F", "-q", "-d"])
+            .arg(staged_path)
+            .arg(&tmp)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .status()
             .await?;
         anyhow::ensure!(
             status.success(),
-            "mkfs.ext4 -d failed packing build output for image '{image}'"
+            "mkfs.ext4 -d failed packing validated runtime artifact for image '{image}'"
         );
-        tokio::fs::rename(&tmp, &out).await?;
+        let mut permissions = tokio::fs::metadata(&tmp).await?.permissions();
+        permissions.set_readonly(true);
+        tokio::fs::set_permissions(&tmp, permissions).await?;
+        let image_file = tokio::fs::File::open(&tmp).await?;
+        image_file.sync_all().await?;
+        let (image_sha256, image_bytes) = hash_file_sha256(&tmp).await?;
+        let publication = RuntimeArtifactPublication {
+            schema: RUNTIME_ARTIFACT_PUBLICATION_SCHEMA,
+            identity: identity.clone(),
+            image_sha256,
+            image_bytes,
+        };
+        let publication_bytes = serde_json::to_vec(&publication)?;
+        anyhow::ensure!(
+            publication_bytes.len() <= 4096,
+            "runtime artifact publication descriptor exceeds 4096 bytes"
+        );
+        let mut publication_file = tokio::fs::File::from_std(publication_file);
+        publication_file.write_all(&publication_bytes).await?;
+        publication_file.sync_all().await?;
+        drop(publication_file);
+
+        Self::verify_publication_image(&publication, &tmp).await?;
+        if legacy {
+            // Preserve the prior inode under a durable name before removing the
+            // canonical commit marker. There is no await between removal and the
+            // new pair's durable links, so request cancellation can only run the
+            // guard before or after this whole namespace transition.
+            std::fs::hard_link(&out, &backup)
+                .context("preserve legacy runtime artifact before publication")?;
+            sync_parent_blocking(&backup)?;
+            temp_guard.begin_publication(true)?;
+            std::fs::remove_file(&out)?;
+            sync_parent_blocking(&out)?;
+        } else {
+            temp_guard.begin_publication(false)?;
+        }
+
+        // Link the descriptor first and the image last. `out` is the commit marker:
+        // before it exists provision attaches nothing; once it exists both names
+        // are durable and hash-bound. These no-replace hard links and parent fsyncs
+        // are synchronous so a dropped future cannot interrupt the critical pair.
+        std::fs::hard_link(&temp_guard.temporary_identity, &sidecar)
+            .context("publish runtime artifact identity")?;
+        sync_parent_blocking(&sidecar)?;
+        std::fs::hard_link(&tmp, &out).context("publish runtime artifact image")?;
+        sync_parent_blocking(&out)?;
+        Self::verify_publication_image(&publication, &out).await?;
+
+        temp_guard.mark_publication_committed()?;
+        temp_guard.commit()?;
+        let keep = std::collections::HashSet::from([out.clone(), sidecar.clone()]);
+        if let Err(error) =
+            Self::cleanup_stale_publication_files(&self.cfg.rootfs_dir, &out, &sidecar, &keep)
+        {
+            tracing::warn!(
+                image,
+                error = %error,
+                "runtime artifact stale publication cleanup refused or failed"
+            );
+        }
         Ok(())
     }
 
+    async fn runtime_artifact_identity(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<Option<RuntimeArtifactIdentity>> {
+        let data = self.data_image_for(image);
+        anyhow::ensure!(
+            data.is_file(),
+            "node is missing the committed runtime artifact image for {image:?}: {} ({})",
+            data.display(),
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+        let publication = self.read_data_publication(image).await.with_context(|| {
+            format!(
+                "node has no valid committed runtime artifact identity for {image:?} ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        Ok(Some(publication.identity))
+    }
+
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
+        self.cell_rootfs_proofs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cell.id);
         let id = cell.id.clone();
         let root = cell.root.clone();
         let containers = self.containers.clone();
@@ -1500,6 +3045,111 @@ fn firecracker_safe_id(id: &str) -> String {
 /// Host-initiated vsock connect: connect to the Firecracker vsock UDS, send the
 /// `CONNECT <port>` handshake, and wait for `OK <peer_port>`. Retries until the
 /// in-guest agent is listening (i.e. the cell has finished booting).
+fn handshake_transcript_sha256(nonce: &str, proof: &AgentBootProof) -> String {
+    let digest = Sha256::digest(agent_handshake_transcript(nonce, proof));
+    let mut value = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+async fn fresh_agent_handshake_nonce() -> anyhow::Result<String> {
+    let mut entropy = [0_u8; AGENT_HANDSHAKE_NONCE_BYTES];
+    let mut random = tokio::fs::File::open("/dev/urandom")
+        .await
+        .context("open OS entropy for agent handshake")?;
+    random
+        .read_exact(&mut entropy)
+        .await
+        .context("read OS entropy for agent handshake")?;
+    let mut nonce = String::with_capacity(AGENT_HANDSHAKE_NONCE_BYTES * 2);
+    use std::fmt::Write as _;
+    for byte in entropy {
+        let _ = write!(nonce, "{byte:02x}");
+    }
+    Ok(nonce)
+}
+
+async fn perform_agent_handshake(
+    stream: &mut UnixStream,
+    rootfs: &RuntimeArtifactRootfsMetadata,
+) -> anyhow::Result<()> {
+    let nonce = fresh_agent_handshake_nonce().await.map_err(|error| {
+        anyhow::anyhow!(
+            "{}: cannot create fresh agent handshake challenge: {error}",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        )
+    })?;
+    let expected = rootfs.agent_boot_proof();
+    anyhow::ensure!(
+        expected.agent_wire_protocol == AGENT_WIRE_PROTOCOL_VERSION
+            && expected.agent_wire_capabilities == AGENT_WIRE_CAPABILITIES
+            && expected.runtime_artifact_protocol == RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+        "{}: host attempted a handshake with an incompatible rootfs proof",
+        hive_core::fault::NODE_RUNTIME_MISSING
+    );
+    let request = serde_json::to_vec(&AgentRequest::Handshake(AgentHandshake {
+        nonce: nonce.clone(),
+        expected_boot: expected.clone(),
+    }))?;
+    write_frame(stream, &request).await.map_err(|error| {
+        anyhow::anyhow!(
+            "{}: could not send the agent handshake: {error}",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        )
+    })?;
+    let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{}: guest did not answer the agent handshake within 5 seconds",
+                hive_core::fault::NODE_RUNTIME_MISSING
+            )
+        })?
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{}: guest closed or malformed the agent handshake: {error}",
+                hive_core::fault::NODE_RUNTIME_MISSING
+            )
+        })?;
+    let event: AgentEvent = serde_json::from_slice(&frame).map_err(|error| {
+        anyhow::anyhow!(
+            "{}: guest returned invalid agent-handshake JSON: {error}",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        )
+    })?;
+    match event {
+        AgentEvent::HandshakeReady(AgentHandshakeReady {
+            nonce: observed_nonce,
+            proof,
+            transcript_sha256,
+        }) => {
+            let transcript = handshake_transcript_sha256(&nonce, &expected);
+            anyhow::ensure!(
+                observed_nonce == nonce
+                    && proof == expected
+                    && FirecrackerBackend::lowercase_sha256(&transcript_sha256)
+                    && transcript_sha256 == transcript,
+                "{}: guest handshake did not match the fresh exact rootfs/agent proof",
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+            Ok(())
+        }
+        AgentEvent::ProtocolFault(fault) => anyhow::bail!(
+            "{}: guest refused the agent handshake with {:?}: {}",
+            hive_core::fault::NODE_RUNTIME_MISSING,
+            fault.code,
+            fault.message
+        ),
+        unexpected => anyhow::bail!(
+            "{}: guest returned out-of-order handshake event {unexpected:?}",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        ),
+    }
+}
+
 async fn connect_agent(uds: &str, timeout: Duration) -> anyhow::Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_err = String::from("unknown");

@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+[Unit]
+Requires={{ build_executor_firewall_unit }}
+After={{ build_executor_firewall_unit }}
+
+[Service]
+# Do not set KillMode here. hive-node.service's load-bearing KillMode=process
+# remains authoritative so conmon-managed tenant/build containers survive a
+# platform restart and are reaped only by explicit lifecycle guards.
+ExecStartPre={{ build_executor_reap_helper_path }}
+ExecStartPre={{ build_executor_nft_apply_path }}
+ExecStartPre={{ build_executor_nft_verify_path }}

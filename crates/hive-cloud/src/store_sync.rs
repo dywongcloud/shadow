@@ -296,9 +296,13 @@ pub static REGISTRY: &[SyncedStore] = &[
                     Some(crate::databases::SyncedDatabases {
                         dbs,
                         tombstones: Default::default(),
+                        studio_replay: Default::default(),
                     })
                 })?;
-            if synced.dbs.is_empty() && synced.tombstones.is_empty() {
+            if synced.dbs.is_empty()
+                && synced.tombstones.is_empty()
+                && synced.studio_replay.is_empty()
+            {
                 return None;
             }
             Some(c.databases.merge_synced(synced))

@@ -1,66 +1,45 @@
 ---
-# CONTENT verification for the backend half. Runs on every platform host AFTER
-# the serial restart play, and answers the only question that matters: is the
-# artifact this run BUILT the artifact this host is RUNNING?
-#
-# Why exit codes are not enough, stated as what actually happened. Three
-# separate defects in this playbook each produced a deploy-shaped NON-EVENT --
-# a run that reported plausible `ok=`/`changed=` counts while provably changing
-# nothing on the fleet:
-#
-#   1. `hostvars['localhost']['_artifact_tmp']` was never set (a `register`
-#      result does not move with `delegate_facts`), so the run died at the
-#      publish task -- after 3 changed tasks.
-#   2. The same defect in the cleanup play, one play later.
-#   3. A `--limit` that dropped the glibc build host built NOTHING for that
-#      group, and the failure surfaced three phases later as an opaque
-#      controller-path error.
-#
-# In each case the recap read partially fine and the binary on the node was
-# provably unchanged. Task exit codes cannot catch this class: every task that
-# ran DID succeed. Only comparing content can, so this file compares:
-#
-#   * the ON-DISK binary against the sha256 of the artifact built this run,
-#   * the RUNNING image (`/proc/<MainPID>/exe`, which resolves to the actual
-#     executing inode even after the path was replaced) against the same sha --
-#     the check that separates "binary swapped" from "binary swapped AND
-#     actually running", and
-#   * the unit's start timestamp against the moment this run began, which is
-#     what proves a restart happened at all rather than being reported by a
-#     `state: restarted` task whose service silently came back on the old image.
-#
-# Every comparison is a hard assert naming the host and both hashes. A missing
-# canonical fact is itself a failure (that is defect 3 arriving here), never a
-# skipped comparison -- see hive_ui_fanout's old `is defined and ...`
-# `failed_when`, which silently PASSED whenever the canonical build id was
-# absent, i.e. exactly when the deploy had not happened.
+# CONTENT verification for the controller+agent release pair. A backend deploy
+# is complete only when hive-node runs the canonical controller and the exact
+# canonical cell-agent bytes plus parseable release fact are installed for the
+# later manual rootfs bake.
 
-- name: Require a canonical artifact for this host's glibc group
+- name: Require canonical controller and cell-agent artifacts for this glibc group
   ansible.builtin.assert:
     that:
       - hostvars[hive_group_build_host].hive_group_build_sha256 is defined
       - (hostvars[hive_group_build_host].hive_group_build_sha256 | default('') | length) == 64
+      - hostvars[hive_group_build_host].hive_group_cell_agent_sha256 is defined
+      - (hostvars[hive_group_build_host].hive_group_cell_agent_sha256 | default('') | length) == 64
     fail_msg: >-
-      NOTHING WAS BUILT for glibc group '{{ hive_glibc_group }}' in this run, so
-      '{{ hive_name }}' cannot have been deployed -- whatever the task recap
-      says. The build host for this group is
-      '{{ hive_group_build_host }}'; include it (--limit {{ inventory_hostname }},{{ hive_group_build_host }})
-      and re-run.
-    success_msg: "canonical artifact present for {{ hive_glibc_group }}"
+      The release pair for '{{ hive_glibc_group }}' is incomplete, so
+      '{{ hive_name }}' cannot be verified. Include build host
+      '{{ hive_group_build_host }}' and rerun the backend release.
 
-- name: Checksum the binary on disk
+- name: Checksum the controller and installed cell agent on disk
   ansible.builtin.stat:
-    path: "{{ hive_binary_path }}"
+    path: "{{ item }}"
     get_checksum: true
     checksum_algorithm: sha256
-  register: _verify_disk
+  loop:
+    - "{{ hive_binary_path }}"
+    - "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+  register: _verify_disk_pair
 
-# /proc/<pid>/exe is the running IMAGE, not the path: it still resolves after
-# the file at hive_binary_path has been replaced, so a host that swapped the
-# binary but whose service never picked it up reads the OLD hash here while the
-# on-disk check above passes. That divergence is precisely the "deploy that
-# changed nothing" shape, and nothing else in the playbook can see it.
-- name: Checksum the RUNNING image and read the unit's start time
+- name: Read the installed cell-agent release fact
+  ansible.builtin.slurp:
+    src: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+  register: _verify_agent_fact
+
+- name: Inspect the cell-agent rollback binary
+  ansible.builtin.stat:
+    path: "{{ (hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent')) ~ '.old' }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _verify_agent_old
+
+# /proc/<pid>/exe is the running controller image, not merely the current path.
+- name: Checksum the running controller and read its unit start time
   ansible.builtin.shell:
     cmd: |
       set -euo pipefail
@@ -80,58 +59,82 @@
   register: _verify_run
   changed_when: false
 
-- name: Record this host's backend verification facts
+- name: Record this host's backend release verification facts
+  vars:
+    _release: "{{ _verify_agent_fact.content | b64decode | from_json }}"
   ansible.builtin.set_fact:
     hive_verify_backend:
       host: "{{ hive_name }}"
       inventory_host: "{{ inventory_hostname }}"
       glibc_group: "{{ hive_glibc_group }}"
       canonical_sha: "{{ hostvars[hive_group_build_host].hive_group_build_sha256 }}"
-      # Content BEFORE this run touched the host (build.yml stats it on the
-      # build host before cargo runs; restart.yml stats it on every follower
-      # before the swap). Empty only when this host had no binary at all.
+      canonical_agent_sha: "{{ hostvars[hive_group_build_host].hive_group_cell_agent_sha256 }}"
       pre_sha: "{{ hive_pre_deploy_sha | default('') }}"
-      disk_sha: "{{ _verify_disk.stat.checksum | default('') }}"
+      pre_agent_sha: "{{ hive_pre_agent_sha | default('') }}"
+      disk_sha: "{{ _verify_disk_pair.results[0].stat.checksum | default('') }}"
+      agent_disk_sha: "{{ _verify_disk_pair.results[1].stat.checksum | default('') }}"
+      agent_release_schema: "{{ _release.schema | default(0) | int }}"
+      agent_release_protocol: "{{ _release.runtime_artifact_protocol | default(0) | int }}"
+      agent_release_sha: "{{ _release.agent_sha256 | default('') }}"
+      agent_old_sha: "{{ _verify_agent_old.stat.checksum | default('') }}"
       running_pid: "{{ _verify_run.stdout.split()[0] }}"
       running_sha: "{{ _verify_run.stdout.split()[1] }}"
       started_epoch: "{{ _verify_run.stdout.split()[2] | int }}"
-      # Deliberately the string yes/no, not a bare boolean expression: outside
-      # jinja2_native a templated `a != b` lands in the fact as the STRING
-      # "False", which is TRUTHY to `selectattr`. The no-op detector is the one
-      # check that must not be fooled by its own encoding.
-      content_changed: "{{ 'yes' if (hive_pre_deploy_sha | default('')) != hostvars[hive_group_build_host].hive_group_build_sha256 else 'no' }}"
+      # A guest-only release is not a no-op merely because controller bytes did
+      # not change. Store yes/no strings because non-native Jinja booleans are
+      # truthy strings under selectattr.
+      content_changed: >-
+        {{ 'yes' if
+           ((hive_pre_deploy_sha | default('')) != hostvars[hive_group_build_host].hive_group_build_sha256 or
+            (hive_pre_agent_sha | default('')) != hostvars[hive_group_build_host].hive_group_cell_agent_sha256)
+           else 'no' }}
 
-- name: Assert the ON-DISK binary is the artifact built this run
+- name: Assert the on-disk controller is canonical
   ansible.builtin.assert:
     that:
       - hive_verify_backend.disk_sha == hive_verify_backend.canonical_sha
     fail_msg: >-
-      {{ hive_name }}: {{ hive_binary_path }} is NOT the artifact built this run.
-      on disk={{ hive_verify_backend.disk_sha | default('(missing)') }}
+      {{ hive_name }} controller on disk={{ hive_verify_backend.disk_sha | default('(missing)') }},
       built={{ hive_verify_backend.canonical_sha }}.
-      The push/swap did not land on this host.
-    success_msg: "{{ hive_name }}: on-disk binary == canonical build"
 
-- name: Assert the RUNNING image is the artifact built this run
+- name: Assert the running controller is canonical
   ansible.builtin.assert:
     that:
       - hive_verify_backend.running_sha == hive_verify_backend.canonical_sha
     fail_msg: >-
-      {{ hive_name }}: hive-node (pid {{ hive_verify_backend.running_pid }}) is
-      EXECUTING a different image than this run built.
-      running={{ hive_verify_backend.running_sha }}
-      built={{ hive_verify_backend.canonical_sha }}.
-      The binary on disk may be correct while the service still runs the old
-      one -- restart it and re-verify.
-    success_msg: "{{ hive_name }}: running image == canonical build"
+      {{ hive_name }} hive-node pid {{ hive_verify_backend.running_pid }} runs
+      {{ hive_verify_backend.running_sha }}, built={{ hive_verify_backend.canonical_sha }}.
+
+- name: Assert the installed cell agent and release fact are canonical
+  ansible.builtin.assert:
+    that:
+      - hive_verify_backend.agent_disk_sha == hive_verify_backend.canonical_agent_sha
+      - hive_verify_backend.agent_release_schema == 1
+      - hive_verify_backend.agent_release_protocol == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - hive_verify_backend.agent_release_sha == hive_verify_backend.canonical_agent_sha
+    fail_msg: >-
+      {{ hive_name }} has an unverified cell-agent package: installed={{ hive_verify_backend.agent_disk_sha }},
+      release-fact={{ hive_verify_backend.agent_release_sha }},
+      built={{ hive_verify_backend.canonical_agent_sha }},
+      schema={{ hive_verify_backend.agent_release_schema }},
+      protocol={{ hive_verify_backend.agent_release_protocol }}.
+
+- name: Assert changed agent bytes preserved the exact rollback binary
+  ansible.builtin.assert:
+    that:
+      - >-
+        hive_verify_backend.pre_agent_sha == '' or
+        hive_verify_backend.pre_agent_sha == hive_verify_backend.canonical_agent_sha or
+        hive_verify_backend.agent_old_sha == hive_verify_backend.pre_agent_sha
+    fail_msg: >-
+      {{ hive_name }} replaced cell-agent {{ hive_verify_backend.pre_agent_sha }}
+      without preserving those exact bytes at hive-cell-agent.old
+      (observed {{ hive_verify_backend.agent_old_sha | default('(missing)') }}).
 
 - name: Assert hive-node actually restarted during this run
   ansible.builtin.assert:
     that:
       - (hive_verify_backend.started_epoch | int) >= (hive_deploy_epoch | int)
     fail_msg: >-
-      {{ hive_name }}: hive-node has been running since
-      {{ hive_verify_backend.started_epoch }} but this deploy started at
-      {{ hive_deploy_epoch }} -- the process predates the deploy, so it was
-      never restarted onto the new artifact.
-    success_msg: "{{ hive_name }}: hive-node restarted during this run"
+      {{ hive_name }} hive-node predates this deploy: started
+      {{ hive_verify_backend.started_epoch }}, deploy began {{ hive_deploy_epoch }}.

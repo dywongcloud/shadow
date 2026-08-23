@@ -215,9 +215,95 @@ fn primary_role() -> String {
     "primary".into()
 }
 
+const STUDIO_REPLAY_STATE_KEY: &str = "STUDIO_TOKEN_REPLAY_STATE";
+pub(crate) const STUDIO_REPLAY_STATE_MAX: usize = 4096;
+const STUDIO_REPLAY_GLOBAL_MAX: usize = 65_536;
+const STUDIO_REPLAY_OVERFLOW: &str = "!overflow";
+const STUDIO_REPLAY_GLOBAL_OVERFLOW_DB: &str = "!overflow";
+
+fn studio_replay_state(
+    connection: &HashMap<String, String>,
+) -> Option<std::collections::BTreeMap<String, u64>> {
+    connection
+        .get(STUDIO_REPLAY_STATE_KEY)
+        .map(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| Some(Default::default()))
+}
+
+fn merge_studio_replay_snapshot(target: &mut StudioReplaySnapshot, incoming: StudioReplaySnapshot) {
+    let now = now_ms();
+    target.retain(|_, facts| {
+        facts.retain(|_, exp| *exp >= now);
+        !facts.is_empty()
+    });
+    for (db_id, facts) in incoming {
+        let merged = target.entry(db_id).or_default();
+        for (digest, exp) in facts {
+            if exp >= now {
+                let current = merged.entry(digest).or_insert(exp);
+                *current = (*current).max(exp);
+            }
+        }
+        if merged.len() > STUDIO_REPLAY_STATE_MAX {
+            let until = merged.values().copied().max().unwrap_or(now);
+            merged.clear();
+            merged.insert(STUDIO_REPLAY_OVERFLOW.to_string(), until);
+        }
+    }
+    let globally_overflowed = target
+        .values()
+        .try_fold(0usize, |total, facts| total.checked_add(facts.len()))
+        .is_none_or(|total| total > STUDIO_REPLAY_GLOBAL_MAX);
+    if globally_overflowed {
+        target.clear();
+        target.insert(
+            STUDIO_REPLAY_GLOBAL_OVERFLOW_DB.to_string(),
+            std::collections::BTreeMap::from([(STUDIO_REPLAY_OVERFLOW.to_string(), u64::MAX)]),
+        );
+    }
+}
+
+fn merge_studio_replay_state(local: &Database, remote: &mut Database) {
+    let (Some(mut merged), Some(incoming)) = (
+        studio_replay_state(&local.connection),
+        studio_replay_state(&remote.connection),
+    ) else {
+        // Corrupt replay state is a fail-closed condition. Preserve a bounded
+        // marker instead of letting either side's malformed value erase facts.
+        let state =
+            std::collections::BTreeMap::from([(STUDIO_REPLAY_OVERFLOW.to_string(), u64::MAX)]);
+        remote.connection.insert(
+            STUDIO_REPLAY_STATE_KEY.to_string(),
+            serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string()),
+        );
+        return;
+    };
+    let now = now_ms();
+    merged.retain(|_, exp| *exp >= now);
+    for (digest, exp) in incoming {
+        if exp >= now {
+            let current = merged.entry(digest).or_insert(exp);
+            *current = (*current).max(exp);
+        }
+    }
+    if merged.len() > STUDIO_REPLAY_STATE_MAX {
+        let until = merged.values().copied().max().unwrap_or(now);
+        merged.clear();
+        merged.insert(STUDIO_REPLAY_OVERFLOW.to_string(), until);
+    }
+    if let Ok(encoded) = serde_json::to_string(&merged) {
+        remote
+            .connection
+            .insert(STUDIO_REPLAY_STATE_KEY.to_string(), encoded);
+    }
+}
+
 impl Database {
     fn masked(&self) -> Database {
         let mut d = self.clone();
+        // Replay facts are internal protocol state, not a connection field. Do
+        // not expose even their key or masked shape through list/detail APIs.
+        d.connection.remove(STUDIO_REPLAY_STATE_KEY);
         for (k, v) in d.connection.iter_mut() {
             let kl = k.to_lowercase();
             if kl.contains("password")
@@ -398,16 +484,26 @@ pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Deletions must travel explicitly. When absence-means-deleted, a node that
 /// simply has not heard about a record yet is indistinguishable from one that
 /// knows it was removed — and the replicated store then propagates the loss.
+pub type StudioReplaySnapshot =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SyncedDatabases {
     pub dbs: Vec<Database>,
     /// id -> deletion time (ms).
     #[serde(default)]
     pub tombstones: std::collections::BTreeMap<String, u64>,
+    /// Database-independent one-use facts. This sidecar deliberately survives a
+    /// wholesale snapshot that omits the database record itself.
+    #[serde(default)]
+    pub studio_replay: StudioReplaySnapshot,
 }
 
 pub struct DatabaseStore {
     dbs: RwLock<Vec<Database>>,
+    /// One-use Studio facts are independent from the resource record so a live
+    /// wholesale restore cannot erase them by omitting that record.
+    studio_replay: RwLock<StudioReplaySnapshot>,
     /// id -> deleted_ms. See [`SyncedDatabases`] and `merge_synced`.
     tombstones: RwLock<std::collections::BTreeMap<String, u64>>,
     port: AtomicU32,
@@ -421,6 +517,7 @@ impl DatabaseStore {
     pub fn new() -> DatabaseStore {
         DatabaseStore {
             dbs: RwLock::new(Vec::new()),
+            studio_replay: RwLock::new(Default::default()),
             tombstones: RwLock::new(std::collections::BTreeMap::new()),
             port: AtomicU32::new(0),
             blob: BlobStore::new(crate::persist::data_dir().join("blob")),
@@ -494,9 +591,17 @@ impl DatabaseStore {
             .cloned()
     }
 
-    /// Unmasked connection (used by the "reveal credentials" endpoint).
+    /// Unmasked connection for trusted internal consumers.
     pub fn get_raw(&self, id: &str) -> Option<Database> {
         self.dbs.read().iter().find(|x| x.id == id).cloned()
+    }
+
+    /// Tenant-visible credential view. The replay ledger is internal protocol
+    /// state, not a connection credential, and must never ride the reveal API.
+    pub fn credentials(&self, id: &str) -> Option<Database> {
+        let mut database = self.get_raw(id)?;
+        database.connection.remove(STUDIO_REPLAY_STATE_KEY);
+        Some(database)
     }
 
     /// NON-SECRET directory of gateway-addressable DBs hosted on THIS node — the
@@ -524,8 +629,49 @@ impl DatabaseStore {
         self.dbs.read().clone()
     }
 
-    pub fn load(&self, data: Vec<Database>) {
-        *self.dbs.write() = data;
+    pub fn load(&self, mut data: Vec<Database>) {
+        let mut replay = self.studio_replay.write();
+        let mut current = self.dbs.write();
+        for database in current.iter().chain(data.iter()) {
+            let facts = studio_replay_state(&database.connection).unwrap_or_else(|| {
+                std::collections::BTreeMap::from([(STUDIO_REPLAY_OVERFLOW.to_string(), u64::MAX)])
+            });
+            merge_studio_replay_snapshot(
+                &mut replay,
+                std::collections::BTreeMap::from([(database.id.clone(), facts)]),
+            );
+        }
+        for incoming in &mut data {
+            if let Some(facts) = replay.get(&incoming.id) {
+                if let Ok(encoded) = serde_json::to_string(facts) {
+                    incoming
+                        .connection
+                        .insert(STUDIO_REPLAY_STATE_KEY.to_string(), encoded);
+                }
+            }
+        }
+        *current = data;
+    }
+
+    pub fn studio_replay_snapshot(&self) -> StudioReplaySnapshot {
+        let mut replay = self.studio_replay.write();
+        merge_studio_replay_snapshot(&mut replay, Default::default());
+        replay.clone()
+    }
+
+    pub fn studio_replay_load(&self, data: StudioReplaySnapshot) {
+        let mut replay = self.studio_replay.write();
+        merge_studio_replay_snapshot(&mut replay, data);
+        let mut dbs = self.dbs.write();
+        for database in dbs.iter_mut() {
+            if let Some(facts) = replay.get(&database.id) {
+                if let Ok(encoded) = serde_json::to_string(facts) {
+                    database
+                        .connection
+                        .insert(STUDIO_REPLAY_STATE_KEY.to_string(), encoded);
+                }
+            }
+        }
     }
 
     /// Durable snapshot of the in-process data stores (queue + vector) so they
@@ -597,11 +743,13 @@ impl DatabaseStore {
 
     /// Snapshot for replication: records plus the tombstones that explain absences.
     pub fn snapshot_synced(&self) -> SyncedDatabases {
+        let studio_replay = self.studio_replay_snapshot();
         let mut dbs = self.dbs.read().clone();
         dbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic bytes (store_sync contract)
         SyncedDatabases {
             dbs,
             tombstones: self.tombstones.read().clone(),
+            studio_replay,
         }
     }
 
@@ -616,10 +764,33 @@ impl DatabaseStore {
     ///     fresh id (or later timestamp) survives;
     ///   * tombstones older than [`TOMBSTONE_RETENTION_MS`] are collected.
     pub fn merge_synced(&self, remote: SyncedDatabases) -> usize {
+        let SyncedDatabases {
+            dbs: mut remote_dbs,
+            tombstones: remote_tombstones,
+            studio_replay,
+        } = remote;
+        let mut embedded_replay = StudioReplaySnapshot::new();
+        for database in &remote_dbs {
+            if let Some(facts) = studio_replay_state(&database.connection) {
+                embedded_replay.insert(database.id.clone(), facts);
+            }
+        }
+        self.studio_replay_load(studio_replay);
+        self.studio_replay_load(embedded_replay);
+        let replay = self.studio_replay_snapshot();
+        for database in &mut remote_dbs {
+            if let Some(facts) = replay.get(&database.id) {
+                if let Ok(encoded) = serde_json::to_string(facts) {
+                    database
+                        .connection
+                        .insert(STUDIO_REPLAY_STATE_KEY.to_string(), encoded);
+                }
+            }
+        }
         let now = now_ms();
         {
             let mut tombs = self.tombstones.write();
-            for (id, ms) in remote.tombstones {
+            for (id, ms) in remote_tombstones {
                 let e = tombs.entry(id).or_insert(ms);
                 if ms > *e {
                     *e = ms;
@@ -630,9 +801,13 @@ impl DatabaseStore {
         let tombs = self.tombstones.read().clone();
 
         let mut dbs = self.dbs.write();
-        for r in remote.dbs {
+        for r in remote_dbs {
             match dbs.iter_mut().find(|d| d.id == r.id) {
-                Some(local) => *local = r,
+                Some(local) => {
+                    let mut remote = r;
+                    merge_studio_replay_state(local, &mut remote);
+                    *local = remote;
+                }
                 None => dbs.push(r),
             }
         }
@@ -730,6 +905,55 @@ impl DatabaseStore {
         if let Some(d) = self.dbs.write().iter_mut().find(|x| x.id == id) {
             f(d);
         }
+    }
+
+    /// Atomically consume a one-use Studio ticket digest in a bounded sidecar
+    /// independent from the database resource record. The connection mirror keeps
+    /// mixed-version replication safe; only SHA-256 digests and expirations exist.
+    pub(crate) fn consume_studio_ticket_digest(
+        &self,
+        id: &str,
+        digest: &str,
+        exp_ms: u64,
+        max_entries: usize,
+    ) -> bool {
+        let mut replay = self.studio_replay.write();
+        let mut dbs = self.dbs.write();
+        let Some(db) = dbs.iter_mut().find(|db| db.id == id) else {
+            return false;
+        };
+        let embedded = match studio_replay_state(&db.connection) {
+            Some(used) => used,
+            None => return false,
+        };
+        merge_studio_replay_snapshot(
+            &mut replay,
+            std::collections::BTreeMap::from([(id.to_string(), embedded)]),
+        );
+        if replay.contains_key(STUDIO_REPLAY_GLOBAL_OVERFLOW_DB) {
+            return false;
+        }
+        if replay.get(id).is_some_and(|used| {
+            used.contains_key(STUDIO_REPLAY_OVERFLOW)
+                || used.contains_key(digest)
+                || used.len() >= max_entries.min(STUDIO_REPLAY_STATE_MAX)
+        }) {
+            return false;
+        }
+        let global_entries = replay
+            .values()
+            .try_fold(0usize, |total, facts| total.checked_add(facts.len()));
+        if global_entries.is_none_or(|total| total >= STUDIO_REPLAY_GLOBAL_MAX) {
+            return false;
+        }
+        let used = replay.entry(id.to_string()).or_default();
+        used.insert(digest.to_string(), exp_ms);
+        let Ok(encoded) = serde_json::to_string(used) else {
+            return false;
+        };
+        db.connection
+            .insert(STUDIO_REPLAY_STATE_KEY.to_string(), encoded);
+        true
     }
 
     /// UNMASKED reconcile view: every live-mode record with a named backing
@@ -1225,7 +1449,11 @@ pub fn provision(
                         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
                         std::env::var("PATH").unwrap_or_default()
                     );
-                    for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    for one in container
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
                         let _ = tokio::process::Command::new("podman")
                             .args(["rm", "-f", "-v", one])
                             .env("PATH", &path_env)
@@ -2290,23 +2518,7 @@ async fn provision_supabase(
             }
         }
     };
-
-    // Pull all three images EXPLICITLY first (retry each): the pull phase is
-    // where a first-time provision is slowest and flakiest, and a pull folded
-    // into `podman run` fails the run opaquely (see podman_pull_retry's doc).
-    for image in [
-        "docker.io/supabase/postgres:15.8.1.085",
-        "docker.io/supabase/postgres-meta:v0.95.2",
-        "docker.io/supabase/studio:2026.02.16-sha-26c615c",
-        "docker.io/supabase/gotrue:v2.189.0",
-        "docker.io/postgrest/postgrest:v14.12",
-        "docker.io/supabase/storage-api:v1.60.4",
-    ] {
-        if !podman_pull_retry(image).await {
-            tracing::warn!(db = %id, image, "supabase image pull failed — simulating");
-            return Ok(("simulated".into(), conn, None));
-        }
-    }
+    let t0 = std::time::Instant::now();
 
     let stack = SupaStack {
         id: id.to_string(),
@@ -2336,6 +2548,37 @@ async fn provision_supabase(
     let c_db = members[0].0.clone();
     let mut started: Vec<String> = Vec::new();
 
+    // Pull every member's image CONCURRENTLY — independent registry fetches
+    // sharing no state, so serializing them buys nothing but wall-clock. The
+    // image comes from `members` itself (each arg vec's last element) rather
+    // than a second hardcoded list, so this can never drift from what
+    // `supabase_stack_args` actually runs. Measured live 2026-08-22, cold
+    // (no cached layers), this exact 6-image ~5GB stack: sequential
+    // `podman pull` loop 95s wall, concurrent 74s wall (~22% off the pull
+    // phase alone) — and that is BEFORE the overlap below, which is the
+    // bigger win: only the db pull is awaited here; the rest keep
+    // downloading in the background while postgres does its own first-boot
+    // initdb + TCP-ready wait, work that previously only started after every
+    // single image (including the 1.1GB studio and 907MB storage-api images)
+    // had already finished downloading.
+    let mut pulls: Vec<tokio::task::JoinHandle<bool>> = members
+        .iter()
+        .map(|(_, args)| {
+            let image = args.last().cloned().unwrap_or_default();
+            tokio::spawn(async move { podman_pull_retry(&image).await })
+        })
+        .collect();
+    let db_pull = pulls.remove(0);
+    let db_pull_ok = db_pull.await.unwrap_or(false);
+    tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), ok = db_pull_ok, "supabase: db image pull done");
+    if !db_pull_ok {
+        tracing::warn!(db = %id, "supabase db image pull failed — simulating");
+        for h in pulls {
+            h.abort();
+        }
+        return Ok(("simulated".into(), conn, None));
+    }
+
     // db first — the engine everything else authenticates against. The
     // supabase/postgres image bakes the Supabase role set but NOT the
     // sidecar roles' passwords (that is a compose-mounted roles.sql this
@@ -2344,18 +2587,32 @@ async fn provision_supabase(
         Ok(()) => started.push(c_db.clone()),
         Err(e) => {
             tracing::warn!(db = %id, error = %e, "supabase db container failed — simulating");
+            for h in pulls {
+                h.abort();
+            }
             return Ok(("simulated".into(), conn, None));
         }
     }
     if !wait_tcp_ready(port_pg).await {
         tracing::warn!(db = %id, %port_pg, "supabase postgres up but loopback port not reachable");
     }
+    tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), "supabase: db tcp ready");
     if !supa_set_service_role_passwords(&c_db, stack.pg_password.as_str()).await {
         tracing::warn!(db = %id, "supabase service-role passwords could not be set — auth/rest/storage sidecars will fail to connect until db-reconcile retries");
     }
+    tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), "supabase: db passwords set");
 
     // Remaining members in builder order (meta, auth, rest, storage, studio).
-    for (cname, args) in &members[1..] {
+    // Each awaits only its OWN pull handle — kicked off above, overlapped
+    // with the db bring-up just finished — before starting; by now most are
+    // already done, so this rarely blocks at all.
+    for ((cname, args), handle) in members[1..].iter().zip(pulls.into_iter()) {
+        let pull_ok = handle.await.unwrap_or(false);
+        if !pull_ok {
+            tracing::warn!(db = %id, container = %cname, "supabase sidecar image pull failed — simulating");
+            cleanup(&started).await;
+            return Ok(("simulated".into(), conn, None));
+        }
         match podman_run_detached(args).await {
             Ok(()) => started.push(cname.clone()),
             Err(e) => {
@@ -2364,12 +2621,14 @@ async fn provision_supabase(
                 return Ok(("simulated".into(), conn, None));
             }
         }
+        tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), container = %cname, "supabase: sidecar started");
     }
     // Studio (Next.js) takes a few seconds to come up; warn-only like the
     // engine check — a slow boot must not demote the record to simulated.
     if !wait_tcp_ready(port_studio).await {
         tracing::warn!(db = %id, %port_studio, "supabase studio up but loopback port not reachable yet");
     }
+    tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), "supabase: provisioning complete");
     let names: Vec<String> = members.iter().map(|(n, _)| n.clone()).collect();
     Ok(("live".into(), conn, Some(names.join(","))))
 }
@@ -2769,9 +3028,8 @@ async fn supa_backfill_sidecar_upgrade(cloud: &Arc<crate::state::CloudState>, d:
     let port_auth = cloud.databases.next_port(24100).to_string();
     let port_rest = cloud.databases.next_port(24600).to_string();
     let port_storage = cloud.databases.next_port(25100).to_string();
-    let new_members = format!(
-        "hive-supa-{short}-auth,hive-supa-{short}-rest,hive-supa-{short}-storage"
-    );
+    let new_members =
+        format!("hive-supa-{short}-auth,hive-supa-{short}-rest,hive-supa-{short}-storage");
     cloud.databases.update(&d.id, |d| {
         d.connection
             .entry("auth_port".into())

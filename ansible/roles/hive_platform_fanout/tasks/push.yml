@@ -1,60 +1,65 @@
 ---
-# Runs on every host (build host included, no-op there) IN PARALLEL: pushes
-# the group's canonical binary and verifies its sha256 landed intact, but
-# does NOT swap/restart -- that happens in the serial restart.yml pass so a
-# bad binary never takes more than one host's hive-node down at once.
+# Runs on followers in parallel. It pushes and verifies the controller+agent
+# pair but swaps neither; restart.yml publishes them serially.
 
-- name: Skip push on the build host itself (already has the canonical binary)
+- name: Skip push on the build host itself (already has canonical artifacts)
   ansible.builtin.meta: end_host
   when: inventory_hostname == hive_group_build_host
 
-# throttle caps this ONE task's concurrency independent of the play's forks
-# (ansible.cfg sets forks=20 so cheap tasks fan out fully). Every copy here
-# originates from the control host (this operator machine) directly to one
-# target -- never one fleet node relaying to several peers -- so it can
-# never reproduce the sshd MaxStartups pileup scripts/roll-backend-fleet.sh
-# hit (that came from many concurrent SSH -A hops converging on one SOURCE
-# node's sshd). The resource this throttle protects is different: the
-# operator machine's own uplink bandwidth pushing a ~100MB binary to up to
-# 13 hosts at once, which is the exact "residential uplink" problem
-# roll-backend-fleet.sh's header names as its reason for node-to-node
-# distribution. Default 4 is a conservative starting point for a laptop
-# uplink; raise with -e hive_push_throttle=N from a well-provisioned box
-# (measure first -- this is a bandwidth guess, not a proven number).
-- name: Push the group's canonical binary (compressed) to /tmp
+- name: Push the group's canonical controller (compressed) to /tmp
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}.gz"
     dest: /tmp/hive-cloud.new.gz
     mode: "0644"
   throttle: "{{ hive_push_throttle | default(4) }}"
 
-# Decompress on the TARGET, so the ~4x saving (measured 3.91x on this binary)
-# applies to every one of these copies, not just the fetch. `-f` because a
-# previous interrupted run may have left the output behind.
-- name: Decompress the pushed binary
+- name: Push the group's canonical cell agent (compressed) to /tmp
+  ansible.builtin.copy:
+    src: "{{ hive_artifact_root }}/hive-cell-agent-{{ hive_glibc_group }}.gz"
+    dest: /tmp/hive-cell-agent.new.gz
+    mode: "0644"
+  throttle: "{{ hive_push_throttle | default(4) }}"
+
+- name: Decompress the pushed controller
   ansible.builtin.shell:
     cmd: "gzip -d -f -c /tmp/hive-cloud.new.gz > /tmp/hive-cloud.new && chmod 0755 /tmp/hive-cloud.new"
   changed_when: true
 
-# UNCHANGED semantics: this still compares against the sha of the UNCOMPRESSED
-# canonical binary taken on the build host, so it verifies the artifact that
-# will actually be executed — compression is transport-only and cannot hide a
-# corrupted or truncated transfer. A gzip that decompresses to the wrong bytes
-# fails here exactly as a bad raw copy did.
-- name: Verify the pushed binary's sha256 matches the canonical build
+- name: Decompress the pushed cell agent
+  ansible.builtin.shell:
+    cmd: "gzip -d -f -c /tmp/hive-cell-agent.new.gz > /tmp/hive-cell-agent.new && chmod 0755 /tmp/hive-cell-agent.new"
+  changed_when: true
+
+# These compare the executable bytes after decompression with the build host's
+# uncompressed SHA-256 facts. A truncated/corrupt transport never reaches the
+# serial publication phase.
+- name: Verify the pushed controller SHA-256
   ansible.builtin.command:
     cmd: sha256sum /tmp/hive-cloud.new
   register: _pushed_sha
   changed_when: false
-  failed_when: _pushed_sha.stdout.split(' ')[0] != hostvars[hive_group_build_host].hive_group_build_sha256
+  failed_when: >-
+    _pushed_sha.stdout.split(' ')[0] !=
+    hostvars[hive_group_build_host].hive_group_build_sha256
 
-- name: Remove the compressed artifact from the target
+- name: Verify the pushed cell-agent SHA-256
+  ansible.builtin.command:
+    cmd: sha256sum /tmp/hive-cell-agent.new
+  register: _pushed_agent_sha
+  changed_when: false
+  failed_when: >-
+    _pushed_agent_sha.stdout.split(' ')[0] !=
+    hostvars[hive_group_build_host].hive_group_cell_agent_sha256
+
+- name: Remove compressed artifacts from the target
   ansible.builtin.file:
-    path: /tmp/hive-cloud.new.gz
+    path: "{{ item }}"
     state: absent
+  loop:
+    - /tmp/hive-cloud.new.gz
+    - /tmp/hive-cell-agent.new.gz
 
-# The cr-sqlite extension (browser_db lanes refuse every round without it —
-# see build.yml's note). Small enough to push uncompressed.
+# The cr-sqlite extension is small enough to push uncompressed.
 - name: Push the group's cr-sqlite extension
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/crsqlite-{{ hive_glibc_group }}.so"

@@ -20,6 +20,10 @@
 // covers them automatically; NODE_OPTIONS is inherited by `cluster` workers
 // automatically too.
 const net = require('net');
+const WORKDIR = process.env.HIVE_RUNTIME_WORKDIR;
+if (WORKDIR) {
+  process.chdir(WORKDIR);
+}
 const GUEST_IP = process.env.LITEBOX_GUEST_IP;
 const NEEDS_REWRITE = new Set(['0.0.0.0', '::', '127.0.0.1', '::1', 'localhost']);
 if (GUEST_IP) {
