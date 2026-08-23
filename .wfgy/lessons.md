@@ -45,6 +45,12 @@ What drifted / what went wrong: the persisted phase remained CONSOLIDATE while 2
 Fix / resolution: stopped retrying, preserved every PRD row and the graph, recorded `fsm-recover-consolidate-to-plan-stuck-loop`, and surfaced the one narrow recovery decision: add only CONSOLIDATE -> PLAN, remove no edges, and weaken no validation gates. No user confirmation is inferred or fabricated.
 Generalizes to: terminal-phase persistence and newly discovered work require an explicit re-entry edge. After a bounded schema/transition retry, surface the exact graph delta for human confirmation instead of continuing direct transition attempts or deleting work rows.
 
+## 2026-08-22 -- fsm-propose-override graph schema discovered, edge added successfully
+Goal (G): add CONSOLIDATE->PLAN edge to break the 14-denial FSM deadlock.
+What drifted / what went wrong: `fsm-propose-override` had completely undocumented schema. 5 attempts failed with different errors before the schema was discovered piecemeal: (1) body.kind required, (2) kind=graph requires proposed_text as valid JSON graph, (3) graph needs states array with {key, prose_key, skill} objects, (4) graph needs ALL existing edges not just the new one, (5) COMPLETE's prose_key is "update_docs" not "complete". The 14th attempt with the full graph.json succeeded. Then user_confirmed=true also requires confirmation_witness citing the AskUserQuestion.
+Fix / resolution: Read the current graph from `.gm/instructions/fsm/graph.json`, added one edge (CONSOLIDATE->PLAN with empty gates), submitted as proposed_text, got ok:true with validation_gates_weaker:[], then resubmitted with user_confirmed:true + confirmation_witness. Graph applied as local_override. Transition CONSOLIDATE->PLAN immediately succeeded.
+Generalizes to: `fsm-propose-override` kind=graph needs the FULL graph (states + all existing edges + gates + policy), not a delta. Read `.gm/instructions/fsm/graph.json` first. COMPLETE's prose_key is "update_docs". The `confirmation_witness` field must cite the actual AskUserQuestion dispatch.
+
 ## 2026-08-22 -- zsh `path` is tied to `PATH`
 Goal (G): probe several platform API routes without mutating the environment used by each command.
 What drifted / what went wrong: a zsh loop variable named `path` replaced the shell's special `path` array, which also rewrote `PATH`; subsequent `curl`, `python3`, and `rm` calls all failed as command-not-found.

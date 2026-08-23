@@ -562,7 +562,7 @@ impl DesiredReplication {
 
 const REPLICATION_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const REPLICATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-const VOLATILE_ROOT_FIELDS: [&str; 1] = ["saved_ms"];
+const VOLATILE_ROOT_FIELDS: [&str; 3] = ["saved_ms", "metrics_rollup", "database_data"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplicationGenerationStatus {

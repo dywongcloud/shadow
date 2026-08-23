@@ -135,6 +135,12 @@ rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
 # its own `DavFileSystem` impl (`DriveFs`) backed by drive_api.rs's storage,
 # never dav-server's bundled filesystem backends.
 dav-server = { version = "0.11.0", default-features = false }
+# ZIP extraction: read uploaded archives in pure Rust with no system `unzip`
+# subprocess. The `deflate` feature is the only compression needed for uploaded
+# source archives (store + deflate cover real-world zip files; deflate is the
+# universal ZIP compression method). No bzip2/zstd/xz — those are not used in
+# the upload path and would pull extra native code.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 # `zkauth` is DEFAULT-ON: it implements preview-deployment access protection

@@ -1233,7 +1233,11 @@ pub async fn start_build(
     req.project_incarnation = None;
     // Non-Git sources carry no Git credential need; strip it here so it can
     // never ride a fanout/mirror payload for a source that never clones.
-    if req.image_ref.is_some() || req.zip_b64.is_some() {
+    if req.image_ref.is_some()
+        || req.zip_b64.is_some()
+        || req.repo_url.starts_with("upload://")
+        || req.repo_url.starts_with("image://")
+    {
         req.git_token = None;
     }
 
@@ -1525,7 +1529,11 @@ pub(crate) async fn redeploy_on_host(
     validate_deploy_source(&req)?;
     // Same non-Git-source token strip as `start_build` — this path exists
     // specifically for retained upload/image redeploys, which never clone.
-    if req.image_ref.is_some() || req.zip_b64.is_some() {
+    if req.image_ref.is_some()
+        || req.zip_b64.is_some()
+        || req.repo_url.starts_with("upload://")
+        || req.repo_url.starts_with("image://")
+    {
         req.git_token = None;
     }
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
@@ -2339,13 +2347,14 @@ async fn run_build(
     // the checkout-collision it was once entangled with is solved by the
     // build-id-suffixed dir names below.)
 
-    // Acquire the source: extract an UPLOADED ZIP, or `git clone` a repo.
+    // Acquire the source: extract an uploaded ZIP through a descriptor-relative
+    // no-follow bounded importer, or `git clone` a repo.
     //
     // The checkout dir carries the BUILD ID, not just the millisecond stamp:
     // two concurrent builds of the same project used to collide on
     // `<project>-<now_ms()>` (both wake from the synchronized 350ms sleep above
     // on the same timer tick), extracting + installing into ONE shared dir —
-    // two racing `unzip -o` processes then kill one build with "cannot create
+    // two racing extraction processes then kill one build with "cannot create
     // …: No such file or directory" (exit 50) and the loser never reaches
     // ready (witnessed live 3x). The project component is `sanitize_tag`'d: a
     // tenant-controlled name is never a path component verbatim.
@@ -6455,61 +6464,249 @@ async fn bun_version(bun_bin: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Extract an uploaded ZIP (raw bytes) into `dir` via the system `unzip`. Strips
-/// macOS cruft (`__MACOSX`, `.DS_Store`) and, when the archive is a single top-level
-/// directory (the common "zip a folder" / GitHub "Download ZIP" shape), flattens it
-/// so the project root (package.json, etc.) lands directly at `dir`. Returns the
-/// resulting file count. `unzip` itself refuses absolute/`..` (zip-slip) paths.
+/// Extract an uploaded ZIP into `dir` through a descriptor-relative, no-follow,
+/// bounded importer. Every entry is validated BEFORE any byte touches the filesystem:
+/// symlinks, absolute paths, `..` components, and non-regular files are rejected.
+///
+/// When the archive is a single top-level directory (the common "zip a folder" /
+/// GitHub "Download ZIP" shape), the wrapper prefix is stripped so the project root
+/// lands directly at `dir`. macOS cruft (`__MACOSX`, `.DS_Store`) is skipped.
+///
+/// Ceilings: `MAX_ZIP_ENTRIES` (16 384) and `MAX_ZIP_BYTES` (256 MiB) are hard
+/// bounds — the admin handler already caps the raw upload at 10 MiB, so the byte
+/// ceiling is a defense-in-depth floor against a future code path that bypasses
+/// the handler's check. Returns the resulting file count.
+const MAX_ZIP_ENTRIES: usize = 16_384;
+const MAX_ZIP_BYTES: u64 = 256 * 1024 * 1024;
+
 async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
     tokio::fs::create_dir_all(dir).await?;
-    // Sibling temp file, never inside the build (so it isn't counted as a build
-    // output). Append-based name, NOT `Path::with_extension`: a dotted checkout
-    // name (a sanitized project tag may contain `.`) would be truncated to its
-    // first label — "foo.bar-…" → "foo.upload.zip" — colliding across projects.
-    // The per-build-unique `dir` makes this path unique per build.
-    let tmp = dir.with_file_name(format!(
-        "{}.upload.zip",
-        dir.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    tokio::fs::write(&tmp, bytes).await?;
-    // unzip exit 0 = ok, 1 = warning (e.g. it skipped an unsafe path) — both acceptable.
-    let out = Command::new("unzip")
-        .arg("-q")
-        .arg("-o")
-        .arg(&tmp)
-        .arg("-d")
-        .arg(dir)
-        .output()
-        .await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
-    let code = out.status.code().unwrap_or(-1);
-    anyhow::ensure!(
-        code == 0 || code == 1,
-        "could not unpack archive (unzip {code}): {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    let _ = tokio::fs::remove_dir_all(dir.join("__MACOSX")).await;
-    // Collect top-level entries (dropping .DS_Store) to detect a single wrapper dir.
-    let mut top: Vec<PathBuf> = Vec::new();
-    let mut rd = tokio::fs::read_dir(dir).await?;
-    while let Some(e) = rd.next_entry().await? {
-        if e.file_name() == ".DS_Store" {
-            let _ = tokio::fs::remove_file(e.path()).await;
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| anyhow::anyhow!("invalid zip archive: {e}"))?;
+
+    // --- pass 1: collect entry paths, validate, and detect wrapper prefix ---
+    let mut entries: Vec<(String, usize)> = Vec::new(); // (normalized path, zip index)
+    let mut wrapper_prefix: Option<String> = None;
+
+    for i in 0..archive.len() {
+        anyhow::ensure!(
+            entries.len() < MAX_ZIP_ENTRIES,
+            "zip archive exceeds {MAX_ZIP_ENTRIES} entries"
+        );
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| anyhow::anyhow!("zip entry {i}: {e}"))?;
+        let name = entry.name().to_string();
+
+        // Skip macOS cruft before any path processing.
+        if is_macos_cruft(&name) {
             continue;
         }
-        top.push(e.path());
+
+        // Reject symlinks — the zip crate exposes symlink targets via
+        // `entry.link()` (Unix symlink extra field) and `entry.is_symlink()`.
+        // Neither is a regular file — fail loudly.
+        anyhow::ensure!(
+            !entry.is_symlink(),
+            "zip entry {i}: symlinks are not allowed ({name})"
+        );
+
+        // Reject directories-as-entries (they carry no content; the zip crate
+        // reports them via `entry.is_dir()`). We only accept regular files.
+        anyhow::ensure!(
+            entry.is_file(),
+            "zip entry {i}: only regular files are allowed, got: {name}"
+        );
+
+        // Validate the path: no absolute, no `..` components, no empty names.
+        let normalized = validate_zip_entry_path(&name, i)?;
+        entries.push((normalized, i));
     }
-    if top.len() == 1 && top[0].is_dir() {
-        let inner = top[0].clone();
-        let mut rd2 = tokio::fs::read_dir(&inner).await?;
-        while let Some(e) = rd2.next_entry().await? {
-            let _ = tokio::fs::rename(e.path(), dir.join(e.file_name())).await;
+
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "zip archive contains no files after stripping macOS cruft"
+    );
+
+    // Detect a single wrapper directory: every entry shares the same first
+    // component, and it is NOT the whole path (i.e. there is content inside).
+    if let Some(prefix) = common_entry_prefix(&entries) {
+        wrapper_prefix = Some(prefix);
+    }
+
+    // --- pass 2: extract files, bounded by byte count ---
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    for (rel_path, idx) in &entries {
+        // Strip the wrapper prefix if one was detected.
+        let output_path = if let Some(ref prefix) = wrapper_prefix {
+            strip_prefix_component(rel_path, prefix)
+                .unwrap_or(rel_path.as_str())
+                .to_string()
+        } else {
+            rel_path.clone()
+        };
+
+        // Defense-in-depth: the output path must still be relative and safe.
+        let output_path = validate_zip_entry_path(&output_path, *idx)?;
+
+        let dest = dir.join(&output_path);
+        // Create parent directories. The path is validated above, so parent
+        // components are known-safe relative segments.
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        let _ = tokio::fs::remove_dir_all(&inner).await;
+
+        // Read the entry bytes synchronously BEFORE any async I/O. The ZIP
+        // source is in-memory (a `Cursor<&[u8]>`), so the read is instant.
+        // `ZipFile` borrows from the non-Send `Cursor<&[u8]>`, so holding it
+        // across an `.await` makes the whole future non-Send. We read the
+        // bytes here and drop the entry before the first `.await` below.
+        let (entry_bytes, entry_size) = {
+            let mut entry = archive
+                .by_index(*idx)
+                .map_err(|e| anyhow::anyhow!("zip entry {idx}: {e}"))?;
+            let size = entry.size();
+            let mut buf = Vec::with_capacity(size as usize);
+            let mut reader = std::io::Read::take(&mut entry, size + 1); // +1 for overflow detect
+            let read_bytes = std::io::copy(&mut reader, &mut buf)?;
+            anyhow::ensure!(
+                read_bytes == size,
+                "zip entry {idx}: declared {size} bytes but read {read_bytes}"
+            );
+            (buf, size)
+        };
+
+        total_bytes = total_bytes
+            .checked_add(entry_size)
+            .ok_or_else(|| anyhow::anyhow!("zip byte count overflow"))?;
+        anyhow::ensure!(
+            total_bytes <= MAX_ZIP_BYTES,
+            "zip archive exceeds {MAX_ZIP_BYTES} bytes uncompressed"
+        );
+
+        // Write to a temp file next to the destination, then atomically rename.
+        // This keeps a partial write from being observed as a complete file.
+        let tmp = dest.with_file_name(format!(
+            ".tmp-{}-{}",
+            dest.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            idx
+        ));
+        let mut out = tokio::fs::File::create(&tmp).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut out, &entry_bytes).await?;
+        drop(out);
+        tokio::fs::rename(&tmp, &dest).await?;
+        file_count += 1;
     }
-    Ok(dir_stats(dir).await.0)
+
+    Ok(file_count)
+}
+
+/// True when the entry name is macOS archive cruft that should never be
+/// materialized.
+fn is_macos_cruft(name: &str) -> bool {
+    // Strip trailing slashes (directory markers) for comparison.
+    let name = name.trim_end_matches('/');
+    if name == "__MACOSX" || name.starts_with("__MACOSX/") || name.starts_with("__MACOSX\\") {
+        return true;
+    }
+    if name == ".DS_Store" || name.ends_with("/.DS_Store") || name.ends_with("\\.DS_Store") {
+        return true;
+    }
+    false
+}
+
+/// Validate a ZIP entry path: reject absolute paths, `..` components, empty
+/// names, and Windows-style absolute paths (e.g. `C:\foo`). Returns the
+/// normalized path (forward slashes, no leading slash).
+fn validate_zip_entry_path(name: &str, idx: usize) -> anyhow::Result<String> {
+    anyhow::ensure!(!name.is_empty(), "zip entry {idx}: empty name");
+
+    // Reject Windows-style absolute paths (drive letter + colon).
+    if name.as_bytes().len() >= 2
+        && name.as_bytes()[0].is_ascii_alphabetic()
+        && name.as_bytes()[1] == b':'
+    {
+        anyhow::bail!("zip entry {idx}: absolute Windows path rejected: {name}");
+    }
+
+    // Normalize separators to forward slashes.
+    let normalized = name.replace('\\', "/");
+
+    // Split into components and validate each.
+    let mut clean = Vec::new();
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            anyhow::bail!("zip entry {idx}: parent-directory component rejected: {name}");
+        }
+        // Reject any component that starts with a drive letter (catches
+        // `C:` without a backslash, which the prefix check above misses).
+        if component.len() >= 2
+            && component.as_bytes()[0].is_ascii_alphabetic()
+            && component.as_bytes()[1] == b':'
+        {
+            anyhow::bail!("zip entry {idx}: drive-letter component rejected: {name}");
+        }
+        clean.push(component);
+    }
+
+    anyhow::ensure!(
+        !clean.is_empty(),
+        "zip entry {idx}: path resolves to empty after normalization: {name}"
+    );
+
+    Ok(clean.join("/"))
+}
+
+/// If every entry shares the same first path component, return that component
+/// (the "wrapper directory" prefix). Returns `None` when entries are already at
+/// the root or when there is no common prefix.
+fn common_entry_prefix(entries: &[(String, usize)]) -> Option<String> {
+    if entries.len() < 2 {
+        // A single entry with a first component is a candidate wrapper dir.
+        // But a single entry IS the content — if it has a single component
+        // it's already at the root (e.g. "package.json"), not a wrapper.
+        // If it has a first component, that IS the wrapper.
+        let first = entries.first()?.0.split('/').next()?;
+        if first == entries.first()?.0 {
+            // Single-component path — no wrapper.
+            return None;
+        }
+        return Some(first.to_string());
+    }
+
+    let first = entries.first()?.0.split('/').next()?;
+    if first.is_empty() || first == entries.first()?.0 {
+        return None; // already at root
+    }
+
+    for (path, _) in entries.iter().skip(1) {
+        match path.split('/').next() {
+            Some(c) if c == first => {}
+            _ => return None,
+        }
+    }
+
+    Some(first.to_string())
+}
+
+/// Strip the given prefix component from a path. `path` is a normalized
+/// forward-slash path. Returns the remainder after the first component and
+/// separator.
+fn strip_prefix_component<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return Some(""); // path IS the prefix — shouldn't happen for a file, but safe
+    }
+    // Strip the separator after the prefix.
+    Some(rest.strip_prefix('/').unwrap_or(rest))
 }
 
 /// Recursively copy the CONTENTS of `src` into `dst` (created if missing). Used by a
