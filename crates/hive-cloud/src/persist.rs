@@ -532,7 +532,15 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
             let s = cloud.ratelimit.stats();
             Some((s.enabled, s.limit, s.window_ms))
         },
-        cron: cloud.cron.list(),
+        cron: {
+                let mut jobs = cloud.cron.list();
+                for job in &mut jobs {
+                    job.last_run_ms = None;
+                    job.runs = 0;
+                    job.next_run_ms = None;
+                }
+                jobs
+            },
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
         teams: team_rows.into_iter().collect(),
@@ -953,6 +961,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // making the cron loop fire it N times per schedule (live-witnessed:
     // vc-shoomoo-0 present 3× on a node). replace_all converges the store.
     cloud.cron.replace_all(snap.cron);
+    cloud.cron.recompute_all();
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
     // `restore` also runs from the asynchronous Guardian rollback guard, after

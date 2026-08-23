@@ -3970,6 +3970,7 @@ async fn run_build(
             })
             .collect();
         let n = cloud.cron.set_source_jobs(&project, "vercel.json", jobs);
+        crate::persist::persist(cloud);
         if !cron_specs.is_empty() {
             log(format!("Registered {n} cron job(s) from vercel.json."));
         }

@@ -9169,7 +9169,10 @@ async fn cron_add(
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &job.deployment)?;
     job.tenant = t;
     match c.cron.add(job) {
-        Ok(j) => Ok(Json(json!(j))),
+        Ok(j) => {
+            crate::persist::persist(&c);
+            Ok(Json(json!(j)))
+        }
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
@@ -9198,6 +9201,7 @@ async fn cron_del(
         ));
     }
     c.cron.remove(&id);
+    crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
@@ -9248,6 +9252,7 @@ async fn cron_run(
     );
     c.record(ev);
     let updated = c.cron.record_manual_run(&id, now_ms());
+    crate::persist::persist(&c);
     Ok(Json(json!({ "status": status, "job": updated })))
 }
 
