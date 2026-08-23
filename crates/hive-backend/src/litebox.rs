@@ -448,11 +448,6 @@ struct LiteboxFunctionProcess {
     // prevents parent-side descriptor reuse before termination/wait and makes
     // ownership explicit beside the process that consumes it.
     _initial_files: File,
-    // The runner's lexical `.tar` pathname lives under a private held directory
-    // descriptor and hard-links the exact `_initial_files` inode. Keeping both
-    // guards beside the process preserves the alias for the runner's lifetime;
-    // Drop removes only the private alias and directory.
-    _initial_files_alias: ArtifactScratch,
 }
 
 pub struct LiteboxBackend {
@@ -2332,6 +2327,7 @@ impl LiteboxBackend {
                 String::from_utf8_lossy(&err).trim(),
             )));
         }
+        drop(initial_files_alias);
 
         use tokio::io::AsyncWriteExt;
         // Bounded: an unresponsive guest must fail loudly, not hang this
@@ -3644,6 +3640,10 @@ impl CellBackend for LiteboxBackend {
         })?;
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
         wait_litebox_ready(&mut child, &func_addr, Duration::from_secs(15)).await?;
+        // Guest readiness proves Litebox has materialized the initial tar. Drop
+        // the descriptor-relative pathname now; cancellation before this point
+        // takes the same Drop cleanup path automatically.
+        drop(initial_files_alias);
         // Keep publication/GC serialized until the runner has consumed the
         // selected immutable archive. A concurrent redelivery can then retire
         // the old reference without deleting the file from under this cold
@@ -3679,7 +3679,6 @@ impl CellBackend for LiteboxBackend {
             LiteboxFunctionProcess {
                 child,
                 _initial_files: initial_files,
-                _initial_files_alias: initial_files_alias,
             },
         );
         if let Some(task) = task.publish() {

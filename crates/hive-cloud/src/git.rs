@@ -9233,9 +9233,10 @@ mod tests {
     fn image_manifest_has_container_fn_and_volume() {
         // The prebuilt-image manifest runs the image as a container with a stable,
         // per-project persistent volume encoded in start_cmd[3].
+        let incarnation = fluid_core::ProjectIncarnation::mint();
         let m = container_manifest(
             "my-proj",
-            fluid_core::ProjectIncarnation::mint(),
+            incarnation,
             "fruitbox12/simplifi:latest",
             8080,
             "http",
@@ -9250,7 +9251,7 @@ mod tests {
         assert_eq!(f.start_cmd[1], "fruitbox12/simplifi:latest");
         assert_eq!(f.start_cmd[2], "8080");
         let cfg: serde_json::Value = serde_json::from_str(&f.start_cmd[3]).unwrap();
-        assert_eq!(cfg["vol"], "hive-vol-my-proj");
+        assert_eq!(cfg["vol"], format!("hive-vol-my-proj-{incarnation}"));
         assert!(cfg["volpath"].as_str().unwrap().starts_with('/'));
     }
 
@@ -9518,9 +9519,10 @@ mod tests {
 
     #[test]
     fn container_manifest_carries_protocol() {
+        let incarnation = fluid_core::ProjectIncarnation::mint();
         let m = container_manifest(
             "proj",
-            fluid_core::ProjectIncarnation::mint(),
+            incarnation,
             "img:tag",
             50051,
             "grpc",
@@ -9538,7 +9540,7 @@ mod tests {
         );
         // start_cmd[3] now carries the automatic persistent-volume run-config.
         let cfg: serde_json::Value = serde_json::from_str(&m.functions[0].start_cmd[3]).unwrap();
-        assert_eq!(cfg["vol"], "hive-vol-proj");
+        assert_eq!(cfg["vol"], format!("hive-vol-proj-{incarnation}"));
         assert_eq!(
             m.functions[0].memory_mib, 0,
             "0 = use the node's generous default (not 512m)"

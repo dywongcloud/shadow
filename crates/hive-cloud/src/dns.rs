@@ -768,6 +768,10 @@ mod tests {
             cert.id, before.id,
             "renew reads current state, never fabricates"
         );
+        // The issued-state writer is gated on a VERIFIED attach — prove the
+        // domain first, exactly as the real activation path does.
+        s.ensure_verify("acme.com", "t", "proj").unwrap();
+        s.mark_verified_as("acme.com", Some("t"));
         assert!(s.set_ssl_issued(
             "acme.com",
             "dom-abc123",

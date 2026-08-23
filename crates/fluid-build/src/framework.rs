@@ -1045,7 +1045,7 @@ mod tests {
         assert_eq!(package_manager(&dir), "pnpm");
         let _ = fs::remove_dir_all(&dir);
 
-        let dir = repo_with(&[("yarn.lock", "")]);
+        let dir = repo_with(&[("yarn.lock", "# yarn lockfile v1\n")]);
         assert_eq!(package_manager(&dir), "yarn");
         let _ = fs::remove_dir_all(&dir);
 
@@ -1072,7 +1072,7 @@ mod tests {
         ]);
         let d = detect_package_manager(&dir);
         assert_eq!(d.manager, "pnpm");
-        assert_eq!(d.source, PackageManagerSource::Corepack);
+        assert_eq!(d.source, PackageManagerSource::PackageJson);
         let warning = d
             .conflict_warning
             .expect("must warn about the conflicting yarn.lock");
@@ -1092,40 +1092,46 @@ mod tests {
         let dir = repo_with(&[("package.json", r#"{"packageManager":"bun@1.2.3"}"#)]);
         let d = detect_package_manager(&dir);
         assert_eq!(d.manager, "bun");
-        assert_eq!(d.source, PackageManagerSource::Corepack);
+        assert_eq!(d.source, PackageManagerSource::PackageJson);
         assert!(d.conflict_warning.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn conflicting_lockfiles_without_corepack_field_still_warn_deterministically() {
-        // No packageManager field — lockfile precedence picks bun, but a
-        // pnpm-lock.yaml is ALSO committed (e.g. a half-migrated repo). Must
-        // still resolve deterministically (bun wins, per precedence) AND warn.
+    fn conflicting_lockfiles_without_declaration_refuse_loudly() {
+        // No packageManager field and TWO lockfiles — precedence used to pick
+        // a winner and warn. Ambiguity without an authoritative declaration is
+        // now a loud refusal naming every lockfile, never a silent pick.
         let dir = repo_with(&[("bun.lock", ""), ("pnpm-lock.yaml", "")]);
         let d = detect_package_manager(&dir);
-        assert_eq!(d.manager, "bun");
-        assert_eq!(d.source, PackageManagerSource::BunLock);
+        assert_eq!(d.manager, "invalid");
+        assert_eq!(d.source, PackageManagerSource::InvalidDeclaration);
         let warning = d
             .conflict_warning
-            .expect("must warn about the conflicting pnpm-lock.yaml");
-        assert!(warning.contains("pnpm-lock.yaml"));
+            .expect("must name the conflicting lockfiles");
+        assert!(warning.contains("bun.lock"), "warning: {warning}");
+        assert!(warning.contains("pnpm-lock.yaml"), "warning: {warning}");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn malformed_or_unrecognized_package_manager_field_falls_back_to_lockfile() {
-        // Unparseable JSON → falls through to lockfile detection, never panics.
+    fn malformed_or_unrecognized_package_manager_field_refuses_loudly() {
+        // Unparseable JSON → loud refusal, never a silent lockfile fallback
+        // (and never a panic).
         let dir = repo_with(&[("package.json", "{not json"), ("yarn.lock", "")]);
-        assert_eq!(package_manager(&dir), "yarn");
+        let d = detect_package_manager(&dir);
+        assert_eq!(d.manager, "invalid");
+        assert!(d.validation_error.is_some());
         let _ = fs::remove_dir_all(&dir);
 
-        // Recognized JSON but an unknown manager name → also falls through.
+        // Recognized JSON but an unknown manager name → same loud refusal.
         let dir = repo_with(&[
             ("package.json", r#"{"packageManager":"deno@1.0.0"}"#),
             ("yarn.lock", ""),
         ]);
-        assert_eq!(package_manager(&dir), "yarn");
+        let d = detect_package_manager(&dir);
+        assert_eq!(d.manager, "invalid");
+        assert!(d.validation_error.is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 }
