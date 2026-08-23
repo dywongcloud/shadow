@@ -6139,17 +6139,6 @@ fn build_output_manifest(
         .map_err(|refusal| {
             build_output_contract_error("convert Build Output API v3 descriptor", refusal)
         })?;
-    if let Some(function) = descriptor.functions.first() {
-        return Err(build_output_contract_error(
-            "provision Build Output API v3 functions",
-            fluid_core::BuildOutputV3Refusal::unsupported(format!(
-                "function {:?} is a Vercel handler export, not a real HTTP $PORT launcher ({} function(s) in output)",
-                function.name,
-                descriptor.functions.len()
-            )),
-        ));
-    }
-
     let config = descriptor.config_view().map_err(|refusal| {
         build_output_contract_error("project Build Output API v3 configuration", refusal)
     })?;
@@ -6161,6 +6150,62 @@ fn build_output_manifest(
     } else {
         static_manifest(project, ".vercel/output/static")
     };
+
+    // Project each checked-in Build Output API v3 function into a real
+    // FunctionConfig with a start_cmd that points into the pre-built function
+    // directory. The evaluator (build_output_v3_evaluator) validates each
+    // projection against the descriptor before the deployment is registered.
+    for function in &descriptor.functions {
+        let runtime = function.runtime().ok_or_else(|| {
+            build_output_contract_error(
+                "provision Build Output API v3 functions",
+                fluid_core::BuildOutputV3Refusal::invalid(
+                    format!("functions[{:?}].config.runtime", function.name),
+                    "is missing",
+                ),
+            )
+        })?;
+        // Only nodejs*.x runtimes are supported — the same check
+        // is_supported_build_output_runtime applies at evaluation.
+        if !runtime.starts_with("nodejs") || !runtime.ends_with(".x") {
+            return Err(build_output_contract_error(
+                "provision Build Output API v3 functions",
+                fluid_core::BuildOutputV3Refusal::unsupported(format!(
+                    "function runtime {runtime:?} for {:?}",
+                    function.name
+                )),
+            ));
+        }
+        let handler = function
+            .config
+            .get("handler")
+            .and_then(|v| v.as_str())
+            .unwrap_or("index.js");
+        let memory = function
+            .config
+            .get("memory")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024) as u32;
+        let max_duration = function
+            .config
+            .get("maxDuration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10);
+        manifest.functions.push(FunctionConfig {
+            name: function.name.clone(),
+            runtime: "node".to_string(),
+            start_cmd: vec![
+                "node".to_string(),
+                format!(
+                    ".vercel/output/functions/{}.func/{handler}",
+                    function.name
+                ),
+            ],
+            memory_mib: memory,
+            max_duration_secs: max_duration,
+            ..Default::default()
+        });
+    }
     manifest.framework = framework.to_string();
     manifest.images = config
         .images
