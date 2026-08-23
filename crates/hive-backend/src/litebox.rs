@@ -1904,30 +1904,13 @@ impl LiteboxBackend {
             output.sync_all().await?;
         }
         if !deps.is_empty() {
-            let mut command = Command::new("tar");
-            let archive_path =
-                crate::runtime_artifact::inherit_file_path(&mut command, &temp.file)?;
-            command
-                .arg("-h")
-                .arg("--absolute-names")
-                .arg("--mtime=@0")
-                .arg("--owner=0")
-                .arg("--group=0")
-                .arg("--numeric-owner")
-                .arg("-rf")
-                .arg(archive_path)
-                .args(&deps)
-                .kill_on_drop(true);
-            let output = command
-                .output()
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to run tar: {error}"))?;
-            anyhow::ensure!(
-                output.status.success(),
-                "tar failed staging runtime dependencies for {}: {}",
-                bin.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            append_ldd_closure_to_tar(&mut temp.file, &deps)
+                .with_context(|| {
+                    format!(
+                        "failed to append LDD closure to tar for {}",
+                        bin.display()
+                    )
+                })?;
         }
         self.stage_bind_shim(directories, &temp).await?;
         temp.file.sync_all()?;
@@ -3206,18 +3189,248 @@ async fn ldd_closure(bin: &Path) -> anyhow::Result<Vec<PathBuf>> {
         if let Some(idx) = line.find("=> ") {
             if let Some(p) = line[idx + 3..].split_whitespace().next() {
                 if p.starts_with('/') {
-                    paths.push(PathBuf::from(p));
+                    let validated = validate_ldd_path(Path::new(p))?;
+                    paths.push(validated);
                 }
             }
         } else if line.starts_with('/') {
             if let Some(p) = line.split_whitespace().next() {
-                paths.push(PathBuf::from(p));
+                let validated = validate_ldd_path(Path::new(p))?;
+                paths.push(validated);
             }
         }
     }
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Approved library directories for LDD closure paths. Defense-in-depth:
+/// shared-library paths from ldd output must resolve to one of these
+/// directories. Paths outside the allowlist are rejected before they ever
+/// reach a filesystem operation.
+const ALLOWED_LIBRARY_DIRS: &[&str] = &[
+    "/usr/lib/",
+    "/lib/",
+    "/lib64/",
+    "/usr/lib64/",
+    "/usr/local/lib/",
+];
+
+fn validate_ldd_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve LDD path {}: {e}", path.display()))?;
+    let resolved_str = resolved.to_string_lossy();
+    let allowed = ALLOWED_LIBRARY_DIRS
+        .iter()
+        .any(|prefix| resolved_str.starts_with(prefix));
+    anyhow::ensure!(
+        allowed,
+        "LDD path {} resolves to {} which is outside the approved library directory allowlist",
+        path.display(),
+        resolved.display()
+    );
+    Ok(path.to_path_buf())
+}
+
+const POSIX_TAR_BLOCK_SIZE: usize = 512;
+
+/// Write a single POSIX tar entry (header + content + padding) to `archive`.
+/// The entry name is stored as-is (absolute path, matching the prior `tar
+/// --absolute-names` behaviour).
+fn write_posix_tar_entry(
+    archive: &mut File,
+    name: &[u8],
+    content: &[u8],
+) -> anyhow::Result<()> {
+    let mut header = [0u8; POSIX_TAR_BLOCK_SIZE];
+
+    // Split name into prefix + name if > 100 bytes
+    let (prefix, name_part) = if name.len() > 100 {
+        // Find the last '/' within the last 155 bytes of the directory part
+        let split_at = name[..name.len().min(155)]
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if split_at == 0 || split_at > 155 || name.len() - split_at > 100 {
+            anyhow::bail!(
+                "tar path too long: {} (prefix={}, name={})",
+                String::from_utf8_lossy(name),
+                split_at,
+                name.len() - split_at
+            );
+        }
+        (&name[..split_at], &name[split_at..])
+    } else {
+        (b"" as &[u8], name)
+    };
+
+    // Name (100 bytes)
+    let name_len = name_part.len().min(100);
+    header[..name_len].copy_from_slice(&name_part[..name_len]);
+
+    // Mode: "0000644\0"
+    header[100..108].copy_from_slice(b"0000644\0");
+
+    // Uid: "0000000\0"
+    header[108..116].copy_from_slice(b"0000000\0");
+
+    // Gid: "0000000\0"
+    header[116..124].copy_from_slice(b"0000000\0");
+
+    // Size (12 bytes, octal)
+    let size_octal = format!("{:011o}\0", content.len());
+    header[124..124 + size_octal.len()].copy_from_slice(size_octal.as_bytes());
+
+    // Mtime: "00000000000\0" (epoch 0)
+    header[136..148].copy_from_slice(b"00000000000\0");
+
+    // Typeflag: '0' (regular file)
+    header[156] = b'0';
+
+    // Linkname (100 bytes) — empty
+    // Magic: "ustar\0"
+    header[257..263].copy_from_slice(b"ustar\0");
+
+    // Version: "00"
+    header[263..265].copy_from_slice(b"00");
+
+    // Uname: "root"
+    header[265..297].fill(0);
+    header[265..269].copy_from_slice(b"root");
+
+    // Gname: "root"
+    header[297..329].fill(0);
+    header[297..301].copy_from_slice(b"root");
+
+    // Devmajor/devminor: 0 (already zeroed)
+
+    // Prefix (155 bytes) at offset 345
+    if !prefix.is_empty() {
+        let prefix_len = prefix.len().min(155);
+        header[345..345 + prefix_len].copy_from_slice(&prefix[..prefix_len]);
+    }
+
+    // Chksum: sum of all bytes treating chksum field (148-156) as spaces
+    let mut chksum: u64 = 0;
+    for b in header.iter() {
+        chksum += *b as u64;
+    }
+    // Add 8 spaces for the chksum field
+    chksum += 8 * (b' ' as u64);
+    let chksum_str = format!("{:06o}\0 ", chksum);
+    header[148..148 + chksum_str.len()].copy_from_slice(chksum_str.as_bytes());
+
+    archive
+        .write_all(&header)
+        .context("write tar header")?;
+    archive
+        .write_all(content)
+        .context("write tar content")?;
+
+    // Pad to 512-byte block boundary
+    let pad = (POSIX_TAR_BLOCK_SIZE - (content.len() % POSIX_TAR_BLOCK_SIZE)) % POSIX_TAR_BLOCK_SIZE;
+    if pad > 0 {
+        archive.write_all(&vec![0u8; pad]).context("write tar padding")?;
+    }
+
+    Ok(())
+}
+
+/// Append the LDD closure files to a tar archive using descriptor-relative
+/// openat2, replacing the prior `tar -h` shell invocation. Each path is
+/// opened against the root filesystem with RESOLVE_BENEATH |
+/// RESOLVE_NO_MAGICLINKS, the real path is resolved via /proc/self/fd,
+/// validated against the allowlist, and the file content is appended with
+/// a POSIX tar header.
+#[cfg(target_os = "linux")]
+fn append_ldd_closure_to_tar(
+    archive: &mut File,
+    deps: &[PathBuf],
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root = File::open("/").context("open root filesystem")?;
+    let mut seen_inodes: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::new();
+    for dep in deps {
+        let relative = dep
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("LDD path {} is not absolute", dep.display()))?;
+        if relative.as_os_str().is_empty() {
+            anyhow::bail!("LDD path is the root directory");
+        }
+        let fd = crate::runtime_artifact::openat2_required(
+            &root,
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            crate::runtime_artifact::RESOLVE_BENEATH
+                | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
+        )
+        .with_context(|| format!("openat2 failed for {}", dep.display()))?;
+        let resolved = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .canonicalize()
+            .with_context(|| {
+                format!("cannot resolve real path for {}", dep.display())
+            })?;
+        let resolved_str = resolved.to_string_lossy();
+        let allowed = ALLOWED_LIBRARY_DIRS
+            .iter()
+            .any(|prefix| resolved_str.starts_with(prefix));
+        anyhow::ensure!(
+            allowed,
+            "LDD path {} resolves to {} which is outside the approved library directory allowlist",
+            dep.display(),
+            resolved.display()
+        );
+        let meta = fd
+            .metadata()
+            .with_context(|| format!("cannot stat {}", dep.display()))?;
+        let ino = (meta.dev(), meta.ino());
+        anyhow::ensure!(
+            seen_inodes.insert(ino),
+            "symlink loop detected: {} already staged (dev={}, ino={})",
+            dep.display(),
+            ino.0,
+            ino.1
+        );
+        let file_size = meta.len();
+        let mut content = vec![0u8; file_size as usize];
+        let mut remaining = &mut content[..];
+        {
+            let mut reader = &fd;
+            while !remaining.is_empty() {
+                let n = reader
+                    .read(remaining)
+                    .with_context(|| format!("read error on {}", dep.display()))?;
+                if n == 0 {
+                    anyhow::bail!(
+                        "{} truncated mid-read (expected {} bytes, got {})",
+                        dep.display(),
+                        file_size,
+                        content.len() - remaining.len()
+                    );
+                }
+                remaining = &mut remaining[n..];
+            }
+        }
+        write_posix_tar_entry(archive, dep.as_os_str().as_encoded_bytes(), &content)?;
+    }
+    // Two zero blocks mark end of archive
+    archive
+        .write_all(&[0u8; POSIX_TAR_BLOCK_SIZE * 2])
+        .context("write tar terminator")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn append_ldd_closure_to_tar(
+    _archive: &mut File,
+    _deps: &[PathBuf],
+) -> anyhow::Result<()> {
+    anyhow::bail!("descriptor-relative tar append requires Linux openat2")
 }
 
 #[async_trait]

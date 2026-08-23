@@ -1328,16 +1328,16 @@ struct OpenHow {
 }
 
 #[cfg(target_os = "linux")]
-const RESOLVE_NO_XDEV: u64 = 0x01;
+pub(crate) const RESOLVE_NO_XDEV: u64 = 0x01;
 #[cfg(target_os = "linux")]
-const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+pub(crate) const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 #[cfg(target_os = "linux")]
-const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+pub(crate) const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 #[cfg(target_os = "linux")]
-const RESOLVE_BENEATH: u64 = 0x08;
+pub(crate) const RESOLVE_BENEATH: u64 = 0x08;
 
 #[cfg(target_os = "linux")]
-fn openat2_raw(
+pub(crate) fn openat2_raw(
     parent: &File,
     path: &std::ffi::OsStr,
     flags: i32,
@@ -1367,7 +1367,7 @@ fn openat2_raw(
 }
 
 #[cfg(target_os = "linux")]
-fn openat2_required(
+pub(crate) fn openat2_required(
     parent: &File,
     path: &std::ffi::OsStr,
     flags: i32,
@@ -1384,7 +1384,7 @@ fn openat2_required(
 }
 
 #[cfg(target_os = "linux")]
-fn open_source_from(parent: &File, relative: &Path) -> anyhow::Result<File> {
+pub(crate) fn open_source_from(parent: &File, relative: &Path) -> anyhow::Result<File> {
     if relative.as_os_str().is_empty() {
         return parent.try_clone().map_err(Into::into);
     }
@@ -1398,7 +1398,7 @@ fn open_source_from(parent: &File, relative: &Path) -> anyhow::Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_source_beneath(root: &File, relative: &Path) -> anyhow::Result<File> {
+pub(crate) fn open_source_beneath(root: &File, relative: &Path) -> anyhow::Result<File> {
     open_source_from(root, relative)
 }
 

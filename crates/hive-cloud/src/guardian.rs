@@ -562,7 +562,7 @@ impl DesiredReplication {
 
 const REPLICATION_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const REPLICATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-const VOLATILE_ROOT_FIELDS: [&str; 3] = ["saved_ms", "metrics_rollup", "database_data"];
+const VOLATILE_ROOT_FIELDS: [&str; 4] = ["saved_ms", "metrics_rollup", "database_data", "cron"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplicationGenerationStatus {
@@ -952,7 +952,7 @@ fn prepare_replication(
     generation: u64,
 ) -> anyhow::Result<Arc<DesiredReplication>> {
     let mut namespaces = std::collections::BTreeMap::new();
-    for (namespace, value) in crate::persist::namespaced(snap) {
+    for (namespace, value) in crate::persist::guardian_v2_namespaced(snap)? {
         let bytes = canonical_json_bytes(value)?;
         namespaces.insert(
             format!("ns/{namespace}/state"),
@@ -2574,7 +2574,9 @@ pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> 
 /// peer's would fabricate phantom deployments pointing at cells that only
 /// exist on the peer), `sandboxes` likewise, `metrics_rollup` is per-node
 /// observed traffic (adopting a peer's would double-count its traffic here),
-/// and `database_data` is the in-process store payload for locally-hosted DBs.
+/// `database_data` is the in-process store payload for locally-hosted DBs,
+/// and `cron` is the per-node scheduler state (adopting a peer's would
+/// schedule another node's jobs and cause duplicate execution).
 /// Everything else — projects, teams, billing, domains, webhooks, DB records,
 /// workflow defs, enterprise config, users/orgs — is tenant/control-plane
 /// state shared fleet-wide via gossip, exactly what a wiped node needs back.
@@ -2584,6 +2586,7 @@ fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
     snap.metrics_rollup = Default::default();
     snap.database_data = Default::default();
     snap.builds = Vec::new();
+    snap.cron = Vec::new();
     snap
 }
 
@@ -2638,7 +2641,13 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
                         behind_secs = (replica.saved_ms.saturating_sub(local.saved_ms)) / 1000,
                         "SNAPSHOT ROLLBACK DETECTED — local state older than the GuardianDB replica; restoring from replica"
                     );
+                    let local_cron = cloud.cron.list();
                     crate::persist::restore(&cloud, replica);
+                    // cron is node-local and stripped from the canonical Guardian
+                    // payload (VOLATILE_ROOT_FIELDS) — the replica's cron list is
+                    // always empty. Preserve the local cron state that was live
+                    // before the rollback so scheduled jobs are not lost.
+                    cloud.cron.replace_all(local_cron);
                     crate::persist::persist(&cloud);
                     tracing::info!(
                         "guardian restore guard: state restored from replicated snapshot"
@@ -2685,7 +2694,15 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
                         local_ms = local.saved_ms,
                         "TOTAL-LOSS RECOVERY — self snapshot remained absent through all retries; adopting SHARED state from newest peer snapshot (node-local runtime stripped)"
                     );
+                    let local_cron = cloud.cron.list();
                     crate::persist::restore(&cloud, strip_node_local(snapshot));
+                    // cron is node-local — on total-loss recovery the local
+                    // state may be empty (rebuilt from deployment records on
+                    // the next deployment change), and on rollback the captured
+                    // local state is the authoritative cron schedule.
+                    if !local_cron.is_empty() {
+                        cloud.cron.replace_all(local_cron);
+                    }
                     crate::persist::persist(&cloud);
                     tracing::info!(peer = %peer, "guardian restore guard: shared state restored from peer snapshot");
                     return;
