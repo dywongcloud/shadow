@@ -212,14 +212,15 @@ pub fn build_output_v3_evaluator(
     Ok(Some(evaluator))
 }
 
+/// Exact, closed allowlist — never a pattern match. Vercel's own currently
+/// supported Node.js Lambda runtimes are 20.x/22.x/24.x; any other value
+/// (an EOL Node line, a not-yet-released one, or a typo) is an unsupported
+/// capability, not merely "not yet tested".
+pub const SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES: &[&str] =
+    &["nodejs20.x", "nodejs22.x", "nodejs24.x"];
+
 fn is_supported_build_output_runtime(runtime: &str) -> bool {
-    let Some(version) = runtime
-        .strip_prefix("nodejs")
-        .and_then(|value| value.strip_suffix(".x"))
-    else {
-        return false;
-    };
-    !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+    SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES.contains(&runtime)
 }
 
 fn validate_build_output_v3_function_projection(
@@ -445,6 +446,19 @@ fn supported_build_output_image_path_pattern(pattern: &str) -> bool {
                 b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'+' | b'?' | b'|'
             )
         })
+}
+
+/// Resolve the CWD a function actually launches from. Every existing
+/// runtime shares one deployment-wide `base` (unchanged behavior); a
+/// function carrying [`fluid_core::FunctionConfig::cwd_relative`] — today,
+/// only Build Output API v3 Node `.func` bundles — launches from its OWN
+/// subdirectory instead, so sibling functions in the same deployment can
+/// never resolve each other's relative `import()`s.
+fn function_launch_workdir(base: &str, function: &fluid_core::FunctionConfig) -> String {
+    match function.cwd_relative.as_deref() {
+        Some(rel) if !rel.is_empty() => Path::new(base).join(rel).to_string_lossy().into_owned(),
+        _ => base.to_string(),
+    }
 }
 
 fn build_output_v3_route_state(manifest: &Manifest) -> Option<BuildOutputV3RouteState> {
@@ -898,7 +912,7 @@ impl Gateway {
                         key,
                         f.clone(),
                         cell_image.clone(),
-                        function_workdir.clone(),
+                        function_launch_workdir(function_workdir, f),
                         tenant.clone(),
                     );
                 }
@@ -931,6 +945,17 @@ impl Gateway {
             tenant,
         };
         let info = view_of(&dep);
+        // A typed Build Contract refusal (including one caught HERE, at deploy
+        // time, by a re-check the settings/vercel.json overlay pipeline can
+        // invalidate after `build_output_manifest` already validated the
+        // manifest once) must register NEITHER a Ready NOR an Error deployment
+        // record, and must never claim the project's production alias — a
+        // refused build leaves the CURRENT production deployment (if any)
+        // exactly as it was. `info` above already carries `state: Error` for
+        // the caller's own logging; nothing below this point may be persisted.
+        if build_output_refused {
+            return info;
+        }
         let project = dep.project.clone();
         let mut st = self.state.lock();
         if let Ok(root) = static_files::StaticRoot::open(&dep.root) {
@@ -1499,11 +1524,12 @@ impl Gateway {
             if let Some(workdir) = runtime_workdir.as_ref() {
                 for f in &manifest.functions {
                     let key = func_key(id.as_str(), &f.name);
+                    let workdir_str = workdir.to_string_lossy().into_owned();
                     self.fluid.register(
                         key,
                         f.clone(),
                         cell_image.clone(),
-                        workdir.to_string_lossy().into_owned(),
+                        function_launch_workdir(&workdir_str, f),
                         restored_tenant.clone(),
                     );
                 }

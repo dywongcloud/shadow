@@ -427,9 +427,7 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
 /// Guardian lane omits it because cron is node-local. Project arrays use the
 /// project identity as their deterministic primary key and reject malformed or
 /// duplicate identities instead of publishing an ambiguous tenant document.
-pub fn guardian_v2_namespaced(
-    snap: &PlatformSnapshot,
-) -> anyhow::Result<BTreeMap<String, Value>> {
+pub fn guardian_v2_namespaced(snap: &PlatformSnapshot) -> anyhow::Result<BTreeMap<String, Value>> {
     let mut docs = namespaced(snap);
     if let Some(global) = docs.get_mut("_global") {
         let fields = global
@@ -439,9 +437,9 @@ pub fn guardian_v2_namespaced(
     }
 
     for (namespace, document) in &mut docs {
-        let fields = document.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!("Guardian namespace {namespace:?} is not an object")
-        })?;
+        let fields = document
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Guardian namespace {namespace:?} is not an object"))?;
         let Some(projects) = fields.get_mut("projects") else {
             continue;
         };
@@ -533,14 +531,14 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
             Some((s.enabled, s.limit, s.window_ms))
         },
         cron: {
-                let mut jobs = cloud.cron.list();
-                for job in &mut jobs {
-                    job.last_run_ms = None;
-                    job.runs = 0;
-                    job.next_run_ms = None;
-                }
-                jobs
-            },
+            let mut jobs = cloud.cron.list();
+            for job in &mut jobs {
+                job.last_run_ms = None;
+                job.runs = 0;
+                job.next_run_ms = None;
+            }
+            jobs
+        },
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
         teams: team_rows.into_iter().collect(),

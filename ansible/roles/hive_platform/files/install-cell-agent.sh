@@ -5,11 +5,13 @@ SOURCE="${1:?usage: hive-install-cell-agent <candidate> [destination]}"
 DEST="${2:-/usr/local/bin/hive-cell-agent}"
 FACT="${CELL_AGENT_RELEASE_FACT:-${DEST}.release.json}"
 EXPECTED_SHA256="${CELL_AGENT_EXPECTED_SHA256:?CELL_AGENT_EXPECTED_SHA256 is required}"
+EXPECTED_ROOTFS_SCHEMA="${CELL_AGENT_ROOTFS_SCHEMA_EXPECTED:-2}"
 EXPECTED_PROTOCOL="${CELL_AGENT_PROTOCOL_EXPECTED:-1}"
+EXPECTED_WIRE_PROTOCOL="${CELL_AGENT_WIRE_PROTOCOL_EXPECTED:-2}"
+EXPECTED_WIRE_CAPABILITIES="${CELL_AGENT_WIRE_CAPABILITIES_EXPECTED:-15}"
 PROBE_TIMEOUT_SECS="${CELL_AGENT_PROTOCOL_TIMEOUT_SECS:-5}"
-# Version of this packaging envelope only. It deliberately does not claim to
-# version the Rust AgentRequest/AgentEvent wire contract.
-RELEASE_SCHEMA=1
+# Version of the complete release-fact envelope consumed by the rootfs builder.
+RELEASE_SCHEMA=2
 
 fail() {
   printf 'hive-cell-agent install refused: %s\n' "$*" >&2
@@ -23,9 +25,12 @@ case "$EXPECTED_SHA256" in
   ''|*[!0-9a-f]*) fail "expected SHA-256 must be 64 lowercase hexadecimal characters" ;;
 esac
 [ "${#EXPECTED_SHA256}" -eq 64 ] || fail "expected SHA-256 has the wrong length"
-case "$EXPECTED_PROTOCOL" in
-  ''|*[!0-9]*) fail "expected runtime-artifact protocol must be an unsigned integer" ;;
-esac
+for numeric in "$EXPECTED_ROOTFS_SCHEMA" "$EXPECTED_PROTOCOL" \
+  "$EXPECTED_WIRE_PROTOCOL" "$EXPECTED_WIRE_CAPABILITIES"; do
+  case "$numeric" in
+    ''|*[!0-9]*) fail "expected protocol facts must be unsigned integers" ;;
+  esac
+done
 case "$PROBE_TIMEOUT_SECS" in
   ''|*[!0-9]*) fail "protocol probe timeout must be an integer from 1 through 30 seconds" ;;
 esac
@@ -61,34 +66,62 @@ STAGED_SHA256="$(sha256sum -- "$STAGE" | cut -d' ' -f1)"
   fail "staged digest $STAGED_SHA256 does not match built digest $EXPECTED_SHA256"
 
 set +e
-AGENT_PROTOCOL="$(timeout --signal=TERM --kill-after=1s \
-  "${PROBE_TIMEOUT_SECS}s" "$STAGE" --runtime-artifact-protocol 2>"$PROBE_ERR")"
+AGENT_PROTOCOL_JSON="$(timeout --signal=TERM --kill-after=1s \
+  "${PROBE_TIMEOUT_SECS}s" "$STAGE" --agent-protocol-fact 2>"$PROBE_ERR")"
 PROBE_RC=$?
 set -e
 [ "$PROBE_RC" -eq 0 ] || \
-  fail "bounded --runtime-artifact-protocol probe failed (rc=$PROBE_RC, timeout=${PROBE_TIMEOUT_SECS}s)"
-case "$AGENT_PROTOCOL" in
-  ''|*[!0-9]*) fail "protocol probe returned a non-integer fact" ;;
-esac
-[ "$AGENT_PROTOCOL" = "$EXPECTED_PROTOCOL" ] || \
-  fail "candidate protocol $AGENT_PROTOCOL does not match required $EXPECTED_PROTOCOL"
-
-printf '{"schema":%s,"runtime_artifact_protocol":%s,"agent_sha256":"%s"}\n' \
-  "$RELEASE_SCHEMA" "$AGENT_PROTOCOL" "$STAGED_SHA256" >"$FACT_TMP"
-chmod 0444 "$FACT_TMP"
-python3 - "$FACT_TMP" "$EXPECTED_PROTOCOL" "$STAGED_SHA256" <<'PYFACT'
+  fail "bounded --agent-protocol-fact probe failed (rc=$PROBE_RC, timeout=${PROBE_TIMEOUT_SECS}s)"
+PROBE_VALUES="$(python3 - "$AGENT_PROTOCOL_JSON" "$EXPECTED_ROOTFS_SCHEMA" \
+  "$EXPECTED_PROTOCOL" "$EXPECTED_WIRE_PROTOCOL" "$EXPECTED_WIRE_CAPABILITIES" <<'PYPROBE'
 import json, sys
-path, expected_protocol, expected_sha = sys.argv[1:]
+raw, rootfs, runtime, wire, capabilities = sys.argv[1:]
+try:
+    fact = json.loads(raw)
+except Exception as error:
+    raise SystemExit(f'agent protocol fact is invalid JSON: {error}')
+keys = {
+    'rootfs_schema', 'runtime_artifact_protocol',
+    'agent_wire_protocol', 'agent_wire_capabilities',
+}
+if set(fact) != keys or any(type(fact[key]) is not int for key in keys):
+    raise SystemExit('agent protocol fact has missing, extra, or non-integer fields')
+expected = {
+    'rootfs_schema': int(rootfs),
+    'runtime_artifact_protocol': int(runtime),
+    'agent_wire_protocol': int(wire),
+    'agent_wire_capabilities': int(capabilities),
+}
+if fact != expected:
+    raise SystemExit(f'agent protocol fact {fact!r} does not match required {expected!r}')
+print(
+    fact['rootfs_schema'], fact['runtime_artifact_protocol'],
+    fact['agent_wire_protocol'], fact['agent_wire_capabilities'],
+)
+PYPROBE
+)" || fail "candidate did not emit the exact required agent protocol fact"
+read -r AGENT_ROOTFS_SCHEMA AGENT_PROTOCOL AGENT_WIRE_PROTOCOL AGENT_WIRE_CAPABILITIES <<<"$PROBE_VALUES"
+
+printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
+  "$RELEASE_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$AGENT_WIRE_CAPABILITIES" "$STAGED_SHA256" >"$FACT_TMP"
+chmod 0444 "$FACT_TMP"
+python3 - "$FACT_TMP" "$EXPECTED_ROOTFS_SCHEMA" "$EXPECTED_PROTOCOL" \
+  "$EXPECTED_WIRE_PROTOCOL" "$EXPECTED_WIRE_CAPABILITIES" "$STAGED_SHA256" <<'PYFACT'
+import json, sys
+path, rootfs, runtime, wire, capabilities, expected_sha = sys.argv[1:]
 with open(path, 'rb') as handle:
     fact = json.load(handle)
-if set(fact) != {'schema', 'runtime_artifact_protocol', 'agent_sha256'}:
-    raise SystemExit('release fact has unexpected fields')
-if fact['schema'] != 1:
-    raise SystemExit('release fact schema is not 1')
-if fact['runtime_artifact_protocol'] != int(expected_protocol):
-    raise SystemExit('release fact protocol mismatch')
-if fact['agent_sha256'] != expected_sha:
-    raise SystemExit('release fact digest mismatch')
+expected = {
+    'schema': 2,
+    'rootfs_schema': int(rootfs),
+    'runtime_artifact_protocol': int(runtime),
+    'agent_wire_protocol': int(wire),
+    'agent_wire_capabilities': int(capabilities),
+    'agent_sha256': expected_sha,
+}
+if fact != expected:
+    raise SystemExit('release fact does not exactly describe the staged agent')
 PYFACT
 
 EXISTING_SHA256=""
@@ -151,16 +184,22 @@ fi
 INSTALLED_SHA256="$(sha256sum -- "$DEST" | cut -d' ' -f1)"
 [ "$INSTALLED_SHA256" = "$STAGED_SHA256" ] || \
   fail "installed digest changed after atomic publication"
-python3 - "$FACT" "$EXPECTED_PROTOCOL" "$INSTALLED_SHA256" <<'PYFINAL'
+python3 - "$FACT" "$EXPECTED_ROOTFS_SCHEMA" "$EXPECTED_PROTOCOL" \
+  "$EXPECTED_WIRE_PROTOCOL" "$EXPECTED_WIRE_CAPABILITIES" "$INSTALLED_SHA256" <<'PYFINAL'
 import json, sys
-with open(sys.argv[1], 'rb') as handle:
+path, rootfs, runtime, wire, capabilities, digest = sys.argv[1:]
+with open(path, 'rb') as handle:
     fact = json.load(handle)
 if fact != {
-    'schema': 1,
-    'runtime_artifact_protocol': int(sys.argv[2]),
-    'agent_sha256': sys.argv[3],
+    'schema': 2,
+    'rootfs_schema': int(rootfs),
+    'runtime_artifact_protocol': int(runtime),
+    'agent_wire_protocol': int(wire),
+    'agent_wire_capabilities': int(capabilities),
+    'agent_sha256': digest,
 }:
     raise SystemExit('published release fact does not describe installed bytes')
 PYFINAL
-printf '{"schema":%s,"runtime_artifact_protocol":%s,"agent_sha256":"%s"}\n' \
-  "$RELEASE_SCHEMA" "$AGENT_PROTOCOL" "$INSTALLED_SHA256"
+printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
+  "$RELEASE_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$AGENT_WIRE_CAPABILITIES" "$INSTALLED_SHA256"

@@ -52,7 +52,10 @@
       environment:
         AGENT_BIN: "{{ hive_cell_agent_install_path }}"
         AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path }}"
+        ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | string }}"
         RUNTIME_ARTIFACT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | string }}"
+        AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | string }}"
+        AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | string }}"
         CELL_AGENT_RELEASE_SCHEMA_EXPECTED: "{{ hive_cell_agent_release_schema_expected | string }}"
         AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | string }}"
       register: hive_runtime_rootfs_agent_preflight
@@ -63,13 +66,18 @@
         _agent_fact: "{{ hive_runtime_rootfs_agent_preflight.stdout | from_json }}"
       ansible.builtin.assert:
         that:
-          - _agent_fact.keys() | sort == ['agent_sha256', 'runtime_artifact_protocol', 'schema']
+          - _agent_fact.keys() | sort == ['agent_sha256', 'agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol', 'schema']
           - (_agent_fact.schema | int) == (hive_cell_agent_release_schema_expected | int)
+          - (_agent_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | int)
           - (_agent_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | int)
+          - (_agent_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | int)
+          - (_agent_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | int)
           - _agent_fact.agent_sha256 is match('^[0-9a-f]{64}$')
         fail_msg: >-
           The bounded agent preflight did not return the exact release-fact
-          schema/protocol/digest expected by this migration. hive-node was not stopped.
+          schema, rootfs schema, runtime-artifact protocol, wire protocol,
+          capability set and digest expected by this migration. hive-node was
+          not stopped.
 
     - name: Download the Wasmer guest tarball when this rootfs must retain Wasmer
       ansible.builtin.get_url:
@@ -178,7 +186,10 @@
         AGENT_BIN: "{{ hive_cell_agent_install_path }}"
         AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path }}"
         CONTAINER_CLI: podman
+        ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | string }}"
         RUNTIME_ARTIFACT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | string }}"
+        AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | string }}"
+        AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | string }}"
         CELL_AGENT_RELEASE_SCHEMA_EXPECTED: "{{ hive_cell_agent_release_schema_expected | string }}"
         AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | string }}"
         WASMER_TARBALL: >-
@@ -211,35 +222,63 @@
             "/var/lib/hive/rootfs/{{ hive_runtime_rootfs_logical_name }}.ext4" \
             "{{ hive_cell_agent_install_path }}" \
             "{{ hive_cell_agent_release_fact_path }}" \
-            "{{ hive_runtime_artifact_protocol_expected | int }}" <<'PYVERIFY'
-          import hashlib, json, os, sys
-          image, agent, release_path, required_protocol = sys.argv[1:]
+            "{{ hive_cell_agent_release_schema_expected | int }}" \
+            "{{ hive_runtime_artifact_rootfs_schema_expected | int }}" \
+            "{{ hive_runtime_artifact_protocol_expected | int }}" \
+            "{{ hive_agent_wire_protocol_expected | int }}" \
+            "{{ hive_agent_wire_capabilities_expected | int }}" <<'PYVERIFY'
+          import hashlib, json, os, subprocess, sys
+          (
+              image, agent, release_path, required_release_schema,
+              required_rootfs_schema, required_protocol, required_wire,
+              required_capabilities,
+          ) = sys.argv[1:]
+          required_release_schema = int(required_release_schema)
+          required_rootfs_schema = int(required_rootfs_schema)
           required_protocol = int(required_protocol)
+          required_wire = int(required_wire)
+          required_capabilities = int(required_capabilities)
           proof_path = image + '.runtime-artifact-protocol.json'
           with open(proof_path, 'rb') as handle:
               proof = json.load(handle)
           with open(release_path, 'rb') as handle:
               release = json.load(handle)
+          marker = json.loads(subprocess.check_output(
+              ['debugfs', '-R', 'cat /etc/hive/runtime-artifact-protocol.json', image],
+              stderr=subprocess.DEVNULL,
+          ))
           def digest(path):
               value = hashlib.sha256()
               with open(path, 'rb') as handle:
                   for chunk in iter(lambda: handle.read(1024 * 1024), b''):
                       value.update(chunk)
               return value.hexdigest()
-          if release != {
-              'schema': 1,
+          expected_release = {
+              'schema': required_release_schema,
+              'rootfs_schema': required_rootfs_schema,
               'runtime_artifact_protocol': required_protocol,
+              'agent_wire_protocol': required_wire,
+              'agent_wire_capabilities': required_capabilities,
               'agent_sha256': digest(agent),
-          }:
-              raise SystemExit('installed agent release fact no longer matches installed bytes')
-          if proof.get('schema') != 1 or proof.get('protocol') != required_protocol:
-              raise SystemExit('rootfs proof schema/protocol mismatch')
-          if proof.get('agent_sha256') != release['agent_sha256']:
-              raise SystemExit('rootfs proof was baked from a different cell agent')
-          if proof.get('image_sha256') != digest(image):
-              raise SystemExit('rootfs proof image digest mismatch')
-          if proof.get('image_bytes') != os.stat(image).st_size:
-              raise SystemExit('rootfs proof image length mismatch')
+          }
+          if release != expected_release:
+              raise SystemExit('installed agent release fact no longer matches installed bytes and protocols')
+          expected_marker = {
+              'schema': required_rootfs_schema,
+              'protocol': required_protocol,
+              'agent_wire_protocol': required_wire,
+              'agent_wire_capabilities': required_capabilities,
+              'agent_sha256': release['agent_sha256'],
+          }
+          if marker != expected_marker:
+              raise SystemExit('in-rootfs marker does not exactly match the installed release fact')
+          expected_proof = {
+              **expected_marker,
+              'image_sha256': digest(image),
+              'image_bytes': os.stat(image).st_size,
+          }
+          if proof != expected_proof:
+              raise SystemExit('rootfs sidecar does not exactly match the image, marker and release fact')
           PYVERIFY
         executable: /bin/bash
       changed_when: false

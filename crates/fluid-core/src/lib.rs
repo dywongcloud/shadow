@@ -480,6 +480,18 @@ pub struct FunctionConfig {
     /// that never opted in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_ipv4_alloc: Option<DedicatedIpv4>,
+    /// Per-function CWD override, relative to the deployment's runtime
+    /// workdir — additive, `None` for every existing caller and every
+    /// pre-upgrade peer. Build Output API v3 Node functions are the first
+    /// user: each `.func` bundle is its own self-contained directory
+    /// (`.vercel/output/functions/<name>.func`), so a deployment with several
+    /// functions must launch EACH ONE from its own directory rather than the
+    /// single shared `runtime_workdir` every other runtime uses — sharing one
+    /// CWD across functions would let one function's relative `import()`
+    /// resolve into a SIBLING function's files. `None` preserves today's
+    /// exact behavior (the shared deployment-wide workdir).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_relative: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -557,6 +569,7 @@ impl Default for FunctionConfig {
             browser_ineligible_reason: None,
             dedicated_ipv4: false,
             dedicated_ipv4_alloc: None,
+            cwd_relative: None,
         }
     }
 }
@@ -1558,16 +1571,37 @@ impl BuildOutputV3 {
             } else {
                 "handler"
             };
-            if config_object
+            let entry_value = config_object
                 .get(entry_key)
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.is_empty())
-                .is_none()
-            {
-                return Err(BuildOutputV3Refusal::invalid(
-                    format!("functions[{:?}].config.{entry_key}", function.name),
-                    "must be a non-empty string",
-                ));
+                .ok_or_else(|| {
+                    BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.{entry_key}", function.name),
+                        "must be a non-empty string",
+                    )
+                })?;
+            // A Node handler must resolve inside the parser's OWN exact
+            // regular-file inventory for this function — never a bare
+            // presence check. This closes two real gaps: a handler string
+            // that is not a portable relative path (absolute, `..`,
+            // control bytes — the exact shape `validate_build_output_relative_path`
+            // already enforces for `files`/`assets`), and a handler that
+            // names a file the parser never actually saw on disk (a
+            // dangling/foreign reference). `edge` is exempted here — it is
+            // refused as an unsupported runtime downstream regardless, and
+            // its `entrypoint` field is not cross-checked against `files`.
+            if entry_key == "handler" {
+                validate_build_output_relative_path(
+                    entry_value,
+                    &format!("functions[{:?}].config.handler", function.name),
+                )?;
+                if !function.files.iter().any(|file| file == entry_value) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.handler", function.name),
+                        "does not name a file in this function's own regular-file inventory",
+                    ));
+                }
             }
             if let Some(prerender) = &function.prerender {
                 if !prerender.is_object() {

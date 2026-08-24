@@ -76,10 +76,11 @@ pub fn place_for_project(
     is_container: bool,
     stateful: bool,
     needs_gpu: bool,
-    needs_wasm: bool,
+    needs_interpreter: impl Into<InterpreterNeeds>,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
 ) -> Vec<Target> {
+    let needs_interpreter = needs_interpreter.into();
     if let Some(holder) = cloud.leases.owner_of(project) {
         let nodes = cloud.registry.nodes();
         if let Some(n) = nodes.iter().find(|n| n.name == holder) {
@@ -92,10 +93,12 @@ pub fn place_for_project(
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
             let gpu_ok = !needs_gpu || n.gpu_count > 0;
             // Stickiness must not out-rank capability: a lease held from before
-            // the project switched to `runtime: "wasmer"` would otherwise pin
-            // every redeploy to a node that cannot execute it. Same predicate
-            // `place` uses, by construction — see `wasm_capable`.
-            let wasm_ok = wasm_capable(n, needs_wasm);
+            // the project switched to `runtime: "wasmer"`/`"bun"` would
+            // otherwise pin every redeploy to a node that cannot execute it.
+            // Same predicates `place` uses, by construction — see
+            // `wasm_capable`/`bun_capable`.
+            let wasm_ok = wasm_capable(n, needs_interpreter.wasm);
+            let bun_ok = bun_capable(n, needs_interpreter.bun);
             let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
             let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
             if n.healthy
@@ -103,6 +106,7 @@ pub fn place_for_project(
                 && reachable
                 && gpu_ok
                 && wasm_ok
+                && bun_ok
                 && runtime_artifact_ok
                 && build_isolation_ok
             {
@@ -143,7 +147,7 @@ pub fn place_for_project(
         is_container,
         stateful,
         needs_gpu,
-        needs_wasm,
+        needs_interpreter,
         needs_runtime_artifact,
         needs_build_isolation,
     )
@@ -166,6 +170,54 @@ pub fn place_for_project(
 /// `gpu_count == 0` already makes.
 pub fn wasm_capable(n: &NodeInfo, needs_wasm: bool) -> bool {
     !needs_wasm || n.wasm_runtime == Some(true)
+}
+
+/// May `n` host a deployment whose functions run on `Runtime::Bun`?
+///
+/// Exact mirror of [`wasm_capable`] — same ONE-definition rationale (called
+/// from both `place`'s capability filter and `place_for_project`'s
+/// lease-stickiness fast path so the two can never answer differently), same
+/// `None` = NOT CAPABLE asymmetry versus `disk_free_gb == 0`'s unknown-so-admit
+/// rule (a peer not reporting `bun_runtime` predates Bun capability probing
+/// and is known-incapable, not unknown), and the identical empty-placement-
+/// beats-guaranteed-failure logic: a node whose gossiped record is stale or
+/// whose Litebox backend cannot execute Bun at all (see `NodeInfo::bun_runtime`)
+/// must never win a Bun deployment.
+pub fn bun_capable(n: &NodeInfo, needs_bun: bool) -> bool {
+    !needs_bun || n.bun_runtime == Some(true)
+}
+
+/// Interpreter-runtime capability needs for one placement decision, bundled so
+/// a NEW interpreter gate (this file's second one, after Wasmer) never has to
+/// widen `place`/`place_for_project`'s positional argument list again — every
+/// existing call site passes a bare `bool` for what used to be `needs_wasm`,
+/// and `From<bool>` below keeps every one of them compiling with its EXACT
+/// prior meaning (`bun: false`) unchanged. A caller that wants to gate on Bun
+/// too constructs this directly instead of relying on the conversion.
+///
+/// This is the extension point a future `git.rs` change should use to make
+/// Bun-aware placement live: derive `needs_bun` there exactly the way
+/// `needs_wasm`/`known_wasm`/`is_wasm` already are (`git.rs`'s
+/// `hive_core::Runtime::from_config_str(..) == Some(hive_core::Runtime::Bun)`
+/// pre-build, and `hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) ==
+/// hive_core::Runtime::Bun` post-build) and pass
+/// `InterpreterNeeds { wasm, bun: needs_bun }` instead of a bare bool at both
+/// `place_for_project`'s and `place`'s call sites. Until that lands, Bun
+/// placement is filtered only by the pre-spawn refusal in
+/// `hive_backend::litebox` and by nodes never advertising `bun_runtime`
+/// truthfully where they cannot run it — this struct exists so wiring the
+/// rest through is a one-line change at each call site, not a signature
+/// change here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InterpreterNeeds {
+    pub wasm: bool,
+    pub bun: bool,
+}
+
+impl From<bool> for InterpreterNeeds {
+    fn from(wasm: bool) -> Self {
+        InterpreterNeeds { wasm, bun: false }
+    }
 }
 
 /// Source-built functions use the split host-static-root / guest-workdir
@@ -232,16 +284,20 @@ pub fn place(
     // which is strictly worse than the explicit empty-placement failure the
     // caller already handles for "nothing eligible".
     needs_gpu: bool,
-    // The project's functions run on `Runtime::Wasmer`: only nodes ADVERTISING
-    // a reachable wasmer binary (`NodeInfo::wasm_runtime == Some(true)`, from
+    // The project's functions run on `Runtime::Wasmer` and/or `Runtime::Bun`:
+    // only nodes ADVERTISING the matching capability
+    // (`NodeInfo::wasm_runtime`/`NodeInfo::bun_runtime == Some(true)`, from
     // the active-backend resource probe) are capable. Same rule and same
     // reasoning as `needs_gpu` directly above, and it is not hypothetical: the
     // first cut of Wasmer support installed the binary on the HOST while every
     // fleet node is Firecracker, which execs `start_cmd` inside the microVM
     // GUEST — so every placement was onto a node guaranteed to ENOENT on every
     // cold start, forever, and the tenant was told to debug their own app.
-    // Empty placement plus an honest error is strictly better.
-    needs_wasm: bool,
+    // Empty placement plus an honest error is strictly better. `impl
+    // Into<InterpreterNeeds>` so a bare `bool` (every call site written before
+    // Bun's own gate existed) keeps compiling with its EXACT prior meaning —
+    // see `InterpreterNeeds`'s doc for the non-breaking-extension rationale.
+    needs_interpreter: impl Into<InterpreterNeeds>,
     // Source-built functions require the split host/guest runtime-artifact v1
     // contract. Pre-upgrade nodes must not receive them.
     needs_runtime_artifact: bool,
@@ -249,6 +305,7 @@ pub fn place(
     // BuildExecutor contract. Old peers and failed probes are ineligible.
     needs_build_isolation: bool,
 ) -> Vec<Target> {
+    let needs_interpreter = needs_interpreter.into();
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
@@ -296,7 +353,12 @@ pub fn place(
         }
         // Wasmer capability, same hard-filter shape as the GPU gate above.
         // See `wasm_capable` for why `None` excludes rather than admits.
-        if !wasm_capable(n, needs_wasm) {
+        if !wasm_capable(n, needs_interpreter.wasm) {
+            return false;
+        }
+        // Bun capability, identical shape and identical reasoning — see
+        // `bun_capable`.
+        if !bun_capable(n, needs_interpreter.bun) {
             return false;
         }
         if !runtime_artifact_capable(n, needs_runtime_artifact) {
@@ -415,8 +477,13 @@ pub fn place(
             // the gpu arm above encodes. Without this the `capable()` filter was
             // decorative on this path: it removed the incapable nodes and then
             // the fallback put them straight back.
-            if needs_wasm && eligibles.is_empty() {
+            if needs_interpreter.wasm && eligibles.is_empty() {
                 tracing::warn!(region = %region, "placement: no wasm-capable node in this region — not widening (wasmer runtime)");
+                continue;
+            }
+            // Same rule, same reason, for Bun.
+            if needs_interpreter.bun && eligibles.is_empty() {
+                tracing::warn!(region = %region, "placement: no bun-capable node in this region — not widening (bun runtime)");
                 continue;
             }
             if needs_runtime_artifact && eligibles.is_empty() {
@@ -480,9 +547,14 @@ pub fn place(
         if needs_gpu {
             tracing::warn!("placement: gpu requested but no healthy GPU-capable node is reachable");
         }
-        if needs_wasm {
+        if needs_interpreter.wasm {
             tracing::warn!(
                 "placement: wasmer runtime requested but no healthy wasm-capable node is reachable"
+            );
+        }
+        if needs_interpreter.bun {
+            tracing::warn!(
+                "placement: bun runtime requested but no healthy bun-capable node is reachable"
             );
         }
         if needs_runtime_artifact {
@@ -541,12 +613,13 @@ mod tests {
     ) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
-            // These placement fixtures are all non-Wasmer, so `None` — the
-            // value a node that never ran the probe reports — is the honest
-            // one, and it keeps them on the not-capable path. A test that
-            // means "this node CAN run wasm" must set `Some(true)` explicitly,
-            // the same rule `disk_free_gb` already carries.
+            // These placement fixtures are all non-Wasmer/non-Bun, so `None` —
+            // the value a node that never ran the probe reports — is the
+            // honest one, and it keeps them on the not-capable path. A test
+            // that means "this node CAN run wasm/bun" must set `Some(true)`
+            // explicitly, the same rule `disk_free_gb` already carries.
             wasm_runtime: None,
+            bun_runtime: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             gpu_model: None,

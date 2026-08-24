@@ -92,9 +92,9 @@
   register: _cell_agent_fact_before
 
 # The publisher copies into /usr/local/bin first, SHA-verifies it, then gives the
-# candidate a hard-bounded CLI probe. Only a strict integer protocol result is
-# converted into the schema-1 JSON release fact and atomically switched into
-# place. The previous binary remains at hive-cell-agent.old.
+# candidate a hard-bounded exact protocol-fact probe. Only a complete schema-2
+# release fact is atomically switched into place. The previous binary remains at
+# hive-cell-agent.old.
 - name: Preflight and atomically install the exact built cell-agent
   ansible.builtin.command:
     argv:
@@ -103,7 +103,10 @@
       - "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
   environment:
     CELL_AGENT_EXPECTED_SHA256: "{{ _cell_agent_build.stat.checksum }}"
+    CELL_AGENT_ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | default(2) | string }}"
     CELL_AGENT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | default(1) | string }}"
+    CELL_AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | default(2) | string }}"
+    CELL_AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | default(15) | string }}"
     CELL_AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | default(5) | string }}"
     CELL_AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
   register: _cell_agent_install
@@ -116,13 +119,17 @@
     _fact: "{{ _cell_agent_install.stdout | from_json }}"
   ansible.builtin.assert:
     that:
-      - _fact.keys() | sort == ['agent_sha256', 'runtime_artifact_protocol', 'schema']
-      - (_fact.schema | int) == 1
+      - _fact.keys() | sort == ['agent_sha256', 'agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol', 'schema']
+      - (_fact.schema | int) == 2
+      - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
       - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
       - _fact.agent_sha256 == _cell_agent_build.stat.checksum
     fail_msg: >-
-      The installed cell-agent did not attest the exact digest and runtime-artifact
-      protocol built alongside hive-cloud; no rootfs may consume it.
+      The installed cell-agent did not attest the exact digest, rootfs schema,
+      runtime-artifact protocol, wire protocol and capability set built alongside
+      hive-cloud; no rootfs may consume it.
 
 - name: Verify the installed cell-agent bytes and release-fact ownership
   ansible.builtin.stat:

@@ -974,6 +974,33 @@ impl DatabaseStore {
             .collect()
     }
 
+    /// Records stuck in "simulated" that this node's reconcile loop should
+    /// re-provision. Two witnessed stuck shapes (both permanent before this):
+    /// Ready+simulated — provision fell back on a transient failure (podman
+    /// down, image pull, container start) and `containers_to_reconcile`'s
+    /// mode=="live" filter excluded it from reconciliation forever; and a
+    /// STALE Provisioning+simulated — the async provision task was killed
+    /// (hive-node restart mid-provision; KillMode=process keeps any started
+    /// containers alive) before it ever wrote the record, witnessed live on
+    /// fc-sanjose-cvm-1 2026-08-23 with two full healthy Supabase stacks
+    /// running against records frozen at provisioning/container=None.
+    pub(crate) fn simulated_to_retry(&self) -> Vec<Database> {
+        const PROVISIONING_ORPHAN_GRACE_MS: u64 = 15 * 60 * 1000;
+        let now = now_ms();
+        self.dbs
+            .read()
+            .iter()
+            .filter(|d| {
+                d.mode == "simulated"
+                    && matches!(d.kind, DbKind::Postgres | DbKind::Redis | DbKind::Supabase)
+                    && (matches!(d.status, DbStatus::Ready)
+                        || (matches!(d.status, DbStatus::Provisioning)
+                            && now.saturating_sub(d.created_ms) > PROVISIONING_ORPHAN_GRACE_MS))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn insert(&self, d: Database) {
         self.dbs.write().push(d);
     }
@@ -2717,11 +2744,159 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
     crate::supervise::spawn_supervised("db-reconcile", move || {
         let cloud = cloud.clone();
         async move {
+            // Per-id exponential backoff (2m -> 64m cap) for simulated-record
+            // re-provisioning: a Supabase retry pulls ~5GB of images, so a
+            // flat 60s cadence would hammer the registry on a persistent
+            // failure. In-process only; a restart resets the backoff, which
+            // is the safe direction (retry sooner, never never).
+            let mut sim_retry: std::collections::HashMap<String, (u64, u32)> =
+                std::collections::HashMap::new();
             loop {
                 crate::supervise::beat("db-reconcile");
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 if !podman_available().await {
                     continue;
+                }
+                let now = now_ms();
+                for d in cloud.databases.simulated_to_retry() {
+                    // Only the record's named host retries: any other node
+                    // spawning the backing would create a rogue duplicate
+                    // engine the record's connection map doesn't point at.
+                    if d.host_node.is_empty() || d.host_node != cloud.node_name {
+                        continue;
+                    }
+                    if teardown_requested(&d.id) {
+                        continue;
+                    }
+                    if let Some((next, _)) = sim_retry.get(&d.id) {
+                        if now < *next {
+                            continue;
+                        }
+                    }
+                    let req = ProvisionReq {
+                        name: d.name.clone(),
+                        project: d.project.clone(),
+                        team: d.team.clone(),
+                        kind: d.kind,
+                        region: Some(d.region.clone()),
+                        provider: Some(d.provider.clone()),
+                        replicas: d.replicas.clone(),
+                    };
+                    let id = d.id.clone();
+                    let db_host = d.db_host.clone();
+                    // A currently-simulated record was never live (no code
+                    // path demotes live->simulated), so any same-name
+                    // containers/volumes are orphans of a killed provision
+                    // task holding secrets nobody recorded — never tenant
+                    // data. Scrub them so the fresh provision's `podman run`
+                    // cannot collide on names or inherit a volume initdb'd
+                    // with a lost password.
+                    {
+                        let short = &id[3..11.min(id.len())];
+                        let mut orphans: Vec<String> = Vec::new();
+                        match d.kind {
+                            DbKind::Supabase => {
+                                for member in ["db", "meta", "studio", "auth", "rest", "storage"] {
+                                    orphans.push(format!("hive-supa-{short}-{member}"));
+                                }
+                            }
+                            _ => orphans.push(format!("hive-db-{short}")),
+                        }
+                        for name in &orphans {
+                            let _ = Command::new("podman")
+                                .args(["rm", "-f", "-v", name])
+                                .env("PATH", augmented_path())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status()
+                                .await;
+                        }
+                        if d.kind == DbKind::Supabase {
+                            for volume in [format!("hive-vol-supa-{short}"), storage_volume(short)]
+                            {
+                                let _ = Command::new("podman")
+                                    .args(["volume", "rm", "-f", &volume])
+                                    .env("PATH", augmented_path())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status()
+                                    .await;
+                            }
+                        }
+                    }
+                    tracing::info!(db = %id, kind = ?d.kind, "db-reconcile: retrying real provisioning for simulated record");
+                    match provision_backing(
+                        &cloud.databases,
+                        &id,
+                        &req,
+                        &cloud.api_base(),
+                        &db_host,
+                    )
+                    .await
+                    {
+                        Ok((mode, conn, container)) if mode == "live" => {
+                            if cloud.databases.get_raw(&id).is_none() || teardown_requested(&id) {
+                                // Deleted while the retry was in flight: the
+                                // fresh backing would leak (same race the
+                                // provision task guards against).
+                                if let Some(container) = container.as_deref() {
+                                    for one in container
+                                        .split(',')
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        let _ = Command::new("podman")
+                                            .args(["rm", "-f", "-v", one])
+                                            .env("PATH", augmented_path())
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .status()
+                                            .await;
+                                    }
+                                    if req.kind == DbKind::Supabase {
+                                        let short = &id[3..11.min(id.len())];
+                                        let _ = Command::new("podman")
+                                            .args([
+                                                "volume",
+                                                "rm",
+                                                "-f",
+                                                &format!("hive-vol-supa-{short}"),
+                                            ])
+                                            .env("PATH", augmented_path())
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .status()
+                                            .await;
+                                    }
+                                }
+                                sim_retry.remove(&id);
+                                continue;
+                            }
+                            let kind = req.kind;
+                            cloud.databases.update(&id, |rec| {
+                                rec.status = DbStatus::Ready;
+                                rec.mode = "live".into();
+                                rec.connection = with_external_endpoint(conn, kind, &db_host);
+                                rec.container = container;
+                                rec.note = String::new();
+                            });
+                            sim_retry.remove(&id);
+                            tracing::info!(db = %id, kind = ?kind, "db-reconcile: simulated record promoted to LIVE backing");
+                            if let Some(rec) = cloud.databases.get_raw(&id) {
+                                if !rec.project.is_empty() {
+                                    crate::admin::apply_db_egress(&cloud, &rec);
+                                }
+                            }
+                            crate::persist::persist(&cloud);
+                        }
+                        _ => {
+                            let entry = sim_retry.entry(id.clone()).or_insert((0, 0));
+                            entry.1 = (entry.1 + 1).min(6);
+                            let delay_ms = 120_000u64 << (entry.1 - 1);
+                            entry.0 = now + delay_ms;
+                            tracing::warn!(db = %id, streak = entry.1, next_retry_in_ms = delay_ms, "db-reconcile: simulated retry still has no live backing");
+                        }
+                    }
                 }
                 for d in cloud.databases.containers_to_reconcile() {
                     // Route by LOCAL EVIDENCE, not just the record: records

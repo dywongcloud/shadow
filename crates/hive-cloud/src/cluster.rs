@@ -253,6 +253,7 @@ mod tests {
         hive_edge::NodeInfo {
             gpu_count: 0,
             wasm_runtime: None,
+            bun_runtime: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             gpu_model: None,

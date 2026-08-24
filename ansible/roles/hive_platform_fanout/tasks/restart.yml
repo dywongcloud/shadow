@@ -97,7 +97,10 @@
       - "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
   environment:
     CELL_AGENT_EXPECTED_SHA256: "{{ hostvars[hive_group_build_host].hive_group_cell_agent_sha256 }}"
+    CELL_AGENT_ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | default(2) | string }}"
     CELL_AGENT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | default(1) | string }}"
+    CELL_AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | default(2) | string }}"
+    CELL_AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | default(15) | string }}"
     CELL_AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | default(5) | string }}"
     CELL_AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
   register: _cell_agent_install
@@ -111,13 +114,17 @@
     _fact: "{{ _cell_agent_install.stdout | from_json }}"
   ansible.builtin.assert:
     that:
-      - _fact.keys() | sort == ['agent_sha256', 'runtime_artifact_protocol', 'schema']
-      - (_fact.schema | int) == 1
+      - _fact.keys() | sort == ['agent_sha256', 'agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol', 'schema']
+      - (_fact.schema | int) == 2
+      - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
       - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
       - _fact.agent_sha256 == hostvars[hive_group_build_host].hive_group_cell_agent_sha256
     fail_msg: >-
-      {{ hive_name }} did not publish the exact built cell-agent digest and
-      runtime-artifact protocol; hive-node remains on its prior running image.
+      {{ hive_name }} did not publish the exact built cell-agent digest, rootfs
+      schema, runtime-artifact protocol, wire protocol and capability set;
+      hive-node remains on its prior running image.
 
 - name: Verify the installed cell-agent bytes and fact metadata before restart
   ansible.builtin.stat:

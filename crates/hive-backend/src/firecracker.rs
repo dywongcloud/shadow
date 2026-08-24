@@ -23,15 +23,18 @@ use crate::{
 use anyhow::Context;
 use async_trait::async_trait;
 use hive_core::{
-    agent_handshake_transcript, now_ms, AgentBootProof, AgentEvent, AgentHandshake,
-    AgentHandshakeReady, AgentRequest, AgentWireProtocol, BuildJob, BuildResult, CellId, LogLine,
-    LogStream, RuntimeArtifactIdentity, RuntimeArtifactRootfsMetadata, AGENT_HANDSHAKE_NONCE_BYTES,
-    AGENT_WIRE_CAPABILITIES, AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT,
-    CELL_GUEST_CID, RUNTIME_ARTIFACT_PROTOCOL_VERSION, RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
+    agent_handshake_transcript, now_ms, validate_agent_handshake_response_frame,
+    validate_agent_versioned_launch_event_frame, AgentBootProof, AgentEvent,
+    AgentFunctionFaultCode, AgentHandshake, AgentHandshakeReady, AgentRequest, AgentWireProtocol,
+    BuildJob, BuildResult, CellId, LogLine, LogStream, RuntimeArtifactIdentity,
+    RuntimeArtifactRootfsMetadata, AGENT_HANDSHAKE_NONCE_BYTES, AGENT_WIRE_CAPABILITIES,
+    AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
+    RUNTIME_ARTIFACT_PROTOCOL_VERSION, RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
     RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -47,6 +50,7 @@ const RUNTIME_ARTIFACT_STALE_GRACE_SECS: u64 = 60 * 60;
 const RUNTIME_ARTIFACT_STALE_SCAN_MAX_ENTRIES: usize = 8192;
 const RUNTIME_ARTIFACT_STALE_MAX_REAP_FRACTION: f64 = 0.6;
 static RUNTIME_ARTIFACT_LOCKS: std::sync::OnceLock<Vec<Mutex<()>>> = std::sync::OnceLock::new();
+static ROOTFS_BOOT_LOCKS: std::sync::OnceLock<Vec<Arc<Mutex<()>>>> = std::sync::OnceLock::new();
 static RUNTIME_ARTIFACT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -694,6 +698,93 @@ impl FirecrackerBackend {
         let mut path = rootfs.as_os_str().to_os_string();
         path.push(RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX);
         PathBuf::from(path)
+    }
+
+    fn rootfs_boot_lock_for(path: &std::path::Path) -> anyhow::Result<Arc<Mutex<()>>> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cell rootfs path has no parent: {}", path.display()))?;
+        let file_name = path.file_name().ok_or_else(|| {
+            anyhow::anyhow!("cell rootfs path has no file name: {}", path.display())
+        })?;
+        let canonical = std::fs::canonicalize(parent)
+            .with_context(|| format!("canonicalize cell rootfs directory {}", parent.display()))?
+            .join(file_name);
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in canonical.as_os_str().to_string_lossy().bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let locks = ROOTFS_BOOT_LOCKS.get_or_init(|| {
+            (0..RUNTIME_ARTIFACT_LOCK_STRIPES)
+                .map(|_| Arc::new(Mutex::new(())))
+                .collect()
+        });
+        Ok(locks[hash as usize % locks.len()].clone())
+    }
+
+    fn rootfs_open_stamp(file: &std::fs::File) -> anyhow::Result<RootfsFileStamp> {
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "opened cell rootfs is not a regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                metadata.uid() == 0 && metadata.nlink() == 1 && metadata.mode() & 0o022 == 0,
+                "opened cell rootfs must be root-owned, single-link, and not group/world-writable"
+            );
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(RootfsFileStamp {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
+
+    fn write_cell_rootfs_protocol_metadata(
+        rootfs: &std::path::Path,
+        metadata: &RuntimeArtifactRootfsMetadata,
+    ) -> anyhow::Result<RootfsFileStamp> {
+        use std::io::Write as _;
+        let sidecar = Self::rootfs_protocol_sidecar_for(rootfs);
+        let bytes = serde_json::to_vec(metadata)?;
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() <= 4096,
+            "cell rootfs protocol proof must be between 1 and 4096 bytes"
+        );
+        remove_file_if_exists(&sidecar)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o444);
+        }
+        let mut file = options.open(&sidecar)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let mut permissions = file.metadata()?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&sidecar, permissions)?;
+        sync_parent_blocking(&sidecar)?;
+        Self::rootfs_protocol_stamp(rootfs)
     }
 
     fn rootfs_stamp(path: &std::path::Path) -> anyhow::Result<RootfsFileStamp> {
@@ -1476,29 +1567,54 @@ impl FirecrackerBackend {
     }
 
     /// Write `/etc/resolv.conf` into the PER-CELL overlay (never the shared base
-    /// image) via debugfs — no mount needed — so the guest can resolve DNS for
-    /// outbound `fetch`. Best-effort: DNS simply won't work if debugfs is absent.
-    async fn write_guest_resolv(&self, overlay: &std::path::Path) {
+    /// image) via debugfs — no mount needed. Deployment cells require this final
+    /// mutation to complete before their exact boot bytes are hashed; build and
+    /// sandbox cells retain the historical best-effort caller posture.
+    async fn write_guest_resolv(&self, overlay: &std::path::Path) -> anyhow::Result<()> {
+        const RESOLVER: &[u8] = b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
         let tmp = overlay.with_extension("resolv.tmp");
-        if tokio::fs::write(&tmp, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
-            .await
-            .is_err()
-        {
-            return;
+        tokio::fs::write(&tmp, RESOLVER).await?;
+        let mutation = async {
+            // Removing a nonexistent path is harmless; the subsequent write and
+            // exact read-back are the authoritative mutation checks. debugfs can
+            // report command-level errors while still exiting zero, so status
+            // alone must never bless the boot bytes.
+            let _ = Command::new("debugfs")
+                .args(["-w", "-R", "rm /etc/resolv.conf"])
+                .arg(overlay)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            let write = Command::new("debugfs")
+                .args(["-w", "-R"])
+                .arg(format!("write {} /etc/resolv.conf", tmp.display()))
+                .arg(overlay)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+            anyhow::ensure!(
+                write.success(),
+                "debugfs could not write the per-cell guest resolver into {}",
+                overlay.display()
+            );
+            let observed = Command::new("debugfs")
+                .args(["-R", "cat /etc/resolv.conf"])
+                .arg(overlay)
+                .stderr(Stdio::null())
+                .output()
+                .await?;
+            anyhow::ensure!(
+                observed.status.success() && observed.stdout == RESOLVER,
+                "debugfs resolver read-back did not match the required final bytes in {}",
+                overlay.display()
+            );
+            Ok(())
         }
-        let script = format!(
-            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
-             debugfs -w -R 'rm /etc/resolv.conf' '{ov}' >/dev/null 2>&1; \
-             debugfs -w -R 'write {tmp} /etc/resolv.conf' '{ov}' >/dev/null 2>&1",
-            ov = overlay.display(),
-            tmp = tmp.display(),
-        );
-        let _ = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
-            .status()
-            .await;
+        .await;
         let _ = tokio::fs::remove_file(&tmp).await;
+        mutation
     }
 }
 
@@ -1515,6 +1631,7 @@ struct FirecrackerProvisionGuard {
     procs: Arc<Mutex<HashMap<CellId, Child>>>,
     taps: Arc<Mutex<HashMap<CellId, String>>>,
     cell_rootfs_proofs: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactRootfsMetadata>>>,
+    rootfs_boot_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     armed: bool,
 }
 
@@ -1532,11 +1649,22 @@ impl FirecrackerProvisionGuard {
             procs,
             taps,
             cell_rootfs_proofs,
+            rootfs_boot_guard: None,
             armed: true,
         }
     }
 
+    fn hold_rootfs_boot_guard(&mut self, guard: tokio::sync::OwnedMutexGuard<()>) {
+        self.rootfs_boot_guard = Some(guard);
+    }
+
+    fn refuse_without_cleanup(&mut self) {
+        self.rootfs_boot_guard.take();
+        self.armed = false;
+    }
+
     fn commit(&mut self) {
+        self.rootfs_boot_guard.take();
         self.armed = false;
     }
 }
@@ -1554,8 +1682,13 @@ impl Drop for FirecrackerProvisionGuard {
         let root = self.root.clone();
         let procs = self.procs.clone();
         let taps = self.taps.clone();
+        let rootfs_boot_guard = self.rootfs_boot_guard.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                // Failed-provision cleanup owns the same per-cell serialization
+                // guard, so a retry cannot recreate files while this task removes
+                // the prior attempt's private rootfs and sidecar.
+                let _rootfs_boot_guard = rootfs_boot_guard;
                 cleanup_firecracker_process_and_tap(&id, &procs, &taps).await;
                 let _ = tokio::fs::remove_dir_all(root).await;
             });
@@ -1654,6 +1787,45 @@ async fn reflink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> std::i
         }
     }
     tokio::fs::copy(src, dst).await.map(|_| ())
+}
+
+async fn hash_open_rootfs_sha256(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> anyhow::Result<(String, u64, RootfsFileStamp)> {
+    let file = file.try_clone()?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let before = FirecrackerBackend::rootfs_open_stamp(&file)?;
+        let mut file = file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut bytes = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes = bytes.saturating_add(read as u64);
+        }
+        let after = FirecrackerBackend::rootfs_open_stamp(&file)?;
+        anyhow::ensure!(
+            before == after && bytes == before.len,
+            "cell rootfs changed during exact-byte hashing: {}",
+            path.display()
+        );
+        let mut digest = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in hasher.finalize() {
+            let _ = write!(digest, "{byte:02x}");
+        }
+        Ok((digest, bytes, after))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("cell rootfs hashing task failed: {error}"))?
 }
 
 async fn hash_file_sha256(path: &std::path::Path) -> anyhow::Result<(String, u64)> {
@@ -1903,6 +2075,19 @@ impl CellBackend for FirecrackerBackend {
         let vsock_uds = run_dir.join("vsock.sock");
         let log_file = run_dir.join("console.log");
         let overlay = run_dir.join("rootfs.ext4");
+        let rootfs_boot_guard = Self::rootfs_boot_lock_for(&overlay)?.lock_owned().await;
+        provision.hold_rootfs_boot_guard(rootfs_boot_guard);
+        let duplicate_live = self.procs.lock().await.contains_key(&spec.id);
+        if duplicate_live {
+            // This attempt owns no process or rootfs bytes. Disarm its cleanup
+            // before refusing: the ordinary failure guard would otherwise remove
+            // the already-live cell that won this per-cell serialization lock.
+            provision.refuse_without_cleanup();
+            anyhow::bail!(
+                "cell {} already has a live Firecracker process; refusing to mutate its rootfs",
+                spec.id
+            );
+        }
 
         // Per-cell writable rootfs. Platform deployment artifacts (`dpl-*`) always
         // boot the one shared base whose exact bytes back NodeInfo capability; their
@@ -2028,8 +2213,77 @@ impl CellBackend for FirecrackerBackend {
                 hive_core::fault::NODE_RUNTIME_MISSING
             );
         }
-        // Give the guest working DNS for outbound fetch (per-cell overlay only).
-        self.write_guest_resolv(&overlay).await;
+        // Give the guest working DNS in its private overlay, then authenticate
+        // the resulting FINAL bytes rather than the immutable base provenance.
+        // A deployment H1 cannot proceed if this expected mutation did not land.
+        let resolv_result = self.write_guest_resolv(&overlay).await;
+        if runtime_artifact_required {
+            resolv_result.with_context(|| {
+                format!(
+                    "cell {} could not complete its final rootfs mutation ({})",
+                    spec.id,
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                )
+            })?;
+        } else if let Err(error) = resolv_result {
+            tracing::warn!(cell = %spec.id, error = %error, "could not write guest resolver; continuing for non-deployment cell");
+        }
+
+        let mut boot_rootfs_file = None;
+        let mut boot_rootfs_stamp = None;
+        let mut boot_rootfs_proof_stamp = None;
+        let rootfs_drive_path = if let Some(base_proof) = selected_rootfs_proof.take() {
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options
+                .open(&overlay)
+                .with_context(|| format!("open final private rootfs for cell {}", spec.id))?;
+            let (image_sha256, image_bytes, hashed_stamp) =
+                hash_open_rootfs_sha256(&file, &overlay).await?;
+            anyhow::ensure!(
+                Self::rootfs_stamp(&overlay)? == hashed_stamp,
+                "cell {} rootfs path changed while its held inode was hashed ({})",
+                spec.id,
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+            anyhow::ensure!(
+                image_sha256 != base_proof.image_sha256,
+                "cell {} final rootfs still equals its immutable base after the required resolver mutation ({})",
+                spec.id,
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+            let final_proof = RuntimeArtifactRootfsMetadata {
+                schema: base_proof.schema,
+                protocol: base_proof.protocol,
+                agent_wire_protocol: base_proof.agent_wire_protocol,
+                agent_wire_capabilities: base_proof.agent_wire_capabilities,
+                agent_sha256: base_proof.agent_sha256,
+                image_sha256,
+                image_bytes,
+            };
+            let proof_stamp = Self::write_cell_rootfs_protocol_metadata(&overlay, &final_proof)?;
+            anyhow::ensure!(
+                Self::read_rootfs_protocol_metadata(&overlay)? == final_proof,
+                "cell {} final rootfs sidecar does not describe its exact hashed bytes",
+                spec.id
+            );
+            let held_path = PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                file.as_raw_fd()
+            ));
+            boot_rootfs_stamp = Some(hashed_stamp);
+            boot_rootfs_proof_stamp = Some(proof_stamp);
+            boot_rootfs_file = Some(file);
+            selected_rootfs_proof = Some(final_proof);
+            held_path
+        } else {
+            overlay.clone()
+        };
 
         // A published build artifact carries a separately-committed exact
         // identity. Copy both into this cell's private run directory so launch
@@ -2161,7 +2415,7 @@ impl CellBackend for FirecrackerBackend {
             "/drives/rootfs",
             &serde_json::json!({
                 "drive_id": "rootfs",
-                "path_on_host": overlay,
+                "path_on_host": rootfs_drive_path,
                 "is_root_device": true,
                 "is_read_only": false,
             }),
@@ -2199,12 +2453,32 @@ impl CellBackend for FirecrackerBackend {
         // entropy makes cold starts fast and deterministic. Best-effort: older
         // Firecracker without the device simply 400s and we proceed.
         let _ = fc_put(&api_sock, "/entropy", &serde_json::json!({})).await;
+        if let (Some(file), Some(image_stamp), Some(proof_stamp), Some(final_proof)) = (
+            boot_rootfs_file.as_ref(),
+            boot_rootfs_stamp.as_ref(),
+            boot_rootfs_proof_stamp.as_ref(),
+            selected_rootfs_proof.as_ref(),
+        ) {
+            anyhow::ensure!(
+                Self::rootfs_open_stamp(file)? == *image_stamp
+                    && Self::rootfs_stamp(&overlay)? == *image_stamp
+                    && Self::rootfs_protocol_stamp(&overlay)? == *proof_stamp
+                    && Self::read_rootfs_protocol_metadata(&overlay)? == *final_proof,
+                "cell {} final rootfs inode/length or exact sidecar changed before VMM boot ({})",
+                spec.id,
+                hive_core::fault::NODE_RUNTIME_MISSING
+            );
+        }
         fc_put(
             &api_sock,
             "/actions",
             &serde_json::json!({ "action_type": "InstanceStart" }),
         )
         .await?;
+        // Firecracker has opened the descriptor-pinned drive and started the
+        // guest. Only now may the host release the held source inode; later guest
+        // writes are ordinary writes through the VMM's already-open drive.
+        drop(boot_rootfs_file);
 
         if let Some(rootfs_proof) = selected_rootfs_proof {
             let mut proofs = self
@@ -2304,6 +2578,7 @@ impl CellBackend for FirecrackerBackend {
                     | AgentEvent::RuntimeArtifactReady(_)
                     | AgentEvent::FunctionReady
                     | AgentEvent::FunctionError(_)
+                    | AgentEvent::FunctionFault(_)
                     | AgentEvent::ExecOutput { .. }
                     | AgentEvent::ExecDone { .. } => {}
                 }
@@ -2481,6 +2756,12 @@ impl CellBackend for FirecrackerBackend {
         let mut artifact_ready = false;
         loop {
             let frame = read_frame(&mut stream).await?;
+            validate_agent_versioned_launch_event_frame(&frame).map_err(|error| {
+                anyhow::anyhow!(
+                    "{}: guest emitted a non-exact post-handshake event: {error}",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                )
+            })?;
             let event: AgentEvent = serde_json::from_slice(&frame).map_err(|error| {
                 anyhow::anyhow!(
                     "{}: guest emitted malformed post-handshake event: {error}",
@@ -2515,18 +2796,36 @@ impl CellBackend for FirecrackerBackend {
                     "{}: guest sent a duplicate or out-of-order handshake reply",
                     hive_core::fault::NODE_RUNTIME_MISSING
                 ),
-                AgentEvent::FunctionError(error)
-                    if error.contains(hive_core::fault::NODE_IMAGE_MISSING)
-                        || error.contains(hive_core::fault::NODE_RUNTIME_MISSING) =>
-                {
-                    anyhow::bail!(error)
+                AgentEvent::FunctionFault(fault) => match fault.code {
+                    AgentFunctionFaultCode::NodeImageMissing => anyhow::bail!(
+                        "{}: guest refused function start: {}",
+                        hive_core::fault::NODE_IMAGE_MISSING,
+                        fault.message
+                    ),
+                    AgentFunctionFaultCode::NodeRuntimeMissing => anyhow::bail!(
+                        "{}: guest refused function start: {}",
+                        hive_core::fault::NODE_RUNTIME_MISSING,
+                        fault.message
+                    ),
+                },
+                AgentEvent::FunctionError(error) => {
+                    // The guest is authenticated, but this value is still the
+                    // tenant process's stderr. Preserve it as diagnostics without
+                    // letting marker-shaped tenant text enter downstream fault
+                    // classifiers, which intentionally inspect returned errors.
+                    tracing::warn!(
+                        cell = %cell.id,
+                        image = %cell.image,
+                        tenant_start_diagnostic = %error,
+                        "tenant process failed to start inside its authenticated cell"
+                    );
+                    anyhow::bail!(
+                        "the deployment's own process failed to start inside its cell; check this \
+                         deployment's logs, entrypoint and required env; the cell itself booted \
+                         successfully ({})",
+                        hive_core::fault::DEPLOYMENT_START_FAILED
+                    )
                 }
-                AgentEvent::FunctionError(error) => anyhow::bail!(
-                    "the deployment's own process failed to start inside its cell: {error} — check \
-                     this deployment's logs, entrypoint and required env; the node booted the \
-                     cell fine ({})",
-                    hive_core::fault::DEPLOYMENT_START_FAILED
-                ),
                 unexpected => anyhow::bail!(
                     "{}: guest emitted out-of-order launch event {unexpected:?}",
                     hive_core::fault::NODE_RUNTIME_MISSING
@@ -3114,6 +3413,12 @@ async fn perform_agent_handshake(
                 hive_core::fault::NODE_RUNTIME_MISSING
             )
         })?;
+    validate_agent_handshake_response_frame(&frame).map_err(|error| {
+        anyhow::anyhow!(
+            "{}: guest returned a non-exact agent-handshake frame: {error}",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        )
+    })?;
     let event: AgentEvent = serde_json::from_slice(&frame).map_err(|error| {
         anyhow::anyhow!(
             "{}: guest returned invalid agent-handshake JSON: {error}",

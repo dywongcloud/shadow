@@ -111,10 +111,38 @@
     not (_agent_bin.stat.isreg | default(false)) or
     (_agent_bin.stat.checksum | default('') | length) != 64
 
+- name: Probe the canonical cell agent's exact protocol fact
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --signal=TERM
+      - --kill-after=1s
+      - "{{ (hive_cell_agent_protocol_timeout_seconds | default(5) | string) ~ 's' }}"
+      - "{{ hive_cargo_target_dir }}/release/hive-cell-agent"
+      - --agent-protocol-fact
+  register: _agent_protocol_fact
+  changed_when: false
+
+- name: Refuse a canonical agent with a mismatched protocol contract
+  vars:
+    _fact: "{{ _agent_protocol_fact.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _fact.keys() | sort == ['agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol']
+      - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
+      - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
+    fail_msg: >-
+      The glibc lane built a cell agent whose exact rootfs schema,
+      runtime-artifact protocol, wire protocol or capability set disagrees with
+      the release contract. Nothing from this lane may be fetched or published.
+
 - name: Set facts for this build host's artifact pair
   ansible.builtin.set_fact:
     hive_group_build_sha256: "{{ _bin.stat.checksum }}"
     hive_group_cell_agent_sha256: "{{ _agent_bin.stat.checksum }}"
+    hive_group_cell_agent_protocol_fact: "{{ _agent_protocol_fact.stdout | from_json }}"
 
 # Compress before either artifact crosses the operator's uplink. Integrity
 # remains over the uncompressed executable bytes and is rechecked after every

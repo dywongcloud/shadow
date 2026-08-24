@@ -458,27 +458,6 @@ pub fn detect_package_manager_checked(repo: &Path) -> anyhow::Result<PackageMana
     let npm_lock = regular_signal(repo, "package-lock.json")?;
     let pnpm_workspace = regular_signal(repo, "pnpm-workspace.yaml")?;
 
-    if declaration.is_none() {
-        let mut lock_managers = Vec::new();
-        if bun_lock {
-            lock_managers.push("bun.lock/bun.lockb");
-        }
-        if pnpm_lock {
-            lock_managers.push("pnpm-lock.yaml");
-        }
-        if yarn_lock {
-            lock_managers.push("yarn.lock");
-        }
-        if npm_lock {
-            lock_managers.push("package-lock.json");
-        }
-        anyhow::ensure!(
-            lock_managers.len() <= 1,
-            "conflicting package-manager lockfiles without an authoritative package.json#packageManager declaration: {}",
-            lock_managers.join(", ")
-        );
-    }
-
     let (mut manager, mut source, declaration) = declaration
         .map(|(manager, declaration)| {
             (
@@ -519,8 +498,17 @@ pub fn detect_package_manager_checked(repo: &Path) -> anyhow::Result<PackageMana
         conflicting.push("package-lock.json");
     }
     let conflict_warning = (!conflicting.is_empty()).then(|| {
+        let selector = match source {
+            PackageManagerSource::PackageJson => {
+                format!("package.json#packageManager selects \"{manager}\" exactly")
+            }
+            PackageManagerSource::PnpmWorkspace => {
+                format!("pnpm-workspace.yaml selects \"{manager}\"")
+            }
+            _ => format!("lockfile precedence (bun > pnpm > yarn > npm) selects \"{manager}\""),
+        };
         format!(
-            "package.json#packageManager selects \"{manager}\" exactly; ignoring stale conflicting lockfile(s): {}.",
+            "{selector}; ignoring stale conflicting lockfile(s): {}.",
             conflicting.join(", ")
         )
     });
@@ -1098,18 +1086,19 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_lockfiles_without_declaration_refuse_loudly() {
-        // No packageManager field and TWO lockfiles — precedence used to pick
-        // a winner and warn. Ambiguity without an authoritative declaration is
-        // now a loud refusal naming every lockfile, never a silent pick.
+    fn conflicting_lockfiles_without_declaration_resolve_by_precedence() {
+        // No packageManager field and TWO lockfiles — the documented Vercel
+        // precedence (bun > pnpm > yarn > npm) picks the winner and the loser
+        // is surfaced in the conflict warning, never a hard refusal: a stale
+        // second lockfile is a routine migration leftover, and refusing it
+        // failed every such repo's deploy outright (witnessed live 2026-08-23).
         let dir = repo_with(&[("bun.lock", ""), ("pnpm-lock.yaml", "")]);
         let d = detect_package_manager(&dir);
-        assert_eq!(d.manager, "invalid");
-        assert_eq!(d.source, PackageManagerSource::InvalidDeclaration);
+        assert_eq!(d.manager, "bun");
+        assert_eq!(d.source, PackageManagerSource::BunLock);
         let warning = d
             .conflict_warning
-            .expect("must name the conflicting lockfiles");
-        assert!(warning.contains("bun.lock"), "warning: {warning}");
+            .expect("must name the conflicting lockfile");
         assert!(warning.contains("pnpm-lock.yaml"), "warning: {warning}");
         let _ = fs::remove_dir_all(&dir);
     }

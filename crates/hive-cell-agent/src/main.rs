@@ -63,8 +63,11 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use hive_core::{
-        agent_handshake_transcript, now_ms, AgentBootProof, AgentEvent, AgentHandshake,
-        AgentHandshakeReady, AgentProtocolFault, AgentProtocolFaultCode, AgentRequest, BuildJob,
+        agent_handshake_transcript, agent_request_frame_kind, now_ms,
+        validate_agent_handshake_request_frame, validate_agent_start_function_request_frame,
+        validate_legacy_agent_start_function_request_frame, AgentBootProof, AgentEvent,
+        AgentFunctionFault, AgentFunctionFaultCode, AgentHandshake, AgentHandshakeReady,
+        AgentProtocolFault, AgentProtocolFaultCode, AgentRequest, AgentRequestFrameKind, BuildJob,
         BuildResult, ExecRequest, FunctionLaunch, LogLine, LogStream, RuntimeArtifactIdentity,
         RuntimeArtifactRootfsMarker, AGENT_HANDSHAKE_NONCE_BYTES, AGENT_WIRE_CAPABILITIES,
         AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
@@ -235,6 +238,11 @@ mod linux {
     static ACCEPTED_HANDSHAKE_NONCES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
+    /// Once any authenticated H1 succeeds, this VM never accepts the pre-H1
+    /// StartFunction lane again, even if that connection disappears before its
+    /// launch frame. This is process-global because one agent process is the VM.
+    static VERSIONED_LAUNCH_ONLY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     fn accepted_handshake_nonces() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
         ACCEPTED_HANDSHAKE_NONCES
@@ -261,52 +269,62 @@ mod linux {
         Ok(false)
     }
 
-    fn parse_agent_request(frame: &[u8]) -> Result<AgentRequest, AgentProtocolFault> {
-        serde_json::from_slice(frame).map_err(|error| {
-            protocol_fault(
-                AgentProtocolFaultCode::Malformed,
-                format!("agent request is not valid protocol JSON: {error}"),
-            )
-        })
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RequestFrameShape {
+        Versioned,
+        FrozenLegacyLaunch,
+        Other,
     }
 
-    /// The one pre-handshake launch shape frozen for a guest-first rollout. It
-    /// is the exact field set serialized by the actual pre-upgrade host, with
-    /// runtime_artifact absent. A future host cannot smuggle a new field through
-    /// this path, and the path never emits RuntimeArtifactReady.
-    fn frozen_legacy_launch_frame(frame: &[u8], launch: &FunctionLaunch) -> bool {
-        if launch.runtime_artifact.is_some() {
-            return false;
-        }
-        let Ok(serde_json::Value::Object(outer)) = serde_json::from_slice(frame) else {
-            return false;
+    struct ParsedAgentRequest {
+        request: AgentRequest,
+        shape: RequestFrameShape,
+    }
+
+    fn parse_agent_request(frame: &[u8]) -> Result<ParsedAgentRequest, AgentProtocolFault> {
+        let kind = agent_request_frame_kind(frame).map_err(|error| {
+            protocol_fault(
+                AgentProtocolFaultCode::Malformed,
+                format!("agent request has an invalid raw envelope: {error}"),
+            )
+        })?;
+        let shape = match kind {
+            AgentRequestFrameKind::Handshake => {
+                validate_agent_handshake_request_frame(frame).map_err(|error| {
+                    protocol_fault(
+                        AgentProtocolFaultCode::Malformed,
+                        format!("agent handshake frame was not exact: {error}"),
+                    )
+                })?;
+                RequestFrameShape::Versioned
+            }
+            AgentRequestFrameKind::StartFunction => {
+                let versioned = validate_agent_start_function_request_frame(frame);
+                let legacy = validate_legacy_agent_start_function_request_frame(frame);
+                match (versioned, legacy) {
+                    (Ok(()), Err(_)) => RequestFrameShape::Versioned,
+                    (Err(_), Ok(())) => RequestFrameShape::FrozenLegacyLaunch,
+                    (versioned, legacy) => {
+                        return Err(protocol_fault(
+                            AgentProtocolFaultCode::Malformed,
+                            format!(
+                                "StartFunction matched neither exact v2 nor exact frozen legacy schema (v2: {}; legacy: {})",
+                                versioned.err().unwrap_or_else(|| "ambiguous match".to_string()),
+                                legacy.err().unwrap_or_else(|| "ambiguous match".to_string()),
+                            ),
+                        ));
+                    }
+                }
+            }
+            AgentRequestFrameKind::Other => RequestFrameShape::Other,
         };
-        if outer.len() != 1 {
-            return false;
-        }
-        let Some(serde_json::Value::Object(fields)) = outer.get("StartFunction") else {
-            return false;
-        };
-        const LEGACY_FIELDS: [&str; 13] = [
-            "start_cmd",
-            "env",
-            "workdir",
-            "port",
-            "max_concurrency",
-            "memory_mib",
-            "cpus",
-            "pids",
-            "runtime",
-            "raw_proxy",
-            "udp_ports",
-            "tcp_ports",
-            "gpu",
-        ];
-        fields.len() == LEGACY_FIELDS.len()
-            && !fields.contains_key("runtime_artifact")
-            && LEGACY_FIELDS
-                .iter()
-                .all(|field| fields.contains_key(*field))
+        let request = serde_json::from_slice(frame).map_err(|error| {
+            protocol_fault(
+                AgentProtocolFaultCode::Malformed,
+                format!("agent request is not valid typed protocol JSON: {error}"),
+            )
+        })?;
+        Ok(ParsedAgentRequest { request, shape })
     }
 
     fn valid_handshake_nonce(nonce: &str) -> bool {
@@ -441,10 +459,16 @@ mod linux {
                 send(stream, &AgentEvent::RuntimeArtifactReady(identity))?;
                 match start_function(&launch, false) {
                     Ok(()) => send(stream, &AgentEvent::FunctionReady)?,
-                    Err(error) => send(stream, &AgentEvent::FunctionError(error.to_string()))?,
+                    Err(error) => send(stream, &versioned_launch_error_event(error))?,
                 }
             }
-            Err(error) => send(stream, &AgentEvent::FunctionError(error.to_string()))?,
+            Err(error) => send(
+                stream,
+                &AgentEvent::FunctionFault(AgentFunctionFault::new(
+                    AgentFunctionFaultCode::NodeImageMissing,
+                    error.to_string(),
+                )),
+            )?,
         }
         let _ = stream.flush();
         Ok(false)
@@ -479,8 +503,9 @@ mod linux {
                 return Ok(false);
             }
         };
+        let first_shape = first.shape;
 
-        match first {
+        match first.request {
             AgentRequest::Handshake(handshake) => {
                 let ready = match validate_handshake(&handshake) {
                     Ok(ready) => ready,
@@ -490,6 +515,10 @@ mod linux {
                         return Ok(false);
                     }
                 };
+                // Latch before HandshakeReady is written. A peer that receives the
+                // ready frame and disconnects (or whose write is only partially
+                // observed) cannot reopen the legacy lane on its next connection.
+                VERSIONED_LAUNCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
                 send(&mut stream, &AgentEvent::HandshakeReady(ready))?;
                 stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                 let next_frame = match read_frame(&mut stream) {
@@ -513,11 +542,11 @@ mod linux {
                         return Ok(false);
                     }
                 };
-                match next {
-                    AgentRequest::StartFunction(launch) => {
+                match (next.shape, next.request) {
+                    (RequestFrameShape::Versioned, AgentRequest::StartFunction(launch)) => {
                         handle_versioned_launch(&mut stream, launch)
                     }
-                    AgentRequest::Handshake(_) => refuse_protocol(
+                    (_, AgentRequest::Handshake(_)) => refuse_protocol(
                         &mut stream,
                         AgentProtocolFaultCode::DuplicateHandshake,
                         "duplicate handshake on one connection",
@@ -525,18 +554,24 @@ mod linux {
                     _ => refuse_protocol(
                         &mut stream,
                         AgentProtocolFaultCode::OutOfOrder,
-                        "handshake must be followed immediately by StartFunction",
+                        "handshake must be followed immediately by the exact v2 StartFunction frame",
                     ),
                 }
             }
             AgentRequest::StartFunction(launch) => {
-                if frozen_legacy_launch_frame(&first_frame, &launch) {
+                if first_shape == RequestFrameShape::FrozenLegacyLaunch
+                    && !VERSIONED_LAUNCH_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+                {
                     handle_legacy_launch(&mut stream, launch)
                 } else {
                     refuse_protocol(
                         &mut stream,
                         AgentProtocolFaultCode::HandshakeRequired,
-                        "StartFunction requires an authenticated agent handshake",
+                        if VERSIONED_LAUNCH_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+                            "this VM completed H1 and is permanently versioned-only; StartFunction requires a fresh authenticated handshake"
+                        } else {
+                            "StartFunction requires an authenticated agent handshake"
+                        },
                     )
                 }
             }
@@ -980,11 +1015,52 @@ mod linux {
         FUNCTION_BRIDGE.get_or_init(|| std::sync::Mutex::new(None))
     }
 
-    fn image_fault(kind: std::io::ErrorKind, message: impl std::fmt::Display) -> std::io::Error {
+    #[derive(Debug)]
+    struct TypedNodeLaunchError {
+        fault: AgentFunctionFault,
+    }
+
+    impl std::fmt::Display for TypedNodeLaunchError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.fault.message)
+        }
+    }
+
+    impl std::error::Error for TypedNodeLaunchError {}
+
+    fn node_launch_fault(
+        kind: std::io::ErrorKind,
+        code: AgentFunctionFaultCode,
+        message: impl std::fmt::Display,
+    ) -> std::io::Error {
         std::io::Error::new(
             kind,
-            format!("{message} ({})", hive_core::fault::NODE_IMAGE_MISSING),
+            TypedNodeLaunchError {
+                fault: AgentFunctionFault::new(code, message.to_string()),
+            },
         )
+    }
+
+    fn typed_node_launch_fault(error: &std::io::Error) -> Option<AgentFunctionFault> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<TypedNodeLaunchError>())
+            .map(|source| source.fault.clone())
+    }
+
+    fn image_fault(kind: std::io::ErrorKind, message: impl std::fmt::Display) -> std::io::Error {
+        node_launch_fault(kind, AgentFunctionFaultCode::NodeImageMissing, message)
+    }
+
+    fn runtime_fault(kind: std::io::ErrorKind, message: impl std::fmt::Display) -> std::io::Error {
+        node_launch_fault(kind, AgentFunctionFaultCode::NodeRuntimeMissing, message)
+    }
+
+    fn versioned_launch_error_event(error: std::io::Error) -> AgentEvent {
+        match typed_node_launch_fault(&error) {
+            Some(fault) => AgentEvent::FunctionFault(fault),
+            None => AgentEvent::FunctionError(error.to_string()),
+        }
     }
 
     struct ValidatedWorkdir {
@@ -1010,12 +1086,9 @@ mod linux {
                 "/workspace"
             }
             _ => {
-                return Err(std::io::Error::new(
+                return Err(runtime_fault(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "runtime artifact identity and workdir must be supplied together ({})",
-                        hive_core::fault::NODE_RUNTIME_MISSING
-                    ),
+                    "runtime artifact identity and workdir must be supplied together",
                 ));
             }
         };
@@ -1151,12 +1224,9 @@ mod linux {
         if fd < 0 {
             let error = std::io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
-                return Err(std::io::Error::new(
+                return Err(runtime_fault(
                     std::io::ErrorKind::Unsupported,
-                    format!(
-                        "guest kernel cannot perform bounded executable resolution: {error} ({})",
-                        hive_core::fault::NODE_RUNTIME_MISSING
-                    ),
+                    format!("guest kernel cannot perform bounded executable resolution: {error}"),
                 ));
             }
             return Err(error);
@@ -1200,30 +1270,36 @@ mod linux {
             workdir: Option<&Path>,
             node_fault: bool,
         ) -> std::io::Result<Self> {
-            let metadata = file.metadata()?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
             if !metadata.is_file() {
-                return Err(std::io::Error::new(
+                return Err(executable_error(
                     std::io::ErrorKind::InvalidData,
                     "resolved executable is not a regular file",
+                    node_fault,
                 ));
             }
             if metadata.mode() & 0o111 == 0 {
-                return Err(std::io::Error::new(
+                return Err(executable_error(
                     std::io::ErrorKind::PermissionDenied,
                     "resolved executable has no execute permission",
+                    node_fault,
                 ));
             }
             let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-            let path = std::fs::read_link(&fd_path)?;
+            let path = std::fs::read_link(&fd_path)
+                .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
             if let Some(workdir) = workdir {
                 if !path.starts_with(workdir) {
-                    return Err(std::io::Error::new(
+                    return Err(executable_error(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
                             "resolved executable {} escapes runtime workdir {}",
                             path.display(),
                             workdir.display()
                         ),
+                        node_fault,
                     ));
                 }
             }
@@ -1257,7 +1333,7 @@ mod linux {
         }
 
         fn error(&self, error: std::io::Error) -> std::io::Error {
-            executable_error(error.kind(), error, self.node_fault)
+            preserve_or_classify_executable_error(error, self.node_fault)
         }
     }
 
@@ -1267,12 +1343,20 @@ mod linux {
         node_fault: bool,
     ) -> std::io::Error {
         if node_fault {
-            std::io::Error::new(
-                kind,
-                format!("{message} ({})", hive_core::fault::NODE_RUNTIME_MISSING),
-            )
+            runtime_fault(kind, message)
         } else {
             std::io::Error::new(kind, message.to_string())
+        }
+    }
+
+    fn preserve_or_classify_executable_error(
+        error: std::io::Error,
+        node_fault: bool,
+    ) -> std::io::Error {
+        if typed_node_launch_fault(&error).is_some() {
+            error
+        } else {
+            executable_error(error.kind(), error, node_fault)
         }
     }
 
@@ -1367,7 +1451,8 @@ mod linux {
         relative: &Path,
         node_fault: bool,
     ) -> std::io::Result<ResolvedExecutable> {
-        let file = open_at(workdir.dir.as_raw_fd(), relative, true)?;
+        let file = open_at(workdir.dir.as_raw_fd(), relative, true)
+            .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
         ResolvedExecutable::from_file(file, Some(&workdir.path), node_fault)
     }
 
@@ -1375,7 +1460,8 @@ mod linux {
         path: &Path,
         node_fault: bool,
     ) -> std::io::Result<ResolvedExecutable> {
-        let file = open_at(libc::AT_FDCWD, path, false)?;
+        let file = open_at(libc::AT_FDCWD, path, false)
+            .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
         ResolvedExecutable::from_file(file, None, node_fault)
     }
 
@@ -1419,8 +1505,9 @@ mod linux {
                         ),
                     ));
                 }
-                return open_system_executable(path, platform_program)
-                    .map_err(|error| executable_error(error.kind(), error, platform_program));
+                return open_system_executable(path, platform_program).map_err(|error| {
+                    preserve_or_classify_executable_error(error, platform_program)
+                });
             }
             return open_artifact_executable(workdir, &normalize_relative(path, false)?, false);
         }
@@ -1448,7 +1535,7 @@ mod linux {
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) => {}
                 Err(error) => {
-                    return Err(executable_error(error.kind(), error, node_fault));
+                    return Err(preserve_or_classify_executable_error(error, node_fault));
                 }
             }
         }
@@ -1497,7 +1584,7 @@ mod linux {
             .enable_all()
             .build()
             .map_err(|error| {
-                std::io::Error::new(
+                runtime_fault(
                     error.kind(),
                     format!("function bridge Tokio runtime creation failed: {error}"),
                 )
@@ -1506,7 +1593,7 @@ mod linux {
         let local = format!("127.0.0.1:{function_port}");
         runtime.block_on(async move {
             let mut listener = tokio_vsock::VsockListener::bind(address).map_err(|error| {
-                std::io::Error::new(
+                runtime_fault(
                     error.kind(),
                     format!(
                         "function bridge bind on vsock port {CELL_FUNCTION_PORT} failed: {error}"
@@ -1567,12 +1654,9 @@ mod linux {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if slot.is_some() {
-            return Err(std::io::Error::new(
+            return Err(runtime_fault(
                 std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "function bridge already exists in this cell ({})",
-                    hive_core::fault::NODE_RUNTIME_MISSING
-                ),
+                "function bridge already exists in this cell",
             ));
         }
         let handle = std::thread::Builder::new()
@@ -1598,12 +1682,9 @@ mod linux {
                 let _ = startup_tx.send(Err(message));
             })
             .map_err(|error| {
-                std::io::Error::new(
+                runtime_fault(
                     error.kind(),
-                    format!(
-                        "function bridge thread creation failed: {error} ({})",
-                        hive_core::fault::NODE_RUNTIME_MISSING
-                    ),
+                    format!("function bridge thread creation failed: {error}"),
                 )
             })?;
         *slot = Some(handle);
@@ -1618,12 +1699,9 @@ mod linux {
                     .map(|handle| handle.is_finished())
                     .unwrap_or(true);
                 if finished {
-                    return Err(std::io::Error::new(
+                    return Err(runtime_fault(
                         std::io::ErrorKind::BrokenPipe,
-                        format!(
-                            "function bridge ended during startup ({})",
-                            hive_core::fault::NODE_RUNTIME_MISSING
-                        ),
+                        "function bridge ended during startup",
                     ));
                 }
                 Ok(())
@@ -1636,12 +1714,9 @@ mod linux {
                 if let Some(handle) = handle {
                     let _ = handle.join();
                 }
-                Err(std::io::Error::new(
+                Err(runtime_fault(
                     std::io::ErrorKind::AddrNotAvailable,
-                    format!(
-                        "function bridge failed before readiness: {message} ({})",
-                        hive_core::fault::NODE_RUNTIME_MISSING
-                    ),
+                    format!("function bridge failed before readiness: {message}"),
                 ))
             }
             Err(error) => {
@@ -1652,12 +1727,9 @@ mod linux {
                 if let Some(handle) = handle {
                     let _ = handle.join();
                 }
-                Err(std::io::Error::new(
+                Err(runtime_fault(
                     std::io::ErrorKind::BrokenPipe,
-                    format!(
-                        "function bridge startup failed without a result: {error} ({})",
-                        hive_core::fault::NODE_RUNTIME_MISSING
-                    ),
+                    format!("function bridge startup failed without a result: {error}"),
                 ))
             }
         }

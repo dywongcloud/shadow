@@ -2042,6 +2042,8 @@ async fn run_build(
         // incapable nodes, never add one.
         let known_wasm = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
             == Some(hive_core::Runtime::Wasmer);
+        let known_bun = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
+            == Some(hive_core::Runtime::Bun);
         let needs_build_isolation = !known_container;
         let targets = crate::schedule::place_for_project(
             cloud,
@@ -2050,7 +2052,10 @@ async fn run_build(
             known_container,
             known_container,
             needs_gpu,
-            known_wasm,
+            crate::schedule::InterpreterNeeds {
+                wasm: known_wasm,
+                bun: known_bun,
+            },
             !known_container,
             needs_build_isolation,
         );
@@ -3431,6 +3436,10 @@ async fn run_build(
     let is_wasm = manifest.functions.iter().any(|f| {
         hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer
     });
+    let is_bun = manifest
+        .functions
+        .iter()
+        .any(|f| hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Bun);
 
     // ---- Stateful fanout-replica guard (the remote sub-build side) ---------
     // The coordinator's two placement gates cannot cover the pure-remote fanout
@@ -4304,7 +4313,10 @@ async fn run_build(
             false,
             is_stateful,
             needs_gpu,
-            is_wasm,
+            crate::schedule::InterpreterNeeds {
+                wasm: is_wasm,
+                bun: is_bun,
+            },
             true,
             true,
         );
@@ -5965,17 +5977,36 @@ trap - EXIT HUP INT TERM
             build_output_manifest(project, plan.framework.slug, output)?;
         }
     }
-    let expected_output = if build_output.is_some() && !explicit_commands {
-        fluid_build::OutputDirectory::parse(".vercel/output")?
+    if explicit_commands {
+        // Repository-controlled install/build commands choose their own
+        // output shape — which may be a package-less Build Output API v3
+        // artifact under `.vercel/output`, a directory the framework's own
+        // `output_dir` heuristic never anticipated. Seal the whole checkout
+        // unconditionally: `finish()` still materializes every byte
+        // (`finish_inner`'s `sealed.materialize_replace` runs regardless of
+        // any directory precondition), so nothing is dropped, and the real
+        // `.vercel/output` parse right below decides what actually shipped
+        // instead of a precondition that can name a directory the explicit
+        // build never promised to produce.
+        isolated.finish().await?;
     } else {
-        plan.output_dir.clone()
-    };
-    isolated.finish_with_output(dir, &expected_output).await?;
+        let expected_output = if build_output.is_some() {
+            fluid_build::OutputDirectory::parse(".vercel/output")?
+        } else {
+            plan.output_dir.clone()
+        };
+        isolated.finish_with_output(dir, &expected_output).await?;
+    }
 
     let parsed_build_output = fluid_build::resolve_build_output_checked(dir)?;
     if let Some(output) = parsed_build_output.as_ref() {
         log("Build Output API v3 detected (.vercel/output).".into());
-        return Ok(build_output_manifest(project, plan.framework.slug, output)?);
+        let mut manifest = build_output_manifest(project, plan.framework.slug, output)?;
+        // Stage the platform-owned launcher AFTER the artifact is fully
+        // materialized (`finish`/`finish_with_output` above) and validated
+        // (`build_output_manifest` just succeeded) — never before.
+        stage_build_output_node_launchers(dir, &mut manifest)?;
+        return Ok(manifest);
     }
 
     use fluid_build::Primitive;
@@ -6166,9 +6197,13 @@ fn build_output_manifest(
                 ),
             )
         })?;
-        // Only nodejs*.x runtimes are supported — the same check
-        // is_supported_build_output_runtime applies at evaluation.
-        if !runtime.starts_with("nodejs") || !runtime.ends_with(".x") {
+        // Exact allowlist — never a loose "nodejs*.x" pattern. Mirrors
+        // fluid_gateway::SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES, the real
+        // enforcement point (`is_supported_build_output_runtime`, applied
+        // again just below via `build_output_v3_evaluator`); duplicated here
+        // ONLY so an unsupported runtime fails fast with a Build Contract
+        // error before a FunctionConfig is even constructed.
+        if !matches!(runtime, "nodejs20.x" | "nodejs22.x" | "nodejs24.x") {
             return Err(build_output_contract_error(
                 "provision Build Output API v3 functions",
                 fluid_core::BuildOutputV3Refusal::unsupported(format!(
@@ -6177,33 +6212,57 @@ fn build_output_manifest(
                 )),
             ));
         }
+        // `descriptor.validate()` (called by `from_parser_value` above)
+        // already REQUIRES a non-empty `handler` string that names a real
+        // entry in this function's own `files` inventory — never defaulted.
+        // This lookup can only fail if that invariant were ever weakened, and
+        // must still fail the build loudly rather than silently guessing
+        // `index.js` (a guess that could point at a file the tenant never
+        // shipped, or shadow a same-named file in a sibling function).
         let handler = function
             .config
             .get("handler")
             .and_then(|v| v.as_str())
-            .unwrap_or("index.js");
+            .ok_or_else(|| {
+                build_output_contract_error(
+                    "provision Build Output API v3 functions",
+                    fluid_core::BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.handler", function.name),
+                        "is missing",
+                    ),
+                )
+            })?;
         let memory = function
             .config
             .get("memory")
             .and_then(|v| v.as_u64())
             .unwrap_or(1024) as u32;
+        // Platform default (5 minutes), matching `default_max_duration` — the
+        // prior `10` here was a Build-Output-only regression from that
+        // default, silently killing any handler that ran longer than 10s.
         let max_duration = function
             .config
             .get("maxDuration")
             .and_then(|v| v.as_u64())
-            .unwrap_or(10);
+            .unwrap_or(fluid_core::FunctionConfig::default().max_duration_secs);
+        let func_dir_rel = format!(".vercel/output/functions/{}.func", function.name);
         manifest.functions.push(FunctionConfig {
             name: function.name.clone(),
             runtime: "node".to_string(),
+            // Direct Node argv against the platform-owned launcher staged by
+            // `stage_build_output_node_launchers` right after this manifest is
+            // built from the fully materialized artifact — no shell, no
+            // package manager. The handler path passed as argv[1] is relative
+            // to the function's OWN `.func` CWD (`cwd_relative` below), the
+            // exact directory the launcher's `import()` resolves against.
             start_cmd: vec![
                 "node".to_string(),
-                format!(
-                    ".vercel/output/functions/{}.func/{handler}",
-                    function.name
-                ),
+                BUILD_OUTPUT_NODE_LAUNCHER_FILE.to_string(),
+                handler.to_string(),
             ],
             memory_mib: memory,
             max_duration_secs: max_duration,
+            cwd_relative: Some(func_dir_rel),
             ..Default::default()
         });
     }
@@ -6263,6 +6322,108 @@ fn build_output_manifest(
         ));
     }
     Ok(manifest)
+}
+
+/// The ONE platform-owned Node HTTP bridge for Build Output API v3 `.func`
+/// bundles (build-output-immutable-launcher). Read at compile time from the
+/// crate's own source tree (the `AFTER_SHIM_JS` precedent above) and staged
+/// verbatim into every Node Build Output function's OWN `.func` directory —
+/// never into the deployment root, and never shared byte-for-byte with a
+/// tenant-writable path.
+const BUILD_OUTPUT_NODE_LAUNCHER_SRC: &str = include_str!("build-output-node-launcher.mjs");
+const BUILD_OUTPUT_NODE_LAUNCHER_FILE: &str = ".hive-build-output-launcher.mjs";
+
+/// Stage [`BUILD_OUTPUT_NODE_LAUNCHER_SRC`] into every Node Build Output
+/// function's own `.func` directory on the now-fully-materialized host
+/// checkout, ONLY after: (1) every repository-controlled install/build
+/// command has finished (`isolated.finish`/`finish_with_output` already ran),
+/// (2) the artifact has been parsed and validated
+/// (`fluid_build::resolve_build_output_checked` + `build_output_manifest`
+/// already succeeded, which is the only way this function is ever reached),
+/// and (3) the checks below — no symlinked `.func` directory, no existing
+/// entry at the reserved launcher path — pass for THIS function. Never called
+/// from the pre-materialization fast-fail check (that call site discards its
+/// `Manifest`; there is nothing to deploy and no host directory to write
+/// into yet).
+fn stage_build_output_node_launchers(
+    dir: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), fluid_build::BuildContractError> {
+    let stage_error = |function: &str, detail: String| {
+        fluid_build::BuildContractError::new(
+            fluid_build::BuildContractErrorCode::InvalidBuildOutput,
+            "stage Build Output API v3 Node launcher",
+            format!("function {function:?}: {detail}"),
+        )
+    };
+    let canonical_root = dir.canonicalize().map_err(|e| {
+        fluid_build::BuildContractError::new(
+            fluid_build::BuildContractErrorCode::InvalidBuildOutput,
+            "stage Build Output API v3 Node launcher",
+            format!("checkout root {} is not readable: {e}", dir.display()),
+        )
+    })?;
+    for function in manifest.functions.iter_mut() {
+        if function.runtime != "node" || function.cwd_relative.is_none() {
+            continue;
+        }
+        let func_dir_rel = function.cwd_relative.clone().unwrap_or_default();
+        let func_dir = dir.join(&func_dir_rel);
+        let canonical_func_dir = func_dir.canonicalize().map_err(|e| {
+            stage_error(
+                &function.name,
+                format!("function directory is not readable: {e}"),
+            )
+        })?;
+        // The parser already proved every FILE under this function is a
+        // portable relative regular-file path; the DIRECTORY CHAIN down to
+        // it is platform-controlled attack surface once we are about to
+        // write a new file into it, so it is checked independently here —
+        // a symlinked `.func` directory (or an ancestor of it) could
+        // otherwise redirect this write anywhere on the host.
+        if !canonical_func_dir.starts_with(&canonical_root) {
+            return Err(stage_error(
+                &function.name,
+                "function directory escapes the checkout root (symlink?)".to_string(),
+            ));
+        }
+        let launcher_path = canonical_func_dir.join(BUILD_OUTPUT_NODE_LAUNCHER_FILE);
+        // Collision refusal: this exact filename is platform-reserved inside
+        // every `.func` directory. `symlink_metadata` (not `metadata`) so an
+        // existing SYMLINK at this path is caught even if its target is
+        // missing/circular.
+        if std::fs::symlink_metadata(&launcher_path).is_ok() {
+            return Err(stage_error(
+                &function.name,
+                format!(
+                    "already contains a reserved platform launcher path {BUILD_OUTPUT_NODE_LAUNCHER_FILE:?}"
+                ),
+            ));
+        }
+        let tmp_path = canonical_func_dir.join(format!("{BUILD_OUTPUT_NODE_LAUNCHER_FILE}.tmp"));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut tmp = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            tmp.write_all(BUILD_OUTPUT_NODE_LAUNCHER_SRC.as_bytes())?;
+            tmp.sync_all()?;
+            drop(tmp);
+            std::fs::rename(&tmp_path, &launcher_path)?;
+            let mut perms = std::fs::metadata(&launcher_path)?.permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&launcher_path, perms)
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(stage_error(
+                &function.name,
+                format!("cannot stage launcher: {e}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn static_manifest(project: &str, static_dir: &str) -> Manifest {

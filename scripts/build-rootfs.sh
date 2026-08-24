@@ -20,6 +20,19 @@
 # marker is what `hive-cloud`'s `detect_wasm_runtime` probe stats to decide
 # whether this node may advertise `NodeInfo::wasm_runtime`, because mounting an
 # ext4 image to look inside would need root and a loop device at every boot.
+#
+# BUN (hive_core::Runtime::Bun): identical requirement and identical reason —
+# `hive-cell-agent` execs a Bun `start_cmd[0]` against the GUEST PATH too, so a
+# `bun` installed on the host is equally invisible to it. Two staging forms,
+# since (unlike wasmer's upstream `.tar.gz`) Bun's own release artifact is a
+# `.zip`: set BUN_TARBALL=/path/to/bun-linux-x64.tar.gz for a repackaged
+# tarball with `bun` at its root (`tar czf bun-linux-x64.tar.gz -C
+# bun-linux-x64 bun`, mirroring the wasmer convention above exactly), or set
+# BUN_BINARY=/path/to/bun for an already-extracted executable (e.g. after
+# unzipping the upstream artifact yourself) — set at most one. When staged, a
+# `<name>.bun` marker file is written NEXT TO the image, the same way and for
+# the same reason as `<name>.wasmer` — `hive-cloud`'s `detect_bun_runtime`
+# probe (`NodeInfo::bun_runtime`) stats it.
 set -euo pipefail
 # Convert controller/timeout signals into a normal shell exit so whichever EXIT
 # cleanup is current unmounts and removes private staging before the remote
@@ -30,11 +43,22 @@ trap 'exit 143' TERM
 
 AGENT_BIN="${AGENT_BIN:-/usr/local/bin/hive-cell-agent}"
 AGENT_RELEASE_FACT="${AGENT_RELEASE_FACT:-${AGENT_BIN}.release.json}"
+ROOTFS_SCHEMA_EXPECTED="${ROOTFS_SCHEMA_EXPECTED:-2}"
 RUNTIME_ARTIFACT_PROTOCOL_EXPECTED="${RUNTIME_ARTIFACT_PROTOCOL_EXPECTED:-1}"
+AGENT_WIRE_PROTOCOL_EXPECTED="${AGENT_WIRE_PROTOCOL_EXPECTED:-2}"
+AGENT_WIRE_CAPABILITIES_EXPECTED="${AGENT_WIRE_CAPABILITIES_EXPECTED:-15}"
 AGENT_PROTOCOL_TIMEOUT_SECS="${AGENT_PROTOCOL_TIMEOUT_SECS:-5}"
-CELL_AGENT_RELEASE_SCHEMA_EXPECTED="${CELL_AGENT_RELEASE_SCHEMA_EXPECTED:-1}"
+CELL_AGENT_RELEASE_SCHEMA_EXPECTED="${CELL_AGENT_RELEASE_SCHEMA_EXPECTED:-2}"
 
 preflight_agent() {
+  command -v debugfs >/dev/null 2>&1 || {
+    echo "debugfs is required to verify exact in-rootfs facts" >&2
+    return 1
+  }
+  command -v flock >/dev/null 2>&1 || {
+    echo "flock is required to serialize cell-agent packaging with the rootfs bake" >&2
+    return 1
+  }
   command -v python3 >/dev/null 2>&1 || {
     echo "python3 is required to verify the cell-agent release fact" >&2
     return 1
@@ -47,12 +71,15 @@ preflight_agent() {
     echo "timeout is required to bound the cell-agent protocol probe" >&2
     return 1
   }
-  case "$RUNTIME_ARTIFACT_PROTOCOL_EXPECTED" in
-    ''|*[!0-9]*) echo "required runtime-artifact protocol must be an unsigned integer" >&2; return 1 ;;
-  esac
-  case "$CELL_AGENT_RELEASE_SCHEMA_EXPECTED" in
-    ''|*[!0-9]*) echo "required cell-agent release schema must be an unsigned integer" >&2; return 1 ;;
-  esac
+  local numeric name
+  for name in ROOTFS_SCHEMA_EXPECTED RUNTIME_ARTIFACT_PROTOCOL_EXPECTED \
+    AGENT_WIRE_PROTOCOL_EXPECTED AGENT_WIRE_CAPABILITIES_EXPECTED \
+    CELL_AGENT_RELEASE_SCHEMA_EXPECTED; do
+    numeric="${!name}"
+    case "$numeric" in
+      ''|*[!0-9]*) echo "$name must be an unsigned integer" >&2; return 1 ;;
+    esac
+  done
   case "$AGENT_PROTOCOL_TIMEOUT_SECS" in
     ''|*[!0-9]*) echo "cell-agent protocol timeout must be from 1 through 30 seconds" >&2; return 1 ;;
   esac
@@ -85,55 +112,104 @@ if stat.S_IMODE(metadata.st_mode) != 0o444 or metadata.st_size <= 0 or metadata.
     raise SystemExit('release fact must be mode 0444 and at most 4096 bytes')
 with open(path, 'rb') as handle:
     fact = json.load(handle)
-if set(fact) != {'schema', 'runtime_artifact_protocol', 'agent_sha256'}:
+keys = {
+    'schema', 'rootfs_schema', 'runtime_artifact_protocol',
+    'agent_wire_protocol', 'agent_wire_capabilities', 'agent_sha256',
+}
+if set(fact) != keys:
     raise SystemExit('release fact has unexpected fields')
-if not isinstance(fact['schema'], int) or not isinstance(fact['runtime_artifact_protocol'], int):
-    raise SystemExit('release fact schema and protocol must be integers')
+for key in keys - {'agent_sha256'}:
+    if type(fact[key]) is not int:
+        raise SystemExit(f'release fact {key} must be an integer')
 digest = fact['agent_sha256']
 if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
     raise SystemExit('release fact agent digest is not lowercase SHA-256')
-print(f"{fact['schema']} {fact['runtime_artifact_protocol']} {digest}")
+print(
+    fact['schema'], fact['rootfs_schema'], fact['runtime_artifact_protocol'],
+    fact['agent_wire_protocol'], fact['agent_wire_capabilities'], digest,
+)
 PYFACT
   )" || {
-    echo "cell-agent release fact is not a parseable supported fact" >&2
+    echo "cell-agent release fact is not a parseable supported schema-2 fact" >&2
     return 1
   }
 
-  local fact_schema fact_protocol fact_sha256 actual_sha256 probe_rc
-  read -r fact_schema fact_protocol fact_sha256 <<<"$fact_values"
+  local fact_schema fact_rootfs_schema fact_protocol fact_wire fact_capabilities fact_sha256
+  read -r fact_schema fact_rootfs_schema fact_protocol fact_wire fact_capabilities fact_sha256 <<<"$fact_values"
   [ "$fact_schema" = "$CELL_AGENT_RELEASE_SCHEMA_EXPECTED" ] || {
     echo "cell-agent release schema $fact_schema does not match required $CELL_AGENT_RELEASE_SCHEMA_EXPECTED" >&2
     return 1
   }
-  [ "$fact_protocol" = "$RUNTIME_ARTIFACT_PROTOCOL_EXPECTED" ] || {
-    echo "cell-agent release protocol $fact_protocol does not match required $RUNTIME_ARTIFACT_PROTOCOL_EXPECTED" >&2
+  [ "$fact_rootfs_schema" = "$ROOTFS_SCHEMA_EXPECTED" ] || {
+    echo "cell-agent rootfs schema $fact_rootfs_schema does not match required $ROOTFS_SCHEMA_EXPECTED" >&2
     return 1
   }
+  [ "$fact_protocol" = "$RUNTIME_ARTIFACT_PROTOCOL_EXPECTED" ] || {
+    echo "cell-agent runtime-artifact protocol $fact_protocol does not match required $RUNTIME_ARTIFACT_PROTOCOL_EXPECTED" >&2
+    return 1
+  }
+  [ "$fact_wire" = "$AGENT_WIRE_PROTOCOL_EXPECTED" ] || {
+    echo "cell-agent wire protocol $fact_wire does not match required $AGENT_WIRE_PROTOCOL_EXPECTED" >&2
+    return 1
+  }
+  [ "$fact_capabilities" = "$AGENT_WIRE_CAPABILITIES_EXPECTED" ] || {
+    echo "cell-agent capabilities $fact_capabilities do not match required $AGENT_WIRE_CAPABILITIES_EXPECTED" >&2
+    return 1
+  }
+  local actual_sha256
   actual_sha256="$(sha256sum "$AGENT_BIN" | cut -d' ' -f1)"
   [ "$actual_sha256" = "$fact_sha256" ] || {
     echo "cell-agent bytes do not match release fact (actual $actual_sha256, fact $fact_sha256)" >&2
     return 1
   }
 
+  local probe_json probe_values probe_rc
   set +e
-  AGENT_PROTOCOL="$(timeout --signal=TERM --kill-after=1s \
-    "${AGENT_PROTOCOL_TIMEOUT_SECS}s" "$AGENT_BIN" --runtime-artifact-protocol 2>/dev/null)"
+  probe_json="$(timeout --signal=TERM --kill-after=1s \
+    "${AGENT_PROTOCOL_TIMEOUT_SECS}s" "$AGENT_BIN" --agent-protocol-fact 2>/dev/null)"
   probe_rc=$?
   set -e
   [ "$probe_rc" -eq 0 ] || {
-    echo "bounded cell-agent --runtime-artifact-protocol probe failed (rc=$probe_rc, timeout=${AGENT_PROTOCOL_TIMEOUT_SECS}s); refusing before rootfs or service mutation" >&2
+    echo "bounded cell-agent --agent-protocol-fact probe failed (rc=$probe_rc, timeout=${AGENT_PROTOCOL_TIMEOUT_SECS}s); refusing before rootfs or service mutation" >&2
     return 1
   }
-  case "$AGENT_PROTOCOL" in
-    ''|*[!0-9]*) echo "cell-agent protocol probe returned a non-integer fact" >&2; return 1 ;;
-  esac
-  [ "$AGENT_PROTOCOL" = "$fact_protocol" ] || {
-    echo "cell-agent probe protocol $AGENT_PROTOCOL does not match release fact $fact_protocol" >&2
+  probe_values="$(python3 - "$probe_json" <<'PYPROBE'
+import json, sys
+try:
+    fact = json.loads(sys.argv[1])
+except Exception as error:
+    raise SystemExit(f'agent protocol fact is invalid JSON: {error}')
+keys = {
+    'rootfs_schema', 'runtime_artifact_protocol',
+    'agent_wire_protocol', 'agent_wire_capabilities',
+}
+if set(fact) != keys or any(type(fact[key]) is not int for key in keys):
+    raise SystemExit('agent protocol fact has missing, extra, or non-integer fields')
+print(
+    fact['rootfs_schema'], fact['runtime_artifact_protocol'],
+    fact['agent_wire_protocol'], fact['agent_wire_capabilities'],
+)
+PYPROBE
+  )" || {
+    echo "cell-agent --agent-protocol-fact did not return the exact supported fact" >&2
     return 1
   }
+  local probe_rootfs probe_protocol probe_wire probe_capabilities
+  read -r probe_rootfs probe_protocol probe_wire probe_capabilities <<<"$probe_values"
+  [ "$probe_rootfs $probe_protocol $probe_wire $probe_capabilities" = \
+    "$fact_rootfs_schema $fact_protocol $fact_wire $fact_capabilities" ] || {
+    echo "cell-agent protocol probe disagrees with its release fact" >&2
+    return 1
+  }
+
+  ROOTFS_SCHEMA="$probe_rootfs"
+  AGENT_PROTOCOL="$probe_protocol"
+  AGENT_WIRE_PROTOCOL="$probe_wire"
+  AGENT_WIRE_CAPABILITIES="$probe_capabilities"
   AGENT_SHA256="$actual_sha256"
-  printf '{"schema":%s,"runtime_artifact_protocol":%s,"agent_sha256":"%s"}\n' \
-    "$fact_schema" "$AGENT_PROTOCOL" "$AGENT_SHA256"
+  printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
+    "$fact_schema" "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+    "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256"
 }
 
 if [ "${1:-}" = "--preflight-agent" ]; then
@@ -153,12 +229,23 @@ SIZE_MIB="${3:-2048}"
 ROOTFS_DIR="${ROOTFS_DIR:-/var/lib/hive/rootfs}"
 CONTAINER_CLI="${CONTAINER_CLI:-docker}"
 WASMER_TARBALL="${WASMER_TARBALL:-}"
+BUN_TARBALL="${BUN_TARBALL:-}"
+BUN_BINARY="${BUN_BINARY:-}"
 
-# Prove the exact installed release BEFORE creating a container, lock, image, or
-# mount. In particular, a bootstrap-vintage agent that treats the unknown flag
-# as "start the server" is killed by the bounded probe instead of hanging this
-# builder forever.
+# Prove the exact installed release BEFORE creating a container, rootfs lock,
+# image, or mount. Then own the installer's release lock and re-prove under that
+# serialization for the entire bake: the installed fact cannot rotate between
+# the snapshot and atomic rootfs publication.
 preflight_agent >/dev/null
+exec 8>"${AGENT_BIN}.install.lock"
+flock -n 8 || {
+  echo "cell-agent packaging owns ${AGENT_BIN}.install.lock; refusing a split release/rootfs bake" >&2
+  exit 1
+}
+preflight_agent >/dev/null
+PACKAGED_RELEASE_FACT="$(printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}' \
+  "$CELL_AGENT_RELEASE_SCHEMA_EXPECTED" "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" \
+  "$AGENT_WIRE_PROTOCOL" "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256")"
 
 # Snapshot the exact proved inode before doing slow image work. Backend packaging
 # publishes the host agent by atomic rename, so a concurrent release could
@@ -239,8 +326,9 @@ sudo mkdir -p "$MNT/build" "$MNT/root" "$MNT/proc" "$MNT/sys" "$MNT/dev" "$MNT/t
 # to the whole ext4 image digest, so a sidecar copied beside a different/legacy
 # image cannot create a capability.
 ROOTFS_MARKER_TMP="$WORK/runtime-artifact-protocol.json"
-printf '{"schema":1,"protocol":%s,"agent_sha256":"%s"}\n' \
-  "$AGENT_PROTOCOL" "$AGENT_SHA256" >"$ROOTFS_MARKER_TMP"
+printf '{"schema":%s,"protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
+  "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256" >"$ROOTFS_MARKER_TMP"
 sudo install -D -o root -g root -m0444 \
   "$ROOTFS_MARKER_TMP" "$MNT$ROOTFS_PROTOCOL_MARKER"
 
@@ -268,6 +356,37 @@ if [ -n "$WASMER_TARBALL" ]; then
   echo "   staged: $WVER"
 fi
 
+# Bun CLI into the GUEST (see the header note for why the host copy cannot
+# serve this purpose — identical reasoning to wasmer above). /usr/local/bin is
+# on the exact PATH the agent sets.
+BUN_MARKER="${ROOTFS_DIR}/${SAFE_NAME}.bun"
+sudo rm -f "$BUN_MARKER"
+if [ -n "$BUN_TARBALL" ] && [ -n "$BUN_BINARY" ]; then
+  echo "set only one of BUN_TARBALL or BUN_BINARY, not both"
+  exit 1
+fi
+BUN_STAGED_BIN=""
+if [ -n "$BUN_TARBALL" ]; then
+  [ -f "$BUN_TARBALL" ] || { echo "BUN_TARBALL=$BUN_TARBALL not found"; exit 1; }
+  echo ">> baking bun CLI into the guest at /usr/local/bin/bun"
+  BTMP="$WORK/bun"
+  mkdir -p "$BTMP"
+  tar -xzf "$BUN_TARBALL" -C "$BTMP" bun
+  sudo install -D -m0755 "$BTMP/bun" "$MNT/usr/local/bin/bun"
+  BUN_STAGED_BIN="$BTMP/bun"
+elif [ -n "$BUN_BINARY" ]; then
+  [ -f "$BUN_BINARY" ] || { echo "BUN_BINARY=$BUN_BINARY not found"; exit 1; }
+  echo ">> baking bun CLI into the guest at /usr/local/bin/bun (from BUN_BINARY)"
+  sudo install -D -m0755 "$BUN_BINARY" "$MNT/usr/local/bin/bun"
+  BUN_STAGED_BIN="$BUN_BINARY"
+fi
+if [ -n "$BUN_STAGED_BIN" ]; then
+  # Fail loudly rather than shipping an image that silently cannot run bun.
+  [ -x "$MNT/usr/local/bin/bun" ] || { echo "bun staging failed"; exit 1; }
+  BVER="$("$BUN_STAGED_BIN" --version 2>/dev/null || echo unknown)"
+  echo "   staged: bun $BVER"
+fi
+
 sudo umount "$MNT"
 IMAGE_SHA256="$(sha256sum "$OUT_TMP" | cut -d' ' -f1)"
 IMAGE_BYTES="$(stat -c '%s' "$OUT_TMP")"
@@ -280,12 +399,76 @@ IMAGE_BYTES="$(stat -c '%s' "$OUT_TMP")"
 # every crash window then reads as NOT CAPABLE (old/new image without a proof),
 # never as a proof for the wrong image.
 SIDECAR_BODY="$WORK/runtime-artifact-rootfs-sidecar.json"
-printf '{"schema":1,"protocol":%s,"agent_sha256":"%s","image_sha256":"%s","image_bytes":%s}\n' \
-  "$AGENT_PROTOCOL" "$AGENT_SHA256" "$IMAGE_SHA256" "$IMAGE_BYTES" >"$SIDECAR_BODY"
+printf '{"schema":%s,"protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s","image_sha256":"%s","image_bytes":%s}\n' \
+  "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256" "$IMAGE_SHA256" "$IMAGE_BYTES" >"$SIDECAR_BODY"
 sudo rm -f "$SIDECAR_TMP"
 sudo install -o root -g root -m0444 "$SIDECAR_BODY" "$SIDECAR_TMP"
 sudo sync -f "$OUT_TMP"
 sudo sync -f "$SIDECAR_TMP"
+
+# Re-prove every independently-produced fact before either canonical name moves.
+# This second whole-image hash is intentional: the first produces the sidecar;
+# this one proves the image remained those exact bytes through marker extraction,
+# sidecar construction and fsync. The install lock held on fd 8 simultaneously
+# keeps the canonical agent/release pair fixed through publication.
+CURRENT_RELEASE_FACT="$(preflight_agent)"
+EMBEDDED_MARKER="$(debugfs -R "cat $ROOTFS_PROTOCOL_MARKER" "$OUT_TMP" 2>/dev/null)"
+python3 - \
+  "$PACKAGED_RELEASE_FACT" "$CURRENT_RELEASE_FACT" "$EMBEDDED_MARKER" \
+  "$SIDECAR_TMP" "$OUT_TMP" "$AGENT_SNAPSHOT" \
+  "$CELL_AGENT_RELEASE_SCHEMA_EXPECTED" "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" \
+  "$AGENT_WIRE_PROTOCOL" "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256" \
+  "$IMAGE_SHA256" "$IMAGE_BYTES" <<'PYPUBLISH'
+import hashlib, json, os, sys
+(
+    packaged_json, current_json, marker_json, sidecar_path, image_path,
+    agent_path, release_schema, rootfs_schema, runtime_protocol,
+    wire_protocol, wire_capabilities, agent_sha, image_sha, image_bytes,
+) = sys.argv[1:]
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+expected_release = {
+    'schema': int(release_schema),
+    'rootfs_schema': int(rootfs_schema),
+    'runtime_artifact_protocol': int(runtime_protocol),
+    'agent_wire_protocol': int(wire_protocol),
+    'agent_wire_capabilities': int(wire_capabilities),
+    'agent_sha256': agent_sha,
+}
+expected_marker = {
+    'schema': int(rootfs_schema),
+    'protocol': int(runtime_protocol),
+    'agent_wire_protocol': int(wire_protocol),
+    'agent_wire_capabilities': int(wire_capabilities),
+    'agent_sha256': agent_sha,
+}
+expected_sidecar = {
+    **expected_marker,
+    'image_sha256': image_sha,
+    'image_bytes': int(image_bytes),
+}
+with open(sidecar_path, 'rb') as handle:
+    sidecar = json.load(handle)
+if json.loads(packaged_json) != expected_release:
+    raise SystemExit('captured release fact disagrees with the packaged agent')
+if json.loads(current_json) != expected_release:
+    raise SystemExit('installed release fact moved before rootfs publication')
+if json.loads(marker_json) != expected_marker:
+    raise SystemExit('in-rootfs marker does not exactly describe the packaged agent protocols')
+if sidecar != expected_sidecar:
+    raise SystemExit('rootfs sidecar does not exactly describe the packaged marker and image')
+if digest(agent_path) != agent_sha:
+    raise SystemExit('private packaged agent snapshot changed before rootfs publication')
+if digest(image_path) != image_sha or os.stat(image_path).st_size != int(image_bytes):
+    raise SystemExit('rootfs image changed after its publication identity was computed')
+PYPUBLISH
 
 # THE ONLY MOMENT THE LIVE BASE CHANGES. A cold start copies either the whole old
 # image or the whole new image. The sidecar verifier hashes the exact current
@@ -303,6 +486,14 @@ trap '"$CONTAINER_CLI" rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"; rm 
 if [ -n "$WASMER_TARBALL" ]; then
   printf '%s\n' "$WVER" | sudo tee "$MARKER" >/dev/null
   echo ">> wrote capability marker: $MARKER"
+fi
+# Same "marker LAST" discipline as wasmer above, same reason: `$BUN_MARKER`
+# was removed up front, so a build that dies anywhere between leaves the node
+# advertising NO bun capability — placement simply skips it instead of
+# routing Bun work to an image that never got the binary.
+if [ -n "$BUN_STAGED_BIN" ]; then
+  printf '%s\n' "$BVER" | sudo tee "$BUN_MARKER" >/dev/null
+  echo ">> wrote capability marker: $BUN_MARKER"
 fi
 echo ">> wrote runtime-artifact rootfs proof: $ROOTFS_PROTOCOL_SIDECAR"
 echo ">> done: $OUT"

@@ -639,12 +639,14 @@ async fn main() -> anyhow::Result<()> {
     // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
     // gossip so placement can target GPU hosts for gpu-requesting functions.
     let gpus = resources::detect_gpus();
-    // Observe both runtime capabilities from the backend that was actually
+    // Observe all three runtime capabilities from the backend that was actually
     // selected above. Firecracker reuses its provision-time exact-rootfs proof;
-    // Litebox answers only after its selected instance remains supported; Mock
-    // never advertises runtime-artifact isolation.
+    // Litebox answers only after its selected instance remains supported (and
+    // NEVER advertises Bun regardless — its syscall shim panics on Bun's own
+    // boot probe); Mock never advertises runtime-artifact isolation.
     let runtime_capabilities = runtime_capability_source.detect().await;
     let wasm_rt = runtime_capabilities.wasm_runtime;
+    let bun_rt = runtime_capabilities.bun_runtime;
     let runtime_artifact_protocol = runtime_capabilities.runtime_artifact_protocol;
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
@@ -949,6 +951,7 @@ async fn main() -> anyhow::Result<()> {
         backend: backend_name.clone(),
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
+        bun_runtime: bun_rt,
         runtime_artifact_protocol,
         // The executor may be initialized above, but this stays fail-closed until
         // every git build surface consumes it in this binary.
@@ -965,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
         cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name,
         gpus = gpus.0, gpu_model = gpus.1.as_deref().unwrap_or("-"), gpu_vram_mb = gpus.2,
         wasm_runtime = wasm_rt.unwrap_or(false),
+        bun_runtime = bun_rt.unwrap_or(false),
         runtime_artifact_protocol = ?runtime_artifact_protocol,
         "node host capacity"
     );
@@ -973,6 +977,13 @@ async fn main() -> anyhow::Result<()> {
             backend = %backend_name,
             "no wasmer runtime on the filesystem this node's functions exec against — \
              Runtime::Wasmer deployments will not be placed here (see the active-backend capability probe)"
+        );
+    }
+    if bun_rt != Some(true) {
+        tracing::info!(
+            backend = %backend_name,
+            "no bun runtime on the filesystem this node's functions exec against — \
+             Runtime::Bun deployments will not be placed here (see the active-backend capability probe)"
         );
     }
     let registry = NodeRegistry::new(me);
@@ -2919,12 +2930,13 @@ fn spawn_disk_refresh(
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
                 registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
                 // Rootfs/proof publication and runtime installation can move
-                // underneath this process. Re-observe both fields from one
-                // selected-backend source, then publish the pair under one
+                // underneath this process. Re-observe all three fields from one
+                // selected-backend source, then publish the tuple under one
                 // registry write lock so gossip can never see a torn verdict.
                 let runtime_capabilities = runtime_capability_source.detect().await;
                 registry.set_self_runtime_capabilities(
                     runtime_capabilities.wasm_runtime,
+                    runtime_capabilities.bun_runtime,
                     runtime_capabilities.runtime_artifact_protocol,
                 );
                 // Same tick, same reason as the disk figure: the restart

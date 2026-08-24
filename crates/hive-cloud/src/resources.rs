@@ -25,12 +25,17 @@ pub fn capacity() -> (u32, u64, u64) {
     (cores, mem_total_mb, disk_total_bytes / 1024 / 1024 / 1024)
 }
 
-/// The two runtime capabilities placement consumes from one observation of the
-/// active backend. Keeping them in one value makes both boot publication and
-/// periodic refresh use one backend/config/image verdict.
+/// The three runtime capabilities placement consumes from one observation of
+/// the active backend. Keeping them in one value makes both boot publication
+/// and periodic refresh use one backend/config/image verdict.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeCapabilities {
     pub wasm_runtime: Option<bool>,
+    /// Can this node's active backend actually run a `Runtime::Bun` function?
+    /// See `NodeInfo::bun_runtime` for the full contract — `Some(false)`
+    /// always on Litebox regardless of what is staged (its pinned upstream
+    /// syscall shim panics on Bun's own boot probe).
+    pub bun_runtime: Option<bool>,
     pub runtime_artifact_protocol: Option<u16>,
 }
 
@@ -50,6 +55,7 @@ enum RuntimeCapabilityBackend {
     Firecracker {
         backend: std::sync::Arc<hive_backend::firecracker::FirecrackerBackend>,
         wasmer_marker: std::path::PathBuf,
+        bun_marker: std::path::PathBuf,
     },
     Litebox(std::sync::Arc<hive_backend::litebox::LiteboxBackend>),
     Mock,
@@ -61,7 +67,7 @@ impl RuntimeCapabilitySource {
         config: &hive_backend::firecracker::FirecrackerConfig,
     ) -> Self {
         // Match FirecrackerBackend::rootfs_for's image-name normalization. The
-        // marker is published next to that exact rootfs by build-rootfs.sh.
+        // markers are published next to that exact rootfs by build-rootfs.sh.
         let image = config
             .base_image
             .chars()
@@ -77,6 +83,7 @@ impl RuntimeCapabilitySource {
             backend: RuntimeCapabilityBackend::Firecracker {
                 backend,
                 wasmer_marker: config.rootfs_dir.join(format!("{image}.wasmer")),
+                bun_marker: config.rootfs_dir.join(format!("{image}.bun")),
             },
         }
     }
@@ -93,20 +100,33 @@ impl RuntimeCapabilitySource {
         }
     }
 
-    /// Observe Wasmer and runtime-artifact support from the active backend.
+    /// Observe Wasmer, Bun and runtime-artifact support from the active
+    /// backend.
     ///
-    /// Firecracker's positive Wasmer answer is conditional on the same exact
-    /// rootfs content proof provisioning checks. A marker for any alternate
-    /// image, a missing/replaced proof, or rootfs bytes that no longer match the
-    /// proof therefore cannot produce a positive capability.
+    /// Firecracker's positive Wasmer/Bun answers are each conditional on the
+    /// same exact rootfs content proof provisioning checks. A marker for any
+    /// alternate image, a missing/replaced proof, or rootfs bytes that no
+    /// longer match the proof therefore cannot produce a positive capability.
+    ///
+    /// Litebox NEVER answers `true` for Bun regardless of what marker or PATH
+    /// entry exists: its pinned upstream syscall shim panics
+    /// (`unimplemented!()`, `litebox_shim_linux/src/syscalls/file.rs:1210`)
+    /// on Bun's own boot-time `readlink("/proc/self/fd/3")` probe, so
+    /// advertising capability there would turn every Bun cold start into an
+    /// uncontrolled guest panic instead of an honest placement refusal. This
+    /// is a fixed backend limitation, not a probe result — see
+    /// `LiteboxBackend`'s module doc's "Security posture"/Bun sections and
+    /// `crate::litebox`'s pre-spawn refusal for the belt-and-braces half.
     pub async fn detect(&self) -> RuntimeCapabilities {
         match &self.backend {
             RuntimeCapabilityBackend::Firecracker {
                 backend,
                 wasmer_marker,
+                bun_marker,
             } => match backend.base_runtime_artifact_protocol().await {
                 Ok(protocol) => RuntimeCapabilities {
                     wasm_runtime: Some(regular_file(wasmer_marker)),
+                    bun_runtime: Some(regular_file(bun_marker)),
                     runtime_artifact_protocol: Some(protocol),
                 },
                 Err(error) => {
@@ -117,6 +137,7 @@ impl RuntimeCapabilitySource {
                     );
                     RuntimeCapabilities {
                         wasm_runtime: Some(false),
+                        bun_runtime: Some(false),
                         runtime_artifact_protocol: None,
                     }
                 }
@@ -124,17 +145,21 @@ impl RuntimeCapabilitySource {
             RuntimeCapabilityBackend::Litebox(backend) if backend.is_supported() => {
                 RuntimeCapabilities {
                     wasm_runtime: Some(which_on_path("wasmer").is_some()),
+                    // Always false — see this method's doc.
+                    bun_runtime: Some(false),
                     runtime_artifact_protocol: Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION),
                 }
             }
             RuntimeCapabilityBackend::Litebox(_) => RuntimeCapabilities {
                 wasm_runtime: Some(false),
+                bun_runtime: Some(false),
                 runtime_artifact_protocol: None,
             },
-            // Mock may truthfully exec a host Wasmer, but it is never an
+            // Mock may truthfully exec a host Wasmer/Bun, but it is never an
             // isolated runtime-artifact backend.
             RuntimeCapabilityBackend::Mock => RuntimeCapabilities {
                 wasm_runtime: Some(which_on_path("wasmer").is_some()),
+                bun_runtime: Some(which_on_path("bun").is_some()),
                 runtime_artifact_protocol: None,
             },
         }

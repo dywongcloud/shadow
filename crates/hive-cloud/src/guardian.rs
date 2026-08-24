@@ -952,44 +952,26 @@ fn prepare_replication(
     generation: u64,
 ) -> anyhow::Result<Arc<DesiredReplication>> {
     let mut namespaces = std::collections::BTreeMap::new();
-    for (namespace, value) in crate::persist::guardian_v2_namespaced(snap)? {
-        let bytes = canonical_json_bytes(value)?;
+    for (namespace, state) in crate::persist::guardian_v2_namespaced(snap)? {
+        let key = guardian_v2_namespace_key(&namespace)?;
+        let bytes = guardian_v2_namespace_bytes(state)?;
         namespaces.insert(
-            format!("ns/{namespace}/state"),
+            key,
             PreparedValue {
                 change_digest: sha256(&bytes),
                 bytes: Arc::new(bytes),
             },
         );
     }
-    let (parts, full) = match snapshot_key() {
-        Some(key) => {
-            let canonical = shared_snapshot_canonical(snap, &key)?;
-            let parts = canonical
-                .parts
-                .into_iter()
-                .map(|(part_key, (class, bytes))| KeyedPreparedValue {
-                    key: part_key,
-                    class,
-                    value: PreparedValue {
-                        change_digest: sha256(&bytes),
-                        bytes: Arc::new(bytes),
-                    },
-                })
-                .collect();
-            let bytes = canonical.base;
-            let full = Some(KeyedPreparedValue {
-                key,
-                class: "full",
-                value: PreparedValue {
-                    change_digest: sha256(&bytes),
-                    bytes: Arc::new(bytes),
-                },
-            });
-            (parts, full)
+
+    let (parts, full) = match NODE_NAME.get() {
+        Some(component) => {
+            let (parts, head) = guardian_v2_prepare_snapshot(snap, component)?;
+            (parts, Some(head))
         }
         None => (Vec::new(), None),
     };
+
     Ok(Arc::new(DesiredReplication {
         generation,
         namespaces,
@@ -1022,6 +1004,791 @@ fn is_lower_hex_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+const GUARDIAN_V2_SNAPSHOT_MAGIC: &str = "hive-guardian-snapshot";
+const GUARDIAN_V2_NAMESPACE_MAGIC: &str = "hive-guardian-namespace";
+const GUARDIAN_V2_VERSION: u64 = 2;
+const GUARDIAN_V2_HEAD_MAX_BYTES: usize = 4 * 1024;
+const GUARDIAN_V2_PART_MAX_BYTES: usize = 512 * 1024 * 1024;
+const GUARDIAN_V2_AGGREGATE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const GUARDIAN_V2_COMPONENT_MAX_BYTES: usize = 255;
+const GUARDIAN_V2_NODE_PREFIX: &str = "snap-v2/node/";
+const GUARDIAN_V2_NAMESPACE_PREFIX: &str = "ns-v2/";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GuardianV2PartKind {
+    State,
+    Deployments,
+    DatabaseData,
+    MetricsRollup,
+    Builds,
+    Sandboxes,
+}
+
+impl GuardianV2PartKind {
+    const ALL: [Self; 6] = [
+        Self::State,
+        Self::Deployments,
+        Self::DatabaseData,
+        Self::MetricsRollup,
+        Self::Builds,
+        Self::Sandboxes,
+    ];
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Deployments => "deployments",
+            Self::DatabaseData => "database_data",
+            Self::MetricsRollup => "metrics_rollup",
+            Self::Builds => "builds",
+            Self::Sandboxes => "sandboxes",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GuardianV2Reference {
+    sha256: String,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GuardianV2Head {
+    references: std::collections::BTreeMap<String, GuardianV2Reference>,
+}
+
+struct GuardianV2StrictValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for GuardianV2StrictValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(GuardianV2StrictValueVisitor)
+    }
+}
+
+struct GuardianV2StrictValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for GuardianV2StrictValueVisitor {
+    type Value = GuardianV2StrictValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object fields")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = i64::try_from(value)
+            .map_err(|_| E::custom("JSON integer is outside the signed 64-bit range"))?;
+        self.visit_i64(value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = u64::try_from(value)
+            .map_err(|_| E::custom("JSON integer is outside the unsigned 64-bit range"))?;
+        self.visit_u64(value)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("JSON float is not finite"))?;
+        Ok(GuardianV2StrictValue(serde_json::Value::Number(number)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(GuardianV2StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <GuardianV2StrictValue as serde::Deserialize>::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(GuardianV2StrictValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(GuardianV2StrictValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut fields = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if fields.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON field {key:?}"
+                )));
+            }
+            let GuardianV2StrictValue(value) = object.next_value()?;
+            fields.insert(key, value);
+        }
+        Ok(GuardianV2StrictValue(serde_json::Value::Object(fields)))
+    }
+}
+
+fn guardian_v2_canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut entries: Vec<_> = std::mem::take(fields).into_iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            for (_, value) in &mut entries {
+                guardian_v2_canonicalize_json(value);
+            }
+            fields.extend(entries);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                guardian_v2_canonicalize_json(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn guardian_v2_canonical_json_bytes(mut value: serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    guardian_v2_canonicalize_json(&mut value);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn guardian_v2_parse_canonical_json(
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if bytes.len() > max_bytes {
+        anyhow::bail!(
+            "Guardian v2 {label} is {} bytes; maximum is {max_bytes}",
+            bytes.len()
+        );
+    }
+    let GuardianV2StrictValue(value) = serde_json::from_slice(bytes)
+        .map_err(|error| anyhow::anyhow!("Guardian v2 {label} JSON: {error}"))?;
+    let canonical = guardian_v2_canonical_json_bytes(value.clone())?;
+    if canonical != bytes {
+        anyhow::bail!("Guardian v2 {label} is not byte-for-byte canonical JSON");
+    }
+    Ok(value)
+}
+
+fn guardian_v2_component_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn guardian_v2_encode_component(component: &str) -> anyhow::Result<String> {
+    let bytes = component.as_bytes();
+    if bytes.is_empty() {
+        anyhow::bail!("Guardian v2 component decodes to an empty value");
+    }
+    if bytes.len() > GUARDIAN_V2_COMPONENT_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 component is {} decoded bytes; maximum is {}",
+            bytes.len(),
+            GUARDIAN_V2_COMPONENT_MAX_BYTES
+        );
+    }
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if guardian_v2_component_safe(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    Ok(encoded)
+}
+
+fn guardian_v2_upper_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn guardian_v2_decode_component(encoded: &str) -> anyhow::Result<String> {
+    if encoded.is_empty() {
+        anyhow::bail!("Guardian v2 component is empty");
+    }
+    let source = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0usize;
+    while index < source.len() {
+        let byte = source[index];
+        if byte == b'%' {
+            if index + 2 >= source.len() {
+                anyhow::bail!("Guardian v2 component has a truncated percent escape");
+            }
+            let high = guardian_v2_upper_hex(source[index + 1]).ok_or_else(|| {
+                anyhow::anyhow!("Guardian v2 component escape is not uppercase %HH")
+            })?;
+            let low = guardian_v2_upper_hex(source[index + 2]).ok_or_else(|| {
+                anyhow::anyhow!("Guardian v2 component escape is not uppercase %HH")
+            })?;
+            let value = (high << 4) | low;
+            if guardian_v2_component_safe(value) {
+                anyhow::bail!("Guardian v2 component escapes a byte in the literal safe set");
+            }
+            decoded.push(value);
+            index += 3;
+            continue;
+        }
+        if !guardian_v2_component_safe(byte) {
+            anyhow::bail!("Guardian v2 component contains an unsafe literal byte");
+        }
+        decoded.push(byte);
+        index += 1;
+    }
+
+    if decoded.is_empty() {
+        anyhow::bail!("Guardian v2 component decodes to an empty value");
+    }
+    if decoded.len() > GUARDIAN_V2_COMPONENT_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 component is {} decoded bytes; maximum is {}",
+            decoded.len(),
+            GUARDIAN_V2_COMPONENT_MAX_BYTES
+        );
+    }
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| anyhow::anyhow!("Guardian v2 component is not valid UTF-8"))?;
+    if guardian_v2_encode_component(&decoded)? != encoded {
+        anyhow::bail!("Guardian v2 component has a noncanonical alias encoding");
+    }
+    Ok(decoded)
+}
+
+fn guardian_v2_node_prefix(component: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "{GUARDIAN_V2_NODE_PREFIX}{}",
+        guardian_v2_encode_component(component)?
+    ))
+}
+
+fn guardian_v2_head_key(component: &str) -> anyhow::Result<String> {
+    Ok(format!("{}/head", guardian_v2_node_prefix(component)?))
+}
+
+fn guardian_v2_part_key(
+    encoded_component: &str,
+    kind: GuardianV2PartKind,
+    digest: &str,
+) -> anyhow::Result<String> {
+    guardian_v2_decode_component(encoded_component)?;
+    if !is_lower_hex_digest(digest) {
+        anyhow::bail!("Guardian v2 part digest is not 64 lowercase hexadecimal characters");
+    }
+    Ok(format!(
+        "{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/{}/{digest}",
+        kind.field()
+    ))
+}
+
+fn guardian_v2_namespace_key(namespace: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "{GUARDIAN_V2_NAMESPACE_PREFIX}{}/state",
+        guardian_v2_encode_component(namespace)?
+    ))
+}
+
+fn guardian_v2_encoded_component_from_head_key(key: &str) -> anyhow::Result<String> {
+    let encoded = key
+        .strip_prefix(GUARDIAN_V2_NODE_PREFIX)
+        .and_then(|rest| rest.strip_suffix("/head"))
+        .filter(|component| !component.is_empty() && !component.contains('/'))
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 head key has an invalid shape"))?;
+    guardian_v2_decode_component(encoded)?;
+    Ok(encoded.to_string())
+}
+
+fn guardian_v2_remove_cron_telemetry(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    let jobs = value
+        .as_object_mut()
+        .and_then(|root| root.get_mut("cron"))
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 snapshot cron is not an array"))?;
+    for (index, job) in jobs.iter_mut().enumerate() {
+        let fields = job.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("Guardian v2 snapshot cron[{index}] is not an object")
+        })?;
+        fields.remove("last_run_ms");
+        fields.remove("next_run_ms");
+        fields.remove("runs");
+    }
+    Ok(())
+}
+
+fn guardian_v2_snapshot_part_values(
+    snapshot: &PlatformSnapshot,
+) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    let mut state = serde_json::to_value(snapshot)?;
+    let root = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("PlatformSnapshot did not serialize as a JSON object"))?;
+    root.remove("saved_ms")
+        .ok_or_else(|| anyhow::anyhow!("PlatformSnapshot omitted saved_ms before v2 transform"))?;
+
+    let mut extracted = std::collections::BTreeMap::new();
+    for kind in GuardianV2PartKind::ALL.into_iter().skip(1) {
+        let field = kind.field();
+        let value = root.remove(field).ok_or_else(|| {
+            anyhow::anyhow!("PlatformSnapshot omitted required v2 root {field:?}")
+        })?;
+        extracted.insert(field.to_string(), value);
+    }
+    remove_siem_delivery_counters(&mut state);
+    guardian_v2_remove_cron_telemetry(&mut state)?;
+
+    let mut parts = std::collections::BTreeMap::new();
+    parts.insert(GuardianV2PartKind::State.field().to_string(), state);
+    parts.extend(extracted);
+    Ok(parts)
+}
+
+fn guardian_v2_wrapper_bytes(
+    kind: GuardianV2PartKind,
+    value: serde_json::Value,
+) -> anyhow::Result<Vec<u8>> {
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert(kind.field().to_string(), value);
+    guardian_v2_canonical_json_bytes(serde_json::Value::Object(wrapper))
+}
+
+fn guardian_v2_parse_part(
+    kind: GuardianV2PartKind,
+    bytes: &[u8],
+    reference: &GuardianV2Reference,
+) -> anyhow::Result<serde_json::Value> {
+    if reference.bytes > GUARDIAN_V2_PART_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 {} reference is {} bytes; maximum is {}",
+            kind.field(),
+            reference.bytes,
+            GUARDIAN_V2_PART_MAX_BYTES
+        );
+    }
+    if bytes.len() != reference.bytes {
+        anyhow::bail!(
+            "Guardian v2 {} wrapper length is {}; head declares {}",
+            kind.field(),
+            bytes.len(),
+            reference.bytes
+        );
+    }
+    if hex::encode(sha256(bytes)) != reference.sha256 {
+        anyhow::bail!("Guardian v2 {} wrapper SHA-256 mismatch", kind.field());
+    }
+    let value = guardian_v2_parse_canonical_json(
+        bytes,
+        GUARDIAN_V2_PART_MAX_BYTES,
+        &format!("{} wrapper", kind.field()),
+    )?;
+    let mut fields = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} wrapper is not an object", kind.field()))?;
+    if fields.len() != 1 {
+        anyhow::bail!(
+            "Guardian v2 {} wrapper does not have exactly one field",
+            kind.field()
+        );
+    }
+    fields
+        .remove(kind.field())
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} wrapper field is absent", kind.field()))
+}
+
+fn guardian_v2_head_bytes(
+    references: &std::collections::BTreeMap<String, GuardianV2Reference>,
+) -> anyhow::Result<Vec<u8>> {
+    if references.len() != GuardianV2PartKind::ALL.len() {
+        anyhow::bail!("Guardian v2 head does not have exactly six references");
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "magic".to_string(),
+        serde_json::Value::String(GUARDIAN_V2_SNAPSHOT_MAGIC.to_string()),
+    );
+    fields.insert(
+        "version".to_string(),
+        serde_json::Value::Number(GUARDIAN_V2_VERSION.into()),
+    );
+    for kind in GuardianV2PartKind::ALL {
+        let reference = references.get(kind.field()).ok_or_else(|| {
+            anyhow::anyhow!("Guardian v2 head reference {} is absent", kind.field())
+        })?;
+        fields.insert(
+            kind.field().to_string(),
+            serde_json::json!({
+                "sha256": reference.sha256,
+                "bytes": reference.bytes as u64,
+            }),
+        );
+    }
+    let bytes = guardian_v2_canonical_json_bytes(serde_json::Value::Object(fields))?;
+    if bytes.len() > GUARDIAN_V2_HEAD_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 head is {} bytes; maximum is {}",
+            bytes.len(),
+            GUARDIAN_V2_HEAD_MAX_BYTES
+        );
+    }
+    guardian_v2_parse_head(&bytes)?;
+    Ok(bytes)
+}
+
+fn guardian_v2_parse_head(bytes: &[u8]) -> anyhow::Result<GuardianV2Head> {
+    let value =
+        guardian_v2_parse_canonical_json(bytes, GUARDIAN_V2_HEAD_MAX_BYTES, "snapshot head")?;
+    let mut fields = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 head is not an object"))?;
+    if fields.len() != GuardianV2PartKind::ALL.len() + 2 {
+        anyhow::bail!("Guardian v2 head does not have exactly six references");
+    }
+    if fields
+        .remove("magic")
+        .and_then(|value| value.as_str().map(str::to_string))
+        != Some(GUARDIAN_V2_SNAPSHOT_MAGIC.to_string())
+    {
+        anyhow::bail!("Guardian v2 head magic is invalid");
+    }
+    if fields.remove("version").and_then(|value| value.as_u64()) != Some(GUARDIAN_V2_VERSION) {
+        anyhow::bail!("Guardian v2 head version is invalid");
+    }
+
+    let mut aggregate = 0usize;
+    let mut references = std::collections::BTreeMap::new();
+    for kind in GuardianV2PartKind::ALL {
+        let mut reference = fields
+            .remove(kind.field())
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Guardian v2 head reference {} is absent or invalid",
+                    kind.field()
+                )
+            })?;
+        if reference.len() != 2 {
+            anyhow::bail!(
+                "Guardian v2 head reference {} does not have exactly sha256 and bytes",
+                kind.field()
+            );
+        }
+        let sha256 = reference
+            .remove("sha256")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .filter(|digest| is_lower_hex_digest(digest))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Guardian v2 head reference {} has an invalid SHA-256",
+                    kind.field()
+                )
+            })?;
+        let bytes_u64 = reference
+            .remove("bytes")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Guardian v2 head reference {} has an invalid byte length",
+                    kind.field()
+                )
+            })?;
+        if !reference.is_empty() {
+            anyhow::bail!(
+                "Guardian v2 head reference {} contains unknown fields",
+                kind.field()
+            );
+        }
+        let bytes = usize::try_from(bytes_u64).map_err(|_| {
+            anyhow::anyhow!(
+                "Guardian v2 head reference {} byte length does not fit this host",
+                kind.field()
+            )
+        })?;
+        if bytes > GUARDIAN_V2_PART_MAX_BYTES {
+            anyhow::bail!(
+                "Guardian v2 head reference {} is {} bytes; maximum is {}",
+                kind.field(),
+                bytes,
+                GUARDIAN_V2_PART_MAX_BYTES
+            );
+        }
+        aggregate = aggregate
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 aggregate byte length overflow"))?;
+        if aggregate > GUARDIAN_V2_AGGREGATE_MAX_BYTES {
+            anyhow::bail!(
+                "Guardian v2 aggregate is {aggregate} bytes; maximum is {}",
+                GUARDIAN_V2_AGGREGATE_MAX_BYTES
+            );
+        }
+        references.insert(
+            kind.field().to_string(),
+            GuardianV2Reference { sha256, bytes },
+        );
+    }
+    if !fields.is_empty() {
+        anyhow::bail!("Guardian v2 head contains unknown fields");
+    }
+    Ok(GuardianV2Head { references })
+}
+
+fn guardian_v2_reconstruct(
+    part_values: &std::collections::BTreeMap<String, serde_json::Value>,
+    wrapper_bytes: &std::collections::BTreeMap<String, Vec<u8>>,
+    saved_ms: u64,
+) -> anyhow::Result<PlatformSnapshot> {
+    if part_values.len() != GuardianV2PartKind::ALL.len()
+        || wrapper_bytes.len() != GuardianV2PartKind::ALL.len()
+    {
+        anyhow::bail!("Guardian v2 reconstruction does not have exactly six parts");
+    }
+    let mut root = part_values
+        .get(GuardianV2PartKind::State.field())
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 state value is not an object"))?;
+    if root.contains_key("saved_ms") {
+        anyhow::bail!("Guardian v2 state illegally contains saved_ms");
+    }
+    for kind in GuardianV2PartKind::ALL.into_iter().skip(1) {
+        if root.contains_key(kind.field()) {
+            anyhow::bail!(
+                "Guardian v2 state illegally contains extracted root {}",
+                kind.field()
+            );
+        }
+        let value = part_values.get(kind.field()).cloned().ok_or_else(|| {
+            anyhow::anyhow!("Guardian v2 reconstruction is missing {}", kind.field())
+        })?;
+        root.insert(kind.field().to_string(), value);
+    }
+    root.insert(
+        "saved_ms".to_string(),
+        serde_json::Value::Number(saved_ms.into()),
+    );
+    let snapshot: PlatformSnapshot = serde_json::from_value(serde_json::Value::Object(root))
+        .map_err(|error| anyhow::anyhow!("Guardian v2 reconstruction: {error}"))?;
+
+    let regenerated = guardian_v2_snapshot_part_values(&snapshot)?;
+    for kind in GuardianV2PartKind::ALL {
+        let expected = wrapper_bytes.get(kind.field()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Guardian v2 reconstruction wrapper {} is absent",
+                kind.field()
+            )
+        })?;
+        let actual = guardian_v2_wrapper_bytes(
+            kind,
+            regenerated.get(kind.field()).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Guardian v2 regenerated part {} is absent", kind.field())
+            })?,
+        )?;
+        if &actual != expected {
+            anyhow::bail!(
+                "Guardian v2 reconstruct-and-transform roundtrip changed {}",
+                kind.field()
+            );
+        }
+    }
+    Ok(snapshot)
+}
+
+fn guardian_v2_validate_namespace_state(state: &serde_json::Value) -> anyhow::Result<()> {
+    let fields = state
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace state is not an object"))?;
+    let Some(projects) = fields.get("projects") else {
+        return Ok(());
+    };
+    let projects = projects
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace projects is not an array"))?;
+    let mut previous: Option<String> = None;
+    for project in projects {
+        let identity = project
+            .as_object()
+            .and_then(|fields| fields.get("project"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace project identity is invalid"))?;
+        if previous.as_deref().is_some_and(|prior| prior >= identity) {
+            anyhow::bail!(
+                "Guardian v2 namespace project identities are not unique strict lexical order"
+            );
+        }
+        previous = Some(identity.to_string());
+    }
+    Ok(())
+}
+
+fn guardian_v2_namespace_bytes(state: serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    guardian_v2_validate_namespace_state(&state)?;
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "magic".to_string(),
+        serde_json::Value::String(GUARDIAN_V2_NAMESPACE_MAGIC.to_string()),
+    );
+    fields.insert(
+        "version".to_string(),
+        serde_json::Value::Number(GUARDIAN_V2_VERSION.into()),
+    );
+    fields.insert("state".to_string(), state);
+    let bytes = guardian_v2_canonical_json_bytes(serde_json::Value::Object(fields))?;
+    guardian_v2_parse_namespace(&bytes)?;
+    Ok(bytes)
+}
+
+fn guardian_v2_parse_namespace(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let value = guardian_v2_parse_canonical_json(bytes, usize::MAX, "namespace envelope")?;
+    let mut fields = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace envelope is not an object"))?;
+    if fields.len() != 3 {
+        anyhow::bail!("Guardian v2 namespace envelope does not have exactly three fields");
+    }
+    if fields
+        .remove("magic")
+        .and_then(|value| value.as_str().map(str::to_string))
+        != Some(GUARDIAN_V2_NAMESPACE_MAGIC.to_string())
+    {
+        anyhow::bail!("Guardian v2 namespace magic is invalid");
+    }
+    if fields.remove("version").and_then(|value| value.as_u64()) != Some(GUARDIAN_V2_VERSION) {
+        anyhow::bail!("Guardian v2 namespace version is invalid");
+    }
+    let state = fields
+        .remove("state")
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace state is absent"))?;
+    if !fields.is_empty() {
+        anyhow::bail!("Guardian v2 namespace envelope contains unknown fields");
+    }
+    guardian_v2_validate_namespace_state(&state)?;
+    Ok(state)
+}
+
+fn guardian_v2_prepare_snapshot(
+    snapshot: &PlatformSnapshot,
+    component: &str,
+) -> anyhow::Result<(Vec<KeyedPreparedValue>, KeyedPreparedValue)> {
+    let encoded_component = guardian_v2_encode_component(component)?;
+    let values = guardian_v2_snapshot_part_values(snapshot)?;
+    let mut wrapper_bytes = std::collections::BTreeMap::new();
+    let mut references = std::collections::BTreeMap::new();
+    let mut parts = Vec::with_capacity(GuardianV2PartKind::ALL.len());
+    let mut aggregate = 0usize;
+
+    for kind in GuardianV2PartKind::ALL {
+        let bytes = guardian_v2_wrapper_bytes(
+            kind,
+            values.get(kind.field()).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Guardian v2 prepared part {} is absent", kind.field())
+            })?,
+        )?;
+        if bytes.len() > GUARDIAN_V2_PART_MAX_BYTES {
+            anyhow::bail!(
+                "Guardian v2 {} wrapper is {} bytes; maximum is {}",
+                kind.field(),
+                bytes.len(),
+                GUARDIAN_V2_PART_MAX_BYTES
+            );
+        }
+        aggregate = aggregate
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 aggregate byte length overflow"))?;
+        if aggregate > GUARDIAN_V2_AGGREGATE_MAX_BYTES {
+            anyhow::bail!(
+                "Guardian v2 aggregate is {aggregate} bytes; maximum is {}",
+                GUARDIAN_V2_AGGREGATE_MAX_BYTES
+            );
+        }
+        let digest = hex::encode(sha256(&bytes));
+        let key = guardian_v2_part_key(&encoded_component, kind, &digest)?;
+        references.insert(
+            kind.field().to_string(),
+            GuardianV2Reference {
+                sha256: digest,
+                bytes: bytes.len(),
+            },
+        );
+        wrapper_bytes.insert(kind.field().to_string(), bytes.clone());
+        parts.push(KeyedPreparedValue {
+            key,
+            class: kind.field(),
+            value: PreparedValue {
+                change_digest: sha256(&bytes),
+                bytes: Arc::new(bytes),
+            },
+        });
+    }
+
+    guardian_v2_reconstruct(&values, &wrapper_bytes, 0)?;
+    let head_bytes = guardian_v2_head_bytes(&references)?;
+    let head = KeyedPreparedValue {
+        key: format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/head"),
+        class: "full",
+        value: PreparedValue {
+            change_digest: sha256(&head_bytes),
+            bytes: Arc::new(head_bytes),
+        },
+    };
+    Ok((parts, head))
 }
 
 fn snapshot_v3_prefix(base_key: &str) -> anyhow::Result<String> {
@@ -1888,19 +2655,738 @@ struct ReplicationWriteStats {
     put_bytes: usize,
 }
 
+fn guardian_v2_latest_entry<'a>(
+    heads: &'a [guardian_db::traits::EntryHead],
+    key: &str,
+) -> Option<&'a guardian_db::traits::EntryHead> {
+    heads
+        .iter()
+        .filter(|head| head.key == key)
+        .max_by_key(|head| head.timestamp)
+}
+
+async fn guardian_v2_current_exact(
+    h: &Handle,
+    key: &str,
+    value: &PreparedValue,
+) -> anyhow::Result<bool> {
+    let heads = h.kv.entry_heads().await?;
+    let Some(head) = guardian_v2_latest_entry(&heads, key) else {
+        return Ok(false);
+    };
+    if head.content_local == Some(false)
+        || head.hash != iroh_blobs::Hash::new(value.bytes.as_ref()).to_hex()
+    {
+        return Ok(false);
+    }
+    Ok(matches!(h.kv.get(key).await, Ok(Some(bytes)) if bytes.as_slice() == value.bytes.as_slice()))
+}
+
+async fn guardian_v2_publish_immutable(
+    h: &Handle,
+    item: &KeyedPreparedValue,
+    protection: &guardian_db::p2p::network::core::BlobProtection,
+) -> anyhow::Result<bool> {
+    let heads = h.kv.entry_heads().await?;
+    let current = guardian_v2_latest_entry(&heads, &item.key);
+    let readable = h.kv.get(&item.key).await.ok().flatten();
+    if let Some(bytes) = &readable {
+        if bytes != item.value.bytes.as_ref() {
+            anyhow::bail!(
+                "Guardian v2 immutable collision at {}: the SHA-addressed key has different readable bytes",
+                item.key
+            );
+        }
+    }
+
+    let expected_blake3 = iroh_blobs::Hash::new(item.value.bytes.as_ref()).to_hex();
+    if let Some(head) = current {
+        if head.hash != expected_blake3 {
+            anyhow::bail!(
+                "Guardian v2 immutable collision at {}: current BLAKE3 metadata names different bytes",
+                item.key
+            );
+        }
+        if head.content_local != Some(false) && readable.is_some() {
+            return Ok(false);
+        }
+    }
+
+    h.kv.put_gc_protected(&item.key, item.value.bytes.as_ref().clone(), protection)
+        .await
+        .map_err(|error| anyhow::anyhow!("Guardian v2 immutable put {}: {error}", item.key))?;
+    Ok(true)
+}
+
+async fn guardian_v2_verify_namespace(
+    h: &Handle,
+    key: &str,
+    expected: &PreparedValue,
+) -> anyhow::Result<()> {
+    let before = h.kv.entry_heads().await?;
+    let head = guardian_v2_latest_entry(&before, key)
+        .map(|head| SnapshotKeyHead {
+            timestamp: head.timestamp,
+            hash: head.hash.clone(),
+        })
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace metadata is absent for {key}"))?;
+    let source = guardian_v2_latest_entry(&before, key)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace metadata is absent for {key}"))?;
+    if source.content_local == Some(false) {
+        anyhow::bail!("Guardian v2 namespace content is not local for {key}");
+    }
+    let bytes =
+        h.kv.get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace bytes are absent for {key}"))?;
+    if bytes.as_slice() != expected.bytes.as_slice()
+        || bytes.len() != expected.bytes.len()
+        || sha256(&bytes) != expected.change_digest
+        || iroh_blobs::Hash::new(&bytes).to_hex() != head.hash
+    {
+        anyhow::bail!("Guardian v2 namespace identity mismatch for {key}");
+    }
+    guardian_v2_parse_namespace(&bytes)?;
+    let after = h.kv.entry_heads().await?;
+    if latest_snapshot_head(&after, key) != Some(head) {
+        anyhow::bail!("Guardian v2 namespace metadata changed during verification for {key}");
+    }
+    Ok(())
+}
+
+fn guardian_v2_validate_prepared_generation(
+    parts: &[KeyedPreparedValue],
+    head: &KeyedPreparedValue,
+) -> anyhow::Result<(String, GuardianV2Head)> {
+    if parts.len() != GuardianV2PartKind::ALL.len() {
+        anyhow::bail!("Guardian v2 prepared generation does not have exactly six parts");
+    }
+    if head.class != "full" {
+        anyhow::bail!("Guardian v2 prepared head has the wrong write class");
+    }
+    let encoded_component = guardian_v2_encoded_component_from_head_key(&head.key)?;
+    if sha256(head.value.bytes.as_ref()) != head.value.change_digest {
+        anyhow::bail!("Guardian v2 prepared head SHA-256 does not match its bytes");
+    }
+    let parsed_head = guardian_v2_parse_head(head.value.bytes.as_ref())?;
+    let mut values = std::collections::BTreeMap::new();
+    let mut wrappers = std::collections::BTreeMap::new();
+    for (kind, part) in GuardianV2PartKind::ALL.into_iter().zip(parts) {
+        if part.class != kind.field() {
+            anyhow::bail!(
+                "Guardian v2 prepared part order/class mismatch: wanted {}, got {}",
+                kind.field(),
+                part.class
+            );
+        }
+        let reference = parsed_head
+            .references
+            .get(kind.field())
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 prepared head lacks {}", kind.field()))?;
+        let expected_key = guardian_v2_part_key(&encoded_component, kind, &reference.sha256)?;
+        if part.key != expected_key {
+            anyhow::bail!(
+                "Guardian v2 prepared {} key does not match its SHA address",
+                kind.field()
+            );
+        }
+        if sha256(part.value.bytes.as_ref()) != part.value.change_digest
+            || hex::encode(part.value.change_digest) != reference.sha256
+        {
+            anyhow::bail!(
+                "Guardian v2 prepared {} SHA-256 does not match its bytes",
+                kind.field()
+            );
+        }
+        let value = guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?;
+        values.insert(kind.field().to_string(), value);
+        wrappers.insert(kind.field().to_string(), part.value.bytes.as_ref().clone());
+    }
+    guardian_v2_reconstruct(&values, &wrappers, 0)?;
+    Ok((encoded_component, parsed_head))
+}
+
+#[cfg(debug_assertions)]
+fn guardian_v2_diagnostic_generation(
+    desired: &DesiredReplication,
+    component: &str,
+) -> anyhow::Result<(Vec<KeyedPreparedValue>, KeyedPreparedValue)> {
+    let source_head = desired
+        .full
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic source head is absent"))?;
+    let encoded = guardian_v2_encode_component(component)?;
+    let mut parts = Vec::with_capacity(GuardianV2PartKind::ALL.len());
+    for (kind, source) in GuardianV2PartKind::ALL.into_iter().zip(&desired.parts) {
+        let digest = hex::encode(source.value.change_digest);
+        parts.push(KeyedPreparedValue {
+            key: guardian_v2_part_key(&encoded, kind, &digest)?,
+            class: kind.field(),
+            value: source.value.clone(),
+        });
+    }
+    let head = KeyedPreparedValue {
+        key: format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/head"),
+        class: "full",
+        value: source_head.value.clone(),
+    };
+    guardian_v2_validate_prepared_generation(&parts, &head)?;
+    Ok((parts, head))
+}
+
+#[cfg(debug_assertions)]
+fn guardian_v2_diagnostic_snapshot(
+    parts: &[KeyedPreparedValue],
+    head: &KeyedPreparedValue,
+) -> anyhow::Result<PlatformSnapshot> {
+    let parsed_head = guardian_v2_parse_head(head.value.bytes.as_ref())?;
+    let mut values = std::collections::BTreeMap::new();
+    let mut wrappers = std::collections::BTreeMap::new();
+    for (kind, part) in GuardianV2PartKind::ALL.into_iter().zip(parts) {
+        let reference = parsed_head
+            .references
+            .get(kind.field())
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic head lacks {}", kind.field()))?;
+        values.insert(
+            kind.field().to_string(),
+            guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?,
+        );
+        wrappers.insert(kind.field().to_string(), part.value.bytes.as_ref().clone());
+    }
+    guardian_v2_reconstruct(&values, &wrappers, 1)
+}
+
+#[cfg(debug_assertions)]
+async fn guardian_v2_diagnostic_publish_generation(
+    h: &Handle,
+    parts: &[KeyedPreparedValue],
+    head: &KeyedPreparedValue,
+) -> anyhow::Result<usize> {
+    let (encoded, _) = guardian_v2_validate_prepared_generation(parts, head)?;
+    let mut hashes = parts
+        .iter()
+        .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
+        .collect::<Vec<_>>();
+    hashes.push(iroh_blobs::Hash::new(head.value.bytes.as_ref()));
+    let mut protection = h.client.protect_hashes(hashes).await?;
+    protection.finish_tag_installation();
+    let registration = PreparedSnapshotRegistration::new(
+        &head.key,
+        head.value.change_digest,
+        parts.iter().map(|part| part.key.clone()).collect(),
+    );
+    let mut writes = 0usize;
+    for part in parts {
+        writes += usize::from(guardian_v2_publish_immutable(h, part, &protection).await?);
+    }
+    if !guardian_v2_current_exact(h, &head.key, &head.value).await? {
+        h.kv.put_gc_protected(&head.key, head.value.bytes.as_ref().clone(), &protection)
+            .await?;
+        writes += 1;
+    }
+    guardian_v2_verify_generation(h, &encoded).await?;
+    drop(protection);
+    drop(registration);
+    Ok(writes)
+}
+
+#[cfg(debug_assertions)]
+async fn guardian_v2_diagnostic_wait_for_gc(
+    h: &Handle,
+    successful_runs_before: u64,
+) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if h.client.backend().gc_health().await.successful_runs > successful_runs_before {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "Guardian v2 diagnostic did not observe concurrent GC; use disposable data with GUARDIAN_GC_SECS=1"
+    )
+}
+
+#[cfg(debug_assertions)]
+async fn guardian_v2_diagnostic_remove_local_blob(
+    h: &Handle,
+    target: iroh_blobs::Hash,
+) -> anyhow::Result<()> {
+    use futures::StreamExt;
+
+    let store = h.client.backend().get_store_for_blobs().await?;
+    let store = store.read().await;
+    let all_hashes = store.blobs().list().hashes().await?;
+    if !all_hashes.contains(&target) {
+        anyhow::bail!("Guardian v2 repair diagnostic target is not local before removal");
+    }
+    let protected_hashes = all_hashes
+        .into_iter()
+        .filter(|hash| *hash != target)
+        .collect::<Vec<_>>();
+    if protected_hashes.is_empty() {
+        anyhow::bail!("Guardian v2 repair diagnostic has no non-target blobs to protect");
+    }
+
+    // Keep the normal Guardian collector behind its write gate while this
+    // disposable-store-only pass removes exactly one current content blob.
+    let protection = h
+        .client
+        .protect_hashes(protected_hashes.iter().copied())
+        .await?;
+    let mut tags = store.tags().list().await?;
+    let mut target_tags = Vec::new();
+    while let Some(tag) = tags.next().await {
+        let tag = tag?;
+        if tag.hash == target {
+            target_tags.push(tag.name);
+        }
+    }
+    drop(tags);
+    for tag in target_tags {
+        store.tags().delete(tag.as_ref()).await?;
+    }
+
+    let mut live = protected_hashes
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    iroh_blobs::store::gc_run_once(store.as_ref(), &mut live).await?;
+    if store.blobs().has(target).await? {
+        anyhow::bail!("Guardian v2 repair diagnostic target survived exact raw GC");
+    }
+    drop(protection);
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+async fn guardian_v2_diagnostic(
+    h: &Handle,
+    desired: &DesiredReplication,
+) -> anyhow::Result<String> {
+    let initial_heads = h.kv.entry_heads().await?;
+    if initial_heads
+        .iter()
+        .any(|head| head.key.starts_with(GUARDIAN_V2_NODE_PREFIX))
+    {
+        anyhow::bail!("Guardian v2 diagnostic requires a fresh disposable Guardian store");
+    }
+    let nonce = hive_core::now_ms();
+
+    for component in ["plain", "a.b_c-1", "slash/name", "é", "%"] {
+        let encoded = guardian_v2_encode_component(component)?;
+        if guardian_v2_decode_component(&encoded)? != component {
+            anyhow::bail!("Guardian v2 component roundtrip changed {component:?}");
+        }
+    }
+    for malformed in ["", "%", "%2", "%2f", "%41", "/", "é", "%FF"] {
+        if guardian_v2_decode_component(malformed).is_ok() {
+            anyhow::bail!("Guardian v2 component decoder accepted {malformed:?}");
+        }
+    }
+    if guardian_v2_encode_component(&"x".repeat(256)).is_ok() {
+        anyhow::bail!("Guardian v2 component encoder accepted more than 255 decoded bytes");
+    }
+
+    let map_a = guardian_v2_canonical_json_bytes(serde_json::json!({"z": 1, "a": 2}))?;
+    let map_b = guardian_v2_canonical_json_bytes(serde_json::json!({"a": 2, "z": 1}))?;
+    if map_a != map_b
+        || guardian_v2_parse_canonical_json(&map_a, 1024, "diagnostic map").is_err()
+        || guardian_v2_parse_canonical_json(br#"{"z":1,"a":2}"#, 1024, "diagnostic map").is_ok()
+        || guardian_v2_parse_canonical_json(br#"{"a":1,"a":2}"#, 1024, "diagnostic duplicate")
+            .is_ok()
+    {
+        anyhow::bail!("Guardian v2 canonical map/duplicate diagnostic failed");
+    }
+    let ordered_a = guardian_v2_canonical_json_bytes(serde_json::json!([1, 2]))?;
+    let ordered_b = guardian_v2_canonical_json_bytes(serde_json::json!([2, 1]))?;
+    if ordered_a == ordered_b {
+        anyhow::bail!("Guardian v2 canonicalizer reordered a semantic array");
+    }
+
+    let mut cron = serde_json::json!({
+        "cron": [{
+            "id": "configured",
+            "schedule": "0 * * * *",
+            "last_run_ms": 1,
+            "next_run_ms": 2,
+            "runs": 3
+        }]
+    });
+    guardian_v2_remove_cron_telemetry(&mut cron)?;
+    let cron_job = &cron["cron"][0];
+    if cron_job.get("id").and_then(serde_json::Value::as_str) != Some("configured")
+        || cron_job.get("schedule").is_none()
+        || cron_job.get("last_run_ms").is_some()
+        || cron_job.get("next_run_ms").is_some()
+        || cron_job.get("runs").is_some()
+    {
+        anyhow::bail!("Guardian v2 cron transform changed configuration or retained telemetry");
+    }
+
+    for namespace in desired.namespaces.values() {
+        guardian_v2_parse_namespace(namespace.bytes.as_ref())?;
+    }
+    if guardian_v2_namespace_bytes(serde_json::json!({
+        "projects": [{"project": "z"}, {"project": "a"}]
+    }))
+    .is_ok()
+    {
+        anyhow::bail!("Guardian v2 namespace accepted out-of-order projects");
+    }
+
+    let source_head = desired
+        .full
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic source head is absent"))?;
+    let parsed_source_head = guardian_v2_parse_head(source_head.value.bytes.as_ref())?;
+    let mut head_unknown: serde_json::Value =
+        serde_json::from_slice(source_head.value.bytes.as_ref())?;
+    head_unknown
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic head is not an object"))?
+        .insert("unknown".to_string(), serde_json::Value::Null);
+    if guardian_v2_parse_head(&guardian_v2_canonical_json_bytes(head_unknown)?).is_ok() {
+        anyhow::bail!("Guardian v2 head accepted an unknown field");
+    }
+    let mut head_missing: serde_json::Value =
+        serde_json::from_slice(source_head.value.bytes.as_ref())?;
+    head_missing
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic head is not an object"))?
+        .remove("state");
+    if guardian_v2_parse_head(&guardian_v2_canonical_json_bytes(head_missing)?).is_ok()
+        || guardian_v2_parse_head(&vec![b' '; GUARDIAN_V2_HEAD_MAX_BYTES + 1]).is_ok()
+    {
+        anyhow::bail!("Guardian v2 head accepted a missing field or oversized body");
+    }
+
+    let first_part = desired
+        .parts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic source part is absent"))?;
+    let first_kind = GuardianV2PartKind::State;
+    let mut malformed_wrapper: serde_json::Value =
+        serde_json::from_slice(first_part.value.bytes.as_ref())?;
+    malformed_wrapper
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic wrapper is not an object"))?
+        .insert("unknown".to_string(), serde_json::Value::Null);
+    let malformed_wrapper = guardian_v2_canonical_json_bytes(malformed_wrapper)?;
+    let malformed_reference = GuardianV2Reference {
+        sha256: hex::encode(sha256(&malformed_wrapper)),
+        bytes: malformed_wrapper.len(),
+    };
+    if guardian_v2_parse_part(first_kind, &malformed_wrapper, &malformed_reference).is_ok() {
+        anyhow::bail!("Guardian v2 part accepted a non-exact wrapper");
+    }
+
+    let mut changed_references = parsed_source_head.references.clone();
+    let changed_metrics = guardian_v2_wrapper_bytes(
+        GuardianV2PartKind::MetricsRollup,
+        serde_json::json!({"guardian_v2_diagnostic": nonce}),
+    )?;
+    let changed_metrics_sha = hex::encode(sha256(&changed_metrics));
+    let original_metrics_sha = changed_references
+        .get(GuardianV2PartKind::MetricsRollup.field())
+        .map(|reference| reference.sha256.clone())
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic metrics reference is absent"))?;
+    if changed_metrics_sha == original_metrics_sha {
+        anyhow::bail!("Guardian v2 diagnostic metrics mutation did not change its address");
+    }
+    changed_references.insert(
+        GuardianV2PartKind::MetricsRollup.field().to_string(),
+        GuardianV2Reference {
+            sha256: changed_metrics_sha,
+            bytes: changed_metrics.len(),
+        },
+    );
+    let changed_head = guardian_v2_head_bytes(&changed_references)?;
+    if sha256(&changed_head) == source_head.value.change_digest {
+        anyhow::bail!("Guardian v2 metrics-only mutation did not change the head");
+    }
+    for kind in GuardianV2PartKind::ALL {
+        if kind != GuardianV2PartKind::MetricsRollup
+            && changed_references
+                .get(kind.field())
+                .map(|reference| &reference.sha256)
+                != parsed_source_head
+                    .references
+                    .get(kind.field())
+                    .map(|reference| &reference.sha256)
+        {
+            anyhow::bail!("Guardian v2 metrics-only mutation changed {}", kind.field());
+        }
+    }
+
+    let (fixture_parts, fixture_head) =
+        guardian_v2_diagnostic_generation(desired, &format!("guardian-v2-diag-fixture-{nonce}"))?;
+    let fixture_snapshot = guardian_v2_diagnostic_snapshot(&fixture_parts, &fixture_head)?;
+    let legacy_bytes = serde_json::to_vec(&fixture_snapshot)?;
+
+    let legacy_peer = format!("guardian-v2-diag-legacy-peer-{nonce}");
+    h.kv.put(
+        &format!("node/{legacy_peer}/snapshot"),
+        legacy_bytes.clone(),
+    )
+    .await?;
+    let legacy_selected = fetch_newest_peer_snapshot().await;
+    if legacy_selected.as_ref().map(|selected| selected.0.as_str()) != Some(legacy_peer.as_str()) {
+        anyhow::bail!("Guardian v2 peer fallback did not select legacy when v2 was absent");
+    }
+
+    let legacy_self = format!("guardian-v2-diag-legacy-self-{nonce}");
+    let legacy_self_key = format!("node/{legacy_self}/snapshot");
+    h.kv.put(&legacy_self_key, legacy_bytes.clone()).await?;
+    if !matches!(
+        fetch_snapshot_at_result(&legacy_self_key).await,
+        SnapshotFetch::Ready(_)
+    ) {
+        anyhow::bail!("Guardian v2 self fallback did not select legacy after two absent probes");
+    }
+
+    let mut first_incomplete_peer: Option<String> = None;
+    for cut in 0..=GuardianV2PartKind::ALL.len() {
+        let component = format!("guardian-v2-diag-cut-{cut}-{nonce}");
+        let (parts, head) = guardian_v2_diagnostic_generation(desired, &component)?;
+        if cut > 0 {
+            let mut hashes = parts
+                .iter()
+                .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
+                .collect::<Vec<_>>();
+            hashes.push(iroh_blobs::Hash::new(head.value.bytes.as_ref()));
+            let mut protection = h.client.protect_hashes(hashes).await?;
+            protection.finish_tag_installation();
+            for part in parts.iter().take(cut) {
+                h.kv.put_gc_protected(&part.key, part.value.bytes.as_ref().clone(), &protection)
+                    .await?;
+            }
+            drop(protection);
+            first_incomplete_peer.get_or_insert(component.clone());
+        }
+        let encoded = guardian_v2_encode_component(&component)?;
+        let probe = guardian_v2_probe(h, &encoded).await;
+        if (cut == 0 && !matches!(probe, GuardianV2Probe::Absent))
+            || (cut > 0 && !matches!(probe, GuardianV2Probe::Incomplete))
+        {
+            anyhow::bail!("Guardian v2 pre-head cut {cut} had the wrong tri-state");
+        }
+    }
+
+    if fetch_newest_peer_snapshot().await.is_some() {
+        anyhow::bail!("Guardian v2 incomplete peer population did not suppress legacy peers");
+    }
+
+    let incomplete_self = format!("guardian-v2-diag-incomplete-self-{nonce}");
+    let incomplete_self_key = format!("node/{incomplete_self}/snapshot");
+    h.kv.put(&incomplete_self_key, legacy_bytes.clone()).await?;
+    let (incomplete_parts, _) = guardian_v2_diagnostic_generation(desired, &incomplete_self)?;
+    h.kv.put(
+        &incomplete_parts[0].key,
+        incomplete_parts[0].value.bytes.as_ref().clone(),
+    )
+    .await?;
+    if !matches!(
+        fetch_snapshot_at_result(&incomplete_self_key).await,
+        SnapshotFetch::Incomplete
+    ) {
+        anyhow::bail!("Guardian v2 incomplete self did not suppress legacy");
+    }
+
+    for missing in 0..GuardianV2PartKind::ALL.len() {
+        let component = format!("guardian-v2-diag-missing-{missing}-{nonce}");
+        let (parts, head) = guardian_v2_diagnostic_generation(desired, &component)?;
+        let mut hashes = parts
+            .iter()
+            .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
+            .collect::<Vec<_>>();
+        hashes.push(iroh_blobs::Hash::new(head.value.bytes.as_ref()));
+        let mut protection = h.client.protect_hashes(hashes).await?;
+        protection.finish_tag_installation();
+        for (index, part) in parts.iter().enumerate() {
+            if index != missing {
+                h.kv.put_gc_protected(&part.key, part.value.bytes.as_ref().clone(), &protection)
+                    .await?;
+            }
+        }
+        h.kv.put_gc_protected(&head.key, head.value.bytes.as_ref().clone(), &protection)
+            .await?;
+        let encoded = guardian_v2_encode_component(&component)?;
+        if !matches!(
+            guardian_v2_probe(h, &encoded).await,
+            GuardianV2Probe::Incomplete
+        ) {
+            anyhow::bail!("Guardian v2 accepted a head missing part index {missing}");
+        }
+        drop(protection);
+    }
+
+    let collision_component = format!("guardian-v2-diag-collision-{nonce}");
+    let (collision_parts, collision_head) =
+        guardian_v2_diagnostic_generation(desired, &collision_component)?;
+    h.kv.put(&collision_parts[0].key, b"immutable-collision".to_vec())
+        .await?;
+    let mut collision_hashes = collision_parts
+        .iter()
+        .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
+        .collect::<Vec<_>>();
+    collision_hashes.push(iroh_blobs::Hash::new(collision_head.value.bytes.as_ref()));
+    let mut collision_protection = h.client.protect_hashes(collision_hashes).await?;
+    collision_protection.finish_tag_installation();
+    if guardian_v2_publish_immutable(h, &collision_parts[0], &collision_protection)
+        .await
+        .is_ok()
+    {
+        anyhow::bail!("Guardian v2 immutable collision was not rejected");
+    }
+    drop(collision_protection);
+
+    let ready_peer = format!("guardian-v2-diag-ready-peer-{nonce}");
+    let (ready_parts, ready_head) = guardian_v2_diagnostic_generation(desired, &ready_peer)?;
+    let first_writes =
+        guardian_v2_diagnostic_publish_generation(h, &ready_parts, &ready_head).await?;
+    let no_op_writes =
+        guardian_v2_diagnostic_publish_generation(h, &ready_parts, &ready_head).await?;
+    if first_writes != GuardianV2PartKind::ALL.len() + 1 || no_op_writes != 0 {
+        anyhow::bail!(
+            "Guardian v2 semantic no-op diagnostic wrote {no_op_writes} values after {first_writes} first-pass writes"
+        );
+    }
+    let repair_part = ready_parts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 repair diagnostic part is absent"))?;
+    let repair_hash = iroh_blobs::Hash::new(repair_part.value.bytes.as_ref());
+    let repair_hash_hex = repair_hash.to_hex();
+    let repair_heads = h.kv.entry_heads().await?;
+    let repair_before = guardian_v2_latest_entry(&repair_heads, &repair_part.key)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 repair diagnostic metadata is absent"))?;
+    let repair_timestamp = repair_before.timestamp;
+    if repair_before.hash != repair_hash_hex || repair_before.content_local != Some(true) {
+        anyhow::bail!("Guardian v2 repair diagnostic did not start from exact local content");
+    }
+
+    guardian_v2_diagnostic_remove_local_blob(h, repair_hash).await?;
+    let missing_heads = h.kv.entry_heads().await?;
+    let missing = guardian_v2_latest_entry(&missing_heads, &repair_part.key)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 repair diagnostic lost its metadata"))?;
+    if missing.hash != repair_hash_hex
+        || missing.timestamp != repair_timestamp
+        || missing.content_local != Some(false)
+    {
+        anyhow::bail!("Guardian v2 repair diagnostic did not retain exact unavailable metadata");
+    }
+
+    let mut repair_protection = h.client.protect_hash(repair_hash).await?;
+    repair_protection.finish_tag_installation();
+    if !guardian_v2_publish_immutable(h, repair_part, &repair_protection).await? {
+        anyhow::bail!("Guardian v2 unavailable immutable content was not repaired");
+    }
+    drop(repair_protection);
+    let repaired_heads = h.kv.entry_heads().await?;
+    let repaired = guardian_v2_latest_entry(&repaired_heads, &repair_part.key)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 repaired metadata is absent"))?;
+    if repaired.hash != repair_hash_hex
+        || repaired.content_local != Some(true)
+        || h.kv.get(&repair_part.key).await?.as_deref() != Some(repair_part.value.bytes.as_slice())
+    {
+        anyhow::bail!("Guardian v2 immutable repair did not restore exact local bytes");
+    }
+
+    let selected_v2 = fetch_newest_peer_snapshot().await;
+    if selected_v2.as_ref().map(|selected| selected.0.as_str()) != Some(ready_peer.as_str()) {
+        anyhow::bail!("Guardian v2 peer selection did not prefer the valid v2 candidate");
+    }
+
+    let ready_self = format!("guardian-v2-diag-ready-self-{nonce}");
+    let ready_self_key = format!("node/{ready_self}/snapshot");
+    h.kv.put(&ready_self_key, legacy_bytes).await?;
+    let (ready_self_parts, ready_self_head) =
+        guardian_v2_diagnostic_generation(desired, &ready_self)?;
+    guardian_v2_diagnostic_publish_generation(h, &ready_self_parts, &ready_self_head).await?;
+    let verified_self =
+        guardian_v2_verify_generation(h, &guardian_v2_encode_component(&ready_self)?).await?;
+    match fetch_snapshot_at_result(&ready_self_key).await {
+        SnapshotFetch::Ready(snapshot)
+            if snapshot.saved_ms == verified_self.head.timestamp / 1000 => {}
+        _ => anyhow::bail!("Guardian v2 ready self did not win over legacy"),
+    }
+
+    let gc_component = format!("guardian-v2-diag-gc-{nonce}");
+    let (gc_parts, gc_head) = guardian_v2_diagnostic_generation(desired, &gc_component)?;
+    let (_, _) = guardian_v2_validate_prepared_generation(&gc_parts, &gc_head)?;
+    let mut gc_hashes = gc_parts
+        .iter()
+        .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
+        .collect::<Vec<_>>();
+    gc_hashes.push(iroh_blobs::Hash::new(gc_head.value.bytes.as_ref()));
+    let mut gc_protection = h.client.protect_hashes(gc_hashes).await?;
+    gc_protection.finish_tag_installation();
+    let gc_registration = PreparedSnapshotRegistration::new(
+        &gc_head.key,
+        gc_head.value.change_digest,
+        gc_parts.iter().map(|part| part.key.clone()).collect(),
+    );
+    let successful_runs_before = h.client.backend().gc_health().await.successful_runs;
+    for part in &gc_parts {
+        guardian_v2_publish_immutable(h, part, &gc_protection).await?;
+    }
+    guardian_v2_diagnostic_wait_for_gc(h, successful_runs_before).await?;
+    for part in &gc_parts {
+        let hash = iroh_blobs::Hash::new(part.value.bytes.as_ref()).to_hex();
+        if !h.client.has_blob_local(&hash).await {
+            anyhow::bail!("Guardian v2 protected part disappeared during concurrent GC");
+        }
+    }
+    h.kv.put_gc_protected(
+        &gc_head.key,
+        gc_head.value.bytes.as_ref().clone(),
+        &gc_protection,
+    )
+    .await?;
+    guardian_v2_verify_generation(h, &guardian_v2_encode_component(&gc_component)?).await?;
+    if !h
+        .client
+        .has_blob_local(&iroh_blobs::Hash::new(gc_head.value.bytes.as_ref()).to_hex())
+        .await
+    {
+        anyhow::bail!("Guardian v2 protected head disappeared during concurrent GC");
+    }
+    drop(gc_protection);
+    drop(gc_registration);
+
+    Ok(format!(
+        "GUARDIAN_V2_DIAGNOSTIC_OK nonce={nonce} codec=ok canonical=ok transforms=ok cuts=7 missing=6 collision=ok repair=ok fallback=ok noop=ok gc=ok incomplete_peer={}",
+        first_incomplete_peer.unwrap_or_default()
+    ))
+}
+
+#[cfg(debug_assertions)]
+async fn maybe_guardian_v2_diagnostic(
+    h: &Handle,
+    desired: &DesiredReplication,
+) -> anyhow::Result<()> {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let enabled = std::env::var("HIVE_GUARDIAN_V2_DIAGNOSTIC")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    let report = guardian_v2_diagnostic(h, desired).await?;
+    tracing::info!(report, "Guardian v2 disposable diagnostic passed");
+    Ok(())
+}
+
 async fn write_replication_batch(
     desired: &DesiredReplication,
-    committed: &CommittedReplication,
+    _committed: &CommittedReplication,
     owned_namespaces: &mut std::collections::BTreeMap<String, SnapshotDigest>,
 ) -> anyhow::Result<ReplicationWriteStats> {
     let h = handle().await?;
-    let live = h.kv.all();
-    let mut stats = ReplicationWriteStats::default();
+    #[cfg(debug_assertions)]
+    maybe_guardian_v2_diagnostic(h, desired).await?;
 
+    let mut stats = ReplicationWriteStats::default();
     for (key, value) in &desired.namespaces {
-        let live_matches = live
-            .get(key)
-            .is_some_and(|bytes| sha256(bytes) == value.change_digest);
+        let live_matches = guardian_v2_current_exact(h, key, value).await?;
         {
             let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
             counters.namespaces.record_attempt(value.bytes.len());
@@ -1923,127 +3409,99 @@ async fn write_replication_batch(
                     .namespaces
                     .record_failed();
             }
-            put_result.map_err(|e| anyhow::anyhow!("guardian namespace put {key}: {e}"))?;
-            owned_namespaces.insert(key.clone(), value.change_digest);
+            put_result
+                .map_err(|error| anyhow::anyhow!("Guardian v2 namespace put {key}: {error}"))?;
             stats.namespace_puts += 1;
             stats.put_bytes += value.bytes.len();
         }
+        guardian_v2_verify_namespace(h, key, value).await?;
+        owned_namespaces.insert(key.clone(), value.change_digest);
     }
 
-    let mut deletes: Vec<String> = live
-        .iter()
-        .filter_map(|(key, bytes)| {
-            if !is_namespace_state_key(key) || desired.namespaces.contains_key(key) {
-                return None;
-            }
-            let live_digest = sha256(bytes);
-            let owned = owned_namespaces.get(key) == Some(&live_digest)
-                || committed.namespaces.get(key) == Some(&live_digest);
-            owned.then(|| key.clone())
-        })
-        .collect();
-    deletes.sort_unstable();
-    for key in deletes {
-        h.kv.delete(&key)
-            .await
-            .map_err(|e| anyhow::anyhow!("guardian namespace delete {key}: {e}"))?;
-        owned_namespaces.remove(&key);
-        stats.deletes += 1;
-        write_counters()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .namespace_deletes += 1;
-    }
-
-    if let Some(full) = &desired.full {
-        // All local publication and cleanup for this node's fixed base key share
-        // one writer gate. The per-delete head proofs below still defend against
-        // replicated head movement, while this lock closes the local recommit race.
+    if let Some(head) = &desired.full {
+        let (encoded_component, prepared_head) =
+            guardian_v2_validate_prepared_generation(&desired.parts, head)?;
         let _lifecycle = SNAPSHOT_LIFECYCLE_LOCK.lock().await;
 
-        // Install Drop-released temporary roots atomically against GC before the
-        // first part publication. Protect the base blob too: its document head is
-        // not a durable root until the final publication succeeds.
-        let mut prepared_hashes: Vec<_> = desired
+        let mut prepared_hashes = desired
             .parts
             .iter()
             .map(|part| iroh_blobs::Hash::new(part.value.bytes.as_ref()))
-            .collect();
-        prepared_hashes.push(iroh_blobs::Hash::new(full.value.bytes.as_ref()));
-        let mut part_guard = h
+            .collect::<Vec<_>>();
+        prepared_hashes.push(iroh_blobs::Hash::new(head.value.bytes.as_ref()));
+        let mut protection = h
             .client
             .protect_hashes(prepared_hashes)
             .await
-            .map_err(|error| anyhow::anyhow!("guardian snapshot parts protect: {error}"))?;
-
-        // Tag installation is complete. Release only its GC setup gate before
-        // publishing: iroh-docs takes the same fair RwLock in its actor, so holding
-        // a read guard while a collector writer is queued would deadlock the next
-        // publication. BlobProtection continues to own every temporary tag until
-        // it is dropped after the committed manifest has been verified.
-        part_guard.finish_tag_installation();
-        let prepared_registration = PreparedSnapshotRegistration::new(
-            &full.key,
-            full.value.change_digest,
+            .map_err(|error| anyhow::anyhow!("Guardian v2 generation protect: {error}"))?;
+        protection.finish_tag_installation();
+        let registration = PreparedSnapshotRegistration::new(
+            &head.key,
+            head.value.change_digest,
             desired.parts.iter().map(|part| part.key.clone()).collect(),
         );
 
-        // Parts are installed before the base manifest. The base is the commit
-        // marker, so readers never adopt a manifest whose referenced bytes were not
-        // successfully written by this batch.
         for part in &desired.parts {
-            let live_matches = live
-                .get(&part.key)
-                .is_some_and(|bytes| sha256(bytes) == part.value.change_digest);
             {
                 let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
-                let class = counters.parts.entry(part.class.to_string()).or_default();
-                class.record_attempt(part.value.bytes.len());
-                if live_matches {
-                    class.record_no_op(part.value.bytes.len());
-                }
+                counters
+                    .parts
+                    .entry(part.class.to_string())
+                    .or_default()
+                    .record_attempt(part.value.bytes.len());
             }
-            if !live_matches {
-                let put_result = h
-                    .kv
-                    .put_gc_protected(&part.key, part.value.bytes.as_ref().clone(), &part_guard)
-                    .await;
-                {
-                    let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
-                    let class = counters.parts.entry(part.class.to_string()).or_default();
-                    if put_result.is_ok() {
-                        class.record_committed(part.value.bytes.len());
-                    } else {
-                        class.record_failed();
-                    }
+            match guardian_v2_publish_immutable(h, part, &protection).await {
+                Ok(true) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .parts
+                        .entry(part.class.to_string())
+                        .or_default()
+                        .record_committed(part.value.bytes.len());
+                    stats.full_puts += 1;
+                    stats.put_bytes += part.value.bytes.len();
                 }
-                put_result
-                    .map_err(|e| anyhow::anyhow!("guardian snapshot part put {}: {e}", part.key))?;
-                stats.full_puts += 1;
-                stats.put_bytes += part.value.bytes.len();
+                Ok(false) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .parts
+                        .entry(part.class.to_string())
+                        .or_default()
+                        .record_no_op(part.value.bytes.len());
+                }
+                Err(error) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .parts
+                        .entry(part.class.to_string())
+                        .or_default()
+                        .record_failed();
+                    return Err(error);
+                }
             }
         }
 
-        let live_matches = live
-            .get(&full.key)
-            .is_some_and(|bytes| sha256(bytes) == full.value.change_digest);
+        let head_matches = guardian_v2_current_exact(h, &head.key, &head.value).await?;
         {
             let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
-            counters.full.record_attempt(full.value.bytes.len());
-            if live_matches {
-                counters.full.record_no_op(full.value.bytes.len());
+            counters.full.record_attempt(head.value.bytes.len());
+            if head_matches {
+                counters.full.record_no_op(head.value.bytes.len());
             }
         }
-        if !live_matches {
+        if !head_matches {
             let put_result =
-                h.kv.put_gc_protected(&full.key, full.value.bytes.as_ref().clone(), &part_guard)
+                h.kv.put_gc_protected(&head.key, head.value.bytes.as_ref().clone(), &protection)
                     .await;
             if put_result.is_ok() {
                 write_counters()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .full
-                    .record_committed(full.value.bytes.len());
+                    .record_committed(head.value.bytes.len());
             } else {
                 write_counters()
                     .lock()
@@ -2052,48 +3510,43 @@ async fn write_replication_batch(
                     .record_failed();
             }
             put_result
-                .map_err(|e| anyhow::anyhow!("guardian full snapshot put {}: {e}", full.key))?;
+                .map_err(|error| anyhow::anyhow!("Guardian v2 head put {}: {error}", head.key))?;
             stats.full_puts += 1;
-            stats.put_bytes += full.value.bytes.len();
+            stats.put_bytes += head.value.bytes.len();
         }
 
-        // Keep temporary roots until the exact base bytes we prepared are the
-        // stable readable current head and every manifest reference is bound to
-        // its own stable current head and immutable bytes. A successful PUT alone
-        // is not proof: a conflicting/malformed head must never authorize
-        // retirement. Before the base PUT, any error or cancellation drops only
-        // this prepared generation's temporary roots; the prior committed
-        // generation remains untouched.
-        let (committed_base_digest, committed_parts) =
-            verified_committed_part_keys(h, &full.key).await?;
-        if committed_base_digest != full.value.change_digest {
-            anyhow::bail!(
-                "committed Guardian snapshot base does not match the prepared generation"
-            );
+        let verified = guardian_v2_verify_generation(h, &encoded_component).await?;
+        if verified.head_sha256 != head.value.change_digest
+            || verified.head.hash != iroh_blobs::Hash::new(head.value.bytes.as_ref()).to_hex()
+            || verified.snapshot.saved_ms != verified.head.timestamp / 1000
+        {
+            anyhow::bail!("Guardian v2 committed head does not match the prepared generation");
         }
-        let desired_parts: std::collections::BTreeSet<_> =
-            desired.parts.iter().map(|part| part.key.clone()).collect();
-        if committed_parts != desired_parts {
-            anyhow::bail!(
-                "committed Guardian snapshot manifest does not match the prepared generation"
-            );
+        for (kind, part) in GuardianV2PartKind::ALL.into_iter().zip(&desired.parts) {
+            let reference = prepared_head.references.get(kind.field()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Guardian v2 prepared reference {} disappeared",
+                    kind.field()
+                )
+            })?;
+            let identity = verified.part_heads.get(kind.field()).ok_or_else(|| {
+                anyhow::anyhow!("Guardian v2 verified part {} disappeared", kind.field())
+            })?;
+            if identity.hash != iroh_blobs::Hash::new(part.value.bytes.as_ref()).to_hex()
+                || reference.sha256 != hex::encode(part.value.change_digest)
+                || reference.bytes != part.value.bytes.len()
+            {
+                anyhow::bail!(
+                    "Guardian v2 committed {} does not match the prepared generation",
+                    kind.field()
+                );
+            }
         }
 
-        // No await may intervene in this transfer: current document metadata now
-        // owns reachability for the exact prepared generation, so dropping the
-        // temporary tags cannot expose it to GC.
-        drop(part_guard);
-        drop(prepared_registration);
-        let reaped = cleanup_committed_snapshot_parts_locked(h, &full.key).await?;
-        stats.deletes += reaped;
-        if reaped > 0 {
-            write_counters()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .part_reap_deletes += reaped as u64;
-        }
+        drop(protection);
+        drop(registration);
     } else if !desired.parts.is_empty() {
-        anyhow::bail!("Guardian snapshot parts exist without a base commit marker");
+        anyhow::bail!("Guardian v2 parts exist without a head commit marker");
     }
 
     Ok(stats)
@@ -2413,7 +3866,133 @@ enum SnapshotFetch {
     Ready(PlatformSnapshot),
 }
 
-async fn fetch_snapshot_at_result(key: &str) -> SnapshotFetch {
+struct GuardianV2Verified {
+    snapshot: PlatformSnapshot,
+    head: SnapshotKeyHead,
+    head_sha256: SnapshotDigest,
+    part_heads: std::collections::BTreeMap<String, SnapshotKeyHead>,
+}
+
+enum GuardianV2Probe {
+    Absent,
+    Incomplete,
+    Ready(GuardianV2Verified),
+}
+
+async fn guardian_v2_verify_generation(
+    h: &Handle,
+    encoded_component: &str,
+) -> anyhow::Result<GuardianV2Verified> {
+    guardian_v2_decode_component(encoded_component)?;
+    let head_key = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/head");
+    let before = h.kv.entry_heads().await?;
+    let head_source = guardian_v2_latest_entry(&before, &head_key)
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 head metadata is absent"))?;
+    if head_source.content_local == Some(false) {
+        anyhow::bail!("Guardian v2 head content is not local");
+    }
+    let head = SnapshotKeyHead {
+        timestamp: head_source.timestamp,
+        hash: head_source.hash.clone(),
+    };
+    let head_bytes =
+        h.kv.get(&head_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 head bytes are absent"))?;
+    if head_bytes.len() > GUARDIAN_V2_HEAD_MAX_BYTES
+        || iroh_blobs::Hash::new(&head_bytes).to_hex() != head.hash
+    {
+        anyhow::bail!("Guardian v2 head length/BLAKE3 metadata mismatch");
+    }
+    let parsed_head = guardian_v2_parse_head(&head_bytes)?;
+    let head_sha256 = sha256(&head_bytes);
+
+    let mut part_values = std::collections::BTreeMap::new();
+    let mut wrapper_bytes = std::collections::BTreeMap::new();
+    let mut part_heads = std::collections::BTreeMap::new();
+    for kind in GuardianV2PartKind::ALL {
+        let reference = parsed_head.references.get(kind.field()).ok_or_else(|| {
+            anyhow::anyhow!("Guardian v2 head reference {} is absent", kind.field())
+        })?;
+        let key = guardian_v2_part_key(encoded_component, kind, &reference.sha256)?;
+        let source = guardian_v2_latest_entry(&before, &key)
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} metadata is absent", kind.field()))?;
+        if source.content_local == Some(false) {
+            anyhow::bail!("Guardian v2 {} content is not local", kind.field());
+        }
+        let identity = SnapshotKeyHead {
+            timestamp: source.timestamp,
+            hash: source.hash.clone(),
+        };
+        let bytes =
+            h.kv.get(&key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} bytes are absent", kind.field()))?;
+        if iroh_blobs::Hash::new(&bytes).to_hex() != identity.hash {
+            anyhow::bail!("Guardian v2 {} BLAKE3 metadata mismatch", kind.field());
+        }
+        let value = guardian_v2_parse_part(kind, &bytes, reference)?;
+        part_values.insert(kind.field().to_string(), value);
+        wrapper_bytes.insert(kind.field().to_string(), bytes);
+        part_heads.insert(kind.field().to_string(), identity);
+    }
+
+    let saved_ms = head.timestamp / 1000;
+    let snapshot = guardian_v2_reconstruct(&part_values, &wrapper_bytes, saved_ms)?;
+    let after = h.kv.entry_heads().await?;
+    if latest_snapshot_head(&after, &head_key) != Some(head.clone()) {
+        anyhow::bail!("Guardian v2 head metadata changed during verification");
+    }
+    for kind in GuardianV2PartKind::ALL {
+        let reference = parsed_head.references.get(kind.field()).ok_or_else(|| {
+            anyhow::anyhow!("Guardian v2 head reference {} disappeared", kind.field())
+        })?;
+        let key = guardian_v2_part_key(encoded_component, kind, &reference.sha256)?;
+        if latest_snapshot_head(&after, &key) != part_heads.get(kind.field()).cloned() {
+            anyhow::bail!(
+                "Guardian v2 {} metadata changed during verification",
+                kind.field()
+            );
+        }
+    }
+
+    Ok(GuardianV2Verified {
+        snapshot,
+        head,
+        head_sha256,
+        part_heads,
+    })
+}
+
+async fn guardian_v2_probe(h: &Handle, encoded_component: &str) -> GuardianV2Probe {
+    if guardian_v2_decode_component(encoded_component).is_err() {
+        return GuardianV2Probe::Incomplete;
+    }
+    let prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/");
+    let Ok(heads) = h.kv.entry_heads().await else {
+        return GuardianV2Probe::Incomplete;
+    };
+    if !heads.iter().any(|head| head.key.starts_with(&prefix)) {
+        return GuardianV2Probe::Absent;
+    }
+    let head_key = format!("{prefix}head");
+    if guardian_v2_latest_entry(&heads, &head_key).is_none() {
+        return GuardianV2Probe::Incomplete;
+    }
+    match guardian_v2_verify_generation(h, encoded_component).await {
+        Ok(verified) => GuardianV2Probe::Ready(verified),
+        Err(error) => {
+            tracing::warn!(
+                component = encoded_component,
+                %error,
+                "Guardian v2 snapshot is incomplete"
+            );
+            GuardianV2Probe::Incomplete
+        }
+    }
+}
+
+async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
     let Ok(h) = handle().await else {
         return SnapshotFetch::Incomplete;
     };
@@ -2526,6 +4105,36 @@ async fn fetch_snapshot_at_result(key: &str) -> SnapshotFetch {
     SnapshotFetch::Ready(snapshot)
 }
 
+fn guardian_v2_component_from_legacy_key(key: &str) -> Option<&str> {
+    key.strip_prefix("node/")
+        .and_then(|rest| rest.strip_suffix("/snapshot"))
+        .filter(|component| !component.is_empty())
+}
+
+async fn fetch_snapshot_at_result(key: &str) -> SnapshotFetch {
+    let Some(component) = guardian_v2_component_from_legacy_key(key) else {
+        return fetch_legacy_snapshot_at_result(key).await;
+    };
+    let Ok(encoded) = guardian_v2_encode_component(component) else {
+        return SnapshotFetch::Incomplete;
+    };
+    let Ok(h) = handle().await else {
+        return SnapshotFetch::Incomplete;
+    };
+    match guardian_v2_probe(h, &encoded).await {
+        GuardianV2Probe::Ready(verified) => SnapshotFetch::Ready(verified.snapshot),
+        GuardianV2Probe::Incomplete => SnapshotFetch::Incomplete,
+        GuardianV2Probe::Absent => {
+            tokio::task::yield_now().await;
+            match guardian_v2_probe(h, &encoded).await {
+                GuardianV2Probe::Ready(verified) => SnapshotFetch::Ready(verified.snapshot),
+                GuardianV2Probe::Incomplete => SnapshotFetch::Incomplete,
+                GuardianV2Probe::Absent => fetch_legacy_snapshot_at_result(key).await,
+            }
+        }
+    }
+}
+
 async fn fetch_snapshot_at(key: &str) -> Option<PlatformSnapshot> {
     match fetch_snapshot_at_result(key).await {
         SnapshotFetch::Ready(snapshot) => Some(snapshot),
@@ -2538,48 +4147,121 @@ pub async fn fetch_node_snapshot() -> Option<PlatformSnapshot> {
     fetch_snapshot_at(&snapshot_key()?).await
 }
 
-/// The newest replicated snapshot from any OTHER node (`node/<peer>/snapshot`),
-/// discovered by enumerating the replicated store's own keys (no registry
-/// dependency — at the boot moment this runs, gossip may not have resynced
-/// yet, but replicated keys survive in the local guardian store). Returns the
-/// owning peer's name alongside the snapshot.
+struct GuardianV2PeerPopulation {
+    components: std::collections::BTreeMap<String, String>,
+    malformed: bool,
+}
+
+fn guardian_v2_peer_population(
+    heads: &[guardian_db::traits::EntryHead],
+    me: &str,
+) -> GuardianV2PeerPopulation {
+    let mut components = std::collections::BTreeMap::new();
+    let mut malformed = false;
+    for head in heads {
+        let Some(rest) = head.key.strip_prefix(GUARDIAN_V2_NODE_PREFIX) else {
+            continue;
+        };
+        let Some((encoded, suffix)) = rest.split_once('/') else {
+            malformed = true;
+            continue;
+        };
+        let decoded = match guardian_v2_decode_component(encoded) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                malformed = true;
+                continue;
+            }
+        };
+        if decoded == me {
+            continue;
+        }
+        if suffix.is_empty() {
+            malformed = true;
+            continue;
+        }
+        components.insert(encoded.to_string(), decoded);
+    }
+    GuardianV2PeerPopulation {
+        components,
+        malformed,
+    }
+}
+
+/// The newest replicated snapshot from any OTHER node. Any valid v2 generation
+/// outranks every legacy candidate; an incomplete v2 population suppresses all
+/// legacy peer fallback. The selected candidate is fetched and verified again
+/// immediately before it is returned.
 pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> {
     let me = NODE_NAME.get()?.as_str();
-    let mut best: Option<(String, PlatformSnapshot)> = None;
-    for key in keys().await {
-        let Some(name) = key
+    let h = handle().await.ok()?;
+    let heads = h.kv.entry_heads().await.ok()?;
+    let population = guardian_v2_peer_population(&heads, me);
+    let mut incomplete_v2 = population.malformed;
+    let mut ready_v2 = Vec::new();
+    for (encoded, name) in &population.components {
+        match guardian_v2_probe(h, encoded).await {
+            GuardianV2Probe::Ready(verified) => {
+                ready_v2.push((encoded.clone(), name.clone(), verified.snapshot.saved_ms));
+            }
+            GuardianV2Probe::Incomplete => incomplete_v2 = true,
+            GuardianV2Probe::Absent => {}
+        }
+    }
+    ready_v2.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (encoded, name, _) in ready_v2 {
+        match guardian_v2_probe(h, &encoded).await {
+            GuardianV2Probe::Ready(verified) => return Some((name, verified.snapshot)),
+            GuardianV2Probe::Incomplete => incomplete_v2 = true,
+            GuardianV2Probe::Absent => {}
+        }
+    }
+    if incomplete_v2 {
+        return None;
+    }
+
+    // A second metadata observation is the proof that the entire peer v2
+    // population is truly absent before any legacy bytes may be considered.
+    tokio::task::yield_now().await;
+    let reprobe_heads = h.kv.entry_heads().await.ok()?;
+    let reprobe = guardian_v2_peer_population(&reprobe_heads, me);
+    if reprobe.malformed || !reprobe.components.is_empty() {
+        return None;
+    }
+
+    let mut legacy_keys = std::collections::BTreeMap::new();
+    for head in &reprobe_heads {
+        let Some(name) = head
+            .key
             .strip_prefix("node/")
-            .and_then(|r| r.strip_suffix("/snapshot"))
+            .and_then(|rest| rest.strip_suffix("/snapshot"))
+            .filter(|name| !name.is_empty() && *name != me)
         else {
             continue;
         };
-        if name == me {
-            continue;
-        }
-        let Some(snap) = fetch_snapshot_at(&key).await else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(_, b)| snap.saved_ms > b.saved_ms)
-        {
-            best = Some((name.to_string(), snap));
+        legacy_keys.insert(name.to_string(), head.key.clone());
+    }
+    let mut ready_legacy = Vec::new();
+    for (name, key) in legacy_keys {
+        if let SnapshotFetch::Ready(snapshot) = fetch_legacy_snapshot_at_result(&key).await {
+            ready_legacy.push((name, key, snapshot.saved_ms));
         }
     }
-    best
+    ready_legacy.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    for (name, key, _) in ready_legacy {
+        if let SnapshotFetch::Ready(snapshot) = fetch_legacy_snapshot_at_result(&key).await {
+            return Some((name, snapshot));
+        }
+    }
+    None
 }
 
-/// Strip the NODE-LOCAL runtime portions from a snapshot before adopting it
-/// from a PEER: `deployments` are this-node cell/serving records (adopting a
-/// peer's would fabricate phantom deployments pointing at cells that only
-/// exist on the peer), `sandboxes` likewise, `metrics_rollup` is per-node
-/// observed traffic (adopting a peer's would double-count its traffic here),
-/// `database_data` is the in-process store payload for locally-hosted DBs,
-/// and `cron` is the per-node scheduler state (adopting a peer's would
-/// schedule another node's jobs and cause duplicate execution).
-/// Everything else — projects, teams, billing, domains, webhooks, DB records,
-/// workflow defs, enterprise config, users/orgs — is tenant/control-plane
-/// state shared fleet-wide via gossip, exactly what a wiped node needs back.
 fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
     snap.deployments = Vec::new();
     snap.sandboxes = Default::default();
@@ -3765,8 +5447,12 @@ fn collect_blob_store_snapshot() -> BlobStoreSnapshot {
     if let Ok(meta) = std::fs::metadata(store_root.join("blobs.db")) {
         out.blobs_db_bytes = meta.len();
     }
-    if let Ok(meta) = std::fs::metadata(guardian_dir.join("iroh").join("iroh_docs").join("docs.redb"))
-    {
+    if let Ok(meta) = std::fs::metadata(
+        guardian_dir
+            .join("iroh")
+            .join("iroh_docs")
+            .join("docs.redb"),
+    ) {
         out.docs_db_bytes = meta.len();
     }
     let mut scanned = 0usize;

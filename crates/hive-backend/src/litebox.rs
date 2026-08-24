@@ -1904,13 +1904,9 @@ impl LiteboxBackend {
             output.sync_all().await?;
         }
         if !deps.is_empty() {
-            append_ldd_closure_to_tar(&mut temp.file, &deps)
-                .with_context(|| {
-                    format!(
-                        "failed to append LDD closure to tar for {}",
-                        bin.display()
-                    )
-                })?;
+            append_ldd_closure_to_tar(&mut temp.file, &deps).with_context(|| {
+                format!("failed to append LDD closure to tar for {}", bin.display())
+            })?;
         }
         self.stage_bind_shim(directories, &temp).await?;
         temp.file.sync_all()?;
@@ -2588,6 +2584,26 @@ fn launch_refusal(reason: impl std::fmt::Display) -> anyhow::Error {
     )
 }
 
+/// The one message for "this backend cannot run Bun at all", shared by
+/// `start_function`'s entry-point refusal (the authoritative `func.runtime`
+/// check, which makes this unreachable in the ordinary case) and the
+/// belt-and-braces check right after `resolve_direct_launch` (which would
+/// otherwise trust `start_cmd`'s argv-derived runtime alone for a
+/// mismatched — `func.runtime == Node` but `start_cmd[0] == "bun"` — launch).
+/// A NODE fault, not a launch-shape refusal: this backend genuinely cannot
+/// run Bun on ANY node, regardless of what is staged, so it is
+/// `NODE_RUNTIME_MISSING` rather than `launch_refusal`'s
+/// `NODE_BACKEND_UNAVAILABLE`.
+fn bun_unsupported_refusal() -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: litebox has no supported Bun runtime on this node — its syscall shim panics on \
+         Bun's own readlink(\"/proc/self/fd/3\") boot probe (upstream unimplemented!()), so \
+         only Node is supported on this backend (operator remedy: place Bun deployments on a \
+         Firecracker or Mock-backed node instead; not an application fault)",
+        hive_core::fault::NODE_RUNTIME_MISSING
+    )
+}
+
 fn command_basename(command: &str) -> &str {
     command.rsplit(['/', '\\']).next().unwrap_or(command)
 }
@@ -3239,11 +3255,7 @@ const POSIX_TAR_BLOCK_SIZE: usize = 512;
 /// Write a single POSIX tar entry (header + content + padding) to `archive`.
 /// The entry name is stored as-is (absolute path, matching the prior `tar
 /// --absolute-names` behaviour).
-fn write_posix_tar_entry(
-    archive: &mut File,
-    name: &[u8],
-    content: &[u8],
-) -> anyhow::Result<()> {
+fn write_posix_tar_entry(archive: &mut File, name: &[u8], content: &[u8]) -> anyhow::Result<()> {
     let mut header = [0u8; POSIX_TAR_BLOCK_SIZE];
 
     // Split name into prefix + name if > 100 bytes
@@ -3323,17 +3335,16 @@ fn write_posix_tar_entry(
     let chksum_str = format!("{:06o}\0 ", chksum);
     header[148..148 + chksum_str.len()].copy_from_slice(chksum_str.as_bytes());
 
-    archive
-        .write_all(&header)
-        .context("write tar header")?;
-    archive
-        .write_all(content)
-        .context("write tar content")?;
+    archive.write_all(&header).context("write tar header")?;
+    archive.write_all(content).context("write tar content")?;
 
     // Pad to 512-byte block boundary
-    let pad = (POSIX_TAR_BLOCK_SIZE - (content.len() % POSIX_TAR_BLOCK_SIZE)) % POSIX_TAR_BLOCK_SIZE;
+    let pad =
+        (POSIX_TAR_BLOCK_SIZE - (content.len() % POSIX_TAR_BLOCK_SIZE)) % POSIX_TAR_BLOCK_SIZE;
     if pad > 0 {
-        archive.write_all(&vec![0u8; pad]).context("write tar padding")?;
+        archive
+            .write_all(&vec![0u8; pad])
+            .context("write tar padding")?;
     }
 
     Ok(())
@@ -3346,14 +3357,10 @@ fn write_posix_tar_entry(
 /// validated against the allowlist, and the file content is appended with
 /// a POSIX tar header.
 #[cfg(target_os = "linux")]
-fn append_ldd_closure_to_tar(
-    archive: &mut File,
-    deps: &[PathBuf],
-) -> anyhow::Result<()> {
+fn append_ldd_closure_to_tar(archive: &mut File, deps: &[PathBuf]) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let root = File::open("/").context("open root filesystem")?;
-    let mut seen_inodes: std::collections::HashSet<(u64, u64)> =
-        std::collections::HashSet::new();
+    let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     for dep in deps {
         let relative = dep
             .strip_prefix("/")
@@ -3372,9 +3379,7 @@ fn append_ldd_closure_to_tar(
         .with_context(|| format!("openat2 failed for {}", dep.display()))?;
         let resolved = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
             .canonicalize()
-            .with_context(|| {
-                format!("cannot resolve real path for {}", dep.display())
-            })?;
+            .with_context(|| format!("cannot resolve real path for {}", dep.display()))?;
         let resolved_str = resolved.to_string_lossy();
         let allowed = ALLOWED_LIBRARY_DIRS
             .iter()
@@ -3410,7 +3415,7 @@ fn append_ldd_closure_to_tar(
                         "{} truncated mid-read (expected {} bytes, got {})",
                         dep.display(),
                         file_size,
-                        content.len() - remaining.len()
+                        file_size as usize - remaining.len()
                     );
                 }
                 remaining = &mut remaining[n..];
@@ -3426,10 +3431,7 @@ fn append_ldd_closure_to_tar(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn append_ldd_closure_to_tar(
-    _archive: &mut File,
-    _deps: &[PathBuf],
-) -> anyhow::Result<()> {
+fn append_ldd_closure_to_tar(_archive: &mut File, _deps: &[PathBuf]) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar append requires Linux openat2")
 }
 
@@ -3695,10 +3697,37 @@ impl CellBackend for LiteboxBackend {
             return Ok(endpoint);
         }
 
+        // Bun is refused here, before any reservation, network setup, tar
+        // alias, or process spawn — never after. `func.runtime` (the
+        // authoritative platform discriminator FunctionLaunch itself carries,
+        // never a parse of `start_cmd`'s tenant-controlled argv text) is the
+        // only signal trusted for this decision, exactly like
+        // `hive-cell-agent`'s own `platform_runtime_program` gate.
+        //
+        // This backend's syscall shim panics (`unimplemented!()`,
+        // `litebox_shim_linux/src/syscalls/file.rs:1210`) on Bun's own
+        // boot-time `readlink("/proc/self/fd/3")` probe — a hard Rust panic
+        // inside the guest's interception layer, not a recoverable error.
+        // Letting a Bun launch reach `resolve_direct_launch`/spawn below would
+        // turn every Bun cold start into an uncontrolled crash instead of an
+        // honest, typed node fault. This mirrors `resources::detect`'s
+        // `bun_runtime: Some(false)` verdict for this backend — placement
+        // should already have excluded this node for a Bun deployment
+        // (`schedule::bun_capable`), so reaching here means the gossiped
+        // capability and this launch disagree (a stale registry entry, a
+        // launch forced past placement). Never falls back to Mock or the
+        // host, never classifies as capacity or a tenant-app fault — this is
+        // a NODE fault, the same class `NODE_IMAGE_MISSING` and
+        // `NODE_BACKEND_UNAVAILABLE` are.
+        if func.runtime == hive_core::Runtime::Bun {
+            return Err(bun_unsupported_refusal());
+        }
+
         // Plain function: bind this cell to the exact durable reference before
         // resolving any repository-controlled launch metadata. Package managers
         // are never run here: a narrow, validated package-script reducer emits
-        // one direct Node/Bun process or a typed backend-capability refusal.
+        // one direct Node process or a typed backend-capability refusal (Bun is
+        // refused above, before this lock, before any of the machinery below).
         let _publication = self.artifact_lock.clone().lock_owned().await;
         let directories = self.prepare_artifact_dirs()?;
         let mut reference = self
@@ -3728,12 +3757,12 @@ impl CellBackend for LiteboxBackend {
             "{}: litebox launch requested a different runtime artifact identity",
             hive_core::fault::NODE_IMAGE_MISSING
         );
-        if !matches!(
-            func.runtime,
-            hive_core::Runtime::Node | hive_core::Runtime::Bun
-        ) {
+        // `Runtime::Bun` is refused unconditionally above, before this branch
+        // is ever reached, so only `Node` remains a legitimate plain-function
+        // runtime on this backend.
+        if func.runtime != hive_core::Runtime::Node {
             return Err(launch_refusal(format!(
-                "runtime {:?} is not a Node/Bun runtime",
+                "runtime {:?} is not a Node runtime",
                 func.runtime
             )));
         }
@@ -3748,6 +3777,19 @@ impl CellBackend for LiteboxBackend {
             bin,
             mut args,
         } = resolve_direct_launch(func, &reference, &app_archive).await?;
+        // Belt-and-braces for the same panic this function's entry already
+        // refuses on `func.runtime`: `resolve_direct_launch` derives ITS
+        // runtime from `start_cmd`'s argv text (needed to tell `node` from
+        // `bun` from a shared package-script reducer), so a launch whose
+        // `start_cmd` names `bun` while `func.runtime` claims something else
+        // — a malformed or mismatched launch that reached this point despite
+        // the entry check — would otherwise still be spawned against the
+        // unsupported syscall shim. The entry check above already refused
+        // every launch where `func.runtime` itself says Bun, so reaching
+        // `DirectRuntime::Bun` here can only mean that disagreement.
+        if runtime == DirectRuntime::Bun {
+            return Err(bun_unsupported_refusal());
+        }
         anyhow::ensure!(
             bin.is_file(),
             "{}: `{}` is not installed on this node, so the direct runtime cannot start here (operator remedy; not an application fault)",

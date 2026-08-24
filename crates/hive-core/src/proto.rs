@@ -256,6 +256,7 @@ impl Runtime {
 /// registry so hive-cloud's UDP relay can resolve the local datagram leg); they
 /// ride here so the backends emit the matching `-p …/udp` publish flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpPublish {
     pub container_port: u16,
     pub host_port: u16,
@@ -272,6 +273,7 @@ pub struct UdpPublish {
 /// :9000) be spliced without the HTTP-framed tunnel corrupting it — emitters
 /// of `-p` flags dedupe against the primary pairing they already publish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpPublish {
     pub container_port: u16,
     pub host_port: u16,
@@ -284,23 +286,28 @@ pub const RUNTIME_ARTIFACT_PROTOCOL_VERSION: u16 = 1;
 /// of FunctionLaunch. Adding, removing, defaulting, or reinterpreting any of
 /// those is a protocol change and MUST monotonically increment this constant;
 /// runtime-artifact identity remains independently versioned above.
-pub const AGENT_WIRE_PROTOCOL_VERSION: u16 = 1;
-/// The peer implements the complete AgentRequest/AgentEvent v1 schema.
+pub const AGENT_WIRE_PROTOCOL_VERSION: u16 = 2;
+/// The peer implements the complete AgentRequest/AgentEvent v2 schema.
 pub const AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA: u64 = 1 << 0;
-/// The peer implements every FunctionLaunch v1 field and its launch semantics.
+/// The peer implements every FunctionLaunch v2 field and its launch semantics.
 pub const AGENT_WIRE_CAPABILITY_FUNCTION_LAUNCH: u64 = 1 << 1;
 /// The peer validates and returns the exact rootfs/agent boot proof during the
 /// challenge handshake, before it accepts a tenant launch.
 pub const AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT: u64 = 1 << 2;
+/// Node-attributed launch failures use a typed event whose origin is independent
+/// of tenant-controlled process diagnostics.
+pub const AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS: u64 = 1 << 3;
 /// Exact capability set for AGENT_WIRE_PROTOCOL_VERSION. Peers require equality,
 /// not subset negotiation, so an unknown launch shape is never silently dropped.
 pub const AGENT_WIRE_CAPABILITIES: u64 = AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA
     | AGENT_WIRE_CAPABILITY_FUNCTION_LAUNCH
-    | AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT;
+    | AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT
+    | AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS;
 pub const AGENT_HANDSHAKE_NONCE_BYTES: usize = 32;
-pub const AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN: &[u8] = b"hive-agent-wire-handshake-v1\0";
+pub const AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN: &[u8] = b"hive-agent-wire-handshake-v2\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentWireProtocol {
     pub protocol: u16,
     pub capabilities: u64,
@@ -326,6 +333,7 @@ pub const RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX: &str = ".runtime-artifact-prot
 pub const RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeArtifactRootfsMarker {
     pub schema: u16,
     /// Runtime-artifact identity protocol, independent from agent wire protocol.
@@ -336,6 +344,7 @@ pub struct RuntimeArtifactRootfsMarker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeArtifactRootfsMetadata {
     pub schema: u16,
     /// Runtime-artifact identity protocol, independent from agent wire protocol.
@@ -350,6 +359,7 @@ pub struct RuntimeArtifactRootfsMetadata {
 /// Exact boot fact authenticated by the host's whole-image verification, the
 /// guest's running-executable digest check, and a fresh same-connection nonce.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentBootProof {
     pub rootfs_schema: u16,
     pub runtime_artifact_protocol: u16,
@@ -378,12 +388,14 @@ impl RuntimeArtifactRootfsMetadata {
 /// prevents replay; expected_boot is independently verified from exact image
 /// bytes by the host and against the running executable by the guest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHandshake {
     pub nonce: String,
     pub expected_boot: AgentBootProof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHandshakeReady {
     pub nonce: String,
     pub proof: AgentBootProof,
@@ -406,6 +418,7 @@ pub enum AgentProtocolFaultCode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentProtocolFault {
     pub code: AgentProtocolFaultCode,
     pub message: String,
@@ -413,6 +426,32 @@ pub struct AgentProtocolFault {
 
 impl AgentProtocolFault {
     pub fn new(code: AgentProtocolFaultCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFunctionFaultCode {
+    NodeImageMissing,
+    NodeRuntimeMissing,
+}
+
+/// A node-attributed function-start failure. The guest constructs this only
+/// from typed platform error origins; tenant stderr remains exclusively in
+/// `AgentEvent::FunctionError` and can never select this code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentFunctionFault {
+    pub code: AgentFunctionFaultCode,
+    pub message: String,
+}
+
+impl AgentFunctionFault {
+    pub fn new(code: AgentFunctionFaultCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -450,6 +489,7 @@ pub fn agent_handshake_transcript(nonce: &str, proof: &AgentBootProof) -> Vec<u8
 /// The host derives it while materializing the build and the guest echoes it
 /// only after validating the marker inside the mounted artifact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeArtifactIdentity {
     pub protocol: u16,
     pub id: String,
@@ -459,6 +499,7 @@ pub struct RuntimeArtifactIdentity {
 /// How to launch a long-lived function server inside a cell (Fluid compute).
 /// The process MUST listen on `$PORT` (Vercel/Heroku convention).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FunctionLaunch {
     /// argv of the server process, e.g. ["node", "server.js"].
     pub start_cmd: Vec<String>,
@@ -467,10 +508,11 @@ pub struct FunctionLaunch {
     /// it is the guest path where the deployment was delivered.
     pub workdir: Option<String>,
     /// Exact isolated-runtime artifact expected by the host. `None` is normal for
-    /// same-host/container paths. An upgraded guest also accepts the exact frozen
-    /// pre-v1 frame with `runtime_artifact` absent and `workdir` either absent/null
-    /// or set; upgraded isolated hosts always send `Some` and require validation
-    /// and echo it before `FunctionReady` is accepted.
+    /// same-host/container paths. An upgraded guest also accepts only the exact
+    /// frozen 13-field pre-v2 frame: `runtime_artifact` is absent while `workdir`
+    /// remains a required (possibly null) field. Upgraded isolated hosts always
+    /// send `Some` and require validation and echo it before `FunctionReady` is
+    /// accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_artifact: Option<RuntimeArtifactIdentity>,
     /// Port the function server should bind ($PORT). Chosen by the backend.
@@ -534,6 +576,247 @@ pub struct FunctionLaunch {
 
 fn default_max_conc() -> u32 {
     10
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRequestFrameKind {
+    Handshake,
+    StartFunction,
+    Other,
+}
+
+/// Inspect only the raw JSON envelope. Versioned callers use this before typed
+/// deserialization so an added outer key cannot be ignored by a permissive
+/// future schema.
+pub fn agent_request_frame_kind(frame: &[u8]) -> Result<AgentRequestFrameKind, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(frame).map_err(|error| format!("invalid JSON: {error}"))?;
+    match value {
+        serde_json::Value::String(_) => Ok(AgentRequestFrameKind::Other),
+        serde_json::Value::Object(fields) if fields.len() == 1 => {
+            match fields.keys().next().map(String::as_str) {
+                Some("Handshake") => Ok(AgentRequestFrameKind::Handshake),
+                Some("StartFunction") => Ok(AgentRequestFrameKind::StartFunction),
+                Some(_) => Ok(AgentRequestFrameKind::Other),
+                None => Err("agent request envelope is empty".to_string()),
+            }
+        }
+        serde_json::Value::Object(_) => {
+            Err("agent request envelope must contain exactly one variant".to_string())
+        }
+        _ => Err("agent request envelope must be a variant string or singleton object".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+#[serde(untagged)]
+enum ExactNullableRuntimeArtifact {
+    Null(()),
+    Identity(ExactRuntimeArtifactIdentity),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactBootProof {
+    #[serde(rename = "rootfs_schema")]
+    _rootfs_schema: serde_json::Value,
+    #[serde(rename = "runtime_artifact_protocol")]
+    _runtime_artifact_protocol: serde_json::Value,
+    #[serde(rename = "agent_wire_protocol")]
+    _agent_wire_protocol: serde_json::Value,
+    #[serde(rename = "agent_wire_capabilities")]
+    _agent_wire_capabilities: serde_json::Value,
+    #[serde(rename = "agent_sha256")]
+    _agent_sha256: serde_json::Value,
+    #[serde(rename = "rootfs_image_sha256")]
+    _rootfs_image_sha256: serde_json::Value,
+    #[serde(rename = "rootfs_image_bytes")]
+    _rootfs_image_bytes: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactHandshake {
+    #[serde(rename = "nonce")]
+    _nonce: serde_json::Value,
+    #[serde(rename = "expected_boot")]
+    _expected_boot: ExactBootProof,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum ExactHandshakeRequestFrame {
+    Handshake(ExactHandshake),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactRuntimeArtifactIdentity {
+    #[serde(rename = "protocol")]
+    _protocol: serde_json::Value,
+    #[serde(rename = "id")]
+    _id: serde_json::Value,
+    #[serde(rename = "content_sha256")]
+    _content_sha256: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactPortPublish {
+    #[serde(rename = "container_port")]
+    _container_port: serde_json::Value,
+    #[serde(rename = "host_port")]
+    _host_port: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactFunctionLaunch {
+    #[serde(rename = "start_cmd")]
+    _start_cmd: serde_json::Value,
+    #[serde(rename = "env")]
+    _env: serde_json::Value,
+    #[serde(rename = "workdir")]
+    _workdir: serde_json::Value,
+    #[serde(rename = "runtime_artifact")]
+    _runtime_artifact: ExactNullableRuntimeArtifact,
+    #[serde(rename = "port")]
+    _port: serde_json::Value,
+    #[serde(rename = "max_concurrency")]
+    _max_concurrency: serde_json::Value,
+    #[serde(rename = "memory_mib")]
+    _memory_mib: serde_json::Value,
+    #[serde(rename = "cpus")]
+    _cpus: serde_json::Value,
+    #[serde(rename = "pids")]
+    _pids: serde_json::Value,
+    #[serde(rename = "runtime")]
+    _runtime: serde_json::Value,
+    #[serde(rename = "raw_proxy")]
+    _raw_proxy: serde_json::Value,
+    #[serde(rename = "udp_ports")]
+    _udp_ports: Vec<ExactPortPublish>,
+    #[serde(rename = "tcp_ports")]
+    _tcp_ports: Vec<ExactPortPublish>,
+    #[serde(rename = "gpu")]
+    _gpu: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactLegacyFunctionLaunch {
+    #[serde(rename = "start_cmd")]
+    _start_cmd: serde_json::Value,
+    #[serde(rename = "env")]
+    _env: serde_json::Value,
+    #[serde(rename = "workdir")]
+    _workdir: serde_json::Value,
+    #[serde(rename = "port")]
+    _port: serde_json::Value,
+    #[serde(rename = "max_concurrency")]
+    _max_concurrency: serde_json::Value,
+    #[serde(rename = "memory_mib")]
+    _memory_mib: serde_json::Value,
+    #[serde(rename = "cpus")]
+    _cpus: serde_json::Value,
+    #[serde(rename = "pids")]
+    _pids: serde_json::Value,
+    #[serde(rename = "runtime")]
+    _runtime: serde_json::Value,
+    #[serde(rename = "raw_proxy")]
+    _raw_proxy: serde_json::Value,
+    #[serde(rename = "udp_ports")]
+    _udp_ports: Vec<ExactPortPublish>,
+    #[serde(rename = "tcp_ports")]
+    _tcp_ports: Vec<ExactPortPublish>,
+    #[serde(rename = "gpu")]
+    _gpu: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum ExactStartFunctionRequestFrame {
+    StartFunction(ExactFunctionLaunch),
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum ExactLegacyStartFunctionRequestFrame {
+    StartFunction(ExactLegacyFunctionLaunch),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactHandshakeReady {
+    #[serde(rename = "nonce")]
+    _nonce: serde_json::Value,
+    #[serde(rename = "proof")]
+    _proof: ExactBootProof,
+    #[serde(rename = "transcript_sha256")]
+    _transcript_sha256: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactProtocolFault {
+    #[serde(rename = "code")]
+    _code: serde_json::Value,
+    #[serde(rename = "message")]
+    _message: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactFunctionFault {
+    #[serde(rename = "code")]
+    _code: serde_json::Value,
+    #[serde(rename = "message")]
+    _message: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum ExactHandshakeResponseFrame {
+    HandshakeReady(ExactHandshakeReady),
+    ProtocolFault(ExactProtocolFault),
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum ExactVersionedLaunchEventFrame {
+    RuntimeArtifactReady(ExactRuntimeArtifactIdentity),
+    FunctionReady,
+    FunctionError(serde_json::Value),
+    FunctionFault(ExactFunctionFault),
+    ProtocolFault(ExactProtocolFault),
+    HandshakeReady(ExactHandshakeReady),
+}
+
+fn validate_exact<T: for<'de> Deserialize<'de>>(frame: &[u8], label: &str) -> Result<(), String> {
+    serde_json::from_slice::<T>(frame)
+        .map(|_| ())
+        .map_err(|error| format!("{label} does not have its exact frozen field set: {error}"))
+}
+
+pub fn validate_agent_handshake_request_frame(frame: &[u8]) -> Result<(), String> {
+    validate_exact::<ExactHandshakeRequestFrame>(frame, "Handshake")
+}
+
+pub fn validate_agent_start_function_request_frame(frame: &[u8]) -> Result<(), String> {
+    validate_exact::<ExactStartFunctionRequestFrame>(frame, "StartFunction v2")
+}
+
+pub fn validate_legacy_agent_start_function_request_frame(frame: &[u8]) -> Result<(), String> {
+    validate_exact::<ExactLegacyStartFunctionRequestFrame>(frame, "legacy StartFunction")
+}
+
+pub fn validate_agent_handshake_response_frame(frame: &[u8]) -> Result<(), String> {
+    validate_exact::<ExactHandshakeResponseFrame>(frame, "agent handshake response")
+}
+
+pub fn validate_agent_versioned_launch_event_frame(frame: &[u8]) -> Result<(), String> {
+    validate_exact::<ExactVersionedLaunchEventFrame>(frame, "versioned launch event")
 }
 
 /// A single argv command to run inside an already-booted, long-lived cell —
@@ -609,8 +892,12 @@ pub enum AgentEvent {
     /// Function server is up and accepting requests on its port; the agent is
     /// now bridging `CELL_FUNCTION_PORT` -> the function.
     FunctionReady,
-    /// Function failed to start.
+    /// Function failed to start for tenant-controlled reasons. This text may
+    /// include tenant stderr and must never be inspected for node-fault markers.
     FunctionError(String),
+    /// Function failed to start because of a typed guest/platform fault whose
+    /// origin is independent of tenant-controlled diagnostics.
+    FunctionFault(AgentFunctionFault),
     /// Agent -> box daemon: please send the cached tarball for `key` (build
     /// cache restore). The box daemon replies with `AgentRequest::CacheData`.
     CacheGet {
