@@ -1,14 +1,15 @@
 ---
-# Fast path: redeploy just the hive-cloud binary fleet-wide, skipping
-# Firecracker/kernel/DNS work entirely. This is the exact pattern used
-# throughout this project's own sessions to roll out a code fix: sync
-# source, rebuild, restart, health-check -- one host at a time so mesh
-# quorum is never lost across more than one node at once.
+# Fast path: rebuild and install the hive-cloud controller plus its exact
+# hive-cell-agent companion fleet-wide, skipping Firecracker/kernel/DNS work.
+# The guest agent is published on the host here but is NOT baked automatically;
+# a later explicitly drained hive_platform_rootfs run owns that migration.
+#
+# One host at a time so mesh quorum is never lost across more than one node.
 #
 # Usage:
 #   ansible-playbook playbooks/platform-only.yml
 #   ansible-playbook playbooks/platform-only.yml --limit fc_pvm
-- name: Redeploy hive-cloud binary only
+- name: Redeploy the hive controller + cell-agent release pair
   hosts: platform
   become: true
   serial: 1

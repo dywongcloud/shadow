@@ -480,6 +480,18 @@ pub struct FunctionConfig {
     /// that never opted in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_ipv4_alloc: Option<DedicatedIpv4>,
+    /// Per-function CWD override, relative to the deployment's runtime
+    /// workdir — additive, `None` for every existing caller and every
+    /// pre-upgrade peer. Build Output API v3 Node functions are the first
+    /// user: each `.func` bundle is its own self-contained directory
+    /// (`.vercel/output/functions/<name>.func`), so a deployment with several
+    /// functions must launch EACH ONE from its own directory rather than the
+    /// single shared `runtime_workdir` every other runtime uses — sharing one
+    /// CWD across functions would let one function's relative `import()`
+    /// resolve into a SIBLING function's files. `None` preserves today's
+    /// exact behavior (the shared deployment-wide workdir).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_relative: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -557,6 +569,7 @@ impl Default for FunctionConfig {
             browser_ineligible_reason: None,
             dedicated_ipv4: false,
             dedicated_ipv4_alloc: None,
+            cwd_relative: None,
         }
     }
 }
@@ -1090,6 +1103,1417 @@ impl BrowserDbPolicy {
 // crate in the dependency graph, reachable from `hive-cell-agent`/
 // `hive-backend` (which do NOT depend on fluid-core) as well as from here.
 pub use hive_core::Runtime;
+
+// ---------------------------------------------------------------------------
+// Lossless Build Output API v3 contract
+// ---------------------------------------------------------------------------
+
+pub const BUILD_OUTPUT_V3_VERSION: u32 = 3;
+/// Schema baseline pinned to the Vercel Build Output Configuration reference
+/// whose authoritative page reports `last_updated: 2026-07-27`.
+pub const BUILD_OUTPUT_V3_SCHEMA_REVISION: &str = "vercel-build-output-v3-2026-07-27";
+pub const BUILD_OUTPUT_V3_MAX_DESCRIPTOR_BYTES: usize = 8 * 1024 * 1024;
+pub const BUILD_OUTPUT_V3_MAX_ROUTES: usize = 4096;
+pub const BUILD_OUTPUT_V3_MAX_FUNCTIONS: usize = 1024;
+pub const BUILD_OUTPUT_V3_MAX_FILES: usize = 100_000;
+pub const BUILD_OUTPUT_V3_MAX_PATH_BYTES: usize = 4096;
+pub const BUILD_OUTPUT_V3_MAX_VALUE_BYTES: usize = 64 * 1024;
+pub const BUILD_OUTPUT_V3_MAX_JSON_NODES: usize = 100_000;
+pub const BUILD_OUTPUT_V3_MAX_DEPTH: usize = 64;
+pub const BUILD_OUTPUT_V3_MAX_METHODS: usize = 32;
+pub const BUILD_OUTPUT_V3_MAX_HEADERS: usize = 128;
+pub const BUILD_OUTPUT_V3_MAX_WILDCARDS: usize = 1024;
+pub const BUILD_OUTPUT_V3_MAX_OVERRIDES: usize = 10_000;
+pub const BUILD_OUTPUT_V3_MAX_CRONS: usize = 1024;
+pub const BUILD_OUTPUT_V3_MAX_CACHE_PATHS: usize = 1024;
+pub const BUILD_OUTPUT_V3_MAX_IMAGE_VALUES: usize = 1024;
+
+/// Durable, host-authority-free Build Output API v3 descriptor. `config` and
+/// every function config remain exact JSON values so an older binary cannot
+/// silently erase a route/runtime field it does not implement. Absolute builder
+/// paths never enter this type; `assets` and `files` are validated relative
+/// inventories.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3 {
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<BuildOutputV3Function>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Function {
+    pub name: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerender: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prerender_files: Vec<String>,
+}
+
+impl BuildOutputV3Function {
+    pub fn runtime(&self) -> Option<&str> {
+        self.config.get("runtime").and_then(|value| value.as_str())
+    }
+}
+
+/// Typed view of the exact `config` value. `extra` is deliberately retained:
+/// compilation refuses it as an unsupported capability instead of dropping it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Config {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<BuildOutputV3Route>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<BuildOutputV3ImagesConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wildcard: Vec<BuildOutputV3Wildcard>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, BuildOutputV3Override>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crons: Vec<BuildOutputV3Cron>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Route {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(rename = "continue", default, skip_serializing_if = "is_false")]
+    pub cont: bool,
+    #[serde(
+        rename = "middlewarePath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub middleware_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Wildcard {
+    pub domain: String,
+    pub value: String,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Override {
+    #[serde(
+        rename = "contentType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3ImagesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
+    #[serde(
+        rename = "remotePatterns",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub remote_patterns: Vec<BuildOutputV3RemotePattern>,
+    #[serde(
+        rename = "localPatterns",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_patterns: Option<Vec<BuildOutputV3LocalPattern>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualities: Vec<u32>,
+    #[serde(
+        rename = "minimumCacheTTL",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub minimum_cache_ttl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+    #[serde(
+        rename = "dangerouslyAllowSVG",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dangerously_allow_svg: Option<bool>,
+    #[serde(
+        rename = "contentSecurityPolicy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content_security_policy: Option<String>,
+    #[serde(
+        rename = "contentDispositionType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content_disposition_type: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3RemotePattern {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3LocalPattern {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildOutputV3Cron {
+    pub path: String,
+    pub schedule: String,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Stable typed refusal returned at conversion/provisioning/routing boundaries.
+/// Callers classify on the variant or `code()`, never message text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildOutputV3Refusal {
+    Invalid { field: String, detail: String },
+    Unsupported { feature: String },
+}
+
+impl BuildOutputV3Refusal {
+    pub const INVALID_CODE: &'static str = "BUILD_OUTPUT_V3_INVALID";
+    pub const UNSUPPORTED_CODE: &'static str = "BUILD_OUTPUT_V3_CAPABILITY_UNSUPPORTED";
+
+    pub fn invalid(field: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::Invalid {
+            field: field.into(),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn unsupported(feature: impl Into<String>) -> Self {
+        Self::Unsupported {
+            feature: feature.into(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid { .. } => Self::INVALID_CODE,
+            Self::Unsupported { .. } => Self::UNSUPPORTED_CODE,
+        }
+    }
+}
+
+impl std::fmt::Display for BuildOutputV3Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { field, detail } => write!(
+                formatter,
+                "{} {field}: {detail}",
+                BuildOutputV3Refusal::INVALID_CODE
+            ),
+            Self::Unsupported { feature } => write!(
+                formatter,
+                "{}: {feature}",
+                BuildOutputV3Refusal::UNSUPPORTED_CODE
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BuildOutputV3Refusal {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildOutputV3Target {
+    Static {
+        path: String,
+        content_type: Option<String>,
+    },
+    Function {
+        name: String,
+    },
+    Response {
+        status: u16,
+        location: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildOutputV3Resolution {
+    pub target: Option<BuildOutputV3Target>,
+    pub rewritten_path: String,
+    pub headers: BTreeMap<String, String>,
+    pub route_matched: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildOutputV3Evaluator {
+    routes: Vec<CompiledBuildOutputV3Route>,
+    outputs: BTreeMap<String, BuildOutputV3Target>,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledBuildOutputV3Route {
+    Filesystem,
+    Source {
+        source: String,
+        regex: regex::Regex,
+        dest: Option<String>,
+        headers: BTreeMap<String, String>,
+        status: Option<u16>,
+        cont: bool,
+        methods: Vec<String>,
+    },
+}
+
+impl BuildOutputV3 {
+    /// Deserialize the host-path-free envelope emitted by
+    /// `fluid_build::BuildOutput::descriptor_value`, then enforce the durable
+    /// contract. This serde bridge keeps the crate dependency graph acyclic.
+    pub fn from_parser_value(
+        value: serde_json::Value,
+    ) -> Result<BuildOutputV3, BuildOutputV3Refusal> {
+        let descriptor: BuildOutputV3 = serde_json::from_value(value).map_err(|error| {
+            BuildOutputV3Refusal::invalid("descriptor", format!("malformed envelope: {error}"))
+        })?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub fn config_view(&self) -> Result<BuildOutputV3Config, BuildOutputV3Refusal> {
+        serde_json::from_value(self.config.clone()).map_err(|error| {
+            BuildOutputV3Refusal::invalid("config", format!("malformed config.json: {error}"))
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), BuildOutputV3Refusal> {
+        let descriptor_bytes = serde_json::to_vec(self)
+            .map_err(|error| {
+                BuildOutputV3Refusal::invalid(
+                    "descriptor",
+                    format!("cannot serialize descriptor: {error}"),
+                )
+            })?
+            .len();
+        if descriptor_bytes > BUILD_OUTPUT_V3_MAX_DESCRIPTOR_BYTES {
+            return Err(BuildOutputV3Refusal::invalid(
+                "descriptor",
+                format!("{descriptor_bytes} bytes exceeds {BUILD_OUTPUT_V3_MAX_DESCRIPTOR_BYTES}"),
+            ));
+        }
+        let mut nodes = 0usize;
+        validate_build_output_json(&self.config, "config", 0, &mut nodes)?;
+        let config = self.config_view()?;
+        if config.version != BUILD_OUTPUT_V3_VERSION {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.version",
+                format!(
+                    "expected exactly {BUILD_OUTPUT_V3_VERSION}, got {}",
+                    config.version
+                ),
+            ));
+        }
+        if config.routes.len() > BUILD_OUTPUT_V3_MAX_ROUTES {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.routes",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_ROUTES}",
+                    config.routes.len()
+                ),
+            ));
+        }
+        if config.wildcard.len() > BUILD_OUTPUT_V3_MAX_WILDCARDS {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.wildcard",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_WILDCARDS}",
+                    config.wildcard.len()
+                ),
+            ));
+        }
+        if config.overrides.len() > BUILD_OUTPUT_V3_MAX_OVERRIDES {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.overrides",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_OVERRIDES}",
+                    config.overrides.len()
+                ),
+            ));
+        }
+        if config.crons.len() > BUILD_OUTPUT_V3_MAX_CRONS {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.crons",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_CRONS}",
+                    config.crons.len()
+                ),
+            ));
+        }
+        if config.cache.len() > BUILD_OUTPUT_V3_MAX_CACHE_PATHS {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.cache",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_CACHE_PATHS}",
+                    config.cache.len()
+                ),
+            ));
+        }
+        for path in &config.cache {
+            validate_build_output_text(path, "config.cache[]")?;
+        }
+        if let Some(images) = &config.images {
+            validate_build_output_images(images)?;
+        }
+        if self.functions.len() > BUILD_OUTPUT_V3_MAX_FUNCTIONS {
+            return Err(BuildOutputV3Refusal::invalid(
+                "functions",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_FUNCTIONS}",
+                    self.functions.len()
+                ),
+            ));
+        }
+        if self.assets.len() > BUILD_OUTPUT_V3_MAX_FILES {
+            return Err(BuildOutputV3Refusal::invalid(
+                "assets",
+                format!(
+                    "{} entries exceeds {BUILD_OUTPUT_V3_MAX_FILES}",
+                    self.assets.len()
+                ),
+            ));
+        }
+        ensure_sorted_unique(&self.assets, "assets")?;
+        for asset in &self.assets {
+            validate_build_output_relative_path(asset, "assets")?;
+        }
+
+        let mut prior_function: Option<&str> = None;
+        let mut total_files = self.assets.len();
+        for function in &self.functions {
+            if prior_function.is_some_and(|prior| prior >= function.name.as_str()) {
+                return Err(BuildOutputV3Refusal::invalid(
+                    "functions",
+                    "function names must be strictly sorted and unique",
+                ));
+            }
+            prior_function = Some(&function.name);
+            validate_build_output_relative_path(&function.name, "functions[].name")?;
+            validate_build_output_json(
+                &function.config,
+                &format!("functions[{:?}].config", function.name),
+                0,
+                &mut nodes,
+            )?;
+            let config_object = function.config.as_object().ok_or_else(|| {
+                BuildOutputV3Refusal::invalid(
+                    format!("functions[{:?}].config", function.name),
+                    "must be a JSON object",
+                )
+            })?;
+            let runtime = config_object
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .filter(|runtime| !runtime.is_empty())
+                .ok_or_else(|| {
+                    BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.runtime", function.name),
+                        "must be a non-empty string",
+                    )
+                })?;
+            let entry_key = if runtime == "edge" {
+                "entrypoint"
+            } else {
+                "handler"
+            };
+            let entry_value = config_object
+                .get(entry_key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.{entry_key}", function.name),
+                        "must be a non-empty string",
+                    )
+                })?;
+            // A Node handler must resolve inside the parser's OWN exact
+            // regular-file inventory for this function — never a bare
+            // presence check. This closes two real gaps: a handler string
+            // that is not a portable relative path (absolute, `..`,
+            // control bytes — the exact shape `validate_build_output_relative_path`
+            // already enforces for `files`/`assets`), and a handler that
+            // names a file the parser never actually saw on disk (a
+            // dangling/foreign reference). `edge` is exempted here — it is
+            // refused as an unsupported runtime downstream regardless, and
+            // its `entrypoint` field is not cross-checked against `files`.
+            if entry_key == "handler" {
+                validate_build_output_relative_path(
+                    entry_value,
+                    &format!("functions[{:?}].config.handler", function.name),
+                )?;
+                if !function.files.iter().any(|file| file == entry_value) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].config.handler", function.name),
+                        "does not name a file in this function's own regular-file inventory",
+                    ));
+                }
+            }
+            if let Some(prerender) = &function.prerender {
+                if !prerender.is_object() {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("functions[{:?}].prerender", function.name),
+                        "must be a JSON object",
+                    ));
+                }
+                validate_build_output_json(
+                    prerender,
+                    &format!("functions[{:?}].prerender", function.name),
+                    0,
+                    &mut nodes,
+                )?;
+                validate_build_output_prerender(
+                    &function.name,
+                    prerender,
+                    &function.prerender_files,
+                )?;
+            } else if !function.prerender_files.is_empty() {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("functions[{:?}].prerender_files", function.name),
+                    "fallback payloads require prerender metadata",
+                ));
+            }
+            ensure_sorted_unique(
+                &function.files,
+                &format!("functions[{:?}].files", function.name),
+            )?;
+            for file in &function.files {
+                validate_build_output_relative_path(
+                    file,
+                    &format!("functions[{:?}].files", function.name),
+                )?;
+            }
+            ensure_sorted_unique(
+                &function.prerender_files,
+                &format!("functions[{:?}].prerender_files", function.name),
+            )?;
+            for file in &function.prerender_files {
+                validate_build_output_relative_path(
+                    file,
+                    &format!("functions[{:?}].prerender_files", function.name),
+                )?;
+            }
+            total_files = total_files
+                .saturating_add(function.files.len())
+                .saturating_add(function.prerender_files.len());
+            if total_files > BUILD_OUTPUT_V3_MAX_FILES {
+                return Err(BuildOutputV3Refusal::invalid(
+                    "files",
+                    format!("aggregate file count exceeds {BUILD_OUTPUT_V3_MAX_FILES}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile ordered routes and exact output indexes once at provisioning.
+    /// Unknown top-level/route semantics and domain wildcard routing are stable
+    /// capability refusals, never ignored metadata.
+    pub fn compile(&self) -> Result<BuildOutputV3Evaluator, BuildOutputV3Refusal> {
+        self.validate()?;
+        let config = self.config_view()?;
+        if let Some(field) = config.extra.keys().next() {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "config field {field:?}"
+            )));
+        }
+        if !config.wildcard.is_empty() {
+            return Err(BuildOutputV3Refusal::unsupported(
+                "config.wildcard domain routing",
+            ));
+        }
+        for (index, wildcard) in config.wildcard.iter().enumerate() {
+            if let Some(field) = wildcard.extra.keys().next() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.wildcard[{index}] field {field:?}"
+                )));
+            }
+        }
+        for (path, path_override) in &config.overrides {
+            if let Some(field) = path_override.extra.keys().next() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.overrides[{path:?}] field {field:?}"
+                )));
+            }
+            validate_build_output_relative_path(path, "config.overrides key")?;
+            if self.assets.binary_search(path).is_err() {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.overrides[{path:?}]"),
+                    "does not name an indexed static asset",
+                ));
+            }
+            if let Some(content_type) = &path_override.content_type {
+                validate_build_output_text(content_type, "config.overrides.contentType")?;
+                if content_type.contains(['\r', '\n']) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("config.overrides[{path:?}].contentType"),
+                        "contains a line break",
+                    ));
+                }
+            }
+        }
+        for (index, cron) in config.crons.iter().enumerate() {
+            if let Some(field) = cron.extra.keys().next() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.crons[{index}] field {field:?}"
+                )));
+            }
+            validate_build_output_public_path(&cron.path, "config.crons[].path")?;
+            validate_build_output_text(&cron.schedule, "config.crons[].schedule")?;
+        }
+        if let Some(images) = &config.images {
+            if let Some(field) = images.extra.keys().next() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.images field {field:?}"
+                )));
+            }
+            for (index, pattern) in images.remote_patterns.iter().enumerate() {
+                if let Some(field) = pattern.extra.keys().next() {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.images.remotePatterns[{index}] field {field:?}"
+                    )));
+                }
+            }
+            if let Some(patterns) = &images.local_patterns {
+                for (index, pattern) in patterns.iter().enumerate() {
+                    if let Some(field) = pattern.extra.keys().next() {
+                        return Err(BuildOutputV3Refusal::unsupported(format!(
+                            "config.images.localPatterns[{index}] field {field:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(function) = self
+            .functions
+            .iter()
+            .find(|function| function.prerender.is_some())
+        {
+            return Err(BuildOutputV3Refusal::unsupported(format!(
+                "prerender/ISR function {:?}",
+                function.name
+            )));
+        }
+
+        let mut outputs = BTreeMap::new();
+        for asset in &self.assets {
+            let path_override = config.overrides.get(asset);
+            let content_type = path_override.and_then(|value| value.content_type.clone());
+            let public_path = match path_override.and_then(|value| value.path.as_deref()) {
+                Some(path) => normalize_build_output_public_path(path)?,
+                None => format!("/{asset}"),
+            };
+            insert_build_output_target(
+                &mut outputs,
+                public_path,
+                BuildOutputV3Target::Static {
+                    path: asset.clone(),
+                    content_type: content_type.clone(),
+                },
+            )?;
+            if path_override
+                .and_then(|value| value.path.as_ref())
+                .is_none()
+            {
+                if asset == "index.html" {
+                    insert_build_output_target(
+                        &mut outputs,
+                        "/".to_string(),
+                        BuildOutputV3Target::Static {
+                            path: asset.clone(),
+                            content_type: content_type.clone(),
+                        },
+                    )?;
+                } else if let Some(directory) = asset.strip_suffix("/index.html") {
+                    insert_build_output_target(
+                        &mut outputs,
+                        format!("/{directory}/"),
+                        BuildOutputV3Target::Static {
+                            path: asset.clone(),
+                            content_type: content_type.clone(),
+                        },
+                    )?;
+                }
+            }
+        }
+        for function in &self.functions {
+            insert_build_output_target(
+                &mut outputs,
+                format!("/{}", function.name),
+                BuildOutputV3Target::Function {
+                    name: function.name.clone(),
+                },
+            )?;
+        }
+
+        let mut routes = Vec::with_capacity(config.routes.len());
+        for (index, route) in config.routes.into_iter().enumerate() {
+            if let Some(field) = route.extra.keys().next() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.routes[{index}] field {field:?}"
+                )));
+            }
+            if route.middleware_path.is_some() {
+                return Err(BuildOutputV3Refusal::unsupported(format!(
+                    "config.routes[{index}].middlewarePath"
+                )));
+            }
+            if let Some(handle) = route.handle {
+                if route.src.is_some()
+                    || route.dest.is_some()
+                    || !route.headers.is_empty()
+                    || route.status.is_some()
+                    || route.cont
+                    || !route.methods.is_empty()
+                {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}] handle {handle:?} with src/dest/status fields"
+                    )));
+                }
+                if handle != "filesystem" {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}] handle {handle:?}"
+                    )));
+                }
+                routes.push(CompiledBuildOutputV3Route::Filesystem);
+                continue;
+            }
+            let source = route.src.ok_or_else(|| {
+                BuildOutputV3Refusal::invalid(
+                    format!("config.routes[{index}].src"),
+                    "is required when handle is absent",
+                )
+            })?;
+            validate_build_output_text(&source, "config.routes[].src")?;
+            if source.is_empty() {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.routes[{index}].src"),
+                    "must not be empty",
+                ));
+            }
+            if route.methods.len() > BUILD_OUTPUT_V3_MAX_METHODS {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.routes[{index}].methods"),
+                    format!("exceeds {BUILD_OUTPUT_V3_MAX_METHODS} entries"),
+                ));
+            }
+            let mut methods = Vec::with_capacity(route.methods.len());
+            for method in route.methods {
+                if method.is_empty() || method.len() > 32 || !method.bytes().all(is_http_token_byte)
+                {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("config.routes[{index}].methods"),
+                        format!("invalid HTTP method {method:?}"),
+                    ));
+                }
+                methods.push(method.to_ascii_uppercase());
+            }
+            methods.sort();
+            methods.dedup();
+            if route.headers.len() > BUILD_OUTPUT_V3_MAX_HEADERS {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.routes[{index}].headers"),
+                    format!("exceeds {BUILD_OUTPUT_V3_MAX_HEADERS} entries"),
+                ));
+            }
+            let mut header_names = Vec::with_capacity(route.headers.len());
+            for (name, value) in &route.headers {
+                validate_build_output_header(index, name, value)?;
+                let lower = name.to_ascii_lowercase();
+                if header_names.contains(&lower) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("config.routes[{index}].headers"),
+                        format!("duplicate case-insensitive header name {name:?}"),
+                    ));
+                }
+                header_names.push(lower);
+            }
+            if let Some(status) = route.status {
+                if !(200..=599).contains(&status) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("config.routes[{index}].status"),
+                        "must be in 200..=599",
+                    ));
+                }
+                if route.cont {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}] combines status with continue"
+                    )));
+                }
+                if route.dest.is_some() {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}] combines status with destination"
+                    )));
+                }
+            }
+            if let Some(dest) = &route.dest {
+                validate_build_output_text(dest, "config.routes[].dest")?;
+                if dest.contains(['\r', '\n']) {
+                    return Err(BuildOutputV3Refusal::invalid(
+                        format!("config.routes[{index}].dest"),
+                        "contains a line break",
+                    ));
+                }
+                let external = dest.contains("://") || dest.starts_with("//");
+                let redirect = route
+                    .status
+                    .is_some_and(|status| (300..=399).contains(&status));
+                if external && !redirect {
+                    return Err(BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}] external rewrite destination"
+                    )));
+                }
+            }
+            let regex = regex::RegexBuilder::new(&source)
+                .size_limit(1024 * 1024)
+                .dfa_size_limit(1024 * 1024)
+                .build()
+                .map_err(|error| {
+                    BuildOutputV3Refusal::unsupported(format!(
+                        "config.routes[{index}].src regex {source:?}: {error}"
+                    ))
+                })?;
+            routes.push(CompiledBuildOutputV3Route::Source {
+                source,
+                regex,
+                dest: route.dest,
+                headers: route.headers,
+                status: route.status,
+                cont: route.cont,
+                methods,
+            });
+        }
+        Ok(BuildOutputV3Evaluator { routes, outputs })
+    }
+}
+
+impl BuildOutputV3Evaluator {
+    pub fn resolve(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Result<BuildOutputV3Resolution, BuildOutputV3Refusal> {
+        let mut rewritten_path = normalize_build_output_internal_path(path)?;
+        let method = method.to_ascii_uppercase();
+        let mut headers = BTreeMap::new();
+        let mut route_matched = false;
+        for route in &self.routes {
+            match route {
+                CompiledBuildOutputV3Route::Filesystem => {
+                    if let Some(target) = self.output_for(&rewritten_path) {
+                        return Ok(BuildOutputV3Resolution {
+                            target: Some(target),
+                            rewritten_path,
+                            headers,
+                            route_matched,
+                        });
+                    }
+                }
+                CompiledBuildOutputV3Route::Source {
+                    source,
+                    regex,
+                    dest,
+                    headers: route_headers,
+                    status,
+                    cont,
+                    methods,
+                } => {
+                    if !methods.is_empty()
+                        && methods
+                            .binary_search_by(|candidate| candidate.as_str().cmp(&method))
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    let current_path = build_output_path_only(&rewritten_path);
+                    let Some(captures) = regex.captures(current_path) else {
+                        continue;
+                    };
+                    route_matched = true;
+                    for (name, template) in route_headers {
+                        let mut value = String::new();
+                        captures.expand(template, &mut value);
+                        validate_build_output_text(
+                            &value,
+                            &format!("expanded header {name:?} from route {source:?}"),
+                        )?;
+                        if value.contains(['\r', '\n']) {
+                            return Err(BuildOutputV3Refusal::invalid(
+                                format!("route {source:?} header {name:?}"),
+                                "expanded value contains a line break",
+                            ));
+                        }
+                        headers.insert(name.clone(), value);
+                    }
+                    let expanded_dest = dest.as_ref().map(|template| {
+                        let mut value = String::new();
+                        captures.expand(template, &mut value);
+                        value
+                    });
+                    if let Some(status) = status {
+                        return Ok(BuildOutputV3Resolution {
+                            target: Some(BuildOutputV3Target::Response {
+                                status: *status,
+                                location: None,
+                            }),
+                            rewritten_path,
+                            headers,
+                            route_matched,
+                        });
+                    }
+                    if let Some(destination) = expanded_dest {
+                        rewritten_path = normalize_build_output_internal_path(&destination)?;
+                    }
+                    if !cont {
+                        return Ok(BuildOutputV3Resolution {
+                            target: self.output_for(&rewritten_path),
+                            rewritten_path,
+                            headers,
+                            route_matched,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(BuildOutputV3Resolution {
+            target: self.output_for(&rewritten_path),
+            rewritten_path,
+            headers,
+            route_matched,
+        })
+    }
+
+    fn output_for(&self, path: &str) -> Option<BuildOutputV3Target> {
+        self.outputs.get(build_output_path_only(path)).cloned()
+    }
+}
+
+fn validate_build_output_images(
+    images: &BuildOutputV3ImagesConfig,
+) -> Result<(), BuildOutputV3Refusal> {
+    let sizes = images
+        .sizes
+        .as_ref()
+        .ok_or_else(|| BuildOutputV3Refusal::invalid("config.images.sizes", "is required"))?;
+    let domains = images
+        .domains
+        .as_ref()
+        .ok_or_else(|| BuildOutputV3Refusal::invalid("config.images.domains", "is required"))?;
+    for (field, count) in [
+        ("sizes", sizes.len()),
+        ("domains", domains.len()),
+        ("remotePatterns", images.remote_patterns.len()),
+        (
+            "localPatterns",
+            images.local_patterns.as_ref().map(Vec::len).unwrap_or(0),
+        ),
+        ("qualities", images.qualities.len()),
+        ("formats", images.formats.len()),
+    ] {
+        if count > BUILD_OUTPUT_V3_MAX_IMAGE_VALUES {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("config.images.{field}"),
+                format!("{count} entries exceeds {BUILD_OUTPUT_V3_MAX_IMAGE_VALUES}"),
+            ));
+        }
+    }
+    if sizes.iter().any(|size| !(1..=4096).contains(size)) {
+        return Err(BuildOutputV3Refusal::invalid(
+            "config.images.sizes",
+            "every width must be in 1..=4096",
+        ));
+    }
+    if images
+        .qualities
+        .iter()
+        .any(|quality| !(1..=100).contains(quality))
+    {
+        return Err(BuildOutputV3Refusal::invalid(
+            "config.images.qualities",
+            "every quality must be in 1..=100",
+        ));
+    }
+    for domain in domains {
+        validate_build_output_text(domain, "config.images.domains[]")?;
+        if domain.is_empty() || domain.contains("://") || domain.contains(['/', '\\', '\r', '\n']) {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.images.domains[]",
+                format!("invalid domain {domain:?}"),
+            ));
+        }
+    }
+    for format in &images.formats {
+        validate_build_output_text(format, "config.images.formats[]")?;
+        if !matches!(format.as_str(), "image/avif" | "image/webp") {
+            return Err(BuildOutputV3Refusal::invalid(
+                "config.images.formats[]",
+                format!("unsupported schema value {format:?}"),
+            ));
+        }
+    }
+    for (index, pattern) in images.remote_patterns.iter().enumerate() {
+        if let Some(protocol) = &pattern.protocol {
+            if !matches!(protocol.as_str(), "http" | "https") {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.images.remotePatterns[{index}].protocol"),
+                    "must be http or https",
+                ));
+            }
+        }
+        validate_build_output_text(
+            &pattern.hostname,
+            &format!("config.images.remotePatterns[{index}].hostname"),
+        )?;
+        if pattern.hostname.is_empty() {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("config.images.remotePatterns[{index}].hostname"),
+                "must not be empty",
+            ));
+        }
+        for (field, value) in [
+            ("port", pattern.port.as_deref()),
+            ("pathname", pattern.pathname.as_deref()),
+            ("search", pattern.search.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_build_output_text(
+                    value,
+                    &format!("config.images.remotePatterns[{index}].{field}"),
+                )?;
+            }
+        }
+    }
+    if let Some(patterns) = &images.local_patterns {
+        for (index, pattern) in patterns.iter().enumerate() {
+            for (field, value) in [
+                ("pathname", pattern.pathname.as_deref()),
+                ("search", pattern.search.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    validate_build_output_text(
+                        value,
+                        &format!("config.images.localPatterns[{index}].{field}"),
+                    )?;
+                }
+            }
+        }
+    }
+    for (field, value) in [
+        (
+            "contentSecurityPolicy",
+            images.content_security_policy.as_deref(),
+        ),
+        (
+            "contentDispositionType",
+            images.content_disposition_type.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_build_output_text(value, &format!("config.images.{field}"))?;
+            if value.contains(['\r', '\n']) {
+                return Err(BuildOutputV3Refusal::invalid(
+                    format!("config.images.{field}"),
+                    "contains a line break",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_output_prerender(
+    name: &str,
+    prerender: &serde_json::Value,
+    fallback_files: &[String],
+) -> Result<(), BuildOutputV3Refusal> {
+    let object = prerender.as_object().ok_or_else(|| {
+        BuildOutputV3Refusal::invalid(
+            format!("functions[{name:?}].prerender"),
+            "must be an object",
+        )
+    })?;
+    match object.get("expiration") {
+        Some(serde_json::Value::Bool(false)) => {}
+        Some(serde_json::Value::Number(number)) if number.as_u64().is_some() => {}
+        _ => {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender.expiration"),
+                "must be a non-negative integer or false",
+            ))
+        }
+    }
+    if object
+        .get("group")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err(BuildOutputV3Refusal::invalid(
+            format!("functions[{name:?}].prerender.group"),
+            "must be a non-negative integer",
+        ));
+    }
+    for field in ["bypassToken", "fallback"] {
+        if object
+            .get(field)
+            .is_some_and(|value| value.as_str().is_none())
+        {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender.{field}"),
+                "must be a string",
+            ));
+        }
+    }
+    if let Some(values) = object.get("allowQuery") {
+        let valid = values.as_array().is_some_and(|values| {
+            values.len() <= 1024 && values.iter().all(|value| value.as_str().is_some())
+        });
+        if !valid {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender.allowQuery"),
+                "must contain at most 1024 strings",
+            ));
+        }
+    }
+    for field in ["passQuery", "exposeErrBody"] {
+        if object
+            .get(field)
+            .is_some_and(|value| value.as_bool().is_none())
+        {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender.{field}"),
+                "must be a boolean",
+            ));
+        }
+    }
+    if let Some(headers) = object.get("initialHeaders") {
+        let valid = headers.as_object().is_some_and(|headers| {
+            headers.len() <= BUILD_OUTPUT_V3_MAX_HEADERS
+                && headers.values().all(|value| value.as_str().is_some())
+        });
+        if !valid {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender.initialHeaders"),
+                "must contain at most 128 string values",
+            ));
+        }
+    }
+    if object.get("initialStatus").is_some_and(|status| {
+        !status
+            .as_u64()
+            .is_some_and(|status| (100..=599).contains(&status))
+    }) {
+        return Err(BuildOutputV3Refusal::invalid(
+            format!("functions[{name:?}].prerender.initialStatus"),
+            "must be in 100..=599",
+        ));
+    }
+    let expected_fallback = object
+        .get("fallback")
+        .and_then(serde_json::Value::as_str)
+        .map(|fallback| {
+            validate_build_output_relative_path(fallback, "prerender fallback")?;
+            let parent = name.rsplit_once('/').map(|(parent, _)| parent);
+            let path = parent
+                .map(|parent| format!("{parent}/{fallback}"))
+                .unwrap_or_else(|| fallback.to_string());
+            validate_build_output_relative_path(&path, "prerender fallback")?;
+            Ok::<String, BuildOutputV3Refusal>(path)
+        })
+        .transpose()?;
+    match expected_fallback {
+        Some(expected) if fallback_files.len() == 1 && fallback_files[0] == expected => {}
+        Some(expected) => {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender_files"),
+                format!("must contain exactly referenced fallback {expected:?}"),
+            ))
+        }
+        None if fallback_files.is_empty() => {}
+        None => {
+            return Err(BuildOutputV3Refusal::invalid(
+                format!("functions[{name:?}].prerender_files"),
+                "contains a fallback without prerender.fallback",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_build_output_json(
+    value: &serde_json::Value,
+    field: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), BuildOutputV3Refusal> {
+    if depth > BUILD_OUTPUT_V3_MAX_DEPTH {
+        return Err(BuildOutputV3Refusal::invalid(
+            field,
+            format!("JSON depth exceeds {BUILD_OUTPUT_V3_MAX_DEPTH}"),
+        ));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > BUILD_OUTPUT_V3_MAX_JSON_NODES {
+        return Err(BuildOutputV3Refusal::invalid(
+            field,
+            format!("JSON node count exceeds {BUILD_OUTPUT_V3_MAX_JSON_NODES}"),
+        ));
+    }
+    match value {
+        serde_json::Value::String(text) => validate_build_output_text(text, field)?,
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_build_output_json(value, field, depth + 1, nodes)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                validate_build_output_text(key, field)?;
+                validate_build_output_json(value, field, depth + 1, nodes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_build_output_text(value: &str, field: &str) -> Result<(), BuildOutputV3Refusal> {
+    if value.len() > BUILD_OUTPUT_V3_MAX_VALUE_BYTES {
+        return Err(BuildOutputV3Refusal::invalid(
+            field,
+            format!("string exceeds {BUILD_OUTPUT_V3_MAX_VALUE_BYTES} bytes"),
+        ));
+    }
+    if value.contains('\0') {
+        return Err(BuildOutputV3Refusal::invalid(field, "contains a NUL byte"));
+    }
+    Ok(())
+}
+
+fn ensure_sorted_unique(values: &[String], field: &str) -> Result<(), BuildOutputV3Refusal> {
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(BuildOutputV3Refusal::invalid(
+            field,
+            "must be strictly sorted and unique",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_build_output_relative_path(
+    value: &str,
+    field: &str,
+) -> Result<(), BuildOutputV3Refusal> {
+    validate_build_output_text(value, field)?;
+    if value.is_empty()
+        || value.len() > BUILD_OUTPUT_V3_MAX_PATH_BYTES
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value
+            .bytes()
+            .any(|byte| byte == b'\\' || byte == b':' || byte.is_ascii_control())
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(BuildOutputV3Refusal::invalid(
+            field,
+            format!("path {value:?} is not a portable normalized relative path"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_build_output_public_path(value: &str, field: &str) -> Result<(), BuildOutputV3Refusal> {
+    normalize_build_output_public_path(value)
+        .map(|_| ())
+        .map_err(|error| match error {
+            BuildOutputV3Refusal::Invalid { detail, .. } => {
+                BuildOutputV3Refusal::invalid(field, detail)
+            }
+            other => other,
+        })
+}
+
+fn normalize_build_output_public_path(value: &str) -> Result<String, BuildOutputV3Refusal> {
+    validate_build_output_text(value, "public path")?;
+    if value.contains(['?', '#'])
+        || value.contains("://")
+        || value.starts_with("//")
+        || value
+            .bytes()
+            .any(|byte| byte == b'\\' || byte.is_ascii_control())
+    {
+        return Err(BuildOutputV3Refusal::invalid(
+            "public path",
+            format!("path {value:?} is not an internal URL path"),
+        ));
+    }
+    let trimmed = value.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Ok("/".to_string());
+    }
+    validate_build_output_relative_path(trimmed.trim_end_matches('/'), "public path")?;
+    Ok(if value.ends_with('/') {
+        format!("/{}/", trimmed.trim_end_matches('/'))
+    } else {
+        format!("/{trimmed}")
+    })
+}
+
+fn normalize_build_output_internal_path(value: &str) -> Result<String, BuildOutputV3Refusal> {
+    validate_build_output_text(value, "route destination")?;
+    if value.contains('#')
+        || value.contains("://")
+        || value.starts_with("//")
+        || value
+            .bytes()
+            .any(|byte| byte == b'\\' || byte.is_ascii_control())
+    {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "external or non-portable route destination {value:?}"
+        )));
+    }
+    let (path, query) = value.split_once('?').unwrap_or((value, ""));
+    let path = if path.is_empty() { "/" } else { path };
+    let normalized = normalize_build_output_public_path(path)?;
+    if query.is_empty() {
+        Ok(normalized)
+    } else {
+        validate_build_output_text(query, "route destination query")?;
+        Ok(format!("{normalized}?{query}"))
+    }
+}
+
+fn build_output_path_only(value: &str) -> &str {
+    value.split_once('?').map(|(path, _)| path).unwrap_or(value)
+}
+
+fn insert_build_output_target(
+    outputs: &mut BTreeMap<String, BuildOutputV3Target>,
+    path: String,
+    target: BuildOutputV3Target,
+) -> Result<(), BuildOutputV3Refusal> {
+    let path = normalize_build_output_public_path(&path)?;
+    if outputs.insert(path.clone(), target).is_some() {
+        return Err(BuildOutputV3Refusal::invalid(
+            "outputs",
+            format!("more than one output claims public path {path:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn validate_build_output_header(
+    route: usize,
+    name: &str,
+    value: &str,
+) -> Result<(), BuildOutputV3Refusal> {
+    if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+        return Err(BuildOutputV3Refusal::invalid(
+            format!("config.routes[{route}].headers"),
+            format!("invalid header name {name:?}"),
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+    ) {
+        return Err(BuildOutputV3Refusal::unsupported(format!(
+            "config.routes[{route}] hop-by-hop header {name:?}"
+        )));
+    }
+    validate_build_output_text(value, "route header value")?;
+    if value.contains(['\r', '\n']) {
+        return Err(BuildOutputV3Refusal::invalid(
+            format!("config.routes[{route}].headers[{name:?}]"),
+            "contains a line break",
+        ));
+    }
+    Ok(())
+}
 
 /// What a route serves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1644,6 +3068,11 @@ pub struct Manifest {
     pub functions: Vec<FunctionConfig>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Server-derived Build Output API v3 descriptor. `Some` is authoritative:
+    /// the gateway evaluates its ordered regex routes and exact output inventory
+    /// directly. `None` preserves legacy prefix routing byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output_v3: Option<BuildOutputV3>,
     /// Redirects mapped from the framework build (gateway honors these).
     #[serde(default)]
     pub redirects: Vec<Redirect>,
@@ -1710,6 +3139,11 @@ pub struct Manifest {
 fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
     use serde::de::Error as _;
     let raw: serde_json::Value = serde_json::from_str(s)?;
+    if raw.get("build_output_v3").is_some() {
+        return Err(serde_json::Error::custom(
+            "build_output_v3 is server-derived and cannot be supplied by fluid.json",
+        ));
+    }
     let Some(functions) = raw.get("functions").and_then(|f| f.as_array()) else {
         return Ok(());
     };
@@ -2096,6 +3530,10 @@ pub struct DeployRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_incarnation: Option<ProjectIncarnation>,
     pub root: String,
+    /// Function cwd inside the serving backend. `None` is legacy and may only
+    /// reuse `root` when the active backend proves it is same-host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_workdir: Option<String>,
     pub manifest: Manifest,
     pub created_at_ms: u64,
     pub creator: String,
@@ -2123,8 +3561,11 @@ pub struct Deployment {
     pub id: DeploymentId,
     pub project: String,
     pub project_incarnation: Option<ProjectIncarnation>,
-    /// Host path to deployment files (mock backend serves from here).
+    /// Canonical host path used only by static/origin serving.
     pub root: std::path::PathBuf,
+    /// Function cwd inside the serving backend. `None` exists only for restored
+    /// legacy records and is not permission to guess on an isolated backend.
+    pub runtime_workdir: Option<std::path::PathBuf>,
     pub manifest: Manifest,
     pub created_at_ms: u64,
     pub state: DeployState,
@@ -2215,9 +3656,10 @@ pub struct GitDeployRequest {
     /// `examples/nextjs`). Empty/None = repo root.
     #[serde(default)]
     pub root_dir: Option<String>,
-    /// Environment variables to set on the project at creation, injected into
-    /// BOTH the build (install/build commands) and the runtime (functions /
-    /// containers). Set from the "New Project" screen.
+    /// Environment variables supplied by a direct creation request. The server
+    /// persists them as runtime-only variables for the server-derived deployment
+    /// environment; fork-sourced requests never persist them. Build variables are
+    /// configured explicitly through the project environment API with build scope.
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
     /// When true, this node deploys LOCALLY only (build + host) and does NOT run
@@ -2320,14 +3762,20 @@ pub struct GitDeployRequest {
     /// allocation but cross-node forwarding to it isn't wired yet.
     #[serde(default)]
     pub image_ports: Option<Vec<PortSpec>>,
-    /// GitHub access token for cloning a PRIVATE repo. Injected on the build node as
-    /// `https://x-access-token:<token>@github.com/...` basic auth for the `git clone`
-    /// only — never written into `repo_url`, never logged (clone stderr is scrubbed),
-    /// and cleared (`take()`) right after the clone so no persisted/gossiped/displayed
-    /// record retains it. Rides placement/fanout like `zip_b64`; `skip_serializing_if`
-    /// omits it entirely when absent (public repos / no connection).
+    /// GitHub access token for cloning a PRIVATE repo. Fed to the git process
+    /// through a 0600 temp-file descriptor-backed credential helper (never embedded
+    /// in a URL, argv, or env), cleared (`take()`) right after clone so no persisted/
+    /// gossiped/displayed record retains it. Rides placement/fanout like `zip_b64`;
+    /// `skip_serializing_if` omits it entirely when absent (public repos / no connection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_token: Option<String>,
+    /// Upload-source lineage ids for a server-resolved redeploy. Despite the
+    /// compatibility field name, values are platform-issued BUILD ids stamped in
+    /// `GitSource.commit`: checkout dirs and retained archives use build ids, while
+    /// gateway deployment ids are independently minted. Empty means no proven
+    /// upload lineage and must fail closed rather than scan newest-any source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_deployment_ids: Vec<String>,
 }
 fn default_prod() -> bool {
     true

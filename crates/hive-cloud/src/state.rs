@@ -588,7 +588,9 @@ impl CloudState {
             configured_expected_peer_ids
         };
         let relayed_trust_compat = configured_bool_default_true("HIVE_RELAYED_TRUST_COMPAT")
-            .unwrap_or_else(|error| panic!("invalid mesh trust compatibility configuration: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("invalid mesh trust compatibility configuration: {error}")
+            });
         if relayed_trust_compat {
             tracing::warn!(
                 "relayed peer records may expand mutable authorization during mixed rollout; \

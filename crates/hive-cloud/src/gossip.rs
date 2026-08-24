@@ -107,11 +107,36 @@ pub async fn request_to(
     body: &[u8],
     timeout_secs: u64,
 ) -> Option<Vec<u8>> {
+    request_to_with_response_cap(
+        cloud,
+        node_id,
+        addr,
+        method,
+        path,
+        body,
+        timeout_secs,
+        16 * 1024 * 1024,
+    )
+    .await
+}
+
+/// Send a gossip request whose response protocol has an explicit larger bound.
+/// The default request path remains capped at 16 MiB.
+pub async fn request_to_with_response_cap(
+    cloud: &Arc<CloudState>,
+    node_id: &str,
+    addr: &str,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    timeout_secs: u64,
+    response_cap: usize,
+) -> Option<Vec<u8>> {
     let pool = cloud.mesh.read().clone()?;
     let addr = relay_hinted_addr(cloud, node_id, addr);
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        pool.gossip_request(node_id, &addr, method, path, body),
+        pool.gossip_request_with_response_cap(node_id, &addr, method, path, body, response_cap),
     )
     .await
     {
@@ -666,8 +691,16 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         }
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
         // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
-        // since the iroh transport carries no HTTP headers.
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/git/deploy") => {
+        // since the iroh transport carries no HTTP headers. The versioned path is
+        // intentionally outside `/v1/git/deploy`: a pre-protocol binary's broad
+        // legacy prefix arm therefore cannot consume a deployment whose runtime
+        // artifact/workdir semantics it does not understand.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some("/v1/runtime-artifact/v1/git/deploy") | Some("/v1/git/deploy")
+            ) =>
+        {
             let team = p
                 .split_once("?team=")
                 .map(|(_, t)| t.to_string())

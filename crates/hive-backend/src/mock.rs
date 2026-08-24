@@ -399,6 +399,23 @@ impl CellBackend for MockBackend {
             );
         }
 
+        // Same node-fault contract as the Wasmer check above, for the same
+        // reason: placement's `schedule::bun_capable` filter should make this
+        // unreachable, so reaching it means the gossiped capability and the
+        // real filesystem disagree. `func.runtime` — the authoritative
+        // platform discriminator, never the argv[0] text — is the signal,
+        // mirroring `hive-cell-agent`'s own `platform_runtime_program` gate.
+        let is_bun = func.runtime == hive_core::Runtime::Bun;
+        if is_bun && !bin_on_path(&func.start_cmd[0], &path) {
+            anyhow::bail!(
+                "{}: this node has no `{}` binary on PATH, so a runtime=\"bun\" \
+                 deployment cannot start here — install the bun CLI on this node \
+                 (operator remedy; not an application fault)",
+                hive_core::fault::NODE_RUNTIME_MISSING,
+                func.start_cmd[0],
+            );
+        }
+
         let mut cmd = Command::new(&func.start_cmd[0]);
         cmd
             // CLEARED, NEVER INHERITED. `Command` inherits the parent's whole

@@ -1,0 +1,645 @@
+---
+- name: Derive kernel-random functional-probe resources
+  ansible.builtin.set_fact:
+    _build_executor_probe_id: "{{ build_executor_invocation_id }}"
+    _build_executor_probe_container: "hive-build-probe-{{ build_executor_invocation_id }}"
+    _build_executor_probe_peer: "hive-build-peer-{{ build_executor_invocation_id }}"
+    _build_executor_probe_volume: "hive-build-probe-{{ build_executor_invocation_id }}"
+    _build_executor_probe_gateway_unit: "hive-build-gateway-{{ build_executor_invocation_id }}.service"
+    _build_executor_probe_private_unit: "hive-build-private-{{ build_executor_invocation_id }}.service"
+    _build_executor_probe_socket_unit: "hive-build-socket-{{ build_executor_invocation_id }}.service"
+    _build_executor_probe_sentinel: "{{ build_executor_state_dir }}/.host-secret-{{ build_executor_invocation_id }}"
+    _build_executor_probe_fifo: "{{ build_executor_state_dir }}/.host-fifo-{{ build_executor_invocation_id }}"
+    _build_executor_probe_socket: "{{ build_executor_state_dir }}/.host-socket-{{ build_executor_invocation_id }}"
+    _build_executor_probe_shm: "/dev/shm/hive-build-probe-{{ build_executor_invocation_id }}"
+
+- name: Execute BuildExecutor functional probes
+  block:
+    - name: Create an empty host listener directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /run
+        prefix: hive-build-probe.
+      register: _build_executor_probe_http_root
+
+    - name: Create the root-only host secret sentinel
+      ansible.builtin.file:
+        path: "{{ _build_executor_probe_sentinel }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Fill the host secret sentinel from the target kernel RNG
+      ansible.builtin.command:
+        argv: [/usr/bin/dd, if=/dev/urandom, "of={{ _build_executor_probe_sentinel }}", bs=32, count=1, conv=notrunc]
+      no_log: true
+
+    - name: Create the root-only host FIFO sentinel
+      ansible.builtin.command:
+        argv: [/usr/bin/mkfifo, --mode=0600, "{{ _build_executor_probe_fifo }}"]
+
+    - name: Create a host IPC namespace sentinel
+      ansible.builtin.copy:
+        content: "host-ipc-only\n"
+        dest: "{{ _build_executor_probe_shm }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Start a live root-only host Unix socket sentinel
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - "--unit={{ _build_executor_probe_socket_unit }}"
+          - --property=Type=simple
+          - /usr/bin/python3
+          - -c
+          - "import os,socket,sys,time; p=sys.argv[1]; os.umask(0o077); s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); time.sleep(3600)"
+          - "{{ _build_executor_probe_socket }}"
+
+    - name: Wait for the host Unix socket sentinel
+      ansible.builtin.wait_for:
+        path: "{{ _build_executor_probe_socket }}"
+        state: present
+        timeout: 5
+
+    - name: Create the byte-capped named tmpfs probe volume
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - volume
+          - create
+          - --driver=local
+          - --label=io.hive.build-executor.probe=true
+          - --opt=type=tmpfs
+          - --opt=device=tmpfs
+          - "--opt=o=size={{ build_executor_probe_workspace_bytes }},uid={{ build_executor_container_uid }},gid={{ build_executor_container_gid }},mode=0700,nosuid,nodev"
+          - "{{ _build_executor_probe_volume }}"
+
+    - name: Create the primary probe through the exact hardened Podman wrapper
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - create
+          - "--name={{ _build_executor_probe_container }}"
+          - --label=io.hive.build-executor.probe=true
+          - --pull=never
+          - --http-proxy=false
+          - --env-host=false
+          - --read-only
+          - --image-volume=ignore
+          - --cap-drop=all
+          - --security-opt=no-new-privileges
+          - --ipc=private
+          - --pid=private
+          - --uts=private
+          - --cgroupns=private
+          - --restart=no
+          - --stop-timeout=0
+          - --no-healthcheck
+          - "--network={{ build_executor_network_name }}"
+          - "--user={{ build_executor_container_uid }}:{{ build_executor_container_gid }}"
+          - "--pids-limit={{ build_executor_probe_pids_limit }}"
+          - "--memory={{ build_executor_probe_memory }}"
+          - "--memory-swap={{ build_executor_probe_memory }}"
+          - --sysctl=net.ipv6.conf.all.disable_ipv6=1
+          - --sysctl=net.ipv6.conf.default.disable_ipv6=1
+          - --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m
+          - "--volume={{ _build_executor_probe_volume }}:/workspace:rw,nosuid,nodev"
+          - --workdir=/workspace
+          - "--hostname={{ _build_executor_probe_container }}"
+          - "{{ build_executor_builder_image_id }}"
+          - /bin/sh
+          - -c
+          - "while :; do sleep 3600; done"
+      environment:
+        HIVE_BUILD_HOST_ENV_SENTINEL: must-not-cross-wrapper
+
+    - name: Create the same-network peer through the exact hardened wrapper
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - create
+          - "--name={{ _build_executor_probe_peer }}"
+          - --label=io.hive.build-executor.probe=true
+          - --pull=never
+          - --http-proxy=false
+          - --env-host=false
+          - --read-only
+          - --image-volume=ignore
+          - --cap-drop=all
+          - --security-opt=no-new-privileges
+          - --ipc=private
+          - --pid=private
+          - --uts=private
+          - --cgroupns=private
+          - --restart=no
+          - --stop-timeout=0
+          - --no-healthcheck
+          - "--network={{ build_executor_network_name }}"
+          - "--user={{ build_executor_container_uid }}:{{ build_executor_container_gid }}"
+          - "--pids-limit={{ build_executor_probe_pids_limit }}"
+          - "--memory={{ build_executor_probe_memory }}"
+          - "--memory-swap={{ build_executor_probe_memory }}"
+          - --sysctl=net.ipv6.conf.all.disable_ipv6=1
+          - --sysctl=net.ipv6.conf.default.disable_ipv6=1
+          - --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m
+          - "--publish={{ build_executor_network_gateway }}:{{ build_executor_probe_hairpin_port }}:{{ build_executor_probe_peer_port }}/tcp"
+          - "--hostname={{ _build_executor_probe_peer }}"
+          - "{{ build_executor_builder_image_id }}"
+          - python3
+          - -c
+          - "import http.server,os,socket,sys; os.chdir('/tmp'); address=socket.gethostbyname(socket.gethostname()); http.server.ThreadingHTTPServer((address,int(sys.argv[1])),http.server.SimpleHTTPRequestHandler).serve_forever()"
+          - "{{ build_executor_probe_peer_port | string }}"
+
+    - name: Inspect the primary probe through the exact hardened wrapper
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", container, inspect, "{{ _build_executor_probe_container }}"]
+      register: _build_executor_probe_inspect_raw
+      changed_when: false
+
+    - name: Decode the primary probe definition
+      ansible.builtin.set_fact:
+        _build_executor_probe_inspect: "{{ (_build_executor_probe_inspect_raw.stdout | from_json)[0] }}"
+
+    - name: Require immutable image, runtime, non-root user, network, and one named volume
+      ansible.builtin.assert:
+        that:
+          - _build_executor_probe_inspect.Image == build_executor_builder_image_id
+          - _build_executor_probe_inspect.OCIRuntime in [build_executor_runsc_path, (build_executor_runsc_path | basename)]
+          - _build_executor_probe_inspect.Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
+          - _build_executor_probe_inspect.HostConfig.NetworkMode == build_executor_network_name
+          - _build_executor_probe_inspect.HostConfig.IpcMode == "private"
+          - _build_executor_probe_inspect.HostConfig.PidMode == "private"
+          - _build_executor_probe_inspect.HostConfig.UTSMode == "private"
+          - _build_executor_probe_inspect.HostConfig.CgroupMode == "private"
+          - _build_executor_probe_inspect.HostConfig.ReadonlyRootfs | bool
+          - _build_executor_probe_inspect.Mounts | length == 1
+          - (_build_executor_probe_inspect.Mounts | selectattr('Type', 'equalto', 'volume') | map(attribute='Name') | list) == [_build_executor_probe_volume]
+
+    - name: Start both exact-runsc probe containers
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", start, "{{ item }}"]
+      loop:
+        - "{{ _build_executor_probe_container }}"
+        - "{{ _build_executor_probe_peer }}"
+
+    - name: Prove Netavark installed nftables state for the active network
+      ansible.builtin.command:
+        argv: ["{{ build_executor_nft_binary }}", list, table, inet, netavark]
+      register: _build_executor_netavark_nft
+      changed_when: false
+
+    - name: Require the active bridge in Netavark's nftables table
+      ansible.builtin.assert:
+        that:
+          - build_executor_network_bridge in _build_executor_netavark_nft.stdout
+
+    - name: Inspect both started probes through the exact hardened wrapper
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - container
+          - inspect
+          - "{{ _build_executor_probe_container }}"
+          - "{{ _build_executor_probe_peer }}"
+      register: _build_executor_started_inspect_raw
+      changed_when: false
+
+    - name: Decode both started probes
+      ansible.builtin.set_fact:
+        _build_executor_started_inspect: "{{ _build_executor_started_inspect_raw.stdout | from_json }}"
+
+    - name: Prove both conmon processes received the exact runtime path and flags
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, pathlib, sys
+            expected_path = sys.argv[1]
+            expected_flags = json.loads(sys.argv[2])
+            for raw_pid in sys.argv[3:]:
+                argv = [item.decode(errors="strict") for item in pathlib.Path(f"/proc/{int(raw_pid)}/cmdline").read_bytes().split(b"\0") if item]
+                joined = "\n".join(argv)
+                if expected_path not in argv and expected_path not in joined:
+                    raise SystemExit(f"conmon omitted exact runtime path: {argv}")
+                for flag in expected_flags:
+                    if flag not in joined:
+                        raise SystemExit(f"conmon omitted runtime flag {flag}: {argv}")
+          - "{{ build_executor_runsc_path }}"
+          - "{{ build_executor_runsc_runtime_flags | to_json }}"
+          - "{{ _build_executor_started_inspect[0].State.ConmonPid | string }}"
+          - "{{ _build_executor_started_inspect[1].State.ConmonPid | string }}"
+      changed_when: false
+
+    - name: Require exactly one attached network on both probes
+      ansible.builtin.assert:
+        that:
+          - (_build_executor_started_inspect[0].NetworkSettings.Networks.keys() | list) == [build_executor_network_name]
+          - (_build_executor_started_inspect[1].NetworkSettings.Networks.keys() | list) == [build_executor_network_name]
+          - _build_executor_started_inspect[1].Image == build_executor_builder_image_id
+          - _build_executor_started_inspect[1].Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
+          - _build_executor_started_inspect[1].HostConfig.ReadonlyRootfs | bool
+          - _build_executor_started_inspect[1].HostConfig.IpcMode == "private"
+          - _build_executor_started_inspect[1].HostConfig.PidMode == "private"
+          - _build_executor_started_inspect[1].HostConfig.UTSMode == "private"
+          - _build_executor_started_inspect[1].HostConfig.CgroupMode == "private"
+          - _build_executor_started_inspect[1].Mounts | length == 0
+
+    - name: Pin the peer's exact IPv4 address
+      ansible.builtin.set_fact:
+        _build_executor_probe_peer_ipv4: >-
+          {{ _build_executor_started_inspect[1].NetworkSettings.Networks[build_executor_network_name].IPAddress }}
+
+    - name: Require exact test addresses and ports to be unused
+      ansible.builtin.wait_for:
+        host: "{{ item.host }}"
+        port: "{{ item.port }}"
+        state: stopped
+        timeout: 1
+      loop:
+        - { host: "{{ build_executor_network_gateway }}", port: "{{ build_executor_probe_listener_port }}" }
+        - { host: "{{ build_executor_probe_host_private_ipv4 }}", port: "{{ build_executor_probe_listener_port }}" }
+
+    - name: Start listeners bound only to the exact gateway and private test addresses
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - "--unit={{ item.unit }}"
+          - --property=Type=simple
+          - /usr/bin/python3
+          - -m
+          - http.server
+          - "{{ build_executor_probe_listener_port | string }}"
+          - --bind
+          - "{{ item.host }}"
+          - --directory
+          - "{{ _build_executor_probe_http_root.path }}"
+      loop:
+        - { unit: "{{ _build_executor_probe_gateway_unit }}", host: "{{ build_executor_network_gateway }}" }
+        - { unit: "{{ _build_executor_probe_private_unit }}", host: "{{ build_executor_probe_host_private_ipv4 }}" }
+
+    - name: Prove exact host and peer listeners are live outside lateral ingress
+      ansible.builtin.wait_for:
+        host: "{{ item.host }}"
+        port: "{{ item.port }}"
+        state: started
+        timeout: 5
+      loop:
+        - { host: "{{ build_executor_network_gateway }}", port: "{{ build_executor_probe_listener_port }}" }
+        - { host: "{{ build_executor_probe_host_private_ipv4 }}", port: "{{ build_executor_probe_listener_port }}" }
+        - { host: "{{ _build_executor_probe_peer_ipv4 }}", port: "{{ build_executor_probe_peer_port }}" }
+        - { host: "{{ build_executor_network_gateway }}", port: "{{ build_executor_probe_hairpin_port }}" }
+
+    - name: Read policy counters before denial probes
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, subprocess, sys
+            nft, inet_table, bridge_table = sys.argv[1:]
+            def packets(family, table, counter):
+                data = json.loads(subprocess.check_output([nft, "-j", "list", "counter", family, table, counter], text=True))
+                return next(row["counter"]["packets"] for row in data["nftables"] if "counter" in row)
+            print(json.dumps({
+                "destination": packets("inet", inet_table, "denied_destination"),
+                "dnat": packets("inet", inet_table, "dnat_denied"),
+                "egress": packets("inet", inet_table, "egress_default_denied"),
+                "fleet": packets("inet", inet_table, "fleet_denied"),
+                "host": packets("inet", inet_table, "host_denied"),
+                "lateral": packets("bridge", bridge_table, "lateral_denied"),
+            }))
+          - "{{ build_executor_nft_binary }}"
+          - "{{ build_executor_nft_table }}"
+          - "{{ build_executor_nft_bridge_table }}"
+      register: _build_executor_counters_before_raw
+      changed_when: false
+
+    - name: Decode policy counters before denial probes
+      ansible.builtin.set_fact:
+        _build_executor_counters_before: "{{ _build_executor_counters_before_raw.stdout | from_json }}"
+
+    - name: Prove command identity, gVisor kernel, empty host env, and workspace write
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - /bin/sh
+          - -eu
+          - -c
+          - >-
+            test "$(id -u)" = "{{ build_executor_container_uid }}";
+            test "$(id -g)" = "{{ build_executor_container_gid }}";
+            grep -qx gvisor /proc/gvisor/kernel_is_gvisor;
+            capeff=;
+            while read -r key value rest; do [ "$key" = "CapEff:" ] && capeff=$value; done </proc/self/status;
+            test "$capeff" = 0000000000000000;
+            test -z "${HTTP_PROXY-}${HTTPS_PROXY-}${ALL_PROXY-}${NO_PROXY-}${http_proxy-}${https_proxy-}${all_proxy-}${no_proxy-}";
+            test -z "${HIVE_BUILD_HOST_ENV_SENTINEL-}";
+            for path in /bin/sh /bin/sleep /bin/tar /usr/bin/awk /usr/bin/env /usr/bin/find /usr/bin/id /usr/bin/realpath /usr/bin/stat /usr/bin/wc; do
+              test -x "$path";
+            done;
+            for command in curl git node npm corepack bun python3 go buildah; do
+              command -v "$command" >/dev/null;
+            done;
+            touch /workspace/non-root-write-ok
+      changed_when: false
+
+    - name: Prove the named tmpfs workspace byte ceiling
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - /bin/sh
+          - -eu
+          - -c
+          - >-
+            rm -f /workspace/non-root-write-ok /workspace/over-limit;
+            ! dd if=/dev/zero of=/workspace/over-limit bs=1048576
+            count={{ ((build_executor_probe_workspace_bytes | int) // 1048576) + 2 }} 2>/dev/null;
+            used=$(du -sk /workspace | cut -f1);
+            [ "$used" -le "{{ ((build_executor_probe_workspace_bytes | int) // 1024) }}" ]
+      changed_when: false
+
+    - name: Prove nested rootless Buildah produces a real OCI archive
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - /bin/sh
+          - -eu
+          - -c
+          - >-
+            rm -f /workspace/over-limit;
+            mkdir -p /workspace/oci-probe;
+            printf 'FROM scratch\nCOPY marker /marker\n' >/workspace/oci-probe/Containerfile;
+            printf verified >/workspace/oci-probe/marker;
+            buildah --storage-driver=vfs bud --isolation=rootless --format=oci
+            --tag hive-build-probe:latest /workspace/oci-probe;
+            buildah --storage-driver=vfs push hive-build-probe:latest
+            oci-archive:/workspace/probe.oci:hive-build-probe;
+            test -s /workspace/probe.oci
+      changed_when: false
+
+    - name: Prove IPv6, host paths, host IPC, and dangerous devices are absent
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - /bin/sh
+          - -eu
+          - -c
+          - >-
+            test ! -s /proc/net/if_inet6;
+            test ! -e {{ _build_executor_probe_sentinel | quote }};
+            test ! -e {{ _build_executor_probe_fifo | quote }};
+            test ! -e {{ _build_executor_probe_socket | quote }};
+            test ! -e {{ _build_executor_probe_shm | quote }};
+            for path in /dev/kvm /dev/mem /dev/fuse /dev/net/tun /dev/dri /dev/nvidia0; do
+              test ! -e "$path";
+            done
+      changed_when: false
+
+    - name: Prove every container resolver is only the dedicated gateway
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - /bin/sh
+          - -eu
+          - -c
+          - >-
+            found=0;
+            while read -r kind value rest; do
+              if [ "$kind" = nameserver ]; then
+                [ "$value" = "{{ build_executor_network_gateway }}" ] || exit 1;
+                found=1;
+              fi;
+            done </etc/resolv.conf;
+            [ "$found" = 1 ]
+      changed_when: false
+
+    - name: Attempt forbidden HTTP connections
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - curl
+          - --ipv4
+          - --noproxy
+          - "*"
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - "--connect-timeout={{ build_executor_probe_connect_timeout_seconds }}"
+          - "--max-time={{ build_executor_probe_connect_timeout_seconds }}"
+          - "{{ item }}"
+      loop:
+        - "http://{{ build_executor_network_gateway }}:{{ build_executor_probe_listener_port }}/"
+        - "http://{{ build_executor_probe_host_private_ipv4 }}:{{ build_executor_probe_listener_port }}/"
+        - http://169.254.169.254/latest/meta-data/
+        - "http://{{ build_executor_fleet_public_ipv4_sorted[0] }}:443/"
+        - "http://{{ build_executor_network_gateway }}:{{ build_executor_probe_hairpin_port }}/"
+        - "http://{{ _build_executor_probe_peer_ipv4 }}:{{ build_executor_probe_peer_port }}/"
+      register: _build_executor_forbidden_http
+      changed_when: false
+      failed_when: false
+
+    - name: Require every forbidden HTTP connection to fail
+      ansible.builtin.assert:
+        that:
+          - _build_executor_forbidden_http.results | map(attribute='rc') | select('equalto', 0) | list | length == 0
+
+    - name: Send direct UDP and TCP DNS probes that policy must deny
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - python3
+          - -c
+          - |
+            import socket, struct, sys
+            upstream = sys.argv[1]
+            timeout = float(sys.argv[2])
+            labels = "example.com".split(".")
+            qname = b"".join(bytes([len(x)]) + x.encode() for x in labels) + b"\0"
+            query = struct.pack("!HHHHHH", 0x4849, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.settimeout(timeout)
+            udp.sendto(query, (upstream, 53))
+            try:
+                udp.recvfrom(512)
+            except socket.timeout:
+                pass
+            else:
+                raise SystemExit("direct UDP DNS bypass returned a packet")
+            finally:
+                udp.close()
+
+            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp.settimeout(timeout)
+            try:
+                result = tcp.connect_ex((upstream, 53))
+            except socket.timeout:
+                result = None
+            finally:
+                tcp.close()
+            if result == 0:
+                raise SystemExit("direct TCP DNS bypass connected")
+          - "{{ build_executor_dns_upstream_ipv4_sorted[0] }}"
+          - "{{ build_executor_probe_connect_timeout_seconds | string }}"
+      changed_when: false
+
+    - name: Read policy counters after denial probes
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, subprocess, sys
+            nft, inet_table, bridge_table = sys.argv[1:]
+            def packets(family, table, counter):
+                data = json.loads(subprocess.check_output([nft, "-j", "list", "counter", family, table, counter], text=True))
+                return next(row["counter"]["packets"] for row in data["nftables"] if "counter" in row)
+            print(json.dumps({
+                "destination": packets("inet", inet_table, "denied_destination"),
+                "dnat": packets("inet", inet_table, "dnat_denied"),
+                "egress": packets("inet", inet_table, "egress_default_denied"),
+                "fleet": packets("inet", inet_table, "fleet_denied"),
+                "host": packets("inet", inet_table, "host_denied"),
+                "lateral": packets("bridge", bridge_table, "lateral_denied"),
+            }))
+          - "{{ build_executor_nft_binary }}"
+          - "{{ build_executor_nft_table }}"
+          - "{{ build_executor_nft_bridge_table }}"
+      register: _build_executor_counters_after_raw
+      changed_when: false
+
+    - name: Decode and require every specific deny path to account for probes
+      ansible.builtin.set_fact:
+        _build_executor_counters_after: "{{ _build_executor_counters_after_raw.stdout | from_json }}"
+
+    - name: Require host, reserved, direct-DNS, and lateral deny counter deltas
+      ansible.builtin.assert:
+        that:
+          - _build_executor_counters_after.host | int >= (_build_executor_counters_before.host | int) + 2
+          - _build_executor_counters_after.destination | int >= (_build_executor_counters_before.destination | int) + 1
+          - _build_executor_counters_after.dnat | int >= (_build_executor_counters_before.dnat | int) + 1
+          - _build_executor_counters_after.egress | int >= (_build_executor_counters_before.egress | int) + 2
+          - _build_executor_counters_after.fleet | int >= (_build_executor_counters_before.fleet | int) + 1
+          - _build_executor_counters_after.lateral | int >= (_build_executor_counters_before.lateral | int) + 1
+
+    - name: Prove TLS-verified public registry HTTPS through gateway DNS
+      ansible.builtin.command:
+        argv:
+          - "{{ build_executor_podman_path }}"
+          - exec
+          - "{{ _build_executor_probe_container }}"
+          - curl
+          - --ipv4
+          - --noproxy
+          - "*"
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - "--connect-timeout={{ build_executor_probe_connect_timeout_seconds }}"
+          - --max-time=15
+          - "{{ build_executor_probe_registry_url }}"
+      register: _build_executor_registry_probe
+      changed_when: false
+
+    - name: Require a real registry HTTPS response
+      ansible.builtin.assert:
+        that:
+          - _build_executor_registry_probe.stdout in ["200", "401"]
+
+  always:
+    - name: Explicitly reap both probe containers through the exact runtime wrapper
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", rm, --force, --volumes, "{{ item }}"]
+      loop:
+        - "{{ _build_executor_probe_container }}"
+        - "{{ _build_executor_probe_peer }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Explicitly reap the named probe volume
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", volume, rm, --force, "{{ _build_executor_probe_volume }}"]
+      changed_when: false
+      failed_when: false
+
+    - name: Stop exact-address and Unix-socket listeners
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - "{{ _build_executor_probe_gateway_unit }}"
+        - "{{ _build_executor_probe_private_unit }}"
+        - "{{ _build_executor_probe_socket_unit }}"
+      failed_when: false
+
+    - name: Reset and collect transient listener units
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, reset-failed, "{{ item }}"]
+      loop:
+        - "{{ _build_executor_probe_gateway_unit }}"
+        - "{{ _build_executor_probe_private_unit }}"
+        - "{{ _build_executor_probe_socket_unit }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Remove host probe paths
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _build_executor_probe_sentinel }}"
+        - "{{ _build_executor_probe_fifo }}"
+        - "{{ _build_executor_probe_socket }}"
+        - "{{ _build_executor_probe_shm }}"
+        - "{{ _build_executor_probe_http_root.path | default('/run/nonexistent-build-executor-probe') }}"
+
+    - name: Verify both probe containers are absent through the exact wrapper
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", container, exists, "{{ item }}"]
+      loop:
+        - "{{ _build_executor_probe_container }}"
+        - "{{ _build_executor_probe_peer }}"
+      register: _build_executor_probe_container_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Verify the named probe volume is absent
+      ansible.builtin.command:
+        argv: ["{{ build_executor_podman_path }}", volume, exists, "{{ _build_executor_probe_volume }}"]
+      register: _build_executor_probe_volume_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Require cleanup to leave no probe container or volume
+      ansible.builtin.assert:
+        that:
+          - _build_executor_probe_container_exists.results | map(attribute='rc') | reject('equalto', 1) | list | length == 0
+          - _build_executor_probe_volume_exists.rc == 1

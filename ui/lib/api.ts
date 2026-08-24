@@ -997,6 +997,8 @@ export interface EnvVar {
   key: string;
   value: string;
   target: string;
+  /** Missing on legacy rows; the backend defaults those to runtime-only. */
+  scope?: "runtime" | "build" | "all";
   sensitive: boolean;
   updated_ms: number;
 }
@@ -1217,6 +1219,9 @@ export interface Database {
   provider?: string;
   mode: string;
   created_ms: number;
+  /** Canonical database-gateway hostname and the node that owns its backing state. */
+  db_host?: string;
+  host_node?: string;
   connection: Record<string, string>;
   container: string | null;
   note: string;

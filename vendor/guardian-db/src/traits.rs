@@ -739,6 +739,18 @@ pub trait KeyValueStore: Store {
     /// The created PUT operation, or an error if the operation fails
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<Operation, Self::Error>;
 
+    /// Write while the caller holds the collector's explicit publication guard.
+    /// The default preserves behavior for non-iroh stores; the iroh-docs KV
+    /// implementation avoids recursively acquiring the same fair gate.
+    async fn put_gc_protected(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _protection: &crate::p2p::network::core::BlobProtection,
+    ) -> Result<Operation, Self::Error> {
+        self.put(key, value).await
+    }
+
     /// Removes a key and its associated value.
     /// Creates a new DEL operation in the distributed log that will be replicated.
     ///

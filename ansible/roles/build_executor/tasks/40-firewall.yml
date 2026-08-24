@@ -1,0 +1,171 @@
+---
+- name: Resolve the installed nft binary
+  ansible.builtin.shell: command -v nft
+  args:
+    executable: /usr/bin/bash
+  register: _build_executor_nft_binary
+  changed_when: false
+
+- name: Pin the nft binary path used by the policy service
+  ansible.builtin.set_fact:
+    build_executor_nft_binary: "{{ _build_executor_nft_binary.stdout | trim }}"
+
+- name: Require an absolute nft binary path
+  ansible.builtin.assert:
+    that:
+      - build_executor_nft_binary is match('^/[A-Za-z0-9._/+-]+$')
+
+- name: Install the dedicated executor nftables policy
+  ansible.builtin.template:
+    src: hive-build-executor.nft.j2
+    dest: "{{ build_executor_nft_policy_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+    unsafe_writes: false
+  notify: restart build-executor firewall
+
+- name: Install the atomic nftables apply helper
+  ansible.builtin.template:
+    src: apply-firewall.sh.j2
+    dest: "{{ build_executor_nft_apply_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    unsafe_writes: false
+  notify: restart build-executor firewall
+
+- name: Install the live firewall verifier
+  ansible.builtin.template:
+    src: verify-firewall.sh.j2
+    dest: "{{ build_executor_nft_verify_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    unsafe_writes: false
+  notify: reload systemd
+
+- name: Install the persistent BuildExecutor firewall unit
+  ansible.builtin.template:
+    src: hive-build-executor-firewall.service.j2
+    dest: "/etc/systemd/system/{{ build_executor_firewall_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: false
+  notify:
+    - reload systemd
+    - restart build-executor firewall
+
+- name: Propagate nftables reloads into ordered BuildExecutor restoration
+  ansible.builtin.template:
+    src: nftables-build-executor.conf.j2
+    dest: "{{ build_executor_nftables_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: false
+  notify: reload systemd
+
+- name: Gate future hive-node starts on stale cleanup and live policy proof
+  ansible.builtin.template:
+    src: hive-node-build-executor.conf.j2
+    dest: "{{ build_executor_hive_node_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: false
+  notify: reload systemd
+
+- name: Install a Netavark 1.16-compatible nftables reload unit when upstream lacks one
+  ansible.builtin.template:
+    src: netavark-nftables-reload.service.j2
+    dest: "{{ build_executor_netavark_reload_fallback_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: false
+  when: not (_build_executor_netavark_reload_unit_stat.stat.exists | bool)
+  notify: reload systemd
+
+- name: Remove the role fallback when the packaged reload unit exists
+  ansible.builtin.file:
+    path: "{{ build_executor_netavark_reload_fallback_path }}"
+    state: absent
+  when: _build_executor_netavark_reload_unit_stat.stat.exists | bool
+  notify: reload systemd
+
+- name: Order Netavark connectivity restore after BuildExecutor policy restore
+  ansible.builtin.template:
+    src: netavark-nftables-reload.conf.j2
+    dest: "{{ build_executor_netavark_reload_dropin_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    unsafe_writes: false
+  notify: reload systemd
+
+- name: Apply notified firewall changes before any executor starts
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the BuildExecutor firewall policy
+  ansible.builtin.systemd:
+    name: "{{ build_executor_firewall_unit }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Enable packaged Netavark nftables state restoration
+  ansible.builtin.systemd:
+    name: "{{ build_executor_netavark_reload_unit }}"
+    enabled: true
+    daemon_reload: true
+
+# Reapply even when no file changed: an out-of-band nft flush must not leave a
+# still-published capability paired with a missing policy.
+- name: Atomically converge the live executor nftables table
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_nft_apply_path }}"
+  changed_when: false
+
+- name: Verify the live executor nftables table
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_nft_binary }}"
+      - list
+      - table
+      - inet
+      - "{{ build_executor_nft_table }}"
+  changed_when: false
+
+- name: Verify the live executor bridge-family lateral-deny table
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_nft_binary }}"
+      - list
+      - table
+      - bridge
+      - "{{ build_executor_nft_bridge_table }}"
+  changed_when: false
+
+- name: Calculate the installed policy digest
+  ansible.builtin.stat:
+    path: "{{ build_executor_nft_policy_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  register: _build_executor_policy_stat
+
+- name: Calculate the installed live-verifier digest
+  ansible.builtin.stat:
+    path: "{{ build_executor_nft_verify_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  register: _build_executor_network_verify_stat
+
+- name: Pin verified policy and verifier digests for capability publication
+  ansible.builtin.set_fact:
+    build_executor_policy_digest: "sha256:{{ _build_executor_policy_stat.stat.checksum }}"
+    build_executor_network_verify_sha256: "{{ _build_executor_network_verify_stat.stat.checksum }}"

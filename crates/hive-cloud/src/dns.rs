@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 const YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
-const CERT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DnsRecord {
@@ -91,6 +90,17 @@ pub struct DomainStore {
     map: RwLock<HashMap<String, DomainRecord>>,
 }
 
+fn pending_ssl() -> SslCert {
+    SslCert {
+        id: String::new(),
+        cns: vec![],
+        renewal: "pending".into(),
+        issued_ms: 0,
+        expires_ms: 0,
+        provider: "OpenEdge (Let's Encrypt)".into(),
+    }
+}
+
 fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
     let now = now_ms();
     DomainRecord {
@@ -104,14 +114,14 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
         expires_ms: now + YEAR_MS,
         nameservers: vec!["ns1.openedge-dns.com".into(), "ns2.openedge-dns.com".into()],
         verify: None,
-        ssl: SslCert {
-            id: format!("cert_{}", &Uuid::new_v4().simple().to_string()[..20]),
-            cns: vec![format!("*.{domain}"), domain.to_string()],
-            renewal: "auto".into(),
-            issued_ms: now,
-            expires_ms: now + CERT_TTL_MS,
-            provider: "OpenEdge (Let's Encrypt)".into(),
-        },
+        // HONEST default: no cert exists yet, so the block says so. It used
+        // to fabricate a cert_<uuid> id with a wildcard `*.{domain}` CN and
+        // issued_ms=now at record CREATION — a cert the HTTP-01-only custom
+        // path cannot even issue (apex+www SANs only, AGENTS.md) — so the
+        // dashboard showed "Managed SSL active" for domains with no bundle
+        // on any edge (witnessed: numo.gg). `set_ssl_issued` fills this from
+        // the REAL bundle when `custom_cert_pass` installs one.
+        ssl: pending_ssl(),
         // A free managed cert needs CAA records authorizing the issuer. The
         // apex A/AAAA set is deliberately NOT seeded here: a fake "anycast"
         // address would resolve the domain somewhere that does not serve it.
@@ -246,21 +256,93 @@ impl DomainStore {
         true
     }
 
-    /// Reissue the free managed certificate (90-day Let's Encrypt-style).
-    pub fn renew_ssl(&self, domain: &str) -> Option<SslCert> {
+    /// Record the REAL installed bundle on the domain's ssl block — the only
+    /// writer allowed to claim an issued cert. Called from acme's
+    /// custom-domain issuance/adoption with the bundle's actual SANs and
+    /// notAfter; everything else (creation default, the renew button) leaves
+    /// the block pending. Fabricating this state was a false-health claim
+    /// the dashboard rendered as "Managed SSL active" (witnessed: numo.gg
+    /// showed a wildcard CN no HTTP-01 order can produce).
+    pub fn set_ssl_issued(
+        &self,
+        domain: &str,
+        bundle_id: &str,
+        sans: Vec<String>,
+        issued_ms: u64,
+        expires_ms: u64,
+    ) -> bool {
         let mut m = self.map.write();
-        let d = m.get_mut(domain)?;
-        let now = now_ms();
-        d.ssl.issued_ms = now;
-        d.ssl.expires_ms = now + CERT_TTL_MS;
-        d.ssl.id = format!("cert_{}", &Uuid::new_v4().simple().to_string()[..20]);
-        Some(d.ssl.clone())
+        let Some(d) = m.get_mut(domain) else {
+            return false;
+        };
+        let apex = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let www = format!("www.{apex}");
+        let attached = d
+            .verify
+            .as_ref()
+            .is_some_and(|verify| verify.status == "verified");
+        if !attached
+            || !bundle_id.starts_with("dom-")
+            || issued_ms == 0
+            || expires_ms <= issued_ms
+            || !sans.iter().any(|n| n == &apex)
+            || sans.iter().any(|n| n != &apex && n != &www)
+        {
+            return false;
+        }
+        if d.ssl.id == bundle_id
+            && d.ssl.cns == sans
+            && d.ssl.renewal == "auto"
+            && d.ssl.issued_ms == issued_ms
+            && d.ssl.expires_ms == expires_ms
+        {
+            return false;
+        }
+        d.ssl.id = bundle_id.to_string();
+        d.ssl.cns = sans;
+        d.ssl.renewal = "auto".into();
+        d.ssl.issued_ms = issued_ms;
+        d.ssl.expires_ms = expires_ms;
+        true
+    }
+
+    /// The UI's "reissue certificate" button. This must never fabricate an
+    /// issued state (its previous behavior: fresh cert_<uuid> id +
+    /// issued_ms=now with no bundle anywhere); the real issuance is
+    /// `acme::custom_cert_pass`, which the HTTP arm kicks after calling
+    /// this. Returns the CURRENT block, honestly.
+    pub fn renew_ssl(&self, domain: &str) -> Option<SslCert> {
+        self.get(domain).map(|d| d.ssl)
     }
 
     pub fn snapshot(&self) -> Vec<DomainRecord> {
         self.map.read().values().cloned().collect()
     }
-    pub fn load(&self, list: Vec<DomainRecord>) {
+    pub fn load(&self, mut list: Vec<DomainRecord>) {
+        // Pre-fix records fabricated `cert_*` ids, wildcard CNs and issue
+        // timestamps at domain creation. They cannot describe this platform's
+        // HTTP-01 custom bundles (`dom-*`, apex plus optional www), so migrate
+        // those claims to the honest pending shape on adoption. A valid block
+        // remains durable after restart: it records a bundle that was actually
+        // installed by `custom_cert_pass`, not this node's current SNI cache.
+        for d in &mut list {
+            let domain = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            let www = format!("www.{domain}");
+            let attached = d
+                .verify
+                .as_ref()
+                .is_some_and(|verify| verify.status == "verified");
+            let valid = attached
+                && d.ssl.id.starts_with("dom-")
+                && d.ssl.renewal == "auto"
+                && d.ssl.issued_ms > 0
+                && d.ssl.expires_ms > d.ssl.issued_ms
+                && d.ssl.cns.iter().any(|n| n == &domain)
+                && d.ssl.cns.iter().all(|n| n == &domain || n == &www);
+            if !valid {
+                d.ssl = pending_ssl();
+            }
+        }
         *self.map.write() = list.into_iter().map(|d| (d.domain.clone(), d)).collect();
     }
 
@@ -399,28 +481,37 @@ impl DomainStore {
             .collect()
     }
 
-    /// Clear verification state (detach) — a later re-attach proves again
-    /// with a fresh challenge.
+    /// Clear verification and issued-certificate metadata (detach) — a later
+    /// re-attach proves again and obtains a fresh bundle. Keeping a `dom-*`
+    /// claim after cert-sync prunes the detached bundle would make the API say
+    /// issued while no edge serves that certificate.
     pub fn clear_verify(&self, domain: &str) {
         let mut m = self.map.write();
         if let Some(d) = m.get_mut(domain) {
             d.verify = None;
+            d.ssl = pending_ssl();
         }
     }
 
-    /// Clear verification for every domain gated on `project` (project
-    /// deletion). A tombstoned project must not keep domains "verified":
-    /// `custom_domain_bundles` reads the status alone and would renew TLS
-    /// for a dead project forever, and a recreated same-name project would
-    /// inherit routing it never proved. The records stay — the tenant may
-    /// still manage the zone. Returns the affected domains (for the event
-    /// log).
-    pub fn clear_verify_for_project(&self, project: &str) -> Vec<String> {
+    /// Clear verification for every domain gated on `project` unless another
+    /// live project attachment still lists that domain. A tombstoned project
+    /// must not keep domains or TLS metadata alive, while a shared attachment
+    /// must not lose the bundle it still serves. The billing-style
+    /// both-halves-or-neither rule applies here too: verification and SSL are
+    /// reset under the same DomainStore write lock. Returns affected domains.
+    pub fn clear_verify_for_project(
+        &self,
+        project: &str,
+        preserved_domains: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
         let mut m = self.map.write();
         let mut out = Vec::new();
         for d in m.values_mut() {
-            if d.verify.as_ref().is_some_and(|v| v.project == project) {
+            if d.verify.as_ref().is_some_and(|v| v.project == project)
+                && !preserved_domains.contains(&d.domain)
+            {
                 d.verify = None;
+                d.ssl = pending_ssl();
                 out.push(d.domain.clone());
             }
         }
@@ -464,16 +555,35 @@ impl DomainStore {
             have == want
         };
         let attached = !(v4.is_empty() && v6.is_empty());
-        let www_now = d
+        let mut www_have: Vec<&str> = d
             .records
             .iter()
-            .any(|r| r.system && r.name.eq_ignore_ascii_case("www") && r.kind == "CNAME");
-        if same("A", &v4) && same("AAAA", &v6) && www_now == attached {
+            .filter(|r| r.system && r.name.eq_ignore_ascii_case("www") && r.kind == "CNAME")
+            .map(|r| r.value.as_str())
+            .collect();
+        www_have.sort_unstable();
+        let www_want = if attached {
+            vec![d.domain.as_str()]
+        } else {
+            Vec::new()
+        };
+        // A system CNAME with an EMPTY name is the legacy buggy shape: the
+        // www alias used to be pushed with `name: String::new()`, which this
+        // damping check and the retain below both missed — so every watcher
+        // cadence appended one more identical record (witnessed live:
+        // numo.gg reached 581 records, www.numo.gg 694). Their presence
+        // forces a rewrite pass so bloated zones converge back to one
+        // correct record set.
+        let legacy_apex_cname = d
+            .records
+            .iter()
+            .any(|r| r.system && r.name.is_empty() && r.kind == "CNAME");
+        if same("A", &v4) && same("AAAA", &v6) && www_have == www_want && !legacy_apex_cname {
             return false;
         }
         d.records.retain(|r| {
             !(r.system
-                && ((r.name.is_empty() && matches!(r.kind.as_str(), "A" | "AAAA"))
+                && ((r.name.is_empty() && matches!(r.kind.as_str(), "A" | "AAAA" | "CNAME"))
                     || (r.name.eq_ignore_ascii_case("www") && r.kind == "CNAME")))
         });
         let now = now_ms();
@@ -495,7 +605,7 @@ impl DomainStore {
         if attached {
             d.records.push(DnsRecord {
                 id: rec_id(),
-                name: String::new(),
+                name: "www".into(),
                 kind: "CNAME".into(),
                 value: d.domain.clone(),
                 ttl: 60,
@@ -646,9 +756,42 @@ mod tests {
         );
         assert!(s.set_auto_renew("acme.com", false));
         assert!(!s.get("acme.com").unwrap().auto_renew);
-        let before = s.get("acme.com").unwrap().ssl.id;
+        // The ssl block starts honest-pending (no fabricated cert) and only
+        // set_ssl_issued — driven by a REAL installed bundle — may claim
+        // issued state; renew_ssl reads, never fabricates.
+        let before = s.get("acme.com").unwrap().ssl;
+        assert!(before.id.is_empty(), "no cert exists before issuance");
+        assert!(before.cns.is_empty(), "no fabricated SANs");
+        assert_eq!(before.issued_ms, 0);
         let cert = s.renew_ssl("acme.com").unwrap();
-        assert_ne!(cert.id, before, "renew reissues a new cert id");
+        assert_eq!(
+            cert.id, before.id,
+            "renew reads current state, never fabricates"
+        );
+        // The issued-state writer is gated on a VERIFIED attach — prove the
+        // domain first, exactly as the real activation path does.
+        s.ensure_verify("acme.com", "t", "proj").unwrap();
+        s.mark_verified_as("acme.com", Some("t"));
+        assert!(s.set_ssl_issued(
+            "acme.com",
+            "dom-abc123",
+            vec!["acme.com".into(), "www.acme.com".into()],
+            5,
+            105
+        ));
+        let after = s.renew_ssl("acme.com").unwrap();
+        assert_eq!(after.id, "dom-abc123");
+        assert_eq!(after.cns, vec!["acme.com", "www.acme.com"]);
+        assert!(
+            !s.set_ssl_issued(
+                "acme.com",
+                "dom-abc123",
+                vec!["acme.com".into(), "www.acme.com".into()],
+                5,
+                105
+            ),
+            "unchanged bundle is a no-op (damping)"
+        );
     }
 
     #[test]

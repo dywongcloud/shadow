@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+[Unit]
+# nftables reloads replace the live ruleset without stopping the unit. Propagate
+# that operation so the role policy reloads first and then restores Netavark's
+# generated table through the firewall service's ordered ExecReload sequence.
+PropagatesReloadTo={{ build_executor_firewall_unit }}

@@ -59,7 +59,17 @@ impl IrohClient {
         let backend = Arc::new(crate::p2p::network::core::IrohBackend::new(&config).await?);
 
         // Get the NodeId from the backend (it loads or generates the persistent key).
-        let node_info = backend.id().await?;
+        let node_info = match backend.id().await {
+            Ok(node_info) => node_info,
+            Err(error) => {
+                return match backend.shutdown().await {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(GuardianError::Other(format!(
+                        "Guardian client initialization failed: {error}; backend cleanup also failed: {cleanup_error}"
+                    ))),
+                };
+            }
+        };
         let node_id = node_info.id;
 
         // Get the secret_key from the backend to keep consistency.
@@ -228,6 +238,22 @@ impl IrohClient {
     /// # Ok(())
     /// # }
     /// ```
+    /// Hold a Drop-released temporary GC root for a hash, including before its
+    /// bytes are imported into the store.
+    pub async fn protect_hash(
+        &self,
+        hash: iroh_blobs::Hash,
+    ) -> Result<crate::p2p::network::core::BlobProtection> {
+        self.backend.protect_hash(hash).await
+    }
+
+    pub async fn protect_hashes(
+        &self,
+        hashes: impl IntoIterator<Item = iroh_blobs::Hash>,
+    ) -> Result<crate::p2p::network::core::BlobProtection> {
+        self.backend.protect_hashes(hashes).await
+    }
+
     /// Metadata-only local-presence check for a blob (no bytes read, no network).
     /// Used by `entry_heads` to attach a content-availability bit to each entry.
     pub async fn has_blob_local(&self, hash: &str) -> bool {
@@ -235,10 +261,11 @@ impl IrohClient {
     }
 
     pub async fn cat_bytes(&self, hash: &str) -> Result<Vec<u8>> {
-        let mut reader = self.backend.cat(hash).await?;
-        let mut data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await?;
-        Ok(data)
+        let reader = self.backend.cat(hash).await?;
+        let data =
+            crate::p2p::network::core::read_to_end_bounded(reader, "IrohClient::cat_bytes result")
+                .await?;
+        Ok(data.to_vec())
     }
 
     /// Helper: Generates a unique ID for a peer-to-peer communication channel.
@@ -394,14 +421,20 @@ impl IrohClient {
         let endpoint = endpoint_lock.as_ref().cloned();
         drop(endpoint_lock);
 
-        // Create the client with the shared store + P2P download.
-        let client = if let Some(ep) = endpoint {
+        // Create the client with the collector's shared exclusion gate. Every
+        // import/download/read therefore participates in the same mark/sweep
+        // boundary as backend operations.
+        if endpoint.is_some() {
             info!("iroh-blobs client initialized with shared store + P2P download");
-            crate::p2p::network::core::blobs::BlobStore::new_with_endpoint(store, ep)
         } else {
             info!("iroh-blobs client initialized with shared store (no P2P)");
-            crate::p2p::network::core::blobs::BlobStore::new(store)
-        };
+        }
+        let client = crate::p2p::network::core::blobs::BlobStore::new_guarded(
+            store,
+            endpoint,
+            self.backend.gc_gate(),
+            self.backend.accepting_work(),
+        );
 
         let mut blobs_guard = self.blobs_client.write().await;
         *blobs_guard = Some(client);
@@ -487,9 +520,16 @@ impl IrohClient {
         .await
     }
 
-    /// Shuts down the client.
+    /// Shuts down the client and awaits every backend durability barrier.
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down Guardian DB client");
+        // Backend shutdown closes the shared admission flag synchronously before
+        // its first await. Clear cached facade handles afterwards so concurrent
+        // lookups can never race a still-open admission window.
+        let result = self.backend.shutdown().await;
+        self.docs_client.write().await.take();
+        self.blobs_client.write().await.take();
+        result?;
         info!("Guardian DB client shut down successfully");
         Ok(())
     }

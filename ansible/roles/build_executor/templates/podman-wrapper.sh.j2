@@ -1,0 +1,23 @@
+#!/usr/bin/bash
+# {{ ansible_managed }}
+set -euo pipefail
+
+for argument in "$@"; do
+    case "$argument" in
+        --runtime|--runtime=*|--runtime-flag|--runtime-flag=*|--hooks-dir|--hooks-dir=*|--module|--module=*|--root|--root=*|--runroot|--runroot=*|--imagestore|--imagestore=*|--storage-driver|--storage-driver=*|--storage-opt|--storage-opt=*|--transient-store|--transient-store=*|--db-backend|--db-backend=*|--conmon|--conmon=*|--network-cmd-path|--network-cmd-path=*|--helper-binary-dir|--helper-binary-dir=*|--tmpdir|--tmpdir=*|--volumepath|--volumepath=*|--namespace|--namespace=*|--remote|--url|--url=*|--connection|--connection=*|--identity|--identity=*|-r|-c)
+            printf 'BuildExecutor Podman wrapper rejects runtime/config override: %s\n' "$argument" >&2
+            exit 64
+            ;;
+    esac
+done
+
+exec /usr/bin/env -i \
+    HOME=/root \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    CONTAINERS_CONF={{ build_executor_containers_conf_path | quote }} \
+    CONTAINERS_CONF_OVERRIDE={{ build_executor_containers_conf_override_path | quote }} \
+    /usr/bin/podman \
+    --runtime={{ build_executor_runsc_path | quote }} \
+{% for flag in build_executor_runsc_runtime_flags %}    --runtime-flag={{ flag | quote }} \
+{% endfor %}    --hooks-dir={{ build_executor_oci_hooks_dir | quote }} \
+    "$@"

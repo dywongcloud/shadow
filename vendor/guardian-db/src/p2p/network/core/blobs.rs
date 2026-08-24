@@ -5,13 +5,17 @@
 ///
 /// This client uses the IrohBackend's shared store, ensuring consistency
 /// and avoiding storage duplication.
+use super::{BlobProtection, preflight_blob_size, read_blob_bounded};
 use crate::guardian::error::{GuardianError, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::EndpointId as NodeId;
 use iroh::endpoint::Endpoint;
 use iroh_blobs::{Hash as BlobHash, HashAndFormat, store::fs::FsStore};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -36,6 +40,10 @@ pub struct BlobStore {
     store: Arc<RwLock<FsStore>>,
     /// Iroh Endpoint for P2P blob download (optional).
     endpoint: Option<Endpoint>,
+    /// Shared with IrohBackend's collector when this client came from IrohClient.
+    gc_gate: Option<Arc<RwLock<()>>>,
+    /// Shared backend admission state. Standalone stores own their own lifecycle.
+    accepting_work: Option<Arc<AtomicBool>>,
 }
 
 impl BlobStore {
@@ -62,6 +70,8 @@ impl BlobStore {
         Self {
             store,
             endpoint: None,
+            gc_gate: None,
+            accepting_work: None,
         }
     }
 
@@ -75,7 +85,44 @@ impl BlobStore {
         Self {
             store,
             endpoint: Some(endpoint),
+            gc_gate: None,
+            accepting_work: None,
         }
+    }
+
+    pub(crate) fn new_guarded(
+        store: Arc<RwLock<FsStore>>,
+        endpoint: Option<Endpoint>,
+        gc_gate: Arc<RwLock<()>>,
+        accepting_work: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            store,
+            endpoint,
+            gc_gate: Some(gc_gate),
+            accepting_work: Some(accepting_work),
+        }
+    }
+
+    fn ensure_accepting_work(&self) -> Result<()> {
+        if self
+            .accepting_work
+            .as_ref()
+            .is_some_and(|accepting| !accepting.load(Ordering::Acquire))
+        {
+            return Err(GuardianError::Other(
+                "Iroh backend is shutting down and no longer accepts blob work".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn gc_read_guard(&self) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
+        self.ensure_accepting_work()?;
+        Ok(match &self.gc_gate {
+            Some(gate) => Some(gate.clone().read_owned().await),
+            None => None,
+        })
     }
 
     /// Adds a document (bytes) to the blob store.
@@ -83,16 +130,30 @@ impl BlobStore {
     /// Returns the BLAKE3 Hash of the stored content.
     #[instrument(level = "debug", skip(self, data))]
     pub async fn add_document(&self, data: Bytes) -> Result<BlobHash> {
+        preflight_blob_size(data.len() as u64, "document blob being added").map_err(|error| {
+            GuardianError::Other(format!(
+                "Document blob exceeds the in-memory limit: {error}"
+            ))
+        })?;
+        let _gc_guard = self.gc_read_guard().await?;
         let store = self.store.read().await;
 
-        // Add bytes to the store using the new API.
-        let outcome = store.blobs().add_bytes(data.clone()).await.map_err(|e| {
-            GuardianError::Other(format!("Error adding bytes to the blob store: {}", e))
-        })?;
+        // Keep the import temporarily protected while replacing that guard with
+        // Guardian's one deliberate persistent tag. Awaiting AddProgress directly
+        // calls `with_tag()` and creates an extra anonymous persistent tag; that
+        // tag survives `delete_document` and makes the blob uncollectable forever.
+        let import_guard = store
+            .blobs()
+            .add_bytes(data.clone())
+            .temp_tag()
+            .await
+            .map_err(|e| {
+                GuardianError::Other(format!("Error adding bytes to the blob store: {}", e))
+            })?;
 
-        let hash = outcome.hash;
+        let hash = import_guard.hash();
 
-        // Create a permanent tag to protect against GC.
+        // Create the sole permanent tag to protect against GC.
         // Format: doc_<hash_hex>
         let tag_name = format!("doc_{}", hex::encode(hash.as_bytes()));
 
@@ -101,6 +162,7 @@ impl BlobStore {
             .set(tag_name.as_bytes(), HashAndFormat::raw(hash))
             .await
             .map_err(|e| GuardianError::Other(format!("Error creating permanent tag: {}", e)))?;
+        drop(import_guard);
 
         debug!(
             "Document added to the blob store: {} ({} bytes)",
@@ -114,14 +176,12 @@ impl BlobStore {
     /// Retrieves a document from the blob store by its hash.
     #[instrument(level = "debug", skip(self))]
     pub async fn get_document(&self, hash: &BlobHash) -> Result<Bytes> {
+        let _gc_guard = self.gc_read_guard().await?;
         let store = self.store.read().await;
 
-        // Use the new API: blobs().get_bytes() - requires an owned Hash.
-        let data = store
-            .blobs()
-            .get_bytes(*hash)
+        let data = read_blob_bounded(&store, *hash, "document blob")
             .await
-            .map_err(|e| GuardianError::Other(format!("Error fetching blob: {}", e)))?;
+            .map_err(|e| GuardianError::Other(format!("Error fetching blob: {e}")))?;
 
         debug!(
             "Document retrieved from the blob store: {} ({} bytes)",
@@ -138,10 +198,20 @@ impl BlobStore {
     /// it tries to download from the remote peer using the iroh-blobs protocol.
     #[instrument(level = "debug", skip(self))]
     pub async fn get_or_download(&self, hash: &BlobHash, providers: &[NodeId]) -> Result<Bytes> {
-        // Try to fetch locally first.
+        use iroh_blobs::api::proto::BlobStatus;
+
+        let gc_guard = self.gc_read_guard().await?;
         let store = self.store.read().await;
-        match store.blobs().get_bytes(*hash).await {
-            Ok(data) => {
+        match store
+            .blobs()
+            .status(*hash)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error checking local blob: {e}")))?
+        {
+            BlobStatus::Complete { .. } => {
+                let data = read_blob_bounded(&store, *hash, "local document blob")
+                    .await
+                    .map_err(|e| GuardianError::Other(format!("Error fetching local blob: {e}")))?;
                 debug!(
                     "Document found locally: {} ({} bytes)",
                     hex::encode(hash.as_bytes()),
@@ -149,44 +219,86 @@ impl BlobStore {
                 );
                 return Ok(data);
             }
-            Err(_) => {
+            BlobStatus::Partial { .. } | BlobStatus::NotFound => {
                 debug!(
-                    "Document not found locally: {}, attempting P2P download",
+                    "Document incomplete or absent locally: {}, attempting P2P download",
                     hex::encode(hash.as_bytes())
                 );
             }
         }
         drop(store);
 
-        // Try a P2P download.
-        self.download_from_peers(hash, providers).await?;
+        // Move the already-acquired fair GC read guard into one owned protection
+        // scope. Acquiring it a second time here could deadlock behind a queued GC
+        // writer; this preserves the existing mutation-gate ordering.
+        let protection = self.protect_download_with_guard(*hash, gc_guard).await?;
+        self.download_from_peers_inner(hash, providers).await?;
 
-        // Now fetch from the local store (it should be there after the download).
+        // The temporary root spans post-download materialisation and the durable
+        // document tag commit. A failed read/tag write or request cancellation drops
+        // it; success never exposes an unrooted acquisition window.
         let store = self.store.read().await;
-        let data = store.blobs().get_bytes(*hash).await.map_err(|e| {
-            GuardianError::Other(format!("Blob not found after P2P download: {}", e))
-        })?;
-
-        // Create a permanent tag to protect against GC.
+        let data = read_blob_bounded(&store, *hash, "document blob fetched from peers")
+            .await
+            .map_err(|e| {
+                GuardianError::Other(format!("Blob unavailable after P2P download: {e}"))
+            })?;
         let tag_name = format!("doc_{}", hex::encode(hash.as_bytes()));
         store
             .tags()
             .set(tag_name.as_bytes(), HashAndFormat::raw(*hash))
             .await
-            .ok();
+            .map_err(|e| GuardianError::Other(format!("Error creating permanent tag: {e}")))?;
+        drop(store);
+        drop(protection);
 
         debug!(
             "Document downloaded via P2P: {} ({} bytes)",
             hex::encode(hash.as_bytes()),
             data.len()
         );
-
         Ok(data)
     }
 
     /// Downloads a blob from remote peers using the iroh-blobs Downloader.
+    ///
+    /// The returned owned protection is mandatory: callers must retain it until
+    /// their persistent pin or document entry commits. Dropping it on failure or
+    /// cancellation releases the temporary root automatically.
     #[instrument(level = "debug", skip(self))]
-    pub async fn download_from_peers(&self, hash: &BlobHash, providers: &[NodeId]) -> Result<()> {
+    pub async fn download_from_peers(
+        &self,
+        hash: &BlobHash,
+        providers: &[NodeId],
+    ) -> Result<BlobProtection> {
+        let protection = self.protect_download(*hash).await?;
+        self.download_from_peers_inner(hash, providers).await?;
+        Ok(protection)
+    }
+
+    async fn protect_download(&self, hash: BlobHash) -> Result<BlobProtection> {
+        let gc_guard = self.gc_read_guard().await?;
+        self.protect_download_with_guard(hash, gc_guard).await
+    }
+
+    async fn protect_download_with_guard(
+        &self,
+        hash: BlobHash,
+        gc_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<BlobProtection> {
+        let store = self.store.read().await;
+        let batch =
+            store.blobs().batch().await.map_err(|e| {
+                GuardianError::Other(format!("Error creating P2P download batch: {e}"))
+            })?;
+        let tag = batch
+            .temp_tag(hash)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error protecting P2P download: {e}")))?;
+        BlobProtection::new(gc_guard, vec![tag], batch)
+    }
+
+    async fn download_from_peers_inner(&self, hash: &BlobHash, providers: &[NodeId]) -> Result<()> {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             GuardianError::Other("Endpoint not available for P2P blob download".to_string())
         })?;
@@ -197,9 +309,10 @@ impl BlobStore {
             ));
         }
 
-        let store = self.store.read().await;
-        let downloader = store.downloader(endpoint);
-
+        let downloader = {
+            let store = self.store.read().await;
+            store.downloader(endpoint)
+        };
         let providers_vec: Vec<NodeId> = providers.to_vec();
         info!(
             "Starting P2P download of blob {} from {} provider(s)",
@@ -211,15 +324,12 @@ impl BlobStore {
         let mut stream = progress
             .stream()
             .await
-            .map_err(|e| GuardianError::Other(format!("Error starting P2P download: {}", e)))?;
+            .map_err(|e| GuardianError::Other(format!("Error starting P2P download: {e}")))?;
 
         while let Some(item) = stream.next().await {
             match &item {
                 iroh_blobs::api::downloader::DownloadProgressItem::Error(e) => {
-                    return Err(GuardianError::Other(format!(
-                        "Error in P2P download: {}",
-                        e
-                    )));
+                    return Err(GuardianError::Other(format!("Error in P2P download: {e}")));
                 }
                 iroh_blobs::api::downloader::DownloadProgressItem::DownloadError => {
                     return Err(GuardianError::Other("P2P download failed".to_string()));
@@ -241,6 +351,7 @@ impl BlobStore {
     /// Checks whether a document exists in the blob store.
     #[instrument(level = "debug", skip(self))]
     pub async fn has_document(&self, hash: &BlobHash) -> Result<bool> {
+        self.ensure_accepting_work()?;
         let store = self.store.read().await;
 
         // Use the new API: blobs().has() - requires an owned Hash.
@@ -254,6 +365,7 @@ impl BlobStore {
     /// Removes the protection tag and optionally deletes the physical blob.
     #[instrument(level = "debug", skip(self))]
     pub async fn delete_document(&self, hash: &BlobHash) -> Result<()> {
+        let _gc_guard = self.gc_read_guard().await?;
         let store = self.store.read().await;
 
         // Remove the protection tag.
@@ -268,8 +380,9 @@ impl BlobStore {
                 GuardianError::Other(format!("Error deleting tag: {}", e))
             })?;
 
-        // Note: The physical blob will be removed by GC when there are no more
-        // references. This avoids accidental deletion of shared blobs.
+        // With periodic GC enabled (GUARDIAN_GC_SECS > 0), the physical blob
+        // becomes collectible once no document head, temporary guard, or other
+        // persistent tag references it. Shared content is never deleted eagerly.
 
         debug!("Document tag removed: {}", hex::encode(hash.as_bytes()));
 
@@ -300,6 +413,7 @@ impl BlobStore {
         use futures::stream::StreamExt;
         use iroh_blobs::api::proto::BlobStatus;
 
+        self.ensure_accepting_work()?;
         let store = self.store.read().await;
         let mut documents = Vec::new();
 
@@ -341,13 +455,18 @@ impl BlobStore {
         Ok(documents)
     }
 
-    /// Performs manual garbage collection.
+    /// Reports the number of hashes currently protected by persistent tags.
     ///
-    /// Removes blobs not referenced by any tag.
+    /// This does not trigger collection. `IrohBackend::initialize_node` wires
+    /// FsStore's periodic collector and the iroh-docs protect handler together;
+    /// `GUARDIAN_GC_SECS=0` disables both halves. Current document heads are
+    /// protected by that callback, while this count includes standalone/sentinel
+    /// `doc_*` tags and every other persistent tag.
     #[instrument(level = "debug", skip(self))]
     pub async fn gc(&self) -> Result<u64> {
         use futures::stream::StreamExt;
 
+        self.ensure_accepting_work()?;
         let store = self.store.read().await;
 
         // Collect all hashes protected by tags.
@@ -364,28 +483,13 @@ impl BlobStore {
             }
         }
 
-        // NO GARBAGE COLLECTOR IS RUNNING. This used to claim "GC is managed
-        // automatically by FsStore … GC runs periodically in the background",
-        // which is false and was actively misleading: in iroh-blobs 0.103 GC is
-        // OPT-IN (`Options::new` sets `gc: None`), and this crate constructs its
-        // store with a plain `FsStore::load`, which takes exactly those defaults.
-        // So nothing ever reclaims an unreferenced blob — the store grows
-        // monotonically — and every `doc_*`/`pin-*` tag counted above is
-        // protecting against a collector that does not exist. `delete_document`'s
-        // promise that "the physical blob will be removed by GC" never happens.
-        //
-        // Returning the protected count instead of a bare 0 keeps this honest and
-        // useful: it reports what WOULD be protected, so an operator can see the
-        // tag set is sane before anyone enables collection.
-        //
-        // BEFORE TURNING GC ON, read this: `Docs::persistent(..).spawn(..)` is
-        // called WITHOUT `.protect_handler(..)`, so iroh-docs' `protect_cb` is
-        // `None` and its content-protection task no-ops. Enabling GC without also
-        // wiring that handler would delete live document content. The two must
-        // land together, never separately.
+        // Collection itself is periodic and owned by FsStore. This diagnostic
+        // intentionally performs no sweep; it reports only the persistent-tag
+        // side of the protection set (iroh-docs heads and temporary in-flight
+        // guards are supplied independently to each GC pass).
         let protected = protected_hashes.len() as u64;
         debug!(
-            "GC: {} hashes protected by tags; no collector configured (iroh-blobs gc is opt-in and off)",
+            "GC status: {} hashes protected by persistent tags",
             protected
         );
         Ok(protected)

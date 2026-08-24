@@ -12,17 +12,20 @@ use iroh::SecretKey;
 use iroh::endpoint::Endpoint;
 use iroh::protocol::Router;
 use iroh::{EndpointAddr as NodeAddr, EndpointId as NodeId};
-use iroh_blobs::api::Tag;
+use iroh_blobs::api::{Tag, TempTag};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash as IrohHash, HashAndFormat};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -43,7 +46,7 @@ pub mod ticket_exchange;
 /// Failing one read loudly is strictly better than losing the process.
 const DEFAULT_MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 
-fn max_blob_bytes() -> u64 {
+pub(crate) fn max_blob_bytes() -> u64 {
     std::env::var("HIVE_MAX_BLOB_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -51,29 +54,453 @@ fn max_blob_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_BLOB_BYTES)
 }
 
-/// `read_to_end` with a hard ceiling.
-///
-/// Reads at most `max_blob_bytes() + 1` so the overflow is DETECTED rather than
-/// inferred, then refuses. Without the `take`, `read_to_end` grows a `Vec` for
-/// as long as the source keeps yielding — the source is a store reader or a
-/// peer, i.e. not something this process controls.
-async fn read_to_end_bounded<R: AsyncRead + Unpin>(
-    reader: R,
-    what: &str,
-) -> std::io::Result<Vec<u8>> {
+fn blob_too_large(what: &str, limit: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{what} exceeds HIVE_MAX_BLOB_BYTES ({limit} bytes) — refusing to materialise it in memory"
+        ),
+    )
+}
+
+pub(crate) fn preflight_blob_size(size: u64, what: &str) -> std::io::Result<()> {
     let limit = max_blob_bytes();
-    let mut buf = Vec::new();
-    reader.take(limit.saturating_add(1)).read_to_end(&mut buf).await?;
-    if buf.len() as u64 > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{what} exceeds HIVE_MAX_BLOB_BYTES ({limit} bytes) — refusing to \
-                 materialise it in memory"
-            ),
-        ));
+    if size > limit {
+        return Err(blob_too_large(what, limit));
     }
-    Ok(buf)
+    Ok(())
+}
+
+/// Materialise an async reader under a hard allocation ceiling.
+///
+/// The one-byte overflow probe lives in a fixed stack chunk. The destination
+/// grows only by the bytes already read, using `try_reserve_exact`; unlike
+/// `read_to_end` it never asks `RawVec` for geometric spare capacity or for the
+/// `limit + 1` probe byte. Converting through a boxed slice drops any allocator
+/// spare before the capacity-bounded `Bytes` leaves this function.
+pub(crate) async fn read_to_end_bounded<R: AsyncRead + Unpin>(
+    mut reader: R,
+    what: &str,
+) -> std::io::Result<Bytes> {
+    const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+    let limit = max_blob_bytes();
+    let allocation_limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut data = Vec::new();
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+
+    loop {
+        let remaining = allocation_limit.saturating_sub(data.len());
+        let probe_len = remaining.saturating_add(1).min(chunk.len());
+        let read = reader.read(&mut chunk[..probe_len]).await?;
+        if read == 0 {
+            return Ok(Bytes::from(data.into_boxed_slice()));
+        }
+        if read > remaining {
+            return Err(blob_too_large(what, limit));
+        }
+
+        data.try_reserve_exact(read).map_err(|error| {
+            std::io::Error::other(format!(
+                "unable to reserve {read} bytes while reading {what} under HIVE_MAX_BLOB_BYTES ({limit} bytes): {error}"
+            ))
+        })?;
+        if data.capacity() > allocation_limit {
+            return Err(blob_too_large(what, limit));
+        }
+        data.extend_from_slice(&chunk[..read]);
+    }
+}
+
+pub(crate) async fn read_blob_bounded(
+    store: &FsStore,
+    hash: IrohHash,
+    what: &str,
+) -> std::io::Result<Bytes> {
+    use iroh_blobs::api::proto::BlobStatus;
+
+    match store
+        .blobs()
+        .status(hash)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    {
+        BlobStatus::Complete { size } => preflight_blob_size(size, what)?,
+        BlobStatus::Partial { size: Some(size) } => preflight_blob_size(size, what)?,
+        BlobStatus::Partial { size: None } => {}
+        BlobStatus::NotFound => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{what} is not present in the local blob store"),
+            ));
+        }
+    }
+
+    read_to_end_bounded(store.reader(hash), what).await
+}
+
+const SNAPSHOT_PART_FIELDS: [&str; 5] = [
+    "deployments",
+    "database_data",
+    "metrics_rollup",
+    "builds",
+    "sandboxes",
+];
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_legacy_auto_tag(name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"auto-";
+    const TIMESTAMP_BYTES: usize = 24;
+
+    let Some(rest) = name.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if rest.len() < TIMESTAMP_BYTES {
+        return false;
+    }
+    let (timestamp, suffix) = rest.split_at(TIMESTAMP_BYTES);
+    let Ok(timestamp) = std::str::from_utf8(timestamp) else {
+        return false;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return false;
+    };
+    if parsed.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() != timestamp {
+        return false;
+    }
+    suffix.is_empty()
+        || suffix.strip_prefix(b"-").is_some_and(|digits| {
+            digits
+                .first()
+                .is_some_and(|digit| matches!(digit, b'1'..=b'9'))
+                && digits.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(digits)
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some()
+        })
+}
+
+#[cfg(debug_assertions)]
+static PIN_RM_DIAGNOSTIC_ERROR_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn is_guardian_durable_tag(name: &[u8]) -> bool {
+    [b"doc_".as_slice(), b"pin-".as_slice()]
+        .into_iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+        })
+}
+
+fn is_snapshot_base_key(key: &[u8]) -> bool {
+    let Ok(key) = std::str::from_utf8(key) else {
+        return false;
+    };
+    key.strip_prefix("node/")
+        .and_then(|rest| rest.strip_suffix("/snapshot"))
+        .is_some_and(|node| !node.is_empty() && !node.contains('/'))
+}
+
+fn is_snapshot_part_key_for_kind(key: &[u8], expected_kind: &str) -> bool {
+    let Ok(key) = std::str::from_utf8(key) else {
+        return false;
+    };
+    let mut segments = key.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("node"), Some(node), Some(kind), Some(field), Some(digest), None)
+            if !node.is_empty()
+                && kind == expected_kind
+                && SNAPSHOT_PART_FIELDS.contains(&field)
+                && is_lower_hex_digest(digest) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The v2 classifier is deliberately exact. Active v3 manifests use their own
+/// grammar below rather than broadening what counts as a v2 snapshot-part key.
+fn is_snapshot_part_key(key: &[u8]) -> bool {
+    is_snapshot_part_key_for_kind(key, "snapshot-part-v2")
+}
+
+fn is_snapshot_v3_part_key(key: &[u8]) -> bool {
+    is_snapshot_part_key_for_kind(key, "parts-v3")
+}
+
+fn snapshot_manifest_references(
+    value: &serde_json::Value,
+    base_key: &str,
+) -> Result<Option<Vec<(String, String, String)>>> {
+    let snapshot = value.as_object().ok_or_else(|| {
+        GuardianError::Other("Current snapshot base is not an object".to_string())
+    })?;
+    let Some(raw_manifest) = snapshot.get("_guardian_parts") else {
+        return Ok(None);
+    };
+    let manifest = raw_manifest.as_object().ok_or_else(|| {
+        GuardianError::Other("Current snapshot part manifest is not an object".to_string())
+    })?;
+    if manifest.len() != SNAPSHOT_PART_FIELDS.len() {
+        return Err(GuardianError::Other(format!(
+            "Current snapshot part manifest has {} fields; expected {}",
+            manifest.len(),
+            SNAPSHOT_PART_FIELDS.len()
+        )));
+    }
+
+    let mut references = Vec::with_capacity(SNAPSHOT_PART_FIELDS.len());
+    for field in SNAPSHOT_PART_FIELDS {
+        let reference = manifest.get(field).ok_or_else(|| {
+            GuardianError::Other(format!("Current snapshot part {field} reference is absent"))
+        })?;
+        let (part_key, digest) = match reference {
+            // First-generation split snapshots used a fixed per-field key and
+            // stored only the expected digest in the base manifest.
+            serde_json::Value::String(digest) => {
+                (format!("{base_key}-part/{field}"), digest.clone())
+            }
+            serde_json::Value::Object(reference) => {
+                if reference.len() != 2
+                    || !reference.contains_key("key")
+                    || !reference.contains_key("sha256")
+                {
+                    return Err(GuardianError::Other(format!(
+                        "Current snapshot part {field} reference has unexpected fields"
+                    )));
+                }
+                let part_key = reference
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        GuardianError::Other(format!("Current snapshot part {field} has no key"))
+                    })?;
+                let digest = reference
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        GuardianError::Other(format!("Current snapshot part {field} has no digest"))
+                    })?;
+                let v2 = format!("{base_key}-part-v2/{field}/{digest}");
+                let v3 = base_key
+                    .strip_suffix("/snapshot")
+                    .map(|prefix| format!("{prefix}/parts-v3/{field}/{digest}"));
+                let addressed_legacy = format!("{base_key}-part/{field}/{digest}");
+                let v2_matches = part_key == v2 && is_snapshot_part_key(part_key.as_bytes());
+                let v3_matches =
+                    v3.as_deref() == Some(part_key) && is_snapshot_v3_part_key(part_key.as_bytes());
+                if !v2_matches && !v3_matches && part_key != addressed_legacy {
+                    return Err(GuardianError::Other(format!(
+                        "Current snapshot part {field} key is outside its manifest namespace"
+                    )));
+                }
+                (part_key.to_string(), digest.to_string())
+            }
+            _ => {
+                return Err(GuardianError::Other(format!(
+                    "Current snapshot part {field} reference is invalid"
+                )));
+            }
+        };
+        if !is_lower_hex_digest(&digest) {
+            return Err(GuardianError::Other(format!(
+                "Current snapshot part {field} digest is invalid"
+            )));
+        }
+        references.push((field.to_string(), part_key, digest));
+    }
+    Ok(Some(references))
+}
+
+async fn current_doc_hashes(store: &FsStore, docs: &Docs) -> Result<HashSet<IrohHash>> {
+    use futures::StreamExt;
+    use iroh_docs::store::Query;
+    use sha2::{Digest, Sha256};
+
+    let mut protected = HashSet::new();
+    let documents = docs
+        .list()
+        .await
+        .map_err(|e| GuardianError::Other(format!("Error listing documents for GC: {e}")))?;
+    futures::pin_mut!(documents);
+    while let Some(document) = documents.next().await {
+        let (namespace, _) = document.map_err(|e| {
+            GuardianError::Other(format!("Error reading document list for GC: {e}"))
+        })?;
+        let Some(doc) = docs
+            .open(namespace)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error opening document for GC: {e}")))?
+        else {
+            return Err(GuardianError::Other(format!(
+                "Document {namespace} disappeared while deriving GC protection"
+            )));
+        };
+        let entries = doc
+            .get_many(Query::single_latest_per_key().build())
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error querying document for GC: {e}")))?;
+        futures::pin_mut!(entries);
+        let mut current = HashMap::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| {
+                GuardianError::Other(format!("Error reading document entry for GC: {e}"))
+            })?;
+            if entry.content_len() != 0 {
+                current.insert(entry.key().to_vec(), entry.content_hash());
+            }
+        }
+
+        // Every current metadata head remains a GC root. Immutable snapshot
+        // payloads become collectible only after the writer tombstones their
+        // exact metadata keys; sweeping bytes first leaves live unreadable heads
+        // that the index synchronizer retries forever.
+        protected.extend(current.values().copied());
+        for (base_key, base_hash) in current.iter().filter(|(key, _)| is_snapshot_base_key(key)) {
+            let base = read_blob_bounded(store, *base_hash, "current snapshot base during GC")
+                .await
+                .map_err(|e| {
+                    GuardianError::Other(format!(
+                        "Current snapshot base is unavailable during GC: {e}"
+                    ))
+                })?;
+            let value: serde_json::Value = serde_json::from_slice(&base).map_err(|e| {
+                GuardianError::Other(format!("Current snapshot base is invalid during GC: {e}"))
+            })?;
+            let base_key = std::str::from_utf8(base_key).map_err(|_| {
+                GuardianError::Other("Current snapshot base key is not UTF-8".to_string())
+            })?;
+            let Some(references) = snapshot_manifest_references(&value, base_key)? else {
+                // Monolithic snapshots have no separately-addressed payloads.
+                continue;
+            };
+            for (field, part_key, digest) in references {
+                let part_hash = current.get(part_key.as_bytes()).ok_or_else(|| {
+                    GuardianError::Other(format!(
+                        "Current snapshot part {field} metadata is absent"
+                    ))
+                })?;
+                let part = read_blob_bounded(
+                    store,
+                    *part_hash,
+                    &format!("current snapshot part {field} during GC"),
+                )
+                .await
+                .map_err(|e| {
+                    GuardianError::Other(format!(
+                        "Current snapshot part {field} is unavailable during GC: {e}"
+                    ))
+                })?;
+                if hex::encode(Sha256::digest(&part)) != digest {
+                    return Err(GuardianError::Other(format!(
+                        "Current snapshot part {field} digest is invalid"
+                    )));
+                }
+                protected.insert(*part_hash);
+            }
+        }
+    }
+    Ok(protected)
+}
+
+async fn prepare_guardian_gc(
+    store: &FsStore,
+    docs: &Docs,
+    legacy_removed_progress: &AtomicU64,
+) -> Result<HashSet<IrohHash>> {
+    use futures::StreamExt;
+
+    // Derive the authoritative protection set first. Any document query error
+    // aborts the whole pass before a tag or blob is mutated.
+    let current = current_doc_hashes(store, docs).await?;
+
+    let mut tags = store
+        .tags()
+        .list()
+        .await
+        .map_err(IrohBackend::map_iroh_error)?;
+    let mut all_tags = Vec::new();
+    while let Some(tag) = tags.next().await {
+        all_tags.push(tag.map_err(IrohBackend::map_iroh_error)?);
+    }
+
+    // Guardian's store is private to this backend and its supported durable tag
+    // names are doc_*/pin-*. Strictly-shaped iroh auto tags are therefore legacy
+    // AddProgress leaks. Reap only a bounded fraction per pass and never one
+    // whose hash is a current document value.
+    let durable_hashes: HashSet<_> = all_tags
+        .iter()
+        .filter(|tag| is_guardian_durable_tag(tag.name.as_ref()))
+        .map(|tag| tag.hash)
+        .collect();
+    let mut legacy: Vec<_> = all_tags
+        .iter()
+        .filter(|tag| {
+            tag.format == BlobFormat::Raw
+                && is_legacy_auto_tag(tag.name.as_ref())
+                && !current.contains(&tag.hash)
+                && !durable_hashes.contains(&tag.hash)
+        })
+        .map(|tag| tag.name.clone())
+        .collect();
+    legacy.sort();
+    let candidate_count = legacy.len();
+    let max_count = std::env::var("GUARDIAN_GC_LEGACY_TAG_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(100_000);
+    // Preserve the half-per-pass cap for every multi-candidate set. The sole
+    // exception is the fully-unreferenced final candidate, which must be removed
+    // or every finite set converges to one immortal root.
+    let fraction_count = if candidate_count == 1 {
+        1
+    } else {
+        candidate_count / 2
+    };
+    let delete_count = max_count.min(fraction_count);
+    legacy.truncate(delete_count);
+    for name in legacy {
+        let removed = store
+            .tags()
+            .delete(name.as_ref())
+            .await
+            .map_err(IrohBackend::map_iroh_error)?;
+        legacy_removed_progress.fetch_add(removed, Ordering::Relaxed);
+    }
+
+    Ok(current)
+}
+
+async fn run_guardian_gc_once(
+    store: &FsStore,
+    docs: &Docs,
+    legacy_removed_progress: &AtomicU64,
+) -> Result<()> {
+    let mut protected = prepare_guardian_gc(store, docs, legacy_removed_progress).await?;
+    iroh_blobs::store::gc_run_once(store.as_ref(), &mut protected)
+        .await
+        .map_err(IrohBackend::map_iroh_error)
 }
 
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay
@@ -112,6 +539,68 @@ pub use blobs::BlobStore;
 pub use docs::WillowDocs;
 pub use gossip::EpidemicPubSub;
 pub use optimized_cache::OptimizedCache;
+
+/// An owned, Drop-released temporary GC scope for raw blobs.
+///
+/// All fields are retained: the batch owns the actor-side scope, while the tags
+/// register hashes inside it. Dropping the scope clears the roots atomically.
+pub struct BlobProtection {
+    gc_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _tags: Vec<TempTag>,
+    _batch: iroh_blobs::api::blobs::Batch,
+}
+
+impl BlobProtection {
+    pub(super) fn new(
+        gc_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        tags: Vec<TempTag>,
+        batch: iroh_blobs::api::blobs::Batch,
+    ) -> Result<Self> {
+        if tags.is_empty() {
+            return Err(GuardianError::Other(
+                "Cannot protect an empty blob set".to_string(),
+            ));
+        }
+        Ok(Self {
+            gc_gate,
+            _tags: tags,
+            _batch: batch,
+        })
+    }
+
+    /// Complete the atomic tag-installation phase while retaining every temporary
+    /// blob root. Subsequent document publications acquire the same gate inside
+    /// the iroh-docs actor, avoiding a recursive fair-RwLock acquisition.
+    pub fn finish_tag_installation(&mut self) {
+        self.gc_gate.take();
+    }
+}
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct SupervisedGcTask {
+    handle: tokio::task::JoinHandle<()>,
+    _abort_on_drop: AbortTaskOnDrop,
+}
+
+impl SupervisedGcTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            _abort_on_drop: AbortTaskOnDrop(handle.abort_handle()),
+            handle,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
 
 /// Information about a pinned object.
 #[derive(Debug, Clone)]
@@ -233,6 +722,13 @@ pub struct IrohBackend {
     pinned_cache: Arc<Mutex<HashMap<String, PinType>>>,
     /// Node status.
     node_status: Arc<RwLock<NodeStatus>>,
+    /// Admission closes before any shutdown step; the Router ingress filter and
+    /// guarded local clients read the same flag.
+    accepting_work: Arc<AtomicBool>,
+    /// Serializes idempotent, retryable shutdown attempts.
+    shutdown_lock: Mutex<()>,
+    shutdown_complete: AtomicBool,
+    shutdown_error: RwLock<Option<String>>,
     /// Cache of peers discovered via Iroh Discovery Services (Pkarr/DNS/mDNS).
     discovery_cache: Arc<RwLock<DiscoveryCache>>,
     /// Optimized cache with integrated metrics, compression and intelligent eviction.
@@ -250,9 +746,377 @@ pub struct IrohBackend {
     ticket_registry: crate::p2p::network::core::ticket_exchange::TicketRegistry,
     /// Peers we have already connected to (candidates for requesting tickets).
     known_peers: Arc<RwLock<std::collections::HashSet<NodeId>>>,
+    /// Serializes whole GC passes against pre-commit blob protection windows.
+    gc_gate: Arc<RwLock<()>>,
+    /// Health of Guardian's supervised blob collector.
+    gc_health: Arc<RwLock<GcHealth>>,
+    /// Cooperative shutdown keeps the worker alive long enough to join its
+    /// currently-owned pass instead of aborting and detaching it.
+    gc_shutdown: tokio_util::sync::CancellationToken,
+    /// Observed outer collector supervisor; shutdown retains and joins it.
+    gc_task: Arc<Mutex<Option<SupervisedGcTask>>>,
     /// Per-peer latency sample history (bounded ring), for per-peer p95/p99 (C1).
     /// Fed by `update_connection_latency`; independent of the EMA `avg_latency_ms`.
     peer_latency_history: Arc<RwLock<HashMap<NodeId, std::collections::VecDeque<f64>>>>,
+}
+
+/// Runtime health of the supervised blob garbage collector.
+#[derive(Debug, Clone, Default)]
+pub struct GcHealth {
+    pub enabled: bool,
+    pub running: bool,
+    pub shutting_down: bool,
+    /// The active pass crossed its advertised deadline and is still retained.
+    pub overdue: bool,
+    /// Abort was requested but the JoinHandle has not resolved within the grace period.
+    pub stuck: bool,
+    pub cancellation_requested_ms: Option<u64>,
+    pub overdue_since_ms: Option<u64>,
+    pub successful_runs: u64,
+    pub failed_runs: u64,
+    pub consecutive_failures: u32,
+    pub legacy_tags_removed: u64,
+    pub last_attempt_ms: Option<u64>,
+    pub last_heartbeat_ms: Option<u64>,
+    pub active_deadline_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+async fn abort_and_join_gc_pass(
+    pass: &mut tokio::task::JoinHandle<Result<()>>,
+    health: &Arc<RwLock<GcHealth>>,
+    reason: String,
+    deadline_expired: bool,
+    heartbeat_interval: Duration,
+) -> Result<()> {
+    const ABORT_GRACE: Duration = Duration::from_secs(5);
+
+    let requested_ms = unix_time_ms();
+    {
+        let mut state = health.write().await;
+        state.cancellation_requested_ms = Some(requested_ms);
+        if deadline_expired {
+            state.overdue = true;
+            state.overdue_since_ms.get_or_insert(requested_ms);
+        }
+        state.last_error = Some(reason.clone());
+        // `running` and `active_deadline_ms` deliberately remain set until the
+        // JoinHandle resolves. Tokio abort is a request, not termination.
+    }
+    pass.abort();
+
+    let stuck_timer = tokio::time::sleep(ABORT_GRACE);
+    tokio::pin!(stuck_timer);
+    let mut stuck_reported = false;
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let joined = loop {
+        tokio::select! {
+            joined = &mut *pass => break joined,
+            _ = &mut stuck_timer, if !stuck_reported => {
+                stuck_reported = true;
+                let now_ms = unix_time_ms();
+                let mut state = health.write().await;
+                state.stuck = true;
+                if state.active_deadline_ms.is_some_and(|deadline| now_ms > deadline) {
+                    state.overdue = true;
+                    state.overdue_since_ms.get_or_insert(now_ms);
+                }
+                state.last_heartbeat_ms = Some(now_ms);
+                state.last_error = Some(format!(
+                    "{reason}; abort requested at {requested_ms}, but the GC pass JoinHandle is still unresolved"
+                ));
+                warn!(
+                    reason,
+                    cancellation_requested_ms = requested_ms,
+                    active_deadline_ms = ?state.active_deadline_ms,
+                    "Guardian blob GC pass is stuck after abort; retaining it and refusing replacement"
+                );
+            }
+            _ = heartbeat.tick() => {
+                let now_ms = unix_time_ms();
+                let mut state = health.write().await;
+                state.last_heartbeat_ms = Some(now_ms);
+                if state.active_deadline_ms.is_some_and(|deadline| now_ms > deadline) {
+                    state.overdue = true;
+                    state.overdue_since_ms.get_or_insert(now_ms);
+                }
+            }
+        }
+    };
+
+    let termination = match joined {
+        Ok(Ok(())) => "completed after cancellation was requested".to_string(),
+        Ok(Err(error)) => format!("terminated with error: {error}"),
+        Err(join_error) if join_error.is_cancelled() => "terminated after abort".to_string(),
+        Err(join_error) => format!("terminated with JoinError: {join_error}"),
+    };
+    Err(GuardianError::Other(format!("{reason}; {termination}")))
+}
+
+async fn run_guardian_gc_worker(
+    store: FsStore,
+    docs: Docs,
+    gc_gate: Arc<RwLock<()>>,
+    health: Arc<RwLock<GcHealth>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    gc_secs: u64,
+    gc_deadline: Duration,
+) {
+    let normal_interval = Duration::from_secs(gc_secs);
+    let max_backoff = normal_interval.min(Duration::from_secs(300));
+    let mut backoff = Duration::from_secs(5).min(max_backoff);
+    let heartbeat_interval = Duration::from_secs(30)
+        .min(gc_deadline)
+        .max(Duration::from_secs(1));
+    #[cfg(debug_assertions)]
+    let mut diagnostic_fault = std::env::var("GUARDIAN_GC_DIAGNOSTIC_FAULT_ONCE").ok();
+
+    loop {
+        if shutdown.is_cancelled() {
+            let mut state = health.write().await;
+            state.shutting_down = true;
+            state.running = false;
+            state.active_deadline_ms = None;
+            return;
+        }
+
+        let now_ms = unix_time_ms();
+        {
+            let mut state = health.write().await;
+            state.running = true;
+            state.overdue = false;
+            state.stuck = false;
+            state.cancellation_requested_ms = None;
+            state.overdue_since_ms = None;
+            state.last_attempt_ms = Some(now_ms);
+            state.last_heartbeat_ms = Some(now_ms);
+            state.active_deadline_ms = Some(now_ms.saturating_add(duration_ms(gc_deadline)));
+        }
+
+        let pass_store = store.clone();
+        let pass_docs = docs.clone();
+        let pass_gate = gc_gate.clone();
+        let legacy_removed_progress = Arc::new(AtomicU64::new(0));
+        let pass_progress = legacy_removed_progress.clone();
+        #[cfg(debug_assertions)]
+        let fault = diagnostic_fault.take();
+        let mut pass = tokio::spawn(async move {
+            #[cfg(debug_assertions)]
+            match fault.as_deref() {
+                Some("error") => {
+                    return Err(GuardianError::Other(
+                        "injected Guardian GC diagnostic error".to_string(),
+                    ));
+                }
+                Some("panic") => panic!("injected Guardian GC diagnostic panic"),
+                Some("hang") => {
+                    // Debug-only lifecycle witness: model a collector call that does
+                    // not reach an async cancellation point promptly. Tokio abort is
+                    // intentionally unable to resolve this JoinHandle until the
+                    // blocking section returns, so overdue/stuck health and the
+                    // no-replacement invariant can be exercised against a real actor.
+                    let hang_secs = std::env::var("GUARDIAN_GC_DIAGNOSTIC_HANG_SECS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value > 0)
+                        .unwrap_or(8);
+                    std::thread::sleep(Duration::from_secs(hang_secs));
+                }
+                _ => {}
+            }
+            let _gc_guard = pass_gate.write_owned().await;
+            run_guardian_gc_once(&pass_store, &pass_docs, pass_progress.as_ref()).await
+        });
+        let deadline = tokio::time::sleep(gc_deadline);
+        tokio::pin!(deadline);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_interval,
+            heartbeat_interval,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut stop_after_pass = false;
+        let result = loop {
+            tokio::select! {
+                joined = &mut pass => {
+                    break match joined {
+                        Ok(result) => result,
+                        Err(join_error) => Err(GuardianError::Other(format!(
+                            "Guardian blob GC task failed: {join_error}"
+                        ))),
+                    };
+                }
+                _ = &mut deadline => {
+                    let reason = format!(
+                        "Guardian blob GC exceeded its {}s deadline",
+                        gc_deadline.as_secs()
+                    );
+                    break abort_and_join_gc_pass(
+                        &mut pass,
+                        &health,
+                        reason,
+                        true,
+                        heartbeat_interval,
+                    ).await;
+                }
+                _ = shutdown.cancelled() => {
+                    stop_after_pass = true;
+                    {
+                        let mut state = health.write().await;
+                        state.shutting_down = true;
+                    }
+                    break abort_and_join_gc_pass(
+                        &mut pass,
+                        &health,
+                        "Guardian blob GC cancelled for backend shutdown".to_string(),
+                        false,
+                        heartbeat_interval,
+                    ).await;
+                }
+                _ = heartbeat.tick() => {
+                    health.write().await.last_heartbeat_ms = Some(unix_time_ms());
+                }
+            }
+        };
+
+        let legacy_removed = legacy_removed_progress.load(Ordering::Relaxed);
+        let now_ms = unix_time_ms();
+        if stop_after_pass || shutdown.is_cancelled() {
+            let mut state = health.write().await;
+            state.running = false;
+            state.shutting_down = true;
+            state.legacy_tags_removed = state.legacy_tags_removed.saturating_add(legacy_removed);
+            state.last_heartbeat_ms = Some(now_ms);
+            state.active_deadline_ms = None;
+            state.overdue = false;
+            state.stuck = false;
+            state.cancellation_requested_ms = None;
+            return;
+        }
+
+        match result {
+            Ok(()) => {
+                {
+                    let mut state = health.write().await;
+                    state.running = false;
+                    state.successful_runs = state.successful_runs.saturating_add(1);
+                    state.consecutive_failures = 0;
+                    state.legacy_tags_removed =
+                        state.legacy_tags_removed.saturating_add(legacy_removed);
+                    state.last_heartbeat_ms = Some(now_ms);
+                    state.active_deadline_ms = None;
+                    state.overdue = false;
+                    state.stuck = false;
+                    state.cancellation_requested_ms = None;
+                    state.overdue_since_ms = None;
+                    state.last_success_ms = Some(now_ms);
+                    state.last_error = None;
+                }
+                backoff = Duration::from_secs(5).min(max_backoff);
+                info!(
+                    legacy_tags_removed = legacy_removed,
+                    "Guardian blob GC completed"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => continue,
+                    _ = tokio::time::sleep(normal_interval) => {}
+                }
+            }
+            Err(error) => {
+                {
+                    let mut state = health.write().await;
+                    state.running = false;
+                    state.failed_runs = state.failed_runs.saturating_add(1);
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                    state.legacy_tags_removed =
+                        state.legacy_tags_removed.saturating_add(legacy_removed);
+                    state.last_heartbeat_ms = Some(now_ms);
+                    state.active_deadline_ms = None;
+                    state.overdue = false;
+                    state.stuck = false;
+                    state.cancellation_requested_ms = None;
+                    state.last_error = Some(error.to_string());
+                }
+                warn!(error = %error, retry_in_secs = backoff.as_secs(), "Guardian blob GC failed; retrying");
+                tokio::select! {
+                    _ = shutdown.cancelled() => continue,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = backoff.saturating_mul(2).min(max_backoff);
+            }
+        }
+    }
+}
+
+async fn run_guardian_gc_supervisor(
+    store: FsStore,
+    docs: Docs,
+    gc_gate: Arc<RwLock<()>>,
+    health: Arc<RwLock<GcHealth>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    gc_secs: u64,
+    gc_deadline: Duration,
+) {
+    let max_backoff = Duration::from_secs(gc_secs).min(Duration::from_secs(300));
+    let mut backoff = Duration::from_secs(5).min(max_backoff);
+    loop {
+        let worker = tokio::spawn(run_guardian_gc_worker(
+            store.clone(),
+            docs.clone(),
+            gc_gate.clone(),
+            health.clone(),
+            shutdown.clone(),
+            gc_secs,
+            gc_deadline,
+        ));
+        let outcome = worker.await;
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        let error = match outcome {
+            Ok(()) => "Guardian blob GC worker stopped unexpectedly".to_string(),
+            Err(join_error) => format!("Guardian blob GC worker failed: {join_error}"),
+        };
+        let now_ms = unix_time_ms();
+        {
+            let mut state = health.write().await;
+            state.running = false;
+            state.failed_runs = state.failed_runs.saturating_add(1);
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.last_heartbeat_ms = Some(now_ms);
+            state.active_deadline_ms = None;
+            state.overdue = false;
+            state.stuck = false;
+            state.cancellation_requested_ms = None;
+            state.last_error = Some(error.clone());
+        }
+        warn!(
+            error,
+            retry_in_secs = backoff.as_secs(),
+            "Guardian blob GC worker stopped; restarting"
+        );
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = backoff.saturating_mul(2).min(max_backoff);
+    }
 }
 
 /// Max latency samples kept per peer for percentile estimation (C1).
@@ -525,6 +1389,10 @@ impl IrohBackend {
                 last_activity: Instant::now(),
                 connected_peers: 0,
             })),
+            accepting_work: Arc::new(AtomicBool::new(true)),
+            shutdown_lock: Mutex::new(()),
+            shutdown_complete: AtomicBool::new(false),
+            shutdown_error: RwLock::new(None),
             discovery_cache: Arc::new(RwLock::new(DiscoveryCache::default())),
 
             // Optimized components.
@@ -540,10 +1408,23 @@ impl IrohBackend {
             ),
             ticket_registry: crate::p2p::network::core::ticket_exchange::new_registry(),
             known_peers: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            gc_gate: Arc::new(RwLock::new(())),
+            gc_health: Arc::new(RwLock::new(GcHealth::default())),
+            gc_shutdown: tokio_util::sync::CancellationToken::new(),
+            gc_task: Arc::new(Mutex::new(None)),
             peer_latency_history: Arc::new(RwLock::new(HashMap::new())),
         };
-        // Initialize the Iroh node asynchronously.
-        backend.initialize_node().await?;
+        // Initialize the Iroh node asynchronously. Every actor acquired before a
+        // later initialization error is explicitly shut down so its endpoint,
+        // docs writer, blob actor, and redb/SQLite locks are not abandoned.
+        if let Err(error) = backend.initialize_node().await {
+            return match backend.shutdown().await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(GuardianError::Other(format!(
+                    "Iroh backend initialization failed: {error}; partial-initialization cleanup also failed: {cleanup_error}"
+                ))),
+            };
+        }
         info!(
             "Optimized Iroh backend initialized successfully at {:?}",
             data_dir_clone
@@ -606,32 +1487,28 @@ impl IrohBackend {
             .await
             .map_err(|e| GuardianError::Other(format!("Error creating store directory: {}", e)))?;
 
-        // Blob garbage collection. Without it the store keeps EVERY blob
-        // ever added — every superseded doc version, forever — which filled
-        // fleet disks at ~44 GB/day/node while the live key set stayed under
-        // 50 MB. The two halves below are UNSAFE APART and must always ship
-        // together: the GcConfig's protect callback comes from iroh-docs'
-        // ProtectCallbackHandler, and the handler half must reach
-        // `Docs::persistent(..).protect_handler(..)` further down — GC with
-        // no protect wiring would sweep doc-referenced (live) blobs.
-        // `GUARDIAN_GC_SECS` env tunes the interval; 0 disables both halves
-        // (paired opt-out, never a lone one).
+        // Guardian supervises GC itself instead of using iroh-blobs' periodic
+        // runner, which exits permanently after one transient gc_run_once error.
+        // The collector is started after Docs so each pass can derive its
+        // protection set from current, materialized document heads.
         let gc_secs: u64 = std::env::var("GUARDIAN_GC_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(21_600);
-        let mut docs_protect_handler = None;
-        let mut store_opts = iroh_blobs::store::fs::options::Options::new(&store_dir);
+        let store_opts = iroh_blobs::store::fs::options::Options::new(&store_dir);
+        {
+            let mut health = self.gc_health.write().await;
+            health.enabled = gc_secs > 0;
+        }
         if gc_secs > 0 {
-            let (handler, protect_cb) = iroh_docs::engine::ProtectCallbackHandler::new();
-            store_opts.gc = Some(iroh_blobs::store::GcConfig {
-                interval: std::time::Duration::from_secs(gc_secs),
-                add_protected: Some(protect_cb),
-            });
-            docs_protect_handler = Some(handler);
-            info!(interval_secs = gc_secs, "guardian blob GC enabled (doc-protected)");
+            info!(
+                interval_secs = gc_secs,
+                "guardian blob GC configured (supervised, current-doc protected)"
+            );
         } else {
-            warn!("guardian blob GC DISABLED (GUARDIAN_GC_SECS=0) — the store will grow without bound");
+            warn!(
+                "guardian blob GC DISABLED (GUARDIAN_GC_SECS=0) — the store will grow without bound"
+            );
         }
 
         // Initialize the FsStore with persistence (same path derivation as
@@ -667,7 +1544,10 @@ impl IrohBackend {
         if let Some(map) = hive_relay_map_from_env() {
             let n = map.len();
             endpoint_builder = endpoint_builder.relay_mode(iroh::RelayMode::Custom(map));
-            tracing::info!(relays = n, "guardian: using self-hosted iroh relays (HIVE_RELAY_URLS)");
+            tracing::info!(
+                relays = n,
+                "guardian: using self-hosted iroh relays (HIVE_RELAY_URLS)"
+            );
         }
         let endpoint = endpoint_builder
             .bind()
@@ -715,7 +1595,7 @@ impl IrohBackend {
             .ok_or_else(|| GuardianError::Other("Store not initialized".to_string()))?;
 
         let blobs = match store_for_blobs {
-            StoreType::Fs(fs_store) => BlobsProtocol::new(fs_store.as_ref(), None),
+            StoreType::Fs(fs_store) => BlobsProtocol::new_managed(fs_store.as_ref(), None),
         };
         drop(store_lock);
 
@@ -734,15 +1614,13 @@ impl IrohBackend {
         };
         drop(store_lock);
 
-        // Create Docs using the Builder pattern. The protect handler is the
-        // OTHER half of the GC wiring above: it answers each GC run with the
-        // set of blob hashes still referenced by doc entries, which is what
-        // makes sweeping the rest safe.
-        let mut docs_builder = Docs::persistent(docs_dir);
-        if let Some(handler) = docs_protect_handler {
-            docs_builder = docs_builder.protect_handler(handler);
-        }
-        let docs = docs_builder
+        // Create Docs without iroh-docs' stock protect callback. That callback
+        // returns every historical author record, including records shadowed by
+        // a newer tombstone, so departed-node payloads remain rooted forever.
+        // Guardian's supervised collector below instead queries the current
+        // single-latest-per-key view on every pass.
+        let docs = Docs::persistent(docs_dir)
+            .mutation_gate(self.gc_gate.clone())
             .spawn(endpoint.clone(), blobs_store, gossip.clone())
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing Docs: {}", e)))?;
@@ -754,11 +1632,54 @@ impl IrohBackend {
         }
         info!("Docs protocol initialized successfully");
 
+        if gc_secs > 0 {
+            let store = {
+                let store_lock = self.store.read().await;
+                match store_lock.as_ref() {
+                    Some(StoreType::Fs(store)) => store.clone(),
+                    None => {
+                        return Err(GuardianError::Other(
+                            "Store unavailable while starting Guardian GC".to_string(),
+                        ));
+                    }
+                }
+            };
+            let docs_for_gc = docs.clone();
+            let gc_gate = self.gc_gate.clone();
+            let health = self.gc_health.clone();
+            let gc_deadline = Duration::from_secs(
+                std::env::var("GUARDIAN_GC_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(30 * 60),
+            );
+            let task = tokio::spawn(run_guardian_gc_supervisor(
+                store,
+                docs_for_gc,
+                gc_gate,
+                health,
+                self.gc_shutdown.clone(),
+                gc_secs,
+                gc_deadline,
+            ));
+            *self.gc_task.lock().await = Some(SupervisedGcTask::new(task));
+        }
+
         // Configure the Router with Gossip, Blobs, Docs and the ticket exchange protocol.
         let ticket_handler = crate::p2p::network::core::ticket_exchange::TicketProtocolHandler::new(
             self.ticket_registry.clone(),
         );
+        let accepting_work = self.accepting_work.clone();
+        let incoming_filter: iroh::protocol::IncomingFilter = Arc::new(move |_| {
+            if accepting_work.load(Ordering::Acquire) {
+                iroh::protocol::IncomingFilterOutcome::Accept
+            } else {
+                iroh::protocol::IncomingFilterOutcome::Reject
+            }
+        });
         let router = Router::builder(endpoint.clone())
+            .incoming_filter(incoming_filter)
             .accept(iroh_gossip::ALPN, gossip)
             .accept(iroh_blobs::ALPN, blobs)
             .accept(iroh_docs::ALPN, docs)
@@ -789,53 +1710,151 @@ impl IrohBackend {
         Ok(())
     }
 
-    /// Shuts down the backend, ensuring all pending operations
-    /// are finished and the data is persisted to disk.
-    ///
-    /// This method is especially important to ensure FsStore tags are
-    /// synchronized to the SQLite database (blobs.db) before shutdown.
+    /// Shuts down every backend actor in dependency order and propagates any
+    /// durability failure.
     pub async fn shutdown(&self) -> Result<()> {
+        // Close admission before waiting on anything. The Router's early filter
+        // rejects new handshakes while already-accepted work is allowed to finish.
+        self.accepting_work.store(false, Ordering::Release);
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return match self.shutdown_error.read().await.clone() {
+                Some(error) => Err(GuardianError::Other(error)),
+                None => Ok(()),
+            };
+        }
+
         debug!("Starting IrohBackend shutdown");
-
-        // 1. Stop accepting new connections on the endpoint.
-        if let Ok(endpoint_arc) = self.get_endpoint().await {
-            let endpoint_lock = endpoint_arc.read().await;
-            if let Some(endpoint) = endpoint_lock.as_ref() {
-                // Wait a bit for pending operations.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Close all active connections.
-                endpoint.close().await;
-                debug!("Endpoint closed");
-            }
-        }
-
-        // 2. Force a flush of pending tags by performing a read.
-        // This helps ensure the SQLite WAL is synchronized.
-        if (self.pin_ls().await).is_ok() {
-            debug!("Tags listed to force a sync");
-        }
-
-        // 3. Wait a bit to ensure asynchronous operations finish.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // 4. Clear the optimized cache.
-        let _ = self.optimized_cache.clear().await;
-        debug!("Optimized cache cleared");
-
-        // 5. Update the node status.
         {
             let mut status = self.node_status.write().await;
             status.is_online = false;
             status.last_activity = Instant::now();
+            status.last_error = Some("backend shutdown in progress".to_string());
+        }
+        {
+            let mut health = self.gc_health.write().await;
+            health.shutting_down = true;
+            // Do not clear running/deadline/overdue here. The worker owns those
+            // facts until its active pass JoinHandle has actually resolved.
         }
 
-        info!("IrohBackend shutdown complete");
-        Ok(())
+        let mut errors = Vec::new();
+
+        // Cooperative cancellation is observed by the worker, which aborts and
+        // retains its active pass until join. Await by mutable reference while the
+        // handle remains in `gc_task`: if this shutdown future is cancelled, a
+        // later shutdown resumes supervision instead of detaching the task.
+        self.gc_shutdown.cancel();
+        {
+            let mut gc_task = self.gc_task.lock().await;
+            if let Some(task) = gc_task.as_mut() {
+                if let Err(join_error) = (&mut task.handle).await {
+                    // Awaiting a JoinHandle to any outcome proves the supervisor
+                    // terminated. Preserve the failure, but never claim an active
+                    // or stuck pass after termination is known.
+                    let error = format!(
+                        "Guardian blob GC supervisor terminated with failure: {join_error}"
+                    );
+                    {
+                        let mut health = self.gc_health.write().await;
+                        health.running = false;
+                        health.active_deadline_ms = None;
+                        health.overdue = false;
+                        health.stuck = false;
+                        health.cancellation_requested_ms = None;
+                        health.last_heartbeat_ms = Some(unix_time_ms());
+                        health.last_error = Some(error.clone());
+                    }
+                    errors.push(error);
+                }
+            }
+            gc_task.take();
+        }
+
+        // Router::shutdown stops the accept loop, awaits every protocol handler
+        // (including Docs), and closes the Endpoint. Guardian's Docs wrapper then
+        // returns the cached exact shutdown/flush outcome instead of the protocol
+        // trait's log-only result.
+        let router = self.router.read().await.as_ref().cloned();
+        if let Some(router) = router {
+            if let Err(error) = router.shutdown().await {
+                errors.push(format!("Iroh Router shutdown failed: {error}"));
+            }
+        }
+
+        let docs = self.docs.read().await.as_ref().cloned();
+        if let Some(docs) = docs {
+            if let Err(error) = docs.shutdown().await {
+                errors.push(format!(
+                    "iroh-docs shutdown/final redb flush failed: {error:#}"
+                ));
+            }
+        }
+
+        // A partial initialization may not have built a Router. Closing the
+        // Endpoint explicitly is idempotent and also completes a failed Router
+        // shutdown's ingress teardown.
+        let endpoint = self.endpoint.read().await.as_ref().cloned();
+        if let Some(endpoint) = endpoint {
+            endpoint.close().await;
+        }
+
+        // Guardian constructs BlobsProtocol in managed mode, so Router shutdown
+        // has stopped ingress without consuming the actor. Sync the metadata DB,
+        // then request supported actor shutdown and await its acknowledgement.
+        let store = {
+            let store_guard = self.store.read().await;
+            store_guard.as_ref().map(|store| match store {
+                StoreType::Fs(store) => store.clone(),
+            })
+        };
+        if let Some(store) = store {
+            if let Err(error) = store.sync_db().await {
+                errors.push(format!("iroh-blobs metadata sync failed: {error}"));
+            }
+            if let Err(error) = store.shutdown().await {
+                errors.push(format!("iroh-blobs actor shutdown failed: {error}"));
+            }
+        }
+
+        if let Err(error) = self.optimized_cache.clear().await {
+            errors.push(format!("optimized cache shutdown clear failed: {error}"));
+        }
+
+        // Drop every retained actor/client handle only after their acknowledged
+        // shutdown. This is what releases docs.redb and blobs.db on partial-init
+        // failures as well as normal process shutdown.
+        *self.router.write().await = None;
+        *self.docs.write().await = None;
+        *self.gossip.write().await = None;
+        *self.endpoint.write().await = None;
+        *self.store.write().await = None;
+        self.connection_pool.write().await.clear();
+
+        let shutdown_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        *self.shutdown_error.write().await = shutdown_error.clone();
+        self.shutdown_complete.store(true, Ordering::Release);
+
+        match shutdown_error {
+            Some(error) => {
+                self.node_status.write().await.last_error = Some(error.clone());
+                Err(GuardianError::Other(error))
+            }
+            None => {
+                self.node_status.write().await.last_error = None;
+                info!("IrohBackend shutdown complete");
+                Ok(())
+            }
+        }
     }
 
     /// Returns a reference to the store if available.
     async fn get_store(&self) -> Result<Arc<RwLock<Option<StoreType>>>> {
+        self.ensure_accepting_work()?;
         let store_lock = self.store.read().await;
         if store_lock.is_none() {
             drop(store_lock);
@@ -849,6 +1868,7 @@ impl IrohBackend {
     /// Returns Arc<RwLock<FsStore>> for direct use by BlobStore.
     /// Ensures the store is initialized and unwraps the StoreType::Fs.
     pub async fn get_store_for_blobs(&self) -> Result<Arc<RwLock<FsStore>>> {
+        self.ensure_accepting_work()?;
         let store_lock = self.store.read().await;
         match store_lock.as_ref() {
             Some(StoreType::Fs(fs_store)) => Ok(Arc::new(RwLock::new(fs_store.clone()))),
@@ -859,8 +1879,26 @@ impl IrohBackend {
         }
     }
 
+    pub(crate) fn gc_gate(&self) -> Arc<RwLock<()>> {
+        self.gc_gate.clone()
+    }
+
+    pub(crate) fn accepting_work(&self) -> Arc<AtomicBool> {
+        self.accepting_work.clone()
+    }
+
+    fn ensure_accepting_work(&self) -> Result<()> {
+        if !self.accepting_work.load(Ordering::Acquire) {
+            return Err(GuardianError::Other(
+                "Iroh backend is shutting down and no longer accepts work".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the endpoint if available.
     pub async fn get_endpoint(&self) -> Result<Arc<RwLock<Option<Endpoint>>>> {
+        self.ensure_accepting_work()?;
         let endpoint_lock = self.endpoint.read().await;
         if endpoint_lock.is_none() {
             drop(endpoint_lock);
@@ -999,10 +2037,16 @@ impl IrohBackend {
     ///   and the caller creates a new namespace (taking the creator role).
     pub async fn resolve_shared_ticket(&self, store_key: &str) -> Option<String> {
         let known_peer_count = self.known_peers.read().await.len();
-        debug!(store_key, known_peer_count, "resolve_shared_ticket: immediate attempt");
+        debug!(
+            store_key,
+            known_peer_count, "resolve_shared_ticket: immediate attempt"
+        );
         // Immediate attempt.
         if let Some(ticket) = self.request_ticket_from_known_peers(store_key).await {
-            debug!(store_key, "resolve_shared_ticket: got ticket on immediate attempt");
+            debug!(
+                store_key,
+                "resolve_shared_ticket: got ticket on immediate attempt"
+            );
             return Some(ticket);
         }
 
@@ -1033,7 +2077,10 @@ impl IrohBackend {
                 return Some(ticket);
             }
         }
-        debug!(store_key, "resolve_shared_ticket: exhausted all retries, falling back to local cache/create");
+        debug!(
+            store_key,
+            "resolve_shared_ticket: exhausted all retries, falling back to local cache/create"
+        );
 
         // Fallback: the creator did not respond in time; we take the namespace to avoid blocking.
         warn!(
@@ -1045,6 +2092,7 @@ impl IrohBackend {
 
     /// Returns a reference to the Gossip if available.
     pub async fn get_gossip(&self) -> Result<Arc<RwLock<Option<Gossip>>>> {
+        self.ensure_accepting_work()?;
         let gossip_lock = self.gossip.read().await;
         if gossip_lock.is_none() {
             drop(gossip_lock);
@@ -1055,6 +2103,7 @@ impl IrohBackend {
 
     /// Returns a reference to the Router if available.
     pub async fn get_router(&self) -> Result<Arc<RwLock<Option<Router>>>> {
+        self.ensure_accepting_work()?;
         let router_lock = self.router.read().await;
         if router_lock.is_none() {
             drop(router_lock);
@@ -1065,6 +2114,7 @@ impl IrohBackend {
 
     /// Returns a reference to Docs if available.
     pub async fn get_docs(&self) -> Result<Arc<RwLock<Option<Docs>>>> {
+        self.ensure_accepting_work()?;
         let docs_lock = self.docs.read().await;
         if docs_lock.is_none() {
             drop(docs_lock);
@@ -1313,8 +2363,8 @@ impl IrohBackend {
     // buffer is turned into `Bytes` ONCE and shared by refcount with the cache and
     // the returned cursor).
 
-
     pub async fn add(&self, data: Pin<Box<dyn AsyncRead + Send>>) -> Result<AddResponse> {
+        self.ensure_accepting_work()?;
         let start = Instant::now();
 
         debug!("Adding content via Iroh");
@@ -1324,33 +2374,65 @@ impl IrohBackend {
             .await
             .map_err(|e| GuardianError::Other(format!("Error reading data: {}", e)))?;
 
-        // Convert to bytes::Bytes and save the size.
-        let bytes_data = Bytes::from(buffer);
+        // The bounded reader already returns a single ref-counted allocation.
+        let bytes_data = buffer;
         let data_size = bytes_data.len();
+        let _gc_guard = self.gc_gate.clone().read_owned().await;
 
         // Get a reference to the store and clone the reference.
         let store_arc = self.get_store().await?;
-        let (temp_tag, store_type_name) = {
+        let (import_guard, store_type_name) = {
             let store_lock = store_arc.read().await;
             match store_lock
                 .as_ref()
                 .ok_or_else(|| GuardianError::Other("Store not available".to_string()))?
             {
                 StoreType::Fs(fs_store) => {
-                    let outcome = fs_store
+                    let import_guard = fs_store
+                        .blobs()
                         .add_bytes(bytes_data.clone())
+                        .temp_tag()
                         .await
                         .map_err(Self::map_iroh_error)?;
-                    (outcome.hash, "FsStore")
+                    (import_guard, "FsStore")
                 }
             }
-        }; // Drop the lock here.
+        }; // Drop the lock here while the TempTag keeps the import protected.
 
-        // Get the hash from the outcome.
-        let hash = temp_tag;
+        // Get the hash from the temporary import guard. The guard remains live
+        // until this operation has finished returning the hash and size.
+        let hash = import_guard.hash();
 
         // Convert the BLAKE3 Hash into a hex string.
         let hash_str = Self::hash_to_string(&hash);
+
+        // `IrohBackend::add` has always been a durable acquisition API: before
+        // Guardian took ownership of GC, awaiting AddProgress installed an
+        // anonymous persistent tag. Replace that unbounded legacy root with the
+        // exact canonical pin the public pin APIs already manage. The TempTag and
+        // GC read gate stay live until this durable write acknowledges; failure or
+        // cancellation drops only the temporary root and never reports success.
+        {
+            let store_lock = store_arc.read().await;
+            match store_lock
+                .as_ref()
+                .ok_or_else(|| GuardianError::Other("Store not available".to_string()))?
+            {
+                StoreType::Fs(fs_store) => {
+                    let tag = Tag::from(format!("pin-{hash_str}").as_str());
+                    fs_store
+                        .tags()
+                        .set(tag.as_ref(), HashAndFormat::raw(hash))
+                        .await
+                        .map_err(Self::map_iroh_error)?;
+                }
+            }
+        }
+        self.pinned_cache
+            .lock()
+            .await
+            .insert(hash_str.clone(), PinType::Direct);
+        drop(import_guard);
 
         // Add the content to the intelligent cache for fast future access.
         if let Err(e) = self.add_to_cache(&hash_str, bytes_data.clone()).await {
@@ -1381,6 +2463,44 @@ impl IrohBackend {
         })
     }
 
+    /// Install an owned temporary GC scope for one raw blob hash.
+    pub async fn protect_hash(&self, hash: IrohHash) -> Result<BlobProtection> {
+        self.protect_hashes([hash]).await
+    }
+
+    /// Install one owned GC scope for an operation publishing several blobs.
+    /// One shared read guard avoids recursively acquiring the fair RwLock after
+    /// a collector writer has queued.
+    pub async fn protect_hashes(
+        &self,
+        hashes: impl IntoIterator<Item = IrohHash>,
+    ) -> Result<BlobProtection> {
+        self.ensure_accepting_work()?;
+        let gc_gate = self.gc_gate.clone().read_owned().await;
+        let store = {
+            let store_guard = self.store.read().await;
+            match store_guard.as_ref() {
+                Some(StoreType::Fs(store)) => store.clone(),
+                None => {
+                    return Err(GuardianError::Other(
+                        "Iroh store not initialized".to_string(),
+                    ));
+                }
+            }
+        };
+        let batch = store.blobs().batch().await.map_err(Self::map_iroh_error)?;
+        let mut tags = Vec::new();
+        for hash in hashes {
+            tags.push(
+                batch
+                    .temp_tag(HashAndFormat::raw(hash))
+                    .await
+                    .map_err(Self::map_iroh_error)?,
+            );
+        }
+        BlobProtection::new(Some(gc_gate), tags, batch)
+    }
+
     /// Retrieves content from the store by its BLAKE3 hash.
     ///
     /// # Arguments
@@ -1404,13 +2524,11 @@ impl IrohBackend {
     /// Pull a blob this node is missing from the peers it is currently connected
     /// to, using iroh-blobs' verified downloader.
     ///
-    /// Providers are the live connection pool rather than a doc-supplied provider
-    /// list on purpose: by the time a blob is discovered missing, the peer that
-    /// originally supplied its entry may be long gone — that is the failure this
-    /// exists to survive. Any connected peer holding the bytes will do, and since
-    /// iroh-blobs verifies the BLAKE3 tree on arrival, asking a broader set costs
-    /// nothing in safety: a peer cannot answer with content that does not hash to
-    /// the requested id.
+    /// Providers come from the durable process-local known-peer roster rather
+    /// than only currently-open connections: downloader discovery can establish
+    /// a fresh path to a peer whose prior connection is no longer pooled. Since
+    /// iroh-blobs verifies the BLAKE3 tree on arrival, broadening candidates does
+    /// not let a peer substitute different content.
     ///
     /// Best-effort by design. An error here means "still missing", which the
     /// caller surfaces exactly as it did before this path existed.
@@ -1418,29 +2536,36 @@ impl IrohBackend {
         use futures::StreamExt;
 
         let endpoint_arc = self.get_endpoint().await?;
-        let endpoint_lock = endpoint_arc.read().await;
-        let endpoint = endpoint_lock.as_ref().ok_or_else(|| {
-            GuardianError::Other("Endpoint not available for P2P blob fetch".to_string())
-        })?;
+        let endpoint = {
+            let endpoint_lock = endpoint_arc.read().await;
+            endpoint_lock.as_ref().cloned().ok_or_else(|| {
+                GuardianError::Other("Endpoint not available for P2P blob fetch".to_string())
+            })?
+        };
 
         let providers: Vec<NodeId> = {
-            let pool = self.connection_pool.read().await;
-            pool.values().map(|c| c.node_id).collect()
+            let peers = self.known_peers.read().await;
+            peers.iter().copied().collect()
         };
         if providers.is_empty() {
             return Err(GuardianError::Other(
-                "no connected peers to fetch missing blob from".to_string(),
+                "no known peers to fetch missing blob from".to_string(),
             ));
         }
 
-        let store_guard = self.store.read().await;
-        let Some(StoreType::Fs(store)) = store_guard.as_ref() else {
-            return Err(GuardianError::Other(
-                "Iroh store not initialized".to_string(),
-            ));
+        let store = {
+            let store_guard = self.store.read().await;
+            match store_guard.as_ref() {
+                Some(StoreType::Fs(store)) => store.clone(),
+                None => {
+                    return Err(GuardianError::Other(
+                        "Iroh store not initialized".to_string(),
+                    ));
+                }
+            }
         };
 
-        let downloader = store.downloader(endpoint);
+        let downloader = store.downloader(&endpoint);
         let mut stream = downloader
             .download(hash, providers)
             .stream()
@@ -1457,11 +2582,15 @@ impl IrohBackend {
                 _ => {}
             }
         }
-        info!("recovered missing blob {} from a connected peer", hash.to_hex());
+        info!(
+            "recovered missing blob {} from a connected peer",
+            hash.to_hex()
+        );
         Ok(())
     }
 
     pub async fn cat(&self, hash_str: &str) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+        self.ensure_accepting_work()?;
         let start = Instant::now();
 
         debug!(
@@ -1471,6 +2600,12 @@ impl IrohBackend {
 
         // First, try to get it from the cache for optimized performance.
         if let Some(cached_data) = self.get_from_cache(hash_str).await {
+            preflight_blob_size(cached_data.len() as u64, "blob read from the memory cache")
+                .map_err(|error| {
+                    GuardianError::Other(format!(
+                        "Cached blob exceeds the in-memory limit: {error}"
+                    ))
+                })?;
             debug!(
                 "Cache hit! Returning content of {} bytes from the cache",
                 cached_data.len()
@@ -1498,22 +2633,34 @@ impl IrohBackend {
 
         // Parse the hexadecimal hash into an IrohHash.
         let hash = Self::parse_hash(hash_str)?;
+        // Protect the generic cat path as one operation: an existing local blob
+        // cannot be swept during its read, and a missing blob fetched from a peer
+        // cannot be swept between import completion and materialization.
+        let _protection = self.protect_hash(hash).await?;
 
         // Fetch the content from the store.
-        let buffer_vec = {
+        let buffer_bytes = {
             let local = {
                 let store_guard = self.store.read().await;
                 match store_guard.as_ref() {
                     Some(StoreType::Fs(store)) => {
-                        let reader = store.reader(hash);
-                        match read_to_end_bounded(reader, "blob read from the local store").await {
-                            Ok(buffer) => Some(Bytes::from(buffer)),
-                            // Local miss. Do NOT fail yet — fall through to a P2P
-                            // fetch below. This is the whole availability fix:
-                            // previously `cat` was local-only, so a doc entry whose
-                            // blob this node never pulled was permanently unreadable
-                            // here even though peers were holding the bytes.
-                            Err(_) => None,
+                        if !store
+                            .blobs()
+                            .has(hash)
+                            .await
+                            .map_err(Self::map_iroh_error)?
+                        {
+                            None
+                        } else {
+                            Some(
+                                read_blob_bounded(store, hash, "blob read from the local store")
+                                    .await
+                                    .map_err(|error| {
+                                        GuardianError::Other(format!(
+                                            "Error reading blob from the local store: {error}"
+                                        ))
+                                    })?,
+                            )
                         }
                     }
                     None => {
@@ -1525,7 +2672,7 @@ impl IrohBackend {
             }; // store lock released before any network work
 
             match local {
-                Some(b) => b.to_vec(),
+                Some(bytes) => bytes,
                 None => {
                     // A doc ENTRY replicates independently of whether any peer can
                     // still serve its BLOB, and iroh-docs' own retry gives up for
@@ -1539,15 +2686,14 @@ impl IrohBackend {
                     // BLAKE3-verified on arrival, so a wrong or hostile answer
                     // cannot be accepted as this hash.
                     debug!(
-                        "Content {} missing locally — attempting P2P fetch from connected peers",
+                        "Content {} missing locally — attempting P2P fetch from known peers",
                         hash_str
                     );
                     self.fetch_blob_from_peers(hash).await?;
                     let store_guard = self.store.read().await;
                     match store_guard.as_ref() {
                         Some(StoreType::Fs(store)) => {
-                            let reader = store.reader(hash);
-                            read_to_end_bounded(reader, "blob fetched from peers")
+                            read_blob_bounded(store, hash, "blob fetched from peers")
                                 .await
                                 .map_err(Self::map_iroh_error)?
                         }
@@ -1569,7 +2715,6 @@ impl IrohBackend {
         // refcounted and `Cursor<Bytes>` is an `AsyncRead`, so the cache and the
         // returned reader can share the same bytes. That clone is half of the
         // 67.9 GB / two-32-GB-mappings state witnessed on fc-bangkok.
-        let buffer_bytes = bytes::Bytes::from(buffer_vec);
         let blob_len = buffer_bytes.len();
         if let Err(e) = self.add_to_cache(hash_str, buffer_bytes.clone()).await {
             warn!("Error adding retrieved content to the cache: {}", e);
@@ -1608,14 +2753,17 @@ impl IrohBackend {
     /// # Arguments
     /// * `hash_str` - BLAKE3 hash in hexadecimal format of the content to pin
     pub async fn pin_add(&self, hash_str: &str) -> Result<()> {
+        self.ensure_accepting_work()?;
         self.execute_with_metrics(async {
+            let _gc_guard = self.gc_gate.clone().read_owned().await;
             debug!("Pinning object {} via Iroh using persistent Tags", hash_str);
 
             // Get a reference to the store.
             let store_arc = self.get_store().await?;
 
-            // Parse the hexadecimal hash.
+            // Parse and canonicalize the hash before deriving durable state.
             let hash = Self::parse_hash(hash_str)?;
+            let canonical_hash = Self::hash_to_string(&hash);
             let hash_and_format = HashAndFormat::new(hash, BlobFormat::Raw);
 
             // Check that the content exists and create a TempTag for protection during the operation.
@@ -1644,8 +2792,8 @@ impl IrohBackend {
                 let store_lock = store_arc.read().await;
                 match store_lock.as_ref().unwrap() {
                     StoreType::Fs(fs_store) => {
-                        // Create a permanent tag with a name based on the hash.
-                        let tag_name = format!("pin-{}", hash_str);
+                        // Create a canonical permanent tag based on the parsed hash.
+                        let tag_name = format!("pin-{canonical_hash}");
                         let tag = Tag::from(tag_name.as_str());
 
                         // Set the tag in the store - this persists to disk.
@@ -1664,7 +2812,7 @@ impl IrohBackend {
             // Add it to the local cache for fast tracking.
             {
                 let mut pinned = self.pinned_cache.lock().await;
-                pinned.insert(hash_str.to_string(), PinType::Direct);
+                pinned.insert(canonical_hash.clone(), PinType::Direct);
             }
 
             info!(
@@ -1684,47 +2832,79 @@ impl IrohBackend {
     /// # Arguments
     /// * `hash_str` - BLAKE3 hash in hexadecimal format of the content to unpin
     pub async fn pin_rm(&self, hash_str: &str) -> Result<()> {
+        self.ensure_accepting_work()?;
         self.execute_with_metrics(async {
+            let _gc_guard = self.gc_gate.clone().read_owned().await;
             debug!(
                 "Unpinning object {} via Iroh by removing the permanent Tag",
                 hash_str
             );
 
-            // First check whether it is pinned in the local cache.
-            let was_cached = {
-                let mut cache = self.pinned_cache.lock().await;
-                cache.remove(hash_str).is_some()
-            };
+            // Validate and canonicalize the hash before deriving its persistent tag name.
+            let hash = Self::parse_hash(hash_str)?;
+            let canonical_hash = Self::hash_to_string(&hash);
 
-            if !was_cached {
-                return Err(GuardianError::Other(format!(
-                    "Object {} was not pinned",
-                    hash_str
-                )));
-            }
-
-            // Get a reference to the store to remove the permanent tag.
+            // The persistent tag database is authoritative. Delete there first,
+            // even when the process-local cache is empty after a restart or a
+            // prior retry. Only update the volatile cache after durable success.
             let store_arc = self.get_store().await?;
-
-            // Remove the permanent tag from the Iroh store.
             {
                 let store_lock = store_arc.read().await;
                 match store_lock.as_ref().unwrap() {
                     StoreType::Fs(fs_store) => {
-                        // Tag name based on the hash (same pattern used in pin_add).
-                        let tag_name = format!("pin-{}", hash_str);
-                        let tag = Tag::from(tag_name.as_str());
+                        #[cfg(debug_assertions)]
+                        if std::env::var("GUARDIAN_PIN_RM_DIAGNOSTIC_ERROR_ONCE").is_ok()
+                            && !PIN_RM_DIAGNOSTIC_ERROR_USED
+                                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(GuardianError::Other(
+                                "injected persistent pin tag deletion error".to_string(),
+                            ));
+                        }
 
-                        // Remove the tag from the store using delete_tag.
-                        fs_store
-                            .tags()
-                            .delete(tag.as_ref())
-                            .await
-                            .map_err(Self::map_iroh_error)?;
+                        use futures::StreamExt;
 
-                        debug!("Permanent tag '{}' removed from the store", tag_name);
+                        let canonical_tag = Tag::from(format!("pin-{canonical_hash}").as_str());
+                        let mut tags_to_delete = vec![canonical_tag];
+                        let mut tags =
+                            fs_store.tags().list().await.map_err(Self::map_iroh_error)?;
+                        while let Some(tag_info) = tags.next().await {
+                            let tag_info = tag_info.map_err(Self::map_iroh_error)?;
+                            let Some(suffix) = tag_info.name.as_ref().strip_prefix(b"pin-") else {
+                                continue;
+                            };
+                            let Ok(suffix) = std::str::from_utf8(suffix) else {
+                                continue;
+                            };
+                            if Self::parse_hash(suffix).ok() != Some(hash)
+                                || tags_to_delete
+                                    .iter()
+                                    .any(|tag| tag.as_ref() == tag_info.name.as_ref())
+                            {
+                                continue;
+                            }
+                            // Migrate every pre-canonicalization case spelling of
+                            // this parsed hash, not only the spelling supplied by
+                            // the current caller.
+                            tags_to_delete.push(tag_info.name);
+                        }
+                        for tag in tags_to_delete {
+                            // Tag deletion is idempotent: an already-absent tag is
+                            // the requested durable state and therefore succeeds.
+                            fs_store
+                                .tags()
+                                .delete(tag.as_ref())
+                                .await
+                                .map_err(Self::map_iroh_error)?;
+                            debug!("Permanent tag '{}' removed from the store", tag);
+                        }
                     }
                 }
+            }
+
+            {
+                let mut pinned = self.pinned_cache.lock().await;
+                pinned.retain(|cached_hash, _| Self::parse_hash(cached_hash).ok() != Some(hash));
             }
 
             info!(
@@ -2027,6 +3207,54 @@ impl IrohBackend {
         Ok(metrics)
     }
 
+    pub async fn gc_health(&self) -> GcHealth {
+        let finished = {
+            match self.gc_task.try_lock() {
+                Ok(mut task) if task.as_ref().is_some_and(SupervisedGcTask::is_finished) => {
+                    task.take()
+                }
+                _ => None,
+            }
+        };
+        if let Some(mut task) = finished {
+            let error = match (&mut task.handle).await {
+                Ok(()) => "Guardian blob GC supervisor stopped unexpectedly".to_string(),
+                Err(join_error) => {
+                    format!("Guardian blob GC supervisor failed: {join_error}")
+                }
+            };
+            let mut health = self.gc_health.write().await;
+            if !health.shutting_down {
+                health.running = false;
+                health.failed_runs = health.failed_runs.saturating_add(1);
+                health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+                health.active_deadline_ms = None;
+                health.overdue = false;
+                health.stuck = false;
+                health.cancellation_requested_ms = None;
+                health.last_error = Some(error);
+            }
+        }
+
+        // Shutdown deliberately holds this mutex while awaiting the supervisor by
+        // mutable reference. A health read must remain non-blocking so an unresolved
+        // pass stays observable as running/overdue/stuck.
+        let missing = self
+            .gc_task
+            .try_lock()
+            .ok()
+            .is_some_and(|task| task.is_none());
+        let mut health = self.gc_health.write().await;
+        if health.enabled && !health.shutting_down && missing {
+            health.running = false;
+            health.consecutive_failures = health.consecutive_failures.max(1);
+            health
+                .last_error
+                .get_or_insert_with(|| "Guardian blob GC supervisor task stopped".to_string());
+        }
+        health.clone()
+    }
+
     pub async fn health_check(&self) -> Result<HealthStatus> {
         let start = Instant::now();
         let mut checks = Vec::new();
@@ -2080,6 +3308,79 @@ impl IrohBackend {
                 "Error accessing metrics".to_string()
             },
         });
+
+        // Check 4: supervised blob collector.
+        let gc = self.gc_health().await;
+        let now_ms = unix_time_ms();
+        let deadline_overdue = gc.overdue
+            || (gc.running
+                && gc
+                    .active_deadline_ms
+                    .is_some_and(|deadline| now_ms > deadline));
+        let heartbeat_stale = gc.running
+            && gc.last_heartbeat_ms.is_none_or(|heartbeat| {
+                now_ms.saturating_sub(heartbeat) > Duration::from_secs(90).as_millis() as u64
+            });
+        let shutdown_stopped = gc.shutting_down && !gc.running && !gc.stuck && !deadline_overdue;
+        let gc_check = !gc.enabled
+            || shutdown_stopped
+            || (!gc.shutting_down
+                && gc.consecutive_failures == 0
+                && !gc.stuck
+                && !deadline_overdue
+                && !heartbeat_stale);
+        checks.push(HealthCheck {
+            name: "blob_gc".to_string(),
+            passed: gc_check,
+            message: if !gc.enabled {
+                "Blob GC disabled by GUARDIAN_GC_SECS=0".to_string()
+            } else if gc.stuck {
+                format!(
+                    "Blob GC pass is stuck after cancellation (running={}, cancellation_requested_ms={:?}, active_deadline_ms={:?}, overdue_since_ms={:?}, last heartbeat {:?})",
+                    gc.running,
+                    gc.cancellation_requested_ms,
+                    gc.active_deadline_ms,
+                    gc.overdue_since_ms,
+                    gc.last_heartbeat_ms
+                )
+            } else if deadline_overdue {
+                format!(
+                    "Blob GC active pass exceeded deadline {:?} (overdue_since_ms={:?}, last heartbeat {:?})",
+                    gc.active_deadline_ms,
+                    gc.overdue_since_ms,
+                    gc.last_heartbeat_ms
+                )
+            } else if gc.shutting_down && gc.running {
+                format!(
+                    "Blob GC shutdown is waiting for active pass termination (cancellation_requested_ms={:?}, active_deadline_ms={:?})",
+                    gc.cancellation_requested_ms,
+                    gc.active_deadline_ms
+                )
+            } else if gc.shutting_down {
+                "Blob GC stopped with the backend".to_string()
+            } else if heartbeat_stale {
+                format!(
+                    "Blob GC heartbeat is stale (last heartbeat {:?})",
+                    gc.last_heartbeat_ms
+                )
+            } else if let Some(error) = gc.last_error.as_deref() {
+                format!(
+                    "Blob GC retrying after {} consecutive failures: {}",
+                    gc.consecutive_failures, error
+                )
+            } else {
+                format!(
+                    "Blob GC healthy (running={}, successful_runs={}, legacy_tags_removed={}, last_heartbeat_ms={:?})",
+                    gc.running,
+                    gc.successful_runs,
+                    gc.legacy_tags_removed,
+                    gc.last_heartbeat_ms
+                )
+            },
+        });
+        if !gc_check {
+            healthy = false;
+        }
 
         let response_time = start.elapsed();
 

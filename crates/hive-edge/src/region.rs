@@ -210,6 +210,39 @@ pub struct NodeInfo {
     /// (deliberately no silent fallback to a node that cannot serve).
     #[serde(default)]
     pub wasm_runtime: Option<bool>,
+    /// Can this node actually EXECUTE a `Runtime::Bun` function — i.e. does a
+    /// `bun` binary exist on the filesystem the function's `start_cmd` is
+    /// spawned against? Probed at boot (`hive-cloud`'s `detect_bun_runtime`),
+    /// backend-aware for the identical reason `wasm_runtime` is: a Firecracker
+    /// cell execs inside the microVM GUEST rootfs, a Mock cell execs against
+    /// the host, and Litebox can never answer `true` regardless of what is
+    /// staged — its pinned upstream syscall shim panics
+    /// (`unimplemented!()`) on Bun's own boot-time
+    /// `readlink("/proc/self/fd/3")` probe, so advertising capability there
+    /// would turn every Bun cold start into an uncontrolled guest panic
+    /// instead of an honest placement refusal.
+    ///
+    /// `None` = NOT REPORTED, and here that is deliberately treated as NOT
+    /// CAPABLE rather than as unknown-so-admit — the same asymmetry
+    /// `wasm_runtime` documents above and for the identical reason: a peer
+    /// that does not report this field predates Bun capability probing
+    /// entirely, on a rootfs built before `bun` was ever staged into it. It
+    /// is KNOWN-incapable, not unknown. Admitting it would hand every Bun
+    /// deployment to a node guaranteed to ENOENT on every cold start,
+    /// forever.
+    #[serde(default)]
+    pub bun_runtime: Option<bool>,
+    /// Runtime-artifact staging protocol implemented by this node. Source-built
+    /// functions require protocol v1 so host static roots and guest workdirs are
+    /// interpreted separately and delivery is gated by backend need. `None` is a
+    /// pre-upgrade node and is deliberately not capable of hosting those builds.
+    #[serde(default)]
+    pub runtime_artifact_protocol: Option<u16>,
+    /// Repository-command isolation protocol implemented and live-probed on this
+    /// node. `None` and unknown versions are ineligible: old peers execute builds
+    /// on the root host and must never receive a source build as fallback.
+    #[serde(default)]
+    pub build_isolation_protocol: Option<u16>,
     /// Marketing model name of the first GPU (e.g. "Tesla T4"); hosts are
     /// homogeneous in practice, and a mixed host still reports a usable name.
     #[serde(default)]
@@ -551,25 +584,24 @@ impl NodeRegistry {
         me.gpu_free_mb = gpu_free_mb;
     }
 
-    /// Refresh whether this node can execute `Runtime::Wasmer` functions.
+    /// Refresh the three runtime capabilities derived from this node's active
+    /// backend and image under one write lock.
     ///
-    /// Refreshed on a timer, not only at boot, because the underlying fact moves
-    /// UNDER a running process in both directions and each direction is a real
-    /// fault. Baking wasmer into the guest rootfs writes the capability marker
-    /// while `hive-node` keeps running, so a boot-only value left the node
-    /// advertising `false` after a successful bake — the operator sees ansible
-    /// report `changed`, the marker assertion pass, and every Wasmer deployment
-    /// still refused, with nothing anywhere saying "restart me". The reverse is
-    /// worse: any later `build-rootfs.sh` run WITHOUT `WASMER_TARBALL` (a
-    /// re-provision, a base-image refresh) removes the marker, and a boot-only
-    /// value would keep advertising `true` for an image whose guest no longer has
-    /// the binary — placement then routes Wasmer work to a node that can only
-    /// fail it, which is precisely the blocker the capability gate exists to
-    /// prevent. The probe is one `Path::exists()` on firecracker and a PATH scan
-    /// otherwise, so re-running it on the existing refresh tick costs nothing.
-    pub fn set_self_wasm_runtime(&self, wasm_runtime: Option<bool>) {
+    /// All three facts move under a running process: a rootfs publication can
+    /// add, remove, or replace its exact proof and Wasmer/Bun markers.
+    /// Publishing them in separate lock acquisitions lets gossip observe a
+    /// tuple that no single backend/image observation produced, so callers
+    /// must always replace the tuple atomically through this method.
+    pub fn set_self_runtime_capabilities(
+        &self,
+        wasm_runtime: Option<bool>,
+        bun_runtime: Option<bool>,
+        runtime_artifact_protocol: Option<u16>,
+    ) {
         let mut me = self.me.write();
         me.wasm_runtime = wasm_runtime;
+        me.bun_runtime = bun_runtime;
+        me.runtime_artifact_protocol = runtime_artifact_protocol;
     }
 
     /// Refresh this node's restart-audit counters (see `hive-cloud`'s
@@ -1022,11 +1054,14 @@ mod tests {
     fn node(id: &str, region: &str, latency: u64, healthy: bool) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
-            // These fixtures exercise region/latency selection, never Wasmer
+            // These fixtures exercise region/latency selection, never Wasmer/Bun
             // placement — `None` is the honest value here (it is exactly what a
             // node that never ran the probe reports) and keeps them on the
-            // not-capable path, which is what a non-Wasmer test node is.
+            // not-capable path, which is what a non-Wasmer/non-Bun test node is.
             wasm_runtime: None,
+            bun_runtime: None,
+            runtime_artifact_protocol: None,
+            build_isolation_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: id.into(),

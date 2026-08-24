@@ -1,10 +1,7 @@
 ---
-# Runs ONLY on the elected build host for one glibc group (see
-# playbooks/parallel-deploy.yml). Syncs source, builds hive-cloud release,
-# and packages the resulting binary + its sha256 for fan-out -- mirrors
-# scripts/roll-backend-fleet.sh's build() step, but expressed as a role task
-# file instead of a bash function so ansible drives the parallel-build /
-# serial-restart split.
+# Runs only on the elected build host for one glibc group. It builds the
+# controller and guest agent from one source snapshot and fetches both exact
+# artifacts for fan-out; restart.yml publishes them serially.
 
 - name: Ensure the source directory exists on the build host
   ansible.builtin.file:
@@ -22,10 +19,9 @@
       - "--exclude=.git"
   register: _synced
 
-# rsync -a preserves local mtimes, so a build that finishes AFTER a sync
-# lands can leave cargo fingerprints newer than the fresh sources and
-# silently skip rebuilding (AGENTS.md "Fleet-roll gotcha"). Touch whenever
-# the sync actually changed anything.
+# rsync -a preserves local mtimes, so a build that finishes after a sync lands
+# can leave cargo fingerprints newer than the fresh sources and silently skip
+# rebuilding. Touch whenever the sync actually changed anything.
 - name: Touch synced sources so cargo cannot skip the rebuild
   ansible.builtin.command:
     cmd: find crates -name "*.rs" -exec touch {} +
@@ -51,36 +47,40 @@
     - Cargo.toml
     - Cargo.lock
 
-# The no-op detector's input on the build host: what this host had BEFORE
-# cargo ran. Cargo does not rewrite an up-to-date binary, so source that did
-# not change yields the SAME sha here and in the canonical artifact -- which is
-# exactly how playbooks/parallel-deploy.yml's verification pass tells "deployed
-# new code" from "deployed nothing and reported ok=".
-- name: Record the binary this host had BEFORE the build
+# Record what this host had before Cargo/packaging. The no-op detector must
+# count an agent-only release as real content movement even when hive-cloud's
+# own bytes happen not to change.
+- name: Record the controller this host had before the build
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
     get_checksum: true
     checksum_algorithm: sha256
   register: _pre_build
 
-- name: Publish the pre-build sha for verification
+- name: Record the installed cell-agent this host had before the build
+  ansible.builtin.stat:
+    path: "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _pre_agent_build
+
+- name: Publish the pre-build digests for verification
   ansible.builtin.set_fact:
     hive_pre_deploy_sha: "{{ _pre_build.stat.checksum | default('') }}"
+    hive_pre_agent_sha: "{{ _pre_agent_build.stat.checksum | default('') }}"
 
-# `-p hive-cell-agent` alongside hive-cloud: the agent is the guest's PID1 and
-# is a SEPARATE binary that this rollout previously never built, so agent-side
-# code could be committed, merged and "rolled out" while no node had it — the
-# guest-side NODE_RUNTIME_MISSING preflight added for the Wasmer runtime shipped
-# exactly that way, compiled and undelivered. The role next door already names
-# this gap ("add `-p hive-cell-agent` to hive_platform's build task if you need
-# it here").
-#
-# Building it does not by itself reach a running guest: the agent is baked INTO
-# the rootfs image, so it lands only on the next `build-rootfs.sh` run, which
-# reads it from AGENT_BIN=/usr/local/bin/hive-cell-agent. Building + installing
-# it here is what makes that rebuild pick up CURRENT code instead of whatever
-# bootstrap-guest.sh happened to compile at node bring-up.
-- name: Build hive-cloud + hive-cell-agent (release) on the group's build host
+# Cargo overwrites hive_binary_path in place on the build host before the serial
+# restart phase. Followers get an .old-roll backup there, so snapshot this host
+# first too.
+- name: Back up the build host's current controller before cargo overwrites it
+  ansible.builtin.copy:
+    src: "{{ hive_binary_path }}"
+    dest: "{{ hive_binary_path }}.old-roll"
+    remote_src: true
+    mode: "0755"
+  when: _pre_build.stat.exists | default(false)
+
+- name: Build hive-cloud + hive-cell-agent on this glibc lane
   ansible.builtin.command:
     cmd: cargo build --release -p hive-cloud -p hive-cell-agent
     chdir: "{{ hive_src_dir }}"
@@ -90,59 +90,89 @@
   async: 1800
   poll: 15
 
-- name: Confirm the binary was produced
+- name: Confirm and checksum the canonical controller
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
   register: _bin
-  failed_when: not _bin.stat.exists
+  failed_when: >-
+    not (_bin.stat.exists | default(false)) or
+    (_bin.stat.checksum | default('') | length) != 64
 
-- name: sha256 the canonical binary
+- name: Confirm and checksum the canonical cell agent
+  ansible.builtin.stat:
+    path: "{{ hive_cargo_target_dir }}/release/hive-cell-agent"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _agent_bin
+  failed_when: >-
+    not (_agent_bin.stat.exists | default(false)) or
+    not (_agent_bin.stat.isreg | default(false)) or
+    (_agent_bin.stat.checksum | default('') | length) != 64
+
+- name: Probe the canonical cell agent's exact protocol fact
   ansible.builtin.command:
-    cmd: "sha256sum {{ hive_binary_path }}"
-  register: _sha
+    argv:
+      - timeout
+      - --signal=TERM
+      - --kill-after=1s
+      - "{{ (hive_cell_agent_protocol_timeout_seconds | default(5) | string) ~ 's' }}"
+      - "{{ hive_cargo_target_dir }}/release/hive-cell-agent"
+      - --agent-protocol-fact
+  register: _agent_protocol_fact
   changed_when: false
 
-- name: Set facts for this build host's artifact
-  ansible.builtin.set_fact:
-    hive_group_build_sha256: "{{ _sha.stdout.split(' ')[0] }}"
+- name: Refuse a canonical agent with a mismatched protocol contract
+  vars:
+    _fact: "{{ _agent_protocol_fact.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _fact.keys() | sort == ['agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol']
+      - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
+      - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
+    fail_msg: >-
+      The glibc lane built a cell agent whose exact rootfs schema,
+      runtime-artifact protocol, wire protocol or capability set disagrees with
+      the release contract. Nothing from this lane may be fetched or published.
 
-# COMPRESS BEFORE IT CROSSES THE OPERATOR'S UPLINK. Every byte of this rollout
-# goes through the control host twice — once down on this fetch, then once up
-# per target on the push — and both legs are the operator machine's own link.
-# push.yml's comment already names that as the residential-uplink problem
-# roll-backend-fleet.sh exists to avoid, and throttles the push half; the FETCH
-# half had no mitigation at all, and it is the half that hung: a ~117 MiB pull
-# from the Bangkok build host sat with the SSH session alive and zero bytes
-# landing for over an hour, twice, blocking the whole fleet rollout while the
-# Virginia build host's identical fetch completed fine.
-#
-# Measured, not assumed: gzip -6 on this binary is 3.91x (257 MiB -> 66 MiB on a
-# debug build; the release binary is ~117 MiB -> ~30 MiB). That is ~30 MiB down
-# and 6x~30 MiB up instead of 117 and 6x117 — the same 4x off both legs, for the
-# cost of a few seconds of CPU on hosts that just spent minutes compiling.
-#
-# The integrity check is UNCHANGED and still covers the real artifact:
-# `hive_group_build_sha256` is the sha of the UNCOMPRESSED binary, taken above,
-# and push.yml verifies it after decompressing on the target. So compression is
-# purely a transport concern and cannot mask a corrupted transfer.
-- name: Compress the canonical binary for transport (on the build host)
+- name: Set facts for this build host's artifact pair
+  ansible.builtin.set_fact:
+    hive_group_build_sha256: "{{ _bin.stat.checksum }}"
+    hive_group_cell_agent_sha256: "{{ _agent_bin.stat.checksum }}"
+    hive_group_cell_agent_protocol_fact: "{{ _agent_protocol_fact.stdout | from_json }}"
+
+# Compress before either artifact crosses the operator's uplink. Integrity
+# remains over the uncompressed executable bytes and is rechecked after every
+# transfer and installation.
+- name: Compress the canonical controller for transport
   ansible.builtin.shell:
     cmd: "gzip -6 -c {{ hive_binary_path }} > {{ hive_binary_path }}.gz"
   changed_when: true
 
-- name: Fetch the COMPRESSED binary to the control host
+- name: Compress the canonical cell agent for transport
+  ansible.builtin.shell:
+    cmd: >-
+      gzip -6 -c {{ hive_cargo_target_dir }}/release/hive-cell-agent >
+      {{ hive_cargo_target_dir }}/release/hive-cell-agent.gz
+  changed_when: true
+
+- name: Fetch the compressed controller to the control host
   ansible.builtin.fetch:
     src: "{{ hive_binary_path }}.gz"
     dest: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}.gz"
     flat: true
 
-# The cr-sqlite loadable extension rides the same fan-out: the browser_db
-# lanes (CRR exchange + browser_db_rest) hard-refuse every round without it,
-# and a backend-only roll otherwise ships no extension at all (witnessed
-# fleet-wide 2026-08-18: "replica open failed" on every node while records
-# looked healthy). Built from the vendored pin with the TOP-LEVEL `make`
-# (the `loadable` target exists only in core/) — a no-op when the pin is
-# unchanged. Per-glibc-group like the binary, for the same reason.
+- name: Fetch the compressed cell agent to the control host
+  ansible.builtin.fetch:
+    src: "{{ hive_cargo_target_dir }}/release/hive-cell-agent.gz"
+    dest: "{{ hive_artifact_root }}/hive-cell-agent-{{ hive_glibc_group }}.gz"
+    flat: true
+
+# The cr-sqlite extension rides the same fan-out. It is built from the vendored
+# pin with the top-level make target and remains per-glibc-group.
 - name: Build the cr-sqlite loadable extension on the group's build host
   ansible.builtin.command:
     cmd: make

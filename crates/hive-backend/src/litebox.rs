@@ -52,14 +52,15 @@
 //! a sandboxed `cat` could not read an unstaged file that genuinely existed
 //! on the host at the exact same path. The fix, also proven live: pass
 //! `--initial-files=<tar>` containing (a) the target's full `ldd` closure at
-//! their absolute paths and (b) the deployment's own file tree at paths
-//! relative to its own root — the guest's default cwd IS that root, so
-//! `node server.js` plus `require()` of local files/`node_modules` resolves
-//! exactly like a host process rooted at the build dir would, no path
-//! rewriting needed. [`LiteboxBackend::deliver_build`]/`start_function`
-//! implement this; there is no compile-cache directory across cold starts
-//! for the same reason (the guest fs is a fresh in-memory snapshot every
-//! process, nothing persists back to the host).
+//! their absolute paths and (b) the deployment's own file tree under
+//! `/workspace`. The runner's guest cwd is `/` and exposes no cwd option, so
+//! `start_function` validates each Node/Bun main entry against the immutable
+//! app archive and passes its exact absolute `/workspace[/app]/...` path; the
+//! preload then changes the application cwd to the validated guest workdir
+//! before tenant module bytes execute. [`LiteboxBackend::deliver_build`]/
+//! `start_function` implement this; there is no compile-cache directory across
+//! cold starts for the same reason (the guest fs is a fresh in-memory snapshot
+//! every process, nothing persists back to the host).
 //!
 //! ## Networking
 //!
@@ -242,15 +243,31 @@
 //! verification this mirrors from the PVM precedent (`AGENTS.md` "PVM
 //! kernels (KVM without hardware virt)").
 
-use crate::{CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink};
+use crate::{
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, RuntimeArtifactSpec,
+};
+use anyhow::Context as _;
 use async_trait::async_trait;
-use hive_core::{now_ms, BuildJob, BuildResult, CellId};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use hive_core::{now_ms, BuildJob, BuildResult, CellId, RuntimeArtifactIdentity};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::{File, OpenOptions};
+use std::io::{Read as StdRead, Write as StdWrite};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::process::Command;
+use std::time::{Duration, SystemTime};
+#[cfg(unix)]
+use std::{
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Backend config knobs.
@@ -260,10 +277,9 @@ pub struct LiteboxConfig {
     /// to `HIVE_LITEBOX_RUNNER_BIN` if set, else `/usr/local/bin/litebox-runner`
     /// (where `ansible/roles/litebox` installs it).
     pub runner_bin: PathBuf,
-    /// Base directory under which per-cell work dirs AND the per-image
-    /// `--initial-files` tar cache live. Ephemeral by design — cells are
-    /// single-use for builds and re-provisioned from `deliver_build`'s
-    /// durable tar artifact for functions — mirrors `MockConfig::root`.
+    /// Ephemeral base directory for per-cell runtime scratch and bring-up
+    /// probe files. Durable application/runtime archives live under
+    /// `cache_root`, never here.
     pub root: PathBuf,
     /// Shared build cache root, passed through to the same
     /// `crate::mock::run_build_process` build pipeline `MockBackend` uses.
@@ -287,7 +303,7 @@ impl Default for LiteboxConfig {
             root: std::env::temp_dir().join("hive-litebox-cells"),
             // `cache_root` is NOT scratch: it holds the DELIVERED build tar,
             // the one artifact `start_function` cannot run without
-            // (`ensure_combined_tar` bails when it is missing). Under
+            // (`ensure_combined_tar_locked` bails when it is missing). Under
             // `temp_dir()` a reboot or a tmp sweep deletes it while the
             // replicated deployment RECORD survives, so the node then refuses
             // to start a deployment it still believes it hosts — the exact
@@ -425,11 +441,20 @@ async fn delete_litebox_link(tun_dev: &str) {
         .await;
 }
 
+struct LiteboxFunctionProcess {
+    child: tokio::process::Child,
+    // Keep the exact immutable archive open in the parent for the runner's
+    // whole lifetime. The child also inherits its own duplicate, but this
+    // prevents parent-side descriptor reuse before termination/wait and makes
+    // ownership explicit beside the process that consumes it.
+    _initial_files: File,
+}
+
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
     /// Long-lived function processes (the litebox runner itself — guest and
     /// runner are one process), keyed by cell, killed on terminate.
-    funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
+    funcs: Arc<AsyncMutex<HashMap<CellId, LiteboxFunctionProcess>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
     /// Per-cell host-container ownership. Container cells bypass litebox and run
@@ -445,6 +470,10 @@ pub struct LiteboxBackend {
     /// real collision if an old cell at that index is somehow still alive,
     /// which `terminate` prevents).
     net_idx: Arc<std::sync::atomic::AtomicUsize>,
+    /// Serializes every reference/artifact publication in this process. A
+    /// delivery and a cold start must never write or reap the same immutable
+    /// generation concurrently; request-driven acquisition stays outside it.
+    artifact_lock: Arc<AsyncMutex<()>>,
     sampler: Arc<crate::CpuSampler>,
 }
 
@@ -463,6 +492,779 @@ const NODE_BIND_SHIM_JS: &str = include_str!("litebox-bind-shim.js");
 /// every launch failed with `Cannot find module
 /// '/tmp/hive-litebox-cells/hive-litebox-bind-shim.js'`.
 const GUEST_BIND_SHIM_PATH: &str = "/hive-litebox-bind-shim.js";
+const GUEST_RUNTIME_GUARD_PATH: &str = "/hive-litebox-runtime-guard.js";
+const INITIAL_FILES_ALIAS_NAME: &str = "initial-files.tar";
+const DELIVERED_WORKDIR: &str = "/workspace";
+const LITEBOX_ARTIFACT_SCHEMA: u16 = 1;
+const RUNTIME_GUARD_EXIT_CODE: i32 = 78;
+const MAX_REFERENCE_BYTES: u64 = 1024 * 1024;
+const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_PACKAGE_SCRIPTS: usize = 256;
+const MAX_PACKAGE_SCRIPT_BYTES: usize = 16 * 1024;
+const MAX_GUEST_ENV_BYTES: usize = 1024 * 1024;
+const DEFAULT_ARTIFACT_GC_GRACE_SECS: u64 = 600;
+const DEFAULT_ARTIFACT_GC_MAX_REAP_FRACTION: f64 = 0.5;
+
+/// Runs before tenant code in both Node and Bun. The host has already verified
+/// the archive hash; this is the guest-side half of the handshake, proving that
+/// litebox actually mounted the same protocol/id/content marker before the bind
+/// shim changes cwd or any repository byte executes.
+const RUNTIME_GUARD_JS: &str = r#"'use strict';
+const fs = require('fs');
+function refuse(message) {
+  try { process.stderr.write(`litebox runtime artifact refusal: ${message}\n`); } catch (_) {}
+  process.exit(78);
+}
+try {
+  const marker = JSON.parse(fs.readFileSync('/workspace/.hive-runtime-artifact-v1.json', 'utf8'));
+  const protocol = Number(process.env.HIVE_RUNTIME_ARTIFACT_PROTOCOL);
+  if (marker.protocol !== protocol ||
+      marker.id !== process.env.HIVE_RUNTIME_ARTIFACT_ID ||
+      marker.content_sha256 !== process.env.HIVE_RUNTIME_ARTIFACT_SHA256) {
+    refuse('mounted identity does not match the host expectation');
+  }
+} catch (error) {
+  refuse(error && error.message ? error.message : String(error));
+}
+require('/hive-litebox-bind-shim.js');
+"#;
+
+static ARTIFACT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeArchiveReference {
+    source_sha256: String,
+    archive_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteboxImageReference {
+    schema: u16,
+    image: String,
+    identity: RuntimeArtifactIdentity,
+    guest_workdir: String,
+    app_archive_sha256: String,
+    #[serde(default)]
+    package_scripts: BTreeMap<String, String>,
+    #[serde(default)]
+    next_entry: Option<String>,
+    #[serde(default)]
+    runtimes: BTreeMap<String, RuntimeArchiveReference>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectRuntime {
+    Node,
+    Bun,
+}
+
+struct DirectLaunch {
+    runtime: DirectRuntime,
+    bin: PathBuf,
+    args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ArtifactArea {
+    Apps,
+    Runtimes,
+    Temporary,
+    Staging,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheEntryState {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    length: u64,
+    modified: SystemTime,
+    modified_nanos: i64,
+}
+
+impl CacheEntryState {
+    fn is_regular(self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    }
+
+    fn is_directory(self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct ArtifactDirectory {
+    path: PathBuf,
+    descriptor: File,
+    identity: DirectoryIdentity,
+}
+
+impl ArtifactDirectory {
+    fn verify_binding(&self) -> anyhow::Result<()> {
+        let current = open_directory_tree(&self.path, false)?;
+        anyhow::ensure!(
+            current.identity == self.identity,
+            "litebox artifact directory identity changed at {}",
+            self.path.display()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn open_regular(&self, name: &OsStr) -> std::io::Result<File> {
+        let name = cache_component(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn create_file(&self, name: &OsStr, mode: u32) -> std::io::Result<File> {
+        let name = cache_component(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    #[cfg(unix)]
+    fn child_names(&self) -> anyhow::Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(descriptor_directory_path(&self.descriptor))? {
+            names.push(entry?.file_name());
+        }
+        names.sort();
+        Ok(names)
+    }
+}
+
+struct ArtifactDirectories {
+    images: ArtifactDirectory,
+    apps: ArtifactDirectory,
+    runtimes: ArtifactDirectory,
+    references: ArtifactDirectory,
+    staging: ArtifactDirectory,
+    temporary: ArtifactDirectory,
+}
+
+impl ArtifactDirectories {
+    fn prepare(cache_root: &Path) -> anyhow::Result<Self> {
+        let cache = open_directory_tree(cache_root, true)?;
+        let images = open_or_create_directory(&cache, OsStr::new("litebox-images-v1"))?;
+        let apps = open_or_create_directory(&images, OsStr::new("apps"))?;
+        let runtimes = open_or_create_directory(&images, OsStr::new("runtimes"))?;
+        let references = open_or_create_directory(&images, OsStr::new("refs"))?;
+        let staging = open_or_create_directory(&images, OsStr::new(".artifact-staging"))?;
+        let temporary = open_or_create_directory(&images, OsStr::new(".tmp"))?;
+        let directories = Self {
+            images,
+            apps,
+            runtimes,
+            references,
+            staging,
+            temporary,
+        };
+        directories.verify_bindings()?;
+        Ok(directories)
+    }
+
+    fn verify_bindings(&self) -> anyhow::Result<()> {
+        self.images.verify_binding()?;
+        self.apps.verify_binding()?;
+        self.runtimes.verify_binding()?;
+        self.references.verify_binding()?;
+        self.staging.verify_binding()?;
+        self.temporary.verify_binding()?;
+        Ok(())
+    }
+}
+
+struct ArtifactTemp {
+    parent: File,
+    name: OsString,
+    file: File,
+    armed: bool,
+}
+
+impl ArtifactTemp {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ArtifactTemp {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(name) = cache_component(&self.name) {
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+struct ArtifactScratchAllocation {
+    parent: File,
+    name: OsString,
+    armed: bool,
+}
+
+impl Drop for ArtifactScratchAllocation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(name) = cache_component(&self.name) {
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+    }
+}
+
+struct ArtifactScratch {
+    parent: File,
+    name: OsString,
+    directory: File,
+    children: Vec<OsString>,
+}
+
+impl Drop for ArtifactScratch {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            for child in &self.children {
+                if let Ok(name) = cache_component(child) {
+                    unsafe {
+                        libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0);
+                    }
+                }
+            }
+            if let Ok(name) = cache_component(&self.name) {
+                unsafe {
+                    libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cache_component(name: &OsStr) -> std::io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid litebox cache path component",
+        ));
+    }
+    CString::new(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &File) -> anyhow::Result<DirectoryIdentity> {
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "litebox cache descriptor is not a directory"
+    );
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
+    let name = cache_component(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_directory_tree(path: &Path, create: bool) -> anyhow::Result<ArtifactDirectory> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "litebox artifact cache root must be an absolute path: {}",
+        path.display()
+    );
+    let mut descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    let mut walked = PathBuf::from("/");
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            _ => anyhow::bail!(
+                "litebox artifact cache path is not normalized: {}",
+                path.display()
+            ),
+        };
+        walked.push(name);
+        let next = match open_directory_at(&descriptor, name) {
+            Ok(next) => next,
+            Err(error) if create && error.raw_os_error() == Some(libc::ENOENT) => {
+                let name_c = cache_component(name)?;
+                let rc = unsafe { libc::mkdirat(descriptor.as_raw_fd(), name_c.as_ptr(), 0o700) };
+                if rc < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(mkdir_error).with_context(|| {
+                            format!("create litebox artifact directory {}", walked.display())
+                        });
+                    }
+                } else {
+                    descriptor.sync_all().with_context(|| {
+                        format!(
+                            "sync parent after creating litebox artifact directory {}",
+                            walked.display()
+                        )
+                    })?;
+                }
+                open_directory_at(&descriptor, name).with_context(|| {
+                    format!(
+                        "open newly-created litebox artifact directory {}",
+                        walked.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "open no-follow litebox artifact directory {}",
+                        walked.display()
+                    )
+                })
+            }
+        };
+        descriptor = next;
+    }
+    let identity = directory_identity(&descriptor)?;
+    Ok(ArtifactDirectory {
+        path: path.to_path_buf(),
+        descriptor,
+        identity,
+    })
+}
+
+#[cfg(not(unix))]
+fn open_directory_tree(_path: &Path, _create: bool) -> anyhow::Result<ArtifactDirectory> {
+    anyhow::bail!("litebox artifact cache requires no-follow Unix directory descriptors")
+}
+
+#[cfg(unix)]
+fn open_or_create_directory(
+    parent: &ArtifactDirectory,
+    name: &OsStr,
+) -> anyhow::Result<ArtifactDirectory> {
+    let path = parent.path.join(name);
+    let descriptor = match open_directory_at(&parent.descriptor, name) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            let name_c = cache_component(name)?;
+            let rc =
+                unsafe { libc::mkdirat(parent.descriptor.as_raw_fd(), name_c.as_ptr(), 0o700) };
+            if rc < 0 {
+                let mkdir_error = std::io::Error::last_os_error();
+                if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(mkdir_error).with_context(|| {
+                        format!("create litebox artifact directory {}", path.display())
+                    });
+                }
+            } else {
+                parent.descriptor.sync_all().with_context(|| {
+                    format!(
+                        "sync parent after creating litebox artifact directory {}",
+                        path.display()
+                    )
+                })?;
+            }
+            open_directory_at(&parent.descriptor, name).with_context(|| {
+                format!(
+                    "open newly-created litebox artifact directory {}",
+                    path.display()
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open no-follow litebox artifact directory {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    let identity = directory_identity(&descriptor)?;
+    anyhow::ensure!(
+        identity.device == parent.identity.device,
+        "litebox artifact child directory crosses a filesystem boundary at {}",
+        path.display()
+    );
+    Ok(ArtifactDirectory {
+        path,
+        descriptor,
+        identity,
+    })
+}
+
+#[cfg(not(unix))]
+fn open_or_create_directory(
+    _parent: &ArtifactDirectory,
+    _name: &OsStr,
+) -> anyhow::Result<ArtifactDirectory> {
+    anyhow::bail!("litebox artifact cache requires no-follow Unix directory descriptors")
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_directory_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_directory_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+}
+
+fn read_bounded_file(mut file: File, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file(),
+        "litebox cache entry is not a regular file"
+    );
+    anyhow::ensure!(
+        before.len() <= max_bytes,
+        "litebox cache entry exceeds {max_bytes} bytes"
+    );
+    let length = usize::try_from(before.len()).context("litebox cache entry is too large")?;
+    let mut bytes = vec![0_u8; length];
+    file.read_exact(&mut bytes)?;
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut extra)? == 0,
+        "litebox cache entry grew while reading"
+    );
+    let after = file.metadata()?;
+    #[cfg(unix)]
+    anyhow::ensure!(
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec(),
+        "litebox cache entry identity changed while reading"
+    );
+    Ok(bytes)
+}
+
+async fn sha256_open_file(file: &File) -> anyhow::Result<String> {
+    let file = file.try_clone()?;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let before = file.metadata()?;
+        anyhow::ensure!(before.is_file(), "litebox artifact is not a regular file");
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 128 * 1024];
+        let mut offset = 0_u64;
+        while offset < before.len() {
+            let take = (before.len() - offset).min(buffer.len() as u64) as usize;
+            let mut filled = 0usize;
+            while filled < take {
+                let read = file.read_at(&mut buffer[filled..take], offset + filled as u64)?;
+                anyhow::ensure!(read > 0, "litebox artifact shrank while hashing");
+                filled += read;
+            }
+            hasher.update(&buffer[..take]);
+            offset += take as u64;
+        }
+        let mut extra = [0_u8; 1];
+        anyhow::ensure!(
+            file.read_at(&mut extra, before.len())? == 0,
+            "litebox artifact grew while hashing"
+        );
+        let after = file.metadata()?;
+        #[cfg(unix)]
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "litebox artifact identity changed while hashing"
+        );
+        Ok(hex_sha256(&hasher.finalize()))
+    })
+    .await
+    .context("litebox artifact hashing task failed")?
+}
+
+async fn verify_immutable_open(
+    directory: &ArtifactDirectory,
+    name: &OsStr,
+    expected_sha256: &str,
+) -> anyhow::Result<File> {
+    anyhow::ensure!(valid_sha256(expected_sha256), "invalid expected SHA-256");
+    let file = directory.open_regular(name).with_context(|| {
+        format!(
+            "open immutable litebox artifact {}/{}",
+            directory.path.display(),
+            name.to_string_lossy()
+        )
+    })?;
+    let actual = sha256_open_file(&file).await?;
+    anyhow::ensure!(
+        actual == expected_sha256,
+        "artifact SHA-256 mismatch at {}/{} (got {actual}, expected {expected_sha256})",
+        directory.path.display(),
+        name.to_string_lossy()
+    );
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn rename_cache_entry(
+    source_parent: &File,
+    source_name: &OsStr,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> anyhow::Result<()> {
+    let source_name = cache_component(source_name)?;
+    let destination_name = cache_component(destination_name)?;
+    let rc = unsafe {
+        libc::renameat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("rename litebox cache entry");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_cache_entry(
+    source_parent: &File,
+    source_name: &OsStr,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_name = cache_component(source_name)?;
+    let destination_name = cache_component(destination_name)?;
+    let rc = unsafe {
+        libc::linkat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Hard-link the exact inode named by `source` without consulting its mutable
+/// cache pathname. Linux documents `/proc/self/fd/<fd>` plus
+/// `AT_SYMLINK_FOLLOW` as the unprivileged `linkat` form for this operation.
+#[cfg(target_os = "linux")]
+fn link_open_file_alias(
+    source: &File,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_path = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_name = cache_component(destination_name)?;
+    let rc = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source_path.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn link_open_file_alias(
+    _source: &File,
+    _destination_parent: &File,
+    _destination_name: &OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-bound Litebox archive aliases require Linux procfs",
+    ))
+}
+
+#[cfg(unix)]
+fn unlink_cache_entry(parent: &File, name: &OsStr, directory: bool) -> anyhow::Result<()> {
+    let name = cache_component(name)?;
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("unlink litebox cache entry");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mtime_nanos(stat: &libc::stat) -> i64 {
+    stat.st_mtime_nsec
+}
+
+#[cfg(target_os = "macos")]
+fn stat_mtime_nanos(stat: &libc::stat) -> i64 {
+    stat.st_mtime_nsec
+}
+
+#[cfg(unix)]
+fn cache_entry_state(
+    directory: &ArtifactDirectory,
+    name: &OsStr,
+) -> anyhow::Result<CacheEntryState> {
+    let name = cache_component(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            directory.descriptor.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("lstat litebox cache entry");
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(CacheEntryState {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        mode: stat.st_mode as u32,
+        length: u64::try_from(stat.st_size).unwrap_or(0),
+        modified: SystemTime::UNIX_EPOCH
+            + Duration::from_secs(u64::try_from(stat.st_mtime).unwrap_or(0)),
+        modified_nanos: stat_mtime_nanos(&stat),
+    })
+}
+
+fn artifact_area_directory(
+    directories: &ArtifactDirectories,
+    area: ArtifactArea,
+) -> &ArtifactDirectory {
+    match area {
+        ArtifactArea::Apps => &directories.apps,
+        ArtifactArea::Runtimes => &directories.runtimes,
+        ArtifactArea::Temporary => &directories.temporary,
+        ArtifactArea::Staging => &directories.staging,
+    }
+}
+
+#[cfg(unix)]
+fn remove_cache_entry(
+    directory: &ArtifactDirectory,
+    name: &OsStr,
+    expected: CacheEntryState,
+) -> anyhow::Result<()> {
+    let current = cache_entry_state(directory, name)?;
+    anyhow::ensure!(
+        current == expected,
+        "litebox artifact GC entry changed between scan and removal: {}/{}",
+        directory.path.display(),
+        name.to_string_lossy()
+    );
+    let kind = current.mode & libc::S_IFMT as u32;
+    if current.is_directory() {
+        let nested_file = open_directory_at(&directory.descriptor, name)?;
+        let nested = ArtifactDirectory {
+            path: directory.path.join(name),
+            identity: directory_identity(&nested_file)?,
+            descriptor: nested_file,
+        };
+        anyhow::ensure!(
+            nested.identity.device == current.device && nested.identity.inode == current.inode,
+            "litebox artifact GC directory changed while opening {}/{}",
+            directory.path.display(),
+            name.to_string_lossy()
+        );
+        remove_cache_directory_contents(&nested)?;
+        unlink_cache_entry(&directory.descriptor, name, true)?;
+    } else if kind == libc::S_IFREG as u32 || kind == libc::S_IFLNK as u32 {
+        unlink_cache_entry(&directory.descriptor, name, false)?;
+    } else {
+        anyhow::bail!(
+            "litebox artifact GC refuses special cache entry {}/{}",
+            directory.path.display(),
+            name.to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_cache_directory_contents(directory: &ArtifactDirectory) -> anyhow::Result<()> {
+    for name in directory.child_names()? {
+        let state = cache_entry_state(directory, &name)?;
+        remove_cache_entry(directory, &name, state)?;
+    }
+    Ok(())
+}
 
 impl LiteboxBackend {
     pub fn new(cfg: LiteboxConfig) -> Self {
@@ -473,45 +1275,222 @@ impl LiteboxBackend {
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
             cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
             net_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            artifact_lock: Arc::new(AsyncMutex::new(())),
             sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
 
-    /// HOST scratch path the embedded shim's content is written to before
-    /// being tar'd into a guest-visible tar by `stage_bind_shim` — never
-    /// referenced by `NODE_OPTIONS` directly, see [`GUEST_BIND_SHIM_PATH`].
-    fn bind_shim_host_scratch_path(&self) -> PathBuf {
-        self.cfg.root.join("hive-litebox-bind-shim.js")
+    fn unique_temp_name(&self, label: &str, suffix: &str) -> OsString {
+        let id = ARTIFACT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        OsString::from(format!(
+            ".{label}-{}-{}-{id}{suffix}",
+            std::process::id(),
+            now_ms()
+        ))
     }
 
-    /// Write the embedded shim to the host scratch path, then append it
-    /// into `tar_path` at [`GUEST_BIND_SHIM_PATH`]'s bare filename so it
-    /// becomes visible to the guest at that exact absolute path.
-    async fn stage_bind_shim(&self, tar_path: &Path) -> anyhow::Result<()> {
-        let host_path = self.bind_shim_host_scratch_path();
-        if let Some(parent) = host_path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+    fn allocate_temp_file(
+        &self,
+        temporary: &ArtifactDirectory,
+        label: &str,
+        suffix: &str,
+    ) -> anyhow::Result<ArtifactTemp> {
+        #[cfg(not(unix))]
+        anyhow::bail!("litebox artifact publication requires Unix descriptors");
+        #[cfg(unix)]
+        for _ in 0..256 {
+            let parent = temporary.descriptor.try_clone()?;
+            let name = self.unique_temp_name(label, suffix);
+            match temporary.create_file(&name, 0o600) {
+                Ok(file) => {
+                    return Ok(ArtifactTemp {
+                        parent,
+                        name,
+                        file,
+                        armed: true,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        tokio::fs::write(&host_path, NODE_BIND_SHIM_JS).await?;
-        let dir = host_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("bind shim scratch path has no parent"))?;
-        let name = host_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("bind shim scratch path has no filename"))?;
-        let out = Command::new("tar")
+        anyhow::bail!("could not allocate a unique litebox artifact temp file")
+    }
+
+    fn allocate_scratch_directory(
+        &self,
+        temporary: &ArtifactDirectory,
+        label: &str,
+    ) -> anyhow::Result<ArtifactScratch> {
+        #[cfg(not(unix))]
+        anyhow::bail!("litebox artifact publication requires Unix descriptors");
+        #[cfg(unix)]
+        for _ in 0..256 {
+            let allocation_parent = temporary.descriptor.try_clone()?;
+            let name = self.unique_temp_name(label, "");
+            let name_c = cache_component(&name)?;
+            let rc =
+                unsafe { libc::mkdirat(temporary.descriptor.as_raw_fd(), name_c.as_ptr(), 0o700) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(error).context("create litebox artifact scratch directory");
+            }
+            let mut allocation = ArtifactScratchAllocation {
+                parent: allocation_parent,
+                name: name.clone(),
+                armed: true,
+            };
+            let preflight = cache_entry_state(temporary, &name)?;
+            let directory = open_directory_at(&temporary.descriptor, &name)
+                .context("open litebox artifact scratch directory")?;
+            let identity = directory_identity(&directory)?;
+            anyhow::ensure!(
+                preflight.is_directory()
+                    && identity.device == preflight.device
+                    && identity.inode == preflight.inode,
+                "litebox artifact scratch directory changed while opening"
+            );
+            let scratch = ArtifactScratch {
+                parent: temporary.descriptor.try_clone()?,
+                name,
+                directory,
+                children: Vec::new(),
+            };
+            allocation.armed = false;
+            return Ok(scratch);
+        }
+        anyhow::bail!("could not allocate a unique litebox artifact scratch directory")
+    }
+
+    /// Give Litebox the lexical `.tar` pathname its CLI requires without ever
+    /// reopening the content-addressed cache name. The alias is a hard link
+    /// created from the already-verified open archive descriptor inside a
+    /// private held directory; the returned Drop guard removes both names on
+    /// every success, error, and cancellation path.
+    fn allocate_initial_files_alias(
+        &self,
+        temporary: &ArtifactDirectory,
+        archive: &File,
+    ) -> anyhow::Result<ArtifactScratch> {
+        let source_before = archive.metadata()?;
+        anyhow::ensure!(
+            source_before.is_file(),
+            "litebox initial-files descriptor is not a regular file"
+        );
+        let mut alias = self.allocate_scratch_directory(temporary, "initial-files")?;
+        let name = OsString::from(INITIAL_FILES_ALIAS_NAME);
+        link_open_file_alias(archive, &alias.directory, &name)
+            .context("create descriptor-bound Litebox initial-files alias")?;
+        alias.children.push(name.clone());
+
+        #[cfg(unix)]
+        {
+            let name = cache_component(&name)?;
+            let fd = unsafe {
+                libc::openat(
+                    alias.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("open descriptor-bound Litebox initial-files alias");
+            }
+            let linked = unsafe { File::from_raw_fd(fd) };
+            let source_after = archive.metadata()?;
+            let linked_metadata = linked.metadata()?;
+            anyhow::ensure!(
+                source_before.dev() == source_after.dev()
+                    && source_before.ino() == source_after.ino()
+                    && source_before.len() == source_after.len()
+                    && source_before.modified().ok() == source_after.modified().ok(),
+                "litebox initial-files descriptor changed while binding its private alias"
+            );
+            anyhow::ensure!(
+                linked_metadata.is_file()
+                    && linked_metadata.dev() == source_before.dev()
+                    && linked_metadata.ino() == source_before.ino()
+                    && linked_metadata.len() == source_before.len(),
+                "litebox initial-files alias is not bound to the verified archive inode"
+            );
+        }
+        Ok(alias)
+    }
+
+    fn write_scratch_file(
+        scratch: &mut ArtifactScratch,
+        name: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        #[cfg(not(unix))]
+        anyhow::bail!("litebox artifact publication requires Unix descriptors");
+        #[cfg(unix)]
+        {
+            let name = OsString::from(name);
+            let name_c = cache_component(&name)?;
+            let fd = unsafe {
+                libc::openat(
+                    scratch.directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o444,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("create litebox artifact scratch file");
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            scratch.children.push(name);
+            Ok(())
+        }
+    }
+
+    /// Append the two platform-owned preloads through held file and directory
+    /// descriptors. Cancellation kills tar; Drop unlinks the private scratch
+    /// names without resolving the mutable cache pathname.
+    async fn stage_bind_shim(
+        &self,
+        directories: &ArtifactDirectories,
+        archive: &ArtifactTemp,
+    ) -> anyhow::Result<()> {
+        let mut scratch = self.allocate_scratch_directory(&directories.temporary, "preloads")?;
+        let bind_name = GUEST_BIND_SHIM_PATH.trim_start_matches('/');
+        let guard_name = GUEST_RUNTIME_GUARD_PATH.trim_start_matches('/');
+        Self::write_scratch_file(&mut scratch, bind_name, NODE_BIND_SHIM_JS.as_bytes())?;
+        Self::write_scratch_file(&mut scratch, guard_name, RUNTIME_GUARD_JS.as_bytes())?;
+        let mut command = Command::new("tar");
+        let scratch_path =
+            crate::runtime_artifact::inherit_file_path(&mut command, &scratch.directory)?;
+        let archive_path = crate::runtime_artifact::inherit_file_path(&mut command, &archive.file)?;
+        let out = command
             .arg("-C")
-            .arg(dir)
+            .arg(scratch_path)
+            .arg("--mtime=@0")
+            .arg("--owner=0")
+            .arg("--group=0")
+            .arg("--numeric-owner")
             .arg("-rf")
-            .arg(tar_path)
-            .arg(name)
+            .arg(archive_path)
+            .arg(bind_name)
+            .arg(guard_name)
+            .kill_on_drop(true)
             .output()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+            .map_err(|error| anyhow::anyhow!("failed to run tar: {error}"))?;
         anyhow::ensure!(
             out.status.success(),
-            "tar failed staging the bind shim into {}: {}",
-            tar_path.display(),
+            "tar failed staging litebox runtime preloads: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
         Ok(())
@@ -614,101 +1593,505 @@ impl LiteboxBackend {
         cfg!(target_os = "linux") && self.cfg.runner_bin.exists()
     }
 
-    fn images_dir(&self) -> PathBuf {
-        self.cfg.root.join("litebox-images")
+    fn image_reference_name(image: &str) -> OsString {
+        let key = sha256_parts(&[b"hive-litebox-image-reference-v1\0", image.as_bytes()]);
+        OsString::from(format!("{key}.json"))
     }
 
-    /// Per-deployment tar of `deliver_build`'s build dir, paths relative to
-    /// the build dir's own root (see module doc's "Guest filesystem").
-    fn app_tar_path(&self, image: &str) -> PathBuf {
-        self.images_dir()
-            .join(format!("{}.app.tar", crate::sanitize_image(image)))
+    fn app_archive_name(sha256: &str) -> OsString {
+        OsString::from(format!("{sha256}.tar"))
     }
 
-    /// Combined per-(image, runtime binary) `--initial-files` tar: the app
-    /// tar plus that binary's full `ldd` closure at absolute paths. Cached
-    /// on disk, rebuilt only when the app tar is newer (a redeploy) or the
-    /// combined tar doesn't exist yet.
-    fn combined_tar_path(&self, image: &str, bin: &Path) -> PathBuf {
-        let bin_key = bin.to_string_lossy().replace('/', "_");
-        self.images_dir()
-            .join(format!("{}.{}.tar", crate::sanitize_image(image), bin_key))
+    fn runtime_archive_name(sha256: &str) -> OsString {
+        OsString::from(format!("{sha256}.tar"))
     }
 
-    async fn ensure_combined_tar(&self, image: &str, bin: &Path) -> anyhow::Result<PathBuf> {
-        let app_tar = self.app_tar_path(image);
-        // Carries `NODE_IMAGE_MISSING` for the same reason the Firecracker path
-        // does: this is a per-node ARTIFACT that should be here and is not, so
-        // the remedy is to reprovision/redeliver on this node — not to read the
-        // app's logs, and not to add capacity. Without a marker every fault this
-        // backend raises falls into `classify_lease_error`'s catch-all and is
-        // published as CAPACITY_EXHAUSTED, which on fc-frankfurt (the one node
-        // serving real tenant traffic on litebox) means every backend failure
-        // there currently blames the host for having no room.
-        anyhow::ensure!(
-            app_tar.exists(),
-            "{}: litebox: no delivered build staged for image {image} — deliver_build must run \
-             before start_function (app tar missing at {})",
-            hive_core::fault::NODE_IMAGE_MISSING,
-            app_tar.display()
-        );
-        let combined = self.combined_tar_path(image, bin);
-        let fresh = match (
-            tokio::fs::metadata(&combined).await,
-            tokio::fs::metadata(&app_tar).await,
-        ) {
-            (Ok(c), Ok(a)) => c
-                .modified()
-                .ok()
-                .zip(a.modified().ok())
-                .map(|(cm, am)| cm >= am)
-                .unwrap_or(false),
-            _ => false,
-        };
-        if fresh {
-            return Ok(combined);
-        }
-        let deps = ldd_closure(bin).await?;
-        let tmp = combined.with_extension("tar.tmp");
-        tokio::fs::copy(&app_tar, &tmp).await.map_err(|e| {
+    fn prepare_artifact_dirs(&self) -> anyhow::Result<ArtifactDirectories> {
+        ArtifactDirectories::prepare(&self.cfg.cache_root)
+    }
+
+    async fn load_image_reference_locked(
+        &self,
+        directories: &ArtifactDirectories,
+        image: &str,
+    ) -> anyhow::Result<LiteboxImageReference> {
+        directories.verify_bindings()?;
+        let name = Self::image_reference_name(image);
+        let file = directories.references.open_regular(&name).map_err(|error| {
             anyhow::anyhow!(
-                "failed to copy {} -> {}: {e}",
-                app_tar.display(),
-                tmp.display()
+                "{}: litebox runtime artifact reference is missing for image {image} at {}/{}: {error}",
+                hive_core::fault::NODE_IMAGE_MISSING,
+                directories.references.path.display(),
+                name.to_string_lossy()
             )
         })?;
-        if !deps.is_empty() {
-            let mut cmd = Command::new("tar");
-            // `-h`/`--dereference`: a shared-library SONAME (what `ldd`
-            // reports, e.g. `libz.so.1`) is very often a symlink to the real
-            // versioned file (`libz.so.1.3.1.zlib-ng`) — proven live on
-            // fc-frankfurt: without dereferencing, the guest got a symlink
-            // node whose relative target was never itself staged, i.e. a
-            // dangling link, and `node`'s dynamic linker failed with
-            // "cannot open shared object file" on exactly that library.
-            // Storing the real bytes under the SONAME name sidesteps the
-            // guest ever needing to resolve a symlink target at all.
-            cmd.arg("-h").arg("--absolute-names").arg("-rf").arg(&tmp);
-            for d in &deps {
-                cmd.arg(d);
-            }
-            let out = cmd
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
-            anyhow::ensure!(
-                out.status.success(),
-                "tar failed staging runtime deps for {}: {}",
-                bin.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES).map_err(|error| {
+            anyhow::anyhow!(
+                "{}: read litebox runtime artifact reference for image {image}: {error:#}",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        let reference: LiteboxImageReference = serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "{}: decode litebox runtime artifact reference for image {image}: {error}",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        validate_image_reference(&reference, image)?;
+        verify_immutable_open(
+            &directories.apps,
+            &Self::app_archive_name(&reference.app_archive_sha256),
+            &reference.app_archive_sha256,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{}: litebox app archive validation failed for image {image}: {error:#}",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        directories.verify_bindings()?;
+        Ok(reference)
+    }
+
+    /// Publish the image's application binding exactly once. A retry may observe
+    /// runtime-closure metadata added by a prior cold start, but it can never
+    /// replace the immutable application/identity/workdir/package binding.
+    async fn write_image_reference_locked(
+        &self,
+        directories: &ArtifactDirectories,
+        reference: &LiteboxImageReference,
+    ) -> anyhow::Result<()> {
+        validate_image_reference(reference, &reference.image)?;
+        let bytes = encoded_image_reference(reference)?;
+        verify_immutable_open(
+            &directories.apps,
+            &Self::app_archive_name(&reference.app_archive_sha256),
+            &reference.app_archive_sha256,
+        )
+        .await?;
+        directories.verify_bindings()?;
+        let mut temp = self.allocate_temp_file(&directories.temporary, "reference", ".json")?;
+        {
+            let mut file = tokio::fs::File::from_std(temp.file.try_clone()?);
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
         }
-        // Stage the bind-rewrite shim into every cell's tar unconditionally
-        // (cheap — one small JS file) rather than trying to detect whether
-        // this deployment's runtime will actually use it.
-        self.stage_bind_shim(&tmp).await?;
-        tokio::fs::rename(&tmp, &combined).await?;
-        Ok(combined)
+        let destination_name = Self::image_reference_name(&reference.image);
+        match link_cache_entry(
+            &temp.parent,
+            &temp.name,
+            &directories.references.descriptor,
+            &destination_name,
+        ) {
+            Ok(()) => {
+                directories.references.descriptor.sync_all()?;
+                let published = directories.references.open_regular(&destination_name)?;
+                anyhow::ensure!(
+                    read_bounded_file(published, MAX_REFERENCE_BYTES)? == bytes,
+                    "litebox image reference changed during first publication"
+                );
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                let existing = self
+                    .load_image_reference_locked(directories, &reference.image)
+                    .await?;
+                ensure_same_application_binding(&existing, reference)?;
+            }
+            Err(error) => return Err(error).context("publish no-replace litebox image reference"),
+        }
+        unlink_cache_entry(&temp.parent, &temp.name, false)?;
+        temp.disarm();
+        directories.temporary.descriptor.sync_all()?;
+        directories.verify_bindings()?;
+        Ok(())
+    }
+
+    /// Replace only lazily-derived runtime-closure metadata after re-proving
+    /// that the durable application binding is byte-for-byte the same one the
+    /// cold start loaded. Cancellation before the rename leaves only a private
+    /// Drop-cleaned temp; no different application can reach this path.
+    async fn write_runtime_reference_locked(
+        &self,
+        directories: &ArtifactDirectories,
+        expected_binding: &mut LiteboxImageReference,
+        runtime_key: &str,
+        runtime: RuntimeArchiveReference,
+    ) -> anyhow::Result<()> {
+        let mut existing = self
+            .load_image_reference_locked(directories, &expected_binding.image)
+            .await?;
+        ensure_same_application_binding(&existing, expected_binding)?;
+        verify_immutable_open(
+            &directories.runtimes,
+            &Self::runtime_archive_name(&runtime.archive_sha256),
+            &runtime.archive_sha256,
+        )
+        .await?;
+        if existing.runtimes.get(runtime_key) == Some(&runtime) {
+            *expected_binding = existing;
+            return Ok(());
+        }
+        let prior_runtimes = existing.runtimes.clone();
+        existing.runtimes.insert(runtime_key.to_string(), runtime);
+        validate_image_reference(&existing, &existing.image)?;
+        let bytes = encoded_image_reference(&existing)?;
+
+        directories.verify_bindings()?;
+        let observed = self
+            .load_image_reference_locked(directories, &existing.image)
+            .await?;
+        ensure_same_application_binding(&observed, &existing)?;
+        anyhow::ensure!(
+            observed.runtimes == prior_runtimes,
+            "litebox runtime reference metadata changed before its serialized update"
+        );
+
+        let mut temp = self.allocate_temp_file(&directories.temporary, "reference", ".json")?;
+        {
+            let mut file = tokio::fs::File::from_std(temp.file.try_clone()?);
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+        }
+        rename_cache_entry(
+            &temp.parent,
+            &temp.name,
+            &directories.references.descriptor,
+            &Self::image_reference_name(&existing.image),
+        )?;
+        temp.disarm();
+        directories.references.descriptor.sync_all()?;
+        directories.temporary.descriptor.sync_all()?;
+        let published = directories
+            .references
+            .open_regular(&Self::image_reference_name(&existing.image))?;
+        anyhow::ensure!(
+            read_bounded_file(published, MAX_REFERENCE_BYTES)? == bytes,
+            "litebox runtime reference metadata changed during publication"
+        );
+        directories.verify_bindings()?;
+        *expected_binding = existing;
+        Ok(())
+    }
+
+    async fn publish_immutable_locked(
+        &self,
+        directories: &ArtifactDirectories,
+        temp: &mut ArtifactTemp,
+        destination: &ArtifactDirectory,
+        destination_name: &OsStr,
+        sha256: &str,
+    ) -> anyhow::Result<File> {
+        directories.verify_bindings()?;
+        #[cfg(unix)]
+        temp.file
+            .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        temp.file.sync_all()?;
+        let actual = sha256_open_file(&temp.file).await?;
+        anyhow::ensure!(
+            actual == sha256,
+            "litebox publication temp hash changed (got {actual}, expected {sha256})"
+        );
+        match link_cache_entry(
+            &temp.parent,
+            &temp.name,
+            &destination.descriptor,
+            destination_name,
+        ) {
+            Ok(()) => {
+                destination.descriptor.sync_all()?;
+                unlink_cache_entry(&temp.parent, &temp.name, false)?;
+                temp.disarm();
+                directories.temporary.descriptor.sync_all()?;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(error) => return Err(error).context("publish immutable litebox artifact"),
+        }
+        let file = verify_immutable_open(destination, destination_name, sha256).await?;
+        directories.verify_bindings()?;
+        Ok(file)
+    }
+
+    async fn package_metadata(
+        &self,
+        staged: &crate::runtime_artifact::StagedRuntimeArtifact,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<(BTreeMap<String, String>, Option<String>)> {
+        let package_relative = artifact.app_rel.join("package.json");
+        let scripts = if let Some(bytes) =
+            staged.read_regular(&package_relative, MAX_PACKAGE_JSON_BYTES)?
+        {
+            let package: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let mut scripts = BTreeMap::new();
+            if let Some(values) = package.get("scripts").and_then(|value| value.as_object()) {
+                anyhow::ensure!(
+                    values.len() <= MAX_PACKAGE_SCRIPTS,
+                    "selected application declares more than {MAX_PACKAGE_SCRIPTS} package scripts"
+                );
+                for (name, value) in values {
+                    let Some(script) = value.as_str() else {
+                        anyhow::bail!(
+                            "selected application package script {name:?} is not a string"
+                        );
+                    };
+                    anyhow::ensure!(
+                        name.len() <= 128 && script.len() <= MAX_PACKAGE_SCRIPT_BYTES,
+                        "selected application package script {name:?} exceeds the litebox metadata limit"
+                    );
+                    scripts.insert(name.clone(), script.to_string());
+                }
+            }
+            scripts
+        } else {
+            BTreeMap::new()
+        };
+
+        let mut base = artifact.app_rel.clone();
+        let next_entry = loop {
+            let relative = base.join("node_modules/next/dist/bin/next");
+            if staged.is_regular_file(&relative)? {
+                break Some(guest_path(&relative)?);
+            }
+            if !base.pop() {
+                break None;
+            }
+        };
+        Ok((scripts, next_entry))
+    }
+
+    async fn ensure_combined_tar_locked(
+        &self,
+        directories: &ArtifactDirectories,
+        image: &str,
+        runtime_key: &str,
+        bin: &Path,
+        reference: &mut LiteboxImageReference,
+    ) -> anyhow::Result<File> {
+        let deps = ldd_closure(bin).await?;
+        let source_sha256 = runtime_source_sha256(
+            bin,
+            &deps,
+            &reference.app_archive_sha256,
+            NODE_BIND_SHIM_JS,
+            RUNTIME_GUARD_JS,
+        )
+        .await?;
+        if let Some(cached) = reference.runtimes.get(runtime_key) {
+            if cached.source_sha256 == source_sha256 {
+                if let Ok(file) = verify_immutable_open(
+                    &directories.runtimes,
+                    &Self::runtime_archive_name(&cached.archive_sha256),
+                    &cached.archive_sha256,
+                )
+                .await
+                {
+                    return Ok(file);
+                }
+            }
+        }
+
+        let app = verify_immutable_open(
+            &directories.apps,
+            &Self::app_archive_name(&reference.app_archive_sha256),
+            &reference.app_archive_sha256,
+        )
+        .await?;
+        let mut temp = self.allocate_temp_file(&directories.temporary, "runtime", ".tar")?;
+        {
+            let mut input = tokio::fs::File::from_std(app.try_clone()?);
+            let mut output = tokio::fs::File::from_std(temp.file.try_clone()?);
+            tokio::io::copy(&mut input, &mut output).await?;
+            output.sync_all().await?;
+        }
+        if !deps.is_empty() {
+            append_ldd_closure_to_tar(&mut temp.file, &deps).with_context(|| {
+                format!("failed to append LDD closure to tar for {}", bin.display())
+            })?;
+        }
+        self.stage_bind_shim(directories, &temp).await?;
+        temp.file.sync_all()?;
+        let after = runtime_source_sha256(
+            bin,
+            &deps,
+            &reference.app_archive_sha256,
+            NODE_BIND_SHIM_JS,
+            RUNTIME_GUARD_JS,
+        )
+        .await?;
+        anyhow::ensure!(
+            after == source_sha256,
+            "{}: litebox runtime executable or linked-library closure changed during publication",
+            hive_core::fault::NODE_RUNTIME_MISSING
+        );
+        let archive_sha256 = sha256_open_file(&temp.file).await?;
+        let destination_name = Self::runtime_archive_name(&archive_sha256);
+        let archive = self
+            .publish_immutable_locked(
+                directories,
+                &mut temp,
+                &directories.runtimes,
+                &destination_name,
+                &archive_sha256,
+            )
+            .await?;
+        self.write_runtime_reference_locked(
+            directories,
+            reference,
+            runtime_key,
+            RuntimeArchiveReference {
+                source_sha256,
+                archive_sha256,
+            },
+        )
+        .await?;
+        if let Err(error) = self.gc_artifacts_locked(directories).await {
+            tracing::warn!(error = %error, "litebox artifact GC refused or failed");
+        }
+        anyhow::ensure!(
+            reference.image == image,
+            "litebox runtime artifact reference changed image during publication"
+        );
+        Ok(archive)
+    }
+
+    async fn gc_artifacts_locked(&self, directories: &ArtifactDirectories) -> anyhow::Result<()> {
+        directories.verify_bindings()?;
+        let mut keep_apps = BTreeSet::new();
+        let mut keep_runtimes = BTreeSet::new();
+        for name in directories.references.child_names()? {
+            let file = directories
+                .references
+                .open_regular(&name)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "litebox artifact GC refuses non-file reference {}/{}: {error}",
+                        directories.references.path.display(),
+                        name.to_string_lossy()
+                    )
+                })?;
+            let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES)?;
+            let reference: LiteboxImageReference = serde_json::from_slice(&bytes)?;
+            validate_image_reference(&reference, &reference.image)?;
+            anyhow::ensure!(
+                name == Self::image_reference_name(&reference.image),
+                "litebox artifact GC refuses a reference with a mismatched filename: {}",
+                name.to_string_lossy()
+            );
+            let app_name = Self::app_archive_name(&reference.app_archive_sha256);
+            verify_immutable_open(&directories.apps, &app_name, &reference.app_archive_sha256)
+                .await?;
+            keep_apps.insert(app_name);
+            for runtime in reference.runtimes.values() {
+                let runtime_name = Self::runtime_archive_name(&runtime.archive_sha256);
+                verify_immutable_open(
+                    &directories.runtimes,
+                    &runtime_name,
+                    &runtime.archive_sha256,
+                )
+                .await?;
+                keep_runtimes.insert(runtime_name);
+            }
+        }
+        anyhow::ensure!(
+            !keep_apps.is_empty(),
+            "litebox artifact GC refuses an empty keep set"
+        );
+
+        let grace = Duration::from_secs(
+            std::env::var("HIVE_LITEBOX_ARTIFACT_GC_GRACE_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_ARTIFACT_GC_GRACE_SECS),
+        );
+        let max_fraction = std::env::var("HIVE_LITEBOX_ARTIFACT_GC_MAX_REAP_FRACTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(DEFAULT_ARTIFACT_GC_MAX_REAP_FRACTION);
+        let now = SystemTime::now();
+        let mut total = 0usize;
+        let mut reap = Vec::new();
+        for (area, directory) in [
+            (ArtifactArea::Apps, &directories.apps),
+            (ArtifactArea::Runtimes, &directories.runtimes),
+            (ArtifactArea::Temporary, &directories.temporary),
+            (ArtifactArea::Staging, &directories.staging),
+        ] {
+            for name in directory.child_names()? {
+                total += 1;
+                if (area == ArtifactArea::Apps && keep_apps.contains(&name))
+                    || (area == ArtifactArea::Runtimes && keep_runtimes.contains(&name))
+                {
+                    continue;
+                }
+                let state = cache_entry_state(directory, &name)?;
+                anyhow::ensure!(
+                    !matches!(area, ArtifactArea::Apps | ArtifactArea::Runtimes)
+                        || state.is_regular(),
+                    "litebox artifact GC refuses a non-file immutable archive {}/{}",
+                    directory.path.display(),
+                    name.to_string_lossy()
+                );
+                let old_enough = now
+                    .duration_since(state.modified)
+                    .ok()
+                    .is_some_and(|age| age >= grace);
+                if old_enough {
+                    reap.push((area, name, state));
+                }
+            }
+        }
+        let fraction = reap.len() as f64 / total.max(1) as f64;
+        anyhow::ensure!(
+            fraction <= max_fraction,
+            "litebox artifact GC refuses to reap {}/{} entries ({fraction:.3} > {max_fraction:.3})",
+            reap.len(),
+            total
+        );
+        directories.verify_bindings()?;
+        let mut touched = BTreeSet::new();
+        for (area, name, state) in reap {
+            let directory = artifact_area_directory(directories, area);
+            remove_cache_entry(directory, &name, state)?;
+            touched.insert(area);
+        }
+        for area in touched {
+            artifact_area_directory(directories, area)
+                .descriptor
+                .sync_all()?;
+        }
+        directories.verify_bindings()?;
+        Ok(())
+    }
+
+    /// Retire one exact platform-issued image reference. The backend trait has
+    /// no deployment-deletion hook yet; its eventual caller must invoke this
+    /// only after the image is absent from live platform state. Archive GC keeps
+    /// its empty-set, age and maximum-fraction blast-radius guards unchanged.
+    pub async fn retire_image_reference(&self, image: &str) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            valid_identity_id(image),
+            "runtime artifact image contains an invalid platform identity"
+        );
+        let _publication = self.artifact_lock.clone().lock_owned().await;
+        let directories = self.prepare_artifact_dirs()?;
+        let name = Self::image_reference_name(image);
+        let file = match directories.references.open_regular(&name) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES)?;
+        let reference: LiteboxImageReference = serde_json::from_slice(&bytes)?;
+        validate_image_reference(&reference, image)?;
+        directories.verify_bindings()?;
+        unlink_cache_entry(&directories.references.descriptor, &name, false)?;
+        directories.references.descriptor.sync_all()?;
+        directories.verify_bindings()?;
+        if let Err(error) = self.gc_artifacts_locked(&directories).await {
+            tracing::warn!(error = %error, "litebox artifact GC refused or failed after reference retirement");
+        }
+        Ok(true)
     }
 
     /// Tier 2: REAL functional proof, TWO checks.
@@ -766,6 +2149,7 @@ impl LiteboxBackend {
                 cmd.arg(d);
             }
             let out = cmd
+                .kill_on_drop(true)
                 .output()
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
@@ -784,6 +2168,7 @@ impl LiteboxBackend {
         }
         cmd.arg("--").arg(&probe_bin).arg(&marker);
         let out = cmd
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| anyhow::anyhow!("failed to spawn litebox runner: {e}"))?;
@@ -825,19 +2210,21 @@ impl LiteboxBackend {
              networking without a runtime to serve through it"
         );
         let deps = ldd_closure(&node_bin).await?;
-        let tar_path = self.cfg.root.join("litebox-network-smoke-deps.tar");
-        if let Some(parent) = tar_path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
+        let _publication = self.artifact_lock.clone().lock_owned().await;
+        let directories = self.prepare_artifact_dirs()?;
+        let archive = self.allocate_temp_file(&directories.temporary, "network-smoke", ".tar")?;
         // Always build the tar (never conditional on `deps` being non-empty
         // — it always needs at least the bind shim) and always pass
         // `--initial-files`, so the guest can find it.
-        let out = Command::new("tar")
+        let mut tar = Command::new("tar");
+        let archive_path = crate::runtime_artifact::inherit_file_path(&mut tar, &archive.file)?;
+        let out = tar
             .arg("-h")
             .arg("--absolute-names")
             .arg("-cf")
-            .arg(&tar_path)
+            .arg(archive_path)
             .args(&deps)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
@@ -846,7 +2233,8 @@ impl LiteboxBackend {
             "tar failed staging node's deps for the network smoke test: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        self.stage_bind_shim(&tar_path).await?;
+        self.stage_bind_shim(&directories, &archive).await?;
+        archive.file.sync_all()?;
 
         let marker = format!("litebox-net-smoke-{}", now_ms());
         // A wildcard bind (`.listen(PROBE_PORT)`, no host) is the exact case
@@ -861,11 +2249,16 @@ impl LiteboxBackend {
 
         let mut cmd = Command::new(&self.cfg.runner_bin);
         reset_signal_dispositions_before_exec(&mut cmd);
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &archive.file)?;
+        let initial_files =
+            crate::runtime_artifact::inherit_file_path(&mut cmd, &initial_files_alias.directory)?
+                .join(INITIAL_FILES_ALIAS_NAME);
         cmd.arg("-Z")
             .arg("--rewrite-syscalls")
             .arg("--forward-env")
             .arg(format!("--tun-device-name={}", net.tun_dev))
-            .arg(format!("--initial-files={}", tar_path.display()))
+            .arg(format!("--initial-files={}", initial_files.display()))
             .arg("--")
             .arg(&node_bin)
             .arg("-e")
@@ -913,6 +2306,7 @@ impl LiteboxBackend {
                 String::from_utf8_lossy(&err).trim(),
             )));
         }
+        drop(initial_files_alias);
 
         use tokio::io::AsyncWriteExt;
         // Bounded: an unresponsive guest must fail loudly, not hang this
@@ -950,6 +2344,764 @@ impl LiteboxBackend {
              wrong — got: {resp_text:?}, want a body containing {marker:?} ({guest_output})"
         );
         Ok(())
+    }
+}
+
+fn sha256_parts(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hex_sha256(&hasher.finalize())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_identity_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_guest_workdir(workdir: &str) -> anyhow::Result<()> {
+    let path = Path::new(workdir);
+    anyhow::ensure!(path.is_absolute(), "litebox guest workdir is not absolute");
+    anyhow::ensure!(
+        path == Path::new(DELIVERED_WORKDIR) || path.starts_with(Path::new(DELIVERED_WORKDIR)),
+        "litebox guest workdir escapes {DELIVERED_WORKDIR}: {workdir}"
+    );
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => normalized.push(value),
+            _ => anyhow::bail!("litebox guest workdir is not normalized: {workdir}"),
+        }
+    }
+    anyhow::ensure!(
+        normalized.to_string_lossy() == workdir,
+        "litebox guest workdir is not canonical: {workdir}"
+    );
+    Ok(())
+}
+
+fn encoded_image_reference(reference: &LiteboxImageReference) -> anyhow::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(reference)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_REFERENCE_BYTES,
+        "litebox runtime artifact reference exceeds {MAX_REFERENCE_BYTES} bytes"
+    );
+    Ok(bytes)
+}
+
+fn ensure_same_application_binding(
+    existing: &LiteboxImageReference,
+    candidate: &LiteboxImageReference,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        existing.schema == candidate.schema
+            && existing.image == candidate.image
+            && existing.identity == candidate.identity
+            && existing.guest_workdir == candidate.guest_workdir
+            && existing.app_archive_sha256 == candidate.app_archive_sha256
+            && existing.package_scripts == candidate.package_scripts
+            && existing.next_entry == candidate.next_entry,
+        "litebox image {} is already published with a different immutable application/identity/workdir/package binding",
+        candidate.image
+    );
+    Ok(())
+}
+
+fn validate_image_reference(
+    reference: &LiteboxImageReference,
+    expected_image: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        reference.schema == LITEBOX_ARTIFACT_SCHEMA,
+        "{}: unsupported litebox artifact-reference schema {}",
+        hive_core::fault::NODE_IMAGE_MISSING,
+        reference.schema
+    );
+    anyhow::ensure!(
+        reference.image == expected_image && valid_identity_id(&reference.image),
+        "{}: litebox artifact reference does not name the exact image",
+        hive_core::fault::NODE_IMAGE_MISSING
+    );
+    anyhow::ensure!(
+        reference.identity.protocol == hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION
+            && reference.identity.id == reference.image
+            && valid_sha256(&reference.identity.content_sha256),
+        "{}: litebox artifact reference carries an invalid runtime identity",
+        hive_core::fault::NODE_IMAGE_MISSING
+    );
+    validate_guest_workdir(&reference.guest_workdir).map_err(|error| {
+        anyhow::anyhow!(
+            "{}: invalid litebox artifact workdir: {error:#}",
+            hive_core::fault::NODE_IMAGE_MISSING
+        )
+    })?;
+    anyhow::ensure!(
+        valid_sha256(&reference.app_archive_sha256),
+        "{}: litebox artifact reference carries an invalid app archive hash",
+        hive_core::fault::NODE_IMAGE_MISSING
+    );
+    anyhow::ensure!(
+        reference.package_scripts.len() <= MAX_PACKAGE_SCRIPTS
+            && reference.package_scripts.iter().all(|(name, script)| {
+                name.len() <= 128 && script.len() <= MAX_PACKAGE_SCRIPT_BYTES
+            }),
+        "{}: litebox artifact reference carries invalid package-script metadata",
+        hive_core::fault::NODE_IMAGE_MISSING
+    );
+    if let Some(next) = &reference.next_entry {
+        validate_guest_workdir(
+            Path::new(next)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or_default(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{}: invalid litebox Next entry: {error:#}",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        anyhow::ensure!(
+            next.ends_with("/node_modules/next/dist/bin/next"),
+            "{}: litebox artifact reference carries a non-canonical Next entry",
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+    }
+    for runtime in reference.runtimes.values() {
+        anyhow::ensure!(
+            valid_sha256(&runtime.source_sha256) && valid_sha256(&runtime.archive_sha256),
+            "{}: litebox artifact reference carries invalid runtime archive hashes",
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+    }
+    Ok(())
+}
+
+fn guest_path(relative: &Path) -> anyhow::Result<String> {
+    anyhow::ensure!(!relative.is_absolute(), "guest artifact path is absolute");
+    let mut path = PathBuf::from(DELIVERED_WORKDIR);
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => path.push(value),
+            _ => anyhow::bail!("guest artifact path contains traversal"),
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+async fn runtime_source_sha256(
+    bin: &Path,
+    deps: &[PathBuf],
+    app_archive_sha256: &str,
+    bind_shim: &str,
+    runtime_guard: &str,
+) -> anyhow::Result<String> {
+    const MAX_RUNTIME_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let mut paths = deps.to_vec();
+    paths.push(bin.to_path_buf());
+    paths.sort();
+    paths.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"hive-litebox-runtime-source-v1\0");
+    hasher.update(app_archive_sha256.as_bytes());
+    hasher.update((bind_shim.len() as u64).to_le_bytes());
+    hasher.update(bind_shim.as_bytes());
+    hasher.update((runtime_guard.len() as u64).to_le_bytes());
+    hasher.update(runtime_guard.as_bytes());
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    for path in paths {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "litebox runtime closure contains a non-absolute path: {}",
+            path.display()
+        );
+        let before = tokio::fs::metadata(&path).await?;
+        anyhow::ensure!(
+            before.is_file(),
+            "litebox runtime closure contains a non-file: {}",
+            path.display()
+        );
+        total = total.saturating_add(before.len());
+        anyhow::ensure!(
+            total <= MAX_RUNTIME_SOURCE_BYTES,
+            "litebox runtime closure exceeds {MAX_RUNTIME_SOURCE_BYTES} bytes"
+        );
+        let path_bytes = path.to_string_lossy();
+        hasher.update((path_bytes.len() as u64).to_le_bytes());
+        hasher.update(path_bytes.as_bytes());
+        hasher.update(before.len().to_le_bytes());
+        let mut file = tokio::fs::File::open(&path).await?;
+        let mut remaining = before.len();
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..take]).await?;
+            hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        let mut extra = [0_u8; 1];
+        anyhow::ensure!(
+            file.read(&mut extra).await? == 0,
+            "litebox runtime source grew while hashing: {}",
+            path.display()
+        );
+        let after = file.metadata().await?;
+        anyhow::ensure!(
+            before.len() == after.len() && before.modified().ok() == after.modified().ok(),
+            "litebox runtime source changed while hashing: {}",
+            path.display()
+        );
+    }
+    Ok(hex_sha256(&hasher.finalize()))
+}
+
+fn launch_refusal(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: litebox requires one direct Node/Bun process and refused this launch shape: {reason}; no process-manager or backend fallback was attempted",
+        hive_core::fault::NODE_BACKEND_UNAVAILABLE
+    )
+}
+
+/// The one message for "this backend cannot run Bun at all", shared by
+/// `start_function`'s entry-point refusal (the authoritative `func.runtime`
+/// check, which makes this unreachable in the ordinary case) and the
+/// belt-and-braces check right after `resolve_direct_launch` (which would
+/// otherwise trust `start_cmd`'s argv-derived runtime alone for a
+/// mismatched — `func.runtime == Node` but `start_cmd[0] == "bun"` — launch).
+/// A NODE fault, not a launch-shape refusal: this backend genuinely cannot
+/// run Bun on ANY node, regardless of what is staged, so it is
+/// `NODE_RUNTIME_MISSING` rather than `launch_refusal`'s
+/// `NODE_BACKEND_UNAVAILABLE`.
+fn bun_unsupported_refusal() -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: litebox has no supported Bun runtime on this node — its syscall shim panics on \
+         Bun's own readlink(\"/proc/self/fd/3\") boot probe (upstream unimplemented!()), so \
+         only Node is supported on this backend (operator remedy: place Bun deployments on a \
+         Firecracker or Mock-backed node instead; not an application fault)",
+        hive_core::fault::NODE_RUNTIME_MISSING
+    )
+}
+
+fn command_basename(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
+}
+
+fn host_interpreted_environment_key(key: &str) -> bool {
+    key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || key.starts_with("MALLOC_")
+        || key.starts_with("LITEBOX_")
+        || matches!(
+            key,
+            "GLIBC_TUNABLES"
+                | "GCONV_PATH"
+                | "GETCONF_DIR"
+                | "LOCPATH"
+                | "NLSPATH"
+                | "LIBC_FATAL_STDERR_"
+                | "LIBC_MALLOC_DEBUG"
+                | "RUST_LOG"
+                | "RUST_BACKTRACE"
+                | "RUST_LIB_BACKTRACE"
+                | "RUST_MIN_STACK"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+        )
+}
+
+fn platform_environment_key(key: &str) -> bool {
+    key.starts_with("HIVE_RUNTIME_")
+        || matches!(
+            key,
+            "PORT" | "PATH" | "HOME" | "NODE_OPTIONS" | "BUN_OPTIONS"
+        )
+}
+
+fn sanitized_guest_environment(func: &FunctionLaunch) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    let mut total = 0usize;
+    for (key, value) in &func.env {
+        anyhow::ensure!(
+            !key.is_empty() && !key.contains(['\0', '=']) && !value.contains('\0'),
+            "litebox tenant environment contains an invalid process-environment entry"
+        );
+        if host_interpreted_environment_key(key) || platform_environment_key(key) {
+            continue;
+        }
+        total = total
+            .saturating_add(key.len())
+            .saturating_add(value.len() + 2);
+        anyhow::ensure!(
+            total <= MAX_GUEST_ENV_BYTES,
+            "litebox tenant environment exceeds {MAX_GUEST_ENV_BYTES} bytes"
+        );
+        environment.insert(key.clone(), value.clone());
+    }
+    Ok(environment)
+}
+
+fn forwarded_package_args<'a>(args: &'a [String]) -> anyhow::Result<&'a [String]> {
+    if args.is_empty() {
+        return Ok(args);
+    }
+    if args.first().map(String::as_str) == Some("--") {
+        return Ok(&args[1..]);
+    }
+    Err(launch_refusal(
+        "package-manager arguments are ambiguous without a `--` separator",
+    ))
+}
+
+fn strict_script_tokens(script: &str, port: u16) -> anyhow::Result<Vec<String>> {
+    if script.len() > MAX_PACKAGE_SCRIPT_BYTES || !script.is_ascii() {
+        return Err(launch_refusal(
+            "the selected package script exceeds the bounded launch-metadata grammar",
+        ));
+    }
+    if script.chars().any(|value| {
+        matches!(
+            value,
+            '\0' | '\n' | '\r' | '\'' | '"' | '\\' | ';' | '&' | '|' | '<' | '>' | '`' | '(' | ')'
+        )
+    }) {
+        return Err(launch_refusal(
+            "the selected package script requires shell parsing or command composition",
+        ));
+    }
+    let mut tokens = Vec::new();
+    for token in script.split_ascii_whitespace() {
+        if token == "$PORT" || token == "${PORT}" {
+            tokens.push(port.to_string());
+            continue;
+        }
+        if token
+            .chars()
+            .any(|value| matches!(value, '$' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#'))
+        {
+            return Err(launch_refusal(
+                "the selected package script requires shell expansion",
+            ));
+        }
+        tokens.push(token.to_string());
+    }
+    if tokens.first().map(String::as_str) == Some("exec") {
+        tokens.remove(0);
+    }
+    if tokens.is_empty() {
+        return Err(launch_refusal("the selected package script is empty"));
+    }
+    Ok(tokens)
+}
+
+fn expand_package_manager(
+    argv: &[String],
+    reference: &LiteboxImageReference,
+    port: u16,
+) -> anyhow::Result<Vec<String>> {
+    let manager = command_basename(&argv[0]);
+    if matches!(manager, "npx" | "bunx" | "corepack") {
+        return Err(launch_refusal(format!(
+            "{manager} is a process-manager wrapper"
+        )));
+    }
+    let (script_name, remaining) = match manager {
+        "npm" | "pnpm" | "yarn" => match argv.get(1).map(String::as_str) {
+            Some("start") => ("start", forwarded_package_args(&argv[2..])?),
+            Some("run") | Some("run-script") => {
+                let name = argv.get(2).ok_or_else(|| {
+                    launch_refusal(format!("{manager} run is missing a script name"))
+                })?;
+                (name.as_str(), forwarded_package_args(&argv[3..])?)
+            }
+            _ => {
+                return Err(launch_refusal(format!(
+                    "unsupported {manager} invocation; only a named package script can be reduced"
+                )))
+            }
+        },
+        "bun" if argv.get(1).map(String::as_str) == Some("run") => {
+            let name = argv
+                .get(2)
+                .ok_or_else(|| launch_refusal("bun run is missing a script name"))?;
+            (name.as_str(), forwarded_package_args(&argv[3..])?)
+        }
+        _ => return Ok(argv.to_vec()),
+    };
+    let script = reference.package_scripts.get(script_name).ok_or_else(|| {
+        launch_refusal(format!(
+            "package script {script_name:?} is absent from the validated selected application"
+        ))
+    })?;
+    let mut direct = strict_script_tokens(script, port)?;
+    direct.extend(remaining.iter().cloned());
+    Ok(direct)
+}
+
+fn validated_direct_entry(
+    runtime: DirectRuntime,
+    entry: &str,
+    guest_workdir: &str,
+) -> anyhow::Result<String> {
+    if entry.is_empty() || entry.contains('\0') || entry.starts_with('-') || entry == "." {
+        return Err(launch_refusal(
+            "the direct runtime entry must be one explicit module path, not stdin, eval, an option, or a directory",
+        ));
+    }
+    if runtime == DirectRuntime::Node && entry == "inspect" {
+        return Err(launch_refusal(
+            "Node's inspect client is not a direct application module",
+        ));
+    }
+    if runtime == DirectRuntime::Bun
+        && matches!(
+            entry,
+            "add"
+                | "build"
+                | "create"
+                | "init"
+                | "install"
+                | "link"
+                | "pm"
+                | "publish"
+                | "remove"
+                | "repl"
+                | "run"
+                | "test"
+                | "update"
+                | "upgrade"
+                | "x"
+        )
+    {
+        return Err(launch_refusal(
+            "Bun subcommands and package-script shorthand are not direct entry modules",
+        ));
+    }
+
+    let path = Path::new(entry);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let mut components = 0usize;
+        let mut relative = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(value) => {
+                    components += 1;
+                    relative.push(value);
+                }
+                _ => {
+                    return Err(launch_refusal(
+                        "the direct runtime entry contains path traversal",
+                    ))
+                }
+            }
+        }
+        anyhow::ensure!(
+            components > 0,
+            "{}",
+            launch_refusal("the direct runtime entry is not artifact-relative")
+        );
+        Path::new(guest_workdir).join(relative)
+    };
+    let absolute = absolute.to_str().ok_or_else(|| {
+        launch_refusal("the direct runtime entry is not valid UTF-8 after normalization")
+    })?;
+    validate_guest_workdir(absolute).map_err(|error| {
+        launch_refusal(format!(
+            "the direct runtime entry escapes the validated artifact: {error:#}"
+        ))
+    })?;
+
+    if runtime == DirectRuntime::Bun {
+        let extension = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase);
+        let path_shaped = entry.contains('/') || entry.starts_with("./");
+        anyhow::ensure!(
+            path_shaped
+                || extension.as_deref().is_some_and(|extension| {
+                    matches!(
+                        extension,
+                        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx"
+                    )
+                }),
+            "{}",
+            launch_refusal(
+                "Bun's bare script-name shorthand is ambiguous; use an explicit module path"
+            )
+        );
+    }
+    Ok(absolute.to_string())
+}
+
+async fn validate_archive_main_entry(archive: &File, guest_entry: &str) -> anyhow::Result<()> {
+    let archive_entry = Path::new(guest_entry)
+        .strip_prefix("/")
+        .map_err(|_| launch_refusal("the direct runtime entry is not an absolute guest path"))?;
+    let mut command = Command::new("tar");
+    let archive_path = crate::runtime_artifact::inherit_file_path(&mut command, archive)?;
+    let output = command
+        .arg("-tvf")
+        .arg(archive_path)
+        .arg("--")
+        .arg(archive_entry)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| {
+            launch_refusal(format!(
+                "could not inspect the immutable application archive: {error}"
+            ))
+        })?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        launch_refusal(format!(
+            "main entry {guest_entry:?} is missing from the immutable application archive: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    );
+    let entry_kind = output
+        .stdout
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    anyhow::ensure!(
+        entry_kind == Some(b'-'),
+        "{}",
+        launch_refusal(format!(
+            "main entry {guest_entry:?} is not one regular, symlink-free application file"
+        ))
+    );
+    Ok(())
+}
+
+fn validate_bun_arguments(args: &[String]) -> anyhow::Result<()> {
+    if args.len() <= 1 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.get(1).map(String::as_str) == Some("--"),
+        "{}",
+        launch_refusal("Bun application arguments require an explicit `--` boundary so runtime flags cannot be smuggled after the entry")
+    );
+    Ok(())
+}
+
+fn validated_next_arguments(
+    args: &[String],
+    entry: String,
+    port: u16,
+) -> anyhow::Result<Vec<String>> {
+    if args.first().map(String::as_str) != Some("start") {
+        return Err(launch_refusal(
+            "only the production `next start` server can be reduced",
+        ));
+    }
+    let mut result = vec![entry, "start".to_string()];
+    let mut index = 1usize;
+    let mut directory_seen = false;
+    while index < args.len() {
+        let argument = &args[index];
+        match argument.as_str() {
+            "-p" | "--port" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| launch_refusal("next start port option is missing its value"))?;
+                anyhow::ensure!(
+                    value == &port.to_string(),
+                    "{}",
+                    launch_refusal("next start may bind only the platform-assigned port")
+                );
+                result.push(argument.clone());
+                result.push(value.clone());
+                index += 2;
+            }
+            "--keepAliveTimeout" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    launch_refusal("next start keepAliveTimeout is missing its value")
+                })?;
+                let timeout = value.parse::<u32>().map_err(|_| {
+                    launch_refusal("next start keepAliveTimeout is not a bounded integer")
+                })?;
+                anyhow::ensure!(
+                    timeout > 0,
+                    "{}",
+                    launch_refusal("next start keepAliveTimeout must be positive")
+                );
+                result.push(argument.clone());
+                result.push(value.clone());
+                index += 2;
+            }
+            _ if argument
+                .strip_prefix("--port=")
+                .is_some_and(|value| value == port.to_string()) =>
+            {
+                result.push(argument.clone());
+                index += 1;
+            }
+            _ if argument.starts_with("--keepAliveTimeout=") => {
+                let value = argument.trim_start_matches("--keepAliveTimeout=");
+                let timeout = value.parse::<u32>().map_err(|_| {
+                    launch_refusal("next start keepAliveTimeout is not a bounded integer")
+                })?;
+                anyhow::ensure!(
+                    timeout > 0,
+                    "{}",
+                    launch_refusal("next start keepAliveTimeout must be positive")
+                );
+                result.push(argument.clone());
+                index += 1;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(launch_refusal(format!(
+                    "next start option {argument:?} is outside the direct-server allowlist"
+                )))
+            }
+            _ => {
+                anyhow::ensure!(
+                    !directory_seen,
+                    "{}",
+                    launch_refusal("next start accepts at most one explicit application directory")
+                );
+                let path = Path::new(argument);
+                anyhow::ensure!(
+                    !path.is_absolute()
+                        && path.components().all(|component| {
+                            matches!(component, Component::Normal(_) | Component::CurDir)
+                        }),
+                    "{}",
+                    launch_refusal("next start application directory escapes the artifact workdir")
+                );
+                directory_seen = true;
+                result.push(argument.clone());
+                index += 1;
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn resolve_direct_launch(
+    func: &FunctionLaunch,
+    reference: &LiteboxImageReference,
+    app_archive: &File,
+) -> anyhow::Result<DirectLaunch> {
+    let argv = expand_package_manager(&func.start_cmd, reference, func.port)?;
+    let command = argv
+        .first()
+        .ok_or_else(|| launch_refusal("the reduced command is empty"))?;
+    let base = command_basename(command);
+    if matches!(
+        base,
+        "npm" | "pnpm" | "yarn" | "npx" | "bunx" | "corepack" | "turbo"
+    ) {
+        return Err(launch_refusal(format!(
+            "nested process-manager command {base:?} cannot be executed by litebox"
+        )));
+    }
+    let mut args = argv[1..].to_vec();
+    let (runtime, name) = match base {
+        "node" | "nodejs" => {
+            anyhow::ensure!(
+                !args.is_empty(),
+                "{}",
+                launch_refusal("direct Node launch is missing an entry module")
+            );
+            (DirectRuntime::Node, "node")
+        }
+        "bun" => {
+            anyhow::ensure!(
+                !args.is_empty(),
+                "{}",
+                launch_refusal("direct Bun launch is missing an entry module")
+            );
+            (DirectRuntime::Bun, "bun")
+        }
+        "next" => {
+            let entry = reference.next_entry.clone().ok_or_else(|| {
+                launch_refusal("the validated artifact does not contain a direct Next CLI entry")
+            })?;
+            args = validated_next_arguments(&args, entry, func.port)?;
+            (DirectRuntime::Node, "node")
+        }
+        _ => {
+            return Err(launch_refusal(format!(
+                "command {base:?} is not a direct Node/Bun runtime"
+            )))
+        }
+    };
+    let entry = validated_direct_entry(runtime, &args[0], &reference.guest_workdir)?;
+    validate_archive_main_entry(app_archive, &entry).await?;
+    args[0] = entry;
+    if runtime == DirectRuntime::Bun {
+        validate_bun_arguments(&args)?;
+    }
+    let bin = resolve_bin(name).await;
+    let bin = tokio::fs::canonicalize(&bin).await.unwrap_or(bin);
+    Ok(DirectLaunch { runtime, bin, args })
+}
+
+async fn wait_litebox_ready(
+    child: &mut Child,
+    address: &str,
+    budget: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.code() == Some(RUNTIME_GUARD_EXIT_CODE) {
+                anyhow::bail!(
+                    "{}: litebox guest rejected the exact runtime artifact before tenant execution",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                );
+            }
+            anyhow::bail!(
+                "{}: litebox direct runtime exited before listening on {address} ({status})",
+                hive_core::fault::DEPLOYMENT_START_FAILED
+            );
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "{}: litebox direct runtime did not listen on {address} within {}s",
+                hive_core::fault::DEPLOYMENT_START_FAILED,
+                budget.as_secs()
+            );
+        }
+        let connect_budget = (deadline - now).min(Duration::from_millis(250));
+        if tokio::time::timeout(connect_budget, tokio::net::TcpStream::connect(address))
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1020,35 +3172,277 @@ async fn resolve_bin(name: &str) -> PathBuf {
 async fn ldd_closure(bin: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let out = Command::new("ldd")
         .arg(bin)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("failed to run ldd on {}: {e}", bin.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let diagnostic = format!("{stdout}\n{stderr}");
     if !out.status.success() {
-        return Ok(Vec::new());
+        if diagnostic.contains("not a dynamic executable")
+            || diagnostic.contains("statically linked")
+        {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!(
+            "{}: ldd could not resolve the runtime closure for {}: {}",
+            hive_core::fault::NODE_RUNTIME_MISSING,
+            bin.display(),
+            diagnostic.trim()
+        );
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        !diagnostic.lines().any(|line| line.contains("=> not found")),
+        "{}: the runtime closure for {} has an unresolved shared library: {}",
+        hive_core::fault::NODE_RUNTIME_MISSING,
+        bin.display(),
+        diagnostic.trim()
+    );
     let mut paths = Vec::new();
-    for line in text.lines() {
+    for line in stdout.lines() {
         let line = line.trim();
         if let Some(idx) = line.find("=> ") {
             if let Some(p) = line[idx + 3..].split_whitespace().next() {
                 if p.starts_with('/') {
-                    paths.push(PathBuf::from(p));
+                    let validated = validate_ldd_path(Path::new(p))?;
+                    paths.push(validated);
                 }
             }
         } else if line.starts_with('/') {
             if let Some(p) = line.split_whitespace().next() {
-                paths.push(PathBuf::from(p));
+                let validated = validate_ldd_path(Path::new(p))?;
+                paths.push(validated);
             }
         }
     }
+    paths.sort();
+    paths.dedup();
     Ok(paths)
+}
+
+/// Approved library directories for LDD closure paths. Defense-in-depth:
+/// shared-library paths from ldd output must resolve to one of these
+/// directories. Paths outside the allowlist are rejected before they ever
+/// reach a filesystem operation.
+const ALLOWED_LIBRARY_DIRS: &[&str] = &[
+    "/usr/lib/",
+    "/lib/",
+    "/lib64/",
+    "/usr/lib64/",
+    "/usr/local/lib/",
+];
+
+fn validate_ldd_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot resolve LDD path {}: {e}", path.display()))?;
+    let resolved_str = resolved.to_string_lossy();
+    let allowed = ALLOWED_LIBRARY_DIRS
+        .iter()
+        .any(|prefix| resolved_str.starts_with(prefix));
+    anyhow::ensure!(
+        allowed,
+        "LDD path {} resolves to {} which is outside the approved library directory allowlist",
+        path.display(),
+        resolved.display()
+    );
+    Ok(path.to_path_buf())
+}
+
+const POSIX_TAR_BLOCK_SIZE: usize = 512;
+
+/// Write a single POSIX tar entry (header + content + padding) to `archive`.
+/// The entry name is stored as-is (absolute path, matching the prior `tar
+/// --absolute-names` behaviour).
+fn write_posix_tar_entry(archive: &mut File, name: &[u8], content: &[u8]) -> anyhow::Result<()> {
+    let mut header = [0u8; POSIX_TAR_BLOCK_SIZE];
+
+    // Split name into prefix + name if > 100 bytes
+    let (prefix, name_part) = if name.len() > 100 {
+        // Find the last '/' within the last 155 bytes of the directory part
+        let split_at = name[..name.len().min(155)]
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if split_at == 0 || split_at > 155 || name.len() - split_at > 100 {
+            anyhow::bail!(
+                "tar path too long: {} (prefix={}, name={})",
+                String::from_utf8_lossy(name),
+                split_at,
+                name.len() - split_at
+            );
+        }
+        (&name[..split_at], &name[split_at..])
+    } else {
+        (b"" as &[u8], name)
+    };
+
+    // Name (100 bytes)
+    let name_len = name_part.len().min(100);
+    header[..name_len].copy_from_slice(&name_part[..name_len]);
+
+    // Mode: "0000644\0"
+    header[100..108].copy_from_slice(b"0000644\0");
+
+    // Uid: "0000000\0"
+    header[108..116].copy_from_slice(b"0000000\0");
+
+    // Gid: "0000000\0"
+    header[116..124].copy_from_slice(b"0000000\0");
+
+    // Size (12 bytes, octal)
+    let size_octal = format!("{:011o}\0", content.len());
+    header[124..124 + size_octal.len()].copy_from_slice(size_octal.as_bytes());
+
+    // Mtime: "00000000000\0" (epoch 0)
+    header[136..148].copy_from_slice(b"00000000000\0");
+
+    // Typeflag: '0' (regular file)
+    header[156] = b'0';
+
+    // Linkname (100 bytes) — empty
+    // Magic: "ustar\0"
+    header[257..263].copy_from_slice(b"ustar\0");
+
+    // Version: "00"
+    header[263..265].copy_from_slice(b"00");
+
+    // Uname: "root"
+    header[265..297].fill(0);
+    header[265..269].copy_from_slice(b"root");
+
+    // Gname: "root"
+    header[297..329].fill(0);
+    header[297..301].copy_from_slice(b"root");
+
+    // Devmajor/devminor: 0 (already zeroed)
+
+    // Prefix (155 bytes) at offset 345
+    if !prefix.is_empty() {
+        let prefix_len = prefix.len().min(155);
+        header[345..345 + prefix_len].copy_from_slice(&prefix[..prefix_len]);
+    }
+
+    // Chksum: sum of all bytes treating chksum field (148-156) as spaces
+    let mut chksum: u64 = 0;
+    for b in header.iter() {
+        chksum += *b as u64;
+    }
+    // Add 8 spaces for the chksum field
+    chksum += 8 * (b' ' as u64);
+    let chksum_str = format!("{:06o}\0 ", chksum);
+    header[148..148 + chksum_str.len()].copy_from_slice(chksum_str.as_bytes());
+
+    archive.write_all(&header).context("write tar header")?;
+    archive.write_all(content).context("write tar content")?;
+
+    // Pad to 512-byte block boundary
+    let pad =
+        (POSIX_TAR_BLOCK_SIZE - (content.len() % POSIX_TAR_BLOCK_SIZE)) % POSIX_TAR_BLOCK_SIZE;
+    if pad > 0 {
+        archive
+            .write_all(&vec![0u8; pad])
+            .context("write tar padding")?;
+    }
+
+    Ok(())
+}
+
+/// Append the LDD closure files to a tar archive using descriptor-relative
+/// openat2, replacing the prior `tar -h` shell invocation. Each path is
+/// opened against the root filesystem with RESOLVE_BENEATH |
+/// RESOLVE_NO_MAGICLINKS, the real path is resolved via /proc/self/fd,
+/// validated against the allowlist, and the file content is appended with
+/// a POSIX tar header.
+#[cfg(target_os = "linux")]
+fn append_ldd_closure_to_tar(archive: &mut File, deps: &[PathBuf]) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root = File::open("/").context("open root filesystem")?;
+    let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    for dep in deps {
+        let relative = dep
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("LDD path {} is not absolute", dep.display()))?;
+        if relative.as_os_str().is_empty() {
+            anyhow::bail!("LDD path is the root directory");
+        }
+        let fd = crate::runtime_artifact::openat2_required(
+            &root,
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            crate::runtime_artifact::RESOLVE_BENEATH
+                | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
+        )
+        .with_context(|| format!("openat2 failed for {}", dep.display()))?;
+        let resolved = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .canonicalize()
+            .with_context(|| format!("cannot resolve real path for {}", dep.display()))?;
+        let resolved_str = resolved.to_string_lossy();
+        let allowed = ALLOWED_LIBRARY_DIRS
+            .iter()
+            .any(|prefix| resolved_str.starts_with(prefix));
+        anyhow::ensure!(
+            allowed,
+            "LDD path {} resolves to {} which is outside the approved library directory allowlist",
+            dep.display(),
+            resolved.display()
+        );
+        let meta = fd
+            .metadata()
+            .with_context(|| format!("cannot stat {}", dep.display()))?;
+        let ino = (meta.dev(), meta.ino());
+        anyhow::ensure!(
+            seen_inodes.insert(ino),
+            "symlink loop detected: {} already staged (dev={}, ino={})",
+            dep.display(),
+            ino.0,
+            ino.1
+        );
+        let file_size = meta.len();
+        let mut content = vec![0u8; file_size as usize];
+        let mut remaining = &mut content[..];
+        {
+            let mut reader = &fd;
+            while !remaining.is_empty() {
+                let n = reader
+                    .read(remaining)
+                    .with_context(|| format!("read error on {}", dep.display()))?;
+                if n == 0 {
+                    anyhow::bail!(
+                        "{} truncated mid-read (expected {} bytes, got {})",
+                        dep.display(),
+                        file_size,
+                        file_size as usize - remaining.len()
+                    );
+                }
+                remaining = &mut remaining[n..];
+            }
+        }
+        write_posix_tar_entry(archive, dep.as_os_str().as_encoded_bytes(), &content)?;
+    }
+    // Two zero blocks mark end of archive
+    archive
+        .write_all(&[0u8; POSIX_TAR_BLOCK_SIZE * 2])
+        .context("write tar terminator")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn append_ldd_closure_to_tar(_archive: &mut File, _deps: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::bail!("descriptor-relative tar append requires Linux openat2")
 }
 
 #[async_trait]
 impl CellBackend for LiteboxBackend {
     fn name(&self) -> &'static str {
         "litebox"
+    }
+
+    fn requires_runtime_artifact_authorization(&self) -> bool {
+        true
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
@@ -1096,6 +3490,42 @@ impl CellBackend for LiteboxBackend {
         })
     }
 
+    async fn provision_runtime(
+        &self,
+        spec: &CellSpec,
+        expected: Option<&RuntimeArtifactIdentity>,
+    ) -> anyhow::Result<CellHandle> {
+        if spec.container.is_some() {
+            anyhow::ensure!(
+                expected.is_none(),
+                "container launch unexpectedly carried a litebox runtime artifact identity"
+            );
+        } else {
+            let expected = expected.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: litebox provisioning is missing its caller-authorized runtime artifact identity",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                )
+            })?;
+            let attached = self
+                .runtime_artifact_identity(&spec.image)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: litebox runtime artifact is missing for image {}",
+                        hive_core::fault::NODE_IMAGE_MISSING,
+                        spec.image
+                    )
+                })?;
+            anyhow::ensure!(
+                &attached == expected,
+                "{}: litebox provisioning observed a different runtime artifact identity",
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+        }
+        self.provision(spec).await
+    }
+
     async fn run_build(
         &self,
         cell: &CellHandle,
@@ -1108,49 +3538,98 @@ impl CellBackend for LiteboxBackend {
         crate::mock::run_build_process(cell, job, sink, &self.cfg.cache_root).await
     }
 
-    /// Packs `build_dir`'s contents into a tar keyed by `image`, paths
-    /// relative to `build_dir` itself — see module doc's "Guest filesystem".
-    /// `start_function` combines this with the runtime binary's `ldd`
-    /// closure into the actual `--initial-files` tar it passes.
-    async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+    /// Publishes one exact, validated checkout snapshot beneath `/workspace`.
+    /// The immutable tar is addressed by its own SHA-256; the platform-issued
+    /// image name points to it through a separately-fsynced atomic reference.
+    async fn deliver_build(
+        &self,
+        image: &str,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            build_dir.is_dir(),
-            "deliver_build: build dir does not exist: {}",
-            build_dir.display()
+            valid_identity_id(image),
+            "runtime artifact image contains an invalid platform identity"
         );
-        tokio::fs::create_dir_all(self.images_dir()).await?;
-        let out = self.app_tar_path(image);
-        let tmp = out.with_extension("tar.tmp");
-        // `-h`/`--dereference`: some package managers (pnpm's node_modules
-        // layout especially) lay out a dependency tree heavily with
-        // symlinks; a dangling one is a silent broken `require()` under the
-        // same guest-fs constraint documented in `ensure_combined_tar`.
-        let res = Command::new("tar")
-            .arg("-h")
-            .arg("-C")
-            .arg(build_dir)
-            .arg("-cf")
-            .arg(&tmp)
-            .arg(".")
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
-        anyhow::ensure!(
-            res.status.success(),
-            "tar failed packing {}: {}",
-            build_dir.display(),
-            String::from_utf8_lossy(&res.stderr).trim()
-        );
-        tokio::fs::rename(&tmp, &out).await?;
+        let publication = self.artifact_lock.clone().lock_owned().await;
+        let directories = self.prepare_artifact_dirs()?;
+        let (staged, _publication) = crate::runtime_artifact::stage_runtime_artifact_serialized(
+            artifact,
+            directories.staging.descriptor.try_clone()?,
+            publication,
+        )
+        .await?;
+        let identity = RuntimeArtifactIdentity {
+            protocol: hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            id: image.to_string(),
+            content_sha256: staged.content_sha256().to_string(),
+        };
+        let guest_workdir = artifact.guest_workdir(DELIVERED_WORKDIR)?;
+        validate_guest_workdir(&guest_workdir)?;
+        let (package_scripts, next_entry) = self.package_metadata(&staged, artifact).await?;
+        staged.write_identity(&identity)?;
+
+        let mut temp = self.allocate_temp_file(&directories.temporary, "app", ".tar")?;
+        staged.package_workspace(&temp.file).await?;
+        temp.file.sync_all()?;
+        let app_archive_sha256 = sha256_open_file(&temp.file).await?;
+        let destination_name = Self::app_archive_name(&app_archive_sha256);
+        self.publish_immutable_locked(
+            &directories,
+            &mut temp,
+            &directories.apps,
+            &destination_name,
+            &app_archive_sha256,
+        )
+        .await?;
+        let reference = LiteboxImageReference {
+            schema: LITEBOX_ARTIFACT_SCHEMA,
+            image: image.to_string(),
+            identity,
+            guest_workdir,
+            app_archive_sha256,
+            package_scripts,
+            next_entry,
+            runtimes: BTreeMap::new(),
+        };
+        self.write_image_reference_locked(&directories, &reference)
+            .await?;
+        if let Err(error) = self.gc_artifacts_locked(&directories).await {
+            tracing::warn!(error = %error, "litebox artifact GC refused or failed");
+        }
         Ok(())
     }
 
-    fn delivered_workdir(&self) -> Option<&'static str> {
-        // The guest's default cwd is its filesystem root, and
-        // `deliver_build` tars the build dir at paths relative to that same
-        // root (see module doc) — "/" is the litebox analogue of
-        // FirecrackerBackend's fixed DELIVERED_WORKDIR guest path.
-        Some("/")
+    async fn runtime_artifact_identity(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<Option<RuntimeArtifactIdentity>> {
+        anyhow::ensure!(
+            valid_identity_id(image),
+            "runtime artifact image contains an invalid platform identity"
+        );
+        let _publication = self.artifact_lock.clone().lock_owned().await;
+        let directories = self.prepare_artifact_dirs()?;
+        let name = Self::image_reference_name(image);
+        let file = match directories.references.open_regular(&name) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES)?;
+        let reference: LiteboxImageReference = serde_json::from_slice(&bytes)?;
+        validate_image_reference(&reference, image)?;
+        verify_immutable_open(
+            &directories.apps,
+            &Self::app_archive_name(&reference.app_archive_sha256),
+            &reference.app_archive_sha256,
+        )
+        .await?;
+        directories.verify_bindings()?;
+        Ok(Some(reference.identity))
+    }
+
+    fn delivered_workdir(&self, artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+        artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
     async fn start_function(
@@ -1158,7 +3637,9 @@ impl CellBackend for LiteboxBackend {
         cell: &CellHandle,
         func: &FunctionLaunch,
     ) -> anyhow::Result<CellEndpoint> {
-        anyhow::ensure!(!func.start_cmd.is_empty(), "empty function start_cmd");
+        if func.start_cmd.is_empty() {
+            return Err(launch_refusal("function start command is empty"));
+        }
 
         // CONTAINER cell: bypass litebox entirely, run via host podman — the
         // same helper FirecrackerBackend calls. See module doc for why.
@@ -1216,33 +3697,123 @@ impl CellBackend for LiteboxBackend {
             return Ok(endpoint);
         }
 
-        // Plain function: run under litebox's syscall rewriter. `func.workdir`
-        // (a HOST path from `deliver_build`'s build_dir) is meaningless to the
-        // guest and deliberately ignored here, the same way FirecrackerBackend
-        // overwrites it before handing FunctionLaunch to its guest agent — the
-        // guest sees `cell.image`'s tar rooted at "/" instead (see module doc).
-        let bin = resolve_bin(&func.start_cmd[0]).await;
-        // The interpreter must exist on the HOST here — this backend stages the
-        // binary's own ldd closure into the guest tar, so a name that resolves
-        // to nothing produces a confusing staging failure rather than an
-        // actionable one. Same preflight and same marker as the mock and
-        // cell-agent paths, so a missing runtime is reported as an operator
-        // remedy instead of falling into the CAPACITY_EXHAUSTED catch-all.
+        // Bun is refused here, before any reservation, network setup, tar
+        // alias, or process spawn — never after. `func.runtime` (the
+        // authoritative platform discriminator FunctionLaunch itself carries,
+        // never a parse of `start_cmd`'s tenant-controlled argv text) is the
+        // only signal trusted for this decision, exactly like
+        // `hive-cell-agent`'s own `platform_runtime_program` gate.
+        //
+        // This backend's syscall shim panics (`unimplemented!()`,
+        // `litebox_shim_linux/src/syscalls/file.rs:1210`) on Bun's own
+        // boot-time `readlink("/proc/self/fd/3")` probe — a hard Rust panic
+        // inside the guest's interception layer, not a recoverable error.
+        // Letting a Bun launch reach `resolve_direct_launch`/spawn below would
+        // turn every Bun cold start into an uncontrolled crash instead of an
+        // honest, typed node fault. This mirrors `resources::detect`'s
+        // `bun_runtime: Some(false)` verdict for this backend — placement
+        // should already have excluded this node for a Bun deployment
+        // (`schedule::bun_capable`), so reaching here means the gossiped
+        // capability and this launch disagree (a stale registry entry, a
+        // launch forced past placement). Never falls back to Mock or the
+        // host, never classifies as capacity or a tenant-app fault — this is
+        // a NODE fault, the same class `NODE_IMAGE_MISSING` and
+        // `NODE_BACKEND_UNAVAILABLE` are.
+        if func.runtime == hive_core::Runtime::Bun {
+            return Err(bun_unsupported_refusal());
+        }
+
+        // Plain function: bind this cell to the exact durable reference before
+        // resolving any repository-controlled launch metadata. Package managers
+        // are never run here: a narrow, validated package-script reducer emits
+        // one direct Node process or a typed backend-capability refusal (Bun is
+        // refused above, before this lock, before any of the machinery below).
+        let _publication = self.artifact_lock.clone().lock_owned().await;
+        let directories = self.prepare_artifact_dirs()?;
+        let mut reference = self
+            .load_image_reference_locked(&directories, &cell.image)
+            .await?;
+        let runtime_workdir = func.workdir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: litebox function is missing its exact runtime artifact workdir",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        anyhow::ensure!(
+            runtime_workdir == reference.guest_workdir,
+            "{}: litebox runtime workdir mismatch (launch {:?}, artifact {:?})",
+            hive_core::fault::NODE_IMAGE_MISSING,
+            runtime_workdir,
+            reference.guest_workdir
+        );
+        let expected = func.runtime_artifact.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: litebox launch is missing its authoritative runtime artifact identity",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        anyhow::ensure!(
+            expected == &reference.identity,
+            "{}: litebox launch requested a different runtime artifact identity",
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+        // `Runtime::Bun` is refused unconditionally above, before this branch
+        // is ever reached, so only `Node` remains a legitimate plain-function
+        // runtime on this backend.
+        if func.runtime != hive_core::Runtime::Node {
+            return Err(launch_refusal(format!(
+                "runtime {:?} is not a Node runtime",
+                func.runtime
+            )));
+        }
+        let app_archive = verify_immutable_open(
+            &directories.apps,
+            &Self::app_archive_name(&reference.app_archive_sha256),
+            &reference.app_archive_sha256,
+        )
+        .await?;
+        let DirectLaunch {
+            runtime,
+            bin,
+            mut args,
+        } = resolve_direct_launch(func, &reference, &app_archive).await?;
+        // Belt-and-braces for the same panic this function's entry already
+        // refuses on `func.runtime`: `resolve_direct_launch` derives ITS
+        // runtime from `start_cmd`'s argv text (needed to tell `node` from
+        // `bun` from a shared package-script reducer), so a launch whose
+        // `start_cmd` names `bun` while `func.runtime` claims something else
+        // — a malformed or mismatched launch that reached this point despite
+        // the entry check — would otherwise still be spawned against the
+        // unsupported syscall shim. The entry check above already refused
+        // every launch where `func.runtime` itself says Bun, so reaching
+        // `DirectRuntime::Bun` here can only mean that disagreement.
+        if runtime == DirectRuntime::Bun {
+            return Err(bun_unsupported_refusal());
+        }
         anyhow::ensure!(
             bin.is_file(),
-            "{}: `{}` is not installed on this node, so a runtime=\"{}\" deployment \
-             cannot start here (operator remedy; not an application fault)",
+            "{}: `{}` is not installed on this node, so the direct runtime cannot start here (operator remedy; not an application fault)",
             hive_core::fault::NODE_RUNTIME_MISSING,
-            func.start_cmd[0],
-            func.runtime.as_str(),
+            bin.display()
         );
-        let initial_files = self.ensure_combined_tar(&cell.image, &bin).await?;
+        let runtime_key = format!(
+            "{}:{}",
+            match runtime {
+                DirectRuntime::Node => "node",
+                DirectRuntime::Bun => "bun",
+            },
+            bin.display()
+        );
+        let initial_files = self
+            .ensure_combined_tar_locked(
+                &directories,
+                &cell.image,
+                &runtime_key,
+                &bin,
+                &mut reference,
+            )
+            .await?;
 
-        // This cell's TUN device + real, distinct guest IP, set up in
-        // `provision` — see module doc's "Networking" section (litebox's
-        // guest IP is patched to be per-invocation configurable, so no
-        // namespace/veth isolation is needed — each cell just gets its own
-        // real address directly).
         let net = self
             .cell_nets
             .lock()
@@ -1251,73 +3822,89 @@ impl CellBackend for LiteboxBackend {
             .cloned()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "litebox: cell {} has no TUN device (provision should have set one up) — \
-                     this is a bug, not a runtime condition",
+                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
                     cell.id
                 )
             })?;
+        if runtime == DirectRuntime::Bun {
+            args.insert(0, GUEST_RUNTIME_GUARD_PATH.to_string());
+            args.insert(0, "--preload".to_string());
+        }
 
-        // The bind-rewrite shim (see module doc's "Networking" section +
-        // litebox-bind-shim.js's own doc comment) is already staged into
-        // `initial_files` by `ensure_combined_tar` -> `stage_bind_shim`;
-        // only Node/Bun actually preload it. Even with the wildcard-bind
-        // patch applied, an app that explicitly hardcodes a loopback
-        // address still needs rewriting to this cell's real guest IP — TUN
-        // can never bridge host<->guest loopback. Python is not covered
-        // yet — see `crate::litebox`'s tracking note.
-        let is_node = matches!(
-            func.runtime,
-            hive_core::Runtime::Node | hive_core::Runtime::Bun
-        );
-
-        let mut cmd = Command::new(&self.cfg.runner_bin);
-        reset_signal_dispositions_before_exec(&mut cmd);
-        cmd.arg("-Z")
+        let guest_environment = sanitized_guest_environment(func)?;
+        let mut command = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut command);
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &initial_files)?;
+        let initial_files_path = crate::runtime_artifact::inherit_file_path(
+            &mut command,
+            &initial_files_alias.directory,
+        )?
+        .join(INITIAL_FILES_ALIAS_NAME);
+        directories.verify_bindings()?;
+        command
+            .arg("-Z")
             .arg("--rewrite-syscalls")
             .arg("--forward-env")
             .arg(format!("--tun-device-name={}", net.tun_dev))
-            .arg(format!("--initial-files={}", initial_files.display()))
+            .arg(format!("--initial-files={}", initial_files_path.display()))
             .arg("--")
             .arg(&bin)
-            .args(&func.start_cmd[1..])
-            // Cleared, not inherited: unlike MockBackend's dev-only process
-            // spawn, this backend fronts REAL (if lower-trust) tenant
-            // traffic — `--forward-env` would otherwise hand this node's own
-            // process secrets (HIVE_SECRET_KEY, HIVE_INTERNAL_TOKEN, ...) to
-            // sandboxed tenant code. Only the function's own declared env
-            // plus the minimum needed to run crosses the boundary.
+            .args(&args)
+            // Nothing from hive-node is inherited. Host-loader, runner-control
+            // and platform-owned keys were removed before the remaining tenant
+            // application environment was inserted.
             .env_clear()
+            .envs(&guest_environment)
             .env("PORT", func.port.to_string())
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/")
-            // Read by ansible/roles/litebox/files/networking.patch's
-            // litebox_runner_linux_userland change — gives THIS cell its own
-            // real, distinct guest identity instead of every cell defaulting
-            // to the same hardcoded 10.0.0.2/10.0.0.1.
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            .envs(&func.env)
+            .env("HIVE_RUNTIME_WORKDIR", &reference.guest_workdir)
+            .env(
+                "HIVE_RUNTIME_ARTIFACT_PROTOCOL",
+                reference.identity.protocol.to_string(),
+            )
+            .env("HIVE_RUNTIME_ARTIFACT_ID", &reference.identity.id)
+            .env(
+                "HIVE_RUNTIME_ARTIFACT_SHA256",
+                &reference.identity.content_sha256,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if is_node {
-            cmd.env("NODE_OPTIONS", format!("--require {GUEST_BIND_SHIM_PATH}"));
+        if runtime == DirectRuntime::Node {
+            command.env(
+                "NODE_OPTIONS",
+                format!("--require {GUEST_RUNTIME_GUARD_PATH}"),
+            );
+        } else {
+            // Bun's CLI preload above is the ordered guard. Do not let a
+            // tenant-supplied compatibility/options variable inject an earlier
+            // preload ahead of that platform-owned handshake.
+            command.env_remove("NODE_OPTIONS").env_remove("BUN_OPTIONS");
         }
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = command.spawn().map_err(|error| {
             anyhow::anyhow!(
-                "failed to spawn litebox runner at {}: {e}",
+                "failed to spawn litebox runner at {}: {error}",
                 self.cfg.runner_bin.display()
             )
         })?;
-        self.funcs.lock().await.insert(cell.id.clone(), child);
-
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
-        crate::mock::wait_tcp_ready(&func_addr, Duration::from_secs(15)).await?;
+        wait_litebox_ready(&mut child, &func_addr, Duration::from_secs(15)).await?;
+        // Guest readiness proves Litebox has materialized the initial tar. Drop
+        // the descriptor-relative pathname now; cancellation before this point
+        // takes the same Drop cleanup path automatically.
+        drop(initial_files_alias);
+        // Keep publication/GC serialized until the runner has consumed the
+        // selected immutable archive. A concurrent redelivery can then retire
+        // the old reference without deleting the file from under this cold
+        // start; a ready guest has already materialized its in-memory fs.
+        drop(_publication);
 
-        // Front the function with a multiplexed tunnel server — same shape
-        // as every other backend's serving path.
         let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let tunnel_addr = listener.local_addr()?.to_string();
@@ -1340,11 +3927,18 @@ impl CellBackend for LiteboxBackend {
                 }
             }
         }));
+        let mut funcs = self.funcs.lock().await;
         let mut tunnels = self.tunnels.lock().await;
+        funcs.insert(
+            cell.id.clone(),
+            LiteboxFunctionProcess {
+                child,
+                _initial_files: initial_files,
+            },
+        );
         if let Some(task) = task.publish() {
             tunnels.insert(cell.id.clone(), task);
         }
-
         Ok(CellEndpoint::Tcp(tunnel_addr))
     }
 
@@ -1365,9 +3959,9 @@ impl CellBackend for LiteboxBackend {
                 container.terminate().await;
             }
             let process = funcs.lock().await.remove(&id);
-            if let Some(mut child) = process {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            if let Some(mut process) = process {
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
             }
             let net = cell_nets.lock().await.remove(&id);
             if let Some(net) = net {
@@ -1386,7 +3980,7 @@ impl CellBackend for LiteboxBackend {
         // is more direct here than the Firecracker VMM-proxy case.
         let pid = {
             let funcs = self.funcs.lock().await;
-            funcs.get(&cell.id).and_then(|c| c.id())?
+            funcs.get(&cell.id).and_then(|c| c.child.id())?
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }

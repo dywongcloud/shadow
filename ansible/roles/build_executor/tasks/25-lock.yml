@@ -1,0 +1,92 @@
+---
+- name: Allocate a kernel-random provisioning identity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/cat
+      - /proc/sys/kernel/random/uuid
+  register: _build_executor_invocation_uuid
+  changed_when: false
+
+- name: Pin unique lock and probe identities
+  ansible.builtin.set_fact:
+    build_executor_invocation_id: "{{ _build_executor_invocation_uuid.stdout | trim }}"
+    _build_executor_lock_unit: "hive-build-lock-{{ _build_executor_invocation_uuid.stdout | trim }}.service"
+    _build_executor_lock_ready: "/run/hive-build-lock-{{ _build_executor_invocation_uuid.stdout | trim }}.ready"
+    _build_executor_lock_held: false
+
+- name: Require a canonical kernel UUID
+  ansible.builtin.assert:
+    that:
+      - build_executor_invocation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+
+# This inline holder uses only preflight-proved host primitives, so the flock is
+# acquired before dnf, capability revocation, file installation, image changes,
+# network inspection, or probes. The unique receipt is written only after flock(2)
+# succeeds; systemd-run returning merely proves that the waiter was launched.
+- name: Start the serialized root-flock holder without pre-lock file mutation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-run
+      - --quiet
+      - --collect
+      - "--unit={{ _build_executor_lock_unit }}"
+      - --property=Type=simple
+      - --property=TimeoutStopSec=5s
+      - /usr/bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        umask 077
+        lock=$1
+        ready=$2
+        token=$3
+        /usr/bin/rm -f -- "$ready" "${ready}.new"
+        exec 9>>"$lock"
+        /usr/bin/flock --exclusive 9
+        printf '%s\n' "$token" >"${ready}.new"
+        /usr/bin/mv -f -- "${ready}.new" "$ready"
+        cleanup() { /usr/bin/rm -f -- "$ready" "${ready}.new"; }
+        trap cleanup EXIT TERM INT
+        while /usr/bin/sleep 3600; do :; done
+      - hive-build-lock-holder
+      - "{{ build_executor_lock_path }}"
+      - "{{ _build_executor_lock_ready }}"
+      - "{{ build_executor_invocation_id }}"
+
+- name: Wait for exclusive host-lock acquisition
+  ansible.builtin.wait_for:
+    path: "{{ _build_executor_lock_ready }}"
+    state: present
+    timeout: "{{ build_executor_lock_wait_seconds }}"
+
+- name: Read the lock-holder receipt
+  ansible.builtin.slurp:
+    src: "{{ _build_executor_lock_ready }}"
+  register: _build_executor_lock_receipt
+
+- name: Require this invocation to own the root flock
+  ansible.builtin.assert:
+    that:
+      - (_build_executor_lock_receipt.content | b64decode | trim) == build_executor_invocation_id
+
+- name: Inspect the stable shared lock inode
+  ansible.builtin.stat:
+    path: "{{ build_executor_lock_path }}"
+    follow: false
+  register: _build_executor_lock_stat
+
+- name: Require the stable lock to be a root-only regular inode
+  ansible.builtin.assert:
+    that:
+      - _build_executor_lock_stat.stat.exists
+      - _build_executor_lock_stat.stat.isreg
+      - not _build_executor_lock_stat.stat.islnk
+      - _build_executor_lock_stat.stat.uid == 0
+      - _build_executor_lock_stat.stat.gid == 0
+      - _build_executor_lock_stat.stat.mode == "0600"
+      - _build_executor_lock_stat.stat.nlink == 1
+    fail_msg: "BuildExecutor serialization lock is not a stable root-only regular inode."
+
+- name: Mark the serialized BuildExecutor lock held
+  ansible.builtin.set_fact:
+    _build_executor_lock_held: true

@@ -23,11 +23,15 @@ reqwest = { workspace = true }
 # Pure-Rust image codecs (no native deps with these features) for the Image
 # Optimization endpoint: JPEG/PNG/WebP/GIF decode + JPEG/PNG/WebP encode.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-# Static-asset compression (Vercel-style): serve a precompressed `.br`/`.gz`
-# sibling when one exists, else compress once inline and persist the sibling.
+# Static-asset compression (Vercel-style): serve a pre-generated `.br`/`.gz`
+# sibling when one exists, else compress bounded assets inline.
 # Both are pure Rust, no native deps.
 brotli = "7"
 flate2 = "1"
+# Linux openat2(2) gives static-asset reads a kernel-enforced RESOLVE_BENEATH
+# boundary. Canonicalize-then-open is TOCTOU-prone when tenant code can mutate
+# its checkout concurrently with a request.
+libc = "0.2"
 
 [dev-dependencies]
 reqwest = { workspace = true }

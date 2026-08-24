@@ -1,32 +1,27 @@
 ---
-# Runs SERIALLY (see playbooks/parallel-deploy.yml's serial: on this play) --
-# swaps the binary into place (a no-op copy on the build host, an atomic
-# mv from the pushed /tmp copy on every follower), restarts hive-node, and
-# health-checks before ansible moves to the next batch. One host at a time
-# by default so mesh quorum is never lost across more than one node at once
-# (AGENTS.md health-verdict-per-observer note; the same reasoning
-# playbooks/platform-only.yml's serial: 1 already encodes).
+# Runs serially. The controller and cell agent are one release pair: both
+# canonical digests must exist, both are verified in place before hive-node is
+# restarted, and the agent's prior bytes remain at hive-cell-agent.old.
 
-# Gate BEFORE anything is touched. A `--limit` that keeps hosts of a glibc
-# group but drops that group's build host builds nothing for them, and without
-# this the restart play would happily bounce the service onto whatever binary
-# was already there and report ok= -- a deploy-shaped non-event.
-- name: Require a canonical artifact for this host's glibc group
+- name: Require a canonical controller+agent pair for this glibc group
   ansible.builtin.assert:
     that:
       - hostvars[hive_group_build_host].hive_group_build_sha256 is defined
       - (hostvars[hive_group_build_host].hive_group_build_sha256 | default('') | length) == 64
+      - hostvars[hive_group_build_host].hive_group_cell_agent_sha256 is defined
+      - (hostvars[hive_group_build_host].hive_group_cell_agent_sha256 | default('') | length) == 64
     fail_msg: >-
-      NOTHING WAS BUILT for glibc group '{{ hive_glibc_group }}' in this run --
-      refusing to restart {{ hive_name }} onto an unverified binary. Build host
-      for this group: '{{ hive_group_build_host }}'.
+      NOTHING COMPLETE WAS BUILT for glibc group '{{ hive_glibc_group }}' in
+      this run. Refusing to publish or restart {{ hive_name }} without both a
+      canonical hive-cloud digest and canonical hive-cell-agent digest. Build
+      host for this group: '{{ hive_group_build_host }}'.
 
-- name: Build host -- binary is already canonical, nothing to swap
+- name: Build host -- controller is already canonical, nothing to swap
   ansible.builtin.debug:
-    msg: "{{ hive_name }}: build host, binary already at {{ hive_binary_path }}"
+    msg: "{{ hive_name }}: build host, controller already at {{ hive_binary_path }}"
   when: inventory_hostname == hive_group_build_host
 
-- name: Follower -- record the binary content BEFORE the swap
+- name: Follower -- record the controller content before the swap
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
     get_checksum: true
@@ -34,12 +29,28 @@
   register: _pre_swap
   when: inventory_hostname != hive_group_build_host
 
-- name: Follower -- publish the pre-swap sha for verification
+- name: Follower -- publish the pre-swap controller digest
   ansible.builtin.set_fact:
     hive_pre_deploy_sha: "{{ _pre_swap.stat.checksum | default('') }}"
   when: inventory_hostname != hive_group_build_host
 
-- name: Follower -- back up the running binary before swap
+- name: Record the installed cell-agent content before publication
+  ansible.builtin.stat:
+    path: "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _pre_agent_install
+
+- name: Record the installed cell-agent release fact before publication
+  ansible.builtin.stat:
+    path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+  register: _pre_agent_fact
+
+- name: Publish the pre-install cell-agent digest
+  ansible.builtin.set_fact:
+    hive_pre_agent_sha: "{{ _pre_agent_install.stat.checksum | default('') }}"
+
+- name: Follower -- back up the running controller before swap
   ansible.builtin.copy:
     src: "{{ hive_binary_path }}"
     dest: "{{ hive_binary_path }}.old-roll"
@@ -47,15 +58,12 @@
     mode: "0755"
   when: inventory_hostname != hive_group_build_host
 
-- name: Follower -- atomically move the verified pushed binary into place
+- name: Follower -- atomically move the verified controller into place
   ansible.builtin.command:
     cmd: mv -f /tmp/hive-cloud.new {{ hive_binary_path }}
   when: inventory_hostname != hive_group_build_host
 
-# Fail here, BEFORE the restart, if the file in place is not the artifact this
-# run built -- restarting onto the wrong binary and discovering it in the
-# verification pass costs a service bounce that this check makes unnecessary.
-- name: Verify the binary now in place is the canonical build (pre-restart)
+- name: Verify the controller now in place is canonical before restart
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
     get_checksum: true
@@ -65,15 +73,108 @@
     (_in_place.stat.checksum | default('')) !=
     hostvars[hive_group_build_host].hive_group_build_sha256
 
+- name: Install the fail-closed cell-agent release publisher
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../hive_platform/files/install-cell-agent.sh"
+    dest: /usr/local/sbin/hive-install-cell-agent
+    owner: root
+    group: root
+    mode: "0755"
+
+# The helper copies the candidate into the destination filesystem, verifies its
+# canonical SHA-256, then bounds and parses the CLI protocol probe. Only after
+# that preflight does it rotate .old and atomically rename the new executable.
+- name: Preflight and atomically publish the canonical cell agent
+  vars:
+    _candidate: >-
+      {{ hive_cargo_target_dir ~ '/release/hive-cell-agent'
+         if inventory_hostname == hive_group_build_host
+         else '/tmp/hive-cell-agent.new' }}
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/hive-install-cell-agent
+      - "{{ _candidate }}"
+      - "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+  environment:
+    CELL_AGENT_EXPECTED_SHA256: "{{ hostvars[hive_group_build_host].hive_group_cell_agent_sha256 }}"
+    CELL_AGENT_ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | default(2) | string }}"
+    CELL_AGENT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | default(1) | string }}"
+    CELL_AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | default(2) | string }}"
+    CELL_AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | default(15) | string }}"
+    CELL_AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | default(5) | string }}"
+    CELL_AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+  register: _cell_agent_install
+  changed_when: >-
+    (_pre_agent_install.stat.checksum | default('')) !=
+      hostvars[hive_group_build_host].hive_group_cell_agent_sha256 or
+    not (_pre_agent_fact.stat.exists | default(false))
+
+- name: Require the exact parseable installed cell-agent release fact
+  vars:
+    _fact: "{{ _cell_agent_install.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - _fact.keys() | sort == ['agent_sha256', 'agent_wire_capabilities', 'agent_wire_protocol', 'rootfs_schema', 'runtime_artifact_protocol', 'schema']
+      - (_fact.schema | int) == 2
+      - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
+      - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
+      - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
+      - _fact.agent_sha256 == hostvars[hive_group_build_host].hive_group_cell_agent_sha256
+    fail_msg: >-
+      {{ hive_name }} did not publish the exact built cell-agent digest, rootfs
+      schema, runtime-artifact protocol, wire protocol and capability set;
+      hive-node remains on its prior running image.
+
+- name: Verify the installed cell-agent bytes and fact metadata before restart
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    get_checksum: "{{ item.checksum }}"
+    checksum_algorithm: sha256
+  loop:
+    - path: "{{ hive_cell_agent_install_path | default('/usr/local/bin/hive-cell-agent') }}"
+      checksum: true
+    - path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
+      checksum: false
+  register: _cell_agent_in_place
+
+- name: Refuse restart unless the installed cell-agent package is exact
+  vars:
+    _agent: "{{ _cell_agent_in_place.results[0].stat }}"
+    _fact_file: "{{ _cell_agent_in_place.results[1].stat }}"
+  ansible.builtin.assert:
+    that:
+      - _agent.exists
+      - _agent.isreg
+      - _agent.pw_name == 'root'
+      - _agent.gr_name == 'root'
+      - _agent.mode == '0755'
+      - _agent.checksum == hostvars[hive_group_build_host].hive_group_cell_agent_sha256
+      - _fact_file.exists
+      - _fact_file.isreg
+      - _fact_file.pw_name == 'root'
+      - _fact_file.gr_name == 'root'
+      - _fact_file.mode == '0444'
+    fail_msg: >-
+      {{ hive_name }} has an incomplete or mismatched cell-agent package; refusing
+      to restart the controller or allow a later rootfs bake to consume it.
+
+- name: Remove the follower cell-agent staging file after publication
+  ansible.builtin.file:
+    path: /tmp/hive-cell-agent.new
+    state: absent
+  when: inventory_hostname != hive_group_build_host
+
 - name: Template the hive-node systemd unit (in case env/vars changed)
   ansible.builtin.template:
     src: "{{ role_path }}/../hive_platform/templates/hive-node.service.j2"
     dest: /etc/systemd/system/hive-node.service
     mode: "0644"
+  no_log: true
+  diff: false
   register: _unit
 
-# The packaged cr-sqlite extension (build.yml's note names the outage class).
-# Followers take the pushed copy; the build host installs from its own dist.
+# Followers take the pushed cr-sqlite copy; the build host installs from dist.
 - name: Install the cr-sqlite extension when its content changed
   ansible.builtin.shell: |
     set -e

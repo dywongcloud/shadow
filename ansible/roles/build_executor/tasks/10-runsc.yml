@@ -1,0 +1,437 @@
+---
+# Atomic whole-bundle gVisor install. The reviewed release is one archive with
+# exactly six members (runsc, containerd-shim-runsc-v1, and four gvisor-bin/
+# support binaries); they are downloaded, checksum-verified at the ARCHIVE
+# level (SHA-256 via get_url + an independent SHA-512 recheck) and then at the
+# PER-MEMBER level against the exact six-member allowlist, extracted into a
+# never-mutated versioned release directory, and only then made live by
+# atomically swapping the build_executor_gvisor_current_link directory
+# symlink onto the whole verified tree in one rename(2). runsc is never
+# exposed without the rest of the bundle: the switch covers all six members
+# together, by construction, because they share one release directory and one
+# link.
+
+- name: Create the versioned gVisor releases directory
+  ansible.builtin.file:
+    path: "{{ build_executor_gvisor_releases_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Remove any stale staging directory from an interrupted previous run
+  ansible.builtin.file:
+    path: "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}"
+    state: absent
+
+- name: Find any orphaned release-switch temporary symlinks from an interrupted previous run
+  ansible.builtin.find:
+    paths: "{{ build_executor_libexec_dir }}"
+    patterns: "gvisor-current.next-*"
+    file_type: any
+    recurse: false
+  register: _build_executor_gvisor_orphaned_switch_links
+
+- name: Remove any orphaned release-switch temporary symlinks
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _build_executor_gvisor_orphaned_switch_links.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Check whether the pinned gVisor release is already installed
+  ansible.builtin.stat:
+    path: "{{ build_executor_gvisor_release_dir }}"
+    follow: false
+  register: _build_executor_gvisor_release_present
+
+- name: Download, verify, and extract the pinned gVisor release
+  when: not (_build_executor_gvisor_release_present.stat.exists and _build_executor_gvisor_release_present.stat.isdir)
+  block:
+    - name: Download the checksum-pinned gVisor release archive
+      ansible.builtin.get_url:
+        url: "{{ build_executor_gvisor_archive_url }}"
+        dest: "{{ build_executor_state_dir }}/gvisor-{{ build_executor_gvisor_release }}.tar.bz2"
+        owner: root
+        group: root
+        mode: "0600"
+        checksum: "sha256:{{ build_executor_gvisor_archive_sha256 }}"
+        force: true
+
+    - name: Recompute the archive SHA-512 independently of get_url's SHA-256 check
+      ansible.builtin.stat:
+        path: "{{ build_executor_state_dir }}/gvisor-{{ build_executor_gvisor_release }}.tar.bz2"
+        checksum_algorithm: sha512
+        get_checksum: true
+        follow: false
+      register: _build_executor_gvisor_archive_stat
+
+    - name: Require the archive to be a root-owned regular file matching both pinned digests
+      ansible.builtin.assert:
+        that:
+          - _build_executor_gvisor_archive_stat.stat.exists
+          - _build_executor_gvisor_archive_stat.stat.isreg
+          - not _build_executor_gvisor_archive_stat.stat.islnk
+          - _build_executor_gvisor_archive_stat.stat.uid == 0
+          - _build_executor_gvisor_archive_stat.stat.gid == 0
+          - _build_executor_gvisor_archive_stat.stat.checksum == build_executor_gvisor_archive_sha512
+        fail_msg: >-
+          Downloaded gVisor archive does not match the pinned SHA-512
+          {{ build_executor_gvisor_archive_sha512 }}; refusing to extract it.
+
+    - name: Create the fresh extraction staging directory
+      ansible.builtin.file:
+        path: "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Extract the verified archive into the staging directory, root-owned
+      ansible.builtin.unarchive:
+        src: "{{ build_executor_state_dir }}/gvisor-{{ build_executor_gvisor_release }}.tar.bz2"
+        dest: "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Enumerate every regular file the archive actually extracted
+      ansible.builtin.find:
+        paths: "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}"
+        recurse: true
+        file_type: file
+      register: _build_executor_gvisor_extracted
+
+    - name: Require the extracted tree to be exactly the reviewed six-member set
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_build_executor_gvisor_extracted.files
+              | map(attribute='path')
+              | map('regex_replace', '^' ~ (build_executor_gvisor_releases_dir ~ '/.staging-' ~ build_executor_invocation_id ~ '/') | regex_escape, '')
+              | sort | list) ==
+            (build_executor_gvisor_members | map(attribute='path') | sort | list)
+        fail_msg: >-
+          Extracted gVisor archive members differ from the reviewed six-member
+          allowlist; refusing to install a bundle shaped differently from the
+          one that was reviewed.
+
+    - name: Verify every reviewed member's checksum and root ownership before publish
+      ansible.builtin.stat:
+        path: "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}/{{ item.path }}"
+        checksum_algorithm: sha256
+        get_checksum: true
+        follow: false
+      loop: "{{ build_executor_gvisor_members }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: _build_executor_gvisor_member_stats
+
+    - name: Require every member to be a root-owned executable matching its pinned SHA-256
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+          - item.stat.uid == 0
+          - item.stat.gid == 0
+          - item.stat.mode == "0755"
+          - item.stat.checksum == item.item.sha256
+        fail_msg: >-
+          {{ item.item.path }} does not match its pinned SHA-256; refusing to
+          install any member of this bundle.
+      loop: "{{ _build_executor_gvisor_member_stats.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Atomically publish the verified release directory
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - -T
+          - "{{ build_executor_gvisor_releases_dir }}/.staging-{{ build_executor_invocation_id }}"
+          - "{{ build_executor_gvisor_release_dir }}"
+      changed_when: true
+
+    - name: Remove the downloaded archive once its bytes are safely installed
+      ansible.builtin.file:
+        path: "{{ build_executor_state_dir }}/gvisor-{{ build_executor_gvisor_release }}.tar.bz2"
+        state: absent
+
+- name: Re-verify every reviewed member in place (covers an already-installed release too)
+  ansible.builtin.stat:
+    path: "{{ build_executor_gvisor_release_dir }}/{{ item.path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  loop: "{{ build_executor_gvisor_members }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _build_executor_gvisor_live_member_stats
+
+- name: Require the live release directory to still match every pinned member exactly
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == "0755"
+      - item.stat.checksum == item.item.sha256
+    fail_msg: >-
+      Installed {{ item.item.path }} no longer matches its pinned SHA-256; the
+      release directory was modified after installation. Refusing to publish
+      a capability against it.
+  loop: "{{ _build_executor_gvisor_live_member_stats.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Read the current gvisor-current link target, if any
+  ansible.builtin.stat:
+    path: "{{ build_executor_gvisor_current_link }}"
+    follow: false
+  register: _build_executor_gvisor_link_before
+
+- name: Refuse to overwrite a non-symlink already occupying gvisor-current
+  ansible.builtin.assert:
+    that:
+      - not _build_executor_gvisor_link_before.stat.exists or _build_executor_gvisor_link_before.stat.islnk
+    fail_msg: >-
+      {{ build_executor_gvisor_current_link }} exists and is not a symlink;
+      refusing to replace an unexpected object at the release-switch path.
+
+- name: Atomically switch gvisor-current onto the verified release (temp-symlink + rename)
+  when: >-
+    not (_build_executor_gvisor_link_before.stat.exists
+      and _build_executor_gvisor_link_before.stat.islnk
+      and _build_executor_gvisor_link_before.stat.lnk_target == build_executor_gvisor_release_dir)
+  block:
+    - name: Create the replacement symlink under a private temporary name
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ln
+          - -s
+          - "{{ build_executor_gvisor_release_dir }}"
+          - "{{ build_executor_gvisor_current_link }}.next-{{ build_executor_invocation_id }}"
+      changed_when: true
+
+    - name: Atomically rename the replacement symlink onto gvisor-current
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - -T
+          - "{{ build_executor_gvisor_current_link }}.next-{{ build_executor_invocation_id }}"
+          - "{{ build_executor_gvisor_current_link }}"
+      changed_when: true
+
+- name: Require gvisor-current to be a symlink onto exactly the pinned release
+  ansible.builtin.stat:
+    path: "{{ build_executor_gvisor_current_link }}"
+    follow: false
+  register: _build_executor_gvisor_link_after
+
+- name: Assert the atomic release switch landed on the reviewed release
+  ansible.builtin.assert:
+    that:
+      - _build_executor_gvisor_link_after.stat.exists
+      - _build_executor_gvisor_link_after.stat.islnk
+      - _build_executor_gvisor_link_after.stat.lnk_target == build_executor_gvisor_release_dir
+
+- name: Recalculate the installed runsc and sidecar checksums through the live symlink
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  loop:
+    - "{{ build_executor_runsc_path }}"
+    - "{{ build_executor_runsc_sidecar_path }}"
+  register: _build_executor_runsc_live_stats
+
+- name: Require runsc and its sidecar to resolve, through the symlink, to real non-symlink regular files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == "0755"
+    fail_msg: >-
+      {{ item.item }} must resolve through gvisor-current to a real root-owned
+      regular executable, never a symlink at its final path component.
+  loop: "{{ _build_executor_runsc_live_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Pin the freshly measured runsc and sidecar checksums for the capability
+  ansible.builtin.set_fact:
+    build_executor_runsc_sha256: "{{ _build_executor_runsc_live_stats.results[0].stat.checksum }}"
+    build_executor_runsc_sidecar_sha256: "{{ _build_executor_runsc_live_stats.results[1].stat.checksum }}"
+
+- name: Require the freshly measured checksums to still match the reviewed pins
+  ansible.builtin.assert:
+    that:
+      - build_executor_runsc_sha256 == (build_executor_gvisor_members | selectattr('path', 'equalto', 'runsc') | first).sha256
+      - >-
+        build_executor_runsc_sidecar_sha256 ==
+        (build_executor_gvisor_members | selectattr('path', 'equalto', 'containerd-shim-runsc-v1') | first).sha256
+
+- name: Read the installed runsc version
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_runsc_path }}"
+      - --version
+  register: _build_executor_runsc_version
+  changed_when: false
+
+- name: Require the checksum-pinned runsc to report the reviewed version
+  ansible.builtin.assert:
+    that:
+      - "('runsc version ' ~ build_executor_runsc_version) in _build_executor_runsc_version.stdout_lines"
+    fail_msg: >-
+      Expected runsc version {{ build_executor_runsc_version }}, got:
+      {{ _build_executor_runsc_version.stdout | default('<no output>') }}
+
+# Beyond a version string: prove the shim's real argument-parsing/validation
+# logic executes (a corrupted or wrong-arch binary fails to exec at all rather
+# than emitting this exact, well-formed refusal), matching the "-v" contract
+# the shim advertises and the runtime error it gives on a genuinely invalid
+# invocation. Both behaviors were confirmed live against this exact pinned
+# release on a real Linux x86_64 host before being encoded here.
+- name: Read the installed containerd-shim-runsc-v1 version
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_runsc_sidecar_path }}"
+      - -v
+  register: _build_executor_shim_version
+  changed_when: false
+
+- name: Require the shim to report its real build version, not a static string
+  ansible.builtin.assert:
+    that:
+      - _build_executor_shim_version.rc == 0
+      - "'containerd-shim-runsc-v1:' in _build_executor_shim_version.stdout"
+      - "'Version:' in _build_executor_shim_version.stdout"
+
+- name: Invoke the shim with no arguments to exercise its real namespace validation
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_runsc_sidecar_path }}"
+  register: _build_executor_shim_bare
+  changed_when: false
+  failed_when: false
+
+- name: Require the shim's real validation path to reject the malformed invocation
+  ansible.builtin.assert:
+    that:
+      - _build_executor_shim_bare.rc != 0
+      - "'shim namespace cannot be empty' in (_build_executor_shim_bare.stdout ~ _build_executor_shim_bare.stderr)"
+    fail_msg: >-
+      containerd-shim-runsc-v1 did not exercise its real argument-validation
+      logic; the installed binary may be corrupted or arch-mismatched.
+
+# gvisor-bin/gvisor_sentry is already exercised for real by the live sandbox
+# boot in 50-probe.yml (runsc execs it to launch the sandbox whose
+# /proc/gvisor/kernel_is_gvisor marker that probe reads) -- confirmed by
+# tracing a real `runsc run` on a Linux x86_64 host. The other three
+# gvisor-bin members (checkpointgofer, gvisor-sentry-prewarmer,
+# runsc-metric-server) back optional features runsc does not exercise on an
+# ordinary sandbox boot, so they are proven here directly: each real exit
+# code and output substring below was observed live against this exact
+# pinned release, not guessed from documentation.
+- name: Invoke every gvisor-bin support binary to prove real, not static, behavior
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_gvisor_current_link }}/gvisor-bin/{{ item.binary }}"
+      - "{{ item.flag }}"
+  loop:
+    - { binary: checkpointgofer, flag: --help }
+    - { binary: gvisor_sentry, flag: --help }
+    - { binary: gvisor-sentry-prewarmer, flag: --help }
+    - { binary: runsc-metric-server, flag: --help }
+  loop_control:
+    label: "{{ item.binary }} {{ item.flag }}"
+  register: _build_executor_gvisor_bin_help
+  changed_when: false
+  failed_when: false
+
+- name: Require each gvisor-bin binary's real, previously-observed CLI contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'checkpointgofer') | first).rc == 0
+      - >-
+        'runs process for remote checkpoint file access' in
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'checkpointgofer') | first).stdout
+      - >-
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'gvisor_sentry') | first).rc == 0
+      - >-
+        'launch a sandbox process' in
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'gvisor_sentry') | first).stdout
+      - >-
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'gvisor-sentry-prewarmer') | first).rc != 0
+      - >-
+        "exec'd by runsc ahead of the sandbox process" in
+        ((_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'gvisor-sentry-prewarmer') | first).stdout ~
+         (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'gvisor-sentry-prewarmer') | first).stderr)
+      - >-
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).rc == 0
+      - >-
+        'implements Prometheus metrics HTTP endpoint' in
+        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).stdout
+    fail_msg: >-
+      A gvisor-bin support binary did not reproduce the real CLI behavior
+      observed live against the pinned release; the installed bundle may be
+      corrupted, truncated, or arch-mismatched.
+
+- name: Enumerate installed gVisor release directories for pruning
+  ansible.builtin.find:
+    paths: "{{ build_executor_gvisor_releases_dir }}"
+    file_type: directory
+    recurse: false
+  register: _build_executor_gvisor_release_dirs
+
+- name: Build the argv for the release-pruning helper
+  ansible.builtin.set_fact:
+    _build_executor_gvisor_prune_argv: >-
+      {{
+        ['/usr/bin/python3', '-c', _build_executor_gvisor_prune_script,
+         build_executor_gvisor_release, build_executor_gvisor_retain_releases | string]
+        + (_build_executor_gvisor_release_dirs.files | map(attribute='path') | map('basename') | list)
+      }}
+  vars:
+    _build_executor_gvisor_prune_script: |
+      import sys
+      current, retain = sys.argv[1], int(sys.argv[2])
+      names = [name for name in sys.argv[3:] if not name.startswith(".staging-")]
+
+      def sort_key(name):
+          date, _, suffix = name.partition(".")
+          try:
+              return (int(date), int(suffix) if suffix else 0)
+          except ValueError:
+              return (0, 0)
+
+      names = sorted(set(names) - {current}, key=sort_key, reverse=True)
+      stale = names[retain:]
+      print("\n".join(stale))
+
+# argv is built above as a real list (not a joined string) so a directory
+# name never has to survive a split; the helper receives exactly one argv
+# entry per candidate release.
+- name: Determine releases beyond the retained rollback window
+  ansible.builtin.command:
+    argv: "{{ _build_executor_gvisor_prune_argv }}"
+  register: _build_executor_gvisor_stale_releases
+  changed_when: false
+
+- name: Prune gVisor releases beyond the retained rollback window
+  ansible.builtin.file:
+    path: "{{ build_executor_gvisor_releases_dir }}/{{ item }}"
+    state: absent
+  loop: "{{ _build_executor_gvisor_stale_releases.stdout_lines }}"
+  when: item | trim | length > 0

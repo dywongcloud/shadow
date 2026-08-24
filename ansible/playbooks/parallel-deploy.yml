@@ -8,7 +8,8 @@
 # and playbooks/platform-only.yml's existing serial: 1):
 #
 #   1. BUILD (parallel, strategy: free): one host per glibc group builds
-#      hive-cloud; one host (the control-plane leader) builds the ui/
+#      one hive-cloud + hive-cell-agent release pair; one host (the
+#      control-plane leader) builds the ui/
 #      Next.js bundle once. All builds run concurrently with each other and
 #      don't lockstep on each other's task boundaries.
 #   2. PUSH (parallel, strategy: free): every host pulls its group's/the
@@ -235,9 +236,10 @@
                       | selectattr('content_changed', 'equalto', 'yes') | list }}"
       ansible.builtin.debug:
         msg:
-          - "BACKEND VERIFIED: {{ _v | length }}/{{ ansible_play_hosts | length }} hosts are RUNNING the artifact built in this run"
-          - "content changed on {{ _changed | length }} host(s): {{ _changed | map(attribute='host') | join(', ') if _changed else '(none)' }}"
-          - "artifacts: {{ _v | map(attribute='canonical_sha') | unique | map('truncate', 12, true, '') | join(', ') }}"
+          - "BACKEND VERIFIED: {{ _v | length }}/{{ ansible_play_hosts | length }} hosts run the controller and install the cell agent built in this run"
+          - "controller or agent content changed on {{ _changed | length }} host(s): {{ _changed | map(attribute='host') | join(', ') if _changed else '(none)' }}"
+          - "controllers: {{ _v | map(attribute='canonical_sha') | unique | map('truncate', 12, true, '') | join(', ') }}"
+          - "cell agents: {{ _v | map(attribute='canonical_agent_sha') | unique | map('truncate', 12, true, '') | join(', ') }}"
       run_once: true
       delegate_to: localhost
       become: false
@@ -260,15 +262,16 @@
           Only {{ _v | length }} of {{ ansible_play_hosts | length }} hosts produced
           verification facts -- the rest were never verified, so this run's result is unknown.
           {% else %}
-          NO-OP DEPLOY: every host already had the exact binary this run built
-          ({{ _v[0].canonical_sha[:12] }}), so nothing was deployed. Either the source
+          NO-OP DEPLOY: every host already had the exact controller+cell-agent
+          pair this run built ({{ _v[0].canonical_sha[:12] }} +
+          {{ _v[0].canonical_agent_sha[:12] }}), so nothing was deployed. Either the source
           never changed, or the build host rebuilt nothing (check that your --limit
           includes the right builder and that crates/ actually synced). Re-run with
           -e allow_noop_deploy=true if a no-op was the intent.
           {% endif %}
         success_msg: >-
-          {{ _changed | length }}/{{ ansible_play_hosts | length }} hosts took new backend content;
-          all {{ _v | length }} verified against the artifact built this run.
+          {{ _changed | length }}/{{ ansible_play_hosts | length }} hosts took new controller or cell-agent content;
+          all {{ _v | length }} verified against the release pair built this run.
       run_once: true
       delegate_to: localhost
       become: false

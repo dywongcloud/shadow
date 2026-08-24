@@ -96,17 +96,8 @@ Environment=HIVE_INTERNAL_TOKEN={{ vault_hive_internal_token }}
 {% if vault_stripe_secret_key %}
 Environment=STRIPE_SECRET_KEY={{ vault_stripe_secret_key }}
 {% endif %}
-{% if vault_github_token %}
-Environment=GITHUB_TOKEN={{ vault_github_token }}
-{% endif %}
 {% if vault_github_webhook_secret %}
 Environment=GITHUB_WEBHOOK_SECRET={{ vault_github_webhook_secret }}
-{% endif %}
-{% if vault_github_app_id %}
-Environment=GITHUB_APP_ID={{ vault_github_app_id }}
-{% endif %}
-{% if vault_github_app_private_key %}
-Environment=GITHUB_APP_PRIVATE_KEY={{ vault_github_app_private_key }}
 {% endif %}
 {% if vault_hive_secret_key %}
 Environment=HIVE_SECRET_KEY={{ vault_hive_secret_key }}

@@ -1172,6 +1172,26 @@ async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String
     }
 }
 
+/// Install a custom bundle before its DomainRecord may claim issuance. The
+/// metadata is a health statement consumed independently of the SNI cache, so
+/// writing it after a parse/key-install failure would recreate the original
+/// fictional "active SSL" state.
+fn install_and_record_custom_bundle(
+    cloud: &Arc<CloudState>,
+    zone: &str,
+    bundle: &str,
+    cert: &CertBundle,
+) -> anyhow::Result<bool> {
+    install_bundle(cert)?;
+    Ok(cloud.domains.set_ssl_issued(
+        zone,
+        bundle,
+        cert.names.clone(),
+        cert.issued_ms,
+        cert.not_after_ms,
+    ))
+}
+
 /// One pass over every verified custom domain: ensure a fresh, SAN-covering
 /// bundle exists, else issue one via HTTP-01 and publish it (guardian + local
 /// store) for the fleet's cert-sync to pick up. **Leader-only internally** —
@@ -1210,7 +1230,7 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
     static ISSUING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let issuing = ISSUING.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-    for (bundle, names, _zone) in custom_domain_bundles(cloud) {
+    for (bundle, names, zone) in custom_domain_bundles(cloud) {
         // The reservation is held from the freshness check through order
         // completion and released by the guard's Drop on EVERY exit path —
         // a cancelled pass (leader flap mid-await, task abort) must never
@@ -1244,6 +1264,15 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
         };
         if let Some(b) = load_bundle_local(&bundle) {
             if fresh(b.issued_ms, &b.names) {
+                match install_and_record_custom_bundle(cloud, &zone, &bundle, &b) {
+                    Ok(true) => crate::persist::persist(cloud),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        %bundle,
+                        error = %e,
+                        "custom-domain TLS bundle is fresh but could not be installed — ssl metadata remains pending"
+                    ),
+                }
                 continue;
             }
         } else {
@@ -1261,6 +1290,15 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
             match gb {
                 Some(b) if fresh(b.issued_ms, &b.names) => {
                     store_bundle_local(&bundle, &b);
+                    match install_and_record_custom_bundle(cloud, &zone, &bundle, &b) {
+                        Ok(true) => crate::persist::persist(cloud),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
+                            %bundle,
+                            error = %e,
+                            "adopted custom-domain TLS bundle could not be installed — ssl metadata remains pending"
+                        ),
+                    }
                     continue;
                 }
                 _ => {}
@@ -1280,8 +1318,18 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
                 store_bundle_local(&bundle, &b);
                 let js = serde_json::to_vec(&b).unwrap_or_default();
                 crate::guardian::put(&guardian_key(&bundle), js).await;
-                if install_bundle(&b).is_ok() {
-                    tracing::info!(%bundle, ?names, "custom-domain TLS bundle issued + installed");
+                match install_and_record_custom_bundle(cloud, &zone, &bundle, &b) {
+                    Ok(changed) => {
+                        tracing::info!(%bundle, ?names, "custom-domain TLS bundle issued + installed");
+                        if changed {
+                            crate::persist::persist(cloud);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        %bundle,
+                        error = %e,
+                        "custom-domain TLS bundle issued but failed to install — ssl metadata remains pending"
+                    ),
                 }
             }
             Err(e) => {

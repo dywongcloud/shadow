@@ -580,23 +580,43 @@ struct ProjectTeamQuery {
 }
 /// Server-to-server (dashboard preview-unlock only, `internal_ok`-gated):
 /// resolve the AUTHORITATIVE owning team for a project so the unlock check
-/// never trusts the `team` query param the edge redirect carried. That param
-/// collapsed to the owner-only "personal" namespace whenever a project's team
-/// tag was lost/empty, denying the real owner ("belongs to another user's
-/// personal workspace"). Local settings row first; fall back to the newest
-/// deployment record's stamped tenant (local, then gossiped peers).
+/// never trusts the `team` query param the edge redirect carried. The refreshed
+/// relational mirror is authoritative when it has a row; local settings and the
+/// newest deployment record are fallback sources only when it has none.
 async fn project_team(
     State(cloud): State<Arc<crate::state::CloudState>>,
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ProjectTeamQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !internal_ok(&headers) {
-        return Err((StatusCode::FORBIDDEN, "team resolution is server-only".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "team resolution is server-only".into(),
+        ));
     }
     let project = q.project.trim().to_string();
     if project.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "project required".into()));
     }
+    // `team_for_project` only returns a value after a successful Guardian index
+    // refresh. A present fresh row is authoritative even when this node's
+    // ProjectStore carries a stale non-empty team. A missing row or unavailable
+    // refresh/query deliberately enters the documented lower-authority fallback.
+    match crate::relational::team_for_project(&project).await {
+        Ok(Some(t)) => {
+            let team = crate::admin::record_tenant(&t).to_string();
+            if team != crate::admin::UNTAGGED_TENANT {
+                return Ok(Json(json!({ "team": team })));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            project,
+            error = %e,
+            "zkauth: fresh relational ownership unavailable; using local/deployment fallback"
+        ),
+    }
+
     let mut team = crate::admin::record_tenant(&cloud.projects.team_of(&project)).to_string();
     if team == crate::admin::UNTAGGED_TENANT {
         let mut best: Option<(u64, String)> = None;

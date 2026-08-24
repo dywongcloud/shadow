@@ -1,0 +1,287 @@
+---
+# These assertions are deliberately controller/input-only. In particular, an
+# omitted builder digest or runsc checksum fails before this role mutates the
+# managed host.
+- name: Require immutable BuildExecutor inputs
+  ansible.builtin.assert:
+    that:
+      - build_executor_protocol == "hive-build-executor/v1"
+      - build_executor_capability_path == "/var/lib/hive/build-executor.json"
+      - build_executor_state_dir == "/var/lib/hive/build-executor"
+      - build_executor_libexec_dir == "/usr/local/libexec/hive-build-executor"
+      - build_executor_builder_context_dir == (build_executor_state_dir ~ "/builder-context")
+      - build_executor_policy_revision is match('^[a-z0-9][a-z0-9._-]{0,31}$')
+      - build_executor_builder_source in ["build", "oci_archive"]
+      - >-
+        build_executor_builder_source != "build" or
+        (build_executor_builder_base_image is match('^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$'))
+      - >-
+        build_executor_builder_source != "oci_archive" or
+        (build_executor_builder_oci_archive_path is match('^/'))
+      - >-
+        build_executor_builder_source != "oci_archive" or
+        (build_executor_builder_oci_archive_sha256 is match('^[0-9a-f]{64}$'))
+      - >-
+        build_executor_builder_source != "oci_archive" or
+        (build_executor_builder_expected_image_id is match('^sha256:[0-9a-f]{64}$'))
+      - >-
+        build_executor_builder_expected_image_id | length == 0 or
+        (build_executor_builder_expected_image_id is match('^sha256:[0-9a-f]{64}$'))
+      - build_executor_builder_tag is match('^localhost/[a-z0-9][a-z0-9._/-]*:[a-z0-9][a-z0-9._-]*$')
+      - build_executor_gvisor_release is match('^[0-9]{8}(\.[0-9]+)?$')
+      - build_executor_gvisor_arch == "x86_64"
+      - >-
+        build_executor_gvisor_archive_url ==
+        ("https://storage.googleapis.com/gvisor/releases/release/" ~ build_executor_gvisor_release ~ "/" ~ build_executor_gvisor_arch ~ "/gvisor.tar.bz2")
+      - build_executor_gvisor_archive_sha256 is match('^[0-9a-f]{64}$')
+      - build_executor_gvisor_archive_sha512 is match('^[0-9a-f]{128}$')
+      - build_executor_gvisor_members is sequence
+      - build_executor_gvisor_members is not string
+      - build_executor_gvisor_members | length == 6
+      - >-
+        (build_executor_gvisor_members | map(attribute='path') | list | unique | length) ==
+        (build_executor_gvisor_members | length)
+      - >-
+        (build_executor_gvisor_members | map(attribute='path') | sort | list) == [
+          'containerd-shim-runsc-v1', 'gvisor-bin/checkpointgofer', 'gvisor-bin/gvisor-sentry-prewarmer',
+          'gvisor-bin/gvisor_sentry', 'gvisor-bin/runsc-metric-server', 'runsc'
+        ]
+      - build_executor_gvisor_members | selectattr('sha256', 'match', '^[0-9a-f]{64}$') | list | length == 6
+      - build_executor_gvisor_releases_dir == (build_executor_libexec_dir ~ "/gvisor-releases")
+      - build_executor_gvisor_release_dir == (build_executor_gvisor_releases_dir ~ "/" ~ build_executor_gvisor_release)
+      - build_executor_gvisor_current_link == (build_executor_libexec_dir ~ "/gvisor-current")
+      - build_executor_gvisor_retain_releases | int >= 1
+      - build_executor_gvisor_retain_releases | int <= 10
+      - build_executor_runsc_sha256 is match('^[0-9a-f]{64}$')
+      - build_executor_runsc_sha256 == (build_executor_gvisor_members | selectattr('path', 'equalto', 'runsc') | first).sha256
+      - build_executor_runsc_version is match('^release-[A-Za-z0-9][A-Za-z0-9._+-]*$')
+      - build_executor_runsc_version == ("release-" ~ build_executor_gvisor_release)
+      - build_executor_runsc_path == (build_executor_gvisor_current_link ~ "/runsc")
+      - build_executor_runsc_sidecar_sha256 is match('^[0-9a-f]{64}$')
+      - >-
+        build_executor_runsc_sidecar_sha256 ==
+        (build_executor_gvisor_members | selectattr('path', 'equalto', 'containerd-shim-runsc-v1') | first).sha256
+      - build_executor_runsc_sidecar_path == (build_executor_gvisor_current_link ~ "/containerd-shim-runsc-v1")
+      - build_executor_runsc_runtime_flags == ["platform=systrap", "network=sandbox", "gvisor-marker-file=true", "directfs=false", "host-uds=none", "host-fifo=none", "net-raw=false", "allow-flag-override=false"]
+      - build_executor_podman_path == (build_executor_libexec_dir ~ "/podman")
+      - build_executor_containers_conf_dir == "/etc/hive/build-executor"
+      - build_executor_containers_conf_path == (build_executor_containers_conf_dir ~ "/containers.conf")
+      - build_executor_containers_conf_override_path == (build_executor_containers_conf_dir ~ "/containers-override.conf")
+      - build_executor_oci_hooks_dir == (build_executor_containers_conf_dir ~ "/oci-hooks.empty")
+      - build_executor_nft_policy_path == "/etc/nftables.d/hive-build-executor.nft"
+      - build_executor_nft_apply_path == (build_executor_libexec_dir ~ "/apply-firewall")
+      - build_executor_nft_verify_path == (build_executor_libexec_dir ~ "/verify-firewall")
+      - build_executor_reap_helper_path == (build_executor_libexec_dir ~ "/reap-stale-probes")
+      - build_executor_lock_path is match('^/run/lock/[A-Za-z0-9._-]+$')
+      - build_executor_firewall_unit == "hive-build-executor-firewall.service"
+      - build_executor_nftables_dropin_dir == "/etc/systemd/system/nftables.service.d"
+      - build_executor_nftables_dropin_path == "/etc/systemd/system/nftables.service.d/20-build-executor-restore.conf"
+      - build_executor_netavark_reload_unit == "netavark-nftables-reload.service"
+      - build_executor_netavark_reload_unit_path == "/usr/lib/systemd/system/netavark-nftables-reload.service"
+      - build_executor_netavark_reload_fallback_path == "/etc/systemd/system/netavark-nftables-reload.service"
+      - build_executor_netavark_reload_dropin_dir == "/etc/systemd/system/netavark-nftables-reload.service.d"
+      - build_executor_netavark_reload_dropin_path == "/etc/systemd/system/netavark-nftables-reload.service.d/20-build-executor-policy.conf"
+      - build_executor_hive_node_dropin_dir == "/etc/systemd/system/hive-node.service.d"
+      - build_executor_hive_node_dropin_path == "/etc/systemd/system/hive-node.service.d/20-build-executor-firewall.conf"
+      - build_executor_nft_table is match('^[a-zA-Z][a-zA-Z0-9_]{0,31}$')
+      - build_executor_nft_bridge_table is match('^[a-zA-Z][a-zA-Z0-9_]{0,31}$')
+      - build_executor_nft_bridge_table != build_executor_nft_table
+      - build_executor_network_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$')
+      - build_executor_network_bridge is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$')
+      - build_executor_network_subnet is match('^[0-9.]+/[0-9]{1,2}$')
+      - build_executor_network_gateway is match('^[0-9.]+$')
+      - build_executor_dns_upstream_ipv4 is sequence
+      - build_executor_dns_upstream_ipv4 is not string
+      - build_executor_dns_upstream_ipv4 | length > 0
+      - build_executor_fleet_public_ipv4 is sequence
+      - build_executor_fleet_public_ipv4 is not string
+      - build_executor_fleet_public_ipv4 | length > 0
+      - build_executor_container_uid | int > 0
+      - build_executor_container_gid | int > 0
+      - build_executor_probe_listener_port | int >= 1024
+      - build_executor_probe_listener_port | int <= 65535
+      - build_executor_probe_peer_port | int >= 1024
+      - build_executor_probe_peer_port | int <= 65535
+      - build_executor_probe_peer_port | int != build_executor_probe_listener_port | int
+      - build_executor_probe_hairpin_port | int >= 1024
+      - build_executor_probe_hairpin_port | int <= 65535
+      - build_executor_probe_hairpin_port | int not in [build_executor_probe_listener_port | int, build_executor_probe_peer_port | int]
+      - build_executor_probe_connect_timeout_seconds | int >= 1
+      - build_executor_probe_connect_timeout_seconds | int <= 30
+      - build_executor_probe_pids_limit | int >= 16
+      - build_executor_probe_pids_limit | int <= 4096
+      - build_executor_probe_memory is match('^[1-9][0-9]*[kKmMgG]$')
+      - build_executor_lock_wait_seconds | int >= 1
+      - build_executor_lock_wait_seconds | int <= 1800
+      - build_executor_workspace_bytes | int >= 67108864
+      - build_executor_workspace_bytes | int <= 17179869184
+      - build_executor_probe_workspace_bytes | int >= 1048576
+      - build_executor_probe_workspace_bytes | int < build_executor_workspace_bytes | int
+      - build_executor_probe_registry_url is match('^https://\S+$')
+    fail_msg: >-
+      BuildExecutor immutable inputs are incomplete or malformed. Supply an
+      exact digest-pinned base (build mode), or a checksum-pinned archive plus
+      expected image ID (oci_archive mode), and checksum/version-pin runsc.
+      The role has not changed this host.
+
+- name: Inspect pre-mutation flock bootstrap primitives
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - /usr/bin/bash
+    - /usr/bin/cat
+    - /usr/bin/flock
+    - /usr/bin/mv
+    - /usr/bin/python3
+    - /usr/bin/rm
+    - /usr/bin/systemd-run
+    - /usr/bin/sleep
+  register: _build_executor_lock_primitives
+
+- name: Require root-owned executable flock bootstrap primitives
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.executable
+    fail_msg: >-
+      BuildExecutor cannot acquire its root serialization lock before mutation:
+      {{ item.item }} is not a root-owned regular executable.
+    quiet: true
+  loop: "{{ _build_executor_lock_primitives.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect any existing shared lock inode before mutation
+  ansible.builtin.stat:
+    path: "{{ build_executor_lock_path }}"
+    follow: false
+  register: _build_executor_existing_lock
+
+- name: Refuse an untrusted pre-existing shared lock inode
+  ansible.builtin.assert:
+    that:
+      - >-
+        not _build_executor_existing_lock.stat.exists or (
+          _build_executor_existing_lock.stat.isreg
+          and not _build_executor_existing_lock.stat.islnk
+          and _build_executor_existing_lock.stat.uid == 0
+          and _build_executor_existing_lock.stat.gid == 0
+          and _build_executor_existing_lock.stat.mode == "0600"
+          and _build_executor_existing_lock.stat.nlink == 1
+        )
+    fail_msg: >-
+      Existing {{ build_executor_lock_path }} is not a stable root-only regular
+      inode; refusing to follow or replace it.
+
+- name: Inspect the reviewed OCI archive before changing the host
+  ansible.builtin.stat:
+    path: "{{ build_executor_builder_oci_archive_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  register: _build_executor_archive_preflight
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Require the reviewed OCI archive bytes before changing the host
+  ansible.builtin.assert:
+    that:
+      - _build_executor_archive_preflight.stat.exists
+      - _build_executor_archive_preflight.stat.isreg
+      - not _build_executor_archive_preflight.stat.islnk
+      - _build_executor_archive_preflight.stat.uid == 0
+      - _build_executor_archive_preflight.stat.gid == 0
+      - _build_executor_archive_preflight.stat.mode in ["0400", "0440", "0444", "0600", "0640", "0644"]
+      - _build_executor_archive_preflight.stat.checksum == build_executor_builder_oci_archive_sha256
+    fail_msg: >-
+      The local builder OCI archive is absent, not a regular file, or does not
+      match build_executor_builder_oci_archive_sha256. The host is unchanged.
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Prove the expected image config is reachable from the reviewed OCI index
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+        import hashlib, json, re, sys, tarfile
+
+        archive, expected = sys.argv[1:]
+        digest_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+        if not digest_pattern.fullmatch(expected):
+            raise SystemExit("expected image ID is not a sha256 digest")
+        with tarfile.open(archive, "r:*") as bundle:
+            members = {}
+            for member in bundle.getmembers():
+                normalized = member.name.removeprefix("./")
+                if normalized in members:
+                    raise SystemExit(f"duplicate OCI archive member: {normalized}")
+                members[normalized] = member
+
+            def read_member(name, limit=16 * 1024 * 1024):
+                member = members.get(name)
+                if member is None or not member.isfile() or member.size > limit:
+                    raise SystemExit(f"missing, non-regular, or oversized OCI member: {name}")
+                stream = bundle.extractfile(member)
+                if stream is None:
+                    raise SystemExit(f"unreadable OCI member: {name}")
+                return stream.read()
+
+            layout = json.loads(read_member("oci-layout", 4096))
+            if layout != {"imageLayoutVersion": "1.0.0"}:
+                raise SystemExit("archive is not an OCI image-layout v1 archive")
+            root = json.loads(read_member("index.json"))
+            pending = list(root.get("manifests") or [])
+            seen = set()
+            found = False
+            while pending:
+                descriptor = pending.pop()
+                digest = descriptor.get("digest")
+                if not isinstance(digest, str) or not digest_pattern.fullmatch(digest):
+                    raise SystemExit("OCI descriptor has a non-sha256 digest")
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                name = "blobs/sha256/" + digest.split(":", 1)[1]
+                raw = read_member(name)
+                if hashlib.sha256(raw).hexdigest() != digest.split(":", 1)[1]:
+                    raise SystemExit(f"OCI descriptor digest mismatch: {digest}")
+                size = descriptor.get("size")
+                if not isinstance(size, int) or size != len(raw):
+                    raise SystemExit(f"OCI descriptor size mismatch: {digest}")
+                value = json.loads(raw)
+                if isinstance(value.get("manifests"), list):
+                    pending.extend(value["manifests"])
+                    continue
+                config = value.get("config")
+                if not isinstance(config, dict):
+                    raise SystemExit(f"OCI descriptor is neither index nor manifest: {digest}")
+                config_digest = config.get("digest")
+                if not isinstance(config_digest, str) or not digest_pattern.fullmatch(config_digest):
+                    raise SystemExit(f"OCI manifest has a non-sha256 config: {digest}")
+                config_name = "blobs/sha256/" + config_digest.split(":", 1)[1]
+                config_raw = read_member(config_name)
+                if hashlib.sha256(config_raw).hexdigest() != config_digest.split(":", 1)[1]:
+                    raise SystemExit(f"OCI config digest mismatch: {config_digest}")
+                config_size = config.get("size")
+                if not isinstance(config_size, int) or config_size != len(config_raw):
+                    raise SystemExit(f"OCI config size mismatch: {config_digest}")
+                found = found or config_digest == expected
+            if not found:
+                raise SystemExit("reviewed OCI archive does not contain the expected image ID")
+      - "{{ build_executor_builder_oci_archive_path }}"
+      - "{{ build_executor_builder_expected_image_id }}"
+  changed_when: false
+  when: build_executor_builder_source == "oci_archive"
+
+- name: Require the fleet's dnf-based production host contract
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.pkg_mgr == "dnf"
+      - ansible_facts.service_mgr == "systemd"
+    fail_msg: >-
+      build_executor currently supports the fleet's dnf/systemd production
+      hosts only (pkg_mgr={{ ansible_facts.pkg_mgr }}, service_mgr={{ ansible_facts.service_mgr }}).

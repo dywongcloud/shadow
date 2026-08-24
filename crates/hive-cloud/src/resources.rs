@@ -25,52 +25,151 @@ pub fn capacity() -> (u32, u64, u64) {
     (cores, mem_total_mb, disk_total_bytes / 1024 / 1024 / 1024)
 }
 
-/// GPUs on this host, probed ONCE at boot (mirrors `capacity()`'s once-at-boot
-/// shape and `geolocate()`'s override-then-probe pattern).
+/// The three runtime capabilities placement consumes from one observation of
+/// the active backend. Keeping them in one value makes both boot publication
+/// and periodic refresh use one backend/config/image verdict.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeCapabilities {
+    pub wasm_runtime: Option<bool>,
+    /// Can this node's active backend actually run a `Runtime::Bun` function?
+    /// See `NodeInfo::bun_runtime` for the full contract — `Some(false)`
+    /// always on Litebox regardless of what is staged (its pinned upstream
+    /// syscall shim panics on Bun's own boot probe).
+    pub bun_runtime: Option<bool>,
+    pub runtime_artifact_protocol: Option<u16>,
+}
+
+/// The backend selected by `main`, including the exact Firecracker image
+/// identity that was passed to the backend constructor.
 ///
-/// Returns `(count, model, total_vram_mb)`. A host with no NVIDIA driver, no
-/// `nvidia-smi`, or no GPUs returns `(0, None, 0)` — absence is a normal state,
-/// never an error, so a CPU-only node's boot is unaffected. `HIVE_GPUS`
-/// (`count,model,vram_mb`, e.g. `2,Tesla T4,30720`) overrides the probe for
-/// dev/testing exactly like `HIVE_GEO` overrides geolocation.
-/// Can this node actually EXECUTE a `Runtime::Wasmer` function? Answers the
-/// question `NodeInfo::wasm_runtime` advertises, and it is BACKEND-AWARE
-/// because the honest answer depends entirely on WHICH FILESYSTEM the
-/// function's `start_cmd` is spawned against:
-///
-///   * `firecracker` — `hive-cell-agent` runs as PID1 INSIDE the microVM and
-///     does `Command::new(start_cmd[0])` against a fixed guest PATH, so the
-///     only filesystem that matters is the GUEST ROOTFS. A host-side
-///     `/usr/local/bin/wasmer` is completely invisible to it. This is the
-///     distinction that made the first cut of this feature ship broken:
-///     ansible installed wasmer on the host, every fleet node is Firecracker,
-///     and every cold start would have ENOENT'd inside a guest built from
-///     `node:20-slim`. We therefore probe the rootfs IMAGE, not the host.
-///   * anything else (`mock`, `litebox`) — the process is spawned against the
-///     HOST filesystem, so a host PATH lookup is the correct question.
-///
-/// `HIVE_WASM_RUNTIME=1|0` overrides the probe (dev/testing, and the operator
-/// escape hatch for a rootfs this probe cannot introspect), exactly like
-/// `HIVE_GPUS` overrides `detect_gpus`.
-pub fn detect_wasm_runtime(backend: &str) -> Option<bool> {
-    if let Ok(v) = std::env::var("HIVE_WASM_RUNTIME") {
-        let v = v.trim();
-        return Some(v == "1" || v.eq_ignore_ascii_case("true"));
+/// This is deliberately not reconstructed from environment variables. An env
+/// value can describe an alternate image while the selected backend still boots
+/// its configured base image; capability advertising must follow the latter.
+#[derive(Clone)]
+pub struct RuntimeCapabilitySource {
+    backend: RuntimeCapabilityBackend,
+}
+
+#[derive(Clone)]
+enum RuntimeCapabilityBackend {
+    Firecracker {
+        backend: std::sync::Arc<hive_backend::firecracker::FirecrackerBackend>,
+        wasmer_marker: std::path::PathBuf,
+        bun_marker: std::path::PathBuf,
+    },
+    Litebox(std::sync::Arc<hive_backend::litebox::LiteboxBackend>),
+    Mock,
+}
+
+impl RuntimeCapabilitySource {
+    pub fn firecracker(
+        backend: std::sync::Arc<hive_backend::firecracker::FirecrackerBackend>,
+        config: &hive_backend::firecracker::FirecrackerConfig,
+    ) -> Self {
+        // Match FirecrackerBackend::rootfs_for's image-name normalization. The
+        // markers are published next to that exact rootfs by build-rootfs.sh.
+        let image = config
+            .base_image
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        Self {
+            backend: RuntimeCapabilityBackend::Firecracker {
+                backend,
+                wasmer_marker: config.rootfs_dir.join(format!("{image}.wasmer")),
+                bun_marker: config.rootfs_dir.join(format!("{image}.bun")),
+            },
+        }
     }
-    if backend == "firecracker" {
-        // The guest rootfs is an ext4 image; mounting it to look inside needs
-        // root and a loop device, which boot must not depend on. Provisioning
-        // (`ansible/roles/firecracker_kvm`, `scripts/build-rootfs.sh`) instead
-        // drops a marker next to the image naming what was staged into it, so
-        // the probe is a cheap stat of a file the image BUILDER wrote — the
-        // builder is the only thing that actually knows.
-        let dir =
-            std::env::var("HIVE_ROOTFS_DIR").unwrap_or_else(|_| "/var/lib/hive/rootfs".to_string());
-        let base = std::env::var("HIVE_CELL_IMAGE").unwrap_or_else(|_| "default".to_string());
-        let marker = std::path::Path::new(&dir).join(format!("{base}.wasmer"));
-        return Some(marker.exists());
+
+    pub fn litebox(backend: std::sync::Arc<hive_backend::litebox::LiteboxBackend>) -> Self {
+        Self {
+            backend: RuntimeCapabilityBackend::Litebox(backend),
+        }
     }
-    Some(which_on_path("wasmer").is_some())
+
+    pub fn mock() -> Self {
+        Self {
+            backend: RuntimeCapabilityBackend::Mock,
+        }
+    }
+
+    /// Observe Wasmer, Bun and runtime-artifact support from the active
+    /// backend.
+    ///
+    /// Firecracker's positive Wasmer/Bun answers are each conditional on the
+    /// same exact rootfs content proof provisioning checks. A marker for any
+    /// alternate image, a missing/replaced proof, or rootfs bytes that no
+    /// longer match the proof therefore cannot produce a positive capability.
+    ///
+    /// Litebox NEVER answers `true` for Bun regardless of what marker or PATH
+    /// entry exists: its pinned upstream syscall shim panics
+    /// (`unimplemented!()`, `litebox_shim_linux/src/syscalls/file.rs:1210`)
+    /// on Bun's own boot-time `readlink("/proc/self/fd/3")` probe, so
+    /// advertising capability there would turn every Bun cold start into an
+    /// uncontrolled guest panic instead of an honest placement refusal. This
+    /// is a fixed backend limitation, not a probe result — see
+    /// `LiteboxBackend`'s module doc's "Security posture"/Bun sections and
+    /// `crate::litebox`'s pre-spawn refusal for the belt-and-braces half.
+    pub async fn detect(&self) -> RuntimeCapabilities {
+        match &self.backend {
+            RuntimeCapabilityBackend::Firecracker {
+                backend,
+                wasmer_marker,
+                bun_marker,
+            } => match backend.base_runtime_artifact_protocol().await {
+                Ok(protocol) => RuntimeCapabilities {
+                    wasm_runtime: Some(regular_file(wasmer_marker)),
+                    bun_runtime: Some(regular_file(bun_marker)),
+                    runtime_artifact_protocol: Some(protocol),
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        code = hive_core::fault::NODE_RUNTIME_MISSING,
+                        "runtime capabilities disabled: the active guest rootfs has no valid exact-image proof"
+                    );
+                    RuntimeCapabilities {
+                        wasm_runtime: Some(false),
+                        bun_runtime: Some(false),
+                        runtime_artifact_protocol: None,
+                    }
+                }
+            },
+            RuntimeCapabilityBackend::Litebox(backend) if backend.is_supported() => {
+                RuntimeCapabilities {
+                    wasm_runtime: Some(which_on_path("wasmer").is_some()),
+                    // Always false — see this method's doc.
+                    bun_runtime: Some(false),
+                    runtime_artifact_protocol: Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION),
+                }
+            }
+            RuntimeCapabilityBackend::Litebox(_) => RuntimeCapabilities {
+                wasm_runtime: Some(false),
+                bun_runtime: Some(false),
+                runtime_artifact_protocol: None,
+            },
+            // Mock may truthfully exec a host Wasmer/Bun, but it is never an
+            // isolated runtime-artifact backend.
+            RuntimeCapabilityBackend::Mock => RuntimeCapabilities {
+                wasm_runtime: Some(which_on_path("wasmer").is_some()),
+                bun_runtime: Some(which_on_path("bun").is_some()),
+                runtime_artifact_protocol: None,
+            },
+        }
+    }
+}
+
+fn regular_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// First match for `name` on the process PATH. Deliberately the same
@@ -82,6 +181,15 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
         .map(|d| d.join(name))
         .find(|c| c.is_file())
 }
+
+/// GPUs on this host, probed ONCE at boot (mirrors `capacity()`'s once-at-boot
+/// shape and `geolocate()`'s override-then-probe pattern).
+///
+/// Returns `(count, model, total_vram_mb)`. A host with no NVIDIA driver, no
+/// `nvidia-smi`, or no GPUs returns `(0, None, 0)` — absence is a normal state,
+/// never an error, so a CPU-only node's boot is unaffected. `HIVE_GPUS`
+/// (`count,model,vram_mb`, e.g. `2,Tesla T4,30720`) overrides the probe for
+/// dev/testing exactly like `HIVE_GEO` overrides geolocation.
 
 pub fn detect_gpus() -> (u32, Option<String>, u64) {
     if let Ok(v) = std::env::var("HIVE_GPUS") {

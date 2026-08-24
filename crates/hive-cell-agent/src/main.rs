@@ -9,13 +9,50 @@
 //! from a systemd unit). It is Linux-only at runtime; on other platforms `main`
 //! is a stub so the workspace still builds on macOS.
 
+fn protocol_probe_requested() -> bool {
+    let Some(arg) = std::env::args_os().nth(1) else {
+        return false;
+    };
+    match arg.to_str() {
+        Some("--runtime-artifact-protocol") => {
+            println!("{}", hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION);
+            true
+        }
+        Some("--agent-wire-protocol") => {
+            println!("{}", hive_core::AGENT_WIRE_PROTOCOL_VERSION);
+            true
+        }
+        Some("--agent-wire-capabilities") => {
+            println!("{}", hive_core::AGENT_WIRE_CAPABILITIES);
+            true
+        }
+        Some("--agent-protocol-fact") => {
+            println!(
+                "{{\"rootfs_schema\":{},\"runtime_artifact_protocol\":{},\"agent_wire_protocol\":{},\"agent_wire_capabilities\":{}}}",
+                hive_core::RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
+                hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+                hive_core::AGENT_WIRE_PROTOCOL_VERSION,
+                hive_core::AGENT_WIRE_CAPABILITIES,
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
+    if protocol_probe_requested() {
+        return;
+    }
     linux::run();
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    if protocol_probe_requested() {
+        return;
+    }
     eprintln!(
         "hive-cell-agent runs inside a Linux microVM (needs AF_VSOCK). \
          Build it for the guest with: cargo build --release -p hive-cell-agent (on Linux/aarch64)."
@@ -26,13 +63,26 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use hive_core::{
-        now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, ExecRequest, FunctionLaunch,
-        LogLine, LogStream, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
+        agent_handshake_transcript, agent_request_frame_kind, now_ms,
+        validate_agent_handshake_request_frame, validate_agent_start_function_request_frame,
+        validate_legacy_agent_start_function_request_frame, AgentBootProof, AgentEvent,
+        AgentFunctionFault, AgentFunctionFaultCode, AgentHandshake, AgentHandshakeReady,
+        AgentProtocolFault, AgentProtocolFaultCode, AgentRequest, AgentRequestFrameKind, BuildJob,
+        BuildResult, ExecRequest, FunctionLaunch, LogLine, LogStream, RuntimeArtifactIdentity,
+        RuntimeArtifactRootfsMarker, AGENT_HANDSHAKE_NONCE_BYTES, AGENT_WIRE_CAPABILITIES,
+        AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
+        RUNTIME_ARTIFACT_MARKER_FILE, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+        RUNTIME_ARTIFACT_ROOTFS_MARKER_PATH, RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
     };
-    use std::io::{BufRead, BufReader, Read, Write};
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Read, Write};
     use std::net::TcpStream;
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Component, Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
@@ -45,6 +95,18 @@ mod linux {
     fn exec_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
         EXEC_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
+
+    /// Set exactly once during `minimal_init`, before any connection is served:
+    /// `/dev/vdb` (the host's attached data image) existed but the `mount(2)`
+    /// syscall itself failed. Distinct from "no `/dev/vdb`" (a normal build
+    /// cell, `false`) and "mounted fine" (also `false`) — this flag exists so a
+    /// later `start_function` can refuse loudly instead of treating the
+    /// `create_dir_all`-created, still-empty `/workspace` as a valid cwd.
+    /// `create_dir_all` runs unconditionally before the syscall (it must, to
+    /// give `mount(2)` a mountpoint), so directory existence alone was never
+    /// proof the mount happened — only the syscall's own return code is.
+    static WORKSPACE_MOUNT_FAILED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     pub fn run() {
         let as_init = std::process::id() == 1;
@@ -79,10 +141,15 @@ mod linux {
         // function looks like it "did not bind its port".
         bring_up_loopback();
         // If a second drive (the delivered build output) is attached, mount it at
-        // /build so the function server runs against the deployment's artifacts.
-        // Best-effort: build cells have no second drive and this simply no-ops.
-        if std::path::Path::new("/dev/vdb").exists() {
-            mount("/dev/vdb", "/build", "ext4");
+        // /workspace so a monorepo app retains its checkout-relative cwd. NOT
+        // best-effort once the device exists: a build cell with no second drive
+        // is a normal, expected no-op, but a cell whose host attached `/dev/vdb`
+        // and whose guest mount then failed must never silently continue with an
+        // empty `/workspace` — that is exactly the "ran, but on nothing" failure
+        // mode `start_function`'s workdir gate exists to catch (see
+        // `WORKSPACE_MOUNT_FAILED`).
+        if std::path::Path::new("/dev/vdb").exists() && !mount("/dev/vdb", "/workspace", "ext4") {
+            WORKSPACE_MOUNT_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -116,7 +183,14 @@ mod linux {
         }
     }
 
-    fn mount(src: &str, target: &str, fstype: &str) {
+    /// Returns whether the `mount(2)` syscall itself reported success. Callers
+    /// that treat a mount as best-effort (proc/sys/dev/tmp — the kernel may
+    /// already have mounted some of these) are free to ignore the result; a
+    /// caller staging tenant data may not, because `create_dir_all` below
+    /// always leaves `target` existing as an empty directory regardless of
+    /// whether the mount happened, so directory existence can never stand in
+    /// for a checked syscall result.
+    fn mount(src: &str, target: &str, fstype: &str) -> bool {
         let _ = std::fs::create_dir_all(target);
         let c_src = cstr(src);
         let c_tgt = cstr(target);
@@ -128,7 +202,7 @@ mod linux {
                 c_fs.as_ptr(),
                 0,
                 std::ptr::null(),
-            );
+            ) == 0
         }
     }
 
@@ -160,15 +234,347 @@ mod linux {
         }
     }
 
+    const MAX_ACCEPTED_HANDSHAKE_NONCES: usize = 4096;
+    static ACCEPTED_HANDSHAKE_NONCES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    /// Once any authenticated H1 succeeds, this VM never accepts the pre-H1
+    /// StartFunction lane again, even if that connection disappears before its
+    /// launch frame. This is process-global because one agent process is the VM.
+    static VERSIONED_LAUNCH_ONLY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn accepted_handshake_nonces() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+        ACCEPTED_HANDSHAKE_NONCES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    fn protocol_fault(
+        code: AgentProtocolFaultCode,
+        message: impl Into<String>,
+    ) -> AgentProtocolFault {
+        AgentProtocolFault::new(code, message)
+    }
+
+    fn refuse_protocol(
+        stream: &mut UnixStream,
+        code: AgentProtocolFaultCode,
+        message: impl Into<String>,
+    ) -> std::io::Result<bool> {
+        send(
+            stream,
+            &AgentEvent::ProtocolFault(protocol_fault(code, message)),
+        )?;
+        let _ = stream.flush();
+        Ok(false)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RequestFrameShape {
+        Versioned,
+        FrozenLegacyLaunch,
+        Other,
+    }
+
+    struct ParsedAgentRequest {
+        request: AgentRequest,
+        shape: RequestFrameShape,
+    }
+
+    fn parse_agent_request(frame: &[u8]) -> Result<ParsedAgentRequest, AgentProtocolFault> {
+        let kind = agent_request_frame_kind(frame).map_err(|error| {
+            protocol_fault(
+                AgentProtocolFaultCode::Malformed,
+                format!("agent request has an invalid raw envelope: {error}"),
+            )
+        })?;
+        let shape = match kind {
+            AgentRequestFrameKind::Handshake => {
+                validate_agent_handshake_request_frame(frame).map_err(|error| {
+                    protocol_fault(
+                        AgentProtocolFaultCode::Malformed,
+                        format!("agent handshake frame was not exact: {error}"),
+                    )
+                })?;
+                RequestFrameShape::Versioned
+            }
+            AgentRequestFrameKind::StartFunction => {
+                let versioned = validate_agent_start_function_request_frame(frame);
+                let legacy = validate_legacy_agent_start_function_request_frame(frame);
+                match (versioned, legacy) {
+                    (Ok(()), Err(_)) => RequestFrameShape::Versioned,
+                    (Err(_), Ok(())) => RequestFrameShape::FrozenLegacyLaunch,
+                    (versioned, legacy) => {
+                        return Err(protocol_fault(
+                            AgentProtocolFaultCode::Malformed,
+                            format!(
+                                "StartFunction matched neither exact v2 nor exact frozen legacy schema (v2: {}; legacy: {})",
+                                versioned.err().unwrap_or_else(|| "ambiguous match".to_string()),
+                                legacy.err().unwrap_or_else(|| "ambiguous match".to_string()),
+                            ),
+                        ));
+                    }
+                }
+            }
+            AgentRequestFrameKind::Other => RequestFrameShape::Other,
+        };
+        let request = serde_json::from_slice(frame).map_err(|error| {
+            protocol_fault(
+                AgentProtocolFaultCode::Malformed,
+                format!("agent request is not valid typed protocol JSON: {error}"),
+            )
+        })?;
+        Ok(ParsedAgentRequest { request, shape })
+    }
+
+    fn valid_handshake_nonce(nonce: &str) -> bool {
+        nonce.len() == AGENT_HANDSHAKE_NONCE_BYTES * 2 && lowercase_sha256(nonce)
+    }
+
+    fn handshake_transcript_sha256(nonce: &str, proof: &AgentBootProof) -> String {
+        let digest = Sha256::digest(agent_handshake_transcript(nonce, proof));
+        let mut value = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in digest {
+            let _ = write!(value, "{byte:02x}");
+        }
+        value
+    }
+
+    fn reserve_handshake_nonce(nonce: &str) -> Result<(), AgentProtocolFault> {
+        let mut accepted = accepted_handshake_nonces()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if accepted.contains(nonce) {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::Replay,
+                "agent handshake nonce was already accepted",
+            ));
+        }
+        if accepted.len() >= MAX_ACCEPTED_HANDSHAKE_NONCES {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::Replay,
+                "agent handshake replay window is full; refusing new launches",
+            ));
+        }
+        accepted.insert(nonce.to_string());
+        Ok(())
+    }
+
+    fn validate_handshake(
+        handshake: &AgentHandshake,
+    ) -> Result<AgentHandshakeReady, AgentProtocolFault> {
+        let expected = &handshake.expected_boot;
+        if expected.agent_wire_protocol != AGENT_WIRE_PROTOCOL_VERSION {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::UnsupportedWireProtocol,
+                format!(
+                    "host requires agent wire protocol {}, guest implements {}",
+                    expected.agent_wire_protocol, AGENT_WIRE_PROTOCOL_VERSION
+                ),
+            ));
+        }
+        if expected.agent_wire_capabilities != AGENT_WIRE_CAPABILITIES {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::CapabilityMismatch,
+                format!(
+                    "host requires agent capability set {:#x}, guest implements {:#x}",
+                    expected.agent_wire_capabilities, AGENT_WIRE_CAPABILITIES
+                ),
+            ));
+        }
+        if expected.runtime_artifact_protocol != RUNTIME_ARTIFACT_PROTOCOL_VERSION {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::RuntimeArtifactProtocolMismatch,
+                format!(
+                    "host requires runtime-artifact protocol {}, guest implements {}",
+                    expected.runtime_artifact_protocol, RUNTIME_ARTIFACT_PROTOCOL_VERSION
+                ),
+            ));
+        }
+        if !valid_handshake_nonce(&handshake.nonce) {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::InvalidNonce,
+                "agent handshake nonce must be 32 random bytes encoded as lowercase hex",
+            ));
+        }
+        if expected.rootfs_schema != RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION
+            || !lowercase_sha256(&expected.agent_sha256)
+            || !lowercase_sha256(&expected.rootfs_image_sha256)
+            || expected.rootfs_image_bytes == 0
+        {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::RootfsProofMismatch,
+                "host presented an invalid rootfs boot proof",
+            ));
+        }
+
+        let observed = validate_rootfs_agent_protocol().map_err(|error| {
+            protocol_fault(
+                AgentProtocolFaultCode::RootfsProofMismatch,
+                format!("guest could not prove its running rootfs agent: {error}"),
+            )
+        })?;
+        let proof = AgentBootProof {
+            rootfs_schema: observed.schema,
+            runtime_artifact_protocol: observed.protocol,
+            agent_wire_protocol: observed.agent_wire_protocol,
+            agent_wire_capabilities: observed.agent_wire_capabilities,
+            agent_sha256: observed.agent_sha256,
+            // The immutable image digest is host-observed. The guest binds it to
+            // its independently-observed marker and executable in the transcript.
+            rootfs_image_sha256: expected.rootfs_image_sha256.clone(),
+            rootfs_image_bytes: expected.rootfs_image_bytes,
+        };
+        if &proof != expected {
+            return Err(protocol_fault(
+                AgentProtocolFaultCode::RootfsProofMismatch,
+                "running guest proof differs from the host-verified rootfs proof",
+            ));
+        }
+        reserve_handshake_nonce(&handshake.nonce)?;
+        Ok(AgentHandshakeReady {
+            nonce: handshake.nonce.clone(),
+            transcript_sha256: handshake_transcript_sha256(&handshake.nonce, &proof),
+            proof,
+        })
+    }
+
+    fn handle_versioned_launch(
+        stream: &mut UnixStream,
+        launch: FunctionLaunch,
+    ) -> std::io::Result<bool> {
+        if !matches!(
+            (&launch.runtime_artifact, &launch.workdir),
+            (Some(_), Some(_))
+        ) {
+            return refuse_protocol(
+                stream,
+                AgentProtocolFaultCode::OutOfOrder,
+                "a handshaken launch must carry both runtime-artifact identity and guest workdir",
+            );
+        }
+        match validate_runtime_artifact(&launch) {
+            Ok(identity) => {
+                send(stream, &AgentEvent::RuntimeArtifactReady(identity))?;
+                match start_function(&launch, false) {
+                    Ok(()) => send(stream, &AgentEvent::FunctionReady)?,
+                    Err(error) => send(stream, &versioned_launch_error_event(error))?,
+                }
+            }
+            Err(error) => send(
+                stream,
+                &AgentEvent::FunctionFault(AgentFunctionFault::new(
+                    AgentFunctionFaultCode::NodeImageMissing,
+                    error.to_string(),
+                )),
+            )?,
+        }
+        let _ = stream.flush();
+        Ok(false)
+    }
+
+    fn handle_legacy_launch(
+        stream: &mut UnixStream,
+        launch: FunctionLaunch,
+    ) -> std::io::Result<bool> {
+        // This path deliberately performs neither half of runtime-artifact H1/H2:
+        // no host identity is trusted, no artifact marker is asserted, and no
+        // RuntimeArtifactReady authorization event is emitted.
+        match start_function(&launch, true) {
+            Ok(()) => send(stream, &AgentEvent::FunctionReady)?,
+            Err(error) => send(stream, &AgentEvent::FunctionError(error.to_string()))?,
+        }
+        let _ = stream.flush();
+        Ok(false)
+    }
+
     /// Returns Ok(true) if a build was executed (caller should stop serving).
-    /// Takes the stream BY VALUE (not `&mut`): the `Exec` branch moves it into a
+    /// Takes the stream BY VALUE (not &mut): the Exec branch moves it into a
     /// dedicated thread that outlives this call, so the accept loop can serve
     /// the next connection without waiting for the command to finish.
     fn handle_conn(mut stream: UnixStream) -> std::io::Result<bool> {
-        let frame = read_frame(&mut stream)?;
-        let req: AgentRequest = serde_json::from_slice(&frame)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        match req {
+        let first_frame = read_frame(&mut stream)?;
+        let first = match parse_agent_request(&first_frame) {
+            Ok(request) => request,
+            Err(fault) => {
+                send(&mut stream, &AgentEvent::ProtocolFault(fault))?;
+                let _ = stream.flush();
+                return Ok(false);
+            }
+        };
+        let first_shape = first.shape;
+
+        match first.request {
+            AgentRequest::Handshake(handshake) => {
+                let ready = match validate_handshake(&handshake) {
+                    Ok(ready) => ready,
+                    Err(fault) => {
+                        send(&mut stream, &AgentEvent::ProtocolFault(fault))?;
+                        let _ = stream.flush();
+                        return Ok(false);
+                    }
+                };
+                // Latch before HandshakeReady is written. A peer that receives the
+                // ready frame and disconnects (or whose write is only partially
+                // observed) cannot reopen the legacy lane on its next connection.
+                VERSIONED_LAUNCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+                send(&mut stream, &AgentEvent::HandshakeReady(ready))?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let next_frame = match read_frame(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return refuse_protocol(
+                            &mut stream,
+                            AgentProtocolFaultCode::OutOfOrder,
+                            format!(
+                                "handshake was not followed by one launch frame within 5 seconds: {error}"
+                            ),
+                        );
+                    }
+                };
+                stream.set_read_timeout(None)?;
+                let next = match parse_agent_request(&next_frame) {
+                    Ok(request) => request,
+                    Err(fault) => {
+                        send(&mut stream, &AgentEvent::ProtocolFault(fault))?;
+                        let _ = stream.flush();
+                        return Ok(false);
+                    }
+                };
+                match (next.shape, next.request) {
+                    (RequestFrameShape::Versioned, AgentRequest::StartFunction(launch)) => {
+                        handle_versioned_launch(&mut stream, launch)
+                    }
+                    (_, AgentRequest::Handshake(_)) => refuse_protocol(
+                        &mut stream,
+                        AgentProtocolFaultCode::DuplicateHandshake,
+                        "duplicate handshake on one connection",
+                    ),
+                    _ => refuse_protocol(
+                        &mut stream,
+                        AgentProtocolFaultCode::OutOfOrder,
+                        "handshake must be followed immediately by the exact v2 StartFunction frame",
+                    ),
+                }
+            }
+            AgentRequest::StartFunction(launch) => {
+                if first_shape == RequestFrameShape::FrozenLegacyLaunch
+                    && !VERSIONED_LAUNCH_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    handle_legacy_launch(&mut stream, launch)
+                } else {
+                    refuse_protocol(
+                        &mut stream,
+                        AgentProtocolFaultCode::HandshakeRequired,
+                        if VERSIONED_LAUNCH_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+                            "this VM completed H1 and is permanently versioned-only; StartFunction requires a fresh authenticated handshake"
+                        } else {
+                            "StartFunction requires an authenticated agent handshake"
+                        },
+                    )
+                }
+            }
             AgentRequest::Ping => {
                 send(&mut stream, &AgentEvent::Pong)?;
                 Ok(false)
@@ -179,22 +585,9 @@ mod linux {
                 let _ = stream.flush();
                 Ok(true)
             }
-            AgentRequest::StartFunction(launch) => {
-                match start_function(&launch) {
-                    Ok(()) => send(&mut stream, &AgentEvent::FunctionReady)?,
-                    Err(e) => send(&mut stream, &AgentEvent::FunctionError(e.to_string()))?,
-                }
-                let _ = stream.flush();
-                // Keep serving control conns; the function bridge runs in threads.
-                Ok(false)
-            }
             // Only valid as a reply during a build (handled in cache_restore).
             AgentRequest::CacheData { .. } => Ok(false),
             AgentRequest::Exec(req) => {
-                // Hand the connection to a thread so the accept loop can keep
-                // serving other connections immediately — unlike `Run`, a
-                // sandbox exec must not block new exec/kill requests, and a
-                // sandbox cell never self-destructs after one command.
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     run_exec(&mut stream, req);
@@ -202,10 +595,6 @@ mod linux {
                 Ok(false)
             }
             AgentRequest::KillExec { id } => {
-                // SIGKILL delivered here; the ORIGINAL exec's own connection/
-                // thread observes the process die and sends the authoritative
-                // `ExecDone{exit_code: None}` — this ack just confirms the
-                // signal was (or wasn't, if already gone) delivered.
                 kill_registered_exec(&id);
                 send(&mut stream, &AgentEvent::Pong)?;
                 let _ = stream.flush();
@@ -406,77 +795,985 @@ mod linux {
         }
     }
 
-    /// The PATH this agent hands a FUNCTION process. Named once so the
-    /// pre-flight existence check below and the spawn itself can never drift
-    /// apart — a check against a different PATH than the exec uses is worse
-    /// than no check. (The build-process spawns elsewhere in this module set
-    /// the same value inline; they are deliberately left alone here, since
-    /// nothing pre-flights against them.)
+    fn lowercase_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn hash_reader_sha256(mut reader: impl Read) -> std::io::Result<String> {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let digest = hasher.finalize();
+        let mut value = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in digest {
+            let _ = write!(value, "{byte:02x}");
+        }
+        Ok(value)
+    }
+
+    fn validate_rootfs_agent_protocol() -> std::io::Result<RuntimeArtifactRootfsMarker> {
+        let marker_path = Path::new(RUNTIME_ARTIFACT_ROOTFS_MARKER_PATH);
+        let mut marker = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(marker_path)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "guest rootfs protocol marker {} is unavailable: {error} ({})",
+                        marker_path.display(),
+                        hive_core::fault::NODE_RUNTIME_MISSING
+                    ),
+                )
+            })?;
+        let metadata = marker.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o222 != 0
+            || metadata.len() == 0
+            || metadata.len() > 4096
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "guest rootfs protocol marker must be a root-owned, read-only, single-link regular file ({})",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        std::io::Read::by_ref(&mut marker)
+            .take(metadata.len() + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "guest rootfs protocol marker changed during exact-length read ({})",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            ));
+        }
+        let observed: RuntimeArtifactRootfsMarker =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "guest rootfs protocol marker is invalid JSON: {error} ({})",
+                        hive_core::fault::NODE_RUNTIME_MISSING
+                    ),
+                )
+            })?;
+        if observed.schema != RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION
+            || observed.protocol != RUNTIME_ARTIFACT_PROTOCOL_VERSION
+            || observed.agent_wire_protocol != AGENT_WIRE_PROTOCOL_VERSION
+            || observed.agent_wire_capabilities != AGENT_WIRE_CAPABILITIES
+            || !lowercase_sha256(&observed.agent_sha256)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "guest rootfs marker has an unsupported schema, runtime-artifact protocol, agent-wire protocol/capability set, or agent digest ({})",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            ));
+        }
+        let agent_sha256 = hash_reader_sha256(std::fs::File::open("/proc/self/exe")?)?;
+        if agent_sha256 != observed.agent_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "running cell agent does not match the rootfs protocol marker ({})",
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            ));
+        }
+        Ok(observed)
+    }
+
+    fn validate_runtime_artifact(
+        launch: &FunctionLaunch,
+    ) -> std::io::Result<RuntimeArtifactIdentity> {
+        let expected = launch.runtime_artifact.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "function launch is missing runtime artifact protocol v{} identity ({})",
+                    RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            )
+        })?;
+        if expected.protocol != RUNTIME_ARTIFACT_PROTOCOL_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "function launch requires unsupported runtime artifact protocol {} ({})",
+                    expected.protocol,
+                    hive_core::fault::NODE_RUNTIME_MISSING
+                ),
+            ));
+        }
+        let _ = validate_rootfs_agent_protocol()?;
+        if WORKSPACE_MOUNT_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!(
+                    "/dev/vdb was attached but failed to mount at /workspace; refusing to run \
+                     tenant code against an empty cwd ({})",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                ),
+            ));
+        }
+
+        let marker_path = Path::new("/workspace").join(RUNTIME_ARTIFACT_MARKER_FILE);
+        let mut marker = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&marker_path)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "runtime artifact marker {} is unavailable: {error} ({})",
+                        marker_path.display(),
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    ),
+                )
+            })?;
+        let metadata = marker.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > 4096
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "runtime artifact marker {} has invalid type, link count, or size ({})",
+                    marker_path.display(),
+                    hive_core::fault::NODE_IMAGE_MISSING
+                ),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        std::io::Read::by_ref(&mut marker)
+            .take(metadata.len() + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "runtime artifact marker changed during exact-length read ({})",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                ),
+            ));
+        }
+        let observed: RuntimeArtifactIdentity =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "runtime artifact marker is invalid JSON: {error} ({})",
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    ),
+                )
+            })?;
+        if &observed != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "runtime artifact marker does not match the host-provided identity ({})",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                ),
+            ));
+        }
+        Ok(observed)
+    }
+
+    /// Default PATH for function processes. A launch may provide a custom PATH,
+    /// but every entry is validated below before it can participate in lookup.
     const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-    /// Is `prog` executable inside this guest via `path`? A program containing a
-    /// separator is a path, not a PATH lookup (`execvp` semantics).
-    fn guest_bin_exists(prog: &str, path: &str) -> bool {
-        if prog.contains('/') {
-            return std::path::Path::new(prog).is_file();
+    type BridgeHandle = std::thread::JoinHandle<()>;
+    static FUNCTION_BRIDGE: std::sync::OnceLock<std::sync::Mutex<Option<BridgeHandle>>> =
+        std::sync::OnceLock::new();
+
+    fn function_bridge() -> &'static std::sync::Mutex<Option<BridgeHandle>> {
+        FUNCTION_BRIDGE.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    #[derive(Debug)]
+    struct TypedNodeLaunchError {
+        fault: AgentFunctionFault,
+    }
+
+    impl std::fmt::Display for TypedNodeLaunchError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.fault.message)
         }
-        path.split(':')
-            .filter(|d| !d.is_empty())
-            .any(|d| std::path::Path::new(d).join(prog).is_file())
+    }
+
+    impl std::error::Error for TypedNodeLaunchError {}
+
+    fn node_launch_fault(
+        kind: std::io::ErrorKind,
+        code: AgentFunctionFaultCode,
+        message: impl std::fmt::Display,
+    ) -> std::io::Error {
+        std::io::Error::new(
+            kind,
+            TypedNodeLaunchError {
+                fault: AgentFunctionFault::new(code, message.to_string()),
+            },
+        )
+    }
+
+    fn typed_node_launch_fault(error: &std::io::Error) -> Option<AgentFunctionFault> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<TypedNodeLaunchError>())
+            .map(|source| source.fault.clone())
+    }
+
+    fn image_fault(kind: std::io::ErrorKind, message: impl std::fmt::Display) -> std::io::Error {
+        node_launch_fault(kind, AgentFunctionFaultCode::NodeImageMissing, message)
+    }
+
+    fn runtime_fault(kind: std::io::ErrorKind, message: impl std::fmt::Display) -> std::io::Error {
+        node_launch_fault(kind, AgentFunctionFaultCode::NodeRuntimeMissing, message)
+    }
+
+    fn versioned_launch_error_event(error: std::io::Error) -> AgentEvent {
+        match typed_node_launch_fault(&error) {
+            Some(fault) => AgentEvent::FunctionFault(fault),
+            None => AgentEvent::FunctionError(error.to_string()),
+        }
+    }
+
+    struct ValidatedWorkdir {
+        path: PathBuf,
+        dir: std::fs::File,
+    }
+
+    fn validate_function_workdir(
+        launch: &FunctionLaunch,
+        legacy_unverified: bool,
+    ) -> std::io::Result<ValidatedWorkdir> {
+        let workdir = match (&launch.runtime_artifact, launch.workdir.as_deref()) {
+            (Some(_), Some(workdir)) if !legacy_unverified => workdir,
+            (None, Some(workdir)) if legacy_unverified => workdir,
+            (None, None) => {
+                if WORKSPACE_MOUNT_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(image_fault(
+                        std::io::ErrorKind::NotConnected,
+                        "/dev/vdb was attached but failed to mount at /workspace; refusing to run \
+                         tenant code against an empty cwd",
+                    ));
+                }
+                "/workspace"
+            }
+            _ => {
+                return Err(runtime_fault(
+                    std::io::ErrorKind::InvalidInput,
+                    "runtime artifact identity and workdir must be supplied together",
+                ));
+            }
+        };
+
+        let workdir_path = Path::new(workdir);
+        let mut normalized = PathBuf::from("/");
+        let mut components = workdir_path.components();
+        if components.next() != Some(Component::RootDir) {
+            return Err(image_fault(
+                std::io::ErrorKind::InvalidInput,
+                "runtime workdir must be an absolute /workspace path",
+            ));
+        }
+        let Some(Component::Normal(first)) = components.next() else {
+            return Err(image_fault(
+                std::io::ErrorKind::InvalidInput,
+                "runtime workdir must name /workspace",
+            ));
+        };
+        if first != "workspace" {
+            return Err(image_fault(
+                std::io::ErrorKind::PermissionDenied,
+                "runtime workdir must stay beneath /workspace",
+            ));
+        }
+        normalized.push(first);
+        for component in components {
+            let Component::Normal(name) = component else {
+                return Err(image_fault(
+                    std::io::ErrorKind::InvalidInput,
+                    "runtime workdir must be lexically normalized",
+                ));
+            };
+            normalized.push(name);
+        }
+        if normalized.as_os_str().as_bytes() != workdir_path.as_os_str().as_bytes() {
+            return Err(image_fault(
+                std::io::ErrorKind::InvalidInput,
+                "runtime workdir must be lexically normalized",
+            ));
+        }
+
+        let mut cursor = PathBuf::from("/");
+        for component in normalized.components() {
+            if let Component::Normal(name) = component {
+                cursor.push(name);
+                let metadata = std::fs::symlink_metadata(&cursor).map_err(|error| {
+                    image_fault(
+                        error.kind(),
+                        format!(
+                            "runtime artifact path {} is unavailable: {error}",
+                            cursor.display()
+                        ),
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(image_fault(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "runtime artifact path {} must be a real directory",
+                            cursor.display()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&normalized)
+            .map_err(|error| {
+                image_fault(
+                    error.kind(),
+                    format!(
+                        "validated runtime workdir {} could not be opened: {error}",
+                        normalized.display()
+                    ),
+                )
+            })?;
+        if !dir.metadata()?.is_dir() {
+            return Err(image_fault(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "validated runtime workdir {} is not a directory",
+                    normalized.display()
+                ),
+            ));
+        }
+        Ok(ValidatedWorkdir {
+            path: normalized,
+            dir,
+        })
+    }
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    fn open_at(dir: RawFd, path: &Path, beneath: bool) -> std::io::Result<std::fs::File> {
+        if path.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "empty executable path",
+            ));
+        }
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "executable path contains a NUL byte",
+            )
+        })?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_MAGICLINKS | if beneath { RESOLVE_BENEATH } else { 0 },
+        };
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir,
+                path.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+                return Err(runtime_fault(
+                    std::io::ErrorKind::Unsupported,
+                    format!("guest kernel cannot perform bounded executable resolution: {error}"),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd as RawFd) })
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct ExecutableStamp {
+        dev: u64,
+        ino: u64,
+        len: u64,
+        mode: u32,
+        mtime: i64,
+        mtime_nsec: i64,
+    }
+
+    impl ExecutableStamp {
+        fn read(metadata: &std::fs::Metadata) -> Self {
+            Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                len: metadata.len(),
+                mode: metadata.mode(),
+                mtime: metadata.mtime(),
+                mtime_nsec: metadata.mtime_nsec(),
+            }
+        }
+    }
+
+    struct ResolvedExecutable {
+        path: PathBuf,
+        stamp: ExecutableStamp,
+        _file: std::fs::File,
+        node_fault: bool,
+    }
+
+    impl ResolvedExecutable {
+        fn from_file(
+            file: std::fs::File,
+            workdir: Option<&Path>,
+            node_fault: bool,
+        ) -> std::io::Result<Self> {
+            let metadata = file
+                .metadata()
+                .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
+            if !metadata.is_file() {
+                return Err(executable_error(
+                    std::io::ErrorKind::InvalidData,
+                    "resolved executable is not a regular file",
+                    node_fault,
+                ));
+            }
+            if metadata.mode() & 0o111 == 0 {
+                return Err(executable_error(
+                    std::io::ErrorKind::PermissionDenied,
+                    "resolved executable has no execute permission",
+                    node_fault,
+                ));
+            }
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            let path = std::fs::read_link(&fd_path)
+                .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
+            if let Some(workdir) = workdir {
+                if !path.starts_with(workdir) {
+                    return Err(executable_error(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "resolved executable {} escapes runtime workdir {}",
+                            path.display(),
+                            workdir.display()
+                        ),
+                        node_fault,
+                    ));
+                }
+            }
+            Ok(Self {
+                path,
+                stamp: ExecutableStamp::read(&metadata),
+                _file: file,
+                node_fault,
+            })
+        }
+
+        fn revalidate(&self) -> std::io::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&self.path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.mode() & 0o111 == 0
+                || ExecutableStamp::read(&metadata) != self.stamp
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "validated executable {} changed before spawn",
+                        self.path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+
+        fn error(&self, error: std::io::Error) -> std::io::Error {
+            preserve_or_classify_executable_error(error, self.node_fault)
+        }
+    }
+
+    fn executable_error(
+        kind: std::io::ErrorKind,
+        message: impl std::fmt::Display,
+        node_fault: bool,
+    ) -> std::io::Error {
+        if node_fault {
+            runtime_fault(kind, message)
+        } else {
+            std::io::Error::new(kind, message.to_string())
+        }
+    }
+
+    fn preserve_or_classify_executable_error(
+        error: std::io::Error,
+        node_fault: bool,
+    ) -> std::io::Error {
+        if typed_node_launch_fault(&error).is_some() {
+            error
+        } else {
+            executable_error(error.kind(), error, node_fault)
+        }
+    }
+
+    fn platform_runtime_program(launch: &FunctionLaunch, program: &str) -> bool {
+        let basename = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program);
+        match launch.runtime {
+            hive_core::Runtime::Node => {
+                matches!(basename, "node" | "npm" | "npx" | "pnpm" | "yarn")
+            }
+            hive_core::Runtime::Bun => matches!(basename, "bun" | "bunx"),
+            hive_core::Runtime::Python => matches!(basename, "python" | "python3"),
+            hive_core::Runtime::Wasmer => basename == "wasmer",
+            hive_core::Runtime::Container | hive_core::Runtime::Command => false,
+        }
+    }
+
+    fn normalize_relative(path: &Path, allow_empty: bool) -> std::io::Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(name) => normalized.push(name),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "executable path {} contains traversal or an absolute prefix",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        if !allow_empty && normalized.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "executable path resolves to the runtime workdir itself",
+            ));
+        }
+        Ok(normalized)
+    }
+
+    fn system_path_entry(path: &Path) -> bool {
+        GUEST_PATH.split(':').any(|entry| Path::new(entry) == path)
+    }
+
+    enum SearchDir {
+        Artifact(PathBuf),
+        System(PathBuf),
+    }
+
+    fn parse_search_path(
+        path: &str,
+        workdir: &ValidatedWorkdir,
+    ) -> std::io::Result<Vec<SearchDir>> {
+        let mut entries = Vec::new();
+        for entry in path.split(':') {
+            if entry.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "function PATH contains an empty entry; use '.' explicitly for the workdir",
+                ));
+            }
+            let entry = Path::new(entry);
+            if entry.is_absolute() {
+                if system_path_entry(entry) {
+                    entries.push(SearchDir::System(entry.to_path_buf()));
+                    continue;
+                }
+                let relative = entry.strip_prefix(&workdir.path).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "function PATH entry {} is outside the runtime workdir and platform PATH",
+                            entry.display()
+                        ),
+                    )
+                })?;
+                entries.push(SearchDir::Artifact(normalize_relative(relative, true)?));
+            } else {
+                entries.push(SearchDir::Artifact(normalize_relative(entry, true)?));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn open_artifact_executable(
+        workdir: &ValidatedWorkdir,
+        relative: &Path,
+        node_fault: bool,
+    ) -> std::io::Result<ResolvedExecutable> {
+        let file = open_at(workdir.dir.as_raw_fd(), relative, true)
+            .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
+        ResolvedExecutable::from_file(file, Some(&workdir.path), node_fault)
+    }
+
+    fn open_system_executable(
+        path: &Path,
+        node_fault: bool,
+    ) -> std::io::Result<ResolvedExecutable> {
+        let file = open_at(libc::AT_FDCWD, path, false)
+            .map_err(|error| preserve_or_classify_executable_error(error, node_fault))?;
+        ResolvedExecutable::from_file(file, None, node_fault)
+    }
+
+    fn resolve_function_executable(
+        launch: &FunctionLaunch,
+        workdir: &ValidatedWorkdir,
+        effective_path: &str,
+    ) -> std::io::Result<ResolvedExecutable> {
+        let program = launch.start_cmd.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty start_cmd")
+        })?;
+        if program.as_bytes().contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "function executable contains a NUL byte",
+            ));
+        }
+        let platform_program = platform_runtime_program(launch, program);
+        if program.contains('/') {
+            let path = Path::new(program);
+            if path.is_absolute() {
+                if let Ok(relative) = path.strip_prefix(&workdir.path) {
+                    return open_artifact_executable(
+                        workdir,
+                        &normalize_relative(relative, false)?,
+                        false,
+                    );
+                }
+                if path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+                    || !GUEST_PATH
+                        .split(':')
+                        .any(|entry| path.starts_with(Path::new(entry)))
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "absolute function executable {} is outside the runtime workdir and platform PATH",
+                            path.display()
+                        ),
+                    ));
+                }
+                return open_system_executable(path, platform_program).map_err(|error| {
+                    preserve_or_classify_executable_error(error, platform_program)
+                });
+            }
+            return open_artifact_executable(workdir, &normalize_relative(path, false)?, false);
+        }
+
+        let mut searched_platform_path = false;
+        for entry in parse_search_path(effective_path, workdir)? {
+            let (result, node_fault) = match entry {
+                SearchDir::Artifact(directory) => (
+                    open_artifact_executable(workdir, &directory.join(program), false),
+                    false,
+                ),
+                SearchDir::System(directory) => {
+                    searched_platform_path = true;
+                    (
+                        open_system_executable(&directory.join(program), platform_program),
+                        platform_program,
+                    )
+                }
+            };
+            match result {
+                Ok(executable) => return Ok(executable),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => {
+                    return Err(preserve_or_classify_executable_error(error, node_fault));
+                }
+            }
+        }
+        let node_fault = platform_program && searched_platform_path;
+        Err(executable_error(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "function executable `{program}` was not found in effective PATH `{effective_path}`"
+            ),
+            node_fault,
+        ))
+    }
+
+    #[derive(Clone, Copy)]
+    enum BridgeMode {
+        Http,
+        Raw,
+    }
+
+    async fn serve_function_connection<S>(
+        stream: S,
+        local: String,
+        max_concurrency: u32,
+        mode: BridgeMode,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        match mode {
+            BridgeMode::Http => {
+                fluid_tunnel::TunnelServer::serve(stream, local, max_concurrency).await;
+            }
+            BridgeMode::Raw => {
+                fluid_tunnel::TunnelServer::serve_raw(stream, local).await;
+            }
+        }
+    }
+
+    fn run_function_bridge(
+        startup: &std::sync::mpsc::SyncSender<Result<(), String>>,
+        ready: &std::sync::atomic::AtomicBool,
+        function_port: u16,
+        max_concurrency: u32,
+        mode: BridgeMode,
+    ) -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                runtime_fault(
+                    error.kind(),
+                    format!("function bridge Tokio runtime creation failed: {error}"),
+                )
+            })?;
+        let address = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, CELL_FUNCTION_PORT);
+        let local = format!("127.0.0.1:{function_port}");
+        runtime.block_on(async move {
+            let mut listener = tokio_vsock::VsockListener::bind(address).map_err(|error| {
+                runtime_fault(
+                    error.kind(),
+                    format!(
+                        "function bridge bind on vsock port {CELL_FUNCTION_PORT} failed: {error}"
+                    ),
+                )
+            })?;
+            ready.store(true, std::sync::atomic::Ordering::SeqCst);
+            if startup.send(Ok(())).is_err() {
+                ready.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "function bridge startup receiver disappeared",
+                ));
+            }
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let local = local.clone();
+                        tokio::spawn(serve_function_connection(
+                            stream,
+                            local,
+                            max_concurrency,
+                            mode,
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+    }
+
+    fn bridge_fatal(message: &str) -> ! {
+        eprintln!("function bridge terminated after readiness: {message}; powering off cell");
+        unsafe {
+            libc::sync();
+            if std::process::id() == 1 {
+                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+            }
+            libc::_exit(1);
+        }
+    }
+
+    fn start_function_bridge(
+        function_port: u16,
+        max_concurrency: u32,
+        raw_proxy: bool,
+    ) -> std::io::Result<()> {
+        let mode = if raw_proxy {
+            BridgeMode::Raw
+        } else {
+            BridgeMode::Http
+        };
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(0);
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_ready = ready.clone();
+        let mut slot = function_bridge()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.is_some() {
+            return Err(runtime_fault(
+                std::io::ErrorKind::AlreadyExists,
+                "function bridge already exists in this cell",
+            ));
+        }
+        let handle = std::thread::Builder::new()
+            .name("hive-function-bridge".to_string())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_function_bridge(
+                        &startup_tx,
+                        &thread_ready,
+                        function_port,
+                        max_concurrency,
+                        mode,
+                    )
+                }));
+                let message = match outcome {
+                    Ok(Ok(())) => "bridge serve task returned unexpectedly".to_string(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "bridge serve task panicked".to_string(),
+                };
+                if thread_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    bridge_fatal(&message);
+                }
+                let _ = startup_tx.send(Err(message));
+            })
+            .map_err(|error| {
+                runtime_fault(
+                    error.kind(),
+                    format!("function bridge thread creation failed: {error}"),
+                )
+            })?;
+        *slot = Some(handle);
+        drop(slot);
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => {
+                let finished = function_bridge()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(true);
+                if finished {
+                    return Err(runtime_fault(
+                        std::io::ErrorKind::BrokenPipe,
+                        "function bridge ended during startup",
+                    ));
+                }
+                Ok(())
+            }
+            Ok(Err(message)) => {
+                let handle = function_bridge()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some(handle) = handle {
+                    let _ = handle.join();
+                }
+                Err(runtime_fault(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("function bridge failed before readiness: {message}"),
+                ))
+            }
+            Err(error) => {
+                let handle = function_bridge()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                if let Some(handle) = handle {
+                    let _ = handle.join();
+                }
+                Err(runtime_fault(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("function bridge startup failed without a result: {error}"),
+                ))
+            }
+        }
+    }
+
+    fn stderr_tail_text(
+        tail: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    ) -> String {
+        let bytes: Vec<u8> = tail
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        String::from_utf8_lossy(&bytes).trim().to_string()
     }
 
     /// Launch the function server and bridge `CELL_FUNCTION_PORT` (vsock) to it.
-    fn start_function(launch: &FunctionLaunch) -> std::io::Result<()> {
+    fn start_function(launch: &FunctionLaunch, legacy_unverified: bool) -> std::io::Result<()> {
         if launch.start_cmd.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "empty start_cmd",
             ));
         }
-        let workdir = launch
-            .workdir
-            .clone()
-            .unwrap_or_else(|| "/build".to_string());
-        let _ = std::fs::create_dir_all(&workdir);
+        let workdir = validate_function_workdir(launch, legacy_unverified)?;
+        let effective_path = launch
+            .env
+            .get("PATH")
+            .map(String::as_str)
+            .unwrap_or(GUEST_PATH);
+        let executable = resolve_function_executable(launch, &workdir, effective_path)?;
 
-        // The interpreter must exist INSIDE THE GUEST. This is the single most
-        // important thing about running a non-Node runtime on Firecracker and
-        // the exact bug the first cut of Wasmer support shipped: wasmer was
-        // installed on the HOST, but this agent is PID1 inside the microVM and
-        // execs against the GUEST rootfs, so the host copy is invisible here.
-        // Checked before spawning so the failure names the node fault and its
-        // remedy (bake it into the rootfs image — see scripts/build-rootfs.sh)
-        // instead of surfacing as a bare ENOENT that the gateway cannot
-        // distinguish from the deployment's own entrypoint being wrong.
-        let prog = &launch.start_cmd[0];
-        if !guest_bin_exists(prog, GUEST_PATH) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "{}: `{prog}` is not installed in this cell's guest image — \
-                     the deployment's runtime must be baked into the rootfs \
-                     (operator remedy; not an application fault)",
-                    hive_core::fault::NODE_RUNTIME_MISSING,
-                ),
-            ));
-        }
-
-        let mut cmd = Command::new(&launch.start_cmd[0]);
-        cmd.args(&launch.start_cmd[1..])
-            .current_dir(&workdir)
-            .env("PATH", GUEST_PATH)
+        let mut cmd = Command::new(&executable.path);
+        cmd.arg0(&launch.start_cmd[0])
+            .args(&launch.start_cmd[1..])
+            .current_dir(format!("/proc/self/fd/{}", workdir.dir.as_raw_fd()))
+            .env_clear()
+            .envs(launch.env.iter())
+            // Platform-owned constraints are applied last, after launch env.
+            .env("PATH", effective_path)
             .env("HOME", "/root")
             .env("PORT", launch.port.to_string())
-            .envs(launch.env.iter())
             .stdin(Stdio::null());
-        // Wire the function's stdout/stderr to the VM serial console. This
-        // agent runs as PID1 with NO open fds (the kernel gives init none), so
-        // an inherited-stdio child wrote its output into the void — every app
-        // crash/console.error was unobservable from the host, which turned
-        // real production failures (e.g. an uncaught throw in a route handler)
-        // into blind 500s. /dev/console lands in the host-side per-cell
-        // console.log next to the kernel boot lines. Best-effort: a rootfs
-        // without /dev/console just keeps the old (silent) behavior.
         if let Ok(con) = std::fs::OpenOptions::new()
             .append(true)
             .open("/dev/console")
@@ -486,149 +1783,95 @@ mod linux {
                 cmd.stderr(Stdio::from(con2));
             }
         }
-        // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
-        // WRITABLE cache dir under the workdir. The build shipped precompiled bytecode
-        // there; Node >=22.1 picks it up automatically (skips parse/compile on a cold
-        // start) and appends entries for modules the build didn't pre-cache. Genuinely
-        // Node/V8-only (`launch.runtime` is the single explicit signal, set by the
-        // scheduler at cold-start — Bun uses JavaScriptCore and never reads this env
-        // var, so gating on it instead of re-sniffing argv fixes a latent bug where a
-        // Bun process used to get NODE_COMPILE_CACHE set for no effect). Bun's own
-        // bytecode cache (a `.jsc` sidecar produced by `bun build --bytecode` at build
-        // time) needs NO runtime env var at all — `bun run <entry>` auto-loads it, so
-        // the Bun path here correctly does nothing. Opt-out via HIVE_COMPILE_CACHE=0.
-        // Never fails boot: a missing/invalid/unwritable cache just means recompiling.
         let cc_off = launch
             .env
             .get("HIVE_COMPILE_CACHE")
-            .map(|v| v == "0" || v == "false")
+            .map(|value| value == "0" || value == "false")
             .unwrap_or(false);
         if !cc_off && launch.runtime.uses_v8_compile_cache() {
-            let cache_dir = format!("{}/.hive-compile-cache", workdir.trim_end_matches('/'));
+            let cache_dir = workdir.path.join(".hive-compile-cache");
             if std::fs::create_dir_all(&cache_dir).is_ok() {
-                cmd.env("NODE_COMPILE_CACHE", &cache_dir);
+                cmd.env("NODE_COMPILE_CACHE", cache_dir);
             }
         }
-        // Detach: the function lives until the cell is torn down. Dropping the
-        // std Child does not kill it. STDERR is piped into a bounded capture
-        // (last 4 KiB) so a process that dies before binding its port can be
-        // DIAGNOSED: the bare "did not bind its port" error told tenants to
-        // "check the deployment's logs" while the guest threw those logs away
-        // — the one artifact that says WHY (missing env, unreachable database,
-        // a stack trace) never left the microVM.
         cmd.stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn()?;
+        executable
+            .revalidate()
+            .map_err(|error| executable.error(error))?;
+        let mut child = cmd.spawn().map_err(|error| {
+            executable.error(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "spawn of validated executable {} failed: {error}",
+                    executable.path.display()
+                ),
+            ))
+        })?;
         let stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         if let Some(err_pipe) = child.stderr.take() {
             let tail = stderr_tail.clone();
             std::thread::spawn(move || {
-                use std::io::Read;
-                let mut r = std::io::BufReader::new(err_pipe);
-                let mut buf = [0u8; 1024];
+                let mut reader = std::io::BufReader::new(err_pipe);
+                let mut buffer = [0u8; 1024];
                 loop {
-                    match r.read(&mut buf) {
+                    match reader.read(&mut buffer) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
-                            t.extend(&buf[..n]);
-                            while t.len() > 4096 {
-                                t.pop_front();
+                        Ok(read) => {
+                            let mut bytes = tail.lock().unwrap_or_else(|error| error.into_inner());
+                            bytes.extend(&buffer[..read]);
+                            while bytes.len() > 4096 {
+                                bytes.pop_front();
                             }
                         }
                     }
                 }
             });
         }
-        let _child = child;
 
-        // Wait for the function to bind its port.
-        //
-        // RUNTIME-AWARE, because 30s is not a neutral number for every runtime.
-        // A Wasmer guest compiles its whole module ahead-of-time (Cranelift)
-        // before it can listen, and on THIS backend that is always a cache MISS:
-        // every provision copies a fresh per-cell overlay from the base image
-        // and terminate discards it, so wasmer's on-disk artifact cache never
-        // survives to a second start. The ~40ms cold start measured for this
-        // runtime elsewhere was a cache HIT and says nothing about the first
-        // compile of a real module. The mock backend already gives wasm the
-        // longer budget for exactly this reason; the guest had no such branch,
-        // so a slow compile timed out, the agent reported FunctionError, and the
-        // gateway published DEPLOYMENT_START_FAILED — telling the tenant to
-        // debug an app that was merely still compiling, while the pool's
-        // crash-loop circuit opened against it.
-        let fport = launch.port;
         let ready_secs = match launch.runtime {
             hive_core::Runtime::Wasmer => 60,
             _ => 30,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(ready_secs);
         loop {
-            if TcpStream::connect(("127.0.0.1", fport)).is_ok() {
+            if TcpStream::connect(("127.0.0.1", launch.port)).is_ok() {
                 break;
             }
+            if let Some(status) = child.try_wait()? {
+                let tail = stderr_tail_text(&stderr_tail);
+                let detail = if tail.is_empty() {
+                    "process wrote nothing to stderr".to_string()
+                } else {
+                    format!("stderr (last 4KiB): {tail}")
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("function exited before binding its port ({status}); {detail}"),
+                ));
+            }
             if std::time::Instant::now() > deadline {
-                // Attach the process's own last words — the single most
-                // diagnostic artifact for a bind failure, previously discarded.
-                let tail: Vec<u8> = stderr_tail
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .copied()
-                    .collect();
-                let tail = String::from_utf8_lossy(&tail);
-                let tail = tail.trim();
-                let msg = if tail.is_empty() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let tail = stderr_tail_text(&stderr_tail);
+                let message = if tail.is_empty() {
                     "function did not bind its port (process wrote nothing to stderr)".to_string()
                 } else {
                     format!("function did not bind its port. Its stderr (last 4KiB): {tail}")
                 };
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, msg));
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Front the function with the SAME multiplexed tunnel protocol the
-        // gateway speaks to instances (the mock backend fronts its functions with
-        // `TunnelServer` too) — served over an async vsock listener on
-        // CELL_FUNCTION_PORT. A dedicated current-thread tokio runtime owns this;
-        // the agent's control channel above stays synchronous. Each accepted
-        // tunnel connection multiplexes many requests onto 127.0.0.1:<fport>.
-        let max_conc = launch.max_concurrency.max(1);
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("tunnel runtime build failed: {e}");
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, CELL_FUNCTION_PORT);
-                let mut listener = match tokio_vsock::VsockListener::bind(addr) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("vsock listen on {CELL_FUNCTION_PORT} failed: {e}");
-                        return;
-                    }
-                };
-                let local = format!("127.0.0.1:{fport}");
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            let local = local.clone();
-                            tokio::spawn(async move {
-                                fluid_tunnel::TunnelServer::serve(stream, local, max_conc).await;
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        });
+        if let Err(error) =
+            start_function_bridge(launch.port, launch.max_concurrency.max(1), launch.raw_proxy)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        drop(child);
         Ok(())
     }
 

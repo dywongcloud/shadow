@@ -211,33 +211,47 @@ pub async fn is_running(apple: bool, name: &str, path_env: &str) -> bool {
 /// capitalized top-level `Name` and container's nested lowercase
 /// `configuration.name` JSON shapes behind one call so callers never touch
 /// either CLI's raw `--format`/`--filter` differences directly.
-pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
-    let Ok(out) = Command::new(bin(apple))
+pub async fn try_list_volume_names(apple: bool, path_env: &str) -> Result<Vec<String>, String> {
+    let out = Command::new(bin(apple))
         .args(["volume", "ls", "--format", "json"])
         .env("PATH", path_env)
+        .kill_on_drop(true)
         .output()
         .await
-    else {
-        return Vec::new();
-    };
+        .map_err(|error| format!("{} volume ls could not start: {error}", bin(apple)))?;
     if !out.status.success() {
-        return Vec::new();
+        return Err(format!(
+            "{} volume ls exited {}: {}",
+            bin(apple),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return Vec::new();
-    };
-    let Some(arr) = v.as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|e| {
-            e.get("Name")
-                .or_else(|| e.get("configuration").and_then(|c| c.get("name")))
-                .or_else(|| e.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_string())
+    let value = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .map_err(|error| format!("{} volume ls returned invalid JSON: {error}", bin(apple)))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{} volume ls returned non-array JSON", bin(apple)))?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("Name")
+                .or_else(|| entry.get("configuration").and_then(|c| c.get("name")))
+                .or_else(|| entry.get("name"))
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
         })
-        .collect()
+        .collect())
+}
+
+/// Compatibility wrapper for best-effort callers. Destructive ownership
+/// cleanup uses [`try_list_volume_names`] so an enumeration failure can never
+/// masquerade as an empty backend.
+pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
+    try_list_volume_names(apple, path_env)
+        .await
+        .unwrap_or_default()
 }
 
 /// Is the given container CLI installed and responsive? (`bin --version`).

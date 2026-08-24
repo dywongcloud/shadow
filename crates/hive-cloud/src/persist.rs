@@ -29,9 +29,11 @@ use crate::state::CloudState;
 #[derive(Default, Serialize, Deserialize)]
 pub struct PlatformSnapshot {
     /// When this snapshot was SAVED (ms epoch). The guardian restore-on-rollback
-    /// guard compares this against the replicated copy to detect a local snapshot
+    /// guard compares this against replicated commit time to detect a local snapshot
     /// that regressed (older file restored after a crash / disk swap): if the
     /// GuardianDB replica is NEWER than what's on disk, the replica wins at boot.
+    /// Guardian canonical payloads omit this write-attempt-only field and restore
+    /// it from the iroh-docs entry timestamp, avoiding a new blob for unchanged state.
     #[serde(default)]
     pub saved_ms: u64,
     #[serde(default)]
@@ -69,6 +71,10 @@ pub struct PlatformSnapshot {
     /// deleted from whichever peer still holds them.
     #[serde(default)]
     pub database_tombstones: std::collections::BTreeMap<String, u64>,
+    /// One-use Studio replay facts are resource-independent so a live Guardian
+    /// restore omitting a database record cannot erase them.
+    #[serde(default)]
+    pub database_studio_replay: crate::databases::StudioReplaySnapshot,
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
@@ -258,8 +264,7 @@ pub fn load() -> PlatformSnapshot {
     }
 }
 
-/// Atomically write the snapshot to disk.
-pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
+fn save_with_guardian_generation(snap: &PlatformSnapshot) -> std::io::Result<Option<u64>> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join("state.json.tmp");
@@ -279,10 +284,14 @@ pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
     // already acknowledged and written.
     std::fs::File::open(&dir)?.sync_all()?;
     // Write per-tenant namespace documents (the multi-tenant schema partition).
-    let _ = save_namespaces(snap);
+    save_namespaces(snap)?;
     // Replicate into the always-on GuardianDB (durable + peer-replicated copy).
-    crate::guardian::replicate(snap);
-    Ok(())
+    Ok(crate::guardian::replicate(snap))
+}
+
+/// Atomically write the snapshot to disk and admit its Guardian generation.
+pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
+    save_with_guardian_generation(snap).map(|_| ())
 }
 
 /// Normalize a tenant namespace: empty => "personal".
@@ -380,9 +389,92 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     global.insert("rewrites".into(), json!(snap.rewrites));
     global.insert("incidents".into(), json!(snap.incidents));
 
+    // These arrays represent keyed sets, not insertion sequences. Several of
+    // their stores are HashMap-backed, so iteration order changes between
+    // otherwise identical captures. Normalize only those set-valued arrays;
+    // WAF/redirect/rewrite order is routing policy and must remain untouched.
+    const SET_FIELDS: [&str; 14] = [
+        "deployments",
+        "projects",
+        "databases",
+        "api_keys",
+        "integrations",
+        "webhooks",
+        "orgs",
+        "users",
+        "domains",
+        "gitops",
+        "teams",
+        "team_tombstones",
+        "cron",
+        "incidents",
+    ];
+    for doc in docs.values_mut() {
+        for field in SET_FIELDS {
+            if let Some(values) = doc.get_mut(field).and_then(Value::as_array_mut) {
+                values.sort_by_cached_key(|value| serde_json::to_vec(value).unwrap_or_default());
+            }
+        }
+    }
+
     docs.into_iter()
         .map(|(k, v)| (k, Value::Object(v)))
         .collect()
+}
+
+/// Guardian snapshot protocol v2's namespace projection. The ordinary local
+/// namespace files retain cron for backwards compatibility; the disjoint v2
+/// Guardian lane omits it because cron is node-local. Project arrays use the
+/// project identity as their deterministic primary key and reject malformed or
+/// duplicate identities instead of publishing an ambiguous tenant document.
+pub fn guardian_v2_namespaced(snap: &PlatformSnapshot) -> anyhow::Result<BTreeMap<String, Value>> {
+    let mut docs = namespaced(snap);
+    if let Some(global) = docs.get_mut("_global") {
+        let fields = global
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Guardian namespace _global is not an object"))?;
+        fields.remove("cron");
+    }
+
+    for (namespace, document) in &mut docs {
+        let fields = document
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Guardian namespace {namespace:?} is not an object"))?;
+        let Some(projects) = fields.get_mut("projects") else {
+            continue;
+        };
+        let projects = projects.as_array_mut().ok_or_else(|| {
+            anyhow::anyhow!("Guardian namespace {namespace:?} projects is not an array")
+        })?;
+        let mut identities = std::collections::BTreeSet::new();
+        for project in projects.iter() {
+            let identity = project
+                .as_object()
+                .and_then(|fields| fields.get("project"))
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Guardian namespace {namespace:?} has a project without a string identity"
+                    )
+                })?;
+            if !identities.insert(identity.to_string()) {
+                anyhow::bail!(
+                    "Guardian namespace {namespace:?} has duplicate project identity {identity:?}"
+                );
+            }
+        }
+        projects.sort_by_cached_key(|project| {
+            let identity = project
+                .get("project")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let canonical_tiebreak = serde_json::to_vec(project).unwrap_or_default();
+            (identity, canonical_tiebreak)
+        });
+    }
+    Ok(docs)
 }
 
 /// Write each tenant namespace document to `$HIVE_DATA/ns/<namespace>.json`.
@@ -438,7 +530,15 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
             let s = cloud.ratelimit.stats();
             Some((s.enabled, s.limit, s.window_ms))
         },
-        cron: cloud.cron.list(),
+        cron: {
+            let mut jobs = cloud.cron.list();
+            for job in &mut jobs {
+                job.last_run_ms = None;
+                job.runs = 0;
+                job.next_run_ms = None;
+            }
+            jobs
+        },
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
         teams: team_rows.into_iter().collect(),
@@ -447,6 +547,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
         database_tombstones: cloud.databases.tombstones_snapshot(),
+        database_studio_replay: cloud.databases.studio_replay_snapshot(),
         project_tombstones,
         project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
@@ -509,9 +610,10 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 struct Persister {
     cloud: Arc<CloudState>,
-    dirty: AtomicU64, // bumped on each persist() request
-    saved: AtomicU64, // highest generation durably written
-    lock: Mutex<()>,  // pairs with `cv` (marker mutex; does NOT guard state)
+    dirty: AtomicU64,  // bumped on each persist() request
+    saved: AtomicU64,  // highest generation durably written
+    lock: Mutex<bool>, // admission-open flag paired with `cv`; does NOT guard state
+    writer: Mutex<()>, // serializes capture + save + `saved` advancement
     cv: Condvar,
 }
 static PERSISTER: OnceLock<Arc<Persister>> = OnceLock::new();
@@ -522,7 +624,8 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
         cloud,
         dirty: AtomicU64::new(0),
         saved: AtomicU64::new(0),
-        lock: Mutex::new(()),
+        lock: Mutex::new(true),
+        writer: Mutex::new(()),
         cv: Condvar::new(),
     });
     if PERSISTER.set(p.clone()).is_err() {
@@ -539,19 +642,38 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
                     g = p.cv.wait(g).unwrap();
                 }
             }
-            // Drain: coalesce everything up to the newest generation seen now.
-            let target = p.dirty.load(Ordering::SeqCst);
-            let snap = capture(&p.cloud);
-            match save(&snap) {
-                Ok(()) => p.saved.store(target, Ordering::SeqCst),
-                Err(e) => {
-                    tracing::warn!(error = %e, "persist(bg) failed; will retry on next mutation");
-                    // Don't advance `saved` → the next persist() re-triggers a write.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+            // Drain: coalesce everything up to the newest generation seen after
+            // acquiring the exclusive snapshot-writer slot. A shutdown flush may
+            // have satisfied this wake while we waited, in which case there is
+            // nothing left to write.
+            let write_result = {
+                let _writer = p.writer.lock().unwrap();
+                let target = p.dirty.load(Ordering::SeqCst);
+                if target <= p.saved.load(Ordering::SeqCst) {
+                    continue;
                 }
+                let snap = capture(&p.cloud);
+                let result = save(&snap);
+                if result.is_ok() {
+                    p.saved.store(target, Ordering::SeqCst);
+                }
+                result
+            };
+            if let Err(e) = write_result {
+                tracing::warn!(error = %e, "persist(bg) failed; will retry on next mutation");
+                // Don't advance `saved` → the next persist() re-triggers a write.
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
         })
         .expect("spawn persister thread");
+}
+
+fn admit_generation(p: &Persister) -> u64 {
+    let mut admission_open = p.lock.lock().unwrap();
+    while !*admission_open {
+        admission_open = p.cv.wait(admission_open).unwrap();
+    }
+    p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1)
 }
 
 /// Persist the current state to disk (call after any mutation). Non-blocking when
@@ -559,12 +681,11 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
 /// fallback otherwise so a mutation is never silently un-persisted.
 pub fn persist(cloud: &Arc<CloudState>) {
     if let Some(p) = PERSISTER.get() {
-        // Bump under the lock so the writer can't miss the wakeup between its
-        // predicate check and `wait`.
-        {
-            let _g = p.lock.lock().unwrap();
-            p.dirty.fetch_add(1, Ordering::SeqCst);
-        }
+        // Admission and the generation bump are one transaction with the
+        // shutdown flush's final dirty==saved check. Once that check closes
+        // admission, a late mutation producer cannot return and race process
+        // exit; before it closes, every admitted generation is drained.
+        let _target = admit_generation(p);
         p.cv.notify_one();
         return;
     }
@@ -575,15 +696,85 @@ pub fn persist(cloud: &Arc<CloudState>) {
     }
 }
 
-/// Synchronously flush the latest state NOW (graceful shutdown). Safe to call even
-/// if the background writer is running — it writes the current state directly.
-pub fn flush_blocking() {
+/// Persist a security decision before acknowledging it. Unlike [`persist`],
+/// this serializes with the background writer and reports fsync failure to the
+/// caller, which can then fail closed instead of minting a session whose replay
+/// fact exists only in memory.
+pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
     if let Some(p) = PERSISTER.get() {
+        let _admitted = admit_generation(p);
+        let _writer = p.writer.lock().unwrap();
         let target = p.dirty.load(Ordering::SeqCst);
         let snap = capture(&p.cloud);
-        if save(&snap).is_ok() {
-            p.saved.store(target, Ordering::SeqCst);
+        return match save(&snap) {
+            Ok(()) => {
+                p.saved.store(target, Ordering::SeqCst);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "durable platform-state write failed");
+                false
+            }
+        };
+    }
+    match save(&capture(cloud)) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "durable platform-state write failed");
+            false
         }
+    }
+}
+
+/// Synchronously drain every admitted generation, then atomically close
+/// persistence admission before returning the exact final Guardian generation.
+/// A producer whose mutation reaches `persist()` after that boundary waits until
+/// process exit instead of acknowledging state absent from the terminal snapshot.
+pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
+    let Some(p) = PERSISTER.get() else {
+        return crate::guardian::close_replication_admission(None);
+    };
+    let timeout = std::env::var("HIVE_PERSIST_SHUTDOWN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(60));
+    let started = std::time::Instant::now();
+    loop {
+        let write_result = {
+            let _writer = p.writer.lock().unwrap();
+            let target = p.dirty.load(Ordering::SeqCst);
+            let snap = capture(&p.cloud);
+            save_with_guardian_generation(&snap).map(|guardian_generation| {
+                p.saved.store(target, Ordering::SeqCst);
+                guardian_generation
+            })
+        };
+
+        // persist() registers under this same lock. It therefore either bumped
+        // dirty before this stable check (and forces another pass), or observes
+        // closed admission and cannot return before process exit.
+        let mut admission_open = p.lock.lock().unwrap();
+        if let Ok(guardian_generation) = write_result {
+            if p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
+                *admission_open = false;
+                drop(admission_open);
+                return crate::guardian::close_replication_admission(guardian_generation);
+            }
+        } else if let Err(error) = &write_result {
+            tracing::error!(%error, "shutdown platform-state write failed; retrying within bounded drain");
+        }
+        drop(admission_open);
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "platform persistence drain timed out after {}ms (dirty={}, saved={})",
+                timeout.as_millis(),
+                p.dirty.load(Ordering::SeqCst),
+                p.saved.load(Ordering::SeqCst)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
@@ -675,7 +866,10 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         );
     }
     if orphaned_count > dropped {
-        tracing::warn!(count = orphaned_count - dropped, "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)");
+        tracing::warn!(
+            count = orphaned_count - dropped,
+            "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)"
+        );
     }
     for rec in deployments {
         // Decide whether a persisted deployment can still serve after a restart:
@@ -765,6 +959,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // making the cron loop fire it N times per schedule (live-witnessed:
     // vc-shoomoo-0 present 3× on a node). replace_all converges the store.
     cloud.cron.replace_all(snap.cron);
+    cloud.cron.recompute_all();
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
     // `restore` also runs from the asynchronous Guardian rollback guard, after
@@ -776,6 +971,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         tombstones: snap.team_tombstones,
     });
     cloud.webhooks.load(snap.webhooks);
+    cloud
+        .databases
+        .studio_replay_load(snap.database_studio_replay);
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.databases.tombstones_load(snap.database_tombstones);

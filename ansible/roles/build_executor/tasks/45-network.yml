@@ -1,0 +1,50 @@
+---
+- name: Build the exact network-create argument vector
+  ansible.builtin.set_fact:
+    _build_executor_network_create_argv: >-
+      {{
+        [build_executor_podman_path, 'network', 'create', '--driver=bridge',
+         '--interface-name=' ~ build_executor_network_bridge,
+         '--subnet=' ~ build_executor_network_subnet,
+         '--gateway=' ~ build_executor_network_gateway,
+         '--label=io.hive.build-executor.policy-id=' ~ build_executor_policy_id]
+        + (build_executor_dns_upstream_ipv4_sorted
+           | map('regex_replace', '^', '--dns=') | list)
+        + [build_executor_network_name]
+      }}
+
+- name: Create the dedicated rootful Netavark network after policy activation
+  ansible.builtin.command:
+    argv: "{{ _build_executor_network_create_argv }}"
+  when: not (_build_executor_network_preflight.network_exists | bool)
+
+- name: Inspect the effective executor network
+  ansible.builtin.command:
+    argv:
+      - "{{ build_executor_podman_path }}"
+      - network
+      - inspect
+      - "{{ build_executor_network_name }}"
+  register: _build_executor_network_inspect_raw
+  changed_when: false
+
+- name: Decode the effective executor network
+  ansible.builtin.set_fact:
+    _build_executor_network_inspect: "{{ (_build_executor_network_inspect_raw.stdout | from_json)[0] }}"
+
+- name: Require exact IPv4-only labeled network settings and DNS upstreams
+  ansible.builtin.assert:
+    that:
+      - _build_executor_network_inspect.driver == "bridge"
+      - _build_executor_network_inspect.network_interface == build_executor_network_bridge
+      - _build_executor_network_inspect.ipv6_enabled is sameas false
+      - _build_executor_network_inspect.internal is sameas false
+      - _build_executor_network_inspect.dns_enabled is sameas true
+      - (_build_executor_network_inspect.network_dns_servers | default([]) | length) == (build_executor_dns_upstream_ipv4_sorted | length)
+      - (_build_executor_network_inspect.network_dns_servers | default([]) | difference(build_executor_dns_upstream_ipv4_sorted) | length) == 0
+      - (build_executor_dns_upstream_ipv4_sorted | difference(_build_executor_network_inspect.network_dns_servers | default([])) | length) == 0
+      - (_build_executor_network_inspect.labels | default({})).get('io.hive.build-executor.policy-id', '') == build_executor_policy_id
+      - _build_executor_network_inspect.subnets | length == 1
+      - _build_executor_network_inspect.subnets[0].subnet == build_executor_network_subnet
+      - _build_executor_network_inspect.subnets[0].gateway == build_executor_network_gateway
+    fail_msg: "Effective Podman network differs from the policy-labeled IPv4-only definition."

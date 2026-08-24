@@ -41,6 +41,11 @@ ansible/.vault_pass
 .gm/browser-profile/
 .gm/browser-profile-*/
 
+# Stray per-subdirectory .gm/ exec-spool left by subagents launched with a
+# nested cwd -- transient regenerable spool state, never repo content. The
+# root .gm/ block above is unaffected (this pattern requires a parent dir).
+**/*/.gm/
+
 # Agent-tool worktree/session scratch (isolated-worktree subagents, local
 # settings) -- transient tooling state, never durable repo content.
 .claude/

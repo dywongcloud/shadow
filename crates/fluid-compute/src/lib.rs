@@ -27,6 +27,7 @@
 use fluid_core::FunctionConfig;
 use hive_backend::{
     connect_endpoint, CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch,
+    RuntimeArtifactPaths, RuntimeArtifactSpec,
 };
 use hive_core::{now_ms, CellId, ResourceSpec};
 use parking_lot::Mutex;
@@ -714,8 +715,33 @@ impl Fluid {
     /// A name comparison silently excludes any backend added later: gating
     /// delivery on `== "firecracker"` made the whole delivery step dead for
     /// LiteboxBackend, whose `start_function` hard-requires the artifact.
-    pub fn delivered_workdir(&self) -> Option<&'static str> {
-        self.backend.delivered_workdir()
+    /// Derive both serving locations from one server-built descriptor. Static
+    /// files must always retain `host_static_root`; only function launch consumes
+    /// `guest_workdir`. `delivery_required` is the backend capability gate.
+    pub fn runtime_artifact_paths(
+        &self,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<RuntimeArtifactPaths> {
+        let host_static_root = artifact.host_static_root()?;
+        let delivered = self.backend.delivered_workdir(artifact)?;
+        let delivery_required = delivered.is_some();
+        let guest_workdir = delivered
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| host_static_root.clone());
+        Ok(RuntimeArtifactPaths {
+            host_static_root,
+            guest_workdir,
+            delivery_required,
+        })
+    }
+
+    /// Legacy backend-level guest-path query. New deployment registration must
+    /// use `runtime_artifact_paths` so it cannot replace the host static root.
+    pub fn delivered_workdir(
+        &self,
+        artifact: &RuntimeArtifactSpec,
+    ) -> anyhow::Result<Option<String>> {
+        self.backend.delivered_workdir(artifact)
     }
 
     /// Make a built deployment available to the cells that will serve it (see
@@ -723,9 +749,9 @@ impl Fluid {
     pub async fn deliver_build(
         &self,
         image: &str,
-        build_dir: &std::path::Path,
+        artifact: &RuntimeArtifactSpec,
     ) -> anyhow::Result<()> {
-        self.backend.deliver_build(image, build_dir).await
+        self.backend.deliver_build(image, artifact).await
     }
 
     /// Total live instances (running + provisioning) a tenant currently holds
@@ -1106,7 +1132,7 @@ impl Fluid {
         // Bound concurrent provisioning so a burst can't saturate the host. Held
         // for the whole provision+start; dropped when this fn returns.
         let _permit = self.cold_start_sem.clone().acquire_owned().await;
-        let (image, launch, mem, vcpus, tenant) = {
+        let (image, mut launch, mem, vcpus, tenant) = {
             let reg = self.registry.lock();
             let pool = reg
                 .get(key)
@@ -1206,6 +1232,11 @@ impl Fluid {
                 start_cmd: pool.cfg.start_cmd.clone(),
                 env: pool.cfg.env.clone(),
                 workdir: Some(pool.workdir.clone()),
+                // Populated after this registry snapshot, before provision, from
+                // the backend's committed delivery identity. It cannot be resolved
+                // while the parking_lot registry lock is held because the proof
+                // lookup is async.
+                runtime_artifact: None,
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
                 // Carry the container memory/cpus/pids ceilings to the backend's
@@ -1236,6 +1267,53 @@ impl Fluid {
                 pool.tenant.clone(),
             )
         };
+
+        // A platform-published isolated artifact is named `dpl-*` at the one
+        // delivery boundary. Resolve its committed identity BEFORE provision and
+        // carry that exact H1 through the launch. The backend then compares H1
+        // with the bytes it actually attached (H2); it must never self-authorize
+        // whatever publication happens to be current after this decision.
+        //
+        // Same-host functions and OCI containers do not attach this artifact and
+        // deliberately retain `None`. A dpl-* launch with no identity is neither
+        // of those legacy shapes, so fail before booting or executing tenant code.
+        let is_container = launch.start_cmd.first().map(String::as_str) == Some("__container__");
+        let needs_runtime_artifact = image.starts_with("dpl-")
+            && !is_container
+            && self.backend.requires_runtime_artifact_authorization();
+        if needs_runtime_artifact {
+            let identity = self
+                .backend
+                .runtime_artifact_identity(&image)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "isolated runtime artifact {image:?} has no committed identity; refusing to provision or execute it ({})",
+                        hive_core::fault::NODE_IMAGE_MISSING
+                    )
+                })?;
+            anyhow::ensure!(
+                launch
+                    .workdir
+                    .as_deref()
+                    .is_some_and(|workdir| !workdir.trim().is_empty()),
+                "isolated runtime artifact {image:?} has no validated runtime workdir ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            anyhow::ensure!(
+                identity.id == image
+                    && identity.protocol == hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION
+                    && identity.content_sha256.len() == 64
+                    && identity.content_sha256.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    }),
+                "isolated runtime artifact {image:?} returned a mismatched identity/protocol/digest ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            launch.runtime_artifact = Some(identity);
+        } else {
+            launch.runtime_artifact = None;
+        }
 
         // A CONTAINER deployment (`["__container__", image, port]`) is run via host
         // podman by the backend (mock OR firecracker), not as a microVM/process —
@@ -1303,7 +1381,10 @@ impl Fluid {
         // and start_function (runtime init + tunnel attach) separately so a slow cold
         // start is explainable, not a single opaque number.
         let t_prov = now_ms();
-        let handle = self.backend.provision(&spec).await?;
+        let handle = self
+            .backend
+            .provision_runtime(&spec, launch.runtime_artifact.as_ref())
+            .await?;
         let mut unpublished = UnpublishedCell::new(self.backend.clone(), handle.clone());
         let provision_ms = now_ms().saturating_sub(t_prov);
         let t_run = now_ms();

@@ -1,0 +1,266 @@
+#!/usr/bin/bash
+# {{ ansible_managed }}
+set -euo pipefail
+umask 077
+
+if [[ $# -gt 1 || ($# -eq 1 && $1 != --lock-held) ]]; then
+    printf 'usage: %s [--lock-held]\n' "$0" >&2
+    exit 64
+fi
+# Hold a shared lifecycle lock across capability bytes, file hashes, image,
+# network, and live nft state so provisioning cannot mutate between checks.
+if [[ $# -eq 0 ]]; then
+    exec 9>>{{ build_executor_lock_path | quote }}
+    /usr/bin/flock --shared 9
+fi
+
+/usr/bin/systemctl --quiet is-active {{ build_executor_firewall_unit | quote }}
+/usr/bin/python3 - <<'PY'
+import hashlib
+import ipaddress
+import json
+import pathlib
+import stat
+import subprocess
+
+capability_path = pathlib.Path({{ build_executor_capability_path | to_json }})
+policy_path = pathlib.Path({{ build_executor_nft_policy_path | to_json }})
+expected = json.loads(r'''{
+  "protocol": {{ build_executor_protocol | to_json }},
+  "builder_image_id": {{ build_executor_builder_image_id | to_json }},
+  "runsc_path": {{ build_executor_runsc_path | to_json }},
+  "runsc_version": {{ build_executor_runsc_version | to_json }},
+  "runsc_sha256": {{ build_executor_runsc_sha256 | to_json }},
+  "runsc_sidecar_path": {{ build_executor_runsc_sidecar_path | to_json }},
+  "runsc_sidecar_sha256": {{ build_executor_runsc_sidecar_sha256 | to_json }},
+  "runsc_runtime_flags": {{ build_executor_runsc_runtime_flags | to_json }},
+  "podman_path": {{ build_executor_podman_path | to_json }},
+  "podman_sha256": {{ build_executor_podman_sha256 | to_json }},
+  "containers_conf_path": {{ build_executor_containers_conf_path | to_json }},
+  "containers_conf_sha256": {{ build_executor_containers_conf_sha256 | to_json }},
+  "containers_conf_override_path": {{ build_executor_containers_conf_override_path | to_json }},
+  "containers_conf_override_sha256": {{ build_executor_containers_conf_override_sha256 | to_json }},
+  "oci_hooks_dir": {{ build_executor_oci_hooks_dir | to_json }},
+  "network_name": {{ build_executor_network_name | to_json }},
+  "network_bridge": {{ build_executor_network_bridge | to_json }},
+  "network_subnet": {{ build_executor_network_subnet | to_json }},
+  "network_gateway": {{ build_executor_network_gateway | to_json }},
+  "network_dns_upstream_ipv4": {{ build_executor_dns_upstream_ipv4_sorted | to_json }},
+  "network_policy_id": {{ build_executor_policy_id | to_json }},
+  "network_ipv6": false,
+  "runtime_fallback": false,
+  "provision_lock_path": {{ build_executor_lock_path | to_json }},
+  "network_verify_path": {{ build_executor_nft_verify_path | to_json }},
+  "nft_binary": {{ build_executor_nft_binary | to_json }},
+  "nft_policy_path": {{ build_executor_nft_policy_path | to_json }},
+  "nft_table": {{ build_executor_nft_table | to_json }},
+  "nft_bridge_table": {{ build_executor_nft_bridge_table | to_json }},
+  "fleet_public_ipv4": {{ build_executor_fleet_public_ipv4_sorted | to_json }},
+  "fleet_probe_ipv4": {{ build_executor_fleet_public_ipv4_sorted[0] | to_json }},
+  "builder_uid": {{ build_executor_container_uid | int }},
+  "builder_gid": {{ build_executor_container_gid | int }},
+  "workspace_bytes": {{ build_executor_workspace_bytes | int }}
+}''')
+
+
+def trusted_file(path, mode):
+    path = pathlib.Path(path)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+        raise SystemExit(f"untrusted regular file: {path}")
+    if stat.S_IMODE(metadata.st_mode) != mode:
+        raise SystemExit(f"wrong mode on {path}: {stat.S_IMODE(metadata.st_mode):04o}")
+    return path
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+capability_path = trusted_file(capability_path, 0o600)
+policy_path = trusted_file(policy_path, 0o600)
+with capability_path.open("r", encoding="utf-8") as handle:
+    capability = json.load(handle)
+if not isinstance(capability, dict):
+    raise SystemExit("capability root is not an object")
+allowed_keys = set(expected) | {"network_policy_digest", "network_verify_sha256"}
+if set(capability) != allowed_keys:
+    raise SystemExit("capability fields differ from protocol v1")
+for key, value in expected.items():
+    if capability.get(key) != value:
+        raise SystemExit(f"capability field differs from installed policy: {key}")
+
+policy_digest = "sha256:" + sha256(policy_path)
+if capability["network_policy_digest"] != policy_digest:
+    raise SystemExit("nft policy bytes differ from the published digest")
+network_verify_path = trusted_file(capability["network_verify_path"], 0o755)
+if sha256(network_verify_path) != capability["network_verify_sha256"]:
+    raise SystemExit("network verifier bytes differ from the published digest")
+for key, mode, digest_key in (
+    ("runsc_path", 0o755, "runsc_sha256"),
+    ("runsc_sidecar_path", 0o755, "runsc_sidecar_sha256"),
+    ("podman_path", 0o755, "podman_sha256"),
+    ("containers_conf_path", 0o600, "containers_conf_sha256"),
+    ("containers_conf_override_path", 0o600, "containers_conf_override_sha256"),
+):
+    path = trusted_file(capability[key], mode)
+    if sha256(path) != capability[digest_key]:
+        raise SystemExit(f"installed checksum differs from capability: {key}")
+
+hooks = pathlib.Path(capability["oci_hooks_dir"])
+hooks_metadata = hooks.lstat()
+if not stat.S_ISDIR(hooks_metadata.st_mode) or hooks_metadata.st_uid != 0 or hooks_metadata.st_gid != 0:
+    raise SystemExit("OCI hooks path is not a trusted directory")
+if stat.S_IMODE(hooks_metadata.st_mode) != 0o700 or any(hooks.iterdir()):
+    raise SystemExit("OCI hooks directory is not root-only and empty")
+lock_path = trusted_file(capability["provision_lock_path"], 0o600)
+if lock_path.lstat().st_nlink != 1:
+    raise SystemExit("BuildExecutor lock path is not a single stable inode")
+
+clean_env = {"HOME": "/root", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+runsc_version = subprocess.run(
+    [capability["runsc_path"], "--version"],
+    env=clean_env, capture_output=True, text=True, timeout=10, check=True,
+)
+if f"runsc version {capability['runsc_version']}" not in runsc_version.stdout.splitlines():
+    raise SystemExit("runsc no longer reports the published version")
+podman = capability["podman_path"]
+subprocess.run([podman, "--version"], env=clean_env, capture_output=True, timeout=10, check=True)
+
+image_rows = json.loads(subprocess.check_output(
+    [podman, "image", "inspect", capability["builder_image_id"]],
+    env=clean_env, text=True, timeout=20,
+))
+if len(image_rows) != 1 or image_rows[0].get("Id") != capability["builder_image_id"]:
+    raise SystemExit("immutable builder image is absent or changed")
+image_config = image_rows[0].get("Config") or {}
+expected_user = f"{capability['builder_uid']}:{capability['builder_gid']}"
+image_label = (image_config.get("Labels") or {}).get("org.hive.build-executor.protocol")
+if image_config.get("User") != expected_user or (image_config.get("Volumes") or {}) or image_label != capability["protocol"]:
+    raise SystemExit("builder image user, volume, or protocol-label policy changed")
+
+network_rows = json.loads(subprocess.check_output(
+    [podman, "network", "inspect", capability["network_name"]],
+    env=clean_env, text=True, timeout=20,
+))
+if len(network_rows) != 1:
+    raise SystemExit("executor network inspect returned an unexpected result")
+network = network_rows[0]
+subnets = network.get("subnets") or []
+network_exact = (
+    network.get("driver") == "bridge"
+    and network.get("network_interface") == capability["network_bridge"]
+    and network.get("ipv6_enabled") is False
+    and network.get("internal") is False
+    and network.get("dns_enabled") is True
+    and len(network.get("network_dns_servers") or []) == len(capability["network_dns_upstream_ipv4"])
+    and set(network.get("network_dns_servers") or []) == set(capability["network_dns_upstream_ipv4"])
+    and (network.get("labels") or {}).get("io.hive.build-executor.policy-id") == capability["network_policy_id"]
+    and len(subnets) == 1
+    and subnets[0].get("subnet") == capability["network_subnet"]
+    and subnets[0].get("gateway") == capability["network_gateway"]
+)
+if not network_exact:
+    raise SystemExit("effective executor network differs from the capability")
+
+nft = str(trusted_file(capability["nft_binary"], 0o755))
+def nft_table(family, name):
+    return json.loads(subprocess.check_output(
+        [nft, "-j", "list", "table", family, name], text=True, timeout=10,
+    ))["nftables"]
+
+inet_rows = nft_table("inet", capability["nft_table"])
+bridge_rows = nft_table("bridge", capability["nft_bridge_table"])
+def records(rows, kind):
+    return [row[kind] for row in rows if kind in row]
+
+def require_table(rows, family, name):
+    tables = records(rows, "table")
+    if len(tables) != 1 or tables[0].get("family") != family or tables[0].get("name") != name:
+        raise SystemExit(f"live nft {family} table identity differs")
+    if tables[0].get("comment") != capability["network_policy_id"]:
+        raise SystemExit(f"live nft {family} table policy identity differs")
+
+require_table(inet_rows, "inet", capability["nft_table"])
+require_table(bridge_rows, "bridge", capability["nft_bridge_table"])
+inet_chains = {row["name"]: row for row in records(inet_rows, "chain")}
+bridge_chains = {row["name"]: row for row in records(bridge_rows, "chain")}
+expected_chains = {
+    "executor_to_host": ("input", 10, "accept"),
+    "executor_forward": ("forward", 10, "accept"),
+}
+if set(inet_chains) != set(expected_chains) or set(bridge_chains) != {"executor_lateral"}:
+    raise SystemExit("live nft chain set differs from policy")
+for name, (hook, priority, policy) in expected_chains.items():
+    chain = inet_chains[name]
+    if chain.get("type") != "filter" or chain.get("hook") != hook or chain.get("prio") != priority or chain.get("policy") != policy:
+        raise SystemExit(f"live nft chain metadata differs: {name}")
+lateral = bridge_chains["executor_lateral"]
+if lateral.get("type") != "filter" or lateral.get("hook") != "forward" or lateral.get("prio") != 10 or lateral.get("policy") != "accept":
+    raise SystemExit("live nft bridge chain metadata differs")
+if {row["name"] for row in records(inet_rows, "counter")} != {
+    "dns_allowed", "web_allowed", "host_denied", "dnat_denied",
+    "denied_destination", "fleet_denied", "ipv6_denied",
+    "egress_default_denied", "ingress_to_executor_denied",
+}:
+    raise SystemExit("live nft inet counter set differs")
+if {row["name"] for row in records(bridge_rows, "counter")} != {"lateral_denied"}:
+    raise SystemExit("live nft bridge counter set differs")
+if {row["name"] for row in records(inet_rows, "set")} != {"denied_ipv4", "fleet_ipv4"}:
+    raise SystemExit("live nft destination sets differ")
+inet_rule_counts = {}
+for rule in records(inet_rows, "rule"):
+    inet_rule_counts[rule["chain"]] = inet_rule_counts.get(rule["chain"], 0) + 1
+bridge_rule_counts = {}
+for rule in records(bridge_rows, "rule"):
+    bridge_rule_counts[rule["chain"]] = bridge_rule_counts.get(rule["chain"], 0) + 1
+if inet_rule_counts != {"executor_to_host": 4, "executor_forward": 10}:
+    raise SystemExit("live nft inet rule count differs")
+if bridge_rule_counts != {"executor_lateral": 1}:
+    raise SystemExit("live nft bridge rule count differs")
+
+inet_rule_comments = [row.get("comment") for row in records(inet_rows, "rule")]
+if inet_rule_comments != [
+    "be-input-ipv6", "be-input-dns-udp", "be-input-dns-tcp", "be-input-default",
+    "be-forward-egress-ipv6", "be-forward-ingress-ipv6", "be-forward-invalid",
+    "be-forward-dnat", "be-forward-special", "be-forward-fleet", "be-forward-web",
+    "be-forward-egress-default", "be-forward-ingress-established", "be-forward-ingress-default",
+]:
+    raise SystemExit("live nft inet rule identity or order differs")
+if [row.get("comment") for row in records(bridge_rows, "rule")] != ["be-bridge-lateral"]:
+    raise SystemExit("live nft bridge rule identity differs")
+
+inet_sets = {row["name"]: row for row in records(inet_rows, "set")}
+def normalized_elements(value):
+    result = set()
+    for element in value.get("elem") or []:
+        if isinstance(element, str):
+            network = ipaddress.ip_network(element if "/" in element else element + "/32", strict=False)
+        elif isinstance(element, dict) and isinstance(element.get("prefix"), dict):
+            prefix = element["prefix"]
+            network = ipaddress.ip_network(f"{prefix['addr']}/{prefix['len']}", strict=False)
+        else:
+            raise SystemExit("live nft set contains an unknown element shape")
+        result.add(network.with_prefixlen)
+    return result
+
+expected_denied = {
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "168.63.129.16/32", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24",
+    "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
+    "192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+}
+if inet_sets["denied_ipv4"].get("type") != "ipv4_addr" or set(inet_sets["denied_ipv4"].get("flags") or []) != {"interval"}:
+    raise SystemExit("live nft denied set metadata differs")
+if normalized_elements(inet_sets["denied_ipv4"]) != expected_denied:
+    raise SystemExit("live nft denied destination set differs")
+expected_fleet = {ipaddress.ip_network(value + "/32").with_prefixlen for value in capability["fleet_public_ipv4"]}
+if inet_sets["fleet_ipv4"].get("type") != "ipv4_addr" or normalized_elements(inet_sets["fleet_ipv4"]) != expected_fleet:
+    raise SystemExit("live nft fleet destination set differs")
+PY

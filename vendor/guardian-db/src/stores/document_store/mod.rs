@@ -163,7 +163,10 @@ async fn refresh_doc_index(
     }
 
     if stale_served > 0 {
-        debug!(stale_served, "DocumentStore index: served last-known-good content for keys whose blob re-fetch failed this round");
+        debug!(
+            stale_served,
+            "DocumentStore index: served last-known-good content for keys whose blob re-fetch failed this round"
+        );
     }
     if lost > 0 {
         let (k, e) = first_lost
@@ -558,19 +561,15 @@ impl GuardianDBDocumentStore {
 
             use futures::StreamExt;
             use iroh_docs::engine::LiveEvent;
-            // COALESCED rebuild — see the matching comment in kv_store::
-            // spawn_live_index_sync. A remote sync burst delivers many events in
-            // a few ms; rebuilding the whole document index (get_many + a
-            // per-key cat_bytes, each allocating) on EVERY event was an
-            // O(events x keys) allocation/network storm driving the fleet's
-            // tokio-worker heap runaway. Set dirty per remote event, rebuild at
-            // most once per debounce window. Correctness unchanged (a full
-            // rebuild reflects latest state regardless of how many events it
-            // collapses); only the rate is bounded.
-            let is_remote = |event: &std::result::Result<LiveEvent, _>| {
+            // Rebuild on every event that can change materialized document state.
+            // Local events matter too: an axum/request future may be cancelled
+            // after the independent iroh-docs actor commits but before the
+            // caller-side index.insert runs.
+            let changes_documents = |event: &std::result::Result<LiveEvent, _>| {
                 matches!(
                     event,
-                    Ok(LiveEvent::InsertRemote { .. })
+                    Ok(LiveEvent::InsertLocal { .. })
+                        | Ok(LiveEvent::InsertRemote { .. })
                         | Ok(LiveEvent::ContentReady { .. })
                         | Ok(LiveEvent::PendingContentReady)
                         | Ok(LiveEvent::SyncFinished(_))
@@ -582,7 +581,7 @@ impl GuardianDBDocumentStore {
                 if dirty {
                     match tokio::time::timeout(DEBOUNCE, stream.next()).await {
                         Ok(Some(event)) => {
-                            if is_remote(&event) {
+                            if changes_documents(&event) {
                                 dirty = true;
                             }
                             continue;
@@ -598,7 +597,7 @@ impl GuardianDBDocumentStore {
                 } else {
                     match stream.next().await {
                         Some(event) => {
-                            if is_remote(&event) {
+                            if changes_documents(&event) {
                                 dirty = true;
                             }
                         }

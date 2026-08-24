@@ -1,0 +1,129 @@
+---
+- name: Remove any prior content from the dedicated OCI hooks directory
+  ansible.builtin.file:
+    path: "{{ build_executor_oci_hooks_dir }}"
+    state: absent
+
+- name: Create dedicated Podman policy directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ build_executor_containers_conf_dir }}", mode: "0755" }
+    - { path: "{{ build_executor_oci_hooks_dir }}", mode: "0700" }
+    - { path: "{{ build_executor_hive_node_dropin_dir }}", mode: "0755" }
+    - { path: "{{ build_executor_nftables_dropin_dir }}", mode: "0755" }
+    - { path: "{{ build_executor_netavark_reload_dropin_dir }}", mode: "0755" }
+
+- name: Install the dedicated no-host-env Podman configuration
+  ansible.builtin.template:
+    src: containers.conf.j2
+    dest: "{{ build_executor_containers_conf_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+    unsafe_writes: false
+
+- name: Install the intentionally empty Podman override configuration
+  ansible.builtin.template:
+    src: containers-override.conf.j2
+    dest: "{{ build_executor_containers_conf_override_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+    unsafe_writes: false
+
+- name: Install the exact-runtime Podman wrapper
+  ansible.builtin.template:
+    src: podman-wrapper.sh.j2
+    dest: "{{ build_executor_podman_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    unsafe_writes: false
+
+- name: Install the next-run/startup stale-probe reaper
+  ansible.builtin.template:
+    src: reap-stale-probes.sh.j2
+    dest: "{{ build_executor_reap_helper_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    unsafe_writes: false
+
+- name: Read rootful Podman host contract
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/podman
+      - info
+      - --format=json
+  register: _build_executor_podman_info_raw
+  changed_when: false
+
+- name: Decode rootful Podman host contract
+  ansible.builtin.set_fact:
+    _build_executor_podman_info: "{{ _build_executor_podman_info_raw.stdout | from_json }}"
+
+- name: Inspect the packaged Netavark nftables reload unit
+  ansible.builtin.stat:
+    path: "{{ build_executor_netavark_reload_unit_path }}"
+    follow: false
+  register: _build_executor_netavark_reload_unit_stat
+
+- name: Inspect any system-level Netavark reload fallback
+  ansible.builtin.stat:
+    path: "{{ build_executor_netavark_reload_fallback_path }}"
+    follow: false
+  register: _build_executor_netavark_reload_fallback_stat
+
+- name: Read an existing system-level Netavark reload fallback
+  ansible.builtin.slurp:
+    src: "{{ build_executor_netavark_reload_fallback_path }}"
+  register: _build_executor_netavark_reload_fallback_raw
+  when: _build_executor_netavark_reload_fallback_stat.stat.exists | bool
+
+- name: Refuse to overwrite an externally owned Netavark reload unit
+  ansible.builtin.assert:
+    that:
+      - _build_executor_netavark_reload_fallback_stat.stat.isreg
+      - not _build_executor_netavark_reload_fallback_stat.stat.islnk
+      - _build_executor_netavark_reload_fallback_stat.stat.uid == 0
+      - _build_executor_netavark_reload_fallback_stat.stat.gid == 0
+      - "'hive-build-executor-owned-fallback' in (_build_executor_netavark_reload_fallback_raw.content | b64decode)"
+    fail_msg: >-
+      {{ build_executor_netavark_reload_fallback_path }} exists but is not owned
+      by build_executor; refusing to overwrite another operator's unit.
+  when: _build_executor_netavark_reload_fallback_stat.stat.exists | bool
+
+- name: Require the existing rootful Netavark backend without migrating it
+  ansible.builtin.assert:
+    that:
+      - not (_build_executor_podman_info.host.security.rootless | bool)
+      - >-
+        (_build_executor_podman_info.host.networkBackend | default(
+          _build_executor_podman_info.host.networkBackendInfo.backend | default('')
+        )) == 'netavark'
+    fail_msg: >-
+      BuildExecutor requires the already-selected rootful Netavark backend. The
+      role refuses to run podman system migrate or change a live host backend.
+
+- name: Calculate dedicated Podman policy checksums
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  loop:
+    - { key: podman, path: "{{ build_executor_podman_path }}" }
+    - { key: containers_conf, path: "{{ build_executor_containers_conf_path }}" }
+    - { key: containers_conf_override, path: "{{ build_executor_containers_conf_override_path }}" }
+  register: _build_executor_podman_policy_stats
+
+- name: Pin dedicated Podman policy checksums
+  ansible.builtin.set_fact:
+    build_executor_podman_sha256: "{{ (_build_executor_podman_policy_stats.results | selectattr('item.key', 'equalto', 'podman') | first).stat.checksum }}"
+    build_executor_containers_conf_sha256: "{{ (_build_executor_podman_policy_stats.results | selectattr('item.key', 'equalto', 'containers_conf') | first).stat.checksum }}"
+    build_executor_containers_conf_override_sha256: "{{ (_build_executor_podman_policy_stats.results | selectattr('item.key', 'equalto', 'containers_conf_override') | first).stat.checksum }}"

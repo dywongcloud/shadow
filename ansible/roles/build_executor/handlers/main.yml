@@ -1,0 +1,11 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart build-executor firewall
+  ansible.builtin.systemd:
+    name: "{{ build_executor_firewall_unit }}"
+    state: restarted
+    enabled: true
+    daemon_reload: true

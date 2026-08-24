@@ -7,6 +7,35 @@ use hive_core::now_ms;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, Weak};
+
+/// The one writer gate for a project's lifecycle. Admission, final deployment
+/// registration, promotion, and deletion all take this keyed mutex before they
+/// decide which incarnation is active. Weak entries keep the registry bounded:
+/// the owned guard retains the lock while it is held; an idle project's entry
+/// can be replaced only after no writer or waiter still owns it.
+static LIFECYCLE_WRITERS: OnceLock<
+    parking_lot::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+pub(crate) async fn lifecycle_write(project: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let key = project.trim().to_ascii_lowercase();
+    let lock = {
+        let mut writers = LIFECYCLE_WRITERS
+            .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            .lock();
+        writers.retain(|_, lock| lock.strong_count() > 0);
+        match writers.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                writers.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnvVar {
@@ -15,6 +44,11 @@ pub struct EnvVar {
     /// "production" | "preview" | "development" | "all"
     #[serde(default = "default_target")]
     pub target: String,
+    /// "runtime" | "build" | "all". Missing on every legacy row, so the
+    /// default is deliberately runtime-only: adding this field must not expose
+    /// years of stored runtime credentials to repository-controlled builds.
+    #[serde(default = "default_env_scope")]
+    pub scope: String,
     #[serde(default)]
     pub sensitive: bool,
     #[serde(default)]
@@ -22,6 +56,15 @@ pub struct EnvVar {
 }
 fn default_target() -> String {
     "production".into()
+}
+fn default_env_scope() -> String {
+    "runtime".into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvExecutionScope {
+    Build,
+    Runtime,
 }
 
 /// Does this value look like a real, live credential? Used to force
@@ -251,6 +294,30 @@ pub struct ProjectSettings {
     pub incarnation: Option<fluid_core::ProjectIncarnation>,
     #[serde(default)]
     pub incarnation_created_ms: u64,
+    /// Non-zero only when this incarnation upgraded an already-live legacy row.
+    /// It authorizes a one-time, exact-ID adoption of deployment records that
+    /// were already visible while that row had no identity. Fresh projects and
+    /// ambiguous post-tombstone legacy rows leave this at zero.
+    #[serde(default)]
+    pub legacy_incarnation_upgrade_ms: u64,
+    /// Platform-issued deployment ids observed before/during the legacy-row
+    /// upgrade. A `project_incarnation: None` record may be stamped only when
+    /// its exact id appears here; name or timestamp proximity is never proof.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_deployment_ids: Vec<String>,
+    /// Exact platform-issued database ids admitted during this incarnation.
+    /// Grow-only for the lifetime: deleting one database removes its catalog
+    /// row but retains this ownership fact so a delayed completion can never be
+    /// mistaken for another same-name project's resource. Pre-upgrade rows have
+    /// an empty set and therefore retain legacy databases on project deletion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_database_ids: Vec<String>,
+    /// Exact incarnation-qualified persistent-volume names emitted by a build.
+    /// This survives deployment deletion so deleting the project can still
+    /// reclaim a compose service's volume without deriving ownership from a
+    /// project-name prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_volume_names: Vec<String>,
     /// Last write to THIS row on THIS node (ms epoch). The per-row freshness
     /// key `merge_synced` compares — newest write wins a replication collision,
     /// and a tombstone at-or-after it deletes the row. `0` = a row never
@@ -381,6 +448,10 @@ impl Default for ProjectSettings {
         ProjectSettings {
             incarnation: None,
             incarnation_created_ms: 0,
+            legacy_incarnation_upgrade_ms: 0,
+            legacy_deployment_ids: Vec::new(),
+            owned_database_ids: Vec::new(),
+            owned_volume_names: Vec::new(),
             updated_ms: 0,
             env: Vec::new(),
             build: BuildConfig::default(),
@@ -480,6 +551,114 @@ impl ProjectStore {
 
     pub fn get(&self, project: &str) -> ProjectSettings {
         self.map.read().get(project).cloned().unwrap_or_default()
+    }
+
+    /// Return the active server-issued incarnation, minting one for a new
+    /// project or upgrading a live legacy row in place. Upgrading preserves the
+    /// row's team, env, build settings, and domains; only its missing identity
+    /// and causal timestamps change.
+    pub fn ensure_incarnation(
+        &self,
+        project: &str,
+    ) -> Result<fluid_core::ProjectIncarnation, ProjectIncarnationError> {
+        let mut map = self.map.write();
+        if let Some(row) = map.get_mut(project) {
+            if let Some(incarnation) = row.incarnation {
+                return Ok(incarnation);
+            }
+            let incarnation = fluid_core::ProjectIncarnation::mint();
+            let legacy_floor = self.tombstones.read().get(project).copied().unwrap_or(0);
+            let incarnation_floor = self
+                .incarnation_tombstones
+                .read()
+                .get(project)
+                .and_then(|tombstones| tombstones.values().copied().max())
+                .unwrap_or(0);
+            let legacy_adoption_unambiguous = incarnation_floor == 0;
+            let created_ms = now_ms()
+                .max(row.updated_ms.saturating_add(1))
+                .max(legacy_floor.saturating_add(1))
+                .max(incarnation_floor.saturating_add(1));
+            row.incarnation = Some(incarnation);
+            row.incarnation_created_ms = created_ms;
+            row.legacy_incarnation_upgrade_ms = legacy_adoption_unambiguous
+                .then_some(created_ms)
+                .unwrap_or(0);
+            row.legacy_deployment_ids.clear();
+            row.owned_database_ids.clear();
+            row.owned_volume_names.clear();
+            row.updated_ms = created_ms;
+            return Ok(incarnation);
+        }
+        drop(map);
+        self.create(project)
+    }
+
+    /// Adopt the coordinator-issued incarnation on an authenticated internal
+    /// fanout. A legacy row is upgraded without losing settings; an already
+    /// identified row must match exactly. A deleted incarnation is never
+    /// reusable, even when this node has no live row yet.
+    pub fn ensure_incarnation_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+    ) -> Result<fluid_core::ProjectIncarnation, ProjectIncarnationError> {
+        if self.tombstone_of_incarnation(project, expected).is_some() {
+            return Err(ProjectIncarnationError::Tombstoned);
+        }
+        let mut map = self.map.write();
+        match map.get_mut(project) {
+            Some(row) if row.incarnation == Some(expected) => Ok(expected),
+            Some(row) if row.incarnation.is_none() => {
+                let legacy_floor = self.tombstones.read().get(project).copied().unwrap_or(0);
+                let incarnation_floor = self
+                    .incarnation_tombstones
+                    .read()
+                    .get(project)
+                    .and_then(|tombstones| tombstones.values().copied().max())
+                    .unwrap_or(0);
+                let legacy_adoption_unambiguous = incarnation_floor == 0;
+                let created_ms = now_ms()
+                    .max(row.updated_ms.saturating_add(1))
+                    .max(legacy_floor.saturating_add(1))
+                    .max(incarnation_floor.saturating_add(1));
+                row.incarnation = Some(expected);
+                row.incarnation_created_ms = created_ms;
+                row.legacy_incarnation_upgrade_ms = legacy_adoption_unambiguous
+                    .then_some(created_ms)
+                    .unwrap_or(0);
+                row.legacy_deployment_ids.clear();
+                row.owned_database_ids.clear();
+                row.owned_volume_names.clear();
+                row.updated_ms = created_ms;
+                Ok(expected)
+            }
+            Some(row) => Err(ProjectIncarnationError::Mismatch {
+                active: row.incarnation.expect("matched None above"),
+            }),
+            None => {
+                let legacy_floor = self.tombstones.read().get(project).copied().unwrap_or(0);
+                let incarnation_floor = self
+                    .incarnation_tombstones
+                    .read()
+                    .get(project)
+                    .and_then(|tombstones| tombstones.values().copied().max())
+                    .unwrap_or(0);
+                let created_ms = now_ms()
+                    .max(legacy_floor.saturating_add(1))
+                    .max(incarnation_floor.saturating_add(1));
+                map.insert(
+                    project.to_string(),
+                    ProjectSettings {
+                        incarnation: Some(expected),
+                        incarnation_created_ms: created_ms,
+                        updated_ms: created_ms,
+                        ..ProjectSettings::default()
+                    },
+                );
+                Ok(expected)
+            }
+        }
     }
 
     pub fn create(
@@ -589,6 +768,70 @@ impl ProjectStore {
         self.with_active(project, expected, Clone::clone)
     }
 
+    /// Bind the exact platform-issued deployment ids observed while an existing
+    /// settings row was still legacy to the incarnation that upgraded it. The
+    /// caller holds [`lifecycle_write`]; later calls can only add exact ids to
+    /// the same migration window. Fresh rows and any row with prior incarnation
+    /// tombstones refuse adoption by returning an empty set.
+    pub fn authorize_legacy_deployments(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        ids: impl IntoIterator<Item = String>,
+    ) -> Result<Vec<String>, ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            if row.legacy_incarnation_upgrade_ms == 0
+                || row.legacy_incarnation_upgrade_ms != row.incarnation_created_ms
+            {
+                return Vec::new();
+            }
+            row.legacy_deployment_ids.extend(ids);
+            row.legacy_deployment_ids.sort();
+            row.legacy_deployment_ids.dedup();
+            row.legacy_deployment_ids.clone()
+        })
+    }
+
+    pub fn legacy_deployment_ids_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+    ) -> Result<Vec<String>, ProjectIncarnationError> {
+        self.with_active(project, expected, |row| {
+            if row.legacy_incarnation_upgrade_ms == row.incarnation_created_ms {
+                row.legacy_deployment_ids.clone()
+            } else {
+                Vec::new()
+            }
+        })
+    }
+
+    pub fn claim_database_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        id: String,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.owned_database_ids.push(id);
+            row.owned_database_ids.sort();
+            row.owned_database_ids.dedup();
+        })
+    }
+
+    pub fn claim_volumes_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.owned_volume_names.extend(names);
+            row.owned_volume_names.sort();
+            row.owned_volume_names.dedup();
+        })
+    }
+
     /// Full snapshot (project -> settings) for persistence.
     pub fn snapshot(&self) -> HashMap<String, ProjectSettings> {
         self.map.read().clone()
@@ -635,6 +878,17 @@ impl ProjectStore {
             if row.incarnation.is_some() && row.incarnation_created_ms == 0 {
                 row.incarnation_created_ms = row.updated_ms;
             }
+            if row.legacy_incarnation_upgrade_ms != row.incarnation_created_ms {
+                row.legacy_incarnation_upgrade_ms = 0;
+                row.legacy_deployment_ids.clear();
+            } else {
+                row.legacy_deployment_ids.sort();
+                row.legacy_deployment_ids.dedup();
+            }
+            row.owned_database_ids.sort();
+            row.owned_database_ids.dedup();
+            row.owned_volume_names.sort();
+            row.owned_volume_names.dedup();
             if row.incarnation_created_ms > ceiling {
                 tracing::warn!(project = %id, created_ms = row.incarnation_created_ms, ceiling_ms = ceiling, "normalizing implausibly future persisted project incarnation on load");
                 row.incarnation_created_ms = now;
@@ -719,6 +973,17 @@ impl ProjectStore {
             if row.incarnation.is_some() && row.incarnation_created_ms == 0 {
                 row.incarnation_created_ms = row.updated_ms;
             }
+            if row.legacy_incarnation_upgrade_ms != row.incarnation_created_ms {
+                row.legacy_incarnation_upgrade_ms = 0;
+                row.legacy_deployment_ids.clear();
+            } else {
+                row.legacy_deployment_ids.sort();
+                row.legacy_deployment_ids.dedup();
+            }
+            row.owned_database_ids.sort();
+            row.owned_database_ids.dedup();
+            row.owned_volume_names.sort();
+            row.owned_volume_names.dedup();
             if row.incarnation_created_ms > ceiling {
                 tracing::warn!(project = %name, created_ms = row.incarnation_created_ms, ceiling_ms = ceiling, "normalizing implausibly future local project incarnation");
                 row.incarnation_created_ms = now;
@@ -732,6 +997,14 @@ impl ProjectStore {
             if remote_row.incarnation.is_some() && remote_row.incarnation_created_ms == 0 {
                 remote_row.incarnation_created_ms = remote_row.updated_ms;
             }
+            if remote_row.legacy_incarnation_upgrade_ms != remote_row.incarnation_created_ms {
+                remote_row.legacy_incarnation_upgrade_ms = 0;
+                remote_row.legacy_deployment_ids.clear();
+            }
+            remote_row.owned_database_ids.sort();
+            remote_row.owned_database_ids.dedup();
+            remote_row.owned_volume_names.sort();
+            remote_row.owned_volume_names.dedup();
             if remote_row.incarnation_created_ms > ceiling {
                 tracing::warn!(project = %name, created_ms = remote_row.incarnation_created_ms, ceiling_ms = ceiling, "dropping relayed project incarnation with implausibly future generation");
                 continue;
@@ -739,6 +1012,33 @@ impl ProjectStore {
             if remote_row.updated_ms > ceiling {
                 tracing::warn!(project = %name, updated_ms = remote_row.updated_ms, ceiling_ms = ceiling, "dropping relayed project row with implausibly future version");
                 continue;
+            }
+            let same_incarnation = map.get(&name).is_some_and(|local| {
+                local.incarnation.is_some()
+                    && local.incarnation == remote_row.incarnation
+                    && local.incarnation_created_ms == remote_row.incarnation_created_ms
+            });
+            if same_incarnation {
+                if let Some(local) = map.get(&name) {
+                    if local.legacy_incarnation_upgrade_ms == local.incarnation_created_ms {
+                        remote_row.legacy_incarnation_upgrade_ms = local.incarnation_created_ms;
+                        remote_row
+                            .legacy_deployment_ids
+                            .extend(local.legacy_deployment_ids.iter().cloned());
+                    }
+                    remote_row
+                        .owned_database_ids
+                        .extend(local.owned_database_ids.iter().cloned());
+                    remote_row
+                        .owned_volume_names
+                        .extend(local.owned_volume_names.iter().cloned());
+                }
+                remote_row.legacy_deployment_ids.sort();
+                remote_row.legacy_deployment_ids.dedup();
+                remote_row.owned_database_ids.sort();
+                remote_row.owned_database_ids.dedup();
+                remote_row.owned_volume_names.sort();
+                remote_row.owned_volume_names.dedup();
             }
             let take = match map.get(&name) {
                 None => true,
@@ -748,11 +1048,7 @@ impl ProjectStore {
                 // Mixed-version strip guard: a pre-`framework_auto` binary
                 // deserializes the row dropping the field (serde default =
                 // false), and any local mutation there re-serializes a newer
-                // row that would demote our AUTO marker to "explicit" —
-                // permanently freezing framework re-detection. When the
-                // framework string itself is unchanged, the auto marker is a
-                // fact about how that string was WRITTEN and cannot be
-                // legitimately revoked by a row that didn't change it.
+                // row that would demote our AUTO marker to "explicit".
                 if let Some(local) = map.get(&name) {
                     if local.build.framework_auto
                         && !remote_row.build.framework_auto
@@ -762,6 +1058,32 @@ impl ProjectStore {
                     }
                 }
                 map.insert(name, remote_row);
+            } else if same_incarnation {
+                // Migration authority is a grow-only exact-id set. Merge it
+                // even when ordinary row freshness keeps the local row; a
+                // last-writer-wins replacement would otherwise forget ids
+                // learned independently on another hosting node.
+                if let Some(local) = map.get_mut(&name) {
+                    if remote_row.legacy_incarnation_upgrade_ms == remote_row.incarnation_created_ms
+                    {
+                        local.legacy_incarnation_upgrade_ms = local.incarnation_created_ms;
+                        local
+                            .legacy_deployment_ids
+                            .extend(remote_row.legacy_deployment_ids);
+                        local.legacy_deployment_ids.sort();
+                        local.legacy_deployment_ids.dedup();
+                    }
+                    local
+                        .owned_database_ids
+                        .extend(remote_row.owned_database_ids);
+                    local.owned_database_ids.sort();
+                    local.owned_database_ids.dedup();
+                    local
+                        .owned_volume_names
+                        .extend(remote_row.owned_volume_names);
+                    local.owned_volume_names.sort();
+                    local.owned_volume_names.dedup();
+                }
             }
         }
         map.retain(|name, row| match row.incarnation {
@@ -869,11 +1191,14 @@ impl ProjectStore {
             .copied()
     }
 
-    pub fn remove_exact(
+    pub fn begin_delete_exact(
         &self,
         project: &str,
         expected: fluid_core::ProjectIncarnation,
-    ) -> Result<ProjectSettings, ProjectIncarnationError> {
+        observed_ms: u64,
+    ) -> Result<(ProjectSettings, u64), ProjectIncarnationError> {
+        let now = now_ms();
+        let ceiling = now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS);
         let mut map = self.map.write();
         let active = map.get(project).ok_or_else(|| {
             if self.tombstone_of_incarnation(project, expected).is_some() {
@@ -887,19 +1212,52 @@ impl ProjectStore {
             Some(active) => return Err(ProjectIncarnationError::Mismatch { active }),
             None => return Err(ProjectIncarnationError::Legacy),
         }
-        let row = map.remove(project).ok_or(ProjectIncarnationError::Missing)?;
-        let now = now_ms();
-        let ceiling = now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS);
-        let mut all_tombstones = self.incarnation_tombstones.write();
-        let tombstones = all_tombstones.entry(project.to_string()).or_default();
-        let prior = tombstones.get(&expected).copied().unwrap_or(0).min(ceiling);
+        let row = map
+            .remove(project)
+            .ok_or(ProjectIncarnationError::Missing)?;
+        let observed_ms = observed_ms.min(ceiling);
+        let prior_project = self
+            .tombstones
+            .read()
+            .get(project)
+            .copied()
+            .unwrap_or(0)
+            .min(ceiling);
+        let prior_incarnation = self
+            .incarnation_tombstones
+            .read()
+            .get(project)
+            .and_then(|tombstones| tombstones.get(&expected))
+            .copied()
+            .unwrap_or(0)
+            .min(ceiling);
         let deleted_ms = now
+            .max(observed_ms.saturating_add(1))
             .max(row.updated_ms.min(ceiling).saturating_add(1))
             .max(row.incarnation_created_ms.min(ceiling).saturating_add(1))
-            .max(prior.saturating_add(1))
+            .max(prior_project.saturating_add(1))
+            .max(prior_incarnation.saturating_add(1))
             .min(ceiling);
-        tombstones.insert(expected, deleted_ms);
-        Ok(row)
+        self.tombstones
+            .write()
+            .insert(project.to_string(), deleted_ms);
+        self.incarnation_tombstones
+            .write()
+            .entry(project.to_string())
+            .or_default()
+            .insert(expected, deleted_ms);
+        drop(map);
+        Self::remove_relational(project, deleted_ms);
+        Ok((row, deleted_ms))
+    }
+
+    pub fn remove_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+    ) -> Result<ProjectSettings, ProjectIncarnationError> {
+        self.begin_delete_exact(project, expected, 0)
+            .map(|(row, _)| row)
     }
 
     pub fn apply_delete_exact(
@@ -912,6 +1270,9 @@ impl ProjectStore {
         let ceiling = project_time_ceiling(now);
         let deleted_ms = deleted_ms.min(ceiling);
         let mut map = self.map.write();
+        let remove_relational = map
+            .get(project)
+            .is_none_or(|row| row.incarnation == Some(expected));
         let removed = if map
             .get(project)
             .is_some_and(|row| row.incarnation == Some(expected))
@@ -920,14 +1281,27 @@ impl ProjectStore {
         } else {
             None
         };
-        let mut all_tombstones = self.incarnation_tombstones.write();
-        let current = all_tombstones
+        let mut project_tombstones = self.tombstones.write();
+        let current = project_tombstones
+            .entry(project.to_string())
+            .or_insert(deleted_ms);
+        if deleted_ms > *current {
+            *current = deleted_ms;
+        }
+        drop(project_tombstones);
+        let mut incarnation_tombstones = self.incarnation_tombstones.write();
+        let current = incarnation_tombstones
             .entry(project.to_string())
             .or_default()
             .entry(expected)
             .or_insert(deleted_ms);
         if deleted_ms > *current {
             *current = deleted_ms;
+        }
+        drop(incarnation_tombstones);
+        drop(map);
+        if remove_relational {
+            Self::remove_relational(project, deleted_ms);
         }
         removed
     }
@@ -1322,7 +1696,17 @@ impl ProjectStore {
         expected: fluid_core::ProjectIncarnation,
         team: &str,
     ) -> Result<(), ProjectIncarnationError> {
-        self.mutate_exact(project, expected, |row| row.team = team.to_string())
+        let (root_dir, updated_ms) = self.mutate_exact(project, expected, |row| {
+            row.team = team.to_string();
+            (row.build.root_dir.clone(), row.updated_ms)
+        })?;
+        let (project, team) = (project.to_string(), team.to_string());
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                crate::relational::set_project_team(&project, &team, &root_dir, updated_ms).await
+            });
+        }
+        Ok(())
     }
 
     /// Persist the monorepo subdirectory so redeploys keep building it.
@@ -1499,46 +1883,107 @@ impl ProjectStore {
             .collect()
     }
 
-    /// Env vars to inject into a function at deploy time (decrypted values).
-    /// Sealed (sensitive) values are opened here; plaintext passes through.
+    /// Runtime-scoped env vars without environment filtering. Kept for callers
+    /// whose environment is genuinely not deployment-specific; build-scoped
+    /// values never escape through this compatibility accessor.
     pub fn env_map(&self, project: &str) -> std::collections::BTreeMap<String, String> {
         self.get(project)
             .env
             .into_iter()
+            .filter(|e| env_scope_matches(&e.scope, EnvExecutionScope::Runtime))
             .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
             .collect()
     }
 
-    /// Env for ONE environment — `"production"` | `"preview"` |
-    /// `"development"`. A var applies when its `target` is `"all"` or matches;
-    /// an empty/unknown target is treated as `"production"` (the field's own
-    /// serde default), so nothing silently widens.
+    /// Env for one deployment environment and one execution phase.
     ///
-    /// `EnvVar::target` and the dashboard's Production/Preview/Development
-    /// selector existed, but every consumer used the unfiltered [`env_map`] —
-    /// so a preview deployment (any non-production branch, any PR) launched
-    /// with the project's PRODUCTION secrets. The isolation the UI promised
-    /// was never enforced anywhere.
+    /// `allow_all_environment=false` is the fork boundary: only variables whose
+    /// environment was explicitly set to `preview` are eligible. An `all` value
+    /// may be convenient for trusted base-repository previews, but it is not an
+    /// explicit grant to code from an unrelated repository.
+    pub fn env_map_for_execution(
+        &self,
+        project: &str,
+        environment: &str,
+        scope: EnvExecutionScope,
+        allow_all_environment: bool,
+    ) -> std::collections::BTreeMap<String, String> {
+        env_map_from_settings(
+            &self.get(project),
+            environment,
+            scope,
+            allow_all_environment,
+        )
+    }
+
+    pub fn env_map_for_execution_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        environment: &str,
+        scope: EnvExecutionScope,
+        allow_all_environment: bool,
+    ) -> Result<std::collections::BTreeMap<String, String>, ProjectIncarnationError> {
+        Ok(env_map_from_settings(
+            &self.get_exact(project, expected)?,
+            environment,
+            scope,
+            allow_all_environment,
+        ))
+    }
+
+    /// Runtime compatibility wrapper. Legacy rows default to runtime-only and
+    /// therefore remain available exactly where they were intended to run.
     pub fn env_map_for(
         &self,
         project: &str,
         environment: &str,
     ) -> std::collections::BTreeMap<String, String> {
-        let want = environment.trim().to_ascii_lowercase();
-        self.get(project)
-            .env
-            .into_iter()
-            .filter(|e| {
-                let t = e.target.trim().to_ascii_lowercase();
-                t == "all" || t == want || (t.is_empty() && want == "production")
-            })
-            .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
-            .collect()
+        self.env_map_for_execution(project, environment, EnvExecutionScope::Runtime, true)
+    }
+}
+
+pub(crate) fn env_map_from_settings(
+    settings: &ProjectSettings,
+    environment: &str,
+    scope: EnvExecutionScope,
+    allow_all_environment: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let want = environment.trim().to_ascii_lowercase();
+    settings
+        .env
+        .iter()
+        .filter(|entry| {
+            let target = entry.target.trim().to_ascii_lowercase();
+            let environment_matches = target == want
+                || (allow_all_environment && target == "all")
+                || (target.is_empty() && want == "production");
+            environment_matches && env_scope_matches(&entry.scope, scope)
+        })
+        .map(|entry| (entry.key.clone(), crate::secrets::decrypt(&entry.value)))
+        .collect()
+}
+
+fn env_scope_matches(raw: &str, want: EnvExecutionScope) -> bool {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "all" => true,
+        "build" => want == EnvExecutionScope::Build,
+        // Empty/unknown values fail toward runtime-only. Empty is the legacy
+        // representation; unknown values must never become an accidental build
+        // grant because a client typoed a new scope.
+        "runtime" | "" => want == EnvExecutionScope::Runtime,
+        _ => want == EnvExecutionScope::Runtime,
     }
 }
 
 fn upsert_env(row: &mut ProjectSettings, mut value: EnvVar) {
     value.updated_ms = now_ms();
+    value.scope = match value.scope.trim().to_ascii_lowercase().as_str() {
+        "build" => "build",
+        "all" => "all",
+        _ => "runtime",
+    }
+    .to_string();
     if !value.sensitive && looks_like_secret(&value.value) {
         value.sensitive = true;
     }
@@ -1610,6 +2055,7 @@ mod tests {
             key: key.into(),
             value: value.into(),
             target: "all".into(),
+            scope: "runtime".into(),
             sensitive,
             updated_ms: 0,
         }

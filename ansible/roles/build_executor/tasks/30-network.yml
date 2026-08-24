@@ -1,0 +1,144 @@
+---
+- name: Validate subnet, route collisions, DNS, fleet IPs, and policy identity
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import hashlib, ipaddress, json, subprocess, sys
+
+        subnet_text, gateway_text, network_name, bridge_name, fleet_raw, dns_raw, private_raw, protocol, revision, podman = sys.argv[1:]
+        wanted = ipaddress.ip_network(subnet_text, strict=True)
+        if wanted.version != 4 or not (16 <= wanted.prefixlen <= 28):
+            raise SystemExit("executor subnet must be canonical IPv4 /16 through /28")
+        private_ranges = tuple(ipaddress.ip_network(x) for x in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        if not any(wanted.subnet_of(parent) for parent in private_ranges):
+            raise SystemExit("executor subnet must be RFC1918")
+        gateway = ipaddress.ip_address(gateway_text)
+        if gateway.version != 4 or gateway not in wanted or gateway in (wanted.network_address, wanted.broadcast_address):
+            raise SystemExit("executor gateway must be a usable address inside the subnet")
+
+        def exact_global_list(raw, label):
+            values = json.loads(raw)
+            if not isinstance(values, list) or not values:
+                raise SystemExit(f"{label} must be a non-empty list")
+            parsed = []
+            for value in values:
+                if not isinstance(value, str):
+                    raise SystemExit(f"{label} entries must be strings")
+                address = ipaddress.ip_address(value)
+                if address.version != 4 or not address.is_global:
+                    raise SystemExit(f"{label} entry is not exact globally-routable IPv4: {value}")
+                parsed.append(str(address))
+            if len(set(parsed)) != len(parsed):
+                raise SystemExit(f"{label} contains duplicates")
+            return sorted(parsed, key=lambda value: int(ipaddress.ip_address(value)))
+
+        fleet = exact_global_list(fleet_raw, "fleet public IPv4 set")
+        dns = exact_global_list(dns_raw, "DNS upstream IPv4 set")
+        policy_material = json.dumps({
+            "bridge": bridge_name,
+            "dns": dns,
+            "fleet": fleet,
+            "gateway": str(gateway),
+            "network": network_name,
+            "protocol": protocol,
+            "revision": revision,
+            "subnet": str(wanted),
+        }, sort_keys=True, separators=(",", ":")).encode()
+        policy_id = "sha256:" + hashlib.sha256(policy_material).hexdigest()
+
+        network_list = json.loads(subprocess.check_output([podman, "network", "ls", "--format", "json"], text=True))
+        network_names = [row.get("Name") or row.get("name") for row in network_list]
+        network_names = [name for name in network_names if name]
+        inspected = []
+        if network_names:
+            inspected = json.loads(subprocess.check_output([podman, "network", "inspect", *network_names], text=True))
+        existing = next((row for row in inspected if row.get("name") == network_name), None)
+        if existing:
+            subnets = existing.get("subnets") or []
+            labels = existing.get("labels") or {}
+            exact = (
+                existing.get("driver") == "bridge"
+                and existing.get("network_interface") == bridge_name
+                and existing.get("ipv6_enabled") is False
+                and existing.get("internal") is False
+                and existing.get("dns_enabled") is True
+                and sorted(existing.get("network_dns_servers") or [], key=lambda value: int(ipaddress.ip_address(value))) == dns
+                and labels.get("io.hive.build-executor.policy-id") == policy_id
+                and len(subnets) == 1
+                and subnets[0].get("subnet") == str(wanted)
+                and subnets[0].get("gateway") == str(gateway)
+            )
+            if not exact:
+                raise SystemExit(f"existing Podman network {network_name} differs from the requested fail-closed definition")
+        else:
+            link = subprocess.run(["/usr/sbin/ip", "link", "show", "dev", bridge_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if link.returncode == 0:
+                raise SystemExit(f"bridge name {bridge_name} already exists outside the requested Podman network")
+
+        for network in inspected:
+            if network.get("name") == network_name:
+                continue
+            for item in network.get("subnets") or []:
+                other = ipaddress.ip_network(item["subnet"], strict=False)
+                if other.version == 4 and other.overlaps(wanted):
+                    raise SystemExit(f"executor subnet overlaps Podman network {network.get('name')}: {other}")
+
+        routes = json.loads(subprocess.check_output(["/usr/sbin/ip", "-j", "-4", "route", "show", "table", "all"], text=True))
+        for route in routes:
+            destination = route.get("dst")
+            if not destination or destination == "default":
+                continue
+            try:
+                other = ipaddress.ip_network(destination, strict=False)
+            except ValueError:
+                continue
+            if not other.overlaps(wanted):
+                continue
+            if existing and route.get("dev") == bridge_name and (other == wanted or other.subnet_of(wanted)):
+                continue
+            raise SystemExit(f"executor subnet overlaps host route {other} via {route.get('dev', '?')}")
+
+        address_rows = json.loads(subprocess.check_output(["/usr/sbin/ip", "-j", "-4", "address", "show"], text=True))
+        assigned = []
+        for row in address_rows:
+            for info in row.get("addr_info") or []:
+                if info.get("family") == "inet":
+                    assigned.append(ipaddress.ip_address(info["local"]))
+        if private_raw:
+            private_probe = ipaddress.ip_address(private_raw)
+            if private_probe not in assigned or not any(private_probe in parent for parent in private_ranges):
+                raise SystemExit("configured private probe address is not an assigned RFC1918 host address")
+        else:
+            private_probe = next((address for address in assigned if address not in wanted and any(address in parent for parent in private_ranges)), None)
+            if private_probe is None:
+                raise SystemExit("no assigned RFC1918 host address exists; configure build_executor_probe_private_ipv4")
+
+        print(json.dumps({
+            "dns_ipv4": dns,
+            "fleet_ipv4": fleet,
+            "network_exists": existing is not None,
+            "policy_id": policy_id,
+            "private_probe_ipv4": str(private_probe),
+        }, separators=(",", ":")))
+      - "{{ build_executor_network_subnet }}"
+      - "{{ build_executor_network_gateway }}"
+      - "{{ build_executor_network_name }}"
+      - "{{ build_executor_network_bridge }}"
+      - "{{ build_executor_fleet_public_ipv4 | to_json }}"
+      - "{{ build_executor_dns_upstream_ipv4 | to_json }}"
+      - "{{ build_executor_probe_private_ipv4 }}"
+      - "{{ build_executor_protocol }}"
+      - "{{ build_executor_policy_revision }}"
+      - "{{ build_executor_podman_path }}"
+  register: _build_executor_network_preflight_raw
+  changed_when: false
+
+- name: Decode validated network and policy facts
+  ansible.builtin.set_fact:
+    _build_executor_network_preflight: "{{ _build_executor_network_preflight_raw.stdout | from_json }}"
+    build_executor_dns_upstream_ipv4_sorted: "{{ (_build_executor_network_preflight_raw.stdout | from_json).dns_ipv4 }}"
+    build_executor_fleet_public_ipv4_sorted: "{{ (_build_executor_network_preflight_raw.stdout | from_json).fleet_ipv4 }}"
+    build_executor_policy_id: "{{ (_build_executor_network_preflight_raw.stdout | from_json).policy_id }}"
+    build_executor_probe_host_private_ipv4: "{{ (_build_executor_network_preflight_raw.stdout | from_json).private_probe_ipv4 }}"

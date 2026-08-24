@@ -21,18 +21,189 @@ pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
 pub use framework::{
-    detect, detect_package_manager, package_manager, plan_build, BuildPlan, FrameworkPreset,
-    PackageManagerDetection, PackageManagerSource, Primitive, PRESETS,
+    detect, detect_checked, detect_package_manager, detect_package_manager_checked,
+    package_manager, plan_build, plan_build_checked_with_package_manager,
+    plan_build_with_package_manager, preset_by_name, BuildPlan, FrameworkPreset,
+    PackageManagerDeclaration, PackageManagerDetection, PackageManagerLockfile,
+    PackageManagerSource, Primitive, PRESETS,
 };
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
 pub use vercel_config::{
-    load_vercel_config, ConditionValue, VercelCondition, VercelConfig, VercelCron, VercelFunction,
-    VercelHeader, VercelHeaderRule, VercelImages, VercelRedirect, VercelRewrite,
+    load_vercel_config, load_vercel_config_checked, ConditionValue, VercelCondition, VercelConfig,
+    VercelCron, VercelFunction, VercelHeader, VercelHeaderRule, VercelImages, VercelRedirect,
+    VercelRewrite,
 };
 
 use serde::Serialize;
+use std::fmt;
 use std::path::Path;
+
+pub const BUILD_CONTRACT_INVALID_METADATA: &str = "BUILD_CONTRACT_INVALID_METADATA";
+pub const BUILD_CONTRACT_INVALID_FRAMEWORK: &str = "BUILD_CONTRACT_INVALID_FRAMEWORK";
+pub const BUILD_CONTRACT_INVALID_OUTPUT_DIRECTORY: &str = "BUILD_CONTRACT_INVALID_OUTPUT_DIRECTORY";
+pub const BUILD_CONTRACT_INVALID_BUILD_OUTPUT: &str = "BUILD_CONTRACT_INVALID_BUILD_OUTPUT";
+pub const BUILD_CONTRACT_UNSUPPORTED_BUILD_OUTPUT: &str = "BUILD_CONTRACT_UNSUPPORTED_BUILD_OUTPUT";
+pub const BUILD_CONTRACT_INVALID_FORWARDED_SETTINGS: &str =
+    "BUILD_CONTRACT_INVALID_FORWARDED_SETTINGS";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildContractErrorCode {
+    InvalidMetadata,
+    InvalidFramework,
+    InvalidOutputDirectory,
+    InvalidBuildOutput,
+    UnsupportedBuildOutput,
+    InvalidForwardedSettings,
+}
+
+impl BuildContractErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidMetadata => BUILD_CONTRACT_INVALID_METADATA,
+            Self::InvalidFramework => BUILD_CONTRACT_INVALID_FRAMEWORK,
+            Self::InvalidOutputDirectory => BUILD_CONTRACT_INVALID_OUTPUT_DIRECTORY,
+            Self::InvalidBuildOutput => BUILD_CONTRACT_INVALID_BUILD_OUTPUT,
+            Self::UnsupportedBuildOutput => BUILD_CONTRACT_UNSUPPORTED_BUILD_OUTPUT,
+            Self::InvalidForwardedSettings => BUILD_CONTRACT_INVALID_FORWARDED_SETTINGS,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BuildContractError {
+    pub code: BuildContractErrorCode,
+    pub operation: &'static str,
+    detail: String,
+}
+
+impl BuildContractError {
+    pub fn new(
+        code: BuildContractErrorCode,
+        operation: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn invalid_metadata(operation: &'static str, detail: impl fmt::Display) -> Self {
+        Self::new(
+            BuildContractErrorCode::InvalidMetadata,
+            operation,
+            detail.to_string(),
+        )
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for BuildContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: {}: {}",
+            self.code.as_str(),
+            self.operation,
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for BuildContractError {}
+
+/// A normalized output directory relative to the selected application. This is
+/// the only output-path form accepted by checked build planning.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct OutputDirectory(String);
+
+impl OutputDirectory {
+    pub const MAX_BYTES: usize = 4096;
+
+    pub fn root() -> Self {
+        Self(".".to_string())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, BuildContractError> {
+        if value.len() > Self::MAX_BYTES || value.chars().any(char::is_control) {
+            return Err(BuildContractError::new(
+                BuildContractErrorCode::InvalidOutputDirectory,
+                "normalize outputDirectory",
+                format!(
+                    "outputDirectory must be at most {} bytes and contain no control characters",
+                    Self::MAX_BYTES
+                ),
+            ));
+        }
+        let value = value.trim().replace('\\', "/");
+        let windows_absolute = value.as_bytes().get(1) == Some(&b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic);
+        if value.starts_with('/') || windows_absolute {
+            return Err(BuildContractError::new(
+                BuildContractErrorCode::InvalidOutputDirectory,
+                "normalize outputDirectory",
+                format!("outputDirectory {value:?} must be checkout-relative"),
+            ));
+        }
+        let mut components = Vec::new();
+        for component in value.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    return Err(BuildContractError::new(
+                        BuildContractErrorCode::InvalidOutputDirectory,
+                        "normalize outputDirectory",
+                        format!("outputDirectory {value:?} may not traverse above the checkout"),
+                    ));
+                }
+                component => components.push(component),
+            }
+        }
+        let normalized = if components.is_empty() {
+            ".".to_string()
+        } else {
+            components.join("/")
+        };
+        if normalized.len() > Self::MAX_BYTES {
+            return Err(BuildContractError::new(
+                BuildContractErrorCode::InvalidOutputDirectory,
+                "normalize outputDirectory",
+                format!(
+                    "normalized outputDirectory exceeds the {}-byte limit",
+                    Self::MAX_BYTES
+                ),
+            ));
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OutputDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckedBuildResolution {
+    pub plan: BuildPlan,
+    /// Present when the selected application already carries Build Output API v3.
+    pub build_output: Option<BuildOutput>,
+}
 
 /// A read-only analysis of a repo — what the dashboard shows on the "Configure
 /// Project" screen before a build runs.
@@ -44,6 +215,8 @@ pub struct Analysis {
     /// Whether the repo already ships a Build Output (`.vercel/output`).
     pub has_build_output: bool,
     pub package_manager: String,
+    pub package_manager_declaration: Option<PackageManagerDeclaration>,
+    pub package_manager_error: Option<String>,
     pub install_command: String,
     pub build_command: String,
     pub output_dir: String,
@@ -58,9 +231,11 @@ pub fn analyze(repo: &Path) -> Analysis {
         primitive: plan.framework.primitive,
         has_build_output: has_build_output(repo),
         package_manager: plan.package_manager,
+        package_manager_declaration: plan.package_manager_declaration,
+        package_manager_error: plan.package_manager_error,
         install_command: plan.install_command,
         build_command: plan.build_command,
-        output_dir: plan.output_dir,
+        output_dir: plan.output_dir.as_str().to_string(),
     }
 }
 
@@ -76,13 +251,78 @@ pub enum Resolution {
     NeedsBuild(BuildPlan),
 }
 
+pub fn resolve_build_output_checked(
+    repo: &Path,
+) -> Result<Option<BuildOutput>, BuildContractError> {
+    let root = repo.join(".vercel/output");
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BuildContractError::new(
+                BuildContractErrorCode::InvalidBuildOutput,
+                "inspect Build Output API v3",
+                error.to_string(),
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(BuildContractError::new(
+            BuildContractErrorCode::InvalidBuildOutput,
+            "inspect Build Output API v3",
+            ".vercel/output must be a real directory",
+        ));
+    }
+    let output = parse_build_output(repo).map_err(|error| {
+        BuildContractError::new(
+            BuildContractErrorCode::InvalidBuildOutput,
+            "parse Build Output API v3",
+            error.to_string(),
+        )
+    })?;
+    if output.config.version != BUILD_OUTPUT_VERSION {
+        return Err(BuildContractError::new(
+            BuildContractErrorCode::InvalidBuildOutput,
+            "parse Build Output API v3",
+            format!(
+                "config.json declares version {}; only version {} is supported",
+                output.config.version, BUILD_OUTPUT_VERSION
+            ),
+        ));
+    }
+    Ok(Some(output))
+}
+
+/// Resolve build planning and any checked-in Build Output through one fail-closed
+/// entry point. `package_manager` is the already-validated install/workspace-root
+/// snapshot; framework detection and outputDirectory remain selected-app local.
+pub fn resolve_build_checked(
+    repo: &Path,
+    package_manager: &PackageManagerDetection,
+    framework_override: Option<&str>,
+    install_override: Option<&str>,
+    build_override: Option<&str>,
+    output_override: Option<&str>,
+) -> Result<CheckedBuildResolution, BuildContractError> {
+    let plan = plan_build_checked_with_package_manager(
+        repo,
+        package_manager,
+        framework_override,
+        install_override,
+        build_override,
+        output_override,
+    )?;
+    let build_output = resolve_build_output_checked(repo)?;
+    Ok(CheckedBuildResolution { plan, build_output })
+}
+
 pub fn resolve(repo: &Path) -> anyhow::Result<Resolution> {
-    if has_build_output(repo) {
-        Ok(Resolution::Ready(parse_build_output(repo)?))
-    } else {
-        Ok(Resolution::NeedsBuild(plan_build(
-            repo, None, None, None, None,
-        )))
+    let package_manager = detect_package_manager_checked(repo)
+        .map_err(|error| BuildContractError::invalid_metadata("resolve package metadata", error))?;
+    let resolution = resolve_build_checked(repo, &package_manager, None, None, None, None)?;
+    match resolution.build_output {
+        Some(output) => Ok(Resolution::Ready(output)),
+        None => Ok(Resolution::NeedsBuild(resolution.plan)),
     }
 }
 

@@ -18,6 +18,7 @@ pub mod firecracker;
 pub mod litebox;
 pub mod litebox_macos;
 pub mod mock;
+pub mod runtime_artifact;
 pub mod snapshot;
 
 use async_trait::async_trait;
@@ -27,6 +28,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 pub use hive_core::FunctionLaunch;
+pub use runtime_artifact::{
+    RuntimeArtifactPaths, RuntimeArtifactSpec, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+};
 
 /// Sink the backend writes build output to. The box daemon fans this out to
 /// any number of log subscribers.
@@ -1737,6 +1741,24 @@ pub trait CellBackend: Send + Sync {
     /// pools — for the real backend it boots a microVM and loads the image.
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle>;
 
+    /// Provision while binding an isolated runtime to the caller-authorized
+    /// delivery identity. Backends that attach runtime artifacts override this
+    /// and reject an H1 -> H2 change before guest code can execute. The default
+    /// accepts only the explicit same-host/container `None` shape.
+    async fn provision_runtime(
+        &self,
+        spec: &CellSpec,
+        expected: Option<&hive_core::RuntimeArtifactIdentity>,
+    ) -> anyhow::Result<CellHandle> {
+        anyhow::ensure!(
+            expected.is_none(),
+            "backend {} cannot provision a caller-authorized runtime artifact ({})",
+            self.name(),
+            hive_core::fault::NODE_RUNTIME_MISSING
+        );
+        self.provision(spec).await
+    }
+
     /// Run a build inside an already-provisioned cell, streaming logs to `sink`.
     async fn run_build(
         &self,
@@ -1757,18 +1779,37 @@ pub trait CellBackend: Send + Sync {
     async fn deliver_build(
         &self,
         _image: &str,
-        _build_dir: &std::path::Path,
+        _artifact: &RuntimeArtifactSpec,
     ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// The guest path a delivered build is mounted at inside a cell (so the
-    /// control plane can register the function pool's workdir to match). For
-    /// same-host backends the workdir is the host `build_dir` (returns `None`,
-    /// meaning "use the build dir as-is"); Firecracker mounts it at a fixed
-    /// guest path.
-    fn delivered_workdir(&self) -> Option<&'static str> {
-        None
+    /// Whether this backend attaches an isolated runtime artifact when serving a
+    /// platform deployment. Same-host and container execution return false; an
+    /// isolated backend returns true so cold-start must resolve and carry H1.
+    fn requires_runtime_artifact_authorization(&self) -> bool {
+        false
+    }
+
+    /// Exact identity committed by `deliver_build` for `image`.
+    ///
+    /// Isolated function launches resolve this BEFORE provisioning and carry it
+    /// through `FunctionLaunch`; the backend must compare it with the artifact
+    /// it actually attaches. That closes the H1 -> H2 publication race: a launch
+    /// authorized against H1 can never silently execute a later delivery H2.
+    /// Same-host/container backends return `None` because they attach no runtime
+    /// artifact and therefore have no identity to authorize.
+    async fn runtime_artifact_identity(
+        &self,
+        _image: &str,
+    ) -> anyhow::Result<Option<hive_core::RuntimeArtifactIdentity>> {
+        Ok(None)
+    }
+
+    /// Guest cwd for the application selected by `artifact`. Same-host backends
+    /// return `None` and retain the host build cwd.
+    fn delivered_workdir(&self, _artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     /// Start a long-lived function server inside the cell and return an endpoint
@@ -1992,18 +2033,14 @@ mod apple_container_live_tests {
         )
         .await;
 
-        let (name, _endpoint, task) =
-            result.expect("container must boot successfully via apple container CLI");
-        assert!(name.starts_with("hive-livetest-"));
+        let launch = result.expect("container must boot successfully via apple container CLI");
+        assert!(matches!(launch.endpoint(), CellEndpoint::Tcp(_)));
+        let name = format!("hive-{cell_id}");
 
         // Real teardown: confirm the container is actually gone afterward, not
         // just that the call didn't error.
-        task.abort();
+        launch.terminate().await;
         crate::container_cli::inject_hosts(&name, path_env, &[]).await; // no-op, exercises the empty-entries guard
-        let _ = tokio::process::Command::new("container")
-            .args(crate::container_cli::rm_args(true, &name))
-            .output()
-            .await;
         let still_running = crate::container_cli::is_running(true, &name, path_env).await;
         assert!(!still_running, "container must be removed after teardown");
     }

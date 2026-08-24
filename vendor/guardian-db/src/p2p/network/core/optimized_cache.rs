@@ -244,7 +244,12 @@ impl OptimizedCache {
         let mut freed = 0u64;
         {
             let mut cache = self.compressed_cache.write().await;
-            while self.compressed_bytes.load(Ordering::Relaxed).saturating_sub(freed) > budget {
+            while self
+                .compressed_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(freed)
+                > budget
+            {
                 match cache.pop_lru() {
                     Some((_k, v)) => freed += v.compressed_data.len() as u64,
                     None => break,
@@ -270,7 +275,12 @@ impl OptimizedCache {
         let mut freed = 0u64;
         {
             let mut cache = self.data_cache.write().await;
-            while self.data_bytes.load(Ordering::Relaxed).saturating_sub(freed) > budget {
+            while self
+                .data_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(freed)
+                > budget
+            {
                 match cache.pop_lru() {
                     Some((_k, v)) => freed += v.data.len() as u64,
                     None => break,
@@ -343,7 +353,8 @@ impl OptimizedCache {
                             let mut data_cache = self.data_cache.write().await;
                             let old = data_cache.put(cid.to_string(), cache_entry);
                             if let Some(old) = old {
-                                self.data_bytes.fetch_sub(old.data.len() as u64, Ordering::Relaxed);
+                                self.data_bytes
+                                    .fetch_sub(old.data.len() as u64, Ordering::Relaxed);
                             }
                         }
                         self.data_bytes.fetch_add(promoted_bytes, Ordering::Relaxed);
@@ -417,7 +428,8 @@ impl OptimizedCache {
                                 .fetch_sub(old.compressed_data.len() as u64, Ordering::Relaxed);
                         }
                     }
-                    self.compressed_bytes.fetch_add(new_bytes, Ordering::Relaxed);
+                    self.compressed_bytes
+                        .fetch_add(new_bytes, Ordering::Relaxed);
 
                     // Update statistics.
                     {
@@ -483,7 +495,8 @@ impl OptimizedCache {
             let mut data_cache = self.data_cache.write().await;
             let old = data_cache.put(cid.to_string(), cache_entry);
             if let Some(old) = old {
-                self.data_bytes.fetch_sub(old.data.len() as u64, Ordering::Relaxed);
+                self.data_bytes
+                    .fetch_sub(old.data.len() as u64, Ordering::Relaxed);
             }
         }
         self.data_bytes.fetch_add(new_bytes, Ordering::Relaxed);

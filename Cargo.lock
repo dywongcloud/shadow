@@ -204,6 +204,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1477,6 +1486,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1935,6 +1955,7 @@ dependencies = [
  "hive-backend",
  "hive-core",
  "image",
+ "libc",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",
@@ -2596,6 +2617,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -2612,6 +2634,7 @@ dependencies = [
  "hive-core",
  "libc",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-vsock",
 ]
@@ -2657,6 +2680,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-relay",
  "jsonwebtoken",
+ "libc",
  "openraft",
  "parking_lot",
  "percent-encoding",
@@ -2678,11 +2702,13 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -3323,8 +3349,6 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5be50b0e2d0a9ba65cee4e0dfb708b3704e02ad12bd4c14c6307e94245943126"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -3388,8 +3412,6 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd1bd5e39d0321a3c4a2bcef9650476c076e2df41a0e84577eca23d6de6c8ab"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -8691,10 +8713,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "displaydoc",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "thiserror 2.0.18",
+ "zopfli",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]
 
 [[package]]
 name = "zstd"

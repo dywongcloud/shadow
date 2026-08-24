@@ -123,7 +123,11 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             get(project_delete_capabilities),
         )
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
-        .route("/v1/git/deploy", post(git_deploy))
+        // Versioned receiver for artifact/workdir semantics. New coordinators use
+        // this path so an old node returns 404/NO_HANDLER instead of accepting a
+        // deployment it would launch from the wrong cwd.
+        .route("/v1/runtime-artifact/v1/git/deploy", post(git_deploy))
+        .route("/v1/git/deploy", post(git_deploy_public))
         // Zip upload: raw `.zip` body (default 2 MB axum limit raised to 12 MB; the
         // handler caps the archive at 10 MB and rejects non-zips).
         .route(
@@ -259,6 +263,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             get(database_get).delete(database_delete),
         )
         .route("/v1/databases/:id/credentials", get(database_credentials))
+        .route("/v1/databases/:id/studio-open", post(database_studio_open))
         .route("/v1/databases/:id/rotate", post(database_rotate))
         .route(
             "/v1/projects/:project/databases",
@@ -730,14 +735,18 @@ async fn project_build_put(
     // an explicit override (which would freeze re-detection). Only an actual
     // framework CHANGE through this PUT is an explicit user choice.
     let mut build = build;
-    // framework_auto is SERVER-owned: the dashboard round-trips the whole
-    // serialized BuildConfig, so a client-sent true would survive an explicit
-    // framework CHANGE and let the next build's auto-refresh clobber the
-    // user's choice. Clear it unconditionally, then re-promote only for an
-    // unchanged auto value.
+    // `framework_auto` also marks the command/output tuple written by older
+    // builders as generated. Preserve that provenance only when the dashboard
+    // round-trips the entire tuple unchanged; editing any member turns the
+    // framework + command set into an explicit user configuration.
     build.framework_auto = false;
     if let Some(cur) = c.projects.get_if_set(&project).map(|s| s.build) {
-        if cur.framework_auto && build.framework.trim() == cur.framework.trim() {
+        if cur.framework_auto
+            && build.framework.trim() == cur.framework.trim()
+            && build.install_command.trim() == cur.install_command.trim()
+            && build.build_command.trim() == cur.build_command.trim()
+            && build.output_dir.trim() == cur.output_dir.trim()
+        {
             build.framework_auto = true;
         }
     }
@@ -1461,6 +1470,7 @@ pub(crate) async fn domain_activate_local(
             "project": project,
             "attached": false,
             "status": "pending",
+            "reason": "no_local_deployment",
             "probe": "verified, but the project has no production deployment on this node yet",
         });
     }
@@ -1481,6 +1491,7 @@ pub(crate) async fn domain_activate_local(
             "project": project,
             "attached": false,
             "status": "pending",
+            "reason": "no_local_deployment",
             "probe": "TXT matched, but the project has no deployment on this node yet",
         });
     }
@@ -1526,6 +1537,7 @@ async fn domain_activate(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((project, domain)): Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     // The domain being activated must be the caller's AND the stored
@@ -1544,7 +1556,46 @@ async fn domain_activate(
             format!("no verification challenge links '{domain}' to project '{project}'"),
         ));
     }
-    Ok(Json(domain_activate_local(&c, &project, &domain).await))
+    let team = verify_project_team(&c, &project);
+    let local = domain_activate_local(&c, &project, &domain).await;
+    // Round-robin rule (AGENTS.md): this arm answers on WHATEVER node the
+    // api host's DNS picked, but the alias applies only where the project
+    // is hosted. A local no-deployment park on a non-host node is not an
+    // answer — the gossiped fleet view knows the real host, so forward
+    // there (the same owner-proxy `activate_domain_alias` already does for
+    // the attach flow). Witnessed live: numo.gg parked "pending" on
+    // fc-sanjose-2 while fc-sanjose-gpu-3 verified the identical call.
+    let parked_no_deployment = local.get("attached").and_then(|a| a.as_bool()) == Some(false)
+        && local.get("reason").and_then(|r| r.as_str()) == Some("no_local_deployment");
+    // `?local=true` is the no-re-forward guard (the `fetch_artifact_from_host`
+    // precedent): a forwarded activate answers locally, honestly, even if its
+    // own gossip view is stale — two nodes with mutually-stale views must
+    // never bounce a request between each other forever.
+    if parked_no_deployment && q.get("local").map(|s| s.as_str()) != Some("true") {
+        if let Some(node) = host_node_for_project(&c, &project) {
+            if node != c.node_name {
+                let body = json!({ "project": project });
+                if let Some(v) = post_to_host_json(
+                    &c,
+                    &node,
+                    &format!("/v1/projects/{project}/domains/{domain}/activate?local=true"),
+                    &team,
+                    &body,
+                )
+                .await
+                {
+                    if v.get("status").and_then(|s| s.as_str()) == Some("verified") {
+                        mark_domain_verified(&c, &domain, &project);
+                        crate::persist::persist(&c);
+                        let kick = c.clone();
+                        tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+                    }
+                    return Ok(Json(v));
+                }
+            }
+        }
+    }
+    Ok(Json(local))
 }
 
 /// `POST /v1/domains/:domain/verify` — synchronous re-check for the UI's
@@ -1668,14 +1719,6 @@ async fn project_domain_detach(
         ));
     }
     c.projects.remove_domain(&project, &domain);
-    // Clear verification only when THIS project's attach holds it — the live
-    // verified attach may belong to a different project of the same tenant.
-    if c.domains
-        .verify_of(&domain)
-        .is_some_and(|v| v.project == project)
-    {
-        c.domains.clear_verify(&domain);
-    }
     // Detach is a revocation: it must reach EVERY node hosting the project,
     // not the first registry entry (adversarial finding: fanout/static
     // projects kept serving on the other hosts while the UI said
@@ -1697,6 +1740,15 @@ async fn project_domain_detach(
         c.gw.remove_alias(&domain);
     }
     if !still_attached {
+        // Full detach revokes both proof and the certificate claim atomically
+        // with the project-side removal. A second live attachment keeps both:
+        // cert-sync still wants and serves the same domain bundle for it.
+        if c.domains
+            .verify_of(&domain)
+            .is_some_and(|v| v.project == project)
+        {
+            c.domains.clear_verify(&domain);
+        }
         // A fully-detached domain's zone stops claiming the platform edge —
         // the pinned system records (apex A/AAAA + www CNAME) would
         // otherwise keep resolving to the fleet forever, serving 404s on a
@@ -1775,6 +1827,12 @@ async fn domain_detach_owner(
         c.gw.remove_alias(&domain);
     }
     if !still_attached {
+        if c.domains
+            .verify_of(&domain)
+            .is_some_and(|v| v.project == project)
+        {
+            c.domains.clear_verify(&domain);
+        }
         c.domains
             .set_system_address_records(&domain, vec![], vec![]);
     }
@@ -2737,6 +2795,10 @@ async fn domain_renew_ssl(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
+    // Kick the REAL issuance pass (leader-gated internally); renew_ssl only
+    // reads the current block now — it must never fabricate an issued state.
+    let kick = c.clone();
+    tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
     let cert = c.domains.renew_ssl(&domain);
     c.audit.record(
         &t,
@@ -2744,9 +2806,8 @@ async fn domain_renew_ssl(
         "update",
         "ssl_cert",
         &domain,
-        "reissued free certificate",
+        "requested certificate reissue",
     );
-    crate::persist::persist(&c);
     Ok(Json(json!(cert)))
 }
 
@@ -2787,14 +2848,62 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     format!("{base}-{}", now_ms())
 }
 
+fn mesh_deploy_authority(claims: Option<&crate::auth::Claims>) -> bool {
+    claims.is_some_and(|claims| claims.sub == "mesh-internal" && claims.role == "service")
+}
+
 pub(crate) async fn git_deploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-    Json(req): Json<fluid_core::GitDeployRequest>,
+    Json(mut req): Json<fluid_core::GitDeployRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    start_named_deploy(&c, &t, req).await
+    let claims = claims.as_ref().map(|extension| &extension.0);
+    if !mesh_deploy_authority(claims) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "authenticated mesh-internal service authority required".into(),
+        ));
+    }
+    let expected = req.project_incarnation.take().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "internal deploy is missing its server-issued project incarnation".into(),
+        )
+    })?;
+    req.no_fanout = true;
+    let t = tenant(&c, &headers, claims);
+    start_named_deploy(&c, &t, req, Some(expected)).await
+}
+
+async fn git_deploy_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(mut req): Json<fluid_core::GitDeployRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let claims = claims.as_ref().map(|extension| &extension.0);
+    // Rolling compatibility: an older coordinator can still send its signed
+    // internal request to the legacy path. Its service claim, not the path or a
+    // caller-controlled request flag, is the authority boundary.
+    if mesh_deploy_authority(claims) {
+        let expected = req.project_incarnation.take().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "internal deploy is missing its server-issued project incarnation".into(),
+            )
+        })?;
+        req.no_fanout = true;
+        let t = tenant(&c, &headers, claims);
+        return start_named_deploy(&c, &t, req, Some(expected)).await;
+    }
+
+    // These fields are internal orchestration data, never public authority.
+    req.project_incarnation = None;
+    req.no_fanout = false;
+    req.fanout_secondary = false;
+    let t = tenant(&c, &headers, claims);
+    start_named_deploy(&c, &t, req, None).await
 }
 
 /// Shared deploy entry: assign the project to the tenant (unique name, conflict
@@ -2805,6 +2914,7 @@ pub(crate) async fn start_named_deploy(
     c: &Arc<CloudState>,
     t: &str,
     mut req: fluid_core::GitDeployRequest,
+    expected_incarnation: Option<fluid_core::ProjectIncarnation>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // Assign the (new) project to the requesting tenant so it shows under their
     // team only — with a globally-unique name (auto-generated when none given).
@@ -2824,8 +2934,16 @@ pub(crate) async fn start_named_deploy(
             .find_key_ci(requested.trim())
             .map(|k| norm(&c.projects.team_of(&k)) == t)
             .unwrap_or(false);
+    if req.redeploy && expected_incarnation.is_none() && !redeploy_existing {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "the project no longer exists; start a new deployment instead of redeploying it".into(),
+        ));
+    }
     let project = if (req.no_fanout || redeploy_existing) && !requested.trim().is_empty() {
-        requested.trim().to_string()
+        c.projects
+            .find_key_ci(requested.trim())
+            .unwrap_or_else(|| requested.trim().to_string())
     } else {
         unique_project_name(c, &requested, &req.repo_url, &t)
     };
@@ -2903,37 +3021,40 @@ pub(crate) async fn start_named_deploy(
         }
     }
     // Ownership check: a project already owned by a DIFFERENT tenant must never be
-    // silently reassigned here, regardless of no_fanout/redeploy_existing — closes
-    // the no_fanout cross-tenant hijack (naming an existing victim project with
-    // no_fanout=true used to skip straight to set_team below with no check at all).
-    if let Some(existing_key) = c.projects.find_key_ci(&project) {
-        if norm(&c.projects.team_of(&existing_key)) != t {
+    // silently reassigned here. Capture or upgrade the server-issued incarnation
+    // while holding the lifecycle writer; deletion after this point tombstones
+    // that exact identity, so build admission fails instead of recreating it.
+    let existing_key = c.projects.find_key_ci(&project);
+    if let Some(existing_key) = existing_key.as_deref() {
+        if norm(&c.projects.team_of(existing_key)) != t {
             return Err((
                 StatusCode::FORBIDDEN,
                 "project belongs to a different team".into(),
             ));
         }
     }
+    let admitted_incarnation = match expected_incarnation {
+        Some(expected) => Some(expected),
+        None => match existing_key {
+            Some(existing_key) => {
+                let _lifecycle = crate::project_settings::lifecycle_write(&existing_key).await;
+                let incarnation = match c.projects.active_incarnation(&existing_key) {
+                    Ok(incarnation) => incarnation,
+                    Err(crate::project_settings::ProjectIncarnationError::Legacy) => c
+                        .projects
+                        .ensure_incarnation(&existing_key)
+                        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+                    Err(error) => return Err((StatusCode::CONFLICT, error.to_string())),
+                };
+                Some(incarnation)
+            }
+            None => None,
+        },
+    };
     req.project = Some(project.clone());
-    c.projects.set_team(&project, &t);
-    // Persist the subdirectory so future redeploys keep building it.
-    if let Some(root) = req
-        .root_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        c.projects.set_root_dir(&project, root);
-    }
-    crate::persist::persist(c);
-    // Keep the git-webhook reverse index in sync with this project's connected
-    // repo — covers git-import at project creation AND any future explicit
-    // connect/reconnect that routes through this shared deploy entry (a no-op
-    // for zip/image sources, which can never receive a GitHub webhook anyway).
-    // See `gitops::GitRepoIndex::set_project_repo`.
-    c.git_index.set_project_repo(&project, &req.repo_url);
-    // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
-    let build_id = crate::git::start_build(c.clone(), req);
+    let build_id = crate::git::start_build(c.clone(), req, admitted_incarnation, Some(t.clone()))
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     Ok(Json(json!({ "build_id": build_id, "project": project })))
 }
 
@@ -2998,6 +3119,7 @@ pub(crate) async fn deploy_zip(
     let filename = meta.filename.unwrap_or_else(|| "archive.zip".into());
     let redeploy = meta.redeploy.unwrap_or(false);
     let req = fluid_core::GitDeployRequest {
+        source_deployment_ids: Vec::new(),
         repo_url: format!("upload://{filename}"),
         branch: None,
         commit: None,        // zip upload: no git history, nothing to pin to
@@ -3025,7 +3147,7 @@ pub(crate) async fn deploy_zip(
         image_ports: None,
         git_token: None, // zip upload has no git clone
     };
-    start_named_deploy(&c, &t, req).await
+    start_named_deploy(&c, &t, req, None).await
 }
 
 #[derive(serde::Deserialize)]
@@ -3097,6 +3219,7 @@ pub(crate) async fn deploy_image(
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let req = fluid_core::GitDeployRequest {
+        source_deployment_ids: Vec::new(),
         // A synthetic source URL so the deployment record reads sensibly; the actual
         // source is `image_ref` (no clone happens).
         repo_url: format!("image://{image}"),
@@ -3126,7 +3249,7 @@ pub(crate) async fn deploy_image(
         image_ports: body.ports,
         git_token: None, // prebuilt image deploy has no git clone
     };
-    start_named_deploy(&c, &t, req).await
+    start_named_deploy(&c, &t, req, None).await
 }
 
 pub(crate) async fn build_get(
@@ -3410,7 +3533,7 @@ async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Respo
             if let Some(secret) = crate::git::artifact_secret() {
                 headers.push((
                     crate::git::ARTIFACT_SIG_HEADER.to_string(),
-                    crate::git::artifact_sig(&secret, &bytes),
+                    crate::git::cache_artifact_sig(&secret, &key, &bytes),
                 ));
             }
             let mut resp = bytes.into_response();
@@ -3941,6 +4064,65 @@ async fn dep_create(
     // the record is registered/persisted. No-op for HTTP-only manifests.
     let mut manifest = req.manifest;
     let project = manifest.project.clone();
+    // Same per-project lifecycle writer gate `run_build`'s finalization
+    // section holds (`project_settings::lifecycle_write`) — this is also a
+    // "final production/preview deployment-registration path", and without
+    // this it could interleave with a concurrent `delete_project_local`
+    // exactly like the git-build race the gate exists to close. Held for the
+    // rest of this handler so registration below cannot straddle a delete's
+    // tombstone application.
+    let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
+    // `DeployRequest.project_incarnation` is rollout metadata exposed on a
+    // public schema, never authority. Resolve or mint the identity exclusively
+    // from the server-owned ProjectStore while the lifecycle writer is held.
+    let row = c.projects.get_if_set(&project);
+    let seen_deployment =
+        c.gw.list()
+            .iter()
+            .any(|deployment| deployment.project == project)
+            || c.peer_deployments
+                .read()
+                .values()
+                .flatten()
+                .any(|deployment| deployment.project == project);
+    if row.is_some() || seen_deployment {
+        if !project_owned_by(&c, &project, &t) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "project belongs to a different team".into(),
+            ));
+        }
+        if row.is_none() {
+            return Err((
+                StatusCode::CONFLICT,
+                "project incarnation authority is still converging; retry the deployment".into(),
+            ));
+        }
+    }
+    let legacy_ids = row
+        .as_ref()
+        .is_some_and(|settings| settings.incarnation.is_none())
+        .then(|| legacy_deployment_ids_for_owner(&c, &project, &t))
+        .unwrap_or_default();
+    let incarnation = match c.projects.active_incarnation(&project) {
+        Ok(incarnation) => incarnation,
+        Err(crate::project_settings::ProjectIncarnationError::Legacy) => c
+            .projects
+            .ensure_incarnation(&project)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+        Err(crate::project_settings::ProjectIncarnationError::Missing) => c
+            .projects
+            .create(&project)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+        Err(error) => return Err((StatusCode::CONFLICT, error.to_string())),
+    };
+    c.projects
+        .set_team_exact(&project, incarnation, &t)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if !legacy_ids.is_empty() {
+        adopt_authorized_legacy_deployments(&c, &project, incarnation, legacy_ids)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    }
     // Browser-function contract enforcement (bn-launch-blocked-assets-never-deployed):
     // this route runs NO bundle/persist step, so a manifest carrying a browser
     // policy would present as loudly-ineligible forever, and a client-supplied
@@ -3961,12 +4143,34 @@ async fn dep_create(
         }
         f.browser_artifact = None;
     }
+    let volume_names = if manifest
+        .functions
+        .iter()
+        .any(|function| function.runtime == "container")
+    {
+        let names = crate::git::project_volume_names(&project, incarnation, &manifest.functions)
+            .map_err(|reason| (StatusCode::BAD_REQUEST, reason))?;
+        if names.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "container deployment has no exact current-incarnation volume claim".into(),
+            ));
+        }
+        Some(names)
+    } else {
+        None
+    };
     if let Err(e) =
         crate::raw_ports::allocate_raw_ports_coordinated(&c, &project, &mut manifest).await
     {
         tracing::warn!(project = %project, error = %e, "raw public-port allocation failed for direct deploy (raw ingress unavailable)");
     }
-    let info = c.gw.deploy_full(
+    if let Some(volume_names) = volume_names {
+        c.projects
+            .claim_volumes_exact(&project, incarnation, volume_names)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    }
+    let info = c.gw.deploy_full_exact(
         req.root,
         manifest,
         creator,
@@ -3974,6 +4178,7 @@ async fn dep_create(
         req.production,
         fluid_core::DeployState::Ready,
         t,
+        incarnation,
     );
     // Persist so the deployment survives a node restart (without this it lived
     // only in memory and was lost on reboot).
@@ -3982,12 +4187,228 @@ async fn dep_create(
     Ok(Json(json!(info)))
 }
 
+/// Whether a just-registered deployment record is still authorized to exist.
+/// A captured incarnation is real proof and must still match the project's
+/// CURRENT active one (mirrors `persist::restore`'s own `Some` arm exactly).
+/// The legacy `None` case has no captured fact to re-check — LIVE-witnessed
+/// 2026-08-22: mirroring `persist::restore`'s `None` arm exactly (reject
+/// whenever the project was EVER tombstoned and no settings row has since
+/// been re-touched) false-positive-rejected an ordinary same-request redeploy
+/// of a just-deleted project name, because `dep_create` never happens to
+/// touch `ProjectSettings` — ordinary git builds usually do (via
+/// `set_production_branch`/`set_build`/etc.), so the boot-restore version of
+/// this bug is rare, but on the live path it fires on literally the very
+/// next request. So `None` is authorized UNLESS the current row proves a
+/// DIFFERENT, REAL incarnation is now active — i.e. a genuine
+/// incarnation-tracked recreation already exists and this legacy record
+/// would collide with it. Mere past deletion, or a row with no incarnation
+/// of its own, is never by itself proof of staleness for this case;
+/// preventing the actual interleaving race is `project_settings::
+/// lifecycle_write`'s job (held across `delete_project_local` and every
+/// gated registration path), not this heuristic's.
+fn deployment_authorized(
+    c: &Arc<CloudState>,
+    project: &str,
+    incarnation: Option<fluid_core::ProjectIncarnation>,
+) -> bool {
+    let snap = c.projects.snapshot_synced();
+    match incarnation {
+        Some(expected) => snap
+            .rows
+            .get(project)
+            .is_some_and(|row| row.incarnation == Some(expected)),
+        None => !snap
+            .rows
+            .get(project)
+            .is_some_and(|row| row.incarnation.is_some()),
+    }
+}
+
 /// Floor a fresh deployment's causal stamp at the project tombstone +1 (see
-/// `ProjectStore::tombstone_of`): without it a redeploy landing inside the
-/// delete generation's skew lead is swept as "old incarnation" by the next
-/// deletion reconcile — the recreated project's first deployment dies and
-/// its resources purge under it (adversarial finding).
+/// `ProjectStore::tombstone_of`) — but only once the record has proven it is
+/// still authorized to exist. Every registration path (direct
+/// `POST /deployments`, git.rs's `run_build`, the first-deploy "Building…"
+/// placeholder) calls this immediately after `gw.deploy_full[_with_runtime]`,
+/// which makes it the ONE chokepoint every registration funnels through —
+/// deliberately kept a plain sync `fn` with this exact 3-arg signature so
+/// git.rs's existing call sites need no edit.
+///
+/// The race this closes (adversarial finding 2026-08-22): `run_build`'s own
+/// "still current" check can pass BEFORE a concurrent `delete_project_local`
+/// tombstones the project, and the build can still finish and register
+/// AFTER — `run_build` never re-reads the project's incarnation at that
+/// point, so without this check the registration got floored above the
+/// tombstone exactly like a genuine post-delete redeploy, resurrecting a
+/// project whose databases/volumes/source may already be purged underneath
+/// it. Rejected here means torn back down completely, detached (this fn
+/// cannot become `async` without editing every caller): no deployment, no
+/// alias, no causal stamp survives a delete the registration lost its race
+/// against.
+pub(crate) fn legacy_deployment_ids_for_owner(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+) -> Vec<String> {
+    let team = norm(team).to_string();
+    // Local records (`DeployRecord`) and gossiped-peer records
+    // (`DeploymentInfo`) are different types with different `id` shapes
+    // (`String` vs `DeploymentId`) — map both onto one common
+    // (id, project, incarnation, tenant) tuple before chaining, rather than
+    // trying to chain incompatible iterator item types directly.
+    let local = c.gw.deployment_records().into_iter().map(|record| {
+        (
+            record.id,
+            record.project,
+            record.project_incarnation,
+            record.tenant,
+        )
+    });
+    let peers: Vec<(
+        String,
+        String,
+        Option<fluid_core::ProjectIncarnation>,
+        String,
+    )> = c
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .cloned()
+        .map(|record| {
+            (
+                record.id.0,
+                record.project,
+                record.project_incarnation,
+                record.tenant,
+            )
+        })
+        .collect();
+    let mut ids: Vec<String> = local
+        .chain(peers)
+        .filter(|(_, rec_project, incarnation, tenant)| {
+            rec_project == project && incarnation.is_none() && {
+                let owner = record_tenant(tenant);
+                owner == team || owner == UNTAGGED_TENANT
+            }
+        })
+        .map(|(id, _, _, _)| id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Persist and apply the exact-id migration authority for records observed
+/// before a live legacy settings row acquired its first incarnation. The caller
+/// holds the project's lifecycle writer. A fresh or tombstone-ambiguous row
+/// returns an empty allow-set and therefore adopts nothing.
+pub(crate) fn adopt_authorized_legacy_deployments(
+    c: &Arc<CloudState>,
+    project: &str,
+    incarnation: fluid_core::ProjectIncarnation,
+    ids: Vec<String>,
+) -> Result<Vec<String>, crate::project_settings::ProjectIncarnationError> {
+    let allowed = c
+        .projects
+        .authorize_legacy_deployments(project, incarnation, ids)?;
+    let adopted =
+        c.gw.adopt_legacy_deployments(project, incarnation, &allowed);
+    if !adopted.is_empty() {
+        crate::persist::persist(c);
+    }
+    Ok(adopted)
+}
+
+fn authorize_local_deployment_incarnation(
+    c: &Arc<CloudState>,
+    project: &str,
+    deployment_id: &str,
+    recorded: Option<fluid_core::ProjectIncarnation>,
+    team: &str,
+) -> Result<fluid_core::ProjectIncarnation, StatusCode> {
+    if let Some(expected) = recorded {
+        c.projects
+            .get_exact(project, expected)
+            .map_err(|_| StatusCode::CONFLICT)?;
+        return Ok(expected);
+    }
+
+    let incarnation = match c.projects.active_incarnation(project) {
+        Ok(incarnation) => incarnation,
+        Err(crate::project_settings::ProjectIncarnationError::Legacy) => {
+            let ids = legacy_deployment_ids_for_owner(c, project, team);
+            let incarnation = c
+                .projects
+                .ensure_incarnation(project)
+                .map_err(|_| StatusCode::CONFLICT)?;
+            adopt_authorized_legacy_deployments(c, project, incarnation, ids)
+                .map_err(|_| StatusCode::CONFLICT)?;
+            incarnation
+        }
+        Err(_) => return Err(StatusCode::CONFLICT),
+    };
+    let allowed = c
+        .projects
+        .legacy_deployment_ids_exact(project, incarnation)
+        .map_err(|_| StatusCode::CONFLICT)?;
+    if !allowed.iter().any(|id| id == deployment_id) {
+        return Err(StatusCode::CONFLICT);
+    }
+    c.gw.adopt_legacy_deployments(project, incarnation, &allowed);
+    c.gw.deployment_records()
+        .iter()
+        .any(|record| record.id == deployment_id && record.project_incarnation == Some(incarnation))
+        .then_some(incarnation)
+        .ok_or(StatusCode::CONFLICT)
+}
+
 pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id: &str) {
+    let incarnation =
+        c.gw.list()
+            .into_iter()
+            .find(|d| d.id.0 == id)
+            .and_then(|d| d.project_incarnation);
+    if !deployment_authorized(c, project, incarnation) {
+        let (c2, id2, project2) = (c.clone(), id.to_string(), project.to_string());
+        tokio::spawn(async move {
+            let _lifecycle = crate::project_settings::lifecycle_write(&project2).await;
+            let mut retained_authorized = false;
+            let removed = match incarnation {
+                Some(expected) => match c2.projects.get_exact(&project2, expected) {
+                    Err(_) => c2.gw.remove_exact(&id2, expected).await,
+                    Ok(_) => {
+                        // Authority recovered before this serialized callback ran.
+                        // Apply the same causal floor the synchronous fast path
+                        // would have applied; retaining an authorized record
+                        // without restamping it lets an older project tombstone
+                        // erase a genuine recreation on the next merge/restart.
+                        if let Some(tombstone) = c2.projects.tombstone_of(&project2) {
+                            c2.gw.restamp_created(&id2, tombstone.saturating_add(1));
+                        }
+                        retained_authorized = true;
+                        None
+                    }
+                },
+                None => {
+                    tracing::error!(
+                        project = %project2,
+                        deployment = %id2,
+                        "rejected an identity-less deployment registration but retained it: no exact incarnation exists for safe removal"
+                    );
+                    None
+                }
+            };
+            tracing::warn!(
+                project = %project2,
+                deployment = %id2,
+                removed = removed.is_some(),
+                retained_authorized,
+                "serialized resolution of a deployment registration that initially lost project-incarnation authority"
+            );
+            crate::persist::persist(&c2);
+        });
+        return;
+    }
     if let Some(t) = c.projects.tombstone_of(project) {
         c.gw.restamp_created(id, t.saturating_add(1));
     }
@@ -4012,8 +4433,23 @@ pub(crate) async fn dep_promote(
         if record_tenant(&d.tenant) != t0 && !project_owned_by(&c, &d.project, &t0) {
             return Err(StatusCode::NOT_FOUND);
         }
-    }
-    if let Some(info) = c.gw.promote(&id) {
+        let project = d.project.clone();
+        let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
+        let selected =
+            c.gw.list()
+                .into_iter()
+                .find(|candidate| candidate.id.0 == id)
+                .ok_or(StatusCode::NOT_FOUND)?;
+        let incarnation = authorize_local_deployment_incarnation(
+            &c,
+            &project,
+            &id,
+            selected.project_incarnation,
+            &t0,
+        )?;
+        let info =
+            c.gw.promote_exact(&id, incarnation)
+                .ok_or(StatusCode::CONFLICT)?;
         crate::persist::persist(&c);
         let ev = c.event(
             &c.region,
@@ -4208,193 +4644,452 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
     });
 }
 
-/// Delete a single deployment (unregisters its functions).
+/// Delete a single deployment under the same project lifecycle writer used by
+/// build finalization, promotion, and full project deletion. The owned guard is
+/// moved into a task before the first cancellable await: dropping the HTTP
+/// request drops only the waiter, never the serialized deletion itself.
 async fn dep_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Ownership: a deployment belongs to its project's team. If it exists but
-    // isn't ours, 404 (don't disclose another tenant's resource). If it doesn't
-    // exist, fall through to the idempotent no-op remove (unchanged behavior).
-    if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        // Record's own tag first (authoritative), fleet-aware fallback second.
-        if record_tenant(&d.tenant) != t && !project_owned_by(&c, &d.project, &t) {
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let Some(initial) =
+        c.gw.list()
+            .into_iter()
+            .find(|deployment| deployment.id.0 == id)
+    else {
+        return Ok(Json(json!({ "removed": id, "project": null })));
+    };
+    if record_tenant(&initial.tenant) != team && !project_owned_by(&c, &initial.project, &team) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let project = initial.project.clone();
+    let lifecycle = crate::project_settings::lifecycle_write(&project).await;
+    let c2 = c.clone();
+    let id2 = id.clone();
+    let project2 = project.clone();
+    let team2 = team.clone();
+    let task = tokio::spawn(async move {
+        let _lifecycle = lifecycle;
+        let selected = c2
+            .gw
+            .list()
+            .into_iter()
+            .find(|deployment| deployment.id.0 == id2)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if selected.project != project2
+            || (record_tenant(&selected.tenant) != team2
+                && !project_owned_by(&c2, &project2, &team2))
+        {
             return Err(StatusCode::NOT_FOUND);
         }
-    }
-    let project = c.gw.remove(&id).await;
-    if let Some(p) = &project {
-        record_event(&c, p, "delete", &format!("deleted deployment {id}"));
-        // Release the project's PUBLIC raw ports only when this was its LAST
-        // local deployment — superseded records of the same project share the
-        // same stable per-project allocation, so releasing earlier would yank
-        // the port out from under a still-registered record.
-        if !c.gw.list().iter().any(|d| d.project == *p) {
-            let retired = crate::raw_ports::release_raw_ports_coordinated(&c, p).await;
+        let incarnation = authorize_local_deployment_incarnation(
+            &c2,
+            &project2,
+            &id2,
+            selected.project_incarnation,
+            &team2,
+        )?;
+        let removed = c2
+            .gw
+            .remove_exact(&id2, incarnation)
+            .await
+            .ok_or(StatusCode::CONFLICT)?;
+        let image = removed.manifest.image.clone();
+        record_event(
+            &c2,
+            &project2,
+            "delete",
+            &format!("deleted deployment {id2}"),
+        );
+        if !c2
+            .gw
+            .list()
+            .iter()
+            .any(|deployment| deployment.project == project2)
+        {
+            let retired = crate::raw_ports::release_raw_ports_coordinated(&c2, &project2).await;
             if !retired.is_empty() {
-                tracing::info!(project = %p, ports = ?retired, "retired public raw port(s) — last deployment deleted; never re-granted");
+                tracing::info!(project = %project2, ports = ?retired, "retired public raw port(s) — last deployment deleted; never re-granted");
             }
         }
-    }
-    crate::persist::persist(&c);
-    Ok(Json(json!({ "removed": id, "project": project })))
+        let image_unreferenced = image
+            .as_deref()
+            .is_some_and(|candidate| !c2.gw.image_is_referenced(candidate));
+        crate::persist::persist(&c2);
+        Ok::<_, StatusCode>((removed, image, image_unreferenced))
+    });
+    let (removed, image, image_unreferenced) = task.await.map_err(|error| {
+        tracing::error!(deployment = %id, %error, "serialized deployment deletion task failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })??;
+    Ok(Json(json!({
+        "removed": removed.id,
+        "project": removed.project,
+        "image": image,
+        "image_last_reference_removed": image_unreferenced,
+    })))
 }
 
-/// Full teardown of a deleted project's resources BEYOND its deployment
-/// records: provisioned databases (with queue/vector/blob payload purge, not
-/// just the catalog entry), backing podman volumes, the on-disk source
-/// checkout(s), and build history — plus a DURABLE audit record. Previously,
-/// deleting a project left all of these behind indefinitely (a real GDPR
-/// Art.17 gap: the only record of the deletion itself lived in a 500-entry,
-/// non-persisted ring buffer that could rotate out within minutes and never
-/// survived a restart). Called from both the local delete path and the
-/// mesh-cascade receiving arm so a project deleted from ANY node gets the
-/// same real cleanup.
+#[derive(Clone)]
+struct ProjectDeleteInventory {
+    incarnation: fluid_core::ProjectIncarnation,
+    deployments: Vec<fluid_core::DeployRecord>,
+    ambiguous_deployments: Vec<fluid_core::DeployRecord>,
+    databases: Vec<crate::databases::Database>,
+    ambiguous_databases: Vec<crate::databases::Database>,
+    build_ids: std::collections::BTreeSet<String>,
+    current_volumes: std::collections::BTreeSet<String>,
+    legacy_volumes: std::collections::BTreeSet<String>,
+    volume_residuals: Vec<ProjectCleanupResidual>,
+    images: std::collections::BTreeSet<String>,
+}
+
+fn path_build_id(
+    project: &str,
+    path: &std::path::Path,
+    roots: &[std::path::PathBuf; 2],
+) -> Option<String> {
+    let parent = path.parent()?;
+    if !roots.iter().any(|root| parent == root) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    crate::git::checkout_prefixes(project)
+        .iter()
+        .find_map(|prefix| deploy_entry_build_id(prefix, name))
+        .map(str::to_string)
+}
+
+fn project_delete_inventory(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+    settings: &crate::project_settings::ProjectSettings,
+    active_checkouts: &[std::path::PathBuf],
+) -> ProjectDeleteInventory {
+    let incarnation = settings
+        .incarnation
+        .expect("delete inventory is built only after exact incarnation authority");
+    let all_project_deployments: Vec<fluid_core::DeployRecord> =
+        c.gw.deployment_records()
+            .into_iter()
+            .filter(|deployment| deployment.project == project)
+            .collect();
+    let (deployments, ambiguous_deployments): (Vec<_>, Vec<_>) = all_project_deployments
+        .into_iter()
+        .partition(|deployment| deployment.project_incarnation == Some(incarnation));
+    let roots = [crate::git::deploy_root(), crate::git::legacy_deploy_root()];
+    let mut build_ids: std::collections::BTreeSet<String> = c
+        .builds
+        .ids_for_incarnation(project, incarnation)
+        .into_iter()
+        .filter(|id| is_platform_build_id(id))
+        .collect();
+    for deployment in &deployments {
+        if let Some(source) = deployment.git.as_ref() {
+            if let Some(build_id) = crate::git::upload_source_build_id(source) {
+                if is_platform_build_id(&build_id) {
+                    build_ids.insert(build_id);
+                }
+            }
+        }
+        if let Some(build_id) =
+            path_build_id(project, std::path::Path::new(&deployment.root), &roots)
+        {
+            build_ids.insert(build_id);
+        }
+    }
+    for path in active_checkouts {
+        if let Some(build_id) = path_build_id(project, path, &roots) {
+            build_ids.insert(build_id);
+        }
+    }
+
+    let services: std::collections::BTreeSet<String> = deployments
+        .iter()
+        .flat_map(|deployment| deployment.manifest.functions.iter())
+        .filter(|function| function.runtime == "container")
+        .map(|function| function.name.clone())
+        .collect();
+    let project_tag = crate::git::sanitize_tag(project);
+    let legacy_base = format!("hive-vol-{project_tag}");
+
+    // Grow-only settings claims are server-derived exact facts for volumes whose
+    // deployment record may already have been reaped. Add the exact names parsed
+    // from every still-live run configuration, but never invent a current base or
+    // service suffix from a project/function prefix.
+    let mut current_volumes: std::collections::BTreeSet<String> =
+        settings.owned_volume_names.iter().cloned().collect();
+    let mut volume_residuals = Vec::new();
+    for deployment in &deployments {
+        if !deployment
+            .manifest
+            .functions
+            .iter()
+            .any(|function| function.runtime == "container")
+        {
+            continue;
+        }
+        match crate::git::project_volume_names(project, incarnation, &deployment.manifest.functions)
+        {
+            Ok(names) => current_volumes.extend(names),
+            Err(reason) => volume_residuals.push(ProjectCleanupResidual::new(
+                "volume_ownership",
+                &deployment.id,
+                format!("retained: {reason}"),
+            )),
+        }
+    }
+
+    // Legacy names carry no incarnation and are never deletion authority. Exact
+    // candidates are retained and reported if present so a prefix-sharing tenant
+    // survives byte-identically while an operator can resolve the residue.
+    let mut legacy_volumes = std::collections::BTreeSet::from([legacy_base.clone()]);
+    for service in &services {
+        legacy_volumes.insert(format!(
+            "{legacy_base}-{}",
+            crate::git::sanitize_tag(service)
+        ));
+    }
+    let images = deployments
+        .iter()
+        .filter_map(|deployment| deployment.manifest.image.clone())
+        .collect();
+
+    // Database catalog rows predate an incarnation field. Admission now records
+    // every newly minted platform id in the incarnation's grow-only settings
+    // lineage while holding the lifecycle writer. Only that exact id set is
+    // deletion authority; legacy/unclaimed rows are retained rather than guessed
+    // from names, teams, or timestamps.
+    let owned_database_ids: std::collections::HashSet<&str> = settings
+        .owned_database_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let (databases, ambiguous_databases): (Vec<_>, Vec<_>) = c
+        .databases
+        .list(Some(project))
+        .into_iter()
+        .partition(|database| {
+            record_tenant(&database.team) == norm(team)
+                && owned_database_ids.contains(database.id.as_str())
+        });
+
+    ProjectDeleteInventory {
+        incarnation,
+        deployments,
+        ambiguous_deployments,
+        databases,
+        ambiguous_databases,
+        build_ids,
+        current_volumes,
+        legacy_volumes,
+        volume_residuals,
+        images,
+    }
+}
+
+/// Run one destructive container/volume command with a hard per-attempt budget.
+/// `kill_on_drop` makes a timeout real: no child survives to mutate the host
+/// after the lifecycle writer has returned an incomplete-cleanup result.
+async fn run_cleanup_command(bin: &str, args: Vec<String>, path_env: &str) -> Result<(), String> {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        let mut command = tokio::process::Command::new(bin);
+        command
+            .args(&args)
+            .env("PATH", path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let result = tokio::time::timeout(Duration::from_secs(10), command.output()).await;
+        let reason = match result {
+            Ok(Ok(output)) if output.status.success() => return Ok(()),
+            Ok(Ok(output)) => format!(
+                "exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(Err(error)) => format!("could not start: {error}"),
+            Err(_) => "timed out after 10s".to_string(),
+        };
+        if attempt == ATTEMPTS {
+            return Err(format!("{reason} after {ATTEMPTS} attempts"));
+        }
+        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+    }
+    unreachable!("bounded cleanup-command loop always returns")
+}
+
+/// Reclaim only the immutable inventory captured for one exact incarnation.
+/// The caller owns the project lifecycle writer for this whole await chain, so
+/// database creation and deployment registration cannot enter a new lifetime
+/// between proof and removal.
 async fn purge_project_resources(
     c: &Arc<CloudState>,
     project: &str,
     team: &str,
-    n_deployments: usize,
     delete_ms: u64,
-) {
-    if observed_project_version_ms(c, project) > delete_ms {
-        tracing::info!(
-            project,
-            delete_ms,
-            "project purge skipped — a causal recreation is newer than this delete generation"
-        );
-        return;
-    }
+    inventory: &ProjectDeleteInventory,
+) -> Vec<ProjectCleanupResidual> {
+    let mut residuals = Vec::new();
     c.audit.record(
         team,
         "user",
         "delete",
         "project",
         project,
-        &format!("{n_deployments} deployment(s)"),
+        &format!(
+            "incarnation={} delete_ms={} deployments={}",
+            inventory.incarnation,
+            delete_ms,
+            inventory.deployments.len()
+        ),
     );
 
-    // Re-check the delete generation before EVERY destructive phase, not
-    // just at entry (the entry check passes before a mid-purge recreate can
-    // exist): a recreate landing while this purge runs must stop the
-    // remaining phases — the still-running purge otherwise destroys the new
-    // incarnation's databases, live data volume, and checkout underneath it
-    // (adversarial finding).
-    if observed_project_version_ms(c, project) > delete_ms {
-        tracing::info!(project, delete_ms, "project purge aborted before database phase — causal recreation mid-purge");
-        return;
+    for deployment in &inventory.ambiguous_deployments {
+        residuals.push(ProjectCleanupResidual::new(
+            "deployment_ownership",
+            &deployment.id,
+            format!(
+                "retained: deployment does not carry exact incarnation {}",
+                inventory.incarnation
+            ),
+        ));
     }
-    for d in c.databases.list(Some(project)) {
-        if !d.replicas.is_empty() {
-            crate::db_replicate::remove_replicas(c.clone(), d.clone());
+    for database in &inventory.ambiguous_databases {
+        residuals.push(ProjectCleanupResidual::new(
+            "database_ownership",
+            &database.id,
+            format!(
+                "retained: database team/creation stamp does not prove ownership by incarnation {}",
+                inventory.incarnation
+            ),
+        ));
+    }
+    residuals.extend(inventory.volume_residuals.iter().cloned());
+
+    let path_env = format!(
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for database in &inventory.databases {
+        crate::databases::note_teardown_request(&database.id);
+        if !database.replicas.is_empty() {
+            crate::db_replicate::remove_replicas(c.clone(), database.clone());
         }
-        if let Some(container) = d.container.clone() {
-            // DB containers are ALWAYS podman-created, even on macOS — see
-            // `databases.rs::ensure_project_db_net`'s doc comment (static-IP
-            // networking has no Apple `container` equivalent). Every
-            // `podman rm`/DB-container teardown site in this file (this one,
-            // plus the two below in `database_delete`/the "remove" op) stays
-            // hardcoded to podman for that reason, unconditionally.
-            // Comma-split: a Supabase record carries its whole stack.
-            for one in container
+        if let Some(containers) = database.container.as_deref() {
+            for container in containers
                 .split(',')
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|name| !name.is_empty())
             {
-                let _ = tokio::process::Command::new("podman")
-                    .args(["rm", "-f", "-v", one])
-                    .env(
-                        "PATH",
-                        format!(
-                            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                            std::env::var("PATH").unwrap_or_default()
-                        ),
-                    )
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-            }
-            if d.kind == crate::databases::DbKind::Supabase {
-                let short = &d.id[3..11.min(d.id.len())];
-                // engine volume + the storage-api member's bucket volume —
-                // delete = data destroyed for BOTH, same semantics.
-                for vol in [
-                    format!("hive-vol-supa-{short}"),
-                    format!("hive-vol-supast-{short}"),
-                ] {
-                    let _ = tokio::process::Command::new("podman")
-                        .args(["volume", "rm", "-f", &vol])
-                        .env(
-                            "PATH",
-                            format!(
-                                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-                                std::env::var("PATH").unwrap_or_default()
-                            ),
-                        )
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
+                if let Err(reason) = run_cleanup_command(
+                    "podman",
+                    hive_backend::container_cli::rm_args(false, container),
+                    &path_env,
+                )
+                .await
+                {
+                    residuals.push(ProjectCleanupResidual::new(
+                        "database_container",
+                        container,
+                        reason,
+                    ));
                 }
             }
         }
-        c.databases.remove_db_and_purge_data(&d.id, &d.team);
-    }
-
-    if observed_project_version_ms(c, project) > delete_ms {
-        tracing::info!(project, delete_ms, "project purge aborted before volume/source phase — causal recreation mid-purge");
-        return;
-    }
-    purge_project_podman_volumes(project).await;
-    c.builds.remove_for_project(project);
-    purge_project_source_dirs(project).await;
-
-    // Public raw ports are a permanent non-reuse boundary: a stale entry-node
-    // route could otherwise splice the former tenant's traffic into a later
-    // tenant. Retire the grants only when this generation still represents a
-    // full project deletion; a newer recreation keeps its stable claim.
-    if observed_project_version_ms(c, project) <= delete_ms {
-        let retired = crate::raw_ports::release_raw_ports_coordinated(c, project).await;
-        if !retired.is_empty() {
-            tracing::info!(
-                project,
-                ports = ?retired,
-                "retired public raw port(s) on project delete — never re-granted"
-            );
+        if database.kind == crate::databases::DbKind::Supabase {
+            let short = database
+                .id
+                .strip_prefix("db_")
+                .and_then(|suffix| suffix.get(..8));
+            match short {
+                Some(short) => {
+                    for volume in [
+                        format!("hive-vol-supa-{short}"),
+                        format!("hive-vol-supast-{short}"),
+                    ] {
+                        if let Err(reason) = run_cleanup_command(
+                            "podman",
+                            hive_backend::container_cli::volume_rm_args(false, &volume),
+                            &path_env,
+                        )
+                        .await
+                        {
+                            residuals.push(ProjectCleanupResidual::new(
+                                "database_volume",
+                                volume,
+                                reason,
+                            ));
+                        }
+                    }
+                }
+                None => residuals.push(ProjectCleanupResidual::new(
+                    "database_identity",
+                    &database.id,
+                    "retained backing volume: database id is not platform-issued db_<8+>",
+                )),
+            }
         }
-    } else {
-        tracing::info!(
-            project,
-            delete_ms,
-            "raw-port retirement skipped — project was causally recreated"
-        );
+        c.databases
+            .remove_db_and_purge_data(&database.id, &database.team);
     }
 
-    // The purge runs DETACHED from both delete paths, after their persist() dirty
-    // bump — so the debounced writer can capture a snapshot BEFORE these catalog
-    // mutations land, and nothing here bumped it again. A restart in that window
-    // resurrected already-purged database rows. Bump once at the end.
+    residuals.extend(
+        purge_project_podman_volumes(&inventory.current_volumes, &inventory.legacy_volumes).await,
+    );
+    let source_residuals = purge_project_source_dirs(project, &inventory.build_ids).await;
+    let source_complete = source_residuals.is_empty();
+    residuals.extend(source_residuals);
+    if source_complete {
+        c.builds
+            .remove_for_incarnation(project, inventory.incarnation);
+    } else {
+        residuals.push(ProjectCleanupResidual::new(
+            "build_history",
+            inventory.incarnation.to_string(),
+            "retained because exact source cleanup is incomplete",
+        ));
+    }
+
+    let retired = crate::raw_ports::release_raw_ports_coordinated(c, project).await;
+    if !retired.is_empty() {
+        tracing::info!(project, ports = ?retired, "retired public raw port(s) on exact project-incarnation delete — never re-granted");
+    }
+
+    for image in &inventory.images {
+        if !c.gw.image_is_referenced(image) && c.gw.backend_name() == "litebox" {
+            // The authoritative last-reference proof is here. The concrete
+            // backend is trait-erased behind `Fluid`, and the released
+            // lifecycle surfaces expose no safe downcast/forwarding seam; do
+            // not emulate `LiteboxBackend::retire_image_reference` with direct
+            // filesystem deletion. Surface the unresolved retirement instead.
+            residuals.push(ProjectCleanupResidual::new(
+                "litebox_image_reference",
+                image,
+                "authoritative last reference removed, but the active LiteboxBackend instance is not reachable through the authorized gateway surface",
+            ));
+        }
+    }
+
     crate::persist::persist(c);
+    residuals
 }
 
-/// Remove every volume named `hive-vol-<project>` or `hive-vol-<project>-<service>`
-/// (compose/multi-service deployments each get their own suffixed volume) — these
-/// are created for app/compose/Containerfile deployments' persistent `/data` and,
-/// unlike the container itself, survive removal of whatever mounted them.
-/// Best-effort: an unreachable/missing container CLI must never fail the broader
-/// project-delete flow.
-///
-/// Checks BOTH backends on macOS: a project's volume could live in podman's store
-/// (compose/multi-service deploys always use podman there — see
-/// `hive_backend::container_cli`'s module doc) or in Apple `container`'s store
-/// (single-container app/Containerfile deploys), and this has no record of which
-/// one a given project actually used — only Linux fleet nodes ever have just one.
-async fn purge_project_podman_volumes(project: &str) {
-    let prefix = format!("hive-vol-{}", crate::git::sanitize_tag(project));
+/// Enumerate a backend first, then remove only incarnation-qualified names that
+/// are actually present. Legacy names are byte-ambiguous (`app` service `v2`
+/// and project `app-v2` base both map to `hive-vol-app-v2`), so a present legacy
+/// candidate is retained and returned as an observable residual.
+async fn purge_project_podman_volumes(
+    current: &std::collections::BTreeSet<String>,
+    legacy: &std::collections::BTreeSet<String>,
+) -> Vec<ProjectCleanupResidual> {
+    const ATTEMPTS: u32 = 3;
+    let mut residuals = Vec::new();
     let path_env = format!(
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
         std::env::var("PATH").unwrap_or_default()
@@ -4406,53 +5101,233 @@ async fn purge_project_podman_volumes(project: &str) {
     };
     for &apple in backends {
         let bin = hive_backend::container_cli::bin(apple);
-        for name in hive_backend::container_cli::list_volume_names(apple, &path_env).await {
-            // Exact match or a `-`-delimited suffix only (the per-service naming
-            // shape from `container_volume_cfg`, e.g. "hive-vol-app-worker") — a
-            // plain substring match would also reap an unrelated project's volume
-            // whose name happens to CONTINUE the same characters with no
-            // delimiter (e.g. "app" must not touch "appearance"'s volume). This
-            // does NOT disambiguate a different project whose name is itself
-            // `<target>-<anything>` (e.g. "app" vs a real project literally named
-            // "app-v2") — project names are allocated to be globally unique (see
-            // the project-name allocator's own comment in git.rs), so that
-            // collision is not expected in practice, but is a known limit of this
-            // prefix-based scheme, not a claim this check fully closes.
-            if name.is_empty() || !(name == prefix || name.starts_with(&format!("{prefix}-"))) {
-                continue;
+        let mut names = None;
+        let mut last_reason = String::new();
+        for attempt in 1..=ATTEMPTS {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                hive_backend::container_cli::try_list_volume_names(apple, &path_env),
+            )
+            .await
+            {
+                Ok(Ok(found)) => {
+                    names = Some(found);
+                    break;
+                }
+                Ok(Err(reason)) => last_reason = reason,
+                Err(_) => last_reason = "volume enumeration timed out after 10s".to_string(),
             }
-            let _ = tokio::process::Command::new(bin)
-                .args(hive_backend::container_cli::volume_rm_args(apple, &name))
-                .env("PATH", &path_env)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            if attempt < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
+        }
+        let Some(names) = names else {
+            residuals.push(ProjectCleanupResidual::new(
+                "volume_enumeration",
+                bin,
+                format!("{last_reason} after {ATTEMPTS} attempts; no volume was removed"),
+            ));
+            continue;
+        };
+        let names: std::collections::HashSet<String> = names.into_iter().collect();
+        for name in legacy.iter().filter(|name| names.contains(*name)) {
+            residuals.push(ProjectCleanupResidual::new(
+                "legacy_volume_ownership",
+                name,
+                "retained: legacy volume name is byte-ambiguous with a prefix-sharing project/service",
+            ));
+        }
+        for name in current.iter().filter(|name| names.contains(*name)) {
+            if let Err(reason) = run_cleanup_command(
+                bin,
+                hive_backend::container_cli::volume_rm_args(apple, name),
+                &path_env,
+            )
+            .await
+            {
+                residuals.push(ProjectCleanupResidual::new("volume_remove", name, reason));
+            }
+        }
+    }
+    residuals
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ProjectCleanupResidual {
+    pub resource: String,
+    pub id: String,
+    pub reason: String,
+}
+
+impl ProjectCleanupResidual {
+    fn new(resource: &str, id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            resource: resource.to_string(),
+            id: id.into(),
+            reason: reason.into(),
         }
     }
 }
 
-/// Synchronously remove every on-disk source checkout for `project`, rather
-/// than relying solely on the periodic `gc_build_dirs` timer (which could
-/// leave a leaked secret or PII in the raw source tree readable on the host
-/// disk for up to ~40 minutes after an explicit delete request — the timer
-/// polls every 10 minutes and only reaps dirs untouched for 30+ minutes).
-/// Sweeps BOTH the durable deploy root and the legacy /tmp root, matching the
-/// sanitized name component (current) and the raw project name (checkouts
-/// written before the name was sanitized for path use).
-async fn purge_project_source_dirs(project: &str) {
-    let prefixes = crate::git::checkout_prefixes(project);
-    for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
-        let Ok(mut rd) = tokio::fs::read_dir(&base).await else {
-            continue;
+/// A build id is always platform-issued: `dpl-` + 10 lowercase-hex chars.
+fn is_platform_build_id(id: &str) -> bool {
+    id.strip_prefix("dpl-").is_some_and(|suffix| {
+        suffix.len() == 10
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Parse one current/legacy checkout, placeholder, or retained-source name.
+/// Syntax only identifies the embedded build id; deletion additionally checks
+/// that id against the immutable incarnation lineage.
+fn deploy_entry_build_id<'a>(prefix: &str, name: &'a str) -> Option<&'a str> {
+    let rest = name.strip_prefix(prefix)?;
+    if let Some(build_id) = rest.strip_suffix(".src.zip") {
+        return is_platform_build_id(build_id).then_some(build_id);
+    }
+    let rest = rest.strip_prefix("building-").unwrap_or(rest);
+    let (stamp, build_id) = rest.split_once('-')?;
+    (!stamp.is_empty()
+        && stamp.bytes().all(|byte| byte.is_ascii_digit())
+        && is_platform_build_id(build_id))
+    .then_some(build_id)
+}
+
+fn owned_deploy_entry(
+    prefix: &str,
+    name: &str,
+    build_ids: &std::collections::BTreeSet<String>,
+) -> bool {
+    deploy_entry_build_id(prefix, name).is_some_and(|build_id| build_ids.contains(build_id))
+}
+
+/// Re-stat with `symlink_metadata` on every bounded attempt so a symlink is
+/// unlinked rather than traversed. Files and symlinks use `remove_file`, real
+/// directories use `remove_dir_all`, and unsupported special files are kept
+/// and reported.
+async fn remove_owned_deploy_entry(path: &std::path::Path) -> Option<ProjectCleanupResidual> {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) if attempt < ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                continue;
+            }
+            Err(error) => {
+                return Some(ProjectCleanupResidual::new(
+                    "source_metadata",
+                    path.display().to_string(),
+                    format!("symlink_metadata failed after {ATTEMPTS} attempts: {error}"),
+                ));
+            }
         };
-        while let Ok(Some(e)) = rd.next_entry().await {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
-                let _ = tokio::fs::remove_dir_all(e.path()).await;
+        let file_type = metadata.file_type();
+        let result = if file_type.is_file() || file_type.is_symlink() {
+            tokio::fs::remove_file(path).await
+        } else if file_type.is_dir() {
+            tokio::fs::remove_dir_all(path).await
+        } else {
+            return Some(ProjectCleanupResidual::new(
+                "source_special",
+                path.display().to_string(),
+                "unsupported filesystem entry retained",
+            ));
+        };
+        match result {
+            Ok(()) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) if attempt < ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
+            Err(error) => {
+                return Some(ProjectCleanupResidual::new(
+                    "source_remove",
+                    path.display().to_string(),
+                    format!("removal failed after {ATTEMPTS} attempts: {error}"),
+                ));
             }
         }
     }
+    unreachable!("bounded source-removal loop always returns")
+}
+
+async fn enumerate_owned_deploy_entries(
+    base: &std::path::Path,
+    prefixes: &[String],
+    build_ids: &std::collections::BTreeSet<String>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    const ATTEMPTS: u32 = 3;
+    let mut last_reason = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let mut entries = match tokio::fs::read_dir(base).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                last_reason = format!("read_dir failed: {error}");
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                continue;
+            }
+        };
+        let mut targets = Vec::new();
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if prefixes
+                        .iter()
+                        .any(|prefix| owned_deploy_entry(prefix, &name, build_ids))
+                    {
+                        targets.push(entry.path());
+                    }
+                }
+                Ok(None) => return Ok(targets),
+                Err(error) => {
+                    last_reason = format!("next_entry failed: {error}");
+                    break;
+                }
+            }
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+        }
+    }
+    Err(format!("{last_reason} after {ATTEMPTS} attempts"))
+}
+
+/// Remove only current/legacy source entries whose platform-issued build id is
+/// in the exact deleted-incarnation lineage. Enumeration, metadata, special
+/// types, and removal failures remain observable in the returned residual set.
+async fn purge_project_source_dirs(
+    project: &str,
+    build_ids: &std::collections::BTreeSet<String>,
+) -> Vec<ProjectCleanupResidual> {
+    let prefixes = crate::git::checkout_prefixes(project);
+    let mut residuals = Vec::new();
+    for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
+        let targets = match enumerate_owned_deploy_entries(&base, &prefixes, build_ids).await {
+            Ok(targets) => targets,
+            Err(reason) => {
+                residuals.push(ProjectCleanupResidual::new(
+                    "source_enumeration",
+                    base.display().to_string(),
+                    reason,
+                ));
+                continue;
+            }
+        };
+        for path in targets {
+            if let Some(residual) = remove_owned_deploy_entry(&path).await {
+                residuals.push(residual);
+            }
+        }
+    }
+    residuals
 }
 
 /// Whether a `project_delete` caller has asserted SOME identity at all —
@@ -4685,30 +5560,45 @@ async fn project_delete(
                 });
             }
             return Ok(Json(json!({
-                "project": project,
+                "project": &project,
                 "delete_ms": delete_ms,
                 "removed_deployments": [],
                 "accepted_by": accepted,
-                "note": "not hosted here — deleted on peers that accepted the cascade",
+                "logical_deleted": true,
+                "cleanup_complete": false,
+                "cleanup_residuals": [{
+                    "phase": "peer_cleanup_observation",
+                    "resource": &project,
+                    "detail": "at least one peer accepted the logical delete, but this coordinator did not receive that peer's physical-cleanup outcome"
+                }],
+                "note": "not hosted here — logical deletion accepted by peers; physical cleanup remains unobserved on this coordinator",
             })));
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    // One explicit request creates exactly ONE immutable generation. Internal
-    // receivers/retries reuse the supplied value; a user-originated delete
-    // issues strictly above every project version visible to this coordinator.
-    let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
-        c.projects
-            .begin_delete(&project, observed_project_version_ms(&c, &project))
-    });
-    let outcome = delete_project_local(&c, &project, &t, delete_ms).await;
-    let ids = outcome.removed;
-    if !outcome.recreated {
+    // The exact local lifecycle owner issues a fresh generation for a user
+    // request, or applies the immutable supplied generation on an internal
+    // single-hop retry. It retains the owned writer until bounded physical
+    // cleanup has either completed or produced explicit residuals.
+    let outcome = delete_project_local_requested(&c, &project, &t, supplied_delete_ms).await;
+    if !outcome.logical_deleted && !outcome.recreated {
+        tracing::warn!(project, residuals = ?outcome.cleanup_residuals, "project delete refused before logical tombstoning");
+        return Err(StatusCode::CONFLICT);
+    }
+    let delete_ms = outcome.delete_ms;
+    let ids = outcome.removed.clone();
+    if outcome.logical_deleted && !outcome.recreated {
         crate::webhooks::dispatch(
             &c.webhooks,
             &project,
             "project.removed",
-            json!({ "project": project, "deployments": ids.len(), "delete_ms": delete_ms }),
+            json!({
+                "project": project,
+                "deployments": ids.len(),
+                "delete_ms": delete_ms,
+                "cleanup_complete": outcome.cleanup_complete,
+                "cleanup_residuals": &outcome.cleanup_residuals,
+            }),
         );
     }
 
@@ -4745,12 +5635,13 @@ async fn project_delete(
     }
     Ok(Json(json!({
         "project": project,
-        // Echo the STORED generation (a receiver-side clamp of an
-        // over-ceiling stamp must surface as the value this node actually
-        // recorded — never the requested one).
-        "delete_ms": c.projects.tombstone_of(&project).unwrap_or(delete_ms),
+        "delete_ms": delete_ms,
+        "incarnation": outcome.incarnation,
         "removed_deployments": ids,
         "recreated": outcome.recreated,
+        "logical_deleted": outcome.logical_deleted,
+        "cleanup_complete": outcome.cleanup_complete,
+        "cleanup_residuals": outcome.cleanup_residuals,
     })))
 }
 
@@ -5037,87 +5928,388 @@ pub(crate) async fn dispatch_project_delete_with(
     false
 }
 
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ProjectDeleteOutcome {
     pub removed: Vec<String>,
-    /// A project row/deployment newer than this delete generation exists, so
-    /// shared resources and project identity were deliberately preserved.
     pub recreated: bool,
+    pub logical_deleted: bool,
+    pub cleanup_complete: bool,
+    pub cleanup_residuals: Vec<ProjectCleanupResidual>,
+    pub delete_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<fluid_core::ProjectIncarnation>,
 }
 
-/// LOCAL-ONLY project teardown used by the HTTP and mesh delete arms. The
-/// immutable `delete_ms` makes retries idempotent: only deployments at or below
-/// that generation are removed, while a causal recreation survives. Team
-/// ownership is checked by the caller.
+fn delete_authority(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+    requested_delete_ms: Option<u64>,
+) -> Result<Option<(crate::project_settings::ProjectSettings, u64)>, ProjectCleanupResidual> {
+    if let Some(row) = c.projects.get_if_set(project) {
+        if record_tenant(&row.team) != UNTAGGED_TENANT && norm(&row.team) != norm(team) {
+            return Err(ProjectCleanupResidual::new(
+                "project_authority",
+                project,
+                "active project settings belong to another tenant",
+            ));
+        }
+        if row.incarnation.is_some() {
+            return Ok(Some((row.clone(), row.incarnation_created_ms)));
+        }
+        let generation_floor = row.updated_ms;
+        let ids = legacy_deployment_ids_for_owner(c, project, team);
+        let incarnation = c.projects.ensure_incarnation(project).map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?;
+        adopt_authorized_legacy_deployments(c, project, incarnation, ids).map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?;
+        let row = c
+            .projects
+            .get_exact(project, incarnation)
+            .map_err(|error| {
+                ProjectCleanupResidual::new("project_authority", project, error.to_string())
+            })?;
+        return Ok(Some((row, generation_floor)));
+    }
+
+    if let Some(delete_ms) = requested_delete_ms {
+        if c.projects
+            .tombstone_of(project)
+            .is_some_and(|stored| stored >= delete_ms)
+        {
+            return Ok(None);
+        }
+    }
+
+    let records: Vec<_> = c
+        .gw
+        .deployment_records()
+        .into_iter()
+        .filter(|record| record.project == project && record_tenant(&record.tenant) == norm(team))
+        .collect();
+    let incarnations: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter_map(|record| record.project_incarnation)
+        .collect();
+    let generation_floor = records
+        .iter()
+        .map(|record| record.created_at_ms)
+        .max()
+        .unwrap_or(0);
+    let incarnation = if incarnations.len() == 1 {
+        *incarnations
+            .iter()
+            .next()
+            .expect("length was checked above")
+    } else {
+        // No uniquely-authoritative incarnation survives locally. Mint a fresh
+        // server identity for the logical deletion, but do not adopt any of the
+        // ambiguous records into it; route removal will make them unreachable
+        // and the residual set will retain their storage for operator review.
+        c.projects.ensure_incarnation(project).map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?
+    };
+    c.projects
+        .ensure_incarnation_exact(project, incarnation)
+        .map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?;
+    let row = c
+        .projects
+        .get_exact(project, incarnation)
+        .map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?;
+    if record_tenant(&row.team) == UNTAGGED_TENANT {
+        c.projects
+            .set_team_exact(project, incarnation, team)
+            .map_err(|error| {
+                ProjectCleanupResidual::new("project_authority", project, error.to_string())
+            })?;
+    }
+    let row = c
+        .projects
+        .get_exact(project, incarnation)
+        .map_err(|error| {
+            ProjectCleanupResidual::new("project_authority", project, error.to_string())
+        })?;
+    let generation_floor = if generation_floor == 0 {
+        row.incarnation_created_ms
+    } else {
+        generation_floor
+    };
+    Ok(Some((row, generation_floor)))
+}
+
+async fn delete_project_owned(
+    c: Arc<CloudState>,
+    project: String,
+    team: String,
+    requested_delete_ms: Option<u64>,
+    lifecycle: tokio::sync::OwnedMutexGuard<()>,
+) -> ProjectDeleteOutcome {
+    let _lifecycle = lifecycle;
+    let authority = match delete_authority(&c, &project, &team, requested_delete_ms) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            let delete_ms = requested_delete_ms
+                .or_else(|| c.projects.tombstone_of(&project))
+                .unwrap_or(0);
+            return ProjectDeleteOutcome {
+                removed: Vec::new(),
+                recreated: false,
+                logical_deleted: true,
+                cleanup_complete: false,
+                cleanup_residuals: vec![ProjectCleanupResidual::new(
+                    "cleanup_state",
+                    &project,
+                    "idempotent retry observed the logical tombstone, but no exact inventory survives to prove physical cleanup completed",
+                )],
+                delete_ms,
+                incarnation: None,
+            };
+        }
+        Err(residual) => {
+            return ProjectDeleteOutcome {
+                removed: Vec::new(),
+                recreated: false,
+                logical_deleted: false,
+                cleanup_complete: false,
+                cleanup_residuals: vec![residual],
+                delete_ms: requested_delete_ms.unwrap_or(0),
+                incarnation: None,
+            };
+        }
+    };
+    let (settings, generation_floor) = authority;
+    let incarnation = settings
+        .incarnation
+        .expect("delete authority always has an incarnation");
+    if let Some(delete_ms) = requested_delete_ms {
+        if delete_ms < generation_floor {
+            return ProjectDeleteOutcome {
+                removed: Vec::new(),
+                recreated: true,
+                logical_deleted: false,
+                cleanup_complete: true,
+                cleanup_residuals: Vec::new(),
+                delete_ms,
+                incarnation: Some(incarnation),
+            };
+        }
+    }
+
+    // Snapshot checkout ownership before cancellation: Drop-owned guards may
+    // disappear while the build unwinds, but their exact paths remain lineage
+    // evidence for the subsequent bounded source sweep.
+    let active_checkouts = crate::git::active_checkout_paths(&project, incarnation);
+    let mut drain_residuals = Vec::new();
+    if let Err(ids) = c
+        .build_cancels
+        .cancel_project_and_drain(&c, &project, incarnation, Duration::from_secs(10))
+        .await
+    {
+        drain_residuals.extend(ids.into_iter().map(|id| {
+            ProjectCleanupResidual::new(
+                "build_drain",
+                id,
+                "build task did not release its Drop-owned completion before the 10s deadline",
+            )
+        }));
+    }
+    if let Err(paths) =
+        crate::git::wait_for_checkout_drain(&project, incarnation, Duration::from_secs(10)).await
+    {
+        drain_residuals.extend(paths.into_iter().map(|path| {
+            ProjectCleanupResidual::new(
+                "checkout_drain",
+                path.display().to_string(),
+                "checkout reservation did not release before the 10s deadline",
+            )
+        }));
+    }
+    // Inventory only after cancellation/drain has settled. An already-admitted
+    // build can create exact-incarnation workflow storage while the delete is
+    // acquiring this writer; snapshotting before the drain would miss that new
+    // database and then falsely report cleanup complete. The pre-cancel checkout
+    // paths above remain source-lineage evidence even after their guards drop.
+    let inventory = project_delete_inventory(&c, &project, &team, &settings, &active_checkouts);
+
+    let delete_ms = match requested_delete_ms {
+        Some(delete_ms) => {
+            c.projects
+                .apply_delete_exact(&project, incarnation, delete_ms);
+            delete_ms
+        }
+        None => match c.projects.begin_delete_exact(
+            &project,
+            incarnation,
+            observed_project_version_ms(&c, &project),
+        ) {
+            Ok((_, delete_ms)) => delete_ms,
+            Err(error) => {
+                return ProjectDeleteOutcome {
+                    removed: Vec::new(),
+                    recreated: true,
+                    logical_deleted: false,
+                    cleanup_complete: false,
+                    cleanup_residuals: vec![ProjectCleanupResidual::new(
+                        "project_tombstone",
+                        &project,
+                        error.to_string(),
+                    )],
+                    delete_ms: 0,
+                    incarnation: Some(incarnation),
+                };
+            }
+        },
+    };
+
+    c.git_index.remove_project(&project);
+    let preserved_domains: std::collections::HashSet<String> = c
+        .projects
+        .all_domains()
+        .into_iter()
+        .map(|(_, domain)| domain)
+        .collect();
+    c.domains
+        .clear_verify_for_project(&project, &preserved_domains);
+    // Persist the exact logical tombstone before any async runtime/resource
+    // teardown. A process death after this point may leave residual bytes, but
+    // it can never resurrect routing or the project lifetime.
+    crate::persist::persist(&c);
+
+    let removed_records = c.gw.remove_project_incarnation(&project, incarnation).await;
+    let removed: Vec<String> = removed_records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect();
+    let mut cleanup_residuals = drain_residuals;
+    if cleanup_residuals.is_empty() {
+        cleanup_residuals
+            .extend(purge_project_resources(&c, &project, &team, delete_ms, &inventory).await);
+    } else {
+        for database in &inventory.databases {
+            cleanup_residuals.push(ProjectCleanupResidual::new(
+                "database_cleanup_deferred",
+                &database.id,
+                "retained because exact build/checkout drain did not complete",
+            ));
+        }
+        for volume in &inventory.current_volumes {
+            cleanup_residuals.push(ProjectCleanupResidual::new(
+                "volume_cleanup_deferred",
+                volume,
+                "retained because exact build/checkout drain did not complete",
+            ));
+        }
+        for build_id in &inventory.build_ids {
+            cleanup_residuals.push(ProjectCleanupResidual::new(
+                "source_cleanup_deferred",
+                build_id,
+                "retained because exact build/checkout drain did not complete",
+            ));
+        }
+        cleanup_residuals.extend(inventory.ambiguous_deployments.iter().map(|deployment| {
+            ProjectCleanupResidual::new(
+                "deployment_ownership",
+                &deployment.id,
+                format!(
+                    "retained: deployment does not carry exact incarnation {}",
+                    inventory.incarnation
+                ),
+            )
+        }));
+    }
+    let cleanup_complete = cleanup_residuals.is_empty();
+    c.audit.record(
+        &team,
+        "system",
+        if cleanup_complete {
+            "cleanup-complete"
+        } else {
+            "cleanup-incomplete"
+        },
+        "project",
+        &project,
+        &format!(
+            "incarnation={} delete_ms={} residuals={}",
+            incarnation,
+            delete_ms,
+            cleanup_residuals.len()
+        ),
+    );
+    record_event(
+        &c,
+        &project,
+        "delete",
+        &format!(
+            "deleted incarnation {incarnation} at generation {delete_ms}; deployments={}; cleanup_complete={cleanup_complete}; residuals={}",
+            removed.len(),
+            cleanup_residuals.len()
+        ),
+    );
+    crate::persist::persist(&c);
+    ProjectDeleteOutcome {
+        removed,
+        recreated: false,
+        logical_deleted: true,
+        cleanup_complete,
+        cleanup_residuals,
+        delete_ms,
+        incarnation: Some(incarnation),
+    }
+}
+
+/// LOCAL-ONLY project teardown used by HTTP and mesh receivers. The owned
+/// lifecycle guard moves into a spawned task before any await that request
+/// cancellation can drop; the task owns cancellation, tombstoning, exact route
+/// removal, and bounded physical cleanup to completion.
+async fn delete_project_local_requested(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+    requested_delete_ms: Option<u64>,
+) -> ProjectDeleteOutcome {
+    let lifecycle = crate::project_settings::lifecycle_write(project).await;
+    let task = tokio::spawn(delete_project_owned(
+        c.clone(),
+        project.to_string(),
+        team.to_string(),
+        requested_delete_ms,
+        lifecycle,
+    ));
+    match task.await {
+        Ok(outcome) => outcome,
+        Err(error) => ProjectDeleteOutcome {
+            removed: Vec::new(),
+            recreated: false,
+            logical_deleted: false,
+            cleanup_complete: false,
+            cleanup_residuals: vec![ProjectCleanupResidual::new(
+                "delete_task",
+                project,
+                format!("serialized deletion task failed: {error}"),
+            )],
+            delete_ms: requested_delete_ms.unwrap_or(0),
+            incarnation: None,
+        },
+    }
+}
+
+/// Mixed-version mesh/main call seam: propagated deletes always carry a
+/// generation. User-originated deletes call `delete_project_local_requested`
+/// with `None` so the exact owner issues the generation under its writer.
 pub(crate) async fn delete_project_local(
     c: &Arc<CloudState>,
     project: &str,
     team: &str,
     delete_ms: u64,
 ) -> ProjectDeleteOutcome {
-    let team = if team.trim().is_empty() {
-        norm(&c.projects.team_of(project)).to_string()
-    } else {
-        team.to_string()
-    };
-
-    // Apply the tombstone BEFORE awaiting deployment teardown. Any settings
-    // mutation that races after this point recreates strictly above delete_ms.
-    c.projects.apply_delete(project, delete_ms);
-    let ids = c.gw.remove_project_through(project, delete_ms).await;
-    let recreated = c
-        .projects
-        .get_if_set(project)
-        .is_some_and(|s| s.updated_ms > delete_ms)
-        || c.gw
-            .list()
-            .iter()
-            .any(|d| d.project == project && d.created_at_ms > delete_ms)
-        || c.peer_deployments
-            .read()
-            .values()
-            .flatten()
-            .any(|d| d.project == project && d.created_at_ms > delete_ms);
-
-    record_event(
-        c,
-        project,
-        "delete",
-        &format!(
-            "applied project delete generation {delete_ms} to {project} ({} deployment(s), recreated={recreated})",
-            ids.len()
-        ),
-    );
-
-    // Commit the generation before any best-effort reclamation. If a causal
-    // recreation exists, its settings/deployments and every shared resource
-    // remain intact; an old retry may only remove objects from its own era.
-    if !recreated {
-        c.git_index.remove_project(project);
-        // Custom domains gated on this project prove again on a future
-        // attach: a tombstoned project must not keep a domain "verified" —
-        // `custom_domain_bundles` reads the status alone and would renew its
-        // TLS forever, and a recreated same-name project would inherit
-        // routing it never proved. The zone records stay (DNS management is
-        // the tenant's, independent of any project).
-        let cleared_domains = c.domains.clear_verify_for_project(project);
-        if !cleared_domains.is_empty() {
-            tracing::info!(%project, domains = ?cleared_domains, "cleared custom-domain verification with project delete");
-        }
-    }
-    crate::persist::persist(c);
-    if !recreated {
-        // Reclamation runs detached so cancellation of the HTTP/mesh request
-        // cannot strand a half-applied delete. It re-checks the generation at
-        // task start before touching databases, volumes, sources or raw ports.
-        let (c2, project2, team2, n) = (c.clone(), project.to_string(), team.clone(), ids.len());
-        tokio::spawn(
-            async move { purge_project_resources(&c2, &project2, &team2, n, delete_ms).await },
-        );
-    }
-    ProjectDeleteOutcome {
-        removed: ids,
-        recreated,
-    }
+    delete_project_local_requested(c, project, team, Some(delete_ms)).await
 }
 
 /// Query for project_delete: `cascade=false` deletes only on this node (no mesh
@@ -5184,7 +6376,10 @@ pub(crate) fn git_for_project_fleet(
 fn source_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
-) -> Option<(fluid_core::GitSource, bool)> {
+) -> Option<(fluid_core::GitSource, bool, Vec<String>)> {
+    // The third element is the selected upload source's platform-issued BUILD
+    // id (`GitSource.commit`). Checkout dirs and retained archives are keyed by
+    // build id, not by the independently-minted deployment id.
     // The LIVE promoted deployment (production == true) outranks the lane
     // heuristic entirely: `target` is immutable while promote/rollback flips
     // only `production`, so after promoting a preview the current production
@@ -5195,8 +6390,10 @@ fn source_for_project_fleet(
     let mut best_prod: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_any: Option<(u64, fluid_core::GitSource)> = None;
     let mut consider = |ts: u64, g: fluid_core::GitSource, target: &str, production: bool| {
-        if production && best_live.as_ref().map_or(true, |(t, _)| ts >= *t) {
-            best_live = Some((ts, g.clone()));
+        if production {
+            if best_live.as_ref().map_or(true, |(t, _)| ts >= *t) {
+                best_live = Some((ts, g.clone()));
+            }
         }
         // `target` is immutable ("production"/"preview"); empty = pre-target
         // snapshot, fall back to the live promoted flag.
@@ -5205,8 +6402,10 @@ fn source_for_project_fleet(
             "preview" => false,
             _ => production,
         };
-        if prod_lane && best_prod.as_ref().map_or(true, |(t, _)| ts >= *t) {
-            best_prod = Some((ts, g.clone()));
+        if prod_lane {
+            if best_prod.as_ref().map_or(true, |(t, _)| ts >= *t) {
+                best_prod = Some((ts, g.clone()));
+            }
         }
         if best_any.as_ref().map_or(true, |(t, _)| ts >= *t) {
             best_any = Some((ts, g));
@@ -5226,10 +6425,24 @@ fn source_for_project_fleet(
             }
         }
     }
-    best_live
-        .or(best_prod)
-        .map(|(_, g)| (g, true))
-        .or(best_any.map(|(_, g)| (g, false)))
+    drop(consider);
+    let lineage_ids = |source: &fluid_core::GitSource| {
+        crate::git::upload_source_build_id(source)
+            .into_iter()
+            .collect()
+    };
+    if let Some((_, g)) = best_live {
+        let ids = lineage_ids(&g);
+        return Some((g, true, ids));
+    }
+    if let Some((_, g)) = best_prod {
+        let ids = lineage_ids(&g);
+        return Some((g, true, ids));
+    }
+    best_any.map(|(_, g)| {
+        let ids = lineage_ids(&g);
+        (g, false, ids)
+    })
 }
 
 /// The port + protocol the newest deployment for `project` was actually running with
@@ -5281,7 +6494,11 @@ fn image_port_spec_for_project_fleet(
             continue;
         };
         let Some(spec) = spec_from(f) else { continue };
-        if r.production && best_live.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+        if r.production
+            && best_live
+                .as_ref()
+                .map_or(true, |(ts, _)| r.created_at_ms >= *ts)
+        {
             best_live = Some((r.created_at_ms, spec.clone()));
         }
         let prod_lane = match r.target.trim() {
@@ -5289,10 +6506,17 @@ fn image_port_spec_for_project_fleet(
             "preview" => false,
             _ => r.production,
         };
-        if prod_lane && best_prod.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+        if prod_lane
+            && best_prod
+                .as_ref()
+                .map_or(true, |(ts, _)| r.created_at_ms >= *ts)
+        {
             best_prod = Some((r.created_at_ms, spec.clone()));
         }
-        if best_any.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+        if best_any
+            .as_ref()
+            .map_or(true, |(ts, _)| r.created_at_ms >= *ts)
+        {
             best_any = Some((r.created_at_ms, spec));
         }
     }
@@ -5326,6 +6550,41 @@ fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::T
         }),
         _ => None,
     }
+}
+
+/// One deterministic node hosting `project`, preferring the live production
+/// record and then the newest record. Project-level owner proxies use this when
+/// public round-robin ingress lands on a node with no local deployment state.
+fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    for deployment in c.gw.list() {
+        if deployment.project == project {
+            candidates.push((
+                deployment.production,
+                deployment.created_at_ms,
+                c.node_name.clone(),
+            ));
+        }
+    }
+    for (node, deployments) in c.peer_deployments.read().iter() {
+        for deployment in deployments {
+            if deployment.project == project {
+                candidates.push((
+                    deployment.production,
+                    deployment.created_at_ms,
+                    node.clone(),
+                ));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates.into_iter().next().map(|(_, _, node)| node)
 }
 
 /// Peer node NAMES hosting `project` — addressed by node (not HTTP admin URL) so the
@@ -5407,12 +6666,21 @@ pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<
         .map(|(node, _)| node.clone())
 }
 
-/// Host node NAME for any deployment of `project` (no HTTP-admin requirement).
-fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
+/// Host node NAME for the selected upload source lineage. Matching the
+/// platform-issued build id stamped in `GitSource.commit` is load-bearing: a
+/// host carrying only a newer preview checkout cannot rebuild production.
+fn host_node_for_source_ids(c: &Arc<CloudState>, ids: &[String]) -> Option<String> {
     c.peer_deployments
         .read()
         .iter()
-        .find(|(_, deps)| deps.iter().any(|d| d.project == project))
+        .find(|(_, deps)| {
+            deps.iter().any(|d| {
+                d.git.as_ref().is_some_and(|g| {
+                    crate::git::upload_source_build_id(g)
+                        .is_some_and(|id| ids.iter().any(|allowed| allowed == &id))
+                })
+            })
+        })
         .map(|(node, _)| node.clone())
 }
 
@@ -5607,8 +6875,10 @@ fn redeploy_request(
     no_fanout: bool,
     git_token: Option<String>,
     image_port_spec: Option<fluid_core::PortSpec>,
+    source_deployment_ids: Vec<String>,
 ) -> fluid_core::GitDeployRequest {
     fluid_core::GitDeployRequest {
+        source_deployment_ids,
         repo_url: src.repo_url.clone(),
         branch: Some(src.branch.clone()).filter(|b| !b.is_empty()),
         // Manual redeploy has no specific webhook-notified commit — build
@@ -5660,7 +6930,18 @@ async fn project_redeploy(
     Path(project): Path<String>,
     Json(body): Json<RedeployBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let incarnation = {
+        let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
+        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+        match c.projects.active_incarnation(&project) {
+            Ok(incarnation) => incarnation,
+            Err(crate::project_settings::ProjectIncarnationError::Legacy) => c
+                .projects
+                .ensure_incarnation(&project)
+                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+            Err(error) => return Err((StatusCode::NOT_FOUND, error.to_string())),
+        }
+    };
 
     // Environment chosen in the modal: "production" | "preview". When absent the
     // branch decides (Vercel's classification).
@@ -5669,13 +6950,20 @@ async fn project_redeploy(
         .as_ref()
         .map(|t| t.trim().to_lowercase())
         .filter(|t| t == "production" || t == "preview");
-    let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+    let root_dir = Some(
+        c.projects
+            .get_exact(&project, incarnation)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?
+            .build
+            .root_dir,
+    )
+    .filter(|s| !s.is_empty());
 
     // Resolve the newest deployment's SOURCE including the non-git pseudo-sources
     // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
     // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
     // zip-uploaded or image-based project (the reported bug).
-    let Some((src, prod_lane)) = source_for_project_fleet(&c, &project) else {
+    let Some((src, prod_lane, source_ids)) = source_for_project_fleet(&c, &project) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Project '{project}' has no deployment to redeploy yet."),
@@ -5697,7 +6985,7 @@ async fn project_redeploy(
     // rebuilds from its own source. (Git/image sources are re-fetchable anywhere and
     // fall through to the normal placement path below.)
     if !src.is_real_git() && src.repo_url.starts_with("upload://") {
-        if crate::git::has_local_source(&project) {
+        if crate::git::has_local_source_for_ids(&project, &source_ids) {
             let req = redeploy_request(
                 &project,
                 &src,
@@ -5707,11 +6995,14 @@ async fn project_redeploy(
                 true,
                 body.git_token.clone(),
                 image_spec.clone(),
+                source_ids.clone(),
             );
-            let build_id = crate::git::start_build(c.clone(), req);
+            let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
+                .await
+                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
             return Ok(Json(json!({ "build_id": build_id })));
         }
-        if let Some(host) = host_node_for_project(&c, &project) {
+        if let Some(host) = host_node_for_source_ids(&c, &source_ids) {
             if host != c.node_name {
                 if let Some(t) = target_for_node(&c, &host) {
                     let req = redeploy_request(
@@ -5723,8 +7014,17 @@ async fn project_redeploy(
                         true,
                         body.git_token.clone(),
                         image_spec.clone(),
+                        source_ids.clone(),
                     );
-                    let build_id = crate::git::redeploy_on_host(c.clone(), project.clone(), req, t);
+                    let build_id = crate::git::redeploy_on_host(
+                        c.clone(),
+                        project.clone(),
+                        req,
+                        t,
+                        Some(incarnation),
+                    )
+                    .await
+                    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
             }
@@ -5757,11 +7057,14 @@ async fn project_redeploy(
             false,
             body.git_token.clone(),
             image_spec.clone(),
+            source_ids.clone(),
         );
         req.repo_url = String::new();
         req.branch = None;
         req.image_ref = Some(image_ref);
-        let build_id = crate::git::start_build(c.clone(), req);
+        let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
@@ -5775,8 +7078,11 @@ async fn project_redeploy(
         false,
         body.git_token.clone(),
         image_spec,
+        source_ids,
     );
-    let build_id = crate::git::start_build(c.clone(), req);
+    let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     Ok(Json(json!({ "build_id": build_id })))
 }
 
@@ -6252,6 +7558,7 @@ async fn git_webhook(
 
         let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
         let req = fluid_core::GitDeployRequest {
+            source_deployment_ids: Vec::new(),
             repo_url: git.repo_url.clone(),
             branch: Some(deploy_branch).filter(|b| !b.is_empty()),
             // Pin to the EXACT commit GitHub notified us about — without this the
@@ -6288,7 +7595,22 @@ async fn git_webhook(
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
         };
-        let build_id = crate::git::start_build(c.clone(), req);
+        // Webhook push: not a fanout receiver and no pre-resolved incarnation
+        // (`req.project_incarnation` above is `None` too) — `start_build`
+        // determines/mints the current one itself under its own
+        // `lifecycle_write`. The project's own recorded team authenticates
+        // legacy-deployment adoption the same way `team_of` gates ownership
+        // elsewhere in this handler.
+        let webhook_team = norm(&c.projects.team_of(&project)).to_string();
+        let build_id = crate::git::start_build(c.clone(), req, None, Some(webhook_team))
+            .await
+            .map_err(|error| {
+                tracing::warn!(project = %project, %error, "git_webhook: start_build rejected the push");
+                error
+            });
+        let Ok(build_id) = build_id else {
+            continue;
+        };
         let ev = c.event(
             &c.region,
             "DEPLOY",
@@ -7847,7 +9169,10 @@ async fn cron_add(
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &job.deployment)?;
     job.tenant = t;
     match c.cron.add(job) {
-        Ok(j) => Ok(Json(json!(j))),
+        Ok(j) => {
+            crate::persist::persist(&c);
+            Ok(Json(json!(j)))
+        }
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
@@ -7876,6 +9201,7 @@ async fn cron_del(
         ));
     }
     c.cron.remove(&id);
+    crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
@@ -7926,6 +9252,7 @@ async fn cron_run(
     );
     c.record(ev);
     let updated = c.cron.record_manual_run(&id, now_ms());
+    crate::persist::persist(&c);
     Ok(Json(json!({ "status": status, "job": updated })))
 }
 
@@ -10375,7 +11702,7 @@ async fn databases_list(
         .databases
         .list(None)
         .into_iter()
-        .filter(|d| norm(&d.team) == t)
+        .filter(|d| record_tenant(&d.team) == t)
         .collect();
 
     // MERGE the leader's view rather than replacing or short-circuiting on
@@ -10387,7 +11714,7 @@ async fn databases_list(
             let have: std::collections::HashSet<String> =
                 list.iter().map(|d| d.id.clone()).collect();
             for d in remote {
-                if norm(&d.team) == t && !have.contains(&d.id) {
+                if record_tenant(&d.team) == t && !have.contains(&d.id) {
                     list.push(d);
                 }
             }
@@ -10423,7 +11750,13 @@ async fn databases_for_project(
     if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
     }
-    Json(json!(c.databases.list(Some(&project))))
+    let list: Vec<_> = c
+        .databases
+        .list(Some(&project))
+        .into_iter()
+        .filter(|d| record_tenant(&d.team) == t)
+        .collect();
+    Json(json!(list))
 }
 
 async fn database_get(
@@ -10434,7 +11767,7 @@ async fn database_get(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.databases.get(&id) {
-        if norm(&d.team) != t {
+        if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
         return Ok(Json(json!(d)));
@@ -10455,8 +11788,8 @@ async fn database_credentials(
 ) -> Result<Json<Value>, StatusCode> {
     // Returns unmasked connection secrets — must be strictly tenant-scoped.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some(d) = c.databases.get_raw(&id) {
-        if norm(&d.team) != t {
+    if let Some(d) = c.databases.credentials(&id) {
+        if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
         return Ok(Json(json!(d)));
@@ -10471,6 +11804,82 @@ async fn database_credentials(
         return Ok(Json(v));
     }
     Err(StatusCode::NOT_FOUND)
+}
+
+/// One-click "Open Studio" for a managed Supabase database: mint a short-lived,
+/// nonce-bearing login ticket. The ticket is returned only in a no-store JSON
+/// body; the dashboard POSTs it to the reserved database-host exchange path, so
+/// no bearer enters a URL, history, referrer, or upstream Studio request.
+async fn database_studio_open(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<(HeaderMap, Json<Value>), StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let (studio_password, studio_url, db_id, is_supabase) =
+        if let Some(d) = c.databases.get_raw(&id) {
+            if record_tenant(&d.team) != t {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            (
+                d.connection
+                    .get("STUDIO_PASSWORD")
+                    .cloned()
+                    .unwrap_or_default(),
+                d.connection.get("STUDIO_URL").cloned().unwrap_or_default(),
+                d.id.clone(),
+                d.kind == crate::databases::DbKind::Supabase,
+            )
+        } else if let Some(v) =
+            databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
+        {
+            // Replication-gap fallback: the leader applied the identical
+            // fail-closed tenant check before returning the record.
+            let conn = v.get("connection").cloned().unwrap_or_default();
+            let g = |k: &str| {
+                conn.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (
+                g("STUDIO_PASSWORD"),
+                g("STUDIO_URL"),
+                v.get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&id)
+                    .to_string(),
+                v.get("kind").and_then(|x| x.as_str()) == Some("supabase"),
+            )
+        } else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+    if !is_supabase || studio_password.is_empty() || !studio_url.starts_with("https://") {
+        return Err(StatusCode::CONFLICT);
+    }
+    let ticket = crate::db_rest::mint_studio_ticket(
+        &studio_password,
+        &db_id,
+        &c.node_name,
+        crate::db_rest::STUDIO_TICKET_TTL_MS,
+    );
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok((
+        response_headers,
+        Json(json!({
+            "action": format!(
+                "{}/_hive/studio-login",
+                studio_url.trim_end_matches('/')
+            ),
+            "ticket": ticket,
+            "expires_in_secs": crate::db_rest::STUDIO_TICKET_TTL_MS / 1000,
+        })),
+    ))
 }
 
 /// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning
@@ -10508,6 +11917,7 @@ pub(crate) fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Databas
                 key: k,
                 value: v,
                 target: "all".into(),
+                scope: "runtime".into(),
                 sensitive,
                 updated_ms: now_ms(),
             },
@@ -10533,6 +11943,232 @@ async fn db_directory(
     Ok(Json(json!(c.databases.directory())))
 }
 
+const DATABASE_INCARNATION_PROVIDER_PREFIX: &str = "__hive_internal_project_incarnation_v1__:";
+
+/// Carry lifecycle authority through the existing `ProvisionReq` mesh ABI.
+///
+/// The iroh dispatch arm deserializes the body into `ProvisionReq` before it
+/// calls this module, so an additive top-level field would be discarded there.
+/// `provider` is cosmetic and optional; a capability-gated internal sender
+/// temporarily wraps its original value here, and the receiver restores it
+/// before the record is created. Public callers can never make this marker
+/// authoritative: only the internal provision handler decodes it, after its
+/// peer/operator gate has passed.
+fn database_internal_provision(
+    mut req: crate::databases::ProvisionReq,
+    incarnation: fluid_core::ProjectIncarnation,
+) -> crate::databases::ProvisionReq {
+    let provider = serde_json::to_vec(&req.provider).unwrap_or_else(|_| b"null".to_vec());
+    let provider = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(provider);
+    req.provider = Some(format!(
+        "{DATABASE_INCARNATION_PROVIDER_PREFIX}{incarnation}:{provider}"
+    ));
+    req
+}
+
+fn database_internal_authority(
+    mut req: crate::databases::ProvisionReq,
+) -> Result<
+    (
+        crate::databases::ProvisionReq,
+        fluid_core::ProjectIncarnation,
+    ),
+    (StatusCode, String),
+> {
+    let encoded = req
+        .provider
+        .as_deref()
+        .and_then(|provider| provider.strip_prefix(DATABASE_INCARNATION_PROVIDER_PREFIX))
+        .ok_or((
+            StatusCode::CONFLICT,
+            "internal database provision is missing its server-issued project incarnation".into(),
+        ))?;
+    let (incarnation, provider) = encoded.split_once(':').ok_or((
+        StatusCode::BAD_REQUEST,
+        "internal database provision carries a malformed project incarnation".into(),
+    ))?;
+    let incarnation = incarnation.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "internal database provision carries an invalid project incarnation".into(),
+        )
+    })?;
+    let provider = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(provider)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "internal database provision carries malformed provider state".into(),
+            )
+        })?;
+    req.provider = serde_json::from_slice(&provider).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "internal database provision carries invalid provider state".into(),
+        )
+    })?;
+    Ok((req, incarnation))
+}
+
+fn database_project_authority(
+    c: &Arc<CloudState>,
+    project: &str,
+    team: &str,
+    expected: Option<fluid_core::ProjectIncarnation>,
+) -> Result<Option<(fluid_core::ProjectIncarnation, u64)>, (StatusCode, String)> {
+    if project.is_empty() {
+        return Ok(None);
+    }
+    if let Some(row) = c.projects.get_if_set(project) {
+        let owner = record_tenant(&row.team);
+        if owner != UNTAGGED_TENANT && owner != norm(team) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "project belongs to a different team".into(),
+            ));
+        }
+    }
+    let legacy_ids = legacy_deployment_ids_for_owner(c, project, team);
+    let incarnation = match expected {
+        Some(expected) => c
+            .projects
+            .ensure_incarnation_exact(project, expected)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+        None => c
+            .projects
+            .ensure_incarnation(project)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?,
+    };
+    c.projects
+        .set_team_exact(project, incarnation, team)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if !legacy_ids.is_empty() {
+        adopt_authorized_legacy_deployments(c, project, incarnation, legacy_ids)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    }
+    let settings = c
+        .projects
+        .get_exact(project, incarnation)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    Ok(Some((incarnation, settings.incarnation_created_ms)))
+}
+
+async fn database_incarnation_capable(c: &Arc<CloudState>, node: &str) -> bool {
+    let capable =
+        |value: &Value| value.get("delete_generation").and_then(Value::as_str) == Some("v1");
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Ok(response) = c
+            .http
+            .get(format!("{admin}/v1/project-delete/capabilities"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if capable(&value) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|candidate| candidate.name == node)
+        .and_then(|candidate| Some((candidate.peer_id?, candidate.iroh_addr?)));
+    let Some((id, address)) = target else {
+        return false;
+    };
+    crate::gossip::request_to(
+        c,
+        &id,
+        &address,
+        hive_p2p::GOSSIP_GET,
+        "/v1/project-delete/capabilities",
+        &[],
+        10,
+    )
+    .await
+    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+    .as_ref()
+    .is_some_and(capable)
+}
+
+fn database_ready_callback(
+    cloud: Arc<CloudState>,
+    project: String,
+    incarnation: Option<fluid_core::ProjectIncarnation>,
+) -> impl Fn(crate::databases::Database) + Send + 'static {
+    move |database| {
+        let cloud = cloud.clone();
+        let project = project.clone();
+        tokio::spawn(async move {
+            let _lifecycle = match incarnation {
+                Some(_) => Some(crate::project_settings::lifecycle_write(&project).await),
+                None => None,
+            };
+            if let Some(expected) = incarnation {
+                let project_is_current =
+                    cloud
+                        .projects
+                        .get_exact(&project, expected)
+                        .is_ok_and(|settings| {
+                            record_tenant(&settings.team) == norm(&database.team)
+                                && settings.owned_database_ids.contains(&database.id)
+                        });
+                let record_is_current =
+                    cloud
+                        .databases
+                        .get_raw(&database.id)
+                        .is_some_and(|current| {
+                            current.id == database.id
+                                && current.project == project
+                                && current.team == database.team
+                                && current.created_ms == database.created_ms
+                        });
+                if !project_is_current || !record_is_current {
+                    tracing::warn!(
+                        project,
+                        incarnation = %expected,
+                        database = %database.id,
+                        "discarding database completion after its project incarnation changed"
+                    );
+                    teardown_db_backing(&database).await;
+                    cloud
+                        .databases
+                        .remove_db_and_purge_data(&database.id, &database.team);
+                    crate::persist::persist(&cloud);
+                    return;
+                }
+            }
+            if !database.project.is_empty()
+                && matches!(database.status, crate::databases::DbStatus::Ready)
+            {
+                apply_db_egress(&cloud, &database);
+            }
+            if !database.replicas.is_empty() {
+                crate::db_replicate::ensure_replicas(cloud.clone(), database.clone());
+            }
+            crate::persist::persist(&cloud);
+            crate::webhooks::dispatch(
+                &cloud.webhooks,
+                &project,
+                "database.ready",
+                json!({
+                    "id": database.id,
+                    "name": database.name,
+                    "kind": database.kind,
+                    "status": database.status,
+                }),
+            );
+        });
+    }
+}
+
 async fn database_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10544,14 +12180,34 @@ async fn database_create(
     // trusted outright whenever non-empty, letting any caller register a
     // database (and auto-inject its connection env) under a DIFFERENT tenant.
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let project = req.project.clone();
+    // Database admission is a project-lifecycle mutation: mint/resolve the
+    // lifetime and insert the provisioning record while holding the same writer
+    // project deletion owns. An empty project is deliberately unbound storage
+    // and has no project lifetime to serialize against.
+    let _lifecycle = if project.is_empty() {
+        None
+    } else {
+        Some(crate::project_settings::lifecycle_write(&project).await)
+    };
     // Only enforce project ownership when the project is ALREADY registered
     // (has a team of record) — provisioning a database for a brand-new
     // project name before its first deploy is a normal flow and must keep
     // working. An EXISTING project owned by a different tenant is rejected.
-    if !req.project.is_empty() && c.projects.snapshot().contains_key(&req.project) {
-        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &req.project)?;
+    if !project.is_empty() && c.projects.snapshot().contains_key(&project) {
+        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     }
-    let project = req.project.clone();
+    let authority = database_project_authority(&c, &project, &req.team, None)?;
+    let incarnation = authority.map(|(incarnation, _)| incarnation);
+    let owned_database_ids: std::collections::HashSet<String> = incarnation
+        .and_then(|expected| c.projects.get_exact(&project, expected).ok())
+        .map(|settings| settings.owned_database_ids.into_iter().collect())
+        .unwrap_or_default();
+    if incarnation.is_some() {
+        // The internal target must be able to validate this exact identity even
+        // if the request is cancelled before provisioning finishes.
+        crate::persist::persist(&c);
+    }
     // Idempotency: provision() itself always mints a fresh id with no dedup
     // check, so a client double-submit (double-click, a retry racing a slow
     // response) silently created exact duplicate databases — witnessed live,
@@ -10568,6 +12224,7 @@ async fn database_create(
             d.team == req.team
                 && d.name == req.name
                 && d.kind == req.kind
+                && (incarnation.is_none() || owned_database_ids.contains(&d.id))
                 && !matches!(d.status, crate::databases::DbStatus::Error)
         })
         .map(|d| d.id)
@@ -10595,7 +12252,7 @@ async fn database_create(
         .filter(|r| !r.is_empty())
         .and_then(|region| {
             let regions = [region.to_string()];
-            crate::schedule::place(&c, &regions, true, true, false, false)
+            crate::schedule::place(&c, &regions, true, true, false, false, false, false)
                 .into_iter()
                 .next()
         })
@@ -10615,29 +12272,61 @@ async fn database_create(
         // replicates back fleet-wide through the existing `databases`
         // store-sync path (the same one that already carries every other
         // node's database records into this node's own `state.json`).
-        if let Some(v) = post_body_to_host(
-            &c,
-            &host_node,
-            "/v1/internal/databases/provision-local",
-            &req.team,
-            &json!(req),
-        )
-        .await
-        {
-            // Adopt the authoritative record into THIS node's own local store
-            // immediately, rather than waiting on `store_sync`'s replication
-            // tick — otherwise a delete that arrives back on THIS node (the one
-            // the client actually talks to) moments later finds nothing in
-            // `c.databases` yet and silently no-ops while still reporting
-            // `removed: true`, leaking the remote container. Witnessed live:
-            // create dispatched sj->bkk, immediate delete issued on sj, bkk
-            // container survived with no warn logged at all — the outer lookup
-            // itself was returning `None`. `upsert_replica` is the existing
-            // insert-or-replace-by-id primitive for exactly this shape.
-            if let Ok(db) = serde_json::from_value::<crate::databases::Database>(v.clone()) {
-                c.databases.upsert_replica(db);
+        let remote_req = match incarnation {
+            Some(expected) if database_incarnation_capable(&c, &host_node).await => {
+                Some(database_internal_provision(req.clone(), expected))
             }
-            return Ok(Json(v));
+            Some(expected) => {
+                tracing::warn!(
+                    node = %host_node,
+                    project,
+                    incarnation = %expected,
+                    "database create: target does not advertise project-lifecycle fencing; provisioning locally"
+                );
+                None
+            }
+            None => Some(req.clone()),
+        };
+        if let Some(remote_req) = remote_req {
+            if let Some(v) = post_body_to_host(
+                &c,
+                &host_node,
+                "/v1/internal/databases/provision-local",
+                &req.team,
+                &json!(remote_req),
+            )
+            .await
+            {
+                if let Some(error) = v.get("error").and_then(Value::as_str) {
+                    return Err((StatusCode::CONFLICT, error.to_string()));
+                }
+                // Adopt the authoritative record into THIS node's own local store
+                // immediately, rather than waiting on `store_sync`'s replication
+                // tick — otherwise a delete that arrives back on THIS node (the one
+                // the client actually talks to) moments later finds nothing in
+                // `c.databases` yet and silently no-ops while still reporting
+                // `removed: true`, leaking the remote container. Witnessed live:
+                // create dispatched sj->bkk, immediate delete issued on sj, bkk
+                // container survived with no warn logged at all — the outer lookup
+                // itself was returning `None`. `upsert_replica` is the existing
+                // insert-or-replace-by-id primitive for exactly this shape.
+                let db = serde_json::from_value::<crate::databases::Database>(v.clone()).map_err(
+                    |error| {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            format!("database owner returned an invalid record: {error}"),
+                        )
+                    },
+                )?;
+                if let Some(expected) = incarnation {
+                    c.projects
+                        .claim_database_exact(&project, expected, db.id.clone())
+                        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                }
+                c.databases.upsert_replica(db);
+                crate::persist::persist(&c);
+                return Ok(Json(v));
+            }
         }
         // Dispatch failed (node unreachable over both HTTP admin and mesh) —
         // fall through to local provisioning rather than failing the create
@@ -10658,26 +12347,18 @@ async fn database_create(
         c.db_domain.clone(),
         c.node_name.clone(),
         c.api_base(),
-        move |d| {
-            // EGRESS: auto-inject this DB's connection env into the owning project so
-            // its deployments can reach it with zero manual copy-paste. Only when the
-            // DB is actually ready (connection populated).
-            if !d.project.is_empty() && matches!(d.status, crate::databases::DbStatus::Ready) {
-                apply_db_egress(&cloud, &d);
-            }
-            // REPLICATION: if replica regions were configured, fan the DB out to them.
-            if !d.replicas.is_empty() {
-                crate::db_replicate::ensure_replicas(cloud.clone(), d.clone());
-            }
-            crate::persist::persist(&cloud);
-            crate::webhooks::dispatch(
-                &cloud.webhooks,
-                &project,
-                "database.ready",
-                json!({ "id": d.id, "name": d.name, "kind": d.kind, "status": d.status }),
-            );
-        },
+        database_ready_callback(cloud, project.clone(), incarnation),
     );
+    if let Some(expected) = incarnation {
+        if let Err(error) = c
+            .projects
+            .claim_database_exact(&project, expected, db.id.clone())
+        {
+            teardown_db_backing(&db).await;
+            c.databases.remove_db_and_purge_data(&db.id, &db.team);
+            return Err((StatusCode::CONFLICT, error.to_string()));
+        }
+    }
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
@@ -10705,8 +12386,48 @@ pub(crate) async fn database_provision_local(
     Json(req): Json<crate::databases::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator_or_internal(&headers, claims.as_ref().map(|e| &e.0))?;
-    let cloud = c.clone();
+    let (req, incarnation) = if req.project.is_empty() {
+        (req, None)
+    } else {
+        let (req, incarnation) = database_internal_authority(req)?;
+        (req, Some(incarnation))
+    };
     let project = req.project.clone();
+    let _lifecycle = if project.is_empty() {
+        None
+    } else {
+        Some(crate::project_settings::lifecycle_write(&project).await)
+    };
+    let authority = database_project_authority(&c, &project, &req.team, incarnation)?;
+    let incarnation = authority.map(|(incarnation, _)| incarnation);
+    let owned_database_ids: std::collections::HashSet<String> = incarnation
+        .and_then(|expected| c.projects.get_exact(&project, expected).ok())
+        .map(|settings| settings.owned_database_ids.into_iter().collect())
+        .unwrap_or_default();
+    if incarnation.is_some() {
+        crate::persist::persist(&c);
+    }
+
+    // A cancelled coordinator request can be retried after this node already
+    // admitted the first copy. Deduplicate under the same lifecycle writer so
+    // the retry cannot mint a second database in this incarnation.
+    if let Some(existing) = c
+        .databases
+        .list(Some(&project))
+        .into_iter()
+        .find(|database| {
+            database.team == req.team
+                && database.name == req.name
+                && database.kind == req.kind
+                && (incarnation.is_none() || owned_database_ids.contains(&database.id))
+                && !matches!(database.status, crate::databases::DbStatus::Error)
+        })
+        .and_then(|database| c.databases.get_raw(&database.id))
+    {
+        return Ok(Json(json!(existing)));
+    }
+
+    let cloud = c.clone();
     let db = crate::databases::provision(
         c.databases.clone(),
         c.region.clone(),
@@ -10714,22 +12435,18 @@ pub(crate) async fn database_provision_local(
         c.db_domain.clone(),
         c.node_name.clone(),
         c.api_base(),
-        move |d| {
-            if !d.project.is_empty() && matches!(d.status, crate::databases::DbStatus::Ready) {
-                apply_db_egress(&cloud, &d);
-            }
-            if !d.replicas.is_empty() {
-                crate::db_replicate::ensure_replicas(cloud.clone(), d.clone());
-            }
-            crate::persist::persist(&cloud);
-            crate::webhooks::dispatch(
-                &cloud.webhooks,
-                &project,
-                "database.ready",
-                json!({ "id": d.id, "name": d.name, "kind": d.kind, "status": d.status }),
-            );
-        },
+        database_ready_callback(cloud, project.clone(), incarnation),
     );
+    if let Some(expected) = incarnation {
+        if let Err(error) = c
+            .projects
+            .claim_database_exact(&project, expected, db.id.clone())
+        {
+            teardown_db_backing(&db).await;
+            c.databases.remove_db_and_purge_data(&db.id, &db.team);
+            return Err((StatusCode::CONFLICT, error.to_string()));
+        }
+    }
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
@@ -10951,7 +12668,7 @@ async fn database_delete(
         }
     }
     if let Some(d) = record {
-        if norm(&d.team) != t {
+        if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
         // Remove the auto-injected egress env vars from the owning project.
@@ -11053,7 +12770,7 @@ async fn database_rotate(
     let Some(d) = c.databases.get_raw(&id) else {
         return Err(StatusCode::NOT_FOUND);
     };
-    if norm(&d.team) != t {
+    if record_tenant(&d.team) != t {
         return Err(StatusCode::NOT_FOUND);
     }
     let Some(rotated) = crate::databases::rotate_blob_credentials(&c.databases, &id) else {
@@ -11094,7 +12811,7 @@ pub(crate) async fn database_replica(
     // against yet and is unaffected.
     if !db.id.trim().is_empty() {
         if let Some(existing) = c.databases.get_raw(&db.id) {
-            if norm(&existing.team) != norm(&db.team) {
+            if record_tenant(&existing.team) != norm(&db.team) {
                 return Err((
                     StatusCode::FORBIDDEN,
                     "db belongs to a different team".into(),
@@ -11730,6 +13447,7 @@ async fn securelink_create(
                 key: rec.env_var.clone(),
                 value: rec.local_addr.clone(),
                 target: "all".into(),
+                scope: "runtime".into(),
                 sensitive: false,
                 updated_ms: now_ms(),
             },
@@ -14932,142 +16650,5 @@ mod tenant_isolation_tests {
         assert!(!super::ct_eq("same-secret", "different"));
         assert!(!super::ct_eq("short", "shorter-value"));
         assert!(super::ct_eq("", ""));
-    }
-}
-
-#[cfg(test)]
-mod project_purge_tests {
-    use super::*;
-
-    /// REGRESSION TEST for a real, confirmed GDPR Art.17 gap: nothing ever
-    /// removed a project's backing container volume — removing the container
-    /// that mounted it leaves the NAMED volume (and the customer data inside
-    /// it) on host disk forever. Real container-CLI calls (no mocking):
-    /// creates two projects' volumes (one with a per-service suffix, matching
-    /// a compose deployment), purges one, and confirms the OTHER project's
-    /// volume — including one whose name is a superstring of the deleted
-    /// project's — survives untouched. On macOS, creates the target's volumes
-    /// in BOTH backends (podman + Apple `container`) to prove the dual-store
-    /// sweep in `purge_project_podman_volumes` actually cleans both.
-    #[tokio::test]
-    async fn purge_project_podman_volumes_removes_only_the_target_project() {
-        let path_env = std::env::var("PATH").unwrap_or_default();
-        let backends: &[bool] = if hive_backend::container_cli::is_apple_default() {
-            &[false, true]
-        } else {
-            &[false]
-        };
-        let mut usable: Vec<bool> = Vec::new();
-        for &apple in backends {
-            if hive_backend::container_cli::available(apple).await {
-                usable.push(apple);
-            } else {
-                eprintln!("skipping backend apple={apple}: CLI not found/usable");
-            }
-        }
-        if usable.is_empty() {
-            eprintln!("skipping: no container CLI available");
-            return;
-        }
-
-        let suffix = std::process::id();
-        let target = format!("purgetest-{suffix}");
-        // A different project whose name CONTINUES the same characters with
-        // no delimiter — the exact false-positive case the exact-or-`-`-
-        // suffix check exists to exclude (see the function's doc comment for
-        // the case it does NOT cover: a different project literally named
-        // `<target>-<anything>`).
-        let other = format!("purgetest-{suffix}other");
-
-        for &apple in &usable {
-            let bin = hive_backend::container_cli::bin(apple);
-            for name in [
-                format!("hive-vol-{target}"),
-                format!("hive-vol-{target}-worker"),
-                format!("hive-vol-{other}"),
-            ] {
-                let _ = tokio::process::Command::new(bin)
-                    .args(["volume", "create", &name])
-                    .output()
-                    .await;
-            }
-        }
-
-        purge_project_podman_volumes(&target).await;
-
-        for &apple in &usable {
-            let names = hive_backend::container_cli::list_volume_names(apple, &path_env).await;
-            assert!(
-                !names.contains(&format!("hive-vol-{target}")),
-                "target project's base volume must be removed (apple={apple})"
-            );
-            assert!(
-                !names.contains(&format!("hive-vol-{target}-worker")),
-                "target project's per-service volume must be removed (apple={apple})"
-            );
-            assert!(
-                names.contains(&format!("hive-vol-{other}")),
-                "a DIFFERENT project whose name is a superstring must survive (apple={apple})"
-            );
-
-            // Cleanup whatever's left (the `other` volume this test created).
-            let bin = hive_backend::container_cli::bin(apple);
-            let _ = tokio::process::Command::new(bin)
-                .args(hive_backend::container_cli::volume_rm_args(
-                    apple,
-                    &format!("hive-vol-{other}"),
-                ))
-                .output()
-                .await;
-        }
-    }
-
-    #[tokio::test]
-    async fn purge_project_source_dirs_removes_only_matching_checkouts() {
-        // Real filesystem, real `deploy_root()` — confirms the synchronous
-        // cleanup (added so a deleted project's source, which can carry
-        // committed secrets/PII, doesn't linger for up to ~40 minutes waiting
-        // on the periodic gc_build_dirs timer) removes the target project's
-        // checkout dir(s) — including a `-building-<ms>` in-progress checkout,
-        // the OTHER real naming shape this repo uses (git.rs:3391) — while
-        // leaving an unrelated project's checkout untouched. Uses the same
-        // `<project>-<stamp>` prefix convention as `newest_deploy_dir`
-        // (git.rs) — like that existing function, this is a prefix match, not
-        // a delimiter-exact one, which is a pre-existing, accepted property
-        // of this convention (project names are allocated to be globally
-        // unique, per the "Pick a globally-unique project name" comment on
-        // git.rs's project-name allocator), not a new gap introduced here.
-        let base = crate::git::deploy_root();
-        tokio::fs::create_dir_all(&base).await.unwrap();
-        let suffix = std::process::id();
-        let project = format!("purge-src-{suffix}");
-        let target_dir = base.join(format!("{project}-abc123"));
-        let target_building_dir = base.join(format!("{project}-building-999999"));
-        let unrelated_dir = base.join(format!("purge-src-unrelated-{suffix}-xyz789"));
-        tokio::fs::create_dir_all(&target_dir).await.unwrap();
-        tokio::fs::create_dir_all(&target_building_dir)
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(&unrelated_dir).await.unwrap();
-        tokio::fs::write(target_dir.join("secret.env"), b"DATABASE_URL=leaked")
-            .await
-            .unwrap();
-
-        purge_project_source_dirs(&project).await;
-
-        assert!(
-            !target_dir.exists(),
-            "target project's checkout must be removed"
-        );
-        assert!(
-            !target_building_dir.exists(),
-            "target project's in-progress -building- checkout must also be removed"
-        );
-        assert!(
-            unrelated_dir.exists(),
-            "an unrelated project's checkout must survive"
-        );
-
-        let _ = tokio::fs::remove_dir_all(&unrelated_dir).await;
     }
 }

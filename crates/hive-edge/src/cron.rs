@@ -103,6 +103,17 @@ impl CronScheduler {
         *self.jobs.write() = deduped;
     }
 
+    /// Recompute every job's `next_run_ms` from its schedule expression.
+    /// Called after restore to derive schedule state from the persisted
+    /// config (telemetry fields `last_run_ms`/`runs` are left at zero).
+    pub fn recompute_all(&self) {
+        let now = now_ms();
+        let mut jobs = self.jobs.write();
+        for job in jobs.iter_mut() {
+            job.next_run_ms = next_after(&job.schedule, now);
+        }
+    }
+
     /// Look up a single job by id.
     pub fn get(&self, id: &str) -> Option<CronJob> {
         self.jobs.read().iter().find(|j| j.id == id).cloned()

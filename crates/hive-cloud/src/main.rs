@@ -8,6 +8,7 @@
 mod acme;
 mod admin;
 mod apikeys;
+mod app_discovery;
 mod audit;
 mod auth;
 mod billing;
@@ -18,6 +19,7 @@ mod browser_db_rest;
 // bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
 mod browser_metering;
 mod browser_presence;
+mod build_executor;
 mod cluster;
 mod compose;
 mod databases;
@@ -90,6 +92,7 @@ mod tencent_eip;
 mod udp_relay;
 mod vercel_dns;
 mod webhooks;
+mod workspace;
 mod world;
 mod world_queue;
 #[cfg(feature = "zkauth")]
@@ -362,6 +365,11 @@ struct Args {
     /// itself. Non-zero exit on failure, so it composes into a shell check.
     #[arg(long = "litebox-probe")]
     litebox_probe: bool,
+    /// Debug-build-only destructive diagnostic against HIVE_DATA. Intended only
+    /// for disposable stores; release binaries do not expose this flag.
+    #[cfg(debug_assertions)]
+    #[arg(long = "guardian-lifecycle-diagnostic")]
+    guardian_lifecycle_diagnostic: bool,
 }
 
 #[tokio::main]
@@ -380,6 +388,12 @@ async fn main() -> anyhow::Result<()> {
     // guardian init ("Database already open") until the next restart.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
+
+    #[cfg(debug_assertions)]
+    if args.guardian_lifecycle_diagnostic {
+        println!("{}", guardian::lifecycle_diagnostic().await?);
+        return Ok(());
+    }
 
     // Operator diagnostic — answered and exited BEFORE any node state exists,
     // so it can be run safely from a laptop, a bastion or a live fleet node
@@ -516,13 +530,15 @@ async fn main() -> anyhow::Result<()> {
             fc_cfg.boot_args = ba;
         }
     }
-    let firecracker = Arc::new(FirecrackerBackend::new(fc_cfg));
+    let firecracker = Arc::new(FirecrackerBackend::new(fc_cfg.clone()));
+    let firecracker_runtime_capabilities =
+        resources::RuntimeCapabilitySource::firecracker(firecracker.clone(), &fc_cfg);
     // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
     // backend — gossiped so the placement scheduler only auto-targets
-    // real-microVM nodes (never the local/mock Mac nodes). `sandbox_fc`
-    // retains the CONCRETE type (Sandboxes' exec/kill methods are
-    // Firecracker-specific, not part of the generic `CellBackend` trait
-    // object every other subsystem sees).
+    // production isolation backends (never the local/mock Mac nodes).
+    // `sandbox_fc` retains the CONCRETE type (Sandboxes' exec/kill methods are
+    // Firecracker-specific, not part of the generic `CellBackend` trait object
+    // every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
     let sandbox_fc: Option<Arc<FirecrackerBackend>> =
         sandbox_fc_supported.then(|| firecracker.clone());
@@ -537,9 +553,14 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
-    let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) = if sandbox_fc_supported {
+    let litebox_runtime_capabilities = resources::RuntimeCapabilitySource::litebox(litebox.clone());
+    let (backend, backend_name, runtime_capability_source): (
+        Arc<dyn CellBackend>,
+        &'static str,
+        resources::RuntimeCapabilitySource,
+    ) = if sandbox_fc_supported {
         tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
-        (firecracker, "firecracker")
+        (firecracker, "firecracker", firecracker_runtime_capabilities)
     } else if litebox_supported {
         // See `hive_backend::litebox`'s module doc for the full, honest
         // security posture — this beats mock's zero isolation but is NOT
@@ -549,7 +570,7 @@ async fn main() -> anyhow::Result<()> {
              — real microVMs unavailable/suppressed on this host. NOT a hardware isolation \
              boundary; see hive_backend::litebox module doc for the full security posture."
         );
-        (litebox, "litebox")
+        (litebox, "litebox", litebox_runtime_capabilities)
     } else {
         if force_mock && !litebox_verified {
             tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1, no verified Litebox) — runtime is mocked for local development");
@@ -565,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
                 cache_root: std::env::temp_dir().join("hive-cloud-cache"),
             })),
             "mock",
+            resources::RuntimeCapabilitySource::mock(),
         )
     };
     let backend_name = backend_name.to_string();
@@ -617,12 +639,33 @@ async fn main() -> anyhow::Result<()> {
     // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
     // gossip so placement can target GPU hosts for gpu-requesting functions.
     let gpus = resources::detect_gpus();
-    // Wasmer-runtime probe, same shape and same purpose as the GPU probe above:
-    // advertise a real capability so placement never hands a deployment to a
-    // node that cannot execute it. Backend-aware — see `detect_wasm_runtime`,
-    // which checks the GUEST rootfs on Firecracker and the HOST PATH elsewhere,
-    // because that is where the respective backends actually exec `start_cmd`.
-    let wasm_rt = resources::detect_wasm_runtime(&backend_name);
+    // Observe all three runtime capabilities from the backend that was actually
+    // selected above. Firecracker reuses its provision-time exact-rootfs proof;
+    // Litebox answers only after its selected instance remains supported (and
+    // NEVER advertises Bun regardless — its syscall shim panics on Bun's own
+    // boot probe); Mock never advertises runtime-artifact isolation.
+    let runtime_capabilities = runtime_capability_source.detect().await;
+    let wasm_rt = runtime_capabilities.wasm_runtime;
+    let bun_rt = runtime_capabilities.bun_runtime;
+    let runtime_artifact_protocol = runtime_capabilities.runtime_artifact_protocol;
+    // A declaration is never enough: initialization re-hashes runsc and the
+    // nft policy, checks the exact network/image/runtime, then executes a real
+    // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
+    let build_isolation_protocol = match build_executor::init_installed().await {
+        Ok(protocol) => {
+            tracing::info!(protocol, "BuildExecutor live probe passed");
+            Some(protocol)
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = ?error.code,
+                operation = error.operation,
+                detail = error.detail(),
+                "BUILD_ISOLATION_UNAVAILABLE: repository builds disabled on this node"
+            );
+            None
+        }
+    };
     // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
     // node has a real peer id and can serve/accept Hive tunnels across networks.
     // Best-effort with a timeout: if it can't bind (offline), the node still boots
@@ -908,6 +951,11 @@ async fn main() -> anyhow::Result<()> {
         backend: backend_name.clone(),
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
+        bun_runtime: bun_rt,
+        runtime_artifact_protocol,
+        // The executor may be initialized above, but this stays fail-closed until
+        // every git build surface consumes it in this binary.
+        build_isolation_protocol: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
         provider: std::env::var("HIVE_CLOUD_PROVIDER")
@@ -920,13 +968,22 @@ async fn main() -> anyhow::Result<()> {
         cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name,
         gpus = gpus.0, gpu_model = gpus.1.as_deref().unwrap_or("-"), gpu_vram_mb = gpus.2,
         wasm_runtime = wasm_rt.unwrap_or(false),
+        bun_runtime = bun_rt.unwrap_or(false),
+        runtime_artifact_protocol = ?runtime_artifact_protocol,
         "node host capacity"
     );
     if wasm_rt != Some(true) {
         tracing::info!(
             backend = %backend_name,
             "no wasmer runtime on the filesystem this node's functions exec against — \
-             Runtime::Wasmer deployments will not be placed here (see detect_wasm_runtime)"
+             Runtime::Wasmer deployments will not be placed here (see the active-backend capability probe)"
+        );
+    }
+    if bun_rt != Some(true) {
+        tracing::info!(
+            backend = %backend_name,
+            "no bun runtime on the filesystem this node's functions exec against — \
+             Runtime::Bun deployments will not be placed here (see the active-backend capability probe)"
         );
     }
     let registry = NodeRegistry::new(me);
@@ -1063,7 +1120,13 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(grace).await;
             }
             tracing::info!("shutdown requested → flushing platform state");
-            persist::flush_blocking();
+            let final_guardian_generation = match persist::flush_blocking() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    tracing::error!(%error, "platform-state shutdown flush failed; Guardian shutdown will not await an unconfirmed generation");
+                    None
+                }
+            };
             // Stamp the run marker as a GRACEFUL exit. Without this every
             // deploy restart and every `systemctl restart` would be classified
             // `unclean_exit` on the way back up, and a signal that fires on
@@ -1089,6 +1152,13 @@ async fn main() -> anyhow::Result<()> {
             // `Endpoint::close()` must be awaited to completion rather than left to
             // process teardown; it is bounded here so a wedged relay can never turn
             // a clean restart into a hung one.
+            // Drain the exact final admitted Guardian generation and durably shut
+            // the backend down (Docs/Router/Store) before the endpoint closes and
+            // the process exits — an acknowledged write must not merely reach the
+            // watch channel and then be abandoned mid-flight by process::exit.
+            if let Err(error) = crate::guardian::shutdown(final_guardian_generation).await {
+                tracing::error!(%error, "Guardian shutdown did not complete cleanly; exiting anyway");
+            }
             // Bound to its own statement so the lock guard is dropped BEFORE the
             // await below — holding it across an await makes this future non-Send.
             let endpoint = flush_cloud.iroh.read().clone();
@@ -1482,7 +1552,7 @@ async fn main() -> anyhow::Result<()> {
     // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
     spawn_anti_entropy_loop(cloud.clone());
     spawn_geo_refresh(cloud.registry.clone());
-    spawn_disk_refresh(cloud.registry.clone(), backend_name.clone());
+    spawn_disk_refresh(cloud.registry.clone(), runtime_capability_source.clone());
     spawn_memory_pressure_alarm();
 
     // Billing meter loop: periodically converts measured fleet compute usage into
@@ -1612,7 +1682,7 @@ async fn main() -> anyhow::Result<()> {
     // `active`). On the control-plane leader that also fails every admin
     // mutation fleet-wide, because the leader-forward candidate list is built
     // from the local registry and comes out empty. See `meshwatch`.
-    meshwatch::spawn(cloud.clone());
+    meshwatch::spawn(cloud.clone(), controlled_restart.clone());
     tenancy_reconcile::spawn(cloud.clone());
     spawn_deletion_reconcile_loop(cloud.clone());
 
@@ -1668,6 +1738,12 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        // guardian-growth-and-gc-observability: guardian.rs owns this route's
+        // handler/state end-to-end (single-writer scope), so it merges here
+        // rather than adding a line inside admin::router() itself. Same
+        // auth/rate-limit/body-limit/timeout layers as every other admin
+        // route below.
+        .merge(crate::guardian::routes().with_state(cloud.clone()))
         .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn_with_state(
             cloud.clone(),
@@ -2836,31 +2912,33 @@ fn resolve_private_addr() -> Option<String> {
 ///
 /// Cheap by construction: one `statvfs`-class read per tick, no CPU sampling.
 /// `HIVE_DISK_REFRESH_SECS` (default 30) tunes it; 0 disables.
-fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>, backend_name: String) {
+fn spawn_disk_refresh(
+    registry: Arc<hive_edge::NodeRegistry>,
+    runtime_capability_source: resources::RuntimeCapabilitySource,
+) {
     let interval = Duration::from_secs(env_u64("HIVE_DISK_REFRESH_SECS", 30));
     if interval.is_zero() {
         return;
     }
     crate::supervise::spawn_supervised("disk-refresh", move || {
         let registry = registry.clone();
-        let backend_name = backend_name.clone();
+        let runtime_capability_source = runtime_capability_source.clone();
         async move {
             loop {
                 tokio::time::sleep(interval).await;
                 crate::supervise::beat("disk-refresh");
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
                 registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
-                // Same tick, same reason: the wasm capability moves UNDER a
-                // running process in both directions. Baking wasmer into the
-                // guest rootfs writes the marker while this process keeps
-                // running (so a boot-only value stays false after a successful
-                // bake and every Wasmer deploy is still refused), and a later
-                // rootfs rebuild WITHOUT wasmer removes it (so a boot-only value
-                // keeps claiming true for an image that lost the binary, which
-                // routes Wasmer work onto a node that can only fail it). One
-                // Path::exists() on firecracker, a PATH scan elsewhere.
-                registry
-                    .set_self_wasm_runtime(crate::resources::detect_wasm_runtime(&backend_name));
+                // Rootfs/proof publication and runtime installation can move
+                // underneath this process. Re-observe all three fields from one
+                // selected-backend source, then publish the tuple under one
+                // registry write lock so gossip can never see a torn verdict.
+                let runtime_capabilities = runtime_capability_source.detect().await;
+                registry.set_self_runtime_capabilities(
+                    runtime_capabilities.wasm_runtime,
+                    runtime_capabilities.bun_runtime,
+                    runtime_capabilities.runtime_artifact_protocol,
+                );
                 // Same tick, same reason as the disk figure: the restart
                 // audit's 24h window SLIDES, so a boot-time-only value goes
                 // stale in the direction that matters (a node keeps
