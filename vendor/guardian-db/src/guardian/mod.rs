@@ -166,15 +166,15 @@ impl GuardianDB {
 
         // Use create() directly for simple names.
         // If it already exists, open it via the full address to preserve the data.
-        let store = match self
-            .base
-            .create(address, "keyvalue", Some(opts.clone()))
-            .await
+        // Boxed: the create/open chain under this call is a very large future
+        // (guardian-core open → store constructor → iroh-docs init). Unboxed
+        // it contributed to the boot-time tokio worker stack overflow.
+        let store = match Box::pin(self.base.create(address, "keyvalue", Some(opts.clone()))).await
         {
             Ok(store) => store,
             Err(GuardianError::DatabaseAlreadyExists(existing_addr)) => {
                 tracing::debug!(address = address, full_addr = %existing_addr, "KeyValueStore already exists, opening existing one");
-                self.base.open(&existing_addr, opts).await?
+                Box::pin(self.base.open(&existing_addr, opts)).await?
             }
             Err(e) => return Err(e),
         };
@@ -988,6 +988,22 @@ impl KeyValueStore for KeyValueStoreWrapper {
             .downcast_ref::<crate::stores::kv_store::GuardianDBKeyValue>()
         {
             Some(kv) => kv.entry_heads().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn entry_heads_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> std::result::Result<Vec<crate::traits::EntryHeadPage>, Self::Error> {
+        match self
+            .store
+            .as_any()
+            .downcast_ref::<crate::stores::kv_store::GuardianDBKeyValue>()
+        {
+            Some(kv) => kv.entry_heads_page(prefix, after, limit).await,
             None => Ok(Vec::new()),
         }
     }

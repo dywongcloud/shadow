@@ -371,7 +371,14 @@ async fn init_handle() -> anyhow::Result<Handle> {
     // spawned actor tasks otherwise outlive the dropped handle (tasks hold
     // the Arc), leaking the whole stack per retry — the exact mechanism
     // behind the 96.9GB OOM freeze on the Virginia hosts.
-    let db = match GuardianDB::new(client, Some(opts)).await {
+    // Boxed awaits: the GuardianDB open chain (`new` → store registration →
+    // `key_value` → guardian-core create/open → the KV store constructor →
+    // iroh-docs init + first index sync) is a tower of very large futures.
+    // Unboxed, the sum of their debug-build poll frames overflowed the tokio
+    // worker stack at boot (100%-reproducible abort ~25s in). Vendor-side
+    // awaits are boxed at each level too; these two keep init_handle's own
+    // frame small.
+    let db = match Box::pin(GuardianDB::new(client, Some(opts))).await {
         Ok(db) => db,
         Err(e) => {
             let _ = seed_client.shutdown().await;
@@ -379,7 +386,7 @@ async fn init_handle() -> anyhow::Result<Handle> {
         }
     };
     tracing::info!("guardian init: GuardianDB open, opening 'hive-state' KV store");
-    let kv = match db.key_value(KV_NAMESPACE, None).await {
+    let kv = match Box::pin(db.key_value(KV_NAMESPACE, None)).await {
         Ok(kv) => kv,
         Err(e) => {
             let _ = seed_client.shutdown().await;
@@ -714,8 +721,14 @@ struct WriteCounters {
     namespaces: ClassWriteCounters,
     parts: std::collections::BTreeMap<String, ClassWriteCounters>,
     full: ClassWriteCounters,
+    /// Complete-generation markers (`snap-v2/node/<c>/gen/<ms>-<sha>`), one
+    /// bounded class like `full` — never per-generation keys.
+    generation: ClassWriteCounters,
     namespace_deletes: u64,
     part_reap_deletes: u64,
+    /// Exact v2 retention deletions (generation markers + superseded part
+    /// metadata keys) confirmed by this process.
+    v2_retention_deletes: u64,
 }
 
 static WRITE_COUNTERS: OnceLock<std::sync::Mutex<WriteCounters>> = OnceLock::new();
@@ -1352,6 +1365,65 @@ fn guardian_v2_encoded_component_from_head_key(key: &str) -> anyhow::Result<Stri
         .ok_or_else(|| anyhow::anyhow!("Guardian v2 head key has an invalid shape"))?;
     guardian_v2_decode_component(encoded)?;
     Ok(encoded.to_string())
+}
+
+/// Complete-generation marker keys: `snap-v2/node/<enc>/gen/<%016x ms>-<sha>`.
+///
+/// The Phase-1 canonical head (`…/head`) is overwritten in place, so prior
+/// generations need their OWN collision-safe root. Each marker's VALUE is the
+/// exact head bytes it names — the same BLAKE3 blob the head entry roots, so
+/// a marker costs zero additional blob bytes while keeping the prior
+/// generation's head (and, through the vendored GC's descriptor closure, its
+/// six parts) reachable until retention retires the marker. The key embeds
+/// both the generation's `saved_ms` (zero-padded hex, so ascending lexical
+/// order IS ascending age — the retention cursor's ordering) and the head's
+/// SHA-256 (same publish → same key, idempotent; different head in the same
+/// millisecond → different key, collision-impossible).
+const GUARDIAN_V2_GEN_SEGMENT: &str = "gen";
+
+fn guardian_v2_generation_key(
+    encoded_component: &str,
+    saved_ms: u64,
+    head_sha256: &str,
+) -> anyhow::Result<String> {
+    guardian_v2_decode_component(encoded_component)?;
+    if !is_lower_hex_digest(head_sha256) {
+        anyhow::bail!("Guardian v2 generation head SHA-256 is not 64 lowercase hex characters");
+    }
+    Ok(format!(
+        "{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/{GUARDIAN_V2_GEN_SEGMENT}/{saved_ms:016x}-{head_sha256}"
+    ))
+}
+
+/// `Some((saved_ms, head_sha256))` when `key` is a well-formed generation
+/// marker under this component. Malformed keys under the gen prefix return
+/// `None` and are never deleted (unknown shapes are never retired).
+fn guardian_v2_parse_generation_key(key: &str, encoded_component: &str) -> Option<(u64, String)> {
+    let prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/{GUARDIAN_V2_GEN_SEGMENT}/");
+    let suffix = key.strip_prefix(&prefix)?;
+    let (ms_hex, sha) = suffix.split_once('-')?;
+    if ms_hex.len() != 16 || !ms_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let saved_ms = u64::from_str_radix(ms_hex, 16).ok()?;
+    is_lower_hex_digest(sha).then(|| (saved_ms, sha.to_string()))
+}
+
+/// `Some((kind, digest))` when `key` is a v2 part key under this component.
+fn guardian_v2_part_key_fields(
+    key: &str,
+    encoded_component: &str,
+) -> Option<(GuardianV2PartKind, String)> {
+    let prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/");
+    let rest = key.strip_prefix(&prefix)?;
+    let (field, digest) = rest.split_once('/')?;
+    if digest.contains('/') || !is_lower_hex_digest(digest) {
+        return None;
+    }
+    GuardianV2PartKind::ALL
+        .into_iter()
+        .find(|kind| kind.field() == field)
+        .map(|kind| (kind, digest.to_string()))
 }
 
 fn guardian_v2_remove_cron_telemetry(value: &mut serde_json::Value) -> anyhow::Result<()> {
@@ -2655,6 +2727,473 @@ struct ReplicationWriteStats {
     put_bytes: usize,
 }
 
+// --- Bounded v2 retention -------------------------------------------------
+//
+// The v2 head is overwritten in place, so superseded immutable parts (and the
+// prior heads themselves, rooted by their complete-generation markers) would
+// otherwise accumulate forever — the witnessed post-cf2b2ba growth class.
+// Each pass retires, for THIS node's own component only (single-writer):
+//   1. generation markers beyond the keep window (count AND age must both
+//      pass), oldest-first in lexical order;
+//   2. part metadata keys referenced by NEITHER the current head NOR any
+//      surviving marker NOR any Drop-guarded in-flight preparation, and older
+//      than the grace window — again in lexical order, resuming from an
+//      explicit cursor across passes.
+// Deleting the metadata entry is what un-roots the part's blob; the vendored
+// collector then reclaims the bytes on its next completed pass. Any doubt —
+// absent/malformed head, unreadable marker, empty reference set — is a typed
+// refusal for the whole pass, never a guess.
+
+struct RetentionConfig {
+    /// Prior COMPLETE generations kept beyond the current one.
+    keep_generations: usize,
+    /// Markers/parts younger than this are never retired, whatever the count.
+    grace_ms: u64,
+    /// Per-pass delete budget (markers + parts) — the blast-radius bound.
+    max_deletes: usize,
+    /// Per-pass ceiling as a fraction of the listed marker population.
+    max_fraction: f64,
+    /// Page size for bounded lexical listing.
+    page: usize,
+    /// Hard cap on the marker population a pass will even consider.
+    max_generations: usize,
+}
+
+fn retention_config() -> RetentionConfig {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+    RetentionConfig {
+        keep_generations: env_usize("HIVE_GUARDIAN_V2_KEEP_GENERATIONS", 2),
+        grace_ms: env_u64("HIVE_GUARDIAN_V2_GEN_GRACE_SECS", 24 * 60 * 60).saturating_mul(1000),
+        max_deletes: env_usize("HIVE_GUARDIAN_V2_RETENTION_MAX_DELETES", 64).max(1),
+        max_fraction: std::env::var("HIVE_GUARDIAN_V2_RETENTION_MAX_FRACTION")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0 && *value <= 1.0)
+            .unwrap_or(0.5),
+        page: env_usize("HIVE_GUARDIAN_V2_RETENTION_PAGE", 512).max(8),
+        max_generations: env_usize("HIVE_GUARDIAN_V2_RETENTION_MAX_GENERATIONS", 8192).max(8),
+    }
+}
+
+/// Snapshot of the most recent retention pass — bounded observability only.
+#[derive(Clone, Default, serde::Serialize)]
+struct RetentionReport {
+    /// `completed` | `noop` | `refused` | `failed`.
+    status: String,
+    reason: Option<String>,
+    started_ms: u64,
+    finished_ms: u64,
+    generations_total: u64,
+    generations_kept: u64,
+    generations_retired: u64,
+    parts_listed: u64,
+    parts_referenced: u64,
+    parts_retired: u64,
+    /// Declared entry bytes of retired part metadata — bytes UN-ROOTED this
+    /// pass. Blob bytes are reclaimed later by the vendored collector and
+    /// counted there; the two figures are deliberately separate so neither
+    /// claims the other's work.
+    parts_unrooted_bytes: u64,
+    parts_skipped_young: u64,
+    parts_skipped_inflight: u64,
+    /// Lexical resume cursor after this pass (None = prefix exhausted; the
+    /// next pass starts from the beginning).
+    cursor: Option<String>,
+}
+
+#[derive(Default)]
+struct RetentionState {
+    cursor: Option<String>,
+    last: Option<RetentionReport>,
+    passes: u64,
+    refusals: u64,
+    retired_generations_total: u64,
+    retired_parts_total: u64,
+    unrooted_bytes_total: u64,
+}
+
+static RETENTION_STATE: OnceLock<std::sync::Mutex<RetentionState>> = OnceLock::new();
+
+fn retention_state() -> &'static std::sync::Mutex<RetentionState> {
+    RETENTION_STATE.get_or_init(|| std::sync::Mutex::new(RetentionState::default()))
+}
+
+fn retention_refusal(report: &mut RetentionReport, reason: String) {
+    tracing::warn!(reason = %reason, "Guardian v2 retention REFUSED (no deletion)");
+    report.status = "refused".to_string();
+    report.reason = Some(reason);
+}
+
+/// One bounded retention pass over THIS node's own v2 subtree. Never
+/// propagates an error: every outcome is a typed report, recorded for the
+/// observability endpoint and returned for the caller's log line.
+async fn guardian_v2_retention_pass(h: &Handle) -> RetentionReport {
+    guardian_v2_retention_pass_with(h, retention_config()).await
+}
+
+/// Explicit-config variant: the env-independent entrypoint the diagnostic
+/// drives with deterministic bounds (never `std::env::set_var` at runtime).
+async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> RetentionReport {
+    let mut report = RetentionReport {
+        started_ms: hive_core::now_ms(),
+        status: "completed".to_string(),
+        ..Default::default()
+    };
+    let _lifecycle = SNAPSHOT_LIFECYCLE_LOCK.lock().await;
+
+    'pass: {
+        let Some(component) = NODE_NAME.get().filter(|name| !name.trim().is_empty()) else {
+            retention_refusal(&mut report, "node identity is uninitialized".to_string());
+            break 'pass;
+        };
+        let encoded = match guardian_v2_encode_component(component) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                retention_refusal(&mut report, format!("component encoding failed: {error}"));
+                break 'pass;
+            }
+        };
+        let node_prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/");
+        let head_key = format!("{node_prefix}head");
+        let gen_prefix = format!("{node_prefix}{GUARDIAN_V2_GEN_SEGMENT}/");
+
+        // 1. The current head is the primary keep-root. Absent or malformed →
+        // refuse the whole pass (incomplete is never absent).
+        let head_bytes = match h.kv.get(&head_key).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                retention_refusal(
+                    &mut report,
+                    "current v2 head is absent; nothing may be retired without a verified \
+                     current generation"
+                        .to_string(),
+                );
+                break 'pass;
+            }
+            Err(error) => {
+                retention_refusal(&mut report, format!("current v2 head read failed: {error}"));
+                break 'pass;
+            }
+        };
+        let head = match guardian_v2_parse_head(&head_bytes) {
+            Ok(head) => head,
+            Err(error) => {
+                retention_refusal(
+                    &mut report,
+                    format!("current v2 head is malformed: {error}"),
+                );
+                break 'pass;
+            }
+        };
+        let head_sha256 = hex::encode(sha256(&head_bytes));
+
+        // 2. Complete generation-marker inventory (bounded, lexical = oldest
+        // first because the key embeds zero-padded saved_ms).
+        let mut markers: Vec<guardian_db::traits::EntryHeadPage> = Vec::new();
+        let mut marker_cursor: Option<String> = None;
+        loop {
+            let page = match h
+                .kv
+                .entry_heads_page(&gen_prefix, marker_cursor.as_deref(), cfg.page)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    retention_refusal(
+                        &mut report,
+                        format!("generation marker listing failed: {error}"),
+                    );
+                    break 'pass;
+                }
+            };
+            let exhausted = page.len() < cfg.page;
+            for row in page {
+                marker_cursor = Some(row.key.clone());
+                if guardian_v2_parse_generation_key(&row.key, &encoded).is_some() {
+                    markers.push(row);
+                }
+            }
+            if markers.len() > cfg.max_generations {
+                retention_refusal(
+                    &mut report,
+                    format!(
+                        "generation marker population exceeds \
+                         HIVE_GUARDIAN_V2_RETENTION_MAX_GENERATIONS={}",
+                        cfg.max_generations
+                    ),
+                );
+                break 'pass;
+            }
+            if exhausted {
+                break;
+            }
+        }
+        report.generations_total = markers.len() as u64;
+
+        // 3. Keep/retire split. The marker naming the CURRENT head is the
+        // anchor: without it the keep set is empty and the pass refuses —
+        // the writer creates it on the next verified publication.
+        let now_ms = hive_core::now_ms();
+        if !markers.iter().any(|row| {
+            guardian_v2_parse_generation_key(&row.key, &encoded)
+                .is_some_and(|(_, sha)| sha == head_sha256)
+        }) {
+            retention_refusal(
+                &mut report,
+                "no complete-generation marker names the current head yet".to_string(),
+            );
+            break 'pass;
+        }
+
+        let mut prior: Vec<&guardian_db::traits::EntryHeadPage> = markers
+            .iter()
+            .filter(|row| {
+                guardian_v2_parse_generation_key(&row.key, &encoded)
+                    .is_some_and(|(_, sha)| sha != head_sha256)
+            })
+            .collect();
+        prior.sort_by(|left, right| left.key.cmp(&right.key));
+        // `prior` is oldest-first; everything beyond the newest
+        // `keep_generations` is retire-eligible (age still gates each one).
+        let retire_eligible = prior.len().saturating_sub(cfg.keep_generations);
+        let mut retire_markers: Vec<&guardian_db::traits::EntryHeadPage> = prior
+            .iter()
+            .take(retire_eligible)
+            .filter(|row| {
+                guardian_v2_parse_generation_key(&row.key, &encoded).is_some_and(|(ms, _)| {
+                    // BOTH conditions: beyond the keep count AND older than
+                    // the grace window.
+                    now_ms.saturating_sub(ms) >= cfg.grace_ms
+                })
+            })
+            .copied()
+            .collect();
+        if !retire_markers.is_empty() && retire_markers.len() >= markers.len() {
+            retention_refusal(
+                &mut report,
+                "retire set would cover every generation marker (implausible keep set)".to_string(),
+            );
+            break 'pass;
+        }
+        let fraction_cap = ((markers.len() as f64) * cfg.max_fraction).floor() as usize;
+        let allowed_markers = retire_markers
+            .len()
+            .min(cfg.max_deletes)
+            .min(fraction_cap.max(1));
+        retire_markers.truncate(allowed_markers);
+
+        let mut budget = cfg.max_deletes;
+        let mut retired_marker_keys = std::collections::BTreeSet::new();
+        for row in &retire_markers {
+            if budget == 0 {
+                break;
+            }
+            match delete_snapshot_key(h, &row.key).await {
+                Ok(true) => {
+                    budget -= 1;
+                    report.generations_retired += 1;
+                    retired_marker_keys.insert(row.key.clone());
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .v2_retention_deletes += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Partial failure: no completed claim for this delete,
+                    // deterministic retry next pass (lexical order is stable).
+                    report.status = "failed".to_string();
+                    report.reason = Some(format!(
+                        "generation marker delete failed at {}: {error}",
+                        row.key
+                    ));
+                    break 'pass;
+                }
+            }
+        }
+        report.generations_kept = report
+            .generations_total
+            .saturating_sub(report.generations_retired);
+
+        // 4. Referenced part keys = current head ∪ every SURVIVING marker.
+        // A surviving marker that cannot be read or parsed is a typed
+        // refusal — a prior complete generation must stay fully reachable.
+        let mut referenced = std::collections::BTreeSet::new();
+        for kind in GuardianV2PartKind::ALL {
+            let Some(reference) = head.references.get(kind.field()) else {
+                retention_refusal(
+                    &mut report,
+                    format!("current head lost reference {}", kind.field()),
+                );
+                break 'pass;
+            };
+            match guardian_v2_part_key(&encoded, kind, &reference.sha256) {
+                Ok(key) => {
+                    referenced.insert(key);
+                }
+                Err(error) => {
+                    retention_refusal(&mut report, format!("current head part key: {error}"));
+                    break 'pass;
+                }
+            }
+        }
+        for row in &markers {
+            if retired_marker_keys.contains(&row.key) {
+                continue;
+            }
+            let bytes = match h.kv.get(&row.key).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    retention_refusal(
+                        &mut report,
+                        format!(
+                            "generation marker {} is unreadable (metadata present, bytes absent)",
+                            row.key
+                        ),
+                    );
+                    break 'pass;
+                }
+                Err(error) => {
+                    retention_refusal(
+                        &mut report,
+                        format!("generation marker {} read failed: {error}", row.key),
+                    );
+                    break 'pass;
+                }
+            };
+            let marker_head = match guardian_v2_parse_head(&bytes) {
+                Ok(head) => head,
+                Err(error) => {
+                    retention_refusal(
+                        &mut report,
+                        format!("generation marker {} is malformed: {error}", row.key),
+                    );
+                    break 'pass;
+                }
+            };
+            for kind in GuardianV2PartKind::ALL {
+                if let Some(reference) = marker_head.references.get(kind.field()) {
+                    if let Ok(key) = guardian_v2_part_key(&encoded, kind, &reference.sha256) {
+                        referenced.insert(key);
+                    }
+                }
+            }
+        }
+        if referenced.is_empty() {
+            retention_refusal(&mut report, "referenced part set is empty".to_string());
+            break 'pass;
+        }
+        report.parts_referenced = referenced.len() as u64;
+
+        // Drop-guarded in-flight preparations are never candidates.
+        let (inflight_parts, _) = prepared_snapshot_keys(&head_key);
+
+        // 5. Part retirement, lexical order, explicit cursor resume.
+        let mut cursor = retention_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cursor
+            .clone();
+        let grace_us = cfg.grace_ms.saturating_mul(1000);
+        let now_us = now_ms.saturating_mul(1000);
+        loop {
+            let page = match h
+                .kv
+                .entry_heads_page(&node_prefix, cursor.as_deref(), cfg.page)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    report.status = "failed".to_string();
+                    report.reason = Some(format!("part listing failed: {error}"));
+                    break 'pass;
+                }
+            };
+            let exhausted = page.len() < cfg.page;
+            for row in page {
+                cursor = Some(row.key.clone());
+                let Some(_) = guardian_v2_part_key_fields(&row.key, &encoded) else {
+                    // head, gen markers, unknown shapes: never candidates.
+                    continue;
+                };
+                report.parts_listed += 1;
+                if referenced.contains(&row.key) {
+                    continue;
+                }
+                if inflight_parts.contains(&row.key) {
+                    report.parts_skipped_inflight += 1;
+                    continue;
+                }
+                if now_us.saturating_sub(row.timestamp) < grace_us {
+                    report.parts_skipped_young += 1;
+                    continue;
+                }
+                if budget == 0 {
+                    break;
+                }
+                match delete_snapshot_key(h, &row.key).await {
+                    Ok(true) => {
+                        budget -= 1;
+                        report.parts_retired += 1;
+                        report.parts_unrooted_bytes += row.content_len;
+                        write_counters()
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .v2_retention_deletes += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.status = "failed".to_string();
+                        report.reason = Some(format!("part delete failed at {}: {error}", row.key));
+                        break 'pass;
+                    }
+                }
+            }
+            if budget == 0 {
+                break;
+            }
+            if exhausted {
+                cursor = None;
+                break;
+            }
+        }
+        report.cursor = cursor;
+        if report.generations_retired == 0 && report.parts_retired == 0 {
+            report.status = "noop".to_string();
+        }
+    }
+
+    report.finished_ms = hive_core::now_ms();
+    {
+        let mut state = retention_state().lock().unwrap_or_else(|p| p.into_inner());
+        state.passes += 1;
+        if report.status == "refused" {
+            state.refusals += 1;
+        }
+        state.retired_generations_total += report.generations_retired;
+        state.retired_parts_total += report.parts_retired;
+        state.unrooted_bytes_total += report.parts_unrooted_bytes;
+        // The cursor advances only on non-failed passes; a failed pass
+        // retries the same deterministic candidate.
+        if report.status != "failed" {
+            state.cursor = report.cursor.clone();
+        }
+        state.last = Some(report.clone());
+    }
+    report
+}
+
 fn guardian_v2_latest_entry<'a>(
     heads: &'a [guardian_db::traits::EntryHead],
     key: &str,
@@ -3375,6 +3914,12 @@ async fn maybe_guardian_v2_diagnostic(
     Ok(())
 }
 
+/// One-shot arming latch for the debug-only final-flush hold (see the block
+/// inside `write_replication_batch`).
+#[cfg(debug_assertions)]
+static FINAL_FLUSH_HOLD_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn write_replication_batch(
     desired: &DesiredReplication,
     _committed: &CommittedReplication,
@@ -3422,6 +3967,29 @@ async fn write_replication_batch(
         let (encoded_component, prepared_head) =
             guardian_v2_validate_prepared_generation(&desired.parts, head)?;
         let _lifecycle = SNAPSHOT_LIFECYCLE_LOCK.lock().await;
+
+        // Debug-only fault injection ON THE REAL PATH: hold the final flush
+        // so `await_final_generation` can be driven into its timeout with a
+        // short HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS while the previous head
+        // stays untouched (nothing below has run yet). One-shot ARMED
+        // (`FINAL_FLUSH_HOLD_ARMED`, set by the lifecycle diagnostic right
+        // before its terminal replicate) with the duration from the env, so
+        // earlier batches in the same run commit normally. Same pattern as
+        // the vendored GUARDIAN_GC_DIAGNOSTIC_FAULT_ONCE; unarmed/absent env
+        // = zero behavior change; release builds compile it out entirely.
+        #[cfg(debug_assertions)]
+        if let Some(hold_ms) = std::env::var("GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .filter(|_| FINAL_FLUSH_HOLD_ARMED.swap(false, std::sync::atomic::Ordering::SeqCst))
+        {
+            tracing::warn!(
+                hold_ms,
+                "GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS armed — holding the v2 commit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+        }
 
         let mut prepared_hashes = desired
             .parts
@@ -3543,6 +4111,59 @@ async fn write_replication_batch(
             }
         }
 
+        // Record this VERIFIED publication as a bounded complete-generation
+        // root. Written only after the full generation verification above —
+        // a marker can never name an unverified head. The marker's value is
+        // the exact head bytes (same blob, zero extra bytes); its key embeds
+        // saved_ms + head SHA-256, so retries are idempotent and collisions
+        // are structurally impossible. Retention (`guardian_v2_retention_pass`)
+        // later retires markers beyond the keep window, which is what finally
+        // un-roots superseded parts.
+        {
+            let generation_key = guardian_v2_generation_key(
+                &encoded_component,
+                verified.snapshot.saved_ms,
+                &hex::encode(head.value.change_digest),
+            )?;
+            let generation_item = KeyedPreparedValue {
+                key: generation_key,
+                class: "generation",
+                value: head.value.clone(),
+            };
+            {
+                let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
+                counters
+                    .generation
+                    .record_attempt(generation_item.value.bytes.len());
+            }
+            match guardian_v2_publish_immutable(h, &generation_item, &protection).await {
+                Ok(true) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .generation
+                        .record_committed(generation_item.value.bytes.len());
+                    stats.full_puts += 1;
+                    stats.put_bytes += generation_item.value.bytes.len();
+                }
+                Ok(false) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .generation
+                        .record_no_op(generation_item.value.bytes.len());
+                }
+                Err(error) => {
+                    write_counters()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .generation
+                        .record_failed();
+                    return Err(error);
+                }
+            }
+        }
+
         drop(protection);
         drop(registration);
     } else if !desired.parts.is_empty() {
@@ -3598,7 +4219,29 @@ async fn replication_writer(
                             return;
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(cleanup_secs)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(cleanup_secs)) => {
+                        // The cleanup cadence the writer has always slept on,
+                        // now actually running the v2 retention pass it was
+                        // reserved for. Same sole-writer task, so retention
+                        // can never race a concurrent publication from this
+                        // process; refusals/failures are typed in the report
+                        // and never break the writer loop.
+                        if let Ok(h) = handle().await {
+                            let report = guardian_v2_retention_pass(h).await;
+                            tracing::info!(
+                                status = %report.status,
+                                reason = report.reason.as_deref().unwrap_or(""),
+                                generations_total = report.generations_total,
+                                generations_retired = report.generations_retired,
+                                parts_listed = report.parts_listed,
+                                parts_retired = report.parts_retired,
+                                parts_unrooted_bytes = report.parts_unrooted_bytes,
+                                parts_skipped_young = report.parts_skipped_young,
+                                cursor = report.cursor.as_deref().unwrap_or(""),
+                                "Guardian v2 retention pass"
+                            );
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -3809,8 +4452,17 @@ fn guardian_shutdown_timeout() -> std::time::Duration {
 
 /// Drain the terminal replication generation, stop and join its sole writer,
 /// then durably shut down Docs, Router, blob store, and endpoint in the backend.
+///
+/// `None` means the caller could not name a terminal generation (the terminal
+/// file save failed or never ran). That must NOT skip the drain: admission is
+/// force-closed at the LATEST already-admitted generation and that exact
+/// generation is drained — otherwise a failed terminal save silently
+/// abandoned the last admitted snapshot mid-write.
 pub async fn shutdown(final_generation: Option<u64>) -> anyhow::Result<()> {
-    let final_generation = close_replication_admission(final_generation)?;
+    let final_generation = match final_generation {
+        Some(generation) => close_replication_admission(Some(generation))?,
+        None => close_replication_admission_at_latest(),
+    };
     let timeout = guardian_shutdown_timeout();
     if let Some(generation) = final_generation {
         await_final_generation(generation, timeout).await?;
@@ -4006,14 +4658,22 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
     else {
         return SnapshotFetch::Absent;
     };
+    // Each refusal names itself at debug level — an Incomplete here silently
+    // vetoes legacy fallback, which is invisible without the reason.
+    macro_rules! incomplete {
+        ($($arg:tt)*) => {{
+            tracing::debug!(key, $($arg)*);
+            return SnapshotFetch::Incomplete;
+        }};
+    }
     let Ok(Some(bytes)) = h.kv.get(key).await else {
-        return SnapshotFetch::Incomplete;
+        incomplete!("legacy fetch: base bytes are absent");
     };
     // The value index deliberately retains its prior readable bytes when a
     // newer doc head's blob is unavailable. Bind bytes and freshness to the
     // same head; never stamp fallback bytes with an unrelated newer timestamp.
     if iroh_blobs::Hash::new(&bytes).to_hex() != head.hash {
-        return SnapshotFetch::Incomplete;
+        incomplete!("legacy fetch: base bytes do not match the newest head");
     }
     let written_ms = head.timestamp / 1000;
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -4030,9 +4690,10 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
     // a digest string and resolves the fixed `<base>-part/<field>` key. Current
     // manifests bind both the immutable content-addressed key and its digest.
     if let Some(manifest) = manifest {
+        let mut merged = std::collections::BTreeSet::new();
         for (field, reference) in manifest {
             if !SNAPSHOT_PART_FIELDS.contains(&field.as_str()) {
-                return SnapshotFetch::Incomplete;
+                incomplete!(field, "legacy fetch: manifest names an unknown field");
             }
             let (part_key, expected) = if let Some(expected) = reference.as_str() {
                 (format!("{key}-part/{field}"), expected)
@@ -4070,33 +4731,47 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
                 (part_key.to_string(), expected)
             };
             let Ok(Some(part_bytes)) = h.kv.get(&part_key).await else {
-                return SnapshotFetch::Incomplete;
+                incomplete!(part_key, "legacy fetch: part bytes are absent");
             };
             if hex::encode(sha256(&part_bytes)) != expected {
-                return SnapshotFetch::Incomplete;
+                incomplete!(part_key, "legacy fetch: part digest mismatch");
             }
             let Ok(mut part) = serde_json::from_slice::<serde_json::Value>(&part_bytes) else {
-                return SnapshotFetch::Incomplete;
+                incomplete!(part_key, "legacy fetch: part is not valid JSON");
             };
             let Some(part_value) = part.as_object_mut().and_then(|part| part.remove(&field)) else {
-                return SnapshotFetch::Incomplete;
+                incomplete!(part_key, "legacy fetch: part is not an exact field wrapper");
             };
+            merged.insert(field.clone());
+            // Volatile root fields (`VOLATILE_ROOT_FIELDS`) are extracted as
+            // literal-Null parts by the canonical writer. On read, Null means
+            // "take the serde default" — the same meaning as absence.
+            // Inserting the literal null fails deserialization for
+            // non-nullable defaulted types (witnessed live in this very
+            // diagnostic: `invalid type: null, expected struct DataSnapshot`).
+            if part_value.is_null() {
+                continue;
+            }
             let Some(root) = value.as_object_mut() else {
-                return SnapshotFetch::Incomplete;
+                incomplete!("legacy fetch: base value is not an object mid-merge");
             };
             root.insert(field, part_value);
         }
         if SNAPSHOT_PART_FIELDS
             .iter()
-            .any(|field| value.get(*field).is_none())
+            .any(|field| !merged.contains(*field))
         {
-            return SnapshotFetch::Incomplete;
+            incomplete!("legacy fetch: a manifest field is still missing after the merge");
         }
     }
 
-    let Ok(mut snapshot) = serde_json::from_value::<PlatformSnapshot>(value) else {
-        return SnapshotFetch::Incomplete;
+    let snapshot = match serde_json::from_value::<PlatformSnapshot>(value) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            incomplete!(%error, "legacy fetch: merged snapshot does not deserialize");
+        }
     };
+    let mut snapshot = snapshot;
     // `saved_ms` is write-attempt volatility and is deliberately absent from
     // canonical payloads. The iroh-docs head timestamp is the durable commit
     // time for these exact bytes, so restore freshness remains meaningful
@@ -4268,7 +4943,17 @@ fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
     snap.metrics_rollup = Default::default();
     snap.database_data = Default::default();
     snap.builds = Vec::new();
-    snap.cron = Vec::new();
+    // Cron JOBS are durable tenant configuration and must survive peer
+    // adoption — wiping them here silently destroyed every cron job on a
+    // total-loss restore. Only the run-result TELEMETRY is node-local: the
+    // same three fields the v2 canonical transform strips
+    // (`guardian_v2_remove_cron_telemetry`), zeroed rather than removed
+    // because this is a typed struct, not JSON.
+    for job in &mut snap.cron {
+        job.last_run_ms = None;
+        job.next_run_ms = None;
+        job.runs = 0;
+    }
     snap
 }
 
@@ -4756,6 +5441,575 @@ async fn diagnostic_present_keys(
 }
 
 #[cfg(debug_assertions)]
+#[cfg(debug_assertions)]
+async fn p2_wait_gc(
+    h: &Handle,
+    what: &str,
+    pred: impl Fn(&guardian_db::p2p::network::core::GcHealth) -> bool,
+) -> anyhow::Result<guardian_db::p2p::network::core::GcHealth> {
+    for _ in 0..600 {
+        let health = h.client.backend().gc_health().await;
+        if pred(&health) {
+            return Ok(health);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("Guardian p2 diagnostic timed out waiting for GC: {what} (GUARDIAN_GC_SECS=1?)")
+}
+
+#[cfg(debug_assertions)]
+fn p2_snapshot(tag: &str) -> PlatformSnapshot {
+    let mut snapshot = PlatformSnapshot::default();
+    snapshot.cron.push(hive_edge::CronJob {
+        id: format!("p2-{tag}"),
+        name: format!("p2 diagnostic {tag}"),
+        schedule: "0 0 * * * *".to_string(),
+        deployment: "p2-diagnostic".to_string(),
+        path: "/api/p2".to_string(),
+        enabled: false,
+        last_run_ms: None,
+        next_run_ms: None,
+        runs: 0,
+        source: "manual".to_string(),
+        tenant: "p2-diagnostic".to_string(),
+    });
+    snapshot
+}
+
+/// Publish one full v2 generation (parts + head, verified) and record its
+/// complete-generation marker at an explicit `marker_ms`. Returns the head
+/// item and the state part's (key, entry bytes) for retirement accounting.
+#[cfg(debug_assertions)]
+async fn p2_publish_generation(
+    h: &Handle,
+    component: &str,
+    tag: &str,
+    marker_ms: u64,
+) -> anyhow::Result<(KeyedPreparedValue, String, usize)> {
+    let snapshot = p2_snapshot(tag);
+    let (parts, head) = guardian_v2_prepare_snapshot(&snapshot, component)?;
+    guardian_v2_diagnostic_publish_generation(h, &parts, &head).await?;
+    let encoded = guardian_v2_encode_component(component)?;
+    let marker_key =
+        guardian_v2_generation_key(&encoded, marker_ms, &hex::encode(head.value.change_digest))?;
+    let marker = KeyedPreparedValue {
+        key: marker_key,
+        class: "generation",
+        value: head.value.clone(),
+    };
+    let mut protection = h
+        .client
+        .protect_hashes([iroh_blobs::Hash::new(head.value.bytes.as_ref())])
+        .await?;
+    protection.finish_tag_installation();
+    guardian_v2_publish_immutable(h, &marker, &protection).await?;
+    drop(protection);
+    let state_part = parts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("p2 generation lost its state part"))?;
+    Ok((head, state_part.key.clone(), state_part.value.bytes.len()))
+}
+
+/// Guardian v2 Phase-2 matrix against the REAL vendored GuardianDB in this
+/// process's disposable HIVE_DATA store: retention keep/grace/budget/cursor,
+/// typed GC refusals (malformed/unknown/missing), confirmed-work byte
+/// accounting, six-parts-missing fetch behavior, legacy fallback only on
+/// true absence, concurrent publish under GC churn, and (env-gated) the
+/// final-flush timeout with previous-head survival.
+#[cfg(debug_assertions)]
+async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
+    let component = NODE_NAME
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("p2 diagnostic node name absent"))?;
+    let encoded = guardian_v2_encode_component(&component)?;
+    let base_key = snapshot_key().ok_or_else(|| anyhow::anyhow!("p2 base key absent"))?;
+    let cfg = |keep: usize, grace_ms: u64, max_deletes: usize, max_fraction: f64| RetentionConfig {
+        keep_generations: keep,
+        grace_ms,
+        max_deletes,
+        max_fraction,
+        page: 512,
+        max_generations: 8192,
+    };
+
+    // S0: empty v2 inventory → retention refuses (head absent), deletes nothing.
+    let report = guardian_v2_retention_pass_with(h, cfg(2, 0, 8, 0.5)).await;
+    if report.status != "refused"
+        || !report
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("head is absent")
+    {
+        anyhow::bail!(
+            "p2 S0: empty-inventory retention did not refuse on absent head: {} {:?}",
+            report.status,
+            report.reason
+        );
+    }
+
+    // S1: three real generations A/B/C with distinct content + markers.
+    let now = hive_core::now_ms();
+    let (_head_a, state_a, state_a_len) =
+        p2_publish_generation(h, &component, "a", now.saturating_sub(5000)).await?;
+    let (_head_b, state_b, state_b_len) =
+        p2_publish_generation(h, &component, "b", now.saturating_sub(4000)).await?;
+    let (head_c, state_c, state_c_len) =
+        p2_publish_generation(h, &component, "c", now.saturating_sub(3000)).await?;
+    if !matches!(
+        guardian_v2_probe(h, &encoded).await,
+        GuardianV2Probe::Ready(_)
+    ) {
+        anyhow::bail!("p2 S1: generation C is not Ready after publish");
+    }
+
+    // Collision: different bytes at the SAME SHA-addressed key must refuse.
+    let collision = KeyedPreparedValue {
+        key: state_c.clone(),
+        class: "state",
+        value: PreparedValue {
+            change_digest: sha256(b"different"),
+            bytes: Arc::new(b"different".to_vec()),
+        },
+    };
+    let mut collision_guard = h
+        .client
+        .protect_hashes([iroh_blobs::Hash::new(b"different")])
+        .await?;
+    collision_guard.finish_tag_installation();
+    let collision_result = guardian_v2_publish_immutable(h, &collision, &collision_guard).await;
+    drop(collision_guard);
+    if !collision_result
+        .err()
+        .map(|error| error.to_string())
+        .is_some_and(|text| text.contains("collision"))
+    {
+        anyhow::bail!("p2 S1: immutable collision was not refused");
+    }
+
+    // S2: the WRITER path records a marker for its own verified publication.
+    let snap_d = p2_snapshot("d");
+    let (_, head_d) = guardian_v2_prepare_snapshot(&snap_d, &component)?;
+    let head_d_sha = hex::encode(head_d.value.change_digest);
+    let generation =
+        replicate(&snap_d).ok_or_else(|| anyhow::anyhow!("p2 S2: replicate refused"))?;
+    let mut writer_marker = None;
+    for _ in 0..600 {
+        if let GuardianV2Probe::Ready(verified) = guardian_v2_probe(h, &encoded).await {
+            if hex::encode(verified.head_sha256) == head_d_sha {
+                let expected =
+                    guardian_v2_generation_key(&encoded, verified.snapshot.saved_ms, &head_d_sha)?;
+                if h.kv.get(&expected).await?.is_some() {
+                    writer_marker = Some(expected);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let writer_marker = writer_marker.ok_or_else(|| {
+        anyhow::anyhow!("p2 S2: writer did not commit generation {generation} with its marker")
+    })?;
+
+    // S3: anchor rule — no marker naming the current head refuses everything.
+    if !delete_snapshot_key(h, &writer_marker).await? {
+        anyhow::bail!("p2 S3: could not remove the current marker for the anchor test");
+    }
+    let report = guardian_v2_retention_pass_with(h, cfg(0, 0, 8, 0.9)).await;
+    if report.status != "refused"
+        || !report
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("names the current head")
+    {
+        anyhow::bail!("p2 S3: retention did not refuse without the current-head marker");
+    }
+    let restore_marker = KeyedPreparedValue {
+        key: writer_marker.clone(),
+        class: "generation",
+        value: head_d.value.clone(),
+    };
+    let mut protection = h
+        .client
+        .protect_hashes([iroh_blobs::Hash::new(head_d.value.bytes.as_ref())])
+        .await?;
+    protection.finish_tag_installation();
+    guardian_v2_publish_immutable(h, &restore_marker, &protection).await?;
+    drop(protection);
+
+    // S4: grace holds; then expiry under budget with fraction cap; then
+    // part retirement in lexical order with cursor resume + restart resume.
+    let report = guardian_v2_retention_pass_with(h, cfg(1, 365 * 24 * 3600 * 1000, 8, 0.9)).await;
+    if report.status != "noop" || report.generations_retired != 0 || report.parts_retired != 0 {
+        anyhow::bail!(
+            "p2 S4: grace window did not hold every young generation: {} retired {}/{}",
+            report.status,
+            report.generations_retired,
+            report.parts_retired
+        );
+    }
+    let report = guardian_v2_retention_pass_with(h, cfg(1, 0, 1, 0.9)).await;
+    if report.generations_retired != 1 || report.parts_retired != 0 {
+        anyhow::bail!("p2 S4: budget-1 pass did not retire exactly marker A");
+    }
+    let report = guardian_v2_retention_pass_with(h, cfg(1, 0, 1, 0.9)).await;
+    if report.generations_retired != 1 {
+        anyhow::bail!("p2 S4: second budget-1 pass did not retire marker B");
+    }
+    let report = guardian_v2_retention_pass_with(h, cfg(0, 0, 8, 0.5)).await;
+    if report.generations_retired != 1 {
+        anyhow::bail!(
+            "p2 S4: fraction cap 0.5 over two markers did not retire exactly C: {}",
+            report.generations_retired
+        );
+    }
+
+    // Parts of A/B/C (their unique state parts) are now unreferenced; D's six
+    // parts stay referenced. Retire with budget 1 per pass: lexical order,
+    // cursor resume, exact unrooted-byte accounting.
+    let mut unrooted = 0u64;
+    let mut retired_parts = 0u64;
+    let mut saw_cursor = false;
+    for pass in 0..8 {
+        let report = guardian_v2_retention_pass_with(h, cfg(0, 0, 1, 0.9)).await;
+        if report.status == "failed" {
+            anyhow::bail!("p2 S4: part retirement failed: {:?}", report.reason);
+        }
+        unrooted += report.parts_unrooted_bytes;
+        retired_parts += report.parts_retired;
+        saw_cursor |= report.cursor.is_some();
+        if pass == 1 {
+            // Restart resume: wipe the in-memory cursor exactly as a process
+            // restart would; the next pass restarts lexically and never
+            // double-retires (delete_snapshot_key is exact).
+            retention_state()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .cursor = None;
+        }
+        if retired_parts >= 3 {
+            break;
+        }
+    }
+    if retired_parts != 3 {
+        anyhow::bail!(
+            "p2 S4: expected exactly 3 superseded state parts retired, got {retired_parts}"
+        );
+    }
+    let expected_unrooted = (state_a_len + state_b_len + state_c_len) as u64;
+    if unrooted != expected_unrooted {
+        anyhow::bail!(
+            "p2 S4: unrooted byte accounting {unrooted} != exact expected {expected_unrooted}"
+        );
+    }
+    if !saw_cursor {
+        anyhow::bail!("p2 S4: bounded part retirement never reported a resume cursor");
+    }
+    for key in [&state_a, &state_b, &state_c] {
+        if h.kv.get(key).await?.is_some() {
+            anyhow::bail!("p2 S4: retired part {key} still has readable metadata");
+        }
+    }
+    let report = guardian_v2_retention_pass_with(h, cfg(0, 0, 8, 0.9)).await;
+    if report.status != "noop" {
+        anyhow::bail!(
+            "p2 S4: retention did not converge to noop: {}",
+            report.status
+        );
+    }
+    if !matches!(
+        guardian_v2_probe(h, &encoded).await,
+        GuardianV2Probe::Ready(_)
+    ) {
+        anyhow::bail!("p2 S4: current generation D lost readiness after retention");
+    }
+
+    // S5: confirmed-work GC accounting. Quiesce to a completed no-op pass,
+    // then reclaim two tombstoned probes of exactly known sizes.
+    let baseline = p2_wait_gc(h, "quiescent no-op pass", |health| {
+        health
+            .last_pass
+            .as_ref()
+            .is_some_and(|pass| pass.status.is_completed() && pass.reclaimed_objects == 0)
+    })
+    .await?;
+    let probe_small = vec![0x51u8; 10_000];
+    let probe_large = vec![0x52u8; 20_000];
+    let probe_small_hash = iroh_blobs::Hash::new(&probe_small).to_hex();
+    let probe_large_hash = iroh_blobs::Hash::new(&probe_large).to_hex();
+    h.kv.put("p2-probe-small", probe_small.clone()).await?;
+    h.kv.put("p2-probe-large", probe_large.clone()).await?;
+    h.kv.delete("p2-probe-small").await?;
+    h.kv.delete("p2-probe-large").await?;
+    let reclaimed_before = baseline.reclaimed_bytes_total;
+    p2_wait_gc(h, "probe reclamation", |health| {
+        health.reclaimed_bytes_total >= reclaimed_before + 30_000
+    })
+    .await?;
+    if h.client.has_blob_local(&probe_small_hash).await
+        || h.client.has_blob_local(&probe_large_hash).await
+    {
+        anyhow::bail!("p2 S5: probe blobs survived a pass that claimed their bytes");
+    }
+    let after = h.client.backend().gc_health().await;
+    let delta = after.reclaimed_bytes_total - reclaimed_before;
+    if delta != 30_000 {
+        anyhow::bail!("p2 S5: confirmed reclaimed byte accounting {delta} != exact expected 30000");
+    }
+
+    // S5b: typed refusals — malformed / unknown-version / missing-part heads
+    // each refuse the WHOLE pass; a collectible probe survives every refusal
+    // and is reclaimed only after the fault is removed.
+    let probe_guard = vec![0x53u8; 4_096];
+    let probe_guard_hash = iroh_blobs::Hash::new(&probe_guard).to_hex();
+    h.kv.put("p2-probe-guard", probe_guard.clone()).await?;
+    h.kv.delete("p2-probe-guard").await?;
+    let fake_head = "snap-v2/node/p2-fake/head";
+    let refusal_matrix: [(&str, Vec<u8>, &str); 3] = [
+        (
+            "malformed",
+            b"not-json".to_vec(),
+            "incomplete_malformed_descriptor",
+        ),
+        (
+            "unknown-version",
+            serde_json::to_vec(&serde_json::json!({
+                "magic": GUARDIAN_V2_SNAPSHOT_MAGIC, "version": 3
+            }))?,
+            "incomplete_unknown_version",
+        ),
+        (
+            "missing-part",
+            serde_json::to_vec(&serde_json::json!({
+                "magic": GUARDIAN_V2_SNAPSHOT_MAGIC, "version": 2,
+                "state": {"sha256": "b".repeat(64), "bytes": 3},
+                "deployments": {"sha256": "b".repeat(64), "bytes": 3},
+                "database_data": {"sha256": "b".repeat(64), "bytes": 3},
+                "metrics_rollup": {"sha256": "b".repeat(64), "bytes": 3},
+                "builds": {"sha256": "b".repeat(64), "bytes": 3},
+                "sandboxes": {"sha256": "b".repeat(64), "bytes": 3},
+            }))?,
+            "incomplete_missing_part",
+        ),
+    ];
+    for (label, bytes, expected_status) in refusal_matrix {
+        h.kv.put(fake_head, bytes).await?;
+        let incomplete_before = h.client.backend().gc_health().await.incomplete_runs;
+        let health = p2_wait_gc(h, label, |health| {
+            health.incomplete_runs > incomplete_before
+        })
+        .await?;
+        let status = health
+            .last_pass
+            .as_ref()
+            .map(|pass| pass.status.as_str())
+            .unwrap_or("none");
+        if status != expected_status {
+            anyhow::bail!(
+                "p2 S5b: {label} head produced status {status}, wanted {expected_status}"
+            );
+        }
+        if !h.client.has_blob_local(&probe_guard_hash).await {
+            anyhow::bail!("p2 S5b: a REFUSED {label} pass reclaimed the guard probe");
+        }
+    }
+    delete_snapshot_key(h, fake_head).await?;
+    p2_wait_gc(h, "post-refusal completion", |health| {
+        health
+            .last_pass
+            .as_ref()
+            .is_some_and(|pass| pass.status.is_completed())
+    })
+    .await?;
+    p2_wait_gc(h, "guard probe reclaim", |health| {
+        health
+            .last_pass
+            .as_ref()
+            .is_some_and(|pass| pass.status.is_completed())
+    })
+    .await?;
+    for _ in 0..600 {
+        if !h.client.has_blob_local(&probe_guard_hash).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if h.client.has_blob_local(&probe_guard_hash).await {
+        anyhow::bail!("p2 S5b: guard probe was never reclaimed after the fault cleared");
+    }
+
+    // S6: each of the six parts missing → fetch is Incomplete (never legacy
+    // fallback, though legacy bytes exist under the same base key); restoring
+    // the exact part restores Ready. One GC refusal is witnessed en route.
+    let mut missing_part_gc_witnessed = false;
+    if !matches!(
+        guardian_v2_probe(h, &encoded).await,
+        GuardianV2Probe::Ready(_)
+    ) {
+        anyhow::bail!("p2 S6: current generation is not Ready before the matrix");
+    }
+    let head_bytes_now =
+        h.kv.get(&format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/head"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("p2 S6: head bytes absent"))?;
+    let parsed_now = guardian_v2_parse_head(&head_bytes_now)?;
+    for kind in GuardianV2PartKind::ALL {
+        let reference = parsed_now
+            .references
+            .get(kind.field())
+            .ok_or_else(|| anyhow::anyhow!("p2 S6: reference {} absent", kind.field()))?;
+        let part_key = guardian_v2_part_key(&encoded, kind, &reference.sha256)?;
+        let part_bytes =
+            h.kv.get(&part_key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("p2 S6: part bytes absent for {part_key}"))?;
+        if !delete_snapshot_key(h, &part_key).await? {
+            anyhow::bail!("p2 S6: could not delete {part_key}");
+        }
+        if !matches!(
+            fetch_snapshot_at_result(&base_key).await,
+            SnapshotFetch::Incomplete
+        ) {
+            anyhow::bail!(
+                "p2 S6: fetch with {} missing was not Incomplete (legacy fallback leak?)",
+                kind.field()
+            );
+        }
+        if !missing_part_gc_witnessed {
+            let incomplete_before = h.client.backend().gc_health().await.incomplete_runs;
+            let health = p2_wait_gc(h, "missing current part", |health| {
+                health.incomplete_runs > incomplete_before
+            })
+            .await?;
+            if health
+                .last_pass
+                .as_ref()
+                .map(|pass| pass.status.as_str())
+                .unwrap_or("none")
+                != "incomplete_missing_part"
+            {
+                anyhow::bail!("p2 S6: GC did not refuse typed on a missing current part");
+            }
+            missing_part_gc_witnessed = true;
+        }
+        let mut protection = h
+            .client
+            .protect_hashes([iroh_blobs::Hash::new(&part_bytes)])
+            .await?;
+        protection.finish_tag_installation();
+        h.kv.put_gc_protected(&part_key, part_bytes, &protection)
+            .await?;
+        drop(protection);
+        if !matches!(
+            guardian_v2_probe(h, &encoded).await,
+            GuardianV2Probe::Ready(_)
+        ) {
+            anyhow::bail!("p2 S6: restore of {} did not return Ready", kind.field());
+        }
+    }
+
+    // True absence → legacy fallback DOES serve.
+    let legacy_only = "node/guardian-diagnostic-legacyonly/snapshot";
+    h.kv.put(
+        legacy_only,
+        serde_json::to_vec(&PlatformSnapshot::default())?,
+    )
+    .await?;
+    if !matches!(
+        fetch_snapshot_at_result(legacy_only).await,
+        SnapshotFetch::Ready(_)
+    ) {
+        anyhow::bail!("p2 S6: legacy fallback did not serve on TRUE v2 absence");
+    }
+
+    // S7: concurrent publish under continuous GC churn — every generation
+    // stays fully verifiable, and the collector never reports the
+    // impossible-under-the-gate mid-pass change.
+    for round in 0..3u32 {
+        let runs_before = h.client.backend().gc_health().await.successful_runs;
+        let (_, _, _) = p2_publish_generation(
+            h,
+            &component,
+            &format!("churn-{round}"),
+            hive_core::now_ms(),
+        )
+        .await?;
+        guardian_v2_verify_generation(h, &encoded).await?;
+        p2_wait_gc(h, "churn pass", |health| {
+            health.successful_runs > runs_before
+        })
+        .await?;
+        guardian_v2_verify_generation(h, &encoded).await?;
+    }
+    let churn_health = h.client.backend().gc_health().await;
+    if churn_health
+        .last_pass
+        .as_ref()
+        .is_some_and(|pass| pass.status.as_str() == "incomplete_changed_during_pass")
+    {
+        anyhow::bail!("p2 S7: the exclusive gate leaked a mid-pass inventory change");
+    }
+
+    // S8: cancellation mid-preparation — Drop releases every prepared root.
+    {
+        let registration = PreparedSnapshotRegistration::new(
+            &format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/head"),
+            sha256(b"p2-cancelled"),
+            vec![format!(
+                "{GUARDIAN_V2_NODE_PREFIX}{encoded}/state/{}",
+                "c".repeat(64)
+            )],
+        );
+        drop(registration);
+        let (parts, _) =
+            prepared_snapshot_keys(&format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/head"));
+        if parts.iter().any(|key| key.ends_with(&"c".repeat(64))) {
+            anyhow::bail!("p2 S8: cancelled preparation left a prepared root behind");
+        }
+    }
+
+    // S9 (env-gated): final-flush timeout on the REAL writer path. The held
+    // commit must time the drain out while the PREVIOUS verified head stays
+    // readable.
+    let mut final_flush = "skipped".to_string();
+    if std::env::var("GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS").is_ok() {
+        let pre = match guardian_v2_probe(h, &encoded).await {
+            GuardianV2Probe::Ready(verified) => hex::encode(verified.head_sha256),
+            _ => anyhow::bail!("p2 S9: no Ready head before the final-flush scenario"),
+        };
+        FINAL_FLUSH_HOLD_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let generation = replicate(&p2_snapshot("final-flush"))
+            .ok_or_else(|| anyhow::anyhow!("p2 S9: replicate refused"))?;
+        let error = match shutdown(Some(generation)).await {
+            Ok(()) => anyhow::bail!("p2 S9: held final flush unexpectedly drained in time"),
+            Err(error) => error.to_string(),
+        };
+        if !error.contains("timed out") {
+            anyhow::bail!("p2 S9: final flush failed for a non-timeout reason: {error}");
+        }
+        let post = match guardian_v2_probe(h, &encoded).await {
+            GuardianV2Probe::Ready(verified) => hex::encode(verified.head_sha256),
+            _ => anyhow::bail!("p2 S9: previous head unreadable after the timed-out final flush"),
+        };
+        if post != pre {
+            anyhow::bail!("p2 S9: the held final flush replaced the previous head");
+        }
+        final_flush = format!("timeout_witnessed head_preserved={}", post == pre);
+    }
+
+    Ok(format!(
+        "p2: empty_refusal=true collision=true writer_marker=true anchor_refusal=true \
+         grace_hold=true budget_retire=true fraction_cap=true parts_retired={retired_parts} \
+         unrooted_bytes={unrooted} cursor_resume={saw_cursor} restart_resume=true noop=true \
+         reclaim_exact_bytes=30000 refusal_matrix=3 six_parts_missing=true \
+         legacy_true_absence_only=true churn_rounds=3 cancel_prepare=true \
+         final_flush={final_flush}"
+    ))
+}
+
+#[cfg(debug_assertions)]
 pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     set_node_name("guardian-diagnostic-self");
     let h = handle().await?;
@@ -4782,13 +6036,20 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
         anyhow::bail!("first non-prefix split commit does not match its prepared generation");
     }
     drop(first_guard);
-    if first_keep.len() != SNAPSHOT_PART_FIELDS.len()
-        || !matches!(
-            fetch_snapshot_at_result(&base_key).await,
-            SnapshotFetch::Ready(_)
-        )
-    {
-        anyhow::bail!("first non-prefix split commit is incomplete");
+    if first_keep.len() != SNAPSHOT_PART_FIELDS.len() {
+        anyhow::bail!(
+            "first non-prefix split commit is incomplete: keep set has {} keys",
+            first_keep.len()
+        );
+    }
+    match fetch_snapshot_at_result(&base_key).await {
+        SnapshotFetch::Ready(_) => {}
+        SnapshotFetch::Absent => {
+            anyhow::bail!("first non-prefix split commit is incomplete: fetch says Absent")
+        }
+        SnapshotFetch::Incomplete => {
+            anyhow::bail!("first non-prefix split commit is incomplete: fetch says Incomplete")
+        }
     }
 
     let mut second = shared_snapshot_canonical(&snapshot, &base_key)?;
@@ -5308,8 +6569,10 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
         anyhow::bail!("malformed departed prefix-like key was not retained as an ordinary root");
     }
 
+    let p2 = guardian_v2_phase2_diagnostic(h).await?;
+
     Ok(format!(
-        "HIVE_GUARDIAN_LIFECYCLE_PASS first_keep={} second_keep={} cleanup_passes={} normal_small={} first_5_plus_6_batch={} marker_backlog={} marker_passes={} concurrent_gc=true exact_reap=true ordinary_roots=true ambiguous_refusal=true population_change_refusal=true prepared_roots=true delete_failure_resume=true cancellation_resume=true head_change_between_groups=true",
+        "HIVE_GUARDIAN_LIFECYCLE_PASS first_keep={} second_keep={} cleanup_passes={} normal_small={} first_5_plus_6_batch={} marker_backlog={} marker_passes={} concurrent_gc=true exact_reap=true ordinary_roots=true ambiguous_refusal=true population_change_refusal=true prepared_roots=true delete_failure_resume=true cancellation_resume=true head_change_between_groups=true {p2}",
         first_keep.len(),
         second_keep.len(),
         cleanup_passes,
@@ -5530,14 +6793,216 @@ struct GcStatusView {
     stuck: bool,
     successful_runs: u64,
     failed_runs: u64,
+    /// Typed refusals (no deletion) — distinct from hard failures.
+    incomplete_runs: u64,
     consecutive_failures: u32,
     legacy_tags_removed: u64,
+    /// Cumulative CONFIRMED reclaimed work across completed passes only.
+    reclaimed_objects_total: u64,
+    reclaimed_bytes_total: u64,
     last_attempt_ms: Option<u64>,
     last_heartbeat_ms: Option<u64>,
     active_deadline_ms: Option<u64>,
     last_success_ms: Option<u64>,
     overdue_since_ms: Option<u64>,
     last_error: Option<String>,
+    /// Structured result of the most recent pass that reached a verdict.
+    last_pass: Option<GcPassView>,
+}
+
+/// Serializable projection of the vendored `GcPassReport`.
+#[derive(serde::Serialize)]
+struct GcPassView {
+    /// Typed status: `completed`, `incomplete_*` (typed refusal, no
+    /// deletion), or `failed`.
+    status: &'static str,
+    reason: Option<String>,
+    started_ms: u64,
+    finished_ms: u64,
+    duration_ms: u64,
+    considered_objects: u64,
+    considered_bytes: u64,
+    reclaimed_objects: u64,
+    reclaimed_bytes: u64,
+    protected_objects: u64,
+    reachable_entries: u64,
+    descriptors: u64,
+    skipped_objects: u64,
+    legacy_tags_removed: u64,
+}
+
+impl From<guardian_db::p2p::network::core::GcPassReport> for GcPassView {
+    fn from(report: guardian_db::p2p::network::core::GcPassReport) -> Self {
+        Self {
+            status: report.status.as_str(),
+            reason: report.reason,
+            started_ms: report.started_ms,
+            finished_ms: report.finished_ms,
+            duration_ms: report.duration_ms,
+            considered_objects: report.considered_objects,
+            considered_bytes: report.considered_bytes,
+            reclaimed_objects: report.reclaimed_objects,
+            reclaimed_bytes: report.reclaimed_bytes,
+            protected_objects: report.protected_objects,
+            reachable_entries: report.reachable_entries,
+            descriptors: report.descriptors,
+            skipped_objects: report.skipped_objects,
+            legacy_tags_removed: report.legacy_tags_removed,
+        }
+    }
+}
+
+/// Per-part status of this node's own current v2 generation — sourced from
+/// BOUNDED lookups only (one exact-prefix page per key, one head read), never
+/// a full store scan on the request path.
+#[derive(serde::Serialize)]
+struct GuardianV2PartStatusView {
+    field: &'static str,
+    sha256: String,
+    declared_bytes: u64,
+    /// The part's metadata entry exists with a matching declared length.
+    ready: bool,
+    entry_bytes: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct GuardianV2StatusView {
+    component: Option<String>,
+    /// `ready` | `absent` | `incomplete` | `unreachable` — the same tri-state
+    /// the restore path uses, with reachability made explicit. `absent` only
+    /// when genuinely nothing exists under this node's v2 prefix head key.
+    head_status: &'static str,
+    /// Generation identity: the committed head's SHA-256 + BLAKE3 + saved_ms.
+    head_sha256: Option<String>,
+    head_blake3: Option<String>,
+    saved_ms: Option<u64>,
+    /// Complete-generation markers currently retained (bounded count).
+    generation_markers: u64,
+    generation_markers_truncated: bool,
+    parts: Vec<GuardianV2PartStatusView>,
+}
+
+impl Default for GuardianV2StatusView {
+    fn default() -> Self {
+        Self {
+            component: None,
+            head_status: "absent",
+            head_sha256: None,
+            head_blake3: None,
+            saved_ms: None,
+            generation_markers: 0,
+            generation_markers_truncated: false,
+            parts: Vec::new(),
+        }
+    }
+}
+
+async fn guardian_v2_status_view(h: &Handle) -> GuardianV2StatusView {
+    let mut view = GuardianV2StatusView {
+        head_status: "absent",
+        ..Default::default()
+    };
+    let Some(component) = NODE_NAME.get().filter(|name| !name.trim().is_empty()) else {
+        view.head_status = "unreachable";
+        return view;
+    };
+    view.component = Some(component.clone());
+    let Ok(encoded) = guardian_v2_encode_component(component) else {
+        view.head_status = "incomplete";
+        return view;
+    };
+    let node_prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/");
+    let head_key = format!("{node_prefix}head");
+
+    let head_entry = match h.kv.entry_heads_page(&head_key, None, 2).await {
+        Ok(page) => page.into_iter().find(|row| row.key == head_key),
+        Err(_) => {
+            view.head_status = "unreachable";
+            return view;
+        }
+    };
+    let Some(head_entry) = head_entry else {
+        return view; // absent
+    };
+    view.head_blake3 = Some(head_entry.hash.clone());
+    view.saved_ms = Some(head_entry.timestamp / 1000);
+
+    let head = match h.kv.get(&head_key).await {
+        Ok(Some(bytes)) => {
+            view.head_sha256 = Some(hex::encode(sha256(&bytes)));
+            match guardian_v2_parse_head(&bytes) {
+                Ok(head) => Some(head),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(head) = head else {
+        view.head_status = "incomplete";
+        return view;
+    };
+
+    let mut all_ready = true;
+    for kind in GuardianV2PartKind::ALL {
+        let Some(reference) = head.references.get(kind.field()) else {
+            all_ready = false;
+            continue;
+        };
+        let Ok(part_key) = guardian_v2_part_key(&encoded, kind, &reference.sha256) else {
+            all_ready = false;
+            continue;
+        };
+        let entry = match h.kv.entry_heads_page(&part_key, None, 2).await {
+            Ok(page) => page.into_iter().find(|row| row.key == part_key),
+            Err(_) => None,
+        };
+        let entry_bytes = entry.as_ref().map(|row| row.content_len);
+        let ready = entry_bytes == Some(reference.bytes as u64);
+        all_ready &= ready;
+        view.parts.push(GuardianV2PartStatusView {
+            field: kind.field(),
+            sha256: reference.sha256.clone(),
+            declared_bytes: reference.bytes as u64,
+            ready,
+            entry_bytes,
+        });
+    }
+    view.head_status = if all_ready { "ready" } else { "incomplete" };
+
+    // Bounded generation-marker count: capped pages, truncation disclosed.
+    let gen_prefix = format!("{node_prefix}{GUARDIAN_V2_GEN_SEGMENT}/");
+    let mut cursor: Option<String> = None;
+    for _ in 0..8 {
+        match h
+            .kv
+            .entry_heads_page(&gen_prefix, cursor.as_deref(), 512)
+            .await
+        {
+            Ok(page) => {
+                let exhausted = page.len() < 512;
+                view.generation_markers += page.len() as u64;
+                cursor = page.into_iter().last().map(|row| row.key);
+                if exhausted {
+                    return view;
+                }
+            }
+            Err(_) => return view,
+        }
+    }
+    view.generation_markers_truncated = true;
+    view
+}
+
+/// Bounded snapshot of the v2 retention loop's state.
+#[derive(serde::Serialize)]
+struct RetentionView {
+    passes: u64,
+    refusals: u64,
+    retired_generations_total: u64,
+    retired_parts_total: u64,
+    unrooted_bytes_total: u64,
+    cursor: Option<String>,
+    last: Option<RetentionReport>,
 }
 
 #[derive(serde::Serialize)]
@@ -5558,6 +7023,11 @@ struct GuardianWriteStatsResponse {
     blob_store: BlobStoreSnapshot,
     protected_roots: ProtectedRootsView,
     gc: GcStatusView,
+    /// This node's own current v2 generation: head identity + per-part
+    /// hash/bytes/readiness (bounded lookups, no store scan).
+    v2: GuardianV2StatusView,
+    /// The v2 retention loop's bounded pass/refusal/cursor state.
+    retention: RetentionView,
 }
 
 async fn guardian_write_stats_handler() -> axum::Json<GuardianWriteStatsResponse> {
@@ -5571,10 +7041,10 @@ async fn guardian_write_stats_handler() -> axum::Json<GuardianWriteStatsResponse
         }
     };
 
-    let gc = match handle().await {
+    let (gc, v2) = match handle().await {
         Ok(h) => {
             let health = h.client.backend().gc_health().await;
-            GcStatusView {
+            let gc = GcStatusView {
                 reachable: true,
                 enabled: health.enabled,
                 running: health.running,
@@ -5583,17 +7053,41 @@ async fn guardian_write_stats_handler() -> axum::Json<GuardianWriteStatsResponse
                 stuck: health.stuck,
                 successful_runs: health.successful_runs,
                 failed_runs: health.failed_runs,
+                incomplete_runs: health.incomplete_runs,
                 consecutive_failures: health.consecutive_failures,
                 legacy_tags_removed: health.legacy_tags_removed,
+                reclaimed_objects_total: health.reclaimed_objects_total,
+                reclaimed_bytes_total: health.reclaimed_bytes_total,
                 last_attempt_ms: health.last_attempt_ms,
                 last_heartbeat_ms: health.last_heartbeat_ms,
                 active_deadline_ms: health.active_deadline_ms,
                 last_success_ms: health.last_success_ms,
                 overdue_since_ms: health.overdue_since_ms,
                 last_error: health.last_error,
-            }
+                last_pass: health.last_pass.map(GcPassView::from),
+            };
+            (gc, guardian_v2_status_view(h).await)
         }
-        Err(_) => GcStatusView::default(),
+        Err(_) => (
+            GcStatusView::default(),
+            GuardianV2StatusView {
+                head_status: "unreachable",
+                ..Default::default()
+            },
+        ),
+    };
+
+    let retention = {
+        let state = retention_state().lock().unwrap_or_else(|p| p.into_inner());
+        RetentionView {
+            passes: state.passes,
+            refusals: state.refusals,
+            retired_generations_total: state.retired_generations_total,
+            retired_parts_total: state.retired_parts_total,
+            unrooted_bytes_total: state.unrooted_bytes_total,
+            cursor: state.cursor.clone(),
+            last: state.last.clone(),
+        }
     };
 
     axum::Json(GuardianWriteStatsResponse {
@@ -5608,6 +7102,8 @@ async fn guardian_write_stats_handler() -> axum::Json<GuardianWriteStatsResponse
             .clone(),
         protected_roots,
         gc,
+        v2,
+        retention,
     })
 }
 

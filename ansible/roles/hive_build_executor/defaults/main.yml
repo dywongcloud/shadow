@@ -1,0 +1,57 @@
+# Deliberately capability-blank by default: the role must be OPTED INTO per
+# host and every host-specific fact must be supplied explicitly. There is no
+# floating default that could pre-advertise the build-isolation capability —
+# with hive_build_executor_install left false the role writes nothing, and
+# with any required var missing it fails before touching the host.
+#
+# Relationship to ansible/roles/build_executor (the canonical, comprehensive
+# role that provisions the host prerequisites — pinned runsc, podman wrapper,
+# network/firewall, lock, probe — and writes /var/lib/hive/build-executor.json
+# with the 36-field shape WITHOUT the reviewed-archive pin): the executor
+# accepts BOTH. The 5 reviewed-archive fields are optional in the executor:
+# the canonical role's declarations (no pin) parse and skip only the archive
+# byte-rehash, while runsc/image-id/flags still bind; this role ADDS the
+# reviewed-archive pin for stricter supply-chain verification, which the
+# executor then enforces (exact-match + archive re-hash). Never run both roles
+# against the same host: they write the same /var/lib/hive/build-executor.json
+# and the LAST one applied wins — pick one per host (this role for the
+# reviewed pinned artifact; build_executor for host prereqs, which remain
+# required regardless).
+hive_build_executor_install: false
+
+# Where the reviewed archive and the capability declaration live on the node.
+hive_build_executor_state_dir: /var/lib/hive/build-executor
+hive_build_executor_archive_dest: /var/lib/hive/build-executor/hive-build-executor-v8.oci
+hive_build_executor_capability_path: /var/lib/hive/build-executor.json
+
+# REQUIRED, no defaults (asserted in tasks): controller-local archive source
+# and every host runtime fact the executor's InstalledCapability declaration
+# demands. Listed here as documentation of the full required set:
+#   hive_build_executor_archive_src        controller path of the v8 archive
+#   hive_build_executor_runsc_path         pinned runsc binary on the node
+#   hive_build_executor_runsc_sidecar_path
+#   hive_build_executor_runsc_sidecar_sha256
+#   hive_build_executor_podman_path        trusted podman wrapper
+#   hive_build_executor_podman_sha256
+#   hive_build_executor_containers_conf_path
+#   hive_build_executor_containers_conf_sha256
+#   hive_build_executor_containers_conf_override_path
+#   hive_build_executor_containers_conf_override_sha256
+#   hive_build_executor_oci_hooks_dir
+#   hive_build_executor_network_name
+#   hive_build_executor_network_bridge
+#   hive_build_executor_network_subnet
+#   hive_build_executor_network_gateway
+#   hive_build_executor_network_dns_upstream_ipv4 (list)
+#   hive_build_executor_network_policy_id
+#   hive_build_executor_network_policy_digest
+#   hive_build_executor_network_verify_path
+#   hive_build_executor_network_verify_sha256
+#   hive_build_executor_nft_binary
+#   hive_build_executor_nft_policy_path
+#   hive_build_executor_nft_table
+#   hive_build_executor_nft_bridge_table
+#   hive_build_executor_fleet_public_ipv4 (list, strictly sorted)
+#   hive_build_executor_fleet_probe_ipv4
+#   hive_build_executor_provision_lock_path
+#   hive_build_executor_workspace_bytes

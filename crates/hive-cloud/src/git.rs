@@ -2066,10 +2066,23 @@ async fn run_build(
             .filter(|n| n.build_isolation_protocol == Some(1))
             .count();
         if needs_build_isolation && targets.is_empty() && build_isolation_nodes == 0 {
-            let msg = "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no node advertises build-isolation protocol v1. No repository-controlled command was run on the host.".to_string();
-            log(msg.clone());
-            tracing::warn!(project = %project, "deploy refused: no isolated builder capability");
-            return Err(anyhow::anyhow!(msg));
+            // Refuse EARLY only when project settings already prove a
+            // repository-controlled command will run (an explicit
+            // install/build command). Everything else proceeds to checkout
+            // and planning — platform-only work that executes no repository
+            // code — and the command chokepoints below refuse with this same
+            // message the moment a plan would actually execute anything.
+            // That keeps a pure-static zero-command repo deployable on a
+            // builder-less fleet without weakening the isolation boundary.
+            let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
+                || !placement_settings.build.build_command.trim().is_empty();
+            if explicit_commands {
+                let msg = "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no node advertises build-isolation protocol v1. No repository-controlled command was run on the host.".to_string();
+                log(msg.clone());
+                tracing::warn!(project = %project, "deploy refused: no isolated builder capability");
+                return Err(anyhow::anyhow!(msg));
+            }
+            log("No isolated builder capability on this fleet — only zero-command static deploys can succeed; any repository command will be refused.".into());
         }
         // A GPU deployment must NEVER fall through to this node when placement
         // found no GPU-capable target. Everywhere else an empty `targets` means
@@ -2130,12 +2143,22 @@ async fn run_build(
             return Err(anyhow::anyhow!(msg));
         }
         if needs_build_isolation && targets.is_empty() {
-            let msg = format!(
-                "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh). No repository-controlled command was run on the host."
-            );
-            log(msg.clone());
-            tracing::warn!(project = %project, build_isolation_nodes, "deploy refused: isolated builder unavailable");
-            return Err(anyhow::anyhow!(msg));
+            // Same deferred-refusal rule as the fleet-wide gate above: only an
+            // explicit command setting proves a repository-controlled command
+            // will run. Everything else proceeds locally — the command
+            // chokepoints (`require_build_session`) refuse the moment the
+            // resolved plan would actually execute anything, so a
+            // zero-command static repo still deploys on a builder-less node.
+            let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
+                || !placement_settings.build.build_command.trim().is_empty();
+            if explicit_commands {
+                let msg = format!(
+                    "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh). No repository-controlled command was run on the host."
+                );
+                log(msg.clone());
+                tracing::warn!(project = %project, build_isolation_nodes, "deploy refused: isolated builder unavailable");
+                return Err(anyhow::anyhow!(msg));
+            }
         }
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
@@ -2970,7 +2993,21 @@ async fn run_build(
         }
     }
     let mut isolated = if req.image_ref.is_none() {
-        Some(IsolatedBuild::begin(&checkout_dir).await?)
+        // Capability-tolerant: a node with NO build executor installed gets
+        // `None` (only zero-command static deploys can proceed — every
+        // command chokepoint refuses on None). A node whose executor EXISTS
+        // but fails to begin still errors loudly: that is a broken builder,
+        // not a missing capability, and silently downgrading it to
+        // static-only semantics would mask the fault.
+        match crate::build_executor::get() {
+            Ok(_) => Some(IsolatedBuild::begin(&checkout_dir).await?),
+            Err(error) => {
+                log(format!(
+                    "No isolated build executor on this node ({error}); repository commands are disabled for this build — only a zero-command static plan can succeed."
+                ));
+                None
+            }
+        }
     } else {
         None
     };
@@ -2995,9 +3032,11 @@ async fn run_build(
         {
             log(format!("Running Ignored Build Step: {cmd}"));
             match run_ignored_command(
-                isolated
-                    .as_mut()
-                    .expect("source deployments always have an isolated build session"),
+                isolated.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "BUILD_ISOLATION_UNAVAILABLE: vercel.json ignoreCommand is a repository-controlled command and requires an isolated build executor. No repository-controlled command was run on the host."
+                    )
+                })?,
                 &build_dir,
                 &cmd,
                 cloud,
@@ -3713,9 +3752,18 @@ async fn run_build(
 
     // No repository process survives an isolated step. Re-seal once after every
     // platform-authored adaptation so the host static tree and the runtime
-    // artifact are derived from the same bounded immutable snapshot.
+    // artifact are derived from the same bounded immutable snapshot. On a
+    // builder-less node this normalization pass has no executor to run through
+    // — and nothing repository-controlled ever ran (the command chokepoints
+    // refuse without a session), so the checkout on disk IS the platform
+    // truth; skip with a log rather than failing the zero-command static lane.
     if !build_failed && !is_container {
-        reseal_platform_output(&checkout_dir).await?;
+        match crate::build_executor::get() {
+            Ok(_) => reseal_platform_output(&checkout_dir).await?,
+            Err(error) => log(format!(
+                "Skipping final reseal: no isolated build executor on this node ({error}); no repository-controlled command ran, the checkout is platform-authored as-is."
+            )),
+        }
     }
 
     // An isolated backend cannot read the host checkout directly, so derive the
@@ -5384,11 +5432,12 @@ async fn produce_manifest(
         )
         .await;
     }
-    let isolated = isolated.ok_or_else(|| {
-        anyhow::anyhow!(
-            "BUILD_ISOLATION_UNAVAILABLE: source deployment has no isolated build session"
-        )
-    })?;
+    // `isolated` stays Optional past this point: a builder-less node may still
+    // complete a plan that executes NO repository-controlled command (the
+    // zero-command static lane). Every site that would run a command — or
+    // materialize a sealed workspace one produced — requires `Some` and
+    // refuses with BUILD_ISOLATION_UNAVAILABLE otherwise.
+    let mut isolated = isolated;
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
     // full topology). Single-Dockerfile projects are unaffected.
@@ -5405,7 +5454,9 @@ async fn produce_manifest(
         );
     }
     if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
-        isolated.finish().await?;
+        if let Some(session) = isolated.as_mut() {
+            session.finish().await?;
+        }
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
             m.project = project.to_string();
@@ -5561,7 +5612,7 @@ impl<'a> PackageManagerLauncher<'a> {
 async fn build_via_fdi(
     cloud: &Arc<CloudState>,
     bid: &str,
-    isolated: &mut IsolatedBuild,
+    mut isolated: Option<&mut IsolatedBuild>,
     repo_root: &Path,
     dir: &Path,
     preparation: FdiPreparation,
@@ -5641,16 +5692,34 @@ async fn build_via_fdi(
             .filter(|command| !command.trim().is_empty())
         {
             log(format!("Running configured install command: `{cmd}`."));
-            run_streamed(isolated, dir, cmd, cloud, bid, build_env).await?;
+            run_streamed(
+                require_build_session(&mut isolated)?,
+                dir,
+                cmd,
+                cloud,
+                bid,
+                build_env,
+            )
+            .await?;
         }
         if let Some(cmd) = build_override
             .as_deref()
             .filter(|command| !command.trim().is_empty())
         {
             log(format!("Running configured build command: `{cmd}`."));
-            run_streamed(isolated, dir, cmd, cloud, bid, build_env).await?;
+            run_streamed(
+                require_build_session(&mut isolated)?,
+                dir,
+                cmd,
+                cloud,
+                bid,
+                build_env,
+            )
+            .await?;
         }
-        isolated.finish().await?;
+        if let Some(session) = isolated.as_deref_mut() {
+            session.finish().await?;
+        }
         // Resolved AFTER the build step above, so a `.wasm` the build just
         // produced is found rather than only one committed to the repo.
         let Some(start) = detect_wasmer_start_cmd(dir).await else {
@@ -5801,9 +5870,16 @@ async fn build_via_fdi(
             install_cmd,
             if is_monorepo { " (workspace root)" } else { "" }
         ));
-        run_streamed(isolated, &install_dir, &install_cmd, cloud, bid, build_env)
-            .await
-            .context("install command failed")?;
+        run_streamed(
+            require_build_session(&mut isolated)?,
+            &install_dir,
+            &install_cmd,
+            cloud,
+            bid,
+            build_env,
+        )
+        .await
+        .map_err(|error| classify_command_failure("install command failed", &install_cmd, error))?;
     }
     // 1.5) SvelteKit: perform both dependency adaptation and config rewrite in
     // the same isolated workspace as install/build. No installed package or
@@ -5872,7 +5948,7 @@ node -e 'const fs=require("fs"); const p="svelte.config.js"; const s=fs.readFile
 printf '%s\n' "SvelteKit adapter switched to $spec"
 "#
         );
-        isolated
+        require_build_session(&mut isolated)?
             .run(
                 dir,
                 &script,
@@ -5916,7 +5992,7 @@ export default {
 HIVE_OPENNEXT_CONFIG
 printf '%s\n' 'OpenNext: generated Node wrapper configuration'
 "#;
-        isolated
+        require_build_session(&mut isolated)?
             .run(
                 dir,
                 script,
@@ -5934,9 +6010,16 @@ printf '%s\n' 'OpenNext: generated Node wrapper configuration'
     // build in the selected project directory.
     if (has_pkg || build_override.is_some()) && !build_cmd.trim().is_empty() {
         log(format!("Running \"{}\"", build_cmd));
-        run_streamed(isolated, build_exec_dir, &build_cmd, cloud, bid, build_env)
-            .await
-            .context("build command failed")?;
+        run_streamed(
+            require_build_session(&mut isolated)?,
+            build_exec_dir,
+            &build_cmd,
+            cloud,
+            bid,
+            build_env,
+        )
+        .await
+        .map_err(|error| classify_command_failure("build command failed", &build_cmd, error))?;
     }
     if matches!(
         &plan.framework.primitive,
@@ -5953,7 +6036,7 @@ chmod 0444 "$tmp"
 mv -f -- "$tmp" "$p"
 trap - EXIT HUP INT TERM
 "#;
-        isolated
+        require_build_session(&mut isolated)?
             .run(
                 dir,
                 script,
@@ -5988,14 +6071,27 @@ trap - EXIT HUP INT TERM
         // `.vercel/output` parse right below decides what actually shipped
         // instead of a precondition that can name a directory the explicit
         // build never promised to produce.
-        isolated.finish().await?;
-    } else {
+        require_build_session(&mut isolated)?.finish().await?;
+    } else if let Some(session) = isolated.as_deref_mut() {
         let expected_output = if build_output.is_some() {
             fluid_build::OutputDirectory::parse(".vercel/output")?
         } else {
             plan.output_dir.clone()
         };
-        isolated.finish_with_output(dir, &expected_output).await?;
+        session.finish_with_output(dir, &expected_output).await?;
+    } else if !plan.output_dir.as_str().trim_matches('/').is_empty()
+        && plan.output_dir.as_str() != "."
+        && !dir.join(plan.output_dir.as_str()).is_dir()
+    {
+        // Builder-less zero-command lane: no sealed workspace exists (the
+        // checkout bytes ARE the output), but the plan's declared output
+        // directory must still exist — a framework plan whose output only a
+        // build step would have produced must fail here exactly like
+        // `finish_with_output`'s precondition, never serve an empty site.
+        anyhow::bail!(
+            "BUILD_ISOLATION_UNAVAILABLE: plan expects output directory {:?} which does not exist in the checkout, and no isolated build executor is available to produce it. No repository-controlled command was run on the host.",
+            plan.output_dir.as_str()
+        );
     }
 
     let parsed_build_output = fluid_build::resolve_build_output_checked(dir)?;
@@ -6047,6 +6143,41 @@ trap - EXIT HUP INT TERM
             // left untouched for zero regression risk). Under an explicit Bun
             // runtime, point directly at the file instead of relying on Bun
             // matching Node's directory-resolution semantics (unverified).
+            //
+            // Monorepo launch-CWD correction: for a workspace member, `dir` is
+            // the workspace INSTALL ROOT (`apps/web`'s parent), but the function
+            // must boot from the SELECTED app subdirectory itself — not the root.
+            // `detect_start_cmd` against the root reads the ROOT's own
+            // package.json, and a root that is a Turbo wrapper
+            // (`{"scripts":{"build":"turbo run build"}}`, NO `start` script)
+            // falls through to the catch-all `["npm","start"]`; `npm start` at
+            // the root then runs `turbo run build`, which exits without ever
+            // binding $PORT — the cold-start loop retries it 5 times and the
+            // circuit opens as `DEPLOYMENT_CIRCUIT_OPEN`, live-witnessed on a
+            // real production deployment. The selected app's own package.json
+            // (`apps/web` -> `"start": "next start"`) is the correct authority
+            // for BOTH the command and the launch CWD. `cwd_relative` is
+            // relative to the deployment's runtime workdir, which the isolated
+            // backend already resolves as the checkout root — for a monorepo
+            // the correct value is the selected app's own path relative to that
+            // root (`apps/web`); for a non-monorepo it stays `None` so the
+            // existing single-workdir behavior is byte-identical.
+            let cwd_relative = if is_monorepo {
+                Some(
+                    dir.strip_prefix(&install_dir)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "selected application {} is outside package-manager root {}",
+                                dir.display(),
+                                install_dir.display()
+                            )
+                        })?
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            } else {
+                None
+            };
             let start = if is_sveltekit && dir.join("build/index.js").exists() {
                 if runtime_override == Some(hive_core::Runtime::Bun) {
                     vec![
@@ -6060,6 +6191,46 @@ trap - EXIT HUP INT TERM
             } else {
                 detect_start_cmd(dir, runtime_override).await
             };
+            // Fail-loud gate: a resolved `npm start`/`bun run start` whose
+            // OWN directory's package.json declares NO `scripts.start` is
+            // exactly the workspace-root-without-start bug — the catch-all in
+            // `detect_start_cmd` emitted `["npm","start"]` blindly, and the
+            // resulting manifest would cold-start a build script, never bind
+            // $PORT, and open the deployment circuit. Refuse NOW with a named
+            // error instead of registering a guaranteed-broken deployment.
+            let catch_all_start = (!runtime_override.is_some_and(|r| r == hive_core::Runtime::Bun)
+                && start.len() == 2
+                && start[0] == "npm"
+                && start[1] == "start")
+                || (runtime_override.is_some_and(|r| r == hive_core::Runtime::Bun)
+                    && start.len() == 4
+                    && start[0] == "bun"
+                    && start[1] == "run"
+                    && start[2] == "--bun"
+                    && start[3] == "start");
+            if catch_all_start {
+                let pkg_raw = tokio::fs::read_to_string(dir.join("package.json"))
+                    .await
+                    .unwrap_or_default();
+                let has_start = serde_json::from_str::<serde_json::Value>(&pkg_raw)
+                    .ok()
+                    .and_then(|v| v.get("scripts").and_then(|s| s.get("start")).map(|_| ()))
+                    .is_some();
+                if !has_start {
+                    return Err(anyhow::anyhow!(
+                        "build produced no usable production server entry for {}: the build \
+                         directory {} has no package.json `scripts.start`, no recognizable server \
+                         entry (server.js/index.js/…), and its workspace root has no `scripts.start` \
+                         either — a catch-all `{}` here would exit without ever binding $PORT and \
+                         open the deployment circuit in production. For a monorepo, the selected \
+                         app subdirectory (not the workspace root) is the directory that must own a \
+                         `start` script.",
+                        project,
+                        dir.display(),
+                        start.join(" ")
+                    ));
+                }
+            }
             log(format!(
                 "Provisioning serverless server: `{}`.",
                 start.join(" ")
@@ -6103,6 +6274,13 @@ trap - EXIT HUP INT TERM
             let mut m = function_manifest(project, start, runtime_override);
             m.framework = plan.framework.slug.to_string();
             m.route_policies = route_policies;
+            // Stamp the monorepo launch CWD onto the single produced function
+            // (function_manifest always emits exactly one, named "api"). For a
+            // non-monorepo this is `None` and behavior is byte-identical to
+            // before.
+            if let (Some(f), Some(cwd)) = (m.functions.first_mut(), cwd_relative) {
+                f.cwd_relative = Some(cwd);
+            }
             // after()/waitUntil runtime support for Node-runtime deployments: drop
             // the platform shim into the build dir and inject it via NODE_OPTIONS
             // so Next.js `after()` (which funnels into the platform waitUntil at
@@ -7567,6 +7745,20 @@ async fn reseal_platform_output(root: &Path) -> anyhow::Result<()> {
         .context("publish platform-finalized output")
 }
 
+/// The one gate every repository-controlled build step funnels through when
+/// the session is optional: a builder-less node (only the zero-command static
+/// lane can succeed there) refuses with the canonical message instead of ever
+/// running the step on the host.
+fn require_build_session<'a>(
+    isolated: &'a mut Option<&mut IsolatedBuild>,
+) -> anyhow::Result<&'a mut IsolatedBuild> {
+    isolated.as_deref_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "BUILD_ISOLATION_UNAVAILABLE: this build step is a repository-controlled command and requires an isolated build executor, but none is available on this node. No repository-controlled command was run on the host."
+        )
+    })
+}
+
 async fn run_streamed(
     isolated: &mut IsolatedBuild,
     dir: &Path,
@@ -7588,6 +7780,63 @@ async fn run_streamed(
         )
         .await
         .map(|_| ())
+}
+
+/// A repository command dying with the shell's 127 has failed on a MISSING
+/// EXECUTABLE, and whose fault that is depends on where the executable was
+/// supposed to come from. Platform-generated commands probe their own
+/// toolchain and print `BUILD_TOOLCHAIN_MISSING`/`BUILD_TOOLCHAIN_MISMATCH`
+/// themselves before exiting 127/42 (see `PackageManagerLauncher::invoke`),
+/// but an explicit override is repository authority and runs byte-for-byte
+/// (see the "Explicit commands" comment at the `install_cmd` assignment), so
+/// no probe ever wraps it — this classifier is the honest-failure half for
+/// that lane. A bare-word command (`bun install`) names the tool it invoked;
+/// a compound or path-shaped command stays generic (the streamed build log
+/// already carries the shell's own `x: command not found` line naming it).
+/// Either way the failure is reported as the BUILD ENVIRONMENT's missing
+/// tool with the operator remedy — never as the tenant's application
+/// failing, because the command text was preserved exactly and the absent
+/// piece is a platform-provisioned executable. Live witness for why this
+/// classification exists: tokenhun build dpl-0c9ba9d462 (2026-08-24), whose
+/// explicit `bun install` died `/bin/sh: bun: command not found` on a fleet
+/// where bun is provisioned on no build host, and surfaced to the tenant as
+/// "install command failed: exited with exit status: 127" — an app-failure
+/// shape for a platform provisioning gap.
+fn classify_command_failure(context: &str, command: &str, error: anyhow::Error) -> anyhow::Error {
+    let rendered = format!("{error:#}");
+    let (marker, summary) = if rendered.contains("exit status: 127") {
+        (
+            "BUILD_TOOLCHAIN_MISSING",
+            "an executable it invokes is not present in this node's build environment",
+        )
+    } else if rendered.contains("exit status: 42") {
+        (
+            "BUILD_TOOLCHAIN_MISMATCH",
+            "the repository's declared toolchain version does not match this node's build environment",
+        )
+    } else {
+        return error.context(context.to_string());
+    };
+    let simple = !command
+        .split_whitespace()
+        .any(|word| word.chars().any(|c| "&|;<>()$`\\\"'".contains(c)));
+    let tool = if simple {
+        command
+            .split_whitespace()
+            .next()
+            .filter(|word| !word.contains('/'))
+            .map(|word| format!(" ({word:?} is the tool it names first)"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    anyhow::anyhow!(
+        "{marker}: {context}: {command:?} failed — {summary}{tool}. This is a \
+         build-environment fault, not an application error. Operator remedy: \
+         provision the toolchain on build-capable hosts and in the build \
+         executor image; tenant remedy: choose a toolchain the builder \
+         provides (node, npm, pnpm, yarn, bun)."
+    )
 }
 
 async fn run_ignored_command(

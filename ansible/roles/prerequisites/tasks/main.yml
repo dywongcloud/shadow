@@ -250,6 +250,95 @@
     - name: Verify wasmer is now runnable
       ansible.builtin.command: /usr/local/bin/wasmer --version
 
+# bun (package manager + hive_core::Runtime::Bun interpreter): a repo whose
+# resolved package manager is bun — a bun.lock, a packageManager declaration,
+# or an explicit `bun install` settings override — runs `bun …` through the
+# node-local toolchain on every lane whose builds/exec reach the host, and
+# dies with exit 127 on any host without it. Witnessed 2026-08-24 (tokenhun
+# build dpl-0c9ba9d462): bun existed on NO fleet host, so the build died
+# `/bin/sh: bun: command not found` and surfaced to the tenant as an
+# application failure for what was a HOST provisioning gap.
+#
+# WHERE THIS BINARY IS USEFUL, PRECISELY (the wasmer lesson above applies
+# verbatim):
+#   * builds under the currently deployed binaries run repository commands on
+#     the HOST via /bin/sh — this install is what they resolve;
+#   * mock-backend start_function spawns on the HOST, and its
+#     NodeInfo::bun_runtime advertisement is probed via which_on_path("bun");
+#   * firecracker execs start_cmd INSIDE the microVM guest — this host
+#     install is invisible there; those nodes need bun baked into the rootfs
+#     IMAGE instead (scripts/build-rootfs.sh's BUN_TARBALL/BUN_BINARY, which
+#     writes the .bun capability marker next to the image);
+#   * litebox can never run Bun (its pinned upstream syscall shim panics on
+#     Bun's own boot probe — hive-backend/src/litebox.rs refuses pre-spawn).
+# The isolated BuildExecutor's pinned image asserts bun at image build time
+# (ansible/roles/build_executor/templates/Containerfile.j2), so executor-path
+# builds do not depend on this host install; this covers the host/legacy/mock
+# lane and the advertisement probe.
+#
+# ASSET SELECTION: bun-linux-x64 requires AVX2; bun-linux-x64-baseline is the
+# official pre-AVX2 build (the same selection bun's own install script
+# makes). Pinned + sha256-verified exactly like the Node/Wasmer installs
+# above — a mutable URL is how the runsc fleet spread happened. The zip
+# ships only `bun`; bunx is the same binary dispatched on argv[0], installed
+# as a symlink exactly like bun's own install script.
+- name: Check whether bun v1.4.0 is already installed
+  ansible.builtin.command: /usr/local/bin/bun --version
+  register: hive_bun_check
+  failed_when: false
+  changed_when: false
+
+# Exact-version test, NOT a substring (the wasmer lesson two blocks up).
+- name: Install bun v1.4.0 from the official release (sha256-verified)
+  when: hive_bun_check.rc != 0 or hive_bun_check.stdout.strip() != '1.4.0'
+  block:
+    # lookup('file', ...) would read the CONTROL node's cpuinfo — the probe
+    # must run on the managed host.
+    - name: Detect AVX2 on the managed host (selects the bun asset variant)
+      ansible.builtin.command: grep -qw avx2 /proc/cpuinfo
+      register: hive_bun_avx2
+      failed_when: false
+      changed_when: false
+
+    - name: Select the bun asset for this CPU (baseline when AVX2 is absent)
+      ansible.builtin.set_fact:
+        hive_bun_asset: "{{ 'bun-linux-x64' if hive_bun_avx2.rc == 0 else 'bun-linux-x64-baseline' }}"
+        hive_bun_sha256: "{{ '2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452' if hive_bun_avx2.rc == 0 else '184fb4595f0d401a217cf7c78c1bc430ba83314dab7a8b94805babbf7fa7097f' }}"
+
+    - name: Download bun v1.4.0 archive with checksum
+      ansible.builtin.get_url:
+        url: "https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/{{ hive_bun_asset }}.zip"
+        dest: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
+        checksum: "sha256:{{ hive_bun_sha256 }}"
+        force: true
+
+    - name: Extract bun from the v1.4.0 archive into /usr/local
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
+        dest: /usr/local
+        remote_src: true
+        extra_opts:
+          - "{{ hive_bun_asset }}/bun"
+        creates: "/usr/local/{{ hive_bun_asset }}/bun"
+
+    - name: Symlink bun + bunx into /usr/local/bin (on hive-node.service's Environment PATH)
+      ansible.builtin.file:
+        src: "/usr/local/{{ hive_bun_asset }}/bun"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: true
+      loop:
+        - bun
+        - bunx
+
+    - name: Remove the archive
+      ansible.builtin.file:
+        path: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
+        state: absent
+
+    - name: Verify bun is now runnable
+      ansible.builtin.command: /usr/local/bin/bun --version
+
 - name: podman socket enabled (git.rs / sandboxes_platform.rs shell out to podman directly, not via the socket, but keep it available for tooling)
   ansible.builtin.systemd:
     name: podman.socket

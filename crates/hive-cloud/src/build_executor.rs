@@ -5,6 +5,47 @@
 //! builder image, the quota-capable named-volume driver, and (when enabled) the
 //! host-declared egress network have been probed. Repository bytes cross the
 //! boundary with `podman cp`; the checkout is never bind-mounted.
+//!
+//! # Invocation/image capability contract (reviewed builder v8)
+//!
+//! The reviewed builder image is NOT started with a blanket `--cap-drop=all`
+//! plus outer `no-new-privileges`, and its entrypoint is never bypassed. That
+//! earlier invocation could not pass its own probe against the reviewed image:
+//! in-image `buildah` is a broker CLIENT (`/usr/local/bin/buildah` ->
+//! `/usr/local/libexec-hive-buildah-client`) that requires the image init's
+//! broker, and the init (`/usr/local/libexec-hive-build-init`, the image
+//! Entrypoint) refuses to start unless the container carries EXACTLY the
+//! eleven capabilities in [`BUILDER_CAPABILITIES`] with `no_new_privs` CLEAR
+//! at entry (`hive-build-init.c`, `require_initial_security`).
+//!
+//! Privilege separation is enforced INSIDE the sandbox by the init, not by
+//! blanket outer flags: the init verifies the exact entry state, forks a
+//! capability-retaining Buildah broker (which launches real Buildah inside a
+//! nested user+mount namespace with `--isolation=chroot` forced by an option
+//! allowlist), then forks the tenant with ALL capabilities dropped and
+//! `no_new_privs` latched, and finally drops its own. Tenant build commands
+//! therefore run with zero capabilities and NNP exactly as before; the eleven
+//! capabilities exist only in the PID-separated broker. Why each is retained
+//! (all consumed by chroot-isolation image assembly inside gVisor):
+//! `SYS_CHROOT` (chroot into the build rootfs), `CHOWN`/`FOWNER`/`FSETID`
+//! (foreign-uid ownership, modes and set-id bit preservation during layer
+//! extraction/commit, e.g. `COPY --chown`), `DAC_OVERRIDE` (traversing store
+//! content owned by other mapped ids), `SETUID`/`SETGID` (multi-id
+//! `uid_map`/`gid_map` for the nested userns and `USER` directives in tenant
+//! builds), `SETPCAP` (broker bounds the child capability set before exec),
+//! `SYS_ADMIN` (bind mounts of /proc//dev into the chroot build root),
+//! `MKNOD` (device nodes in tenant rootfs), `SETFCAP` (file-capability
+//! xattrs in tenant images). A mixed invocation is structurally impossible:
+//! under dropped capabilities or preset NNP the init exits 125 before any
+//! tenant byte runs, and without the init the broker socket never exists, so
+//! every nested-build path refuses. Never reintroduce the blanket flags
+//! silently: they LOOK stricter but only disable the reviewed privilege
+//! separation and were never a working contract against this image.
+//!
+//! Identity is pinned end-to-end: the installed declaration must carry the
+//! byte-reproducible reviewed archive facts (`REVIEWED_BUILDER_*`), the
+//! measured archive hash must match, and the Podman image id must equal the
+//! reviewed OCI config digest. Any mismatch leaves the capability blank.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +86,66 @@ const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 8] = [
     "net-raw=false",
     "allow-flag-override=false",
 ];
+
+/// Reviewed builder artifact facts (hive-build-executor v8, accepted after two
+/// independent clean-BuildKit-root builds produced byte-identical archives).
+/// The installed declaration must repeat these EXACTLY and the measured
+/// archive must hash to them; any drift leaves the capability blank. There are
+/// no floating defaults: shipping a new builder means reviewing and updating
+/// these constants together with the archive.
+///
+/// The archive is the COMPRESSION-NORMALIZED artifact, not BuildKit's raw
+/// export. BuildKit's uncompressed layers are byte-reproducible across
+/// independent roots (identical diff_ids), but its gzip envelope is NOT
+/// deterministic (measured: two independent roots gave identical uncompressed
+/// content, 531,394,560 vs 468,183,040 compressed bytes). The recipe therefore
+/// recompresses every layer with a single canonical gzip (fixed level, mtime=0,
+/// no original-name) and rebuilds the manifest/index deterministically, so any
+/// two independent builds normalize to the exact bytes pinned below. The image
+/// CONFIG digest is unaffected (it references only uncompressed diff_ids), which
+/// is why `builder_config_digest` == the podman image id stays stable across
+/// the normalization.
+const REVIEWED_BUILDER_ARCHIVE_SHA256: &str =
+    "9e40310b3bd0591e1276bd3a58cd09832949d0c8686270d01b1a98e13e095682";
+const REVIEWED_BUILDER_ARCHIVE_BYTES: u64 = 459_059_200;
+const REVIEWED_BUILDER_MANIFEST_DIGEST: &str =
+    "sha256:feb1c13108a6c4e3b5671d62f852e11e59a21d8ba3df79653c65a07665b71a54";
+/// The OCI config digest IS the Podman image id for a loaded image; the
+/// declaration's `builder_image_id` must equal it.
+const REVIEWED_BUILDER_CONFIG_DIGEST: &str =
+    "sha256:3c7f08e2e6acf73b3fa1c30b9382609eda86ac6dca04bbdf53c8141c74772835";
+const REVIEWED_RUNSC_VERSION: &str = "release-20260817.0";
+const REVIEWED_RUNSC_SHA256: &str =
+    "048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c";
+/// The image init: verified as the image Entrypoint at probe time and always
+/// invoked explicitly, so a config drift can never silently bypass it.
+const BUILDER_INIT_PATH: &str = "/usr/local/libexec-hive-build-init";
+const BUILDER_INIT_ENTRYPOINT_FLAG: &str = "--entrypoint=/usr/local/libexec-hive-build-init";
+/// The exact container capability set the image init requires at entry (see
+/// the module doc for why each is retained by the broker). Order follows the
+/// kernel capability numbers; the derived tenant bounding mask is
+/// [`BUILDER_TENANT_BOUNDING_MASK`].
+const BUILDER_CAPABILITIES: [&str; 11] = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "SETGID",
+    "SETUID",
+    "SETPCAP",
+    "SYS_CHROOT",
+    "SYS_ADMIN",
+    "MKNOD",
+    "SETFCAP",
+];
+/// /proc/self/status CapBnd for the tenant: the eleven capabilities above as
+/// a kernel bitmask. The tenant's effective/permitted/inheritable/ambient
+/// sets must all read zero; only the unusable bounding set retains the mask
+/// (no file capabilities or set-id binaries exist in the reviewed image).
+const BUILDER_TENANT_BOUNDING_MASK: &str = "00000000882401db";
+/// Mirrors the reviewed bring-up harness invocation; single-container runsc
+/// sandboxes accept it inertly and CRI-style shims require it.
+const SANDBOX_ANNOTATION: &str = "--annotation=io.kubernetes.cri.container-type=sandbox";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +315,24 @@ pub fn get() -> Result<BuildExecutor> {
 struct InstalledCapability {
     protocol: String,
     builder_image_id: String,
+    /// Optional reviewed-archive pin. When present, ALL five must be present
+    /// and match the reviewed facts and the archive is re-hashed against them
+    /// (fail-closed on corruption). When absent — the canonical
+    /// `ansible/roles/build_executor` declaration shape, which this codebase
+    /// cannot edit — the declaration parses and only the archive byte-check
+    /// is skipped; the runsc/image-id/flags checks below still bind. Never
+    /// make these silent-floating: an absent pin is a conscious declaration
+    /// choice, a wrong value is always a refusal.
+    #[serde(default)]
+    builder_archive_path: Option<PathBuf>,
+    #[serde(default)]
+    builder_archive_sha256: Option<String>,
+    #[serde(default)]
+    builder_archive_bytes: Option<u64>,
+    #[serde(default)]
+    builder_manifest_digest: Option<String>,
+    #[serde(default)]
+    builder_config_digest: Option<String>,
     runsc_path: PathBuf,
     runsc_version: String,
     runsc_sha256: String,
@@ -483,6 +602,113 @@ impl BuildExecutor {
                 "runsc wrapper flags differ from the reviewed fail-closed set",
             ));
         }
+        // Reviewed-archive pin: all-or-nothing. A partial set is a malformed
+        // declaration (refuse); a full set must match the reviewed facts and
+        // the archive is re-hashed; an absent set (canonical role) parses and
+        // skips only the archive byte-check.
+        let archive_pin_present = declaration.builder_archive_path.is_some()
+            || declaration.builder_archive_sha256.is_some()
+            || declaration.builder_archive_bytes.is_some()
+            || declaration.builder_manifest_digest.is_some()
+            || declaration.builder_config_digest.is_some();
+        if archive_pin_present {
+            let archive_path = declaration
+                .builder_archive_path
+                .as_ref()
+                .ok_or_else(|| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::InvalidConfig,
+                        "load installed BuildExecutor",
+                        "builder archive pin is partial: builder_archive_path is required",
+                    )
+                })?;
+            let archive_sha = declaration
+                .builder_archive_sha256
+                .as_deref()
+                .ok_or_else(|| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::InvalidConfig,
+                        "load installed BuildExecutor",
+                        "builder archive pin is partial: builder_archive_sha256 is required",
+                    )
+                })?;
+            let archive_bytes = declaration
+                .builder_archive_bytes
+                .ok_or_else(|| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::InvalidConfig,
+                        "load installed BuildExecutor",
+                        "builder archive pin is partial: builder_archive_bytes is required",
+                    )
+                })?;
+            let manifest_digest = declaration
+                .builder_manifest_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::InvalidConfig,
+                        "load installed BuildExecutor",
+                        "builder archive pin is partial: builder_manifest_digest is required",
+                    )
+                })?;
+            let config_digest = declaration
+                .builder_config_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::InvalidConfig,
+                        "load installed BuildExecutor",
+                        "builder archive pin is partial: builder_config_digest is required",
+                    )
+                })?;
+            if archive_sha != REVIEWED_BUILDER_ARCHIVE_SHA256
+                || archive_bytes != REVIEWED_BUILDER_ARCHIVE_BYTES
+                || manifest_digest != REVIEWED_BUILDER_MANIFEST_DIGEST
+                || config_digest != REVIEWED_BUILDER_CONFIG_DIGEST
+            {
+                return Err(BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityMismatch,
+                    "load installed BuildExecutor",
+                    "declaration differs from the reviewed builder/runsc facts",
+                ));
+            }
+            validate_trusted_regular_file(archive_path, "reviewed builder OCI archive")?;
+            let measured_archive = sha256_file(archive_path).await?;
+            let archive_metadata =
+                tokio::fs::metadata(archive_path).await.map_err(|error| {
+                    BuildExecutorError::new(
+                        BuildExecutorErrorCode::CapabilityUnavailable,
+                        "load installed BuildExecutor",
+                        format!("cannot measure builder archive: {error}"),
+                    )
+                })?;
+            if hex_bytes(&measured_archive) != REVIEWED_BUILDER_ARCHIVE_SHA256
+                || archive_metadata.len() != REVIEWED_BUILDER_ARCHIVE_BYTES
+            {
+                return Err(BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityMismatch,
+                    "load installed BuildExecutor",
+                    format!(
+                        "builder archive differs from the reviewed facts: measured sha256 {} ({} bytes)",
+                        hex_bytes(&measured_archive),
+                        archive_metadata.len()
+                    ),
+                ));
+            }
+        }
+        if declaration.builder_image_id.trim_start_matches("sha256:")
+            != REVIEWED_BUILDER_CONFIG_DIGEST.trim_start_matches("sha256:")
+            || declaration.runsc_version != REVIEWED_RUNSC_VERSION
+            || declaration.runsc_sha256 != REVIEWED_RUNSC_SHA256
+            || declaration.builder_uid != 65532
+            || declaration.builder_gid != 65532
+        {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityMismatch,
+                "load installed BuildExecutor",
+                "declaration differs from the reviewed builder/runsc facts",
+            ));
+        }
         validate_trusted_executable(&declaration.podman_path, "BuildExecutor Podman wrapper")?;
         validate_trusted_executable(&declaration.runsc_sidecar_path, "runsc sidecar")?;
         validate_trusted_regular_file(
@@ -670,6 +896,15 @@ impl BuildExecutor {
             &mut hasher,
             "builder-image",
             config.builder_image.as_bytes(),
+        );
+        digest_field(&mut hasher, "builder-init", BUILDER_INIT_PATH.as_bytes());
+        for capability in BUILDER_CAPABILITIES {
+            digest_field(&mut hasher, "builder-capability", capability.as_bytes());
+        }
+        digest_field(
+            &mut hasher,
+            "builder-tenant-bounding",
+            BUILDER_TENANT_BOUNDING_MASK.as_bytes(),
         );
         digest_field(&mut hasher, "uid", &config.user.uid.to_le_bytes());
         digest_field(&mut hasher, "gid", &config.user.gid.to_le_bytes());
@@ -1029,6 +1264,7 @@ impl BuildExecutor {
             WORKSPACE_MOUNT,
             idle,
             &[],
+            false,
         );
         let created = self.podman_output(args, Duration::from_secs(30)).await?;
         require_success("create build container", &created)?;
@@ -1103,7 +1339,17 @@ impl BuildExecutor {
             .await?;
         cleanup.add_volume(volume.clone());
 
-        let idle = "trap 'exit 0' TERM INT; while :; do /bin/sleep 3600; done";
+        // The writer's tenant first runs the in-image selfcheck, which
+        // witnesses the full runtime contract from inside the sandbox: exact
+        // uid/gid 65532, tenant CapEff/CapPrm/CapInh/CapAmb all zero, tenant
+        // CapBnd exactly BUILDER_TENANT_BOUNDING_MASK, no_new_privs latched,
+        // a live broker, and the pinned toolchain versions. The output file
+        // is renamed into place atomically so the exec probe below never
+        // reads a partial write.
+        let idle = "hive-builder-selfcheck > /workspace/.hive-selfcheck.tmp 2>&1 \
+            && mv /workspace/.hive-selfcheck.tmp /workspace/.hive-selfcheck.out \
+            || { mv /workspace/.hive-selfcheck.tmp /workspace/.hive-selfcheck.out 2>/dev/null; exit 125; }; \
+            trap 'exit 0' TERM INT; while :; do /bin/sleep 3600; done";
         let args = self.container_create_args(
             &writer,
             &[format!("{volume}:{WORKSPACE_MOUNT}:rw,U,nodev,nosuid")],
@@ -1112,6 +1358,7 @@ impl BuildExecutor {
             WORKSPACE_MOUNT,
             idle,
             &[],
+            true,
         );
         let created = self.podman_output(args, Duration::from_secs(30)).await?;
         require_success("probe create sandbox", &created)?;
@@ -1122,22 +1369,38 @@ impl BuildExecutor {
             .podman_output([os("start"), os(&writer)], Duration::from_secs(30))
             .await?;
         require_success("probe start runsc sandbox", &started)?;
+        // Exec'd processes never inherit the init's broker environment, so
+        // the probe recovers the per-boot abstract socket name from the
+        // supervising init (container PID 1, same uid) and talks to the
+        // broker exactly the way tenant mains do. Buildah runs brokered with
+        // the chroot isolation the broker's option allowlist enforces; a
+        // direct or rootless invocation has no working path in this image.
         let script = "set -eu; \
             test \"$(cat /proc/gvisor/kernel_is_gvisor)\" = gvisor; \
             test \"$(/usr/bin/id -u)\" = \"$1\"; \
             test \"$(/usr/bin/id -g)\" = \"$2\"; \
+            i=0; until test -s /workspace/.hive-selfcheck.out; do \
+              i=$((i+1)); test \"$i\" -le 120; /bin/sleep 1; done; \
+            /usr/bin/tail -n 1 /workspace/.hive-selfcheck.out | /usr/bin/grep -qx selfcheck=PASS; \
             for c in docker podman nerdctl; do ! command -v \"$c\" >/dev/null 2>&1; done; \
-            command -v buildah >/dev/null; \
+            test \"$(command -v buildah)\" = /usr/local/bin/buildah; \
+            HIVE_BUILDAH_SOCKET=$(/usr/bin/tr '\\0' '\\n' < /proc/1/environ | /usr/bin/sed -n 's/^HIVE_BUILDAH_SOCKET=//p'); \
+            test -n \"$HIVE_BUILDAH_SOCKET\"; export HIVE_BUILDAH_SOCKET; \
+            test \"$(buildah __hive_broker_security_v1)\" = broker_security=PASS; \
             set -- $(/usr/bin/stat -f -c '%S %b' /workspace); \
             cap=$(($1 * $2)); printf '%s\\n' \"$cap\"; \
             printf hive-build-volume-probe > /workspace/probe; \
-            mkdir /workspace/oci-probe; \
-            printf 'FROM scratch\\nCOPY marker /marker\\n' >/workspace/oci-probe/Containerfile; \
-            printf verified >/workspace/oci-probe/marker; \
-            buildah --storage-driver=vfs bud --isolation=rootless --format=oci \
-              --tag hive-build-probe:latest /workspace/oci-probe >/dev/null; \
-            buildah --storage-driver=vfs push hive-build-probe:latest \
-              oci-archive:/workspace/probe.oci:hive-build-probe >/dev/null; \
+            mkdir -p /workspace/.buildah/xdg /workspace/.buildah/tmp; \
+            rm -rf /workspace/oci-probe; \
+            mkdir -p /workspace/oci-probe/store /workspace/oci-probe/run /workspace/oci-probe/context; \
+            printf 'FROM scratch\\nCOPY marker /marker\\n' >/workspace/oci-probe/context/Containerfile; \
+            printf verified >/workspace/oci-probe/context/marker; \
+            buildah --root=/workspace/oci-probe/store --runroot=/workspace/oci-probe/run \
+              --storage-driver=vfs bud --isolation=chroot --format=oci --layers=false --no-cache \
+              --timestamp=0 --tag localhost/hive-build-probe:latest /workspace/oci-probe/context >/dev/null 2>&1; \
+            buildah --root=/workspace/oci-probe/store --runroot=/workspace/oci-probe/run \
+              --storage-driver=vfs push --format=oci localhost/hive-build-probe:latest \
+              oci-archive:/workspace/probe.oci:hive-build-probe >/dev/null 2>&1; \
             test -s /workspace/probe.oci";
         let extra = [
             self.inner.config.user.uid.to_string(),
@@ -1177,6 +1440,7 @@ impl BuildExecutor {
             WORKSPACE_MOUNT,
             "set -eu; test \"$(cat /workspace/probe)\" = hive-build-volume-probe",
             &[],
+            false,
         );
         let created = self.podman_output(args, Duration::from_secs(30)).await?;
         require_success("probe create persistence reader", &created)?;
@@ -1408,6 +1672,11 @@ impl BuildExecutor {
         workdir: &str,
         script: &str,
         script_args: &[String],
+        // `true` keeps the image environment plus the init-exported broker
+        // variables for the tenant (`HIVE_BUILDAH_SOCKET`/`_BROKER_PID`, only
+        // sound for coordinator-authored probe scripts); `false` scrubs the
+        // tenant environment with `env -i` exactly as before.
+        image_env: bool,
     ) -> Vec<OsString> {
         let config = &self.inner.config;
         let limits = &config.limits;
@@ -1430,8 +1699,15 @@ impl BuildExecutor {
             os("--read-only"),
             os("--read-only-tmpfs=false"),
             os("--image-volume=ignore"),
+            // The image init requires EXACTLY this capability set with
+            // no_new_privs clear at entry; it retains them only in the
+            // PID-separated Buildah broker and starts the tenant with all
+            // capabilities dropped and no_new_privs latched. An outer
+            // `--security-opt=no-new-privileges` or a bare `--cap-drop=all`
+            // makes the init exit 125 before any tenant byte runs (see the
+            // module doc, "Invocation/image capability contract").
             os("--cap-drop=all"),
-            os("--security-opt=no-new-privileges"),
+            os(SANDBOX_ANNOTATION),
             os("--ipc=private"),
             os("--pid=private"),
             os("--uts=private"),
@@ -1479,6 +1755,9 @@ impl BuildExecutor {
                 .map(|value| value.network.as_str())
                 .unwrap_or("none")),
         ];
+        for capability in BUILDER_CAPABILITIES {
+            args.push(os(format!("--cap-add={capability}")));
+        }
         if let Some(path) = env_file {
             args.push(os("--env-file"));
             args.push(path.as_os_str().to_os_string());
@@ -1487,21 +1766,30 @@ impl BuildExecutor {
             args.push(os("--volume"));
             args.push(os(mount));
         }
-        if env_file.is_some() {
+        // Every container main process is supervised by the image init: it
+        // re-verifies the entry capability contract, starts the broker, and
+        // execs the argv below as the fully-de-capped, NNP-latched tenant.
+        // The init path is pinned here AND verified against the image config
+        // at probe time, so neither side can drift silently.
+        if env_file.is_some() || image_env {
             // Step containers need the validated --env-file values long enough for
             // clean_env_wrapper to copy only the requested keys into its own
-            // `env -i` process. An outer `env -i` would erase them first.
+            // `env -i` process. An outer `env -i` would erase them first. The
+            // probe writer keeps the image environment for the same reason:
+            // the in-image selfcheck consumes the broker variables.
             args.extend([
-                os("--entrypoint=/bin/sh"),
+                os(BUILDER_INIT_ENTRYPOINT_FLAG),
                 os(&config.builder_image),
+                os("/bin/sh"),
                 os("-c"),
                 os(script),
                 os("hive-build"),
             ]);
         } else {
             args.extend([
-                os("--entrypoint=/usr/bin/env"),
+                os(BUILDER_INIT_ENTRYPOINT_FLAG),
                 os(&config.builder_image),
+                os("/usr/bin/env"),
                 os("-i"),
                 os(format!("PATH={BASE_PATH}")),
                 os("HOME=/workspace/home"),
@@ -1775,6 +2063,7 @@ impl BuildExecutor {
             "/sealed/artifact",
             script,
             &[],
+            false,
         );
         let created = self.podman_output(args, Duration::from_secs(30)).await?;
         require_success("create output verifier", &created)?;
@@ -1964,6 +2253,7 @@ impl BuildSession {
             &step.cwd.container_path(),
             &wrapper,
             &script_args,
+            false,
         );
         let created = self
             .executor
@@ -2392,6 +2682,7 @@ chmod 0400 "$archive"
             "/sealed",
             "trap 'exit 0' TERM INT; while :; do /bin/sleep 3600; done",
             &[],
+            false,
         );
         let created = session
             .executor
@@ -2422,6 +2713,7 @@ chmod 0400 "$archive"
             "/sealed",
             copy_script,
             &[output.as_str().to_string()],
+            false,
         );
         let created = session
             .executor
@@ -2669,6 +2961,7 @@ exit 74
             "/sealed/artifact",
             script,
             &[path.as_str().to_string()],
+            false,
         );
         let created = self
             .executor
@@ -3707,6 +4000,42 @@ fn verify_image_inspect(bytes: &[u8], reference: &str) -> Result<()> {
             BuildExecutorErrorCode::CapabilityMismatch,
             "probe builder image",
             format!("local image does not report configured sha256:{expected}"),
+        ));
+    }
+    // The loaded image must still carry the reviewed runtime contract: the
+    // init as Entrypoint (this executor invokes it explicitly, but a config
+    // drift here means the archive is not the reviewed one), the exact
+    // non-root user, and the protocol label.
+    let image_config = object
+        .get("Config")
+        .or_else(|| object.get("config"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityMismatch,
+                "probe builder image",
+                "image inspect carries no Config object",
+            )
+        })?;
+    let user_ok = json_str(image_config, &["User"]) == Some("65532:65532");
+    let entrypoint_ok = image_config
+        .get("Entrypoint")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values.len() == 1 && values[0].as_str() == Some(BUILDER_INIT_PATH)
+        });
+    let workdir_ok = json_str(image_config, &["WorkingDir"]) == Some(WORKSPACE_MOUNT);
+    let label_ok = image_config
+        .get("Labels")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|labels| labels.get("org.hive.build-executor.protocol"))
+        .and_then(serde_json::Value::as_str)
+        == Some("hive-build-executor/v1");
+    if !user_ok || !entrypoint_ok || !workdir_ok || !label_ok {
+        return Err(BuildExecutorError::new(
+            BuildExecutorErrorCode::CapabilityMismatch,
+            "probe builder image",
+            "image config user/entrypoint/workdir/protocol-label differ from the reviewed contract",
         ));
     }
     Ok(())

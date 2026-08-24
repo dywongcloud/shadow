@@ -56,3 +56,9 @@ Goal (G): probe several platform API routes without mutating the environment use
 What drifted / what went wrong: a zsh loop variable named `path` replaced the shell's special `path` array, which also rewrote `PATH`; subsequent `curl`, `python3`, and `rm` calls all failed as command-not-found.
 Fix / resolution: renamed the loop variable to `route` and reran the bounded read-only probe successfully.
 Generalizes to: in zsh scripts, never use `path` as an ordinary scalar; it is a special parameter tied to `PATH`. Use `route`, `target`, or another non-special name.
+
+## 2026-08-24 -- zsh read-only specials strike again: `status`
+Goal (G): background CI watcher polling `gh run list` until terminal state.
+What drifted / what went wrong: the loop assigned `status=$(...)`; in zsh `status` is a read-only special (aliases `$?`), so the script died on line 3 with "read-only variable: status" and the watch produced a false "failed" notification while CI was actually in_progress.
+Fix / resolution: renamed to `ci_state`. Sibling of the 2026-08 `path` lesson (loop variable `path` rewrote PATH).
+Generalizes to: never use zsh special names (`path`, `status`, `options`, `cdpath`, `fignore`, `mailpath`, `manpath`, `watch`, `histchars`) as shell variables in this environment; prefer task-prefixed names (`ci_state`, `route`).

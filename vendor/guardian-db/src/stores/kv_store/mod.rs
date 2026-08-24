@@ -119,9 +119,13 @@ async fn refresh_kv_index(
     client: &Arc<crate::p2p::network::client::IrohClient>,
     index: &Arc<KeyValueIndex>,
 ) -> Result<usize> {
-    let entries = docs
-        .get_many(doc, Query::single_latest_per_key().build())
-        .await?;
+    // Boxed: the irpc-backed docs query and the per-entry blob read below are
+    // both very large futures. Left inline they inflate this generator and —
+    // in debug builds — every enclosing poll frame on the worker stack; the
+    // unboxed chain (store init → sync_index_from_docs → here → cat_bytes)
+    // overflowed the tokio worker stack at boot. Boxing keeps each poll frame
+    // pointer-sized at an init/rebuild-only allocation cost.
+    let entries = Box::pin(docs.get_many(doc, Query::single_latest_per_key().build())).await?;
 
     // Snapshot BEFORE clear_all so a transient content-fetch failure can fall
     // back to last-known-good instead of dropping the key. This refresh fully
@@ -149,7 +153,7 @@ async fn refresh_kv_index(
 
         // Read the content bytes via the blob store using the content_hash.
         let hash_str = entry.content_hash().to_hex();
-        match client.cat_bytes(&hash_str).await {
+        match Box::pin(client.cat_bytes(&hash_str)).await {
             Ok(value) => {
                 index.insert(key, value);
                 count += 1;
@@ -583,6 +587,57 @@ impl KeyValueStore for GuardianDBKeyValue {
         Ok(heads)
     }
 
+    /// Bounded lexical page of live entry heads under `prefix` — streams
+    /// straight off the iroh-docs query iterator (redb range pushdown for the
+    /// prefix, 64-entry client backpressure window), retaining at most
+    /// `limit` rows. The `content_len` rides the same redb row, so a page
+    /// costs zero content RPCs. `after` is an exclusive cursor: entries with
+    /// `key <= after` are skipped, which keeps resumption deterministic in
+    /// ascending key order even while the key population mutates between
+    /// pages.
+    async fn entry_heads_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::traits::EntryHeadPage>> {
+        use futures::StreamExt;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = Query::single_latest_per_key()
+            .key_prefix(prefix.as_bytes())
+            .build();
+        let entries = Box::pin(self.doc_handle.get_many(query))
+            .await
+            .map_err(|e| GuardianError::Store(format!("entry_heads_page query failed: {e}")))?;
+        futures::pin_mut!(entries);
+        let mut page = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry
+                .map_err(|e| GuardianError::Store(format!("entry_heads_page read failed: {e}")))?;
+            // Entries with content_len == 0 are deletion markers.
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let key = String::from_utf8_lossy(entry.key()).to_string();
+            if after.is_some_and(|cursor| key.as_str() <= cursor) {
+                continue;
+            }
+            page.push(crate::traits::EntryHeadPage {
+                key,
+                hash: entry.content_hash().to_hex(),
+                timestamp: entry.timestamp(),
+                content_len: entry.content_len(),
+            });
+            if page.len() >= limit {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
     /// Real targeted reconciliation: `iroh_docs::api::Doc::start_sync` against
     /// exactly this document and exactly this one peer (never a full-database
     /// refresh). Subscribes BEFORE issuing `start_sync` so the matching
@@ -704,7 +759,14 @@ impl GuardianDBKeyValue {
     /// Queries all document entries and rebuilds the in-memory index.
     /// Used after load/sync operations or for state recovery.
     pub async fn sync_index_from_docs(&self) -> Result<usize> {
-        refresh_kv_index(&self.docs, &self.doc_handle, &self.client, &self.index).await
+        // Boxed for the same stack-overflow fix as `refresh_kv_index` itself.
+        Box::pin(refresh_kv_index(
+            &self.docs,
+            &self.doc_handle,
+            &self.client,
+            &self.index,
+        ))
+        .await
     }
 
     /// Starts a background task that keeps the in-memory index synchronized with the
@@ -756,7 +818,9 @@ impl GuardianDBKeyValue {
                         Err(_) => {
                             // Quiet window elapsed with the index still dirty — rebuild once.
                             dirty = false;
-                            if let Err(e) = refresh_kv_index(&docs, &doc, &client, &index).await {
+                            if let Err(e) =
+                                Box::pin(refresh_kv_index(&docs, &doc, &client, &index)).await
+                            {
                                 warn!("Failed to update KV index via live sync: {:?}", e);
                             }
                         }
@@ -932,8 +996,16 @@ impl GuardianDBKeyValue {
         // --- 1. Initialize iroh-docs ---
 
         // Ensure the iroh-docs subsystem is initialized in the client.
+        //
+        // NOTE on the `Box::pin` calls throughout this constructor: `new` is
+        // one long async fn awaiting many very large irpc/iroh futures. In
+        // debug builds each unboxed sub-future reserves its full size in this
+        // generator's poll frame, and the sum (this fn + the guardian-core
+        // open/create chain above it) overflowed the tokio worker stack at
+        // boot — a 100%-reproducible abort. Boxing the fat awaits keeps each
+        // poll frame pointer-sized; this path runs once per store open.
         if !client.has_docs_client().await {
-            client.init_docs().await.map_err(|e| {
+            Box::pin(client.init_docs()).await.map_err(|e| {
                 GuardianError::Store(format!("Failed to initialize iroh-docs: {}", e))
             })?;
         }
@@ -944,7 +1016,7 @@ impl GuardianDBKeyValue {
 
         // --- 2. Get the AuthorId ---
 
-        let author_id = docs.get_or_init_author().await.map_err(|e| {
+        let author_id = Box::pin(docs.get_or_init_author()).await.map_err(|e| {
             GuardianError::Store(format!("Failed to initialize iroh-docs author: {}", e))
         })?;
 
@@ -1009,7 +1081,7 @@ impl GuardianDBKeyValue {
         // a peer that already holds this store and that authorizes this node (gated via AccessController).
         let resolved_ticket: Option<String> = match opts.doc_ticket.clone() {
             Some(t) => Some(t),
-            None => client.backend().resolve_shared_ticket(&store_key).await,
+            None => Box::pin(client.backend().resolve_shared_ticket(&store_key)).await,
         };
 
         // Establish the document, tracking whether this replica holds the namespace write
@@ -1022,7 +1094,7 @@ impl GuardianDBKeyValue {
                 .map_err(|e| GuardianError::Store(format!("Invalid DocTicket: {}", e)))?;
             // The ticket's capability determines whether we receive the write secret.
             let ticket_writable = matches!(ticket.capability, Capability::Write(_));
-            let doc = docs.import_doc(ticket).await?;
+            let doc = Box::pin(docs.import_doc(ticket)).await?;
             let ns_id = doc.id();
             // Persist the imported NamespaceId and its writability for future reopenings.
             cache
@@ -1046,7 +1118,7 @@ impl GuardianDBKeyValue {
                     ns_bytes.copy_from_slice(&namespace_bytes);
                     let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
 
-                    match docs.open_doc(namespace_id).await? {
+                    match Box::pin(docs.open_doc(namespace_id)).await? {
                         Some(doc) => {
                             // Writability was recorded when the namespace was first established;
                             // legacy stores without the flag are assumed write-capable.
@@ -1070,7 +1142,7 @@ impl GuardianDBKeyValue {
                                 "Cached namespace {:?} not found, creating new document",
                                 namespace_id
                             );
-                            let doc = docs.create_doc().await?;
+                            let doc = Box::pin(docs.create_doc()).await?;
                             let ns_id = doc.id();
                             cache
                                 .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
@@ -1096,7 +1168,7 @@ impl GuardianDBKeyValue {
                 }
                 _ => {
                     // No NamespaceId in the cache — create a new document.
-                    let doc = docs.create_doc().await?;
+                    let doc = Box::pin(docs.create_doc()).await?;
                     let ns_id = doc.id();
                     cache
                         .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
@@ -1159,7 +1231,7 @@ impl GuardianDBKeyValue {
         };
 
         // Synchronize the local index with the iroh-docs document state.
-        match store.sync_index_from_docs().await {
+        match Box::pin(store.sync_index_from_docs()).await {
             Ok(count) => {
                 if count > 0 {
                     info!(
@@ -1184,18 +1256,15 @@ impl GuardianDBKeyValue {
         // automatic namespace exchange on the network. The capability is gated per requester
         // by the AccessController: write-authorized peers get the write ticket (namespace
         // secret), read-only peers get the read ticket (public key only).
-        match store.share_tickets().await {
+        match Box::pin(store.share_tickets()).await {
             Ok((read_ticket, write_ticket)) => {
-                store
-                    .client
-                    .backend()
-                    .register_ticket_provider(
-                        store_key,
-                        read_ticket,
-                        write_ticket,
-                        access_controller_for_registry,
-                    )
-                    .await;
+                Box::pin(store.client.backend().register_ticket_provider(
+                    store_key,
+                    read_ticket,
+                    write_ticket,
+                    access_controller_for_registry,
+                ))
+                .await;
             }
             Err(e) => {
                 warn!(

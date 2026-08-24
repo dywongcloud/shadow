@@ -1,0 +1,36 @@
+# Reviewed builder facts — EXACT pins, never operator-overridable floating
+# defaults (vars/ precedence deliberately outranks inventory). These values
+# must stay byte-identical to the REVIEWED_BUILDER_* / REVIEWED_RUNSC_*
+# constants in crates/hive-cloud/src/build_executor.rs: the executor refuses
+# any declaration that differs, so drifting one side only blanks the
+# capability fleet-wide (fail-closed, never fail-open).
+#
+# Provenance: hive-build-executor v8, accepted 2026-08-23 after two
+# independent clean-BuildKit-root builds produced byte-identical archives
+# (checkpoint /home/dylanwong.guest/hive-builder-20260822 on build host
+# litebox; recipe hive-builder-context-v8.lock.json). The archive is the
+# COMPRESSION-NORMALIZED artifact: BuildKit's uncompressed layers are
+# byte-reproducible (identical diff_ids) but its gzip envelope is not, so the
+# recipe recompresses every layer canonically (fixed gzip level, mtime=0, no
+# name) and rebuilds the manifest/index deterministically. The config digest
+# (== podman image id) is unchanged by normalization.
+hive_build_executor_protocol: "hive-build-executor/v1"
+hive_build_executor_archive_sha256: "9e40310b3bd0591e1276bd3a58cd09832949d0c8686270d01b1a98e13e095682"
+hive_build_executor_archive_bytes: 459059200
+hive_build_executor_manifest_digest: "sha256:feb1c13108a6c4e3b5671d62f852e11e59a21d8ba3df79653c65a07665b71a54"
+# The OCI config digest IS the podman image id of the loaded image.
+hive_build_executor_config_digest: "sha256:3c7f08e2e6acf73b3fa1c30b9382609eda86ac6dca04bbdf53c8141c74772835"
+hive_build_executor_runsc_version: "release-20260817.0"
+hive_build_executor_runsc_sha256: "048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c"
+hive_build_executor_uid: 65532
+hive_build_executor_gid: 65532
+# Must equal REQUIRED_RUNSC_RUNTIME_FLAGS in build_executor.rs, in order.
+hive_build_executor_runsc_runtime_flags:
+  - "platform=systrap"
+  - "network=sandbox"
+  - "gvisor-marker-file=true"
+  - "directfs=false"
+  - "host-uds=none"
+  - "host-fifo=none"
+  - "net-raw=false"
+  - "allow-flag-override=false"
