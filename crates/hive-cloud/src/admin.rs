@@ -4476,6 +4476,22 @@ pub(crate) async fn dep_promote(
         if let Some(v) =
             post_to_host(&c, &node, &format!("/v1/deployments/{id}/promote"), &t0).await
         {
+            // The host node updated its alias, but THIS node (the leader) still
+            // holds the old project→deployment alias in its LOCAL gateway state.
+            // Without this local update, the leader serves the previous deployment
+            // for the project hostname forever, and every other node that round-
+            // robins the project hostname locally does the same — the promote only
+            // landed on one node. Update the local alias here so the leader and
+            // any node that proxies through it also route correctly.
+            //
+            // The host node already owns the deployment record; this node only
+            // needs the alias to point at it so mesh routing can forward requests
+            // to the host. The deployment record itself is gossiped fleet-wide via
+            // peer_deployments, so the alias is the only missing piece.
+            if let Some(project) = v.get("project").and_then(|p| p.as_str()) {
+                c.gw.set_project_alias(project, &id);
+                crate::persist::persist(&c);
+            }
             return Ok(Json(v));
         }
     }
@@ -12821,8 +12837,15 @@ pub(crate) async fn database_replica(
     }
     match op {
         "register" => {
-            db.role = "replica".into();
-            db.region = c.region.clone();
+            // Default to replica role / this node's region, but let the caller
+            // override either (the primary uses this same endpoint to re-register
+            // a corrected record without code changes).
+            if db.role.is_empty() {
+                db.role = "replica".into();
+            }
+            if db.region.is_empty() {
+                db.region = c.region.clone();
+            }
             // Platform-native kinds serve from THIS node's in-process store (data
             // arrives via write-mirroring); rewrite endpoint host to our API base.
             // Postgres/Redis get a real local backing container so reads are local.

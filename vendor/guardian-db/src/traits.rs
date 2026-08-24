@@ -706,6 +706,22 @@ pub struct EntryHead {
     pub content_local: Option<bool>,
 }
 
+/// One row of a bounded, lexically-ordered HEAD listing
+/// ([`KeyValueStore::entry_heads_page`]). Unlike [`EntryHead`] it carries the
+/// entry's declared content length (free — it lives in the same redb row) and
+/// deliberately omits the per-entry `content_local` blob probe, so producing a
+/// page costs zero content RPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryHeadPage {
+    pub key: String,
+    /// Hex-encoded BLAKE3 content hash (`iroh_blobs::Hash::to_hex()`).
+    pub hash: String,
+    /// Entry timestamp (iroh-docs' internal microsecond clock).
+    pub timestamp: u64,
+    /// The entry's declared content length in bytes.
+    pub content_len: u64,
+}
+
 /// Outcome of a targeted [`KeyValueStore::sync_with_peer`] reconciliation
 /// round. Mirrors iroh-docs' own `engine::live::SyncDetails` field-for-field
 /// so callers outside this crate (e.g. hive-cloud) don't need to depend on
@@ -791,6 +807,27 @@ pub trait KeyValueStore: Store {
     /// loop's cheap "compare before pulling" primitive. Default: empty
     /// (only the iroh-docs-backed KV store implements this for real).
     async fn entry_heads(&self) -> Result<Vec<EntryHead>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Bounded, lexically-ordered page of live entry heads under `prefix`.
+    ///
+    /// `after` is an EXCLUSIVE lower-bound cursor (the last key of the
+    /// previous page); at most `limit` rows are returned, in ascending key
+    /// order, streaming out of the underlying store — never a full
+    /// materialisation. A short page (fewer than `limit` rows) means the
+    /// prefix is exhausted past the cursor.
+    ///
+    /// Default: empty, matching [`KeyValueStore::entry_heads`]'s convention
+    /// for stores that don't implement it. Callers making DELETION decisions
+    /// must treat an empty page as no-evidence (nothing to do), never as
+    /// proof of absence.
+    async fn entry_heads_page(
+        &self,
+        _prefix: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<EntryHeadPage>, Self::Error> {
         Ok(Vec::new())
     }
 

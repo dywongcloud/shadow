@@ -261,7 +261,12 @@ impl IrohClient {
     }
 
     pub async fn cat_bytes(&self, hash: &str) -> Result<Vec<u8>> {
-        let reader = self.backend.cat(hash).await?;
+        // `IrohBackend::cat` is a very large future (cache probe + protection
+        // + local read + peer-fetch fallback). Box it so callers that embed
+        // `cat_bytes` in their own generators (the KV index rebuild polls one
+        // per entry) stay small on the poll stack — part of the structural
+        // fix for the boot-time tokio-worker stack overflow.
+        let reader = Box::pin(self.backend.cat(hash)).await?;
         let data =
             crate::p2p::network::core::read_to_end_bounded(reader, "IrohClient::cat_bytes result")
                 .await?;

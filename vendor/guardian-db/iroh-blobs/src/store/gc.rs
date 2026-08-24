@@ -80,31 +80,112 @@ pub(super) async fn gc_mark_task(
     Ok(())
 }
 
+/// Structured, confirmed-work-only accounting for one GC sweep.
+///
+/// Counters describe CONFIRMED completed work: `reclaimed_*` counts only
+/// candidates whose deletion was re-verified (`has()` returned false after
+/// the delete batch). A candidate that survives deletion (e.g. protected by
+/// a race the actor honored) lands in `skipped_objects`, never in
+/// `reclaimed_*`. Byte figures come from `status()` resolved BEFORE the
+/// delete; a candidate whose size the store could not name contributes to
+/// object counts but adds zero bytes, so byte totals are exact lower bounds,
+/// never estimates.
+#[derive(Debug, Clone, Default)]
+pub struct GcSweepStats {
+    /// Blobs enumerated by the sweep listing (live + dead).
+    pub considered_objects: u64,
+    /// Deletion candidates (enumerated blobs not in the live set).
+    pub candidate_objects: u64,
+    /// Bytes of deletion candidates whose size the store resolved pre-delete.
+    pub considered_bytes: u64,
+    /// Candidates confirmed absent after their delete batch.
+    pub reclaimed_objects: u64,
+    /// Bytes of confirmed-deleted candidates (size known pre-delete).
+    pub reclaimed_bytes: u64,
+    /// Candidates still present after their delete batch (protected races,
+    /// actor-skipped entries) — never counted as reclaimed.
+    pub skipped_objects: u64,
+    /// Size of the live/protected set when the sweep started.
+    pub protected_objects: u64,
+    /// Wall-clock duration of mark + sweep, in milliseconds.
+    pub duration_ms: u64,
+}
+
+async fn gc_sweep_batch(
+    store: &Store,
+    batch: &mut Vec<(Hash, Option<u64>)>,
+    stats: &mut GcSweepStats,
+) -> crate::api::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    store
+        .blobs()
+        .delete(batch.iter().map(|(hash, _)| *hash))
+        .await?;
+    for (hash, size) in batch.drain(..) {
+        // Exact deletion confirmation: only a blob that is verifiably gone
+        // counts as reclaimed. `has()` is metadata-only (one actor RPC).
+        if store.blobs().has(hash).await? {
+            stats.skipped_objects += 1;
+        } else {
+            stats.reclaimed_objects += 1;
+            stats.reclaimed_bytes += size.unwrap_or(0);
+        }
+    }
+    Ok(())
+}
+
 async fn gc_sweep_task(
     store: &Store,
     live: &HashSet<Hash>,
+    stats: &mut GcSweepStats,
     co: &Co<GcSweepEvent>,
 ) -> crate::api::Result<()> {
-    let mut blobs = store.blobs().list().stream().await?;
-    let mut count = 0;
-    let mut batch = Vec::new();
-    while let Some(hash) = blobs.next().await {
-        let hash = hash?;
-        if !live.contains(&hash) {
-            batch.push(hash);
-            count += 1;
-        }
-        if batch.len() >= 100 {
-            store.blobs().delete(batch.clone()).await?;
-            batch.clear();
+    use crate::api::proto::BlobStatus;
+
+    stats.protected_objects = live.len() as u64;
+    // Phase 1: drain the listing COMPLETELY, filtering only — no other store
+    // command may be issued while the list stream is live. The meta actor
+    // serves the listing and every status/delete from one serial loop, so a
+    // per-candidate `status()` awaited mid-stream deadlocks against the
+    // stream's own backpressure window (witnessed live as a GC pass wedging
+    // at "gc: sweep" until its deadline abort). Memory: 32 bytes per DEAD
+    // blob — proportional to reclaimable garbage, never to the live store.
+    let mut candidates: Vec<Hash> = Vec::new();
+    {
+        let mut blobs = store.blobs().list().stream().await?;
+        while let Some(hash) = blobs.next().await {
+            let hash = hash?;
+            stats.considered_objects += 1;
+            if !live.contains(&hash) {
+                candidates.push(hash);
+            }
         }
     }
-    if !batch.is_empty() {
-        store.blobs().delete(batch).await?;
+    stats.candidate_objects = candidates.len() as u64;
+
+    // Phase 2: size, delete, and confirm in bounded chunks.
+    let mut batch: Vec<(Hash, Option<u64>)> = Vec::with_capacity(100);
+    for chunk in candidates.chunks(100) {
+        for hash in chunk {
+            // Size BEFORE delete — afterwards there is nothing left to ask.
+            let size = match store.blobs().status(*hash).await? {
+                BlobStatus::Complete { size } => Some(size),
+                BlobStatus::Partial { size } => size,
+                BlobStatus::NotFound => Some(0),
+            };
+            stats.considered_bytes += size.unwrap_or(0);
+            batch.push((*hash, size));
+        }
+        gc_sweep_batch(store, &mut batch, stats).await?;
     }
     store.sync_db().await?;
-    co.yield_(GcSweepEvent::CustomDebug(format!("deleted {count} blobs")))
-        .await;
+    co.yield_(GcSweepEvent::CustomDebug(format!(
+        "deleted {} of {} candidate blobs ({} bytes)",
+        stats.reclaimed_objects, stats.candidate_objects, stats.reclaimed_bytes
+    )))
+    .await;
     Ok(())
 }
 
@@ -122,9 +203,10 @@ fn gc_mark<'a>(
 fn gc_sweep<'a>(
     store: &'a Store,
     live: &'a HashSet<Hash>,
+    stats: &'a mut GcSweepStats,
 ) -> impl Stream<Item = GcSweepEvent> + 'a {
     Gen::new(|co| async move {
-        if let Err(e) = gc_sweep_task(store, live, &co).await {
+        if let Err(e) = gc_sweep_task(store, live, stats, &co).await {
             co.yield_(GcSweepEvent::Error(e)).await;
         }
     })
@@ -176,29 +258,48 @@ pub type ProtectCb = Arc<
         + 'static,
 >;
 
+/// Backwards-compatible entrypoint: identical semantics to
+/// [`gc_run_once_with_stats`], result discarded.
 pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api::Result<()> {
+    gc_run_once_with_stats(store, live).await.map(|_| ())
+}
+
+/// The mark phase alone: clears prior protections, then extends `live` with
+/// every tag/temp-tag root and each root's recursive hashseq children.
+///
+/// Public so a supervisor can insert its own consistency re-check between
+/// mark and sweep (e.g. re-reading document heads to prove nothing was
+/// published mid-pass) before any deletion happens.
+pub async fn gc_mark_all(store: &Store, live: &mut HashSet<Hash>) -> crate::api::Result<()> {
     debug!(externally_protected = live.len(), "gc: start");
-    {
-        store.clear_protected().await?;
-        let mut stream = gc_mark(store, live);
-        while let Some(ev) = stream.next().await {
-            match ev {
-                GcMarkEvent::CustomDebug(msg) => {
-                    debug!("{}", msg);
-                }
-                GcMarkEvent::CustomWarning(msg, err) => {
-                    warn!("{}: {:?}", msg, err);
-                }
-                GcMarkEvent::Error(err) => {
-                    error!("error during gc mark: {:?}", err);
-                    return Err(err);
-                }
+    store.clear_protected().await?;
+    debug!("gc: protections cleared");
+    let mut stream = gc_mark(store, live);
+    while let Some(ev) = stream.next().await {
+        match ev {
+            GcMarkEvent::CustomDebug(msg) => {
+                debug!("{}", msg);
+            }
+            GcMarkEvent::CustomWarning(msg, err) => {
+                warn!("{}: {:?}", msg, err);
+            }
+            GcMarkEvent::Error(err) => {
+                error!("error during gc mark: {:?}", err);
+                return Err(err);
             }
         }
     }
+    Ok(())
+}
+
+/// The sweep phase alone: deletes every stored blob not in `live` and returns
+/// confirmed-work-only accounting. Callers must have completed
+/// [`gc_mark_all`] on the same `live` set first.
+pub async fn gc_sweep_all(store: &Store, live: &HashSet<Hash>) -> crate::api::Result<GcSweepStats> {
     debug!(total_protected = live.len(), "gc: sweep");
+    let mut stats = GcSweepStats::default();
     {
-        let mut stream = gc_sweep(store, live);
+        let mut stream = gc_sweep(store, live, &mut stats);
         while let Some(ev) = stream.next().await {
             match ev {
                 GcSweepEvent::CustomDebug(msg) => {
@@ -215,8 +316,24 @@ pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api:
         }
     }
     debug!("gc: done");
+    Ok(stats)
+}
 
-    Ok(())
+/// One mark+sweep pass returning structured, confirmed-work-only accounting.
+///
+/// `live` is the caller's protection set on entry and the full live set on
+/// return, exactly as [`gc_run_once`] always behaved. Any error aborts the
+/// pass; a pass that returns `Ok` completed both phases, and its stats
+/// describe only work that was re-verified (see [`GcSweepStats`]).
+pub async fn gc_run_once_with_stats(
+    store: &Store,
+    live: &mut HashSet<Hash>,
+) -> crate::api::Result<GcSweepStats> {
+    let started = n0_future::time::Instant::now();
+    gc_mark_all(store, live).await?;
+    let mut stats = gc_sweep_all(store, live).await?;
+    stats.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    Ok(stats)
 }
 
 pub async fn run_gc(store: Store, config: GcConfig) {

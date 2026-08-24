@@ -634,7 +634,18 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new();
     let cron = Arc::new(CronScheduler::new());
     let workflows = WorkflowEngine::new();
-    let public_base = format!("http://{}", args.listen);
+    // public_base is gossiped as `gateway` in serve_hosts and used for HTTP mesh
+    // routing between nodes.  Using the `--listen` bind address (usually 0.0.0.0)
+    // makes every cross-node proxy connect to localhost instead of the remote peer,
+    // silently breaking the mesh.  Prefer HIVE_PUBLIC_IP when it is set so the
+    // gateway URL carries a real address other nodes can actually reach.
+    let public_base = {
+        let port = args.listen.port();
+        match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+            Some(v) if !v.is_empty() && v != "0.0.0.0" => format!("http://{}:{}", v, port),
+            _ => format!("http://{}", args.listen),
+        }
+    };
     let cap = resources::capacity();
     // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
     // gossip so placement can target GPU hosts for gpu-requesting functions.
@@ -2302,11 +2313,22 @@ async fn admin_ingress(
                         local_epoch = ours,
                         "rejected forwarded mutation with stale control-plane epoch (fenced)"
                     );
-                    return (
+                    // Disclose OUR current epoch so a well-behaved forwarder can
+                    // max-merge it and re-stamp instead of failing the write on
+                    // a pure race (an epoch bump landing while the forward was
+                    // in flight). This refusal is provably-not-applied — it
+                    // fires before the router — so that retry is safe; a
+                    // genuinely superseded sender never converges to a current
+                    // epoch and is still refused after the bounded retries.
+                    let mut resp = (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "stale control-plane epoch (ownership changed); retry",
+                        STALE_EPOCH_BODY,
                     )
                         .into_response();
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&ours.to_string()) {
+                        resp.headers_mut().insert("x-hive-cp-epoch-current", v);
+                    }
+                    return resp;
                 }
             }
         }
@@ -2410,6 +2432,28 @@ fn is_not_leader_refusal(status: u16, body: &[u8]) -> bool {
         && std::str::from_utf8(body).is_ok_and(|s| s.trim() == NOT_LEADER_BODY)
 }
 
+/// The EXACT body the epoch fence in `admin_ingress`'s forwarded-marker branch
+/// returns when a forwarded mutation's sender epoch is behind the receiver's.
+/// One constant, two users — emitter and [`is_stale_epoch_refusal`] — the same
+/// emitter/matcher drift discipline as [`NOT_LEADER_BODY`].
+const STALE_EPOCH_BODY: &str = "stale control-plane epoch (ownership changed); retry";
+
+/// True for exactly the response the `admin_ingress` epoch fence produces.
+/// Like [`not_leader_refusal`], that refusal is emitted BEFORE the receiver's
+/// router ever runs, so the mutation was provably not applied and re-sending
+/// it with a converged epoch is safe.
+fn is_stale_epoch_refusal(status: u16, body: &[u8]) -> bool {
+    status == axum::http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        && std::str::from_utf8(body).is_ok_and(|s| s.trim() == STALE_EPOCH_BODY)
+}
+
+/// Bounded count of same-candidate re-stamps after a receiver discloses a
+/// newer epoch (a bump that landed mid-forward, or one gossip delivered during
+/// the round trip). A bump storm faster than the forward RTT, or a sender that
+/// can never converge, still ends in the refusal — the fence's protection is a
+/// bound, not a single shot.
+const MAX_STALE_EPOCH_RETRIES: u32 = 3;
+
 /// A no-redirect reqwest client that resolves `api_host` to a specific leader
 /// IP:443 — so the forward deterministically hits the leader with a valid SNI +
 /// cert (the wildcard/api bundle covers `api_host`). Cached per (ip, host).
@@ -2502,12 +2546,16 @@ fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
 /// FULL auth path and re-derives the tenant from the caller's own token — this
 /// hop grants nothing and asserts no identity of its own.
 ///
-/// Walks [`leader_forward_candidates`] and moves to the next one on exactly two
-/// provably-not-applied outcomes: the `not control-plane leader` refusal (issued
-/// before the receiver's router ever runs) and a CONNECT failure (nothing was
-/// sent). Any other answer — including a mid-flight transport error, whose
-/// effect is unknowable — is returned as-is, because re-sending a mutation that
-/// may already have been applied is worse than surfacing the failure.
+/// Walks [`leader_forward_candidates`] and moves to the next one on exactly
+/// three provably-not-applied outcomes: the `not control-plane leader` refusal
+/// (issued before the receiver's router ever runs), the stale-epoch fence
+/// refusal (also issued before the router ever runs — retried in place after
+/// adopting the receiver's disclosed epoch, bounded by
+/// [`MAX_STALE_EPOCH_RETRIES`], then walked like any other refusal), and a
+/// CONNECT failure (nothing was sent). Any other answer — including a
+/// mid-flight transport error, whose effect is unknowable — is returned as-is,
+/// because re-sending a mutation that may already have been applied is worse
+/// than surfacing the failure.
 async fn admin_forward_to_leader(
     cloud: &Arc<CloudState>,
     api_host: &str,
@@ -2533,75 +2581,125 @@ async fn admin_forward_to_leader(
             return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
         }
     };
-    let cp_epoch = cloud.cluster.epoch();
+    let mut cp_epoch = cloud.cluster.epoch();
     let candidates = leader_forward_candidates(cloud);
     let last = candidates.len().saturating_sub(1);
     let mut refused: Option<axum::response::Response> = None;
-    for (i, (name, ip)) in candidates.iter().enumerate() {
+    let mut stale_retries = 0u32;
+    'candidates: for (i, (name, ip)) in candidates.iter().enumerate() {
         let Some(client) = leader_client(ip, api_host) else {
             continue; // unparsable registry address: nothing was sent, try the next
         };
-        // The forwarder's control-plane epoch rides along as the fencing token —
-        // the receiver refuses the write if this is behind ITS epoch (the sender's
-        // view of ownership is stale). See admin_ingress's forwarded branch.
-        let mut rb = client
-            .request(method.clone(), &url)
-            .header("x-hive-admin-forwarded", "1")
-            .header("x-hive-cp-epoch", cp_epoch.to_string());
-        for (k, v) in parts.headers.iter() {
-            let n = k.as_str().to_ascii_lowercase();
-            if matches!(n.as_str(), "host" | "content-length" | "connection") {
-                continue;
-            }
-            rb = rb.header(k, v);
-        }
-        rb = rb
-            .header(reqwest::header::HOST, api_host)
-            .body(body.to_vec());
-        match rb.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let mut out = axum::http::Response::builder().status(status);
-                for (k, v) in resp.headers().iter() {
-                    let n = k.as_str().to_ascii_lowercase();
-                    if matches!(
-                        n.as_str(),
-                        "connection" | "transfer-encoding" | "content-length"
-                    ) {
-                        continue;
-                    }
-                    out = out.header(k.as_str(), v.as_bytes());
-                }
-                let bytes = resp.bytes().await.unwrap_or_default();
-                if is_not_leader_refusal(status, &bytes) {
-                    tracing::warn!(
-                        candidate = %name,
-                        path = %path_q,
-                        remaining = last.saturating_sub(i),
-                        "leader forward refused: candidate is not the control-plane leader"
-                    );
-                    // Keep the refusal as the answer of last resort, then try the
-                    // next candidate — this node's own view is the thing in doubt.
-                    refused = Some(
-                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, NOT_LEADER_BODY)
-                            .into_response(),
-                    );
+        loop {
+            // The forwarder's control-plane epoch rides along as the fencing
+            // token — the receiver refuses the write if this is behind ITS
+            // epoch (the sender's view of ownership is stale). See
+            // admin_ingress's forwarded branch.
+            let mut rb = client
+                .request(method.clone(), &url)
+                .header("x-hive-admin-forwarded", "1")
+                .header("x-hive-cp-epoch", cp_epoch.to_string());
+            for (k, v) in parts.headers.iter() {
+                let n = k.as_str().to_ascii_lowercase();
+                if matches!(n.as_str(), "host" | "content-length" | "connection") {
                     continue;
                 }
-                return out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
-                    (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response()
-                });
+                rb = rb.header(k, v);
             }
-            Err(e) if e.is_connect() => {
-                tracing::warn!(candidate = %name, error = %e, "leader forward could not connect");
-                continue; // connection never established: provably not applied
-            }
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "control-plane leader forward failed",
-                )
-                    .into_response()
+            rb = rb
+                .header(reqwest::header::HOST, api_host)
+                .body(body.to_vec());
+            match rb.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    // The fence discloses the epoch it fenced against, so a
+                    // mid-flight bump is converged deterministically instead of
+                    // racing gossip for it.
+                    let disclosed_epoch = resp
+                        .headers()
+                        .get("x-hive-cp-epoch-current")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let mut out = axum::http::Response::builder().status(status);
+                    for (k, v) in resp.headers().iter() {
+                        let n = k.as_str().to_ascii_lowercase();
+                        if matches!(
+                            n.as_str(),
+                            "connection" | "transfer-encoding" | "content-length"
+                        ) {
+                            continue;
+                        }
+                        out = out.header(k.as_str(), v.as_bytes());
+                    }
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    if is_not_leader_refusal(status, &bytes) {
+                        tracing::warn!(
+                            candidate = %name,
+                            path = %path_q,
+                            remaining = last.saturating_sub(i),
+                            "leader forward refused: candidate is not the control-plane leader"
+                        );
+                        // Keep the refusal as the answer of last resort, then
+                        // try the next candidate — this node's own view is the
+                        // thing in doubt.
+                        refused = Some(
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, NOT_LEADER_BODY)
+                                .into_response(),
+                        );
+                        continue 'candidates;
+                    }
+                    if is_stale_epoch_refusal(status, &bytes) {
+                        // Provably not applied (the fence fires before the
+                        // receiver's router), so re-sending is safe — same
+                        // argument as the not-leader refusal. The disclosed
+                        // epoch is authoritative: max-merge it and re-stamp,
+                        // turning a mid-flight bump race into one retried round
+                        // trip instead of a user-visible 503.
+                        if let Some(e) = disclosed_epoch {
+                            cloud.cluster.adopt_epoch(e);
+                        }
+                        let now = cloud.cluster.epoch();
+                        if now > cp_epoch && stale_retries < MAX_STALE_EPOCH_RETRIES {
+                            stale_retries += 1;
+                            cp_epoch = now;
+                            tracing::warn!(
+                                candidate = %name,
+                                path = %path_q,
+                                adopted_epoch = now,
+                                attempt = stale_retries,
+                                "leader forward fenced on a stale epoch; adopted receiver epoch, retrying"
+                            );
+                            continue;
+                        }
+                        // Nothing newer to converge to (pre-upgrade receiver and
+                        // gossip has not caught up), or the bound is spent.
+                        // Another candidate may still be at our epoch — epoch
+                        // views are per-observer, like health — so walk on; the
+                        // refusal stays the answer of last resort.
+                        refused = Some(
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                STALE_EPOCH_BODY,
+                            )
+                                .into_response(),
+                        );
+                        continue 'candidates;
+                    }
+                    return out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+                        (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response()
+                    });
+                }
+                Err(e) if e.is_connect() => {
+                    tracing::warn!(candidate = %name, error = %e, "leader forward could not connect");
+                    continue 'candidates; // connection never established: provably not applied
+                }
+                Err(_) => {
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "control-plane leader forward failed",
+                    )
+                        .into_response()
+                }
             }
         }
     }

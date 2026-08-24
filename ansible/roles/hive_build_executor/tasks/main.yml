@@ -1,0 +1,161 @@
+# Install the reviewed isolated-builder OCI archive and publish the
+# fail-closed capability declaration the hive-cloud BuildExecutor probes at
+# boot. Ordering is load-bearing: every byte is verified BEFORE anything
+# lands at its final path, and the declaration is written LAST via tmp +
+# atomic rename — an aborted run can only leave the node capability-blank,
+# never capability-wrong.
+---
+- name: End host when BuildExecutor install is not opted in
+  ansible.builtin.meta: end_host
+  when: not (hive_build_executor_install | bool)
+
+- name: Require every host runtime fact (no floating defaults)
+  ansible.builtin.assert:
+    that:
+      - hive_build_executor_archive_src is defined
+      - hive_build_executor_runsc_path is defined
+      - hive_build_executor_runsc_sidecar_path is defined
+      - hive_build_executor_runsc_sidecar_sha256 is defined
+      - hive_build_executor_podman_path is defined
+      - hive_build_executor_podman_sha256 is defined
+      - hive_build_executor_containers_conf_path is defined
+      - hive_build_executor_containers_conf_sha256 is defined
+      - hive_build_executor_containers_conf_override_path is defined
+      - hive_build_executor_containers_conf_override_sha256 is defined
+      - hive_build_executor_oci_hooks_dir is defined
+      - hive_build_executor_network_name is defined
+      - hive_build_executor_network_bridge is defined
+      - hive_build_executor_network_subnet is defined
+      - hive_build_executor_network_gateway is defined
+      - hive_build_executor_network_dns_upstream_ipv4 is defined
+      - hive_build_executor_network_policy_id is defined
+      - hive_build_executor_network_policy_digest is defined
+      - hive_build_executor_network_verify_path is defined
+      - hive_build_executor_network_verify_sha256 is defined
+      - hive_build_executor_nft_binary is defined
+      - hive_build_executor_nft_policy_path is defined
+      - hive_build_executor_nft_table is defined
+      - hive_build_executor_nft_bridge_table is defined
+      - hive_build_executor_fleet_public_ipv4 is defined
+      - hive_build_executor_fleet_probe_ipv4 is defined
+      - hive_build_executor_provision_lock_path is defined
+      - hive_build_executor_workspace_bytes is defined
+    fail_msg: >-
+      hive_build_executor requires every host runtime fact explicitly; a
+      missing value must fail the play, never default to something that
+      advertises capability.
+
+- name: Verify the controller-side archive against the reviewed pin
+  delegate_to: localhost
+  become: false
+  ansible.builtin.stat:
+    path: "{{ hive_build_executor_archive_src }}"
+    checksum_algorithm: sha256
+  register: hive_build_executor_src_stat
+
+- name: Refuse a controller archive that is not the reviewed artifact
+  ansible.builtin.assert:
+    that:
+      - hive_build_executor_src_stat.stat.exists
+      - hive_build_executor_src_stat.stat.isreg
+      - hive_build_executor_src_stat.stat.size == hive_build_executor_archive_bytes
+      - hive_build_executor_src_stat.stat.checksum == hive_build_executor_archive_sha256
+    fail_msg: >-
+      controller archive {{ hive_build_executor_archive_src }} does not match
+      the reviewed sha256/size pin; refusing to ship it anywhere.
+
+- name: Create the state directory
+  ansible.builtin.file:
+    path: "{{ hive_build_executor_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the archive (verified copy, final path only on byte match)
+  ansible.builtin.copy:
+    src: "{{ hive_build_executor_archive_src }}"
+    dest: "{{ hive_build_executor_archive_dest }}"
+    checksum: "{{ hive_build_executor_archive_sha256 }}"
+    owner: root
+    group: root
+    mode: "0400"
+
+- name: Re-measure the staged archive on the node
+  ansible.builtin.stat:
+    path: "{{ hive_build_executor_archive_dest }}"
+    checksum_algorithm: sha256
+  register: hive_build_executor_dest_stat
+
+- name: Refuse a staged archive that drifted in transit
+  ansible.builtin.assert:
+    that:
+      - hive_build_executor_dest_stat.stat.size == hive_build_executor_archive_bytes
+      - hive_build_executor_dest_stat.stat.checksum == hive_build_executor_archive_sha256
+    fail_msg: staged archive does not match the reviewed pin after copy.
+
+- name: Verify the pinned runsc binary on the node
+  ansible.builtin.stat:
+    path: "{{ hive_build_executor_runsc_path }}"
+    checksum_algorithm: sha256
+  register: hive_build_executor_runsc_stat
+
+- name: Refuse an unpinned runsc
+  ansible.builtin.assert:
+    that:
+      - hive_build_executor_runsc_stat.stat.exists
+      - hive_build_executor_runsc_stat.stat.checksum == hive_build_executor_runsc_sha256
+    fail_msg: >-
+      runsc at {{ hive_build_executor_runsc_path }} does not hash to the
+      reviewed {{ hive_build_executor_runsc_version }} pin.
+
+- name: Load the builder image from the staged archive
+  ansible.builtin.command:
+    argv:
+      - "{{ hive_build_executor_podman_path }}"
+      - load
+      - --input
+      - "{{ hive_build_executor_archive_dest }}"
+  register: hive_build_executor_load
+  changed_when: true
+
+- name: Read the loaded image id
+  ansible.builtin.command:
+    argv:
+      - "{{ hive_build_executor_podman_path }}"
+      - image
+      - inspect
+      - --format
+      - "{{ '{{.Id}}' }}"
+      - "{{ hive_build_executor_config_digest }}"
+  register: hive_build_executor_image_id
+  changed_when: false
+
+- name: Refuse a loaded image whose id is not the reviewed config digest
+  ansible.builtin.assert:
+    that:
+      - >-
+        (hive_build_executor_image_id.stdout | trim)
+        in [hive_build_executor_config_digest,
+            hive_build_executor_config_digest | replace('sha256:', '')]
+    fail_msg: >-
+      loaded image id {{ hive_build_executor_image_id.stdout | trim }} is not
+      the reviewed config digest; the archive on this node is not the
+      reviewed artifact.
+
+- name: Render the capability declaration to a private temporary path
+  ansible.builtin.template:
+    src: build-executor.json.j2
+    dest: "{{ hive_build_executor_capability_path }}.staged"
+    owner: root
+    group: root
+    mode: "0400"
+
+- name: Publish the capability declaration atomically (last step)
+  ansible.builtin.command:
+    argv:
+      - mv
+      - "-f"
+      - "{{ hive_build_executor_capability_path }}.staged"
+      - "{{ hive_build_executor_capability_path }}"
+  changed_when: true

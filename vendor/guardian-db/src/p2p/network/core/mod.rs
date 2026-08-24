@@ -87,7 +87,12 @@ pub(crate) async fn read_to_end_bounded<R: AsyncRead + Unpin>(
     let limit = max_blob_bytes();
     let allocation_limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut data = Vec::new();
-    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    // Heap-allocated: this local lives across `.await`, so an inline array
+    // would embed 64 KiB into EVERY future that transitively contains this
+    // one — and in debug builds each enclosing poll frame also reserves that
+    // space on the worker STACK. Measured as a contributor to the boot-time
+    // tokio-worker stack overflow in the guardian KV init chain.
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES];
 
     loop {
         let remaining = allocation_limit.saturating_sub(data.len());
@@ -332,107 +337,486 @@ fn snapshot_manifest_references(
     Ok(Some(references))
 }
 
-async fn current_doc_hashes(store: &FsStore, docs: &Docs) -> Result<HashSet<IrohHash>> {
+/// Typed reason a GC pass refused to proceed. Every variant means the pass
+/// performed NO deletion: an incomplete/unverifiable root inventory must
+/// never be interpreted as absence — refusal is the only safe answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcRootsIncomplete {
+    /// The document/entry listing itself failed.
+    Listing(String),
+    /// A reserved-key descriptor (snapshot base/head/generation marker) held
+    /// bytes that do not parse as the format its key promises.
+    MalformedDescriptor { key: String, reason: String },
+    /// A reserved-key descriptor parsed, but names a version this build does
+    /// not understand — refuse rather than guess at its reference schema.
+    UnknownDescriptorVersion { key: String, version: Option<u64> },
+    /// A descriptor references a part whose current metadata entry is absent.
+    MissingPart { key: String, part_key: String },
+    /// A referenced part's bytes are unreadable or fail their declared
+    /// length/digest.
+    UnreadablePart {
+        key: String,
+        part_key: String,
+        reason: String,
+    },
+    /// A hard memory bound was hit before the inventory completed; the exact
+    /// bound is named so the operator can raise it deliberately.
+    BoundExceeded { bound: &'static str, limit: u64 },
+    /// The current-head inventory changed between mark and sweep. Under the
+    /// exclusive `gc_gate` this is structurally impossible, so seeing it is
+    /// an invariant breach that must refuse the sweep.
+    ChangedDuringPass { detail: String },
+}
+
+impl GcRootsIncomplete {
+    pub fn status(&self) -> GcPassStatus {
+        match self {
+            Self::Listing(_) => GcPassStatus::IncompleteListing,
+            Self::MalformedDescriptor { .. } => GcPassStatus::IncompleteMalformedDescriptor,
+            Self::UnknownDescriptorVersion { .. } => GcPassStatus::IncompleteUnknownVersion,
+            Self::MissingPart { .. } => GcPassStatus::IncompleteMissingPart,
+            Self::UnreadablePart { .. } => GcPassStatus::IncompleteUnreadable,
+            Self::BoundExceeded { .. } => GcPassStatus::IncompleteBoundExceeded,
+            Self::ChangedDuringPass { .. } => GcPassStatus::IncompleteChangedDuringPass,
+        }
+    }
+}
+
+impl std::fmt::Display for GcRootsIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listing(reason) => write!(f, "GC root listing failed: {reason}"),
+            Self::MalformedDescriptor { key, reason } => {
+                write!(f, "descriptor {key} is malformed: {reason}")
+            }
+            Self::UnknownDescriptorVersion { key, version } => {
+                write!(f, "descriptor {key} names unknown version {version:?}")
+            }
+            Self::MissingPart { key, part_key } => {
+                write!(f, "descriptor {key} references absent part {part_key}")
+            }
+            Self::UnreadablePart {
+                key,
+                part_key,
+                reason,
+            } => write!(
+                f,
+                "descriptor {key} references unreadable part {part_key}: {reason}"
+            ),
+            Self::BoundExceeded { bound, limit } => {
+                write!(f, "GC inventory bound {bound}={limit} exceeded")
+            }
+            Self::ChangedDuringPass { detail } => {
+                write!(f, "current heads changed during the GC pass: {detail}")
+            }
+        }
+    }
+}
+
+/// Typed status of one supervised GC pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GcPassStatus {
+    #[default]
+    Completed,
+    IncompleteListing,
+    IncompleteMalformedDescriptor,
+    IncompleteUnknownVersion,
+    IncompleteMissingPart,
+    IncompleteUnreadable,
+    IncompleteBoundExceeded,
+    IncompleteChangedDuringPass,
+    Failed,
+}
+
+impl GcPassStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::IncompleteListing => "incomplete_listing",
+            Self::IncompleteMalformedDescriptor => "incomplete_malformed_descriptor",
+            Self::IncompleteUnknownVersion => "incomplete_unknown_version",
+            Self::IncompleteMissingPart => "incomplete_missing_part",
+            Self::IncompleteUnreadable => "incomplete_unreadable_part",
+            Self::IncompleteBoundExceeded => "incomplete_bound_exceeded",
+            Self::IncompleteChangedDuringPass => "incomplete_changed_during_pass",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn is_completed(self) -> bool {
+        matches!(self, Self::Completed)
+    }
+}
+
+/// Structured result of one supervised GC pass. Reclaimed counters describe
+/// CONFIRMED completed work only: a refused/incomplete pass reports zero
+/// reclaimed objects/bytes by construction (it never reached the sweep), and
+/// a failed pass never produces a `Completed` report.
+#[derive(Debug, Clone, Default)]
+pub struct GcPassReport {
+    pub status: GcPassStatus,
+    /// Human-readable detail for non-completed statuses (and for the
+    /// impossible-under-the-gate post-sweep anomaly on completed ones).
+    pub reason: Option<String>,
+    pub started_ms: u64,
+    pub finished_ms: u64,
+    pub duration_ms: u64,
+    /// Blobs enumerated by the sweep listing (live + dead).
+    pub considered_objects: u64,
+    /// Bytes of deletion candidates whose size was resolved before deletion.
+    pub considered_bytes: u64,
+    /// Deletion candidates confirmed absent after their delete batch.
+    pub reclaimed_objects: u64,
+    pub reclaimed_bytes: u64,
+    /// Size of the live/protected set when the sweep started.
+    pub protected_objects: u64,
+    /// Current (non-tombstone) document entries whose content is rooted.
+    pub reachable_entries: u64,
+    /// Reserved-key descriptors (snapshot bases, v2 heads, generation
+    /// markers) whose reference closure was verified this pass.
+    pub descriptors: u64,
+    /// Deletion candidates that survived their delete batch — never counted
+    /// as reclaimed.
+    pub skipped_objects: u64,
+    pub legacy_tags_removed: u64,
+}
+
+// --- Hive v2 snapshot descriptors (schema-bounded, never tenant JSON) -----
+//
+// The platform writes six-part content-addressed snapshots under
+// `snap-v2/node/<component>/…`. The collector cannot import the platform
+// crate, so the minimal envelope grammar is duplicated here and kept
+// deliberately exact: only keys shaped like a v2 head/generation marker are
+// ever parsed as descriptors, everything else is protected as an opaque
+// current head. Namespace state (`ns-v2/…`) is self-contained and is NEVER
+// interpreted.
+const HIVE_V2_DESCRIPTOR_MAGIC: &str = "hive-guardian-snapshot";
+const HIVE_V2_DESCRIPTOR_VERSION: u64 = 2;
+const HIVE_V2_NODE_PREFIX: &str = "snap-v2/node/";
+const HIVE_V2_PART_FIELDS: [&str; 6] = [
+    "state",
+    "deployments",
+    "database_data",
+    "metrics_rollup",
+    "builds",
+    "sandboxes",
+];
+
+/// `Some(component)` when `key` is a v2 head (`…/head`) or complete-
+/// generation marker (`…/gen/<id>`) — the two key shapes whose value is a
+/// six-reference descriptor.
+fn v2_descriptor_component(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix(HIVE_V2_NODE_PREFIX)?;
+    let (component, suffix) = rest.split_once('/')?;
+    if component.is_empty() {
+        return None;
+    }
+    if suffix == "head" {
+        return Some(component);
+    }
+    let gen_id = suffix.strip_prefix("gen/")?;
+    (!gen_id.is_empty() && !gen_id.contains('/')).then_some(component)
+}
+
+/// Parse one v2 descriptor value into its `(field, sha256, bytes)` references.
+fn parse_v2_descriptor(
+    key: &str,
+    bytes: &[u8],
+) -> std::result::Result<Vec<(String, String, u64)>, GcRootsIncomplete> {
+    let malformed = |reason: String| GcRootsIncomplete::MalformedDescriptor {
+        key: key.to_string(),
+        reason,
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| malformed(format!("not valid JSON: {error}")))?;
+    let fields = value
+        .as_object()
+        .ok_or_else(|| malformed("not a JSON object".to_string()))?;
+    if fields.get("magic").and_then(serde_json::Value::as_str) != Some(HIVE_V2_DESCRIPTOR_MAGIC) {
+        return Err(malformed("magic is absent or wrong".to_string()));
+    }
+    let version = fields.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(HIVE_V2_DESCRIPTOR_VERSION) {
+        return Err(GcRootsIncomplete::UnknownDescriptorVersion {
+            key: key.to_string(),
+            version,
+        });
+    }
+    if fields.len() != HIVE_V2_PART_FIELDS.len() + 2 {
+        return Err(malformed(format!(
+            "expected exactly {} fields, found {}",
+            HIVE_V2_PART_FIELDS.len() + 2,
+            fields.len()
+        )));
+    }
+    let mut references = Vec::with_capacity(HIVE_V2_PART_FIELDS.len());
+    for field in HIVE_V2_PART_FIELDS {
+        let reference = fields
+            .get(field)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| malformed(format!("reference {field} is absent or not an object")))?;
+        if reference.len() != 2 {
+            return Err(malformed(format!(
+                "reference {field} has unexpected fields"
+            )));
+        }
+        let sha256 = reference
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| is_lower_hex_digest(digest))
+            .ok_or_else(|| malformed(format!("reference {field} has an invalid sha256")))?;
+        let declared = reference
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| malformed(format!("reference {field} has an invalid byte length")))?;
+        references.push((field.to_string(), sha256.to_string(), declared));
+    }
+    Ok(references)
+}
+
+fn gc_env_bound(name: &'static str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// One streaming scan over every document's current (latest-per-key) entries.
+///
+/// Memory is bounded by construction: entries stream out of redb (`get_many`
+/// is a real iterator, backpressured at 64 items); only 32-byte content
+/// hashes are retained for the protection set, plus the keys of the RESERVED
+/// trees (`node/…`, `snap-v2/…`) needed for descriptor closure — tenant
+/// namespace keys are never retained. Two explicit bounds
+/// (`GUARDIAN_GC_MAX_CURRENT_ENTRIES`, `GUARDIAN_GC_MAX_TRACKED_KEYS`) turn
+/// a runaway inventory into a typed refusal naming the bound instead of an
+/// unbounded allocation.
+///
+/// The order-insensitive `fingerprint` (XOR of per-entry SHA-256 over
+/// namespace/key/hash/len) identifies the exact current-head inventory, so a
+/// second cheap scan can prove nothing changed between mark and sweep.
+struct CurrentRootScan {
+    protected: HashSet<IrohHash>,
+    /// Reserved-tree key → (content hash, content length).
+    reserved: std::collections::BTreeMap<String, (IrohHash, u64)>,
+    reachable_entries: u64,
+    fingerprint: [u8; 32],
+}
+
+fn is_reserved_tree_key(key: &[u8]) -> bool {
+    key.starts_with(b"node/") || key.starts_with(b"snap-v2/")
+}
+
+async fn scan_current_entries(
+    docs: &Docs,
+    track: bool,
+) -> std::result::Result<CurrentRootScan, GcRootsIncomplete> {
     use futures::StreamExt;
     use iroh_docs::store::Query;
     use sha2::{Digest, Sha256};
 
-    let mut protected = HashSet::new();
+    let max_entries = gc_env_bound("GUARDIAN_GC_MAX_CURRENT_ENTRIES", 2_000_000);
+    let max_tracked = gc_env_bound("GUARDIAN_GC_MAX_TRACKED_KEYS", 250_000);
+
+    let mut scan = CurrentRootScan {
+        protected: HashSet::new(),
+        reserved: std::collections::BTreeMap::new(),
+        reachable_entries: 0,
+        fingerprint: [0u8; 32],
+    };
+
     let documents = docs
         .list()
         .await
-        .map_err(|e| GuardianError::Other(format!("Error listing documents for GC: {e}")))?;
+        .map_err(|e| GcRootsIncomplete::Listing(format!("error listing documents: {e}")))?;
     futures::pin_mut!(documents);
     while let Some(document) = documents.next().await {
-        let (namespace, _) = document.map_err(|e| {
-            GuardianError::Other(format!("Error reading document list for GC: {e}"))
-        })?;
+        let (namespace, _) = document
+            .map_err(|e| GcRootsIncomplete::Listing(format!("error reading document list: {e}")))?;
         let Some(doc) = docs
             .open(namespace)
             .await
-            .map_err(|e| GuardianError::Other(format!("Error opening document for GC: {e}")))?
+            .map_err(|e| GcRootsIncomplete::Listing(format!("error opening document: {e}")))?
         else {
-            return Err(GuardianError::Other(format!(
-                "Document {namespace} disappeared while deriving GC protection"
+            return Err(GcRootsIncomplete::Listing(format!(
+                "document {namespace} disappeared while deriving GC protection"
             )));
         };
-        let entries = doc
-            .get_many(Query::single_latest_per_key().build())
+        let entries = Box::pin(doc.get_many(Query::single_latest_per_key().build()))
             .await
-            .map_err(|e| GuardianError::Other(format!("Error querying document for GC: {e}")))?;
+            .map_err(|e| GcRootsIncomplete::Listing(format!("error querying document: {e}")))?;
         futures::pin_mut!(entries);
-        let mut current = HashMap::new();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| {
-                GuardianError::Other(format!("Error reading document entry for GC: {e}"))
+                GcRootsIncomplete::Listing(format!("error reading document entry: {e}"))
             })?;
-            if entry.content_len() != 0 {
-                current.insert(entry.key().to_vec(), entry.content_hash());
+            if entry.content_len() == 0 {
+                continue;
+            }
+            scan.reachable_entries += 1;
+            if scan.reachable_entries > max_entries {
+                return Err(GcRootsIncomplete::BoundExceeded {
+                    bound: "GUARDIAN_GC_MAX_CURRENT_ENTRIES",
+                    limit: max_entries,
+                });
+            }
+            let hash = entry.content_hash();
+            let mut hasher = Sha256::new();
+            hasher.update(namespace.as_bytes());
+            hasher.update((entry.key().len() as u64).to_le_bytes());
+            hasher.update(entry.key());
+            hasher.update(hash.as_bytes());
+            hasher.update(entry.content_len().to_le_bytes());
+            let digest: [u8; 32] = hasher.finalize().into();
+            for (acc, byte) in scan.fingerprint.iter_mut().zip(digest) {
+                *acc ^= byte;
+            }
+            scan.protected.insert(hash);
+            if track && is_reserved_tree_key(entry.key()) {
+                if scan.reserved.len() as u64 >= max_tracked {
+                    return Err(GcRootsIncomplete::BoundExceeded {
+                        bound: "GUARDIAN_GC_MAX_TRACKED_KEYS",
+                        limit: max_tracked,
+                    });
+                }
+                let key = String::from_utf8_lossy(entry.key()).to_string();
+                scan.reserved.insert(key, (hash, entry.content_len()));
             }
         }
+    }
+    Ok(scan)
+}
 
-        // Every current metadata head remains a GC root. Immutable snapshot
-        // payloads become collectible only after the writer tombstones their
-        // exact metadata keys; sweeping bytes first leaves live unreadable heads
-        // that the index synchronizer retries forever.
-        protected.extend(current.values().copied());
-        for (base_key, base_hash) in current.iter().filter(|(key, _)| is_snapshot_base_key(key)) {
-            let base = read_blob_bounded(store, *base_hash, "current snapshot base during GC")
-                .await
-                .map_err(|e| {
-                    GuardianError::Other(format!(
-                        "Current snapshot base is unavailable during GC: {e}"
-                    ))
-                })?;
-            let value: serde_json::Value = serde_json::from_slice(&base).map_err(|e| {
-                GuardianError::Other(format!("Current snapshot base is invalid during GC: {e}"))
+/// Verify the complete reachable closure of every reserved-key descriptor —
+/// legacy `node/<n>/snapshot` bases AND v2 heads/generation markers — before
+/// any deletion. Returns the number of descriptors verified. Any failure is
+/// a typed refusal; incomplete is never treated as absent.
+async fn verify_descriptor_closure(
+    store: &FsStore,
+    scan: &CurrentRootScan,
+) -> std::result::Result<u64, GcRootsIncomplete> {
+    use sha2::{Digest, Sha256};
+
+    let mut descriptors = 0u64;
+    let mut verified_parts: HashSet<&str> = HashSet::new();
+    for (key, (hash, _len)) in &scan.reserved {
+        let is_legacy_base = is_snapshot_base_key(key.as_bytes());
+        let is_v2 = v2_descriptor_component(key).is_some();
+        if !is_legacy_base && !is_v2 {
+            continue;
+        }
+        descriptors += 1;
+        let bytes = read_blob_bounded(store, *hash, "descriptor during GC")
+            .await
+            .map_err(|e| GcRootsIncomplete::UnreadablePart {
+                key: key.clone(),
+                part_key: key.clone(),
+                reason: format!("descriptor bytes unavailable: {e}"),
             })?;
-            let base_key = std::str::from_utf8(base_key).map_err(|_| {
-                GuardianError::Other("Current snapshot base key is not UTF-8".to_string())
+
+        if is_legacy_base {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                GcRootsIncomplete::MalformedDescriptor {
+                    key: key.clone(),
+                    reason: format!("not valid JSON: {e}"),
+                }
             })?;
-            let Some(references) = snapshot_manifest_references(&value, base_key)? else {
+            let references = snapshot_manifest_references(&value, key).map_err(|e| {
+                GcRootsIncomplete::MalformedDescriptor {
+                    key: key.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let Some(references) = references else {
                 // Monolithic snapshots have no separately-addressed payloads.
                 continue;
             };
             for (field, part_key, digest) in references {
-                let part_hash = current.get(part_key.as_bytes()).ok_or_else(|| {
-                    GuardianError::Other(format!(
-                        "Current snapshot part {field} metadata is absent"
-                    ))
-                })?;
+                let Some((part_hash, _)) = scan.reserved.get(&part_key) else {
+                    return Err(GcRootsIncomplete::MissingPart {
+                        key: key.clone(),
+                        part_key,
+                    });
+                };
+                if let Some((existing, _)) = scan.reserved.get_key_value(&part_key) {
+                    if !verified_parts.insert(existing.as_str()) {
+                        continue;
+                    }
+                }
                 let part = read_blob_bounded(
                     store,
                     *part_hash,
                     &format!("current snapshot part {field} during GC"),
                 )
                 .await
-                .map_err(|e| {
-                    GuardianError::Other(format!(
-                        "Current snapshot part {field} is unavailable during GC: {e}"
-                    ))
+                .map_err(|e| GcRootsIncomplete::UnreadablePart {
+                    key: key.clone(),
+                    part_key: part_key.clone(),
+                    reason: e.to_string(),
                 })?;
                 if hex::encode(Sha256::digest(&part)) != digest {
-                    return Err(GuardianError::Other(format!(
-                        "Current snapshot part {field} digest is invalid"
-                    )));
+                    return Err(GcRootsIncomplete::UnreadablePart {
+                        key: key.clone(),
+                        part_key,
+                        reason: "SHA-256 does not match the manifest".to_string(),
+                    });
                 }
-                protected.insert(*part_hash);
+            }
+        } else {
+            let component = v2_descriptor_component(key).expect("checked above");
+            for (field, sha256, declared) in parse_v2_descriptor(key, &bytes)? {
+                let part_key = format!("{HIVE_V2_NODE_PREFIX}{component}/{field}/{sha256}");
+                let Some((part_entry, part_len)) = scan.reserved.get(&part_key) else {
+                    return Err(GcRootsIncomplete::MissingPart {
+                        key: key.clone(),
+                        part_key,
+                    });
+                };
+                if *part_len != declared {
+                    return Err(GcRootsIncomplete::UnreadablePart {
+                        key: key.clone(),
+                        part_key,
+                        reason: format!(
+                            "entry length {part_len} does not match declared {declared}"
+                        ),
+                    });
+                }
+                if let Some((existing, _)) = scan.reserved.get_key_value(&part_key) {
+                    if !verified_parts.insert(existing.as_str()) {
+                        continue;
+                    }
+                }
+                let part = read_blob_bounded(
+                    store,
+                    *part_entry,
+                    &format!("v2 snapshot part {field} during GC"),
+                )
+                .await
+                .map_err(|e| GcRootsIncomplete::UnreadablePart {
+                    key: key.clone(),
+                    part_key: part_key.clone(),
+                    reason: e.to_string(),
+                })?;
+                if part.len() as u64 != declared || hex::encode(Sha256::digest(&part)) != sha256 {
+                    return Err(GcRootsIncomplete::UnreadablePart {
+                        key: key.clone(),
+                        part_key,
+                        reason: "bytes do not match the declared length/SHA-256".to_string(),
+                    });
+                }
             }
         }
     }
-    Ok(protected)
+    Ok(descriptors)
 }
 
-async fn prepare_guardian_gc(
+async fn reap_legacy_auto_tags(
     store: &FsStore,
-    docs: &Docs,
+    current: &HashSet<IrohHash>,
     legacy_removed_progress: &AtomicU64,
-) -> Result<HashSet<IrohHash>> {
+) -> Result<()> {
     use futures::StreamExt;
-
-    // Derive the authoritative protection set first. Any document query error
-    // aborts the whole pass before a tag or blob is mutated.
-    let current = current_doc_hashes(store, docs).await?;
 
     let mut tags = store
         .tags()
@@ -488,19 +872,114 @@ async fn prepare_guardian_gc(
             .map_err(IrohBackend::map_iroh_error)?;
         legacy_removed_progress.fetch_add(removed, Ordering::Relaxed);
     }
-
-    Ok(current)
+    Ok(())
 }
 
+/// One supervised GC pass. `Ok(report)` with a non-`Completed` status is a
+/// typed REFUSAL (no deletion happened); `Err` is a hard store/actor failure.
+/// The whole pass runs under the exclusive write side of `gc_gate`, so no
+/// publisher can interleave — the fingerprint re-check between mark and sweep
+/// proves that invariant on every pass rather than assuming it.
 async fn run_guardian_gc_once(
     store: &FsStore,
     docs: &Docs,
     legacy_removed_progress: &AtomicU64,
-) -> Result<()> {
-    let mut protected = prepare_guardian_gc(store, docs, legacy_removed_progress).await?;
-    iroh_blobs::store::gc_run_once(store.as_ref(), &mut protected)
+) -> Result<GcPassReport> {
+    let started_ms = unix_time_ms();
+    let started = Instant::now();
+    let mut report = GcPassReport {
+        started_ms,
+        ..Default::default()
+    };
+    let finish = |mut report: GcPassReport| {
+        report.finished_ms = unix_time_ms();
+        report.duration_ms = duration_ms(started.elapsed());
+        report
+    };
+
+    // 1. Root inventory — typed refusal aborts before any tag/blob mutation.
+    let scan = match scan_current_entries(docs, true).await {
+        Ok(scan) => scan,
+        Err(incomplete) => {
+            report.status = incomplete.status();
+            report.reason = Some(incomplete.to_string());
+            return Ok(finish(report));
+        }
+    };
+    report.reachable_entries = scan.reachable_entries;
+
+    // 2. Complete reachable closure of every current descriptor.
+    match verify_descriptor_closure(store, &scan).await {
+        Ok(descriptors) => report.descriptors = descriptors,
+        Err(incomplete) => {
+            report.status = incomplete.status();
+            report.reason = Some(incomplete.to_string());
+            return Ok(finish(report));
+        }
+    }
+
+    // 3. Bounded legacy auto-tag reaping (tag metadata only, never bytes).
+    reap_legacy_auto_tags(store, &scan.protected, legacy_removed_progress).await?;
+
+    // 4. Mark.
+    let fingerprint = scan.fingerprint;
+    let reachable = scan.reachable_entries;
+    let mut live = scan.protected;
+    // `reserved` (with its keys) is dropped here — mark/sweep need hashes only.
+    drop(scan.reserved);
+    iroh_blobs::store::gc_mark_all(store.as_ref(), &mut live)
         .await
-        .map_err(IrohBackend::map_iroh_error)
+        .map_err(IrohBackend::map_iroh_error)?;
+
+    // 5. Fence: re-read the current-head inventory and refuse the sweep if it
+    // moved. Structurally impossible under the exclusive gate; checked anyway
+    // so a gate bypass can never cost a freshly published part.
+    let recheck = match scan_current_entries(docs, false).await {
+        Ok(recheck) => recheck,
+        Err(incomplete) => {
+            report.status = incomplete.status();
+            report.reason = Some(incomplete.to_string());
+            return Ok(finish(report));
+        }
+    };
+    if recheck.fingerprint != fingerprint || recheck.reachable_entries != reachable {
+        let incomplete = GcRootsIncomplete::ChangedDuringPass {
+            detail: format!(
+                "entries {} -> {} between mark and sweep",
+                reachable, recheck.reachable_entries
+            ),
+        };
+        report.status = incomplete.status();
+        report.reason = Some(incomplete.to_string());
+        return Ok(finish(report));
+    }
+
+    // 6. Sweep with confirmed-work accounting.
+    let stats = iroh_blobs::store::gc_sweep_all(store.as_ref(), &live)
+        .await
+        .map_err(IrohBackend::map_iroh_error)?;
+    report.considered_objects = stats.considered_objects;
+    report.considered_bytes = stats.considered_bytes;
+    report.reclaimed_objects = stats.reclaimed_objects;
+    report.reclaimed_bytes = stats.reclaimed_bytes;
+    report.protected_objects = stats.protected_objects;
+    report.skipped_objects = stats.skipped_objects;
+    report.status = GcPassStatus::Completed;
+
+    // 7. Post-sweep paranoia: deletions cannot be undone, so a mismatch here
+    // is reported loudly on a completed pass rather than downgrading it.
+    if let Ok(post) = scan_current_entries(docs, false).await {
+        if post.fingerprint != fingerprint {
+            let detail = format!(
+                "current heads changed DURING the sweep despite the exclusive gc gate \
+                 (entries {} -> {})",
+                reachable, post.reachable_entries
+            );
+            tracing::error!(detail, "Guardian GC invariant breach");
+            report.reason = Some(detail);
+        }
+    }
+    Ok(finish(report))
 }
 
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay
@@ -774,8 +1253,18 @@ pub struct GcHealth {
     pub overdue_since_ms: Option<u64>,
     pub successful_runs: u64,
     pub failed_runs: u64,
+    /// Passes that ended in a typed refusal (no deletion) — distinct from
+    /// `failed_runs` (hard store/actor errors) and from success.
+    pub incomplete_runs: u64,
     pub consecutive_failures: u32,
     pub legacy_tags_removed: u64,
+    /// Cumulative CONFIRMED reclaimed work across completed passes only.
+    /// Refused/incomplete passes never contribute; an aborted pass's partial
+    /// deletions are deliberately under-reported rather than estimated.
+    pub reclaimed_objects_total: u64,
+    pub reclaimed_bytes_total: u64,
+    /// Structured result of the most recent pass that ran to a verdict.
+    pub last_pass: Option<GcPassReport>,
     pub last_attempt_ms: Option<u64>,
     pub last_heartbeat_ms: Option<u64>,
     pub active_deadline_ms: Option<u64>,
@@ -796,12 +1285,12 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 async fn abort_and_join_gc_pass(
-    pass: &mut tokio::task::JoinHandle<Result<()>>,
+    pass: &mut tokio::task::JoinHandle<Result<GcPassReport>>,
     health: &Arc<RwLock<GcHealth>>,
     reason: String,
     deadline_expired: bool,
     heartbeat_interval: Duration,
-) -> Result<()> {
+) -> Result<GcPassReport> {
     const ABORT_GRACE: Duration = Duration::from_secs(5);
 
     let requested_ms = unix_time_ms();
@@ -860,7 +1349,7 @@ async fn abort_and_join_gc_pass(
     };
 
     let termination = match joined {
-        Ok(Ok(())) => "completed after cancellation was requested".to_string(),
+        Ok(Ok(_)) => "completed after cancellation was requested".to_string(),
         Ok(Err(error)) => format!("terminated with error: {error}"),
         Err(join_error) if join_error.is_cancelled() => "terminated after abort".to_string(),
         Err(join_error) => format!("terminated with JoinError: {join_error}"),
@@ -1010,7 +1499,9 @@ async fn run_guardian_gc_worker(
         }
 
         match result {
-            Ok(()) => {
+            Ok(report) if report.status.is_completed() => {
+                let mut report = report;
+                report.legacy_tags_removed = legacy_removed;
                 {
                     let mut state = health.write().await;
                     state.running = false;
@@ -1018,6 +1509,13 @@ async fn run_guardian_gc_worker(
                     state.consecutive_failures = 0;
                     state.legacy_tags_removed =
                         state.legacy_tags_removed.saturating_add(legacy_removed);
+                    // Cumulative counters carry CONFIRMED completed work only.
+                    state.reclaimed_objects_total = state
+                        .reclaimed_objects_total
+                        .saturating_add(report.reclaimed_objects);
+                    state.reclaimed_bytes_total = state
+                        .reclaimed_bytes_total
+                        .saturating_add(report.reclaimed_bytes);
                     state.last_heartbeat_ms = Some(now_ms);
                     state.active_deadline_ms = None;
                     state.overdue = false;
@@ -1026,11 +1524,53 @@ async fn run_guardian_gc_worker(
                     state.overdue_since_ms = None;
                     state.last_success_ms = Some(now_ms);
                     state.last_error = None;
+                    state.last_pass = Some(report.clone());
                 }
                 backoff = Duration::from_secs(5).min(max_backoff);
                 info!(
                     legacy_tags_removed = legacy_removed,
+                    considered_objects = report.considered_objects,
+                    reclaimed_objects = report.reclaimed_objects,
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    protected_objects = report.protected_objects,
+                    reachable_entries = report.reachable_entries,
+                    descriptors = report.descriptors,
+                    skipped_objects = report.skipped_objects,
+                    duration_ms = report.duration_ms,
                     "Guardian blob GC completed"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => continue,
+                    _ = tokio::time::sleep(normal_interval) => {}
+                }
+            }
+            Ok(report) => {
+                // Typed refusal: the pass performed NO deletion. This is a
+                // data/inventory condition, not a collector fault — record it
+                // distinctly and retry on the normal cadence, never treat it
+                // as absence or as success.
+                let mut report = report;
+                report.legacy_tags_removed = legacy_removed;
+                let status = report.status.as_str();
+                let reason = report.reason.clone();
+                {
+                    let mut state = health.write().await;
+                    state.running = false;
+                    state.incomplete_runs = state.incomplete_runs.saturating_add(1);
+                    state.legacy_tags_removed =
+                        state.legacy_tags_removed.saturating_add(legacy_removed);
+                    state.last_heartbeat_ms = Some(now_ms);
+                    state.active_deadline_ms = None;
+                    state.overdue = false;
+                    state.stuck = false;
+                    state.cancellation_requested_ms = None;
+                    state.last_error = reason.clone();
+                    state.last_pass = Some(report);
+                }
+                warn!(
+                    status,
+                    reason = reason.as_deref().unwrap_or("unknown"),
+                    "Guardian blob GC pass REFUSED (typed incomplete); no deletion performed"
                 );
                 tokio::select! {
                     _ = shutdown.cancelled() => continue,
@@ -1051,6 +1591,14 @@ async fn run_guardian_gc_worker(
                     state.stuck = false;
                     state.cancellation_requested_ms = None;
                     state.last_error = Some(error.to_string());
+                    state.last_pass = Some(GcPassReport {
+                        status: GcPassStatus::Failed,
+                        reason: Some(error.to_string()),
+                        started_ms: now_ms,
+                        finished_ms: now_ms,
+                        legacy_tags_removed: legacy_removed,
+                        ..Default::default()
+                    });
                 }
                 warn!(error = %error, retry_in_secs = backoff.as_secs(), "Guardian blob GC failed; retrying");
                 tokio::select! {

@@ -1099,6 +1099,18 @@ impl Gateway {
         self.promote_incarnation(id, None)
     }
 
+    /// Update the project→deployment alias WITHOUT requiring the deployment
+    /// record to exist in this node's local gateway state. Used when a promote
+    /// was proxied to the host node — the host already owns the record, and this
+    /// node only needs the alias so mesh routing can forward project-hostname
+    /// requests to the host. Idempotent: calling it on a node that already has
+    /// the deployment record is harmless (the alias is already correct).
+    pub fn set_project_alias(&self, project: &str, deployment_id: &str) {
+        let did = DeploymentId::from(deployment_id.to_string());
+        let mut st = self.state.lock();
+        st.aliases.insert(project.to_string(), did);
+    }
+
     pub fn promote_exact(&self, id: &str, expected: ProjectIncarnation) -> Option<DeploymentInfo> {
         self.promote_incarnation(id, Some(expected))
     }

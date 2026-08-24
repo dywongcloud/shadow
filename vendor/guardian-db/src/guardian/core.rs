@@ -1151,8 +1151,10 @@ impl GuardianDB {
             "Database created"
         );
 
-        // Open the database.
-        self.open(&db_address.to_string(), options).await
+        // Open the database. Boxed: `open` (and the store-constructor chain
+        // under it) is a very large future; inline it doubles this frame in
+        // debug builds — part of the boot-time worker stack overflow fix.
+        Box::pin(self.open(&db_address.to_string(), options)).await
     }
 
     /// Opens a database from a GuardianDB address.
@@ -1339,8 +1341,8 @@ impl GuardianDB {
         tracing::debug!(manifest_type = %manifest_type, "Database type detected");
         tracing::debug!("Creating store instance");
 
-        self.create_store(&manifest_type, &parsed_address, options)
-            .await
+        // Boxed for the same worker-stack reason as `create` → `open`.
+        Box::pin(self.create_store(&manifest_type, &parsed_address, options)).await
     }
 
     /// Determines a database address by creating its manifest and saving it to the Client.
