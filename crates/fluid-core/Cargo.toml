@@ -15,3 +15,6 @@ regex = "1"
 # BLAKE3 is the platform's content-addressing hash (browser artifact digests).
 # Already in the workspace lock (hive-browser, guardian-db) at 1.8.x.
 blake3 = "1"
+# SHA-256 anchors the normalized-manifest identity every deployment generation
+# binds (`canonical_manifest_bytes` / `normalized_manifest_sha256`).
+sha2 = { workspace = true }

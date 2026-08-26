@@ -812,6 +812,49 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             "persist::restore: skipped deployment records that lack active project-incarnation authority"
         );
     }
+    let ready_for_authority = deployments
+        .iter()
+        .filter(|record| record.state == fluid_core::DeployState::Ready)
+        .map(|record| {
+            (
+                record.id.clone(),
+                record.project.clone(),
+                record.created_at_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let restore_authority = cloud
+        .deployment_ledger
+        .authorize_restore_batch(&ready_for_authority)
+        .unwrap_or_else(|error| panic!("deployment restore authority failed closed: {error:#}"));
+    let mut legacy_ready = 0usize;
+    let before_readiness_filter = deployments.len();
+    deployments.retain(|record| {
+        if record.state != fluid_core::DeployState::Ready {
+            return true;
+        }
+        match restore_authority.get(&record.id) {
+            Some(crate::deployment_ledger::RestoreAuthority::Proven) => true,
+            Some(crate::deployment_ledger::RestoreAuthority::LegacyMigration) => {
+                legacy_ready += 1;
+                true
+            }
+            Some(crate::deployment_ledger::RestoreAuthority::Refused) | None => false,
+        }
+    });
+    let readiness_rejected = before_readiness_filter - deployments.len();
+    if legacy_ready > 0 {
+        tracing::warn!(
+            count = legacy_ready,
+            "persist::restore: preserved pre-ledger Ready deployment(s) as explicit legacy predecessors; they are not readiness proof and cannot authorize promotion"
+        );
+    }
+    if readiness_rejected > 0 {
+        tracing::error!(
+            count = readiness_rejected,
+            "persist::restore: refused Ready deployment(s) without published acceptance evidence"
+        );
+    }
     let n = deployments.len();
     // Reconcile orphaned in-flight builds. A deployment/build persisted with
     // state Queued/Building was mid-flight in an async task on the PREVIOUS

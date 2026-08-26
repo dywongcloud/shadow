@@ -170,10 +170,14 @@
     - name: Require immutable image, runtime, non-root user, network, and one named volume
       ansible.builtin.assert:
         that:
-          - _build_executor_probe_inspect.Image == build_executor_builder_image_id
+          - (_build_executor_probe_inspect.Image | regex_replace('^sha256:', '')) == (build_executor_builder_image_id | regex_replace('^sha256:', ''))
           - _build_executor_probe_inspect.OCIRuntime in [build_executor_runsc_path, (build_executor_runsc_path | basename)]
           - _build_executor_probe_inspect.Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
-          - _build_executor_probe_inspect.HostConfig.NetworkMode == build_executor_network_name
+          # podman 5.x reports HostConfig.NetworkMode as "bridge" for a named
+          # bridge network; the authoritative membership is the Networks map key.
+          - >-
+            _build_executor_probe_inspect.HostConfig.NetworkMode == build_executor_network_name
+            or build_executor_network_name in ((_build_executor_probe_inspect.NetworkSettings.Networks | default({})) | list)
           - _build_executor_probe_inspect.HostConfig.IpcMode == "private"
           - _build_executor_probe_inspect.HostConfig.PidMode == "private"
           - _build_executor_probe_inspect.HostConfig.UTSMode == "private"

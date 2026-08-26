@@ -612,16 +612,13 @@ impl BuildExecutor {
             || declaration.builder_manifest_digest.is_some()
             || declaration.builder_config_digest.is_some();
         if archive_pin_present {
-            let archive_path = declaration
-                .builder_archive_path
-                .as_ref()
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_archive_path is required",
-                    )
-                })?;
+            let archive_path = declaration.builder_archive_path.as_ref().ok_or_else(|| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::InvalidConfig,
+                    "load installed BuildExecutor",
+                    "builder archive pin is partial: builder_archive_path is required",
+                )
+            })?;
             let archive_sha = declaration
                 .builder_archive_sha256
                 .as_deref()
@@ -632,25 +629,24 @@ impl BuildExecutor {
                         "builder archive pin is partial: builder_archive_sha256 is required",
                     )
                 })?;
-            let archive_bytes = declaration
-                .builder_archive_bytes
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_archive_bytes is required",
-                    )
-                })?;
-            let manifest_digest = declaration
-                .builder_manifest_digest
-                .as_deref()
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_manifest_digest is required",
-                    )
-                })?;
+            let archive_bytes = declaration.builder_archive_bytes.ok_or_else(|| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::InvalidConfig,
+                    "load installed BuildExecutor",
+                    "builder archive pin is partial: builder_archive_bytes is required",
+                )
+            })?;
+            let manifest_digest =
+                declaration
+                    .builder_manifest_digest
+                    .as_deref()
+                    .ok_or_else(|| {
+                        BuildExecutorError::new(
+                            BuildExecutorErrorCode::InvalidConfig,
+                            "load installed BuildExecutor",
+                            "builder archive pin is partial: builder_manifest_digest is required",
+                        )
+                    })?;
             let config_digest = declaration
                 .builder_config_digest
                 .as_deref()
@@ -674,14 +670,13 @@ impl BuildExecutor {
             }
             validate_trusted_regular_file(archive_path, "reviewed builder OCI archive")?;
             let measured_archive = sha256_file(archive_path).await?;
-            let archive_metadata =
-                tokio::fs::metadata(archive_path).await.map_err(|error| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::CapabilityUnavailable,
-                        "load installed BuildExecutor",
-                        format!("cannot measure builder archive: {error}"),
-                    )
-                })?;
+            let archive_metadata = tokio::fs::metadata(archive_path).await.map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    "load installed BuildExecutor",
+                    format!("cannot measure builder archive: {error}"),
+                )
+            })?;
             if hex_bytes(&measured_archive) != REVIEWED_BUILDER_ARCHIVE_SHA256
                 || archive_metadata.len() != REVIEWED_BUILDER_ARCHIVE_BYTES
             {
@@ -4021,9 +4016,7 @@ fn verify_image_inspect(bytes: &[u8], reference: &str) -> Result<()> {
     let entrypoint_ok = image_config
         .get("Entrypoint")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| {
-            values.len() == 1 && values[0].as_str() == Some(BUILDER_INIT_PATH)
-        });
+        .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some(BUILDER_INIT_PATH));
     let workdir_ok = json_str(image_config, &["WorkingDir"]) == Some(WORKSPACE_MOUNT);
     let label_ok = image_config
         .get("Labels")

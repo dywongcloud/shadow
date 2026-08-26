@@ -9,9 +9,13 @@
 //! address space) on Unix. Stronger isolation (separate kernels) is the
 //! Firecracker backend's job; tenant tagging flows identically through both.
 
-use crate::{CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink};
+use crate::{
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
+};
 use async_trait::async_trait;
-use hive_core::{now_ms, BuildJob, BuildResult, CellId, LogLine, LogStream};
+use hive_core::{
+    now_ms, BuildJob, BuildResult, CellId, LogLine, LogStream, RuntimeArtifactIdentity,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -73,8 +77,16 @@ impl Drop for RootRollback {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MockRuntimeArtifactReceipt {
+    identity: RuntimeArtifactIdentity,
+    app_root: PathBuf,
+}
+
 pub struct MockBackend {
     cfg: MockConfig,
+    /// Exact immutable application bytes authorized for each platform image id.
+    runtime_artifacts: Arc<std::sync::Mutex<HashMap<String, MockRuntimeArtifactReceipt>>>,
     /// Long-lived function processes, keyed by cell, killed on terminate.
     funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
@@ -95,6 +107,7 @@ impl MockBackend {
     pub fn new(cfg: MockConfig) -> Self {
         MockBackend {
             cfg,
+            runtime_artifacts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -250,6 +263,84 @@ impl CellBackend for MockBackend {
         "mock"
     }
 
+    fn requires_runtime_artifact_authorization(&self) -> bool {
+        true
+    }
+
+    async fn deliver_build(
+        &self,
+        image: &str,
+        artifact: &SealedRuntimeArtifact,
+    ) -> anyhow::Result<()> {
+        let receipt = MockRuntimeArtifactReceipt {
+            identity: artifact.identity(image)?,
+            app_root: artifact.host_app_root()?,
+        };
+        let mut artifacts = self
+            .runtime_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = artifacts.get(image) {
+            anyhow::ensure!(
+                existing == &receipt,
+                "runtime artifact image id {image:?} is already bound to different immutable content"
+            );
+            return Ok(());
+        }
+        artifacts.insert(image.to_string(), receipt);
+        Ok(())
+    }
+
+    async fn runtime_artifact_identity(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<Option<RuntimeArtifactIdentity>> {
+        let artifacts = self
+            .runtime_artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipt = artifacts.get(image).ok_or_else(|| {
+            anyhow::anyhow!(
+                "node is missing the committed runtime artifact for {image:?} ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        Ok(Some(receipt.identity.clone()))
+    }
+
+    async fn provision_runtime(
+        &self,
+        spec: &CellSpec,
+        expected: Option<&RuntimeArtifactIdentity>,
+    ) -> anyhow::Result<CellHandle> {
+        if let Some(expected) = expected {
+            anyhow::ensure!(
+                spec.container.is_none() && spec.image.starts_with("dpl-"),
+                "runtime artifact authorization was presented for a non-artifact cell {} ({})",
+                spec.id,
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+            let artifacts = self
+                .runtime_artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let receipt = artifacts.get(&spec.image).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "node is missing the committed runtime artifact for {:?} ({})",
+                    spec.image,
+                    hive_core::fault::NODE_IMAGE_MISSING
+                )
+            })?;
+            anyhow::ensure!(
+                &receipt.identity == expected,
+                "deployment {:?} artifact changed after caller authorization ({})",
+                spec.image,
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+        }
+        self.provision(spec).await
+    }
+
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
         // Per-tenant isolation: every cell's sandbox lives under its tenant's
         // subtree (`<root>/<tenant>/<cell-id>`), so one tenant's cells can never
@@ -340,6 +431,44 @@ impl CellBackend for MockBackend {
             return Ok(endpoint);
         }
 
+        let workdir = func.workdir.as_ref().map(PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mock function launch omitted its runtime workdir ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            )
+        })?;
+        if cell.image.starts_with("dpl-") {
+            let authorized = func.runtime_artifact.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mock function launch omitted the caller-authorized runtime artifact identity ({})",
+                    hive_core::fault::NODE_IMAGE_MISSING
+                )
+            })?;
+            let artifacts = self
+                .runtime_artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let receipt = artifacts.get(&cell.image).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "node is missing the committed runtime artifact for {:?} ({})",
+                    cell.image,
+                    hive_core::fault::NODE_IMAGE_MISSING
+                )
+            })?;
+            anyhow::ensure!(
+                &receipt.identity == authorized && receipt.app_root == workdir,
+                "mock function launch does not match its committed sealed runtime artifact ({})",
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+        } else {
+            anyhow::ensure!(
+                func.runtime_artifact.is_none(),
+                "non-artifact mock image {:?} received a runtime artifact identity ({})",
+                cell.image,
+                hive_core::fault::NODE_IMAGE_MISSING
+            );
+        }
+
         // Native macOS litebox: real syscall-level sandboxing for Node
         // functions (see `crate::litebox_macos`'s module doc). Capability is
         // PROBED, never assumed — `available` fails fast (no sudoers grant
@@ -352,12 +481,6 @@ impl CellBackend for MockBackend {
         {
             return self.start_function_litebox_macos(cell, func).await;
         }
-
-        let workdir = func
-            .workdir
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cell.root.clone());
 
         // Ensure common tool dirs (podman/docker, homebrew) are on PATH so
         // container deploys work regardless of how the node was launched.
@@ -416,6 +539,13 @@ impl CellBackend for MockBackend {
             );
         }
 
+        let runtime_home = cell.root.join("runtime-home");
+        let runtime_tmp = cell.root.join("runtime-tmp");
+        let runtime_cache = cell.root.join("runtime-cache");
+        tokio::fs::create_dir_all(&runtime_home).await?;
+        tokio::fs::create_dir_all(&runtime_tmp).await?;
+        tokio::fs::create_dir_all(&runtime_cache).await?;
+
         let mut cmd = Command::new(&func.start_cmd[0]);
         cmd
             // CLEARED, NEVER INHERITED. `Command` inherits the parent's whole
@@ -448,7 +578,9 @@ impl CellBackend for MockBackend {
             .current_dir(&workdir)
             .env("PORT", func.port.to_string())
             .env("PATH", path)
-            .env("HOME", &workdir)
+            .env("HOME", &runtime_home)
+            .env("TMPDIR", &runtime_tmp)
+            .env("XDG_CACHE_HOME", &runtime_cache)
             .envs(&func.env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -471,10 +603,7 @@ impl CellBackend for MockBackend {
             .map(|v| v == "0" || v == "false")
             .unwrap_or(false);
         if !cc_off && func.runtime.uses_v8_compile_cache() {
-            let cache_dir = workdir.join(".hive-compile-cache");
-            if std::fs::create_dir_all(&cache_dir).is_ok() {
-                cmd.env("NODE_COMPILE_CACHE", &cache_dir);
-            }
+            cmd.env("NODE_COMPILE_CACHE", &runtime_cache);
         }
 
         let child = cmd.spawn()?;

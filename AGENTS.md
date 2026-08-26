@@ -133,6 +133,24 @@ history).
 - Verify the fix by writing through the public round-robin host and reading it
   back several times, AND directly against a node still running the previous
   binary — the old node must still fail. That contrast is the proof.
+- **The stale-epoch 503 is a retryable refusal class, and the fence discloses
+  its epoch.** The `admin_ingress` epoch fence answers a behind-epoch forwarded
+  mutation with 503 `stale control-plane epoch (ownership changed); retry`
+  PLUS an `x-hive-cp-epoch-current` header carrying the receiver's own epoch.
+  `admin_forward_to_leader` treats it as a third provably-not-applied outcome
+  (the fence fires before the receiver's router, same retry-safety argument as
+  `not control-plane leader`): max-merge the disclosed epoch via `adopt_epoch`,
+  re-stamp, retry same-candidate up to `MAX_STALE_EPOCH_RETRIES` (3), then walk
+  candidates and only then return the refusal. The invariant is unchanged — a
+  sender that never converges (genuine ownership divergence) is still refused;
+  the bound, not the fence, is what moved. Why it matters: the epoch is an
+  OBSERVER-LOCAL fencing token that max-merges fleet-wide, so one sick node
+  inflates it for everyone — witnessed 2026-08-24, fc-virginia-2's cgroup-OOM
+  crash loop (restart counter 2652, ~5s process life, 151 stale firecracker
+  processes pinning 13.3 GB of its 16.5 GB cgroup) transiently self-elected on
+  every boot, bumping the fleet epoch ~5/min and fencing ~17% of in-flight
+  forwards (leader log: 442 rejections/h, always exactly one epoch behind,
+  leader itself stable with zero transitions).
 - **Store-sync adoption is WHOLESALE-REPLACE under a per-observer owner
   election, so an owner flap can churn a fresh leader write away fleet-wide.**
   `store_sync::REGISTRY`'s leader-pull entries (teams, billing, projects, …)

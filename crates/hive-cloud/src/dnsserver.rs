@@ -976,6 +976,7 @@ mod tests {
             bun_runtime: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
+            artifact_transfer_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

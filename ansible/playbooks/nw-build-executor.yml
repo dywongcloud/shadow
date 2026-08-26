@@ -1,0 +1,7 @@
+---
+- name: Provision the isolated BuildExecutor on phoenix
+  hosts: phx
+  become: true
+  gather_facts: true
+  roles:
+    - build_executor

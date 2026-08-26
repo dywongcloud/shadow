@@ -312,18 +312,22 @@
         checksum: "sha256:{{ hive_bun_sha256 }}"
         force: true
 
-    - name: Extract bun from the v1.4.0 archive into /usr/local
+    # Versioned extract dir (the wasmer convention two blocks up): an
+    # unversioned dir plus `creates` would skip extraction on a future version
+    # bump, leaving the symlink on the old binary while the check demands the
+    # new one.
+    - name: Extract bun from the v1.4.0 archive into /usr/local/bun-v1.4.0
       ansible.builtin.unarchive:
         src: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
-        dest: /usr/local
+        dest: /usr/local/bun-v1.4.0
         remote_src: true
         extra_opts:
           - "{{ hive_bun_asset }}/bun"
-        creates: "/usr/local/{{ hive_bun_asset }}/bun"
+        creates: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}/bun"
 
     - name: Symlink bun + bunx into /usr/local/bin (on hive-node.service's Environment PATH)
       ansible.builtin.file:
-        src: "/usr/local/{{ hive_bun_asset }}/bun"
+        src: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}/bun"
         dest: "/usr/local/bin/{{ item }}"
         state: link
         force: true

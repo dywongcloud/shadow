@@ -243,6 +243,13 @@ pub struct NodeInfo {
     /// on the root host and must never receive a source build as fallback.
     #[serde(default)]
     pub build_isolation_protocol: Option<u16>,
+    /// Sealed runtime-artifact TRANSFER protocol (coordinator→target
+    /// Begin/Chunk/Finalize/Prepare/Commit generation delivery) served by this
+    /// node's receiver. `None` = pre-upgrade peer or a receiver that failed to
+    /// initialize — deliberately NOT an immutable-generation fanout target; the
+    /// coordinator keeps the legacy per-target dispatch for it.
+    #[serde(default)]
+    pub artifact_transfer_protocol: Option<u16>,
     /// Marketing model name of the first GPU (e.g. "Tesla T4"); hosts are
     /// homogeneous in practice, and a mixed host still reports a usable name.
     #[serde(default)]
@@ -602,6 +609,14 @@ impl NodeRegistry {
         me.wasm_runtime = wasm_runtime;
         me.bun_runtime = bun_runtime;
         me.runtime_artifact_protocol = runtime_artifact_protocol;
+    }
+
+    /// Publish (or withdraw) this node's sealed-artifact transfer receiver
+    /// capability. Set once after the receiver initializes; a disabled
+    /// receiver advertises `None` so no coordinator selects this node as an
+    /// immutable-generation transfer target.
+    pub fn set_self_artifact_transfer_protocol(&self, protocol: Option<u16>) {
+        self.me.write().artifact_transfer_protocol = protocol;
     }
 
     /// Refresh this node's restart-audit counters (see `hive-cloud`'s
@@ -1004,6 +1019,37 @@ impl NodeRegistry {
             if peer.guardian_iroh_addr.is_none() {
                 peer.guardian_iroh_addr = existing.guardian_iroh_addr.clone();
             }
+            // Same regression, same fix, for every OTHER capability-advertisement
+            // field a node can newly GAIN after boot (a rootfs rebuild that stages
+            // wasmer/bun, a litebox verification, a BuildExecutor probe passing, a
+            // runtime-artifact receiver initializing). Each is `None` = "not yet
+            // capable/known" and monotonically becomes `Some` as capability is
+            // proven live — never the reverse while the node keeps running. A
+            // relayed copy older than the peer's own most recent direct announce
+            // (this round, concurrently processed, from a peer that hasn't yet
+            // relearned the new capability) must not silently un-advertise it —
+            // witnessed live 2026-08-26: fc-phoenix's own `/v1/nodes` correctly
+            // showed `runtime_artifact_protocol: Some(1)` immediately after
+            // gaining Litebox verification, while the leader's registry stayed
+            // permanently `None` for it, incorrectly excluding it from every
+            // runtime-artifact-gated placement despite `last_seen_ms` advancing
+            // normally (proving gossip itself was flowing — just periodically
+            // clobbered by a stale relay hop that raced the direct announce).
+            if peer.wasm_runtime.is_none() {
+                peer.wasm_runtime = existing.wasm_runtime;
+            }
+            if peer.bun_runtime.is_none() {
+                peer.bun_runtime = existing.bun_runtime;
+            }
+            if peer.runtime_artifact_protocol.is_none() {
+                peer.runtime_artifact_protocol = existing.runtime_artifact_protocol;
+            }
+            if peer.build_isolation_protocol.is_none() {
+                peer.build_isolation_protocol = existing.build_isolation_protocol;
+            }
+            if peer.artifact_transfer_protocol.is_none() {
+                peer.artifact_transfer_protocol = existing.artifact_transfer_protocol;
+            }
         }
         if peer.healthy && peer.latency_ms == u64::MAX {
             peer.latency_ms = Self::RESTORED_LATENCY_MS;
@@ -1062,6 +1108,7 @@ mod tests {
             bun_runtime: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
+            artifact_transfer_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: id.into(),

@@ -356,6 +356,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_admission::routes())
         // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
         .merge(crate::browser_artifacts::routes())
+        // ---- Immutable runtime artifact transfer (bounded, durable, mesh-internal) ----
+        .merge(crate::runtime_artifact_transfer::routes())
         // ---- Browser-replicated database exchange (fleet-initiated pull) ----
         .merge(crate::browser_db::routes())
         // ---- browser_db libsql/Hrana + Upstash REST surface (owner-proxied) ----

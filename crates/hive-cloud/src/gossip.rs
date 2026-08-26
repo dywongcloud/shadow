@@ -149,6 +149,16 @@ pub async fn request_to_with_response_cap(
 /// the SAME endpoints that answer HTTP gossip, so the two transports are
 /// byte-equivalent. Returns the response body bytes.
 pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u8]) -> Vec<u8> {
+    dispatch_verified(cloud, method, path, body, None).await
+}
+
+async fn dispatch_verified(
+    cloud: &Arc<CloudState>,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    signer: Option<&str>,
+) -> Vec<u8> {
     match path {
         "/v1/nodes/announce" if method == hive_p2p::GOSSIP_POST => {
             if let Ok(node) = serde_json::from_slice::<hive_edge::NodeInfo>(body) {
@@ -688,6 +698,37 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 .map(|v| crate::zkauth::urldecode(&v))
                 .unwrap_or_default();
             jb(crate::zkauth::mint_rpc(&team, &user, &project).await)
+        }
+        // Bounded immutable runtime-artifact transfer. Exact versioned operation
+        // paths must stay ahead of every broader runtime/deploy arm: old peers
+        // answer an unknown path with an empty body, which the sender treats as
+        // NO_HANDLER rather than letting a legacy deploy handler rebuild source.
+        // Unlike `team_claims`, this arm accepts only a verified short-lived
+        // service token and the iroh transport's verified endpoint signer.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some("/v1/runtime-artifact-transfer/v1/begin")
+                    | Some("/v1/runtime-artifact-transfer/v1/chunk")
+                    | Some("/v1/runtime-artifact-transfer/v1/query")
+                    | Some("/v1/runtime-artifact-transfer/v1/finalize")
+                    | Some("/v1/runtime-artifact-transfer/v1/abort")
+            ) =>
+        {
+            let operation = p
+                .split('?')
+                .next()
+                .and_then(|path| path.rsplit('/').next())
+                .unwrap_or_default();
+            let token = qparam(p, "tok");
+            crate::runtime_artifact_transfer::mesh_dispatch(
+                cloud,
+                operation,
+                signer,
+                token.as_deref(),
+                body,
+            )
+            .await
         }
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
         // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
@@ -1895,7 +1936,7 @@ pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
                 )
                 .unwrap_or_default();
             }
-            dispatch(&cloud, method, &path, &body).await
+            dispatch_verified(&cloud, method, &path, &body, signer.as_deref()).await
         })
     })
 }

@@ -109,7 +109,7 @@
   ansible.builtin.assert:
     that:
       - hive_verify_backend.agent_disk_sha == hive_verify_backend.canonical_agent_sha
-      - hive_verify_backend.agent_release_schema == 1
+      - hive_verify_backend.agent_release_schema == 2
       - hive_verify_backend.agent_release_protocol == (hive_runtime_artifact_protocol_expected | default(1) | int)
       - hive_verify_backend.agent_release_sha == hive_verify_backend.canonical_agent_sha
     fail_msg: >-

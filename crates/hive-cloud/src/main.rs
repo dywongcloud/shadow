@@ -19,6 +19,7 @@ mod browser_db_rest;
 // bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
 mod browser_metering;
 mod browser_presence;
+mod build_coordinates;
 mod build_executor;
 mod cluster;
 mod compose;
@@ -27,6 +28,7 @@ mod db_gateway;
 mod db_replicate;
 mod db_rest;
 mod dedicated_ipv4_listener;
+mod deployment_ledger;
 mod dht_probe;
 mod discovery;
 mod dns;
@@ -68,11 +70,18 @@ mod push;
 mod raw_ports;
 mod raw_proxy;
 mod relational;
+mod repository_build;
 mod resources;
 mod resp;
 mod resp_cache;
 mod restart_audit;
 mod retry;
+mod runtime_artifact_transfer;
+mod runtime_artifact_transfer_fs;
+mod runtime_artifact_transfer_sender;
+mod runtime_artifact_transfer_service;
+mod runtime_artifact_transfer_store;
+mod runtime_artifact_transfer_wire;
 mod sandboxes;
 mod sandboxes_api;
 mod sandboxes_platform;
@@ -641,7 +650,10 @@ async fn main() -> anyhow::Result<()> {
     // gateway URL carries a real address other nodes can actually reach.
     let public_base = {
         let port = args.listen.port();
-        match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+        match std::env::var("HIVE_PUBLIC_IP")
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
             Some(v) if !v.is_empty() && v != "0.0.0.0" => format!("http://{}:{}", v, port),
             _ => format!("http://{}", args.listen),
         }
@@ -967,6 +979,10 @@ async fn main() -> anyhow::Result<()> {
         // The executor may be initialized above, but this stays fail-closed until
         // every git build surface consumes it in this binary.
         build_isolation_protocol: None,
+        // Published after CloudState::new proves the transfer receiver actually
+        // initialized (its worker, durable store and recovery all succeeded) —
+        // never asserted from this literal.
+        artifact_transfer_protocol: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
         provider: std::env::var("HIVE_CLOUD_PROVIDER")
@@ -1032,6 +1048,16 @@ async fn main() -> anyhow::Result<()> {
     // `Weak` deliberately: the AccessControl impl must never be the thing
     // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
+    // Advertise the sealed-artifact transfer receiver only after CloudState
+    // construction PROVED it initialized (durable store opened, worker
+    // spawned, interrupted transactions recovered). A receiver that failed
+    // closed keeps advertising `None`, so no coordinator ever selects this
+    // node as an immutable-generation transfer target.
+    if cloud.runtime_artifact_transfer.enabled() {
+        cloud.registry.set_self_artifact_transfer_protocol(Some(
+            crate::runtime_artifact_transfer_wire::PROTOCOL_VERSION,
+        ));
+    }
 
     // Tell the gateway the PUBLIC domain user deployments are reachable on, so
     // the URLs it reports (`DeploymentInfo::alias` and friends, which the
@@ -1057,6 +1083,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the coalescing background persister: after this, persist() marks dirty
     // + wakes the writer instead of fsync-ing the whole state on the request thread.
     persist::spawn_persister(cloud.clone());
+    deployment_ledger::spawn_outbox(cloud.clone());
     // Metrics hour/day rollups (metrics.rs's RollupSnapshot, the only durable slice
     // of MetricsStore) are the sole exception to "persist() runs after every
     // mutation": state.rs's record() — called on every single HTTP request — never
@@ -1129,6 +1156,13 @@ async fn main() -> anyhow::Result<()> {
                 // the grace window; wait for it here since exit() below would
                 // otherwise kill them the instant this task returns regardless.
                 tokio::time::sleep(grace).await;
+            }
+            tracing::info!("shutdown requested → draining runtime artifact transfers");
+            if let Err(error) = flush_cloud.runtime_artifact_transfer.shutdown().await {
+                tracing::error!(
+                    %error,
+                    "runtime artifact transfer worker did not drain cleanly; continuing shutdown"
+                );
             }
             tracing::info!("shutdown requested → flushing platform state");
             let final_guardian_generation = match persist::flush_blocking() {
@@ -2079,6 +2113,11 @@ fn owner_routed(path: &str) -> bool {
         // than stored since there is no `Database` record to carry a host_node.
         || path.starts_with("/v1/browser-db/")
         || (path.starts_with("/v1/projects/") && path.ends_with("/browser-db/rest-mesh"))
+        // Runtime artifact transfers are addressed to the immutable request's
+        // exact target node. Sending a chunk to the control-plane leader would
+        // mutate a different host's transaction journal (or fail WrongTarget)
+        // and make resumable delivery impossible across leader changes.
+        || path.starts_with("/v1/runtime-artifact-transfer/v1/")
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied

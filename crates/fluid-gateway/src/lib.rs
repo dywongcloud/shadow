@@ -20,13 +20,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use fluid_compute::{func_key, Fluid, FunctionStats, Lease};
+use fluid_compute::{func_key, Fluid, FunctionStats, Lease, PoolSpec};
 use fluid_core::{
     BuildOutputV3Evaluator, BuildOutputV3Refusal, BuildOutputV3Target, DeployRequest, Deployment,
     DeploymentId, DeploymentInfo, Manifest, ProjectIncarnation, RouteTarget,
 };
 use fluid_tunnel::TunnelClient;
-use hive_backend::{connect_endpoint, RuntimeArtifactPaths, RuntimeArtifactSpec};
+use hive_backend::{
+    connect_endpoint, seal_host_runtime_artifact, RuntimeArtifactPaths, RuntimeArtifactSpec,
+    SealedRuntimeArtifact,
+};
 use hive_core::{now_ms, CellId};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -34,12 +37,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
 struct GwState {
+    accepting: bool,
     deployments: HashMap<DeploymentId, Deployment>,
     /// Open directory identities held for each deployment's whole registered
     /// lifetime. Static reads never re-resolve a replaceable root pathname.
@@ -455,10 +459,22 @@ fn supported_build_output_image_path_pattern(pattern: &str) -> bool {
 /// subdirectory instead, so sibling functions in the same deployment can
 /// never resolve each other's relative `import()`s.
 fn function_launch_workdir(base: &str, function: &fluid_core::FunctionConfig) -> String {
-    match function.cwd_relative.as_deref() {
-        Some(rel) if !rel.is_empty() => Path::new(base).join(rel).to_string_lossy().into_owned(),
-        _ => base.to_string(),
+    // `cwd_relative` rides the wire in normalized form whose app-root spelling
+    // is a literal "." (build_coordinates::FunctionCwd::wire). `Path::join`
+    // preserves `.` components verbatim, so a naive join emits "<base>/." —
+    // which then fails the backend's exact string equality against the sealed
+    // artifact's workdir (witnessed live: litebox refused launch "/workspace/
+    // apps/web/." vs artifact "/workspace/apps/web"). Push only Normal
+    // components so every spelling of the same directory joins identically.
+    let mut path = std::path::PathBuf::from(base);
+    if let Some(rel) = function.cwd_relative.as_deref() {
+        for component in Path::new(rel).components() {
+            if let std::path::Component::Normal(name) = component {
+                path.push(name);
+            }
+        }
     }
+    path.to_string_lossy().into_owned()
 }
 
 fn build_output_v3_route_state(manifest: &Manifest) -> Option<BuildOutputV3RouteState> {
@@ -466,6 +482,101 @@ fn build_output_v3_route_state(manifest: &Manifest) -> Option<BuildOutputV3Route
         Ok(Some(evaluator)) => Some(BuildOutputV3RouteState::Ready(Arc::new(evaluator))),
         Ok(None) => None,
         Err(refusal) => Some(BuildOutputV3RouteState::Refused(refusal)),
+    }
+}
+
+enum LocalManifestKind {
+    Static,
+    Process,
+    Container,
+}
+
+struct SyncDeployJob {
+    request: DeployRequest,
+    response: std::sync::mpsc::SyncSender<anyhow::Result<DeploymentInfo>>,
+}
+
+struct SyncDeployWorker {
+    sender: Option<std::sync::mpsc::SyncSender<SyncDeployJob>>,
+    join: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl SyncDeployWorker {
+    fn start(gateway: &Arc<Gateway>) -> anyhow::Result<Self> {
+        const QUEUE_CAPACITY: usize = 16;
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<SyncDeployJob>(QUEUE_CAPACITY);
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        let fluid = gateway.fluid.clone();
+        let gateway = Arc::downgrade(gateway);
+        let join = std::thread::Builder::new()
+            .name("fluid-sync-deploy".into())
+            .spawn(move || -> anyhow::Result<()> {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build();
+                let ready = runtime
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                if ready_sender.send(ready).is_err() {
+                    return Ok(());
+                }
+                let runtime = runtime
+                    .map_err(|error| anyhow::anyhow!("deployment runtime failed: {error}"))?;
+                while let Ok(job) = receiver.recv() {
+                    let result = match gateway.upgrade() {
+                        Some(gateway) => {
+                            runtime.block_on(gateway.deploy_local_request(job.request))
+                        }
+                        None => Err(anyhow::anyhow!("gateway was dropped before deployment ran")),
+                    };
+                    let _ = job.response.send(result);
+                }
+                runtime.block_on(fluid.shutdown())?;
+                Ok(())
+            })?;
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender: Some(sender),
+                join: Some(join),
+            }),
+            Ok(Err(error)) => {
+                let _ = join.join();
+                anyhow::bail!("could not start deployment runtime: {error}")
+            }
+            Err(error) => {
+                let _ = join.join();
+                anyhow::bail!("deployment runtime exited during startup: {error}")
+            }
+        }
+    }
+
+    fn sender(&self) -> anyhow::Result<std::sync::mpsc::SyncSender<SyncDeployJob>> {
+        self.sender
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("deployment runtime is shutting down"))
+    }
+
+    fn stop_inner(&mut self) -> anyhow::Result<()> {
+        self.sender.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        if join.thread().id() == std::thread::current().id() {
+            return Ok(());
+        }
+        join.join()
+            .map_err(|_| anyhow::anyhow!("deployment runtime thread panicked"))??;
+        Ok(())
+    }
+}
+
+impl Drop for SyncDeployWorker {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
     }
 }
 
@@ -488,18 +599,99 @@ pub struct Gateway {
     /// access at all (fluid-gateway is a lower-level crate hive-cloud embeds,
     /// never the other way around).
     rum: RumStore,
-    /// Low-trust browser serving targets and their independent circuit state.
-    /// Kept outside Fluid's lease pools so a frozen tab can never be classified
-    /// as host capacity exhaustion.
     browser: RwLock<BrowserRoutes>,
+    runtime_artifact_store: PathBuf,
+    sync_deployer: Mutex<Option<SyncDeployWorker>>,
+    shutting_down: AtomicBool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadinessFunctionReceipt {
+    pub function: String,
+    pub cell_id: String,
+    pub status: Option<u16>,
+    pub response_bytes: usize,
+    pub response_truncated: bool,
+    pub raw_bound: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeploymentReadinessReceipt {
+    pub deployment_id: String,
+    pub observed_ms: u64,
+    pub functions: Vec<ReadinessFunctionReceipt>,
+    pub static_root_open: bool,
+    pub static_status: Option<u16>,
+    pub static_response_bytes: usize,
+    pub static_response_truncated: bool,
+}
+
+/// Cancellation-safe handle for a hidden deployment candidate. Dropping it
+/// synchronously removes the candidate record and atomically detaches its whole
+/// pool set; cell termination continues outside the registry lock.
+pub struct StagedDeployment {
+    gateway: Arc<Gateway>,
+    info: DeploymentInfo,
+    receipt: Option<DeploymentReadinessReceipt>,
+    armed: bool,
+}
+
+impl StagedDeployment {
+    pub fn info(&self) -> &DeploymentInfo {
+        &self.info
+    }
+
+    pub fn receipt(&self) -> Option<&DeploymentReadinessReceipt> {
+        self.receipt.as_ref()
+    }
+
+    pub async fn prove_ready(&mut self) -> anyhow::Result<&DeploymentReadinessReceipt> {
+        let receipt = self.gateway.probe_staged(&self.info.id).await?;
+        self.receipt = Some(receipt);
+        Ok(self.receipt.as_ref().expect("receipt was just set"))
+    }
+
+    pub fn publish_ready(mut self) -> anyhow::Result<(DeploymentInfo, DeploymentReadinessReceipt)> {
+        let receipt = self
+            .receipt
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("staged deployment has no readiness receipt"))?;
+        let info = self.gateway.publish_staged_ready(&self.info.id)?;
+        self.armed = false;
+        Ok((info, receipt))
+    }
+}
+
+impl Drop for StagedDeployment {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(keys) = self.gateway.take_staged(&self.info.id) else {
+            return;
+        };
+        let fluid = self.gateway.fluid.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                fluid.unregister_many(&keys).await;
+            });
+        }
+    }
 }
 
 impl Gateway {
     pub fn new(fluid: Arc<Fluid>, image: String) -> Arc<Gateway> {
+        let runtime_artifact_store = std::env::var_os("HIVE_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("fluid-runtime-artifacts-{}", std::process::id()))
+            })
+            .join("runtime-artifacts-v1");
         Arc::new(Gateway {
             fluid,
             image,
             state: Mutex::new(GwState {
+                accepting: true,
                 deployments: HashMap::new(),
                 static_roots: HashMap::new(),
                 aliases: HashMap::new(),
@@ -512,7 +704,43 @@ impl Gateway {
             tunnels_reused: AtomicU64::new(0),
             rum: RumStore::new(),
             browser: RwLock::new(BrowserRoutes::default()),
+            runtime_artifact_store,
+            sync_deployer: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
         })
+    }
+
+    /// Close direct-deploy admission, stop the compatibility worker, release
+    /// gateway tunnels, and wait for Fluid to terminate every owned cell. Safe
+    /// to call repeatedly or concurrently.
+    pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<usize> {
+        self.shutting_down.store(true, Ordering::Release);
+        self.state.lock().accepting = false;
+        let worker = self.sync_deployer.lock().take();
+        let worker_error = if let Some(mut worker) = worker {
+            match tokio::time::timeout(
+                Duration::from_secs(40),
+                tokio::task::spawn_blocking(move || worker.stop_inner()),
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(format!("{error:#}")),
+                Ok(Err(error)) => Some(format!("deployment worker join failed: {error}")),
+                Err(_) => Some("deployment worker did not stop within 40s".to_string()),
+            }
+        } else {
+            None
+        };
+        self.tunnels.lock().await.clear();
+        let fluid_result = self.fluid.shutdown().await;
+        match (worker_error, fluid_result) {
+            (None, result) => result,
+            (Some(worker), Ok(_)) => anyhow::bail!(worker),
+            (Some(worker), Err(fluid)) => {
+                anyhow::bail!("{worker}; Fluid shutdown also failed: {fluid:#}")
+            }
+        }
     }
 
     /// Record one `/_vercel/speed-insights/vitals` beacon payload
@@ -703,18 +931,168 @@ impl Gateway {
         self.tunnels.lock().await.remove(cell);
     }
 
-    /// Register a deployment: wire its functions into the Fluid pool and make it
-    /// routable. Becomes the default (most-recent) deployment.
-    pub fn deploy(&self, root: String, manifest: Manifest) -> DeploymentInfo {
-        self.deploy_full(
+    /// Compatibility seam for synchronous library callers. The bounded worker
+    /// owns a persistent Tokio runtime, so tunnel and backend tasks spawned by a
+    /// successful deployment survive this method returning.
+    pub fn deploy(self: &Arc<Self>, root: String, manifest: Manifest) -> DeploymentInfo {
+        let request = DeployRequest {
+            root: root.clone(),
+            manifest: manifest.clone(),
+            project_incarnation: None,
+            creator: Some("you".into()),
+            git: None,
+            production: true,
+        };
+        match self.sync_deploy_request(request) {
+            Ok(info) => info,
+            Err(error) => {
+                warn!(%error, "synchronous deployment refused");
+                self.deploy_full(
+                    root,
+                    manifest,
+                    "you".into(),
+                    None,
+                    true,
+                    fluid_core::DeployState::Error,
+                    String::new(),
+                )
+            }
+        }
+    }
+
+    fn sync_deploy_request(
+        self: &Arc<Self>,
+        request: DeployRequest,
+    ) -> anyhow::Result<DeploymentInfo> {
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::Acquire),
+            "gateway is shutting down; direct deployment admission is closed"
+        );
+        let sender = {
+            let mut worker = self.sync_deployer.lock();
+            anyhow::ensure!(
+                !self.shutting_down.load(Ordering::Acquire),
+                "gateway shutdown began before direct deployment was queued"
+            );
+            if worker.is_none() {
+                *worker = Some(SyncDeployWorker::start(self)?);
+            }
+            worker
+                .as_ref()
+                .expect("deployment worker was just initialized")
+                .sender()?
+        };
+        let (response, result) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(SyncDeployJob { request, response })
+            .map_err(|_| anyhow::anyhow!("deployment runtime stopped before accepting work"))?;
+        result
+            .recv()
+            .map_err(|_| anyhow::anyhow!("deployment runtime stopped without a result"))?
+    }
+
+    /// Seal one local source snapshot, commit its exact runtime identity, stage it
+    /// hidden, and publish immutable aliases only after a bounded real response.
+    /// Production alias movement remains a separate durable transaction.
+    pub async fn deploy_local_request(
+        self: &Arc<Self>,
+        request: DeployRequest,
+    ) -> anyhow::Result<DeploymentInfo> {
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::Acquire),
+            "gateway is shutting down; direct deployment admission is closed"
+        );
+        let DeployRequest {
             root,
+            mut manifest,
+            project_incarnation,
+            creator,
+            git,
+            production,
+        } = request;
+        let kind = classify_local_manifest(&manifest)?;
+        if matches!(kind, LocalManifestKind::Static) {
+            anyhow::ensure!(
+                manifest.image.is_none(),
+                "static-only deployment supplied an inapplicable function image"
+            );
+        }
+
+        let source_root = std::fs::canonicalize(&root)
+            .map_err(|error| anyhow::anyhow!("could not open deployment root {root:?}: {error}"))?;
+        tokio::fs::create_dir_all(&self.runtime_artifact_store).await?;
+        let store_root = std::fs::canonicalize(&self.runtime_artifact_store).map_err(|error| {
+            anyhow::anyhow!(
+                "could not resolve runtime artifact store {}: {error}",
+                self.runtime_artifact_store.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !store_root.starts_with(&source_root),
+            "runtime artifact store cannot be nested inside the deployment source"
+        );
+        let spec = RuntimeArtifactSpec::new(source_root, ".");
+        let sealed = seal_host_runtime_artifact(&spec, &store_root).await?;
+
+        let (host_static_root, runtime_workdir) = match kind {
+            LocalManifestKind::Static => (path_utf8(sealed.host_app_root()?)?, None),
+            LocalManifestKind::Container => {
+                let root = path_utf8(sealed.host_app_root()?)?;
+                (root.clone(), Some(root))
+            }
+            LocalManifestKind::Process => {
+                let image = format!("dpl-{}", sealed.content_sha256());
+                if let Some(requested) = manifest.image.as_deref() {
+                    anyhow::ensure!(
+                        requested == image,
+                        "process deployment supplied image {requested:?}; exact sealed identity is {image:?}"
+                    );
+                }
+                let expected = sealed.identity(&image)?;
+                let paths = self.runtime_artifact_paths(&sealed)?;
+                anyhow::ensure!(
+                    paths.delivery_required,
+                    "backend {} did not require sealed runtime authorization",
+                    self.backend_name()
+                );
+                self.deliver_build(&image, &sealed).await?;
+                let committed = self
+                    .runtime_artifact_identity(&image)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "backend {} accepted {image:?} without a committed artifact receipt",
+                            self.backend_name()
+                        )
+                    })?;
+                anyhow::ensure!(
+                    committed == expected,
+                    "backend {} committed artifact identity {:?}, expected {:?}",
+                    self.backend_name(),
+                    committed,
+                    expected
+                );
+                manifest.image = Some(image);
+                (
+                    path_utf8(paths.host_static_root)?,
+                    Some(path_utf8(paths.guest_workdir)?),
+                )
+            }
+        };
+
+        let mut staged = self.stage_full_with_runtime_incarnation(
+            host_static_root,
+            runtime_workdir,
             manifest,
-            "you".into(),
-            None,
-            true,
-            fluid_core::DeployState::Ready,
+            creator.unwrap_or_else(|| "you".into()),
+            git,
+            production,
             String::new(),
-        )
+            project_incarnation,
+        )?;
+        staged.prove_ready().await?;
+        let (info, _) = staged.publish_ready()?;
+        Ok(info)
     }
 
     /// Name of the active isolation backend ("mock" | "firecracker").
@@ -726,34 +1104,39 @@ impl Gateway {
     /// must retain both; an isolated guest path must never replace the host root.
     pub fn runtime_artifact_paths(
         &self,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<RuntimeArtifactPaths> {
         self.fluid.runtime_artifact_paths(artifact)
     }
 
-    /// Legacy guest-path query retained for callers that have not yet adopted
-    /// [`Gateway::runtime_artifact_paths`].
     pub fn delivered_workdir(
         &self,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<Option<String>> {
         self.fluid.delivered_workdir(artifact)
     }
 
-    /// Pack a built deployment's output so the serving cells can reach it (only
-    /// meaningful for an isolated backend; a no-op for the same-host mock).
+    /// Commit a caller-authorized sealed deployment artifact to the serving
+    /// backend before any function pool references its identity.
     pub async fn deliver_build(
         &self,
         image: &str,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
         self.fluid.deliver_build(image, artifact).await
     }
 
-    /// Full deploy for callers that do not already hold a paired runtime-artifact
-    /// descriptor. Reuse the host path only when the active backend proves that it
-    /// executes on the same host; isolated backends retain static serving but never
-    /// guess a guest cwd from a host path.
+    pub async fn runtime_artifact_identity(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<Option<hive_core::RuntimeArtifactIdentity>> {
+        self.fluid.runtime_artifact_identity(image).await
+    }
+
+    /// Full deploy for callers that do not hold sealed runtime authority.
+    /// Such callers may register static/container deployments, but a function
+    /// deployment fails closed rather than inferring execution authority from
+    /// a mutable host path.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full(
         &self,
@@ -765,24 +1148,13 @@ impl Gateway {
         state: fluid_core::DeployState,
         tenant: String,
     ) -> DeploymentInfo {
-        let runtime_workdir = self
-            .legacy_same_host_workdir(&root)
-            .map(|path| path.to_string_lossy().into_owned());
         self.deploy_full_with_runtime(
-            root,
-            runtime_workdir,
-            manifest,
-            creator,
-            git,
-            production,
-            state,
-            tenant,
+            root, None, manifest, creator, git, production, state, tenant,
         )
     }
 
-    /// Register one same-host deployment under exact project-incarnation
-    /// authority. This is the direct-deploy twin of
-    /// [`Self::deploy_full_with_runtime_exact`].
+    /// Register one deployment under exact project-incarnation authority
+    /// without mutable host-path execution authority.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full_exact(
         &self,
@@ -795,12 +1167,9 @@ impl Gateway {
         tenant: String,
         project_incarnation: ProjectIncarnation,
     ) -> DeploymentInfo {
-        let runtime_workdir = self
-            .legacy_same_host_workdir(&root)
-            .map(|path| path.to_string_lossy().into_owned());
         self.deploy_full_with_runtime_exact(
             root,
-            runtime_workdir,
+            None,
             manifest,
             creator,
             git,
@@ -838,6 +1207,7 @@ impl Gateway {
             state,
             tenant,
             None,
+            true,
         )
     }
 
@@ -867,7 +1237,78 @@ impl Gateway {
             state,
             tenant,
             Some(project_incarnation),
+            true,
         )
+    }
+
+    /// Register a complete candidate as `Building` without publishing any alias.
+    /// The returned guard owns rollback until a bounded runtime proof is recorded
+    /// and the caller explicitly publishes the ready deployment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_full_with_runtime_exact(
+        self: &Arc<Self>,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        tenant: String,
+        project_incarnation: ProjectIncarnation,
+    ) -> anyhow::Result<StagedDeployment> {
+        self.stage_full_with_runtime_incarnation(
+            host_static_root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            tenant,
+            Some(project_incarnation),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_full_with_runtime_incarnation(
+        self: &Arc<Self>,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        tenant: String,
+        project_incarnation: Option<ProjectIncarnation>,
+    ) -> anyhow::Result<StagedDeployment> {
+        anyhow::ensure!(
+            self.state.lock().accepting,
+            "gateway is shutting down; deployment staging is closed"
+        );
+        let info = self.deploy_full_with_runtime_incarnation(
+            host_static_root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            fluid_core::DeployState::Building,
+            tenant,
+            project_incarnation,
+            false,
+        );
+        if info.state != fluid_core::DeployState::Building {
+            self.discard_unpublished_record(&info.id);
+            anyhow::bail!(
+                "deployment candidate {} was refused before staging",
+                info.id
+            );
+        }
+        Ok(StagedDeployment {
+            gateway: self.clone(),
+            info,
+            receipt: None,
+            armed: true,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -882,6 +1323,7 @@ impl Gateway {
         mut state: fluid_core::DeployState,
         tenant: String,
         project_incarnation: Option<ProjectIncarnation>,
+        publish_routes: bool,
     ) -> DeploymentInfo {
         // Normalize the owner once at the boundary so the stored record, the
         // function pools, and every cell agree on the tenant (empty => "personal").
@@ -904,17 +1346,31 @@ impl Gateway {
             );
             state = fluid_core::DeployState::Error;
         }
-        if !build_output_refused {
+        if !build_output_refused
+            && matches!(
+                state,
+                fluid_core::DeployState::Building | fluid_core::DeployState::Ready
+            )
+        {
             if let Some(function_workdir) = runtime_workdir.as_ref() {
-                for f in &manifest.functions {
-                    let key = func_key(id.as_str(), &f.name);
-                    self.fluid.register(
-                        key,
-                        f.clone(),
-                        cell_image.clone(),
-                        function_launch_workdir(function_workdir, f),
-                        tenant.clone(),
+                let specs = manifest
+                    .functions
+                    .iter()
+                    .map(|function| PoolSpec {
+                        key: func_key(id.as_str(), &function.name),
+                        cfg: function.clone(),
+                        image: cell_image.clone(),
+                        workdir: function_launch_workdir(function_workdir, function),
+                        tenant: tenant.clone(),
+                    })
+                    .collect();
+                if let Err(error) = self.fluid.register_many(specs) {
+                    warn!(
+                        deployment = %id,
+                        %error,
+                        "function-pool set registration refused"
                     );
+                    state = fluid_core::DeployState::Error;
                 }
             } else if !manifest.functions.is_empty() {
                 warn!(
@@ -935,8 +1391,9 @@ impl Gateway {
             state,
             creator,
             git,
-            production,
-            // The build target is immutable; `production` (promoted) may later flip.
+            production: production && publish_routes && state == fluid_core::DeployState::Ready,
+            // The requested build lane is immutable; production alias ownership
+            // is committed separately after readiness.
             target: if production {
                 "production".into()
             } else {
@@ -964,6 +1421,10 @@ impl Gateway {
         if let Some(routes) = build_output_v3 {
             st.build_output_v3.insert(id.clone(), routes);
         }
+        if !publish_routes || state != fluid_core::DeployState::Ready {
+            st.deployments.insert(id, dep);
+            return info;
+        }
         // Does this project already have a (different) production deployment? If
         // not, this deploy claims the bare production domain even when it isn't
         // itself a production deploy — so the very first deploy and the "Building…"
@@ -971,6 +1432,7 @@ impl Gateway {
         let has_production = st.deployments.values().any(|d| {
             d.project == project
                 && d.production
+                && d.state == fluid_core::DeployState::Ready
                 && d.id != id
                 && project_incarnation
                     .is_none_or(|incarnation| d.project_incarnation == Some(incarnation))
@@ -1023,6 +1485,244 @@ impl Gateway {
         info
     }
 
+    fn discard_unpublished_record(&self, id: &DeploymentId) {
+        let mut st = self.state.lock();
+        if st
+            .deployments
+            .get(id)
+            .is_some_and(|deployment| deployment.state != fluid_core::DeployState::Ready)
+        {
+            st.deployments.remove(id);
+            st.static_roots.remove(id);
+            st.build_output_v3.remove(id);
+        }
+    }
+
+    fn take_staged(&self, id: &DeploymentId) -> Option<Vec<String>> {
+        let mut st = self.state.lock();
+        let deployment = st.deployments.get(id)?;
+        if deployment.state != fluid_core::DeployState::Building {
+            return None;
+        }
+        let keys = deployment
+            .manifest
+            .functions
+            .iter()
+            .map(|function| func_key(id.as_str(), &function.name))
+            .collect();
+        st.deployments.remove(id);
+        st.static_roots.remove(id);
+        st.build_output_v3.remove(id);
+        Some(keys)
+    }
+
+    fn publish_staged_ready(&self, id: &DeploymentId) -> anyhow::Result<DeploymentInfo> {
+        let mut st = self.state.lock();
+        anyhow::ensure!(
+            st.accepting,
+            "gateway shutdown began before staged deployment publication"
+        );
+        let info = {
+            let deployment = st
+                .deployments
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("staged deployment {id} no longer exists"))?;
+            anyhow::ensure!(
+                deployment.state == fluid_core::DeployState::Building,
+                "deployment {id} is not a staged candidate"
+            );
+            deployment.state = fluid_core::DeployState::Ready;
+            deployment.production = false;
+            view_of(deployment)
+        };
+        insert_deploy_aliases(&mut st, id);
+        st.default.get_or_insert_with(|| id.clone());
+        Ok(info)
+    }
+
+    async fn probe_staged(&self, id: &DeploymentId) -> anyhow::Result<DeploymentReadinessReceipt> {
+        const MAX_HEADER_COUNT: usize = 128;
+        const MAX_HEADER_BYTES: usize = 32 * 1024;
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+        let (deployment, static_root, build_output_v3) = {
+            let st = self.state.lock();
+            let deployment = st
+                .deployments
+                .get(id)
+                .filter(|deployment| deployment.state == fluid_core::DeployState::Building)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("deployment {id} is not staged"))?;
+            (
+                deployment,
+                st.static_roots.get(id).cloned(),
+                st.build_output_v3.get(id).cloned(),
+            )
+        };
+        let static_root_open = static_root.is_some();
+        let mut static_status = None;
+        let mut static_response_bytes = 0usize;
+        let mut static_response_truncated = false;
+        if deployment.manifest.functions.is_empty() {
+            let selected = SelectedDeployment {
+                deployment: deployment.clone(),
+                static_root,
+                build_output_v3,
+            };
+            let response =
+                serve_static(&selected, "/", accepted_encodings(&HeaderMap::new())).await;
+            let platform_code = response
+                .headers()
+                .get("x-hive-error")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let acceptable = match (response.status(), platform_code.as_deref()) {
+                (status, None) if status.is_success() || status.is_redirection() => true,
+                // An ordinary content miss at "/" is a LEGAL static site (no
+                // root index.html — Vercel deploys these fine and serves 404
+                // at the root); only genuine platform fault codes
+                // (STATIC_UNAVAILABLE, STATIC_FORBIDDEN, BUILD_OUTPUT_*) may
+                // fail readiness. This exact conflation refused a healthy
+                // zero-command deployment with the opaque "returned a
+                // platform error" — the code the probe saw is now always
+                // named.
+                (StatusCode::NOT_FOUND, Some("NOT_FOUND")) => true,
+                _ => false,
+            };
+            anyhow::ensure!(
+                acceptable,
+                "static readiness request failed: HTTP {}, platform code {}",
+                response.status(),
+                platform_code.as_deref().unwrap_or("none")
+            );
+            static_status = Some(response.status().as_u16());
+            match axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BYTES).await {
+                Ok(bytes) => static_response_bytes = bytes.len(),
+                Err(_) => {
+                    static_response_bytes = MAX_RESPONSE_BYTES;
+                    static_response_truncated = true;
+                }
+            }
+        }
+
+        let mut functions = Vec::with_capacity(deployment.manifest.functions.len());
+        for function in &deployment.manifest.functions {
+            let key = func_key(id.as_str(), &function.name);
+            let timeout = readiness_probe_timeout();
+            let receipt = tokio::time::timeout(timeout, async {
+                let lease = self.fluid.lease(&key).await.map_err(|error| {
+                    anyhow::anyhow!("{} failed to launch: {error}", function.name)
+                })?;
+                let cell_id = lease.cell_id().to_string();
+                if function.needs_raw_proxy() {
+                    return Ok(ReadinessFunctionReceipt {
+                        function: function.name.clone(),
+                        cell_id,
+                        status: None,
+                        response_bytes: 0,
+                        response_truncated: false,
+                        raw_bound: true,
+                    });
+                }
+                let (client, _) = self.tunnel_for(lease.cell_id(), &lease.endpoint).await?;
+                let mut response = client
+                    .request(
+                        "GET",
+                        "/",
+                        vec![("host".into(), deployment.project.clone())],
+                        &[],
+                        timeout,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    response.headers.len() <= MAX_HEADER_COUNT,
+                    "{} returned too many readiness headers",
+                    function.name
+                );
+                let header_bytes =
+                    response
+                        .headers
+                        .iter()
+                        .try_fold(0usize, |total, (name, value)| {
+                            total
+                                .checked_add(name.len())
+                                .and_then(|size| size.checked_add(value.len()))
+                        });
+                anyhow::ensure!(
+                    header_bytes.is_some_and(|bytes| bytes <= MAX_HEADER_BYTES),
+                    "{} returned oversized readiness headers",
+                    function.name
+                );
+                anyhow::ensure!(
+                    !response
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("x-hive-error")),
+                    "{} returned a platform-generated error response",
+                    function.name
+                );
+                anyhow::ensure!(
+                    (100..500).contains(&response.status),
+                    "{} readiness request returned HTTP {}",
+                    function.name,
+                    response.status
+                );
+                let mut response_bytes = 0usize;
+                let mut response_truncated = false;
+                let body_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+                while response_bytes < MAX_RESPONSE_BYTES {
+                    let remaining =
+                        body_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, response.body.recv()).await {
+                        Ok(Some(chunk)) => {
+                            let available = MAX_RESPONSE_BYTES - response_bytes;
+                            response_bytes += chunk.len().min(available);
+                            if chunk.len() > available {
+                                response_truncated = true;
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                if response_bytes == MAX_RESPONSE_BYTES {
+                    response_truncated = true;
+                }
+                Ok(ReadinessFunctionReceipt {
+                    function: function.name.clone(),
+                    cell_id,
+                    status: Some(response.status),
+                    response_bytes,
+                    response_truncated,
+                    raw_bound: false,
+                })
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} readiness probe exceeded {}ms",
+                    function.name,
+                    timeout.as_millis()
+                )
+            })??;
+            functions.push(receipt);
+        }
+        functions.sort_by(|left, right| left.function.cmp(&right.function));
+        Ok(DeploymentReadinessReceipt {
+            deployment_id: id.to_string(),
+            observed_ms: now_ms(),
+            functions,
+            static_root_open,
+            static_status,
+            static_response_bytes,
+            static_response_truncated,
+        })
+    }
+
     /// Re-stamp a deployment's creation time — the causal-stamp seam for
     /// project-delete generations: a deployment registered over a fresh
     /// tombstone must dominate it (`remove_project_through` sweeps
@@ -1069,7 +1769,9 @@ impl Gateway {
         let target = st
             .deployments
             .values()
-            .find(|d| d.project == project && d.production)
+            .find(|d| {
+                d.project == project && d.production && d.state == fluid_core::DeployState::Ready
+            })
             .map(|d| d.id.clone());
         if let Some(id) = target {
             st.aliases_full.insert(host, id);
@@ -1123,6 +1825,9 @@ impl Gateway {
         let did = DeploymentId::from(id.to_string());
         let mut st = self.state.lock();
         let selected = st.deployments.get(&did)?;
+        if selected.state != fluid_core::DeployState::Ready {
+            return None;
+        }
         if expected.is_some_and(|incarnation| selected.project_incarnation != Some(incarnation)) {
             return None;
         }
@@ -1206,7 +1911,11 @@ impl Gateway {
         for d in st.deployments.values() {
             for f in &d.manifest.functions {
                 let key = func_key(d.id.as_str(), &f.name);
-                let n = if d.production { f.min_instances } else { 0 };
+                let n = if d.production && d.state == fluid_core::DeployState::Ready {
+                    f.min_instances
+                } else {
+                    0
+                };
                 self.fluid.set_min_instances(&key, n);
             }
         }
@@ -1227,9 +1936,7 @@ impl Gateway {
                 .collect();
             (dep.project.clone(), keys)
         };
-        for k in keys {
-            self.fluid.unregister(&k).await;
-        }
+        self.fluid.unregister_many(&keys).await;
         let mut st = self.state.lock();
         st.deployments.remove(&did);
         st.static_roots.remove(&did);
@@ -1241,6 +1948,7 @@ impl Gateway {
             st.default = st
                 .deployments
                 .values()
+                .filter(|d| d.state == fluid_core::DeployState::Ready)
                 .max_by_key(|d| d.created_at_ms)
                 .map(|d| d.id.clone());
         }
@@ -1248,7 +1956,7 @@ impl Gateway {
         if let Some(newest) = st
             .deployments
             .values()
-            .filter(|d| d.project == project)
+            .filter(|d| d.project == project && d.state == fluid_core::DeployState::Ready)
             .max_by_key(|d| d.created_at_ms)
             .map(|d| d.id.clone())
         {
@@ -1306,9 +2014,7 @@ impl Gateway {
             .iter()
             .map(|function| func_key(&record.id, &function.name))
             .collect();
-        for key in keys {
-            self.fluid.unregister(&key).await;
-        }
+        self.fluid.unregister_many(&keys).await;
         let mut st = self.state.lock();
         let still_owned = st
             .deployments
@@ -1326,6 +2032,7 @@ impl Gateway {
             st.default = st
                 .deployments
                 .values()
+                .filter(|deployment| deployment.state == fluid_core::DeployState::Ready)
                 .max_by_key(|deployment| deployment.created_at_ms)
                 .map(|deployment| deployment.id.clone());
         }
@@ -1335,6 +2042,7 @@ impl Gateway {
             .filter(|deployment| {
                 deployment.project == record.project
                     && deployment.project_incarnation == Some(expected)
+                    && deployment.state == fluid_core::DeployState::Ready
             })
             .max_by_key(|deployment| deployment.created_at_ms)
             .map(|deployment| deployment.id.clone())
@@ -1507,11 +2215,7 @@ impl Gateway {
     /// re-register its functions with the Fluid pool. Used on boot.
     pub fn restore(&self, rec: fluid_core::DeployRecord) {
         let id = DeploymentId::from(rec.id.clone());
-        let runtime_workdir = rec
-            .runtime_workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .or_else(|| self.legacy_same_host_workdir(&rec.root));
+        let runtime_workdir = rec.runtime_workdir.as_deref().map(PathBuf::from);
         let restored_tenant = if rec.tenant.trim().is_empty() {
             "__untagged__".to_string()
         } else {
@@ -1532,27 +2236,34 @@ impl Gateway {
             );
             restored_state = fluid_core::DeployState::Error;
         }
-        if !build_output_refused {
+        if !build_output_refused && restored_state == fluid_core::DeployState::Ready {
             if let Some(workdir) = runtime_workdir.as_ref() {
-                for f in &manifest.functions {
-                    let key = func_key(id.as_str(), &f.name);
-                    let workdir_str = workdir.to_string_lossy().into_owned();
-                    self.fluid.register(
-                        key,
-                        f.clone(),
-                        cell_image.clone(),
-                        function_launch_workdir(&workdir_str, f),
-                        restored_tenant.clone(),
+                let workdir = workdir.to_string_lossy().into_owned();
+                let specs = manifest
+                    .functions
+                    .iter()
+                    .map(|function| PoolSpec {
+                        key: func_key(id.as_str(), &function.name),
+                        cfg: function.clone(),
+                        image: cell_image.clone(),
+                        workdir: function_launch_workdir(&workdir, function),
+                        tenant: restored_tenant.clone(),
+                    })
+                    .collect();
+                if let Err(error) = self.fluid.register_many(specs) {
+                    warn!(
+                        deployment = %id,
+                        %error,
+                        "restored function-pool set registration refused"
                     );
+                    restored_state = fluid_core::DeployState::Error;
                 }
             } else if !manifest.functions.is_empty() {
                 warn!(
                     deployment = %id,
-                    "restore refused function registration: legacy record has no runtime workdir and this backend requires delivered artifacts"
+                    "restore refused function registration: record has no runtime workdir and this backend requires delivered artifacts"
                 );
-                if manifest.build_output_v3.is_some() {
-                    restored_state = fluid_core::DeployState::Error;
-                }
+                restored_state = fluid_core::DeployState::Error;
             }
         }
         let dep = Deployment {
@@ -1594,16 +2305,11 @@ impl Gateway {
             st.build_output_v3.insert(id.clone(), routes);
         }
         st.deployments.insert(id.clone(), dep);
-        set_alias_if_newer(&mut st, &project, &id);
-        insert_deploy_aliases(&mut st, &id);
-        st.default.get_or_insert(id);
-    }
-
-    fn legacy_same_host_workdir(&self, root: &str) -> Option<PathBuf> {
-        let artifact = RuntimeArtifactSpec::new(root, ".");
-        let paths = self.fluid.runtime_artifact_paths(&artifact).ok()?;
-        (!paths.delivery_required && paths.guest_workdir == paths.host_static_root)
-            .then_some(paths.guest_workdir)
+        if restored_state == fluid_core::DeployState::Ready {
+            set_alias_if_newer(&mut st, &project, &id);
+            insert_deploy_aliases(&mut st, &id);
+            st.default.get_or_insert(id);
+        }
     }
 
     /// Pick the deployment for a request: `<project>.<host>` subdomain, else the
@@ -1644,6 +2350,7 @@ impl Gateway {
         let selected = |id: &DeploymentId| {
             st.deployments
                 .get(id)
+                .filter(|deployment| deployment.state == fluid_core::DeployState::Ready)
                 .cloned()
                 .map(|deployment| SelectedDeployment {
                     static_root: st.static_roots.get(id).cloned(),
@@ -1852,6 +2559,199 @@ impl Gateway {
     }
 }
 
+fn classify_local_manifest(manifest: &Manifest) -> anyhow::Result<LocalManifestKind> {
+    let mut process = false;
+    let mut container = false;
+    for function in &manifest.functions {
+        let marker = function.start_cmd.first().map(String::as_str) == Some("__container__");
+        let typed = function.runtime == "container";
+        anyhow::ensure!(
+            marker == typed,
+            "function {:?} has inconsistent container runtime authority",
+            function.name
+        );
+        if marker {
+            anyhow::ensure!(
+                function.start_cmd.len() == 3,
+                "container function {:?} requires exactly image and port arguments",
+                function.name
+            );
+            let image = &function.start_cmd[1];
+            anyhow::ensure!(
+                immutable_oci_ref(image),
+                "container function {:?} image {image:?} is mutable; resolve it to sha256 first",
+                function.name
+            );
+            let port = function.start_cmd[2].parse::<u16>().ok();
+            anyhow::ensure!(
+                port.is_some_and(|port| port != 0),
+                "container function {:?} has an invalid port",
+                function.name
+            );
+            container = true;
+        } else {
+            process = true;
+        }
+    }
+    anyhow::ensure!(
+        !(process && container),
+        "one deployment cannot mix sealed process authority with OCI container authority"
+    );
+    Ok(if process {
+        LocalManifestKind::Process
+    } else if container {
+        LocalManifestKind::Container
+    } else {
+        LocalManifestKind::Static
+    })
+}
+
+fn immutable_oci_ref(image: &str) -> bool {
+    if let Some(digest) = image.strip_prefix("sha256:") {
+        return valid_sha256_digest(digest);
+    }
+    let Some((reference, digest)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !reference.is_empty()
+        && !reference.contains('@')
+        && valid_oci_repository_reference(reference)
+        && valid_sha256_digest(digest)
+}
+
+fn valid_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_oci_repository_reference(reference: &str) -> bool {
+    if reference.is_empty() || reference.len() > 384 {
+        return false;
+    }
+    let last_slash = reference.rfind('/');
+    let tag_separator = reference
+        .rfind(':')
+        .filter(|colon| last_slash.is_none_or(|slash| *colon > slash));
+    let (name, tag) = match tag_separator {
+        Some(colon) => (&reference[..colon], Some(&reference[colon + 1..])),
+        None => (reference, None),
+    };
+    if name.is_empty() || name.len() > 255 || tag.is_some_and(|tag| !valid_oci_tag(tag)) {
+        return false;
+    }
+
+    let mut components = name.split('/');
+    let Some(first) = components.next() else {
+        return false;
+    };
+    let first_is_registry = first == "localhost" || first.contains('.') || first.contains(':');
+    if if first_is_registry {
+        !valid_oci_registry(first)
+    } else {
+        !valid_oci_name_component(first)
+    } {
+        return false;
+    }
+    components.all(valid_oci_name_component)
+}
+
+fn valid_oci_registry(registry: &str) -> bool {
+    let host = match registry.rsplit_once(':') {
+        Some((host, port)) => {
+            if host.contains(':')
+                || port.is_empty()
+                || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+            {
+                return false;
+            }
+            host
+        }
+        None => registry,
+    };
+    if host == "localhost" {
+        return true;
+    }
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn valid_oci_name_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
+        return false;
+    }
+    let mut index = 1usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'_') {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if bytes
+            .get(index)
+            .is_none_or(|byte| !(byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_oci_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn path_utf8(path: PathBuf) -> anyhow::Result<String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("validated runtime artifact path is not UTF-8"))
+}
+
+fn readiness_probe_timeout() -> Duration {
+    let millis = std::env::var("HIVE_DEPLOY_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(90_000)
+        .clamp(1_000, 300_000);
+    Duration::from_millis(millis)
+}
+
 fn static_dir_path(dep: &Deployment) -> PathBuf {
     let path = dep
         .manifest
@@ -1953,11 +2853,26 @@ pub async fn serve_admin(gw: Arc<Gateway>, addr: std::net::SocketAddr) -> anyhow
     Ok(())
 }
 
-async fn admin_deploy(
-    State(gw): State<Arc<Gateway>>,
-    Json(req): Json<DeployRequest>,
-) -> Json<DeploymentInfo> {
-    Json(gw.deploy(req.root, req.manifest))
+async fn admin_deploy(State(gw): State<Arc<Gateway>>, Json(req): Json<DeployRequest>) -> Response {
+    match gw.deploy_local_request(req).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => {
+            warn!(%error, "direct deployment refused");
+            let mut response = (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": "DEPLOYMENT_REFUSED",
+                    "error": error.to_string(),
+                })),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static("x-hive-error"),
+                HeaderValue::from_static("DEPLOYMENT_REFUSED"),
+            );
+            response
+        }
+    }
 }
 
 async fn admin_list(State(gw): State<Arc<Gateway>>) -> Json<Vec<DeploymentInfo>> {
