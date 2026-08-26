@@ -3009,6 +3009,24 @@ async fn run_build(
             runtime_env.len(),
         ));
     }
+    // A variable the user can SEE in settings but the build cannot see is a
+    // silent mystery ("DATABASE_URL is not set" after they set it) — name the
+    // gap in the build log, keys only, never values.
+    {
+        let runtime_only: Vec<&str> = runtime_env
+            .keys()
+            .filter(|k| !build_env.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        if !runtime_only.is_empty() {
+            log(format!(
+                "Note: {} runtime-scoped variable(s) are NOT exposed to the build: {}. \
+                 Set scope to \"Build + Runtime\" in Settings → Environment Variables if the build needs them.",
+                runtime_only.len(),
+                runtime_only.join(", ")
+            ));
+        }
+    }
     let build_cache_enabled = req.use_cache;
 
     // Build from a subdirectory for monorepo templates (e.g. `examples/nextjs`).

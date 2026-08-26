@@ -18,7 +18,11 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [k, setK] = useState("");
   const [v, setV] = useState("");
   const [target, setTarget] = useState("production");
-  const [scope, setScope] = useState<"runtime" | "build" | "all">("runtime");
+  // Default "all" (Build + Runtime) — Vercel parity: a variable someone adds
+  // without touching the selector must be visible to the BUILD too. The old
+  // "runtime" default silently starved builds ("DATABASE_URL is not set"
+  // during migrate after the user had set it in settings).
+  const [scope, setScope] = useState<"runtime" | "build" | "all">("all");
   const [sensitive, setSensitive] = useState(true);
   // Save-path error + busy state: the server answer to a failed write (401
   // session expired, 403 wrong workspace, network) used to be swallowed by an
@@ -56,7 +60,7 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
       await apiSend("POST", `/v1/projects/${project}/env`, {
         key: k.trim(), value: v, target, scope, sensitive, updated_ms: 0,
       });
-      setK(""); setV(""); setScope("runtime"); setSensitive(true); setAdding(false);
+      setK(""); setV(""); setScope("all"); setSensitive(true); setAdding(false);
       load();
     } catch (e) {
       setSaveErr(String(e).replace(/^Error:\s*/, ""));
@@ -77,7 +81,8 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
     setEditing(e.key);
     setEditVal(e.sensitive ? "" : e.value); // sensitive values are server-masked
     setEditTarget(e.target || "production");
-    setEditScope(e.scope || "runtime");
+    // Legacy empty scope now means Build + Runtime on the backend.
+    setEditScope(e.scope || "all");
   }
   async function saveEdit(e: EnvVar) {
     // Backend semantics: an empty value on an existing key KEEPS the stored
@@ -144,9 +149,9 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
                 onChange={(e) => setScope(e.target.value as "runtime" | "build" | "all")}
                 className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-border-strong focus:outline-none focus:ring-2 focus:ring-border"
               >
-                <option value="runtime">Runtime only (default)</option>
+                <option value="runtime">Runtime only</option>
                 <option value="build">Build only</option>
-                <option value="all">Build and runtime</option>
+                <option value="all">Build and runtime (default)</option>
               </select>
             </div>
             <label className="flex items-center gap-3 self-end pb-2 text-sm text-secondary">
@@ -197,7 +202,7 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
                   {e.sensitive && <Badge>Sensitive</Badge>}
                 </div>
                 <div className="text-xs capitalize text-secondary">
-                  {e.target} · {(e.scope || "runtime").replace("all", "build + runtime")}
+                  {e.target} · {(e.scope || "all").replace("all", "build + runtime")}
                   {/* Value preview: plaintext vars show their value; sensitive stay hidden. */}
                   {!e.sensitive && e.value && (
                     <span className="ml-2 font-mono normal-case text-muted">= {e.value.length > 42 ? e.value.slice(0, 42) + "…" : e.value}</span>
