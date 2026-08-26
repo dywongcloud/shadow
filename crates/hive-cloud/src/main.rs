@@ -388,8 +388,25 @@ struct Args {
     guardian_writer_cadence_diagnostic: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// Explicit runtime instead of #[tokio::main] for ONE reason: worker stack
+// size. run_build's async pipeline compiles to poll frames large enough to
+// blow tokio's default 2 MiB worker stack — witnessed live: every deploy on a
+// debug binary died `thread 'tokio-rt-worker' has overflowed its stack` the
+// moment the build task started (the CI acceptance node crashed on its first
+// deploy, red since f75aa2c5), and release binaries sit close enough to the
+// edge that the same class killed nodes under real load. 16 MiB is virtual
+// address space per worker, not resident memory — pages are only committed
+// when touched — so the cost is nil and the whole failure class is gone.
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
