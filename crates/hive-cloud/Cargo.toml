@@ -76,6 +76,9 @@ hex = "0.4"
 # Already in the tree via iroh; pinned to that version so no new graph pull.
 hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
 serde_cbor = "0.11"
+# Guardian v2 immutable snapshot parts use a versioned zstd envelope. The
+# decoder remains backward-compatible with pre-envelope raw canonical JSON.
+zstd = "0.13"
 # DB-gateway HTTP REST surface: SQL-over-HTTP for managed Postgres. Real client
 # with real parameter binding (extended protocol) — never string interpolation.
 # chrono/serde_json/uuid decode features match crates already in the tree.

@@ -1,6 +1,8 @@
 ---
-- name: Provision the isolated BuildExecutor on phoenix
-  hosts: phx
+- name: Provision the isolated BuildExecutor
+  # Default target stays phx (the original canary); override per run with
+  # -e be_target=<host|group> to provision further nodes (e.g. va2, fc_kvm).
+  hosts: "{{ be_target | default('phx') }}"
   become: true
   gather_facts: true
   roles:

@@ -379,6 +379,13 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long = "guardian-lifecycle-diagnostic")]
     guardian_lifecycle_diagnostic: bool,
+    /// Focused debug-build-only real-store witness for compression plus the
+    /// replication-writer retention cadence under continuous snapshot traffic.
+    /// Requires disposable HIVE_DATA, HIVE_GUARDIAN_WRITER_CADENCE_DIAGNOSTIC=1,
+    /// and HIVE_GUARDIAN_PART_REAP_CHECK_SECS<=2. Release binaries omit it.
+    #[cfg(debug_assertions)]
+    #[arg(long = "guardian-writer-cadence-diagnostic")]
+    guardian_writer_cadence_diagnostic: bool,
 }
 
 #[tokio::main]
@@ -398,6 +405,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
+    #[cfg(debug_assertions)]
+    if args.guardian_writer_cadence_diagnostic {
+        println!("{}", guardian::writer_cadence_diagnostic().await?);
+        return Ok(());
+    }
     #[cfg(debug_assertions)]
     if args.guardian_lifecycle_diagnostic {
         println!("{}", guardian::lifecycle_diagnostic().await?);
@@ -1147,6 +1159,29 @@ async fn main() -> anyhow::Result<()> {
                     "controlled restart requested; beginning graceful shutdown"
                 ),
                 None => tracing::info!("shutdown signal received; beginning graceful shutdown"),
+            }
+            // HARD DEADLINE on the whole graceful sequence. Several steps below
+            // await work that is not individually bounded (the runtime-artifact
+            // transfer drain, the platform-state flush, guardian shutdown), and a
+            // wedge in any of them leaves the process alive but dark — witnessed
+            // live on fc-sanjose (2026-08-26): memwatch requested a MemoryPressure
+            // restart at rss 12GB, "beginning graceful shutdown" logged, and the
+            // process then sat frozen for 5+ minutes serving nothing while the
+            // fleet treated the dark leader as current. The watchdog turns any
+            // wedged step into the bounded restart the caller asked for; the exit
+            // code matches what the normal tail would have used.
+            {
+                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 90));
+                let code = if requested_reason.is_some() { 17 } else { 0 };
+                tokio::spawn(async move {
+                    tokio::time::sleep(deadline).await;
+                    tracing::error!(
+                        ?deadline,
+                        exit_code = code,
+                        "graceful shutdown exceeded its hard deadline — forcing exit now"
+                    );
+                    std::process::exit(code);
+                });
             }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {

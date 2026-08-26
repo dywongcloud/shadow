@@ -561,48 +561,80 @@ impl GuardianDBDocumentStore {
 
             use futures::StreamExt;
             use iroh_docs::engine::LiveEvent;
-            // Rebuild on every event that can change materialized document state.
-            // Local events matter too: an axum/request future may be cancelled
-            // after the independent iroh-docs actor commits but before the
-            // caller-side index.insert runs.
-            let changes_documents = |event: &std::result::Result<LiveEvent, _>| {
-                matches!(
-                    event,
-                    Ok(LiveEvent::InsertLocal { .. })
-                        | Ok(LiveEvent::InsertRemote { .. })
-                        | Ok(LiveEvent::ContentReady { .. })
-                        | Ok(LiveEvent::PendingContentReady)
-                        | Ok(LiveEvent::SyncFinished(_))
-                )
-            };
-            const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-            let mut dirty = false;
+            // INCREMENTAL application, not full rebuild — same change and same
+            // measured reason as the sibling kv_store live sync (see its comment:
+            // the debounced full rebuild re-fetched every value in the doc several
+            // times a minute under fleet gossip and was a top allocation site of
+            // the leader-OOM RSS balloon). Local events are applied incrementally
+            // too, and still matter: an axum/request future may be cancelled after
+            // the independent iroh-docs actor commits but before the caller-side
+            // index.insert runs — applying the InsertLocal entry here closes that
+            // gap without a full refetch. The rate-limited full resync remains as
+            // the safety net for dropped subscription events.
+            const FULL_RESYNC_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
+            const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut pending: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut full_dirty = false;
+            let mut last_full = std::time::Instant::now();
             loop {
-                if dirty {
-                    match tokio::time::timeout(DEBOUNCE, stream.next()).await {
-                        Ok(Some(event)) => {
-                            if changes_documents(&event) {
-                                dirty = true;
-                            }
-                            continue;
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            dirty = false;
-                            if let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
-                                warn!("Failed to update Document index via live sync: {:?}", e);
+                match tokio::time::timeout(IDLE_TICK, stream.next()).await {
+                    Ok(None) => break,
+                    Err(_) => {}
+                    Ok(Some(Ok(
+                        LiveEvent::InsertRemote { entry, .. } | LiveEvent::InsertLocal { entry },
+                    ))) => {
+                        let key = String::from_utf8_lossy(entry.key()).to_string();
+                        if entry.content_len() == 0 {
+                            index.remove(&key);
+                            pending.retain(|_, keys| {
+                                keys.retain(|k| k != &key);
+                                !keys.is_empty()
+                            });
+                        } else {
+                            let hash_str = entry.content_hash().to_hex().to_string();
+                            match client.cat_bytes(&hash_str).await {
+                                Ok(value) => index.insert(key, value),
+                                Err(_) => {
+                                    pending.entry(hash_str).or_default().push(key);
+                                }
                             }
                         }
                     }
-                } else {
-                    match stream.next().await {
-                        Some(event) => {
-                            if changes_documents(&event) {
-                                dirty = true;
+                    Ok(Some(Ok(LiveEvent::ContentReady { hash }))) => {
+                        let hash_str = hash.to_hex().to_string();
+                        if let Some(keys) = pending.remove(&hash_str) {
+                            match client.cat_bytes(&hash_str).await {
+                                Ok(value) => {
+                                    for key in keys {
+                                        index.insert(key, value.clone());
+                                    }
+                                }
+                                Err(_) => full_dirty = true,
                             }
                         }
-                        None => break,
                     }
+                    Ok(Some(Ok(LiveEvent::SyncFinished(_))))
+                    | Ok(Some(Ok(LiveEvent::PendingContentReady))) => {
+                        full_dirty = true;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(e))) => {
+                        debug!(
+                            "Document live sync subscription error (scheduling resync): {:?}",
+                            e
+                        );
+                        full_dirty = true;
+                    }
+                }
+                if full_dirty && last_full.elapsed() >= FULL_RESYNC_MIN_INTERVAL {
+                    full_dirty = false;
+                    pending.clear();
+                    if let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
+                        warn!("Failed to update Document index via live sync: {:?}", e);
+                    }
+                    last_full = std::time::Instant::now();
                 }
             }
             debug!("Live index sync terminated for Document store");

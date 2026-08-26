@@ -6763,6 +6763,36 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("staging platform after shim failed")?;
+        // Also stage the exported-app launcher. It is consumed only when the
+        // selected app has NO usable start script but its entry EXPORTS the
+        // server (the Vercel zero-config Express shape) — see the launcher
+        // fallback at the catch-all-start refusal below. Staged here
+        // unconditionally because the session is still open at this point and
+        // is already closed by the time that refusal can run; an unused
+        // launcher file is as harmless as an unused after-shim.
+        let launcher_script = r#"set -eu
+p=.hive-express-launcher.mjs
+[ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: launcher path may not be a symlink' >&2; exit 41; }
+tmp=$(mktemp .hive-express-launcher.XXXXXX)
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+printf '%s' "$1" >"$tmp"
+chmod 0444 "$tmp"
+mv -f -- "$tmp" "$p"
+trap - EXIT HUP INT TERM
+"#;
+        require_build_session(&mut isolated)?
+            .run(
+                dir,
+                launcher_script,
+                "stage platform exported-app launcher",
+                &[EXPRESS_LAUNCHER_JS.to_string()],
+                false,
+                cloud,
+                bid,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .context("staging platform exported-app launcher failed")?;
     }
     // Runtime dependency normalization for nested pnpm workspaces, auto-planned
     // lane only: repository-controlled install/build overrides own their output
@@ -6944,7 +6974,7 @@ done' hive-delink {} +
             // The selected application owns both command discovery and the runtime
             // artifact base. Function cwd is normalized later relative to that base;
             // it must not repeat the selected checkout path here.
-            let start = if is_sveltekit && dir.join("build/index.js").exists() {
+            let mut start = if is_sveltekit && dir.join("build/index.js").exists() {
                 if runtime_override == Some(hive_core::Runtime::Bun) {
                     vec![
                         "bun".to_string(),
@@ -6983,18 +7013,45 @@ done' hive-delink {} +
                     .and_then(|v| v.get("scripts").and_then(|s| s.get("start")).map(|_| ()))
                     .is_some();
                 if !has_start {
-                    return Err(anyhow::anyhow!(
-                        "build produced no usable production server entry for {}: the build \
-                         directory {} has no package.json `scripts.start`, no recognizable server \
-                         entry (server.js/index.js/…), and its workspace root has no `scripts.start` \
-                         either — a catch-all `{}` here would exit without ever binding $PORT and \
-                         open the deployment circuit in production. For a monorepo, the selected \
-                         app subdirectory (not the workspace root) is the directory that must own a \
-                         `start` script.",
-                        project,
-                        dir.display(),
-                        start.join(" ")
-                    ));
+                    // Zero-config exported-app lane (Vercel Express parity):
+                    // no start script, but the app's entry module EXPORTS its
+                    // server (`export default app`) — serve it through the
+                    // platform launcher staged earlier this build. TypeScript
+                    // entries run under Node's own type stripping; the Bun
+                    // catch-all shape keeps the refusal below (Bun's own
+                    // `bun run <entry>` semantics are a separate lane).
+                    let launcher_entry =
+                        if runtime_override.is_some_and(|r| r == hive_core::Runtime::Bun) {
+                            None
+                        } else {
+                            discover_exported_server_entry(dir)
+                        };
+                    if let Some(entry) = launcher_entry {
+                        let mut cmd = vec!["node".to_string()];
+                        if entry.ends_with(".ts") || entry.ends_with(".mts") {
+                            cmd.push("--experimental-strip-types".to_string());
+                        }
+                        cmd.push(EXPRESS_LAUNCHER_FILE.to_string());
+                        cmd.push(entry.clone());
+                        log(format!(
+                            "No start script — serving the exported app entry `{entry}` via the \
+                             platform launcher."
+                        ));
+                        start = cmd;
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "build produced no usable production server entry for {}: the build \
+                             directory {} has no package.json `scripts.start`, no recognizable server \
+                             entry (server.js/index.js/src/index.ts/…), and its workspace root has no \
+                             `scripts.start` either — a catch-all `{}` here would exit without ever \
+                             binding $PORT and open the deployment circuit in production. For a \
+                             monorepo, the selected app subdirectory (not the workspace root) is the \
+                             directory that must own a `start` script.",
+                            project,
+                            dir.display(),
+                            start.join(" ")
+                        ));
+                    }
                 }
             }
             log(format!(
@@ -7059,6 +7116,43 @@ done' hive-delink {} +
 /// at compile time from the crate's assets and written into each Node deployment.
 const AFTER_SHIM_JS: &str = include_str!("../assets/after-shim.cjs");
 const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
+
+/// The exported-app launcher (Vercel zero-config Express parity): wraps an
+/// entry module that `export default`s its app instead of binding $PORT. Same
+/// staging pattern as the after shim; consumed only by the no-start-script
+/// fallback in `build_via_fdi`.
+const EXPRESS_LAUNCHER_JS: &str = include_str!("../assets/express-launcher.mjs");
+const EXPRESS_LAUNCHER_FILE: &str = ".hive-express-launcher.mjs";
+
+/// Find an entry module that plausibly exports the app's server, for the
+/// no-start-script launcher lane. `package.json` `main`/`module` win, then the
+/// conventional stems Vercel's zero-config Node lane recognizes. Returns a
+/// checkout-relative path; never follows `..`.
+fn discover_exported_server_entry(dir: &Path) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            for field in ["main", "module"] {
+                if let Some(m) = v.get(field).and_then(|m| m.as_str()) {
+                    let m = m.trim().trim_start_matches("./");
+                    if !m.is_empty() {
+                        candidates.push(m.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for prefix in ["", "src/", "api/", "server/"] {
+        for stem in ["index", "server", "app", "main"] {
+            for ext in [".js", ".mjs", ".cjs", ".ts", ".mts"] {
+                candidates.push(format!("{prefix}{stem}{ext}"));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|rel| !rel.contains("..") && !rel.starts_with('/') && dir.join(rel).is_file())
+}
 
 /// Wire the already-sealed after()-support shim into the first function's serve
 /// environment. The bytes themselves are staged inside `IsolatedBuild` before

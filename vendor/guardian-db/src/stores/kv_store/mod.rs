@@ -94,21 +94,6 @@ impl KeyValueIndex {
     }
 }
 
-/// True for iroh-docs events that mean REMOTE state changed and the local index
-/// must be rebuilt. Local inserts are already applied by put_impl/delete_impl.
-fn is_remote_event(
-    event: &std::result::Result<iroh_docs::engine::LiveEvent, impl std::fmt::Debug>,
-) -> bool {
-    use iroh_docs::engine::LiveEvent;
-    matches!(
-        event,
-        Ok(LiveEvent::InsertRemote { .. })
-            | Ok(LiveEvent::ContentReady { .. })
-            | Ok(LiveEvent::PendingContentReady)
-            | Ok(LiveEvent::SyncFinished(_))
-    )
-}
-
 /// Rebuilds the in-memory index from the current state of the iroh-docs document.
 ///
 /// Function shared between `sync_index_from_docs` (manual load/sync) and the reactive
@@ -790,50 +775,91 @@ impl GuardianDBKeyValue {
             };
 
             use futures::StreamExt;
-            // COALESCED rebuild: a remote sync burst can deliver hundreds of
-            // InsertRemote/ContentReady events in a few ms. Rebuilding the whole
-            // index (get_many + a `cat_bytes` per key, each allocating a Vec) on
-            // EVERY event turned a burst into an O(events x keys) allocation +
-            // network storm — a confirmed driver of the fleet's tokio-worker heap
-            // runaway/OOM under mesh sync storms. Instead we set a "dirty" flag on
-            // each remote event and rebuild AT MOST once per debounce window,
-            // draining every event that arrived during the rebuild into a single
-            // follow-up pass. Correctness is unchanged (a full rebuild reflects
-            // the latest doc state regardless of how many events it collapses);
-            // only the rebuild RATE is bounded.
-            const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-            let mut dirty = false;
+            use iroh_docs::engine::LiveEvent;
+            // INCREMENTAL application, not full rebuild. The previous shape set a
+            // dirty flag on every remote event and re-ran refresh_kv_index (a
+            // get_many + one cat_bytes per key, re-fetching EVERY value) behind a
+            // 250ms debounce. On a continuously-gossiping fleet the quiet window
+            // recurs every few seconds, so this was a full multi-GB refetch of the
+            // whole doc several times a minute — measured live (symbolized jemalloc
+            // heap dumps, fc-sanjose 2026-08-26) as the top allocation site of the
+            // fleet-wide RSS balloon that OOM-killed the control-plane leader every
+            // ~5 minutes. Each remote event names exactly what changed, so apply
+            // that one entry: a deletion marker removes the key, content present
+            // fetches one blob, content not yet local parks the key per-hash until
+            // its ContentReady arrives. A rate-limited full resync remains as the
+            // safety net for anything incremental application cannot observe
+            // (e.g. events dropped by a lagging subscription).
+            const FULL_RESYNC_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
+            const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut pending: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut full_dirty = false;
+            // The store constructor just ran sync_index_from_docs, so the index is
+            // fresh at spawn time.
+            let mut last_full = std::time::Instant::now();
             loop {
-                if dirty {
-                    // Drain any events that arrived while we were waiting, so a
-                    // steady event stream still collapses to one rebuild/window.
-                    match tokio::time::timeout(DEBOUNCE, stream.next()).await {
-                        Ok(Some(event)) => {
-                            if is_remote_event(&event) {
-                                dirty = true;
-                            }
-                            continue; // keep draining until the window goes quiet
-                        }
-                        Ok(None) => break, // stream ended
-                        Err(_) => {
-                            // Quiet window elapsed with the index still dirty — rebuild once.
-                            dirty = false;
-                            if let Err(e) =
-                                Box::pin(refresh_kv_index(&docs, &doc, &client, &index)).await
-                            {
-                                warn!("Failed to update KV index via live sync: {:?}", e);
+                match tokio::time::timeout(IDLE_TICK, stream.next()).await {
+                    Ok(None) => break, // stream ended
+                    Err(_) => {}       // idle tick: fall through to the resync check
+                    Ok(Some(Ok(LiveEvent::InsertRemote { entry, .. }))) => {
+                        let key = String::from_utf8_lossy(entry.key()).to_string();
+                        if entry.content_len() == 0 {
+                            // Deletion marker: drop the key, and un-park it from any
+                            // hash it was waiting on (the delete supersedes it).
+                            index.remove(&key);
+                            pending.retain(|_, keys| {
+                                keys.retain(|k| k != &key);
+                                !keys.is_empty()
+                            });
+                        } else {
+                            let hash_str = entry.content_hash().to_hex().to_string();
+                            match Box::pin(client.cat_bytes(&hash_str)).await {
+                                Ok(value) => index.insert(key, value),
+                                Err(_) => {
+                                    // Blob not local yet — ContentReady for this
+                                    // hash will complete it.
+                                    pending.entry(hash_str).or_default().push(key);
+                                }
                             }
                         }
                     }
-                } else {
-                    match stream.next().await {
-                        Some(event) => {
-                            if is_remote_event(&event) {
-                                dirty = true;
+                    Ok(Some(Ok(LiveEvent::ContentReady { hash }))) => {
+                        let hash_str = hash.to_hex().to_string();
+                        if let Some(keys) = pending.remove(&hash_str) {
+                            match Box::pin(client.cat_bytes(&hash_str)).await {
+                                Ok(value) => {
+                                    for key in keys {
+                                        index.insert(key, value.clone());
+                                    }
+                                }
+                                // Announced ready yet unreadable — heal via resync.
+                                Err(_) => full_dirty = true,
                             }
                         }
-                        None => break,
                     }
+                    Ok(Some(Ok(LiveEvent::SyncFinished(_))))
+                    | Ok(Some(Ok(LiveEvent::PendingContentReady))) => {
+                        // Round markers carry no per-entry info; the entries they
+                        // announce arrive as their own InsertRemote/ContentReady
+                        // events. Schedule the rate-limited safety-net resync only.
+                        full_dirty = true;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(e))) => {
+                        // A lagging/errored subscription may have dropped events.
+                        debug!("KV live sync subscription error (scheduling resync): {:?}", e);
+                        full_dirty = true;
+                    }
+                }
+                if full_dirty && last_full.elapsed() >= FULL_RESYNC_MIN_INTERVAL {
+                    full_dirty = false;
+                    pending.clear();
+                    if let Err(e) = Box::pin(refresh_kv_index(&docs, &doc, &client, &index)).await {
+                        warn!("Failed to update KV index via live sync: {:?}", e);
+                    }
+                    last_full = std::time::Instant::now();
                 }
             }
             debug!("Live index sync terminated for KV store");

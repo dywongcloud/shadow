@@ -1025,6 +1025,9 @@ const GUARDIAN_V2_VERSION: u64 = 2;
 const GUARDIAN_V2_HEAD_MAX_BYTES: usize = 4 * 1024;
 const GUARDIAN_V2_PART_MAX_BYTES: usize = 512 * 1024 * 1024;
 const GUARDIAN_V2_AGGREGATE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const GUARDIAN_V2_PART_ENVELOPE_MAGIC: &[u8] = b"HIVE-GUARDIAN-V2-PART\0";
+const GUARDIAN_V2_PART_ENVELOPE_VERSION: u8 = 1;
+const GUARDIAN_V2_PART_ZSTD_LEVEL: i32 = 3;
 const GUARDIAN_V2_COMPONENT_MAX_BYTES: usize = 255;
 const GUARDIAN_V2_NODE_PREFIX: &str = "snap-v2/node/";
 const GUARDIAN_V2_NAMESPACE_PREFIX: &str = "ns-v2/";
@@ -1479,11 +1482,83 @@ fn guardian_v2_wrapper_bytes(
     guardian_v2_canonical_json_bytes(serde_json::Value::Object(wrapper))
 }
 
-fn guardian_v2_parse_part(
+fn guardian_v2_encode_part(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if raw.len() > GUARDIAN_V2_PART_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 raw part is {} bytes; maximum is {}",
+            raw.len(),
+            GUARDIAN_V2_PART_MAX_BYTES
+        );
+    }
+    let compressed = zstd::bulk::compress(raw, GUARDIAN_V2_PART_ZSTD_LEVEL)
+        .map_err(|error| anyhow::anyhow!("Guardian v2 part zstd encode: {error}"))?;
+    let raw_len = u64::try_from(raw.len())
+        .map_err(|_| anyhow::anyhow!("Guardian v2 raw part length does not fit u64"))?;
+    let capacity = GUARDIAN_V2_PART_ENVELOPE_MAGIC
+        .len()
+        .checked_add(1 + std::mem::size_of::<u64>())
+        .and_then(|header| header.checked_add(compressed.len()))
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 compressed part length overflow"))?;
+    if capacity > GUARDIAN_V2_PART_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 compressed part is {capacity} bytes; maximum is {}",
+            GUARDIAN_V2_PART_MAX_BYTES
+        );
+    }
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(GUARDIAN_V2_PART_ENVELOPE_MAGIC);
+    encoded.push(GUARDIAN_V2_PART_ENVELOPE_VERSION);
+    encoded.extend_from_slice(&raw_len.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn guardian_v2_decode_part(bytes: &[u8]) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+    if !bytes.starts_with(GUARDIAN_V2_PART_ENVELOPE_MAGIC) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let version_at = GUARDIAN_V2_PART_ENVELOPE_MAGIC.len();
+    let length_at = version_at + 1;
+    let payload_at = length_at + std::mem::size_of::<u64>();
+    if bytes.len() < payload_at {
+        anyhow::bail!("Guardian v2 compressed part header is truncated");
+    }
+    if bytes[version_at] != GUARDIAN_V2_PART_ENVELOPE_VERSION {
+        anyhow::bail!(
+            "Guardian v2 compressed part version {} is unsupported",
+            bytes[version_at]
+        );
+    }
+    let raw_len = u64::from_le_bytes(
+        bytes[length_at..payload_at]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Guardian v2 compressed part length is malformed"))?,
+    );
+    let raw_len = usize::try_from(raw_len).map_err(|_| {
+        anyhow::anyhow!("Guardian v2 compressed part length does not fit this host")
+    })?;
+    if raw_len > GUARDIAN_V2_PART_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 compressed part declares {raw_len} raw bytes; maximum is {}",
+            GUARDIAN_V2_PART_MAX_BYTES
+        );
+    }
+    let raw = zstd::bulk::decompress(&bytes[payload_at..], raw_len)
+        .map_err(|error| anyhow::anyhow!("Guardian v2 part zstd decode: {error}"))?;
+    if raw.len() != raw_len {
+        anyhow::bail!(
+            "Guardian v2 compressed part decoded to {} bytes; header declares {raw_len}",
+            raw.len()
+        );
+    }
+    Ok(std::borrow::Cow::Owned(raw))
+}
+
+fn guardian_v2_parse_part<'a>(
     kind: GuardianV2PartKind,
-    bytes: &[u8],
+    bytes: &'a [u8],
     reference: &GuardianV2Reference,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<(serde_json::Value, std::borrow::Cow<'a, [u8]>)> {
     if reference.bytes > GUARDIAN_V2_PART_MAX_BYTES {
         anyhow::bail!(
             "Guardian v2 {} reference is {} bytes; maximum is {}",
@@ -1503,8 +1578,9 @@ fn guardian_v2_parse_part(
     if hex::encode(sha256(bytes)) != reference.sha256 {
         anyhow::bail!("Guardian v2 {} wrapper SHA-256 mismatch", kind.field());
     }
+    let raw = guardian_v2_decode_part(bytes)?;
     let value = guardian_v2_parse_canonical_json(
-        bytes,
+        raw.as_ref(),
         GUARDIAN_V2_PART_MAX_BYTES,
         &format!("{} wrapper", kind.field()),
     )?;
@@ -1518,9 +1594,10 @@ fn guardian_v2_parse_part(
             kind.field()
         );
     }
-    fields
+    let value = fields
         .remove(kind.field())
-        .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} wrapper field is absent", kind.field()))
+        .ok_or_else(|| anyhow::anyhow!("Guardian v2 {} wrapper field is absent", kind.field()))?;
+    Ok((value, raw))
 }
 
 fn guardian_v2_head_bytes(
@@ -1670,6 +1747,17 @@ fn guardian_v2_reconstruct(
     {
         anyhow::bail!("Guardian v2 reconstruction does not have exactly six parts");
     }
+    let aggregate = wrapper_bytes.values().try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Guardian v2 raw aggregate byte length overflow"))
+    })?;
+    if aggregate > GUARDIAN_V2_AGGREGATE_MAX_BYTES {
+        anyhow::bail!(
+            "Guardian v2 raw aggregate is {aggregate} bytes; maximum is {}",
+            GUARDIAN_V2_AGGREGATE_MAX_BYTES
+        );
+    }
     let mut root = part_values
         .get(GuardianV2PartKind::State.field())
         .and_then(serde_json::Value::as_object)
@@ -1807,22 +1895,22 @@ fn guardian_v2_prepare_snapshot(
     let mut aggregate = 0usize;
 
     for kind in GuardianV2PartKind::ALL {
-        let bytes = guardian_v2_wrapper_bytes(
+        let raw = guardian_v2_wrapper_bytes(
             kind,
             values.get(kind.field()).cloned().ok_or_else(|| {
                 anyhow::anyhow!("Guardian v2 prepared part {} is absent", kind.field())
             })?,
         )?;
-        if bytes.len() > GUARDIAN_V2_PART_MAX_BYTES {
+        if raw.len() > GUARDIAN_V2_PART_MAX_BYTES {
             anyhow::bail!(
                 "Guardian v2 {} wrapper is {} bytes; maximum is {}",
                 kind.field(),
-                bytes.len(),
+                raw.len(),
                 GUARDIAN_V2_PART_MAX_BYTES
             );
         }
         aggregate = aggregate
-            .checked_add(bytes.len())
+            .checked_add(raw.len())
             .ok_or_else(|| anyhow::anyhow!("Guardian v2 aggregate byte length overflow"))?;
         if aggregate > GUARDIAN_V2_AGGREGATE_MAX_BYTES {
             anyhow::bail!(
@@ -1830,6 +1918,7 @@ fn guardian_v2_prepare_snapshot(
                 GUARDIAN_V2_AGGREGATE_MAX_BYTES
             );
         }
+        let bytes = guardian_v2_encode_part(&raw)?;
         let digest = hex::encode(sha256(&bytes));
         let key = guardian_v2_part_key(&encoded_component, kind, &digest)?;
         references.insert(
@@ -1839,7 +1928,7 @@ fn guardian_v2_prepare_snapshot(
                 bytes: bytes.len(),
             },
         );
-        wrapper_bytes.insert(kind.field().to_string(), bytes.clone());
+        wrapper_bytes.insert(kind.field().to_string(), raw);
         parts.push(KeyedPreparedValue {
             key,
             class: kind.field(),
@@ -3337,9 +3426,9 @@ fn guardian_v2_validate_prepared_generation(
                 kind.field()
             );
         }
-        let value = guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?;
+        let (value, raw) = guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?;
         values.insert(kind.field().to_string(), value);
-        wrappers.insert(kind.field().to_string(), part.value.bytes.as_ref().clone());
+        wrappers.insert(kind.field().to_string(), raw.into_owned());
     }
     guardian_v2_reconstruct(&values, &wrappers, 0)?;
     Ok((encoded_component, parsed_head))
@@ -3386,11 +3475,9 @@ fn guardian_v2_diagnostic_snapshot(
             .references
             .get(kind.field())
             .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic head lacks {}", kind.field()))?;
-        values.insert(
-            kind.field().to_string(),
-            guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?,
-        );
-        wrappers.insert(kind.field().to_string(), part.value.bytes.as_ref().clone());
+        let (value, raw) = guardian_v2_parse_part(kind, part.value.bytes.as_ref(), reference)?;
+        values.insert(kind.field().to_string(), value);
+        wrappers.insert(kind.field().to_string(), raw.into_owned());
     }
     guardian_v2_reconstruct(&values, &wrappers, 1)
 }
@@ -3603,8 +3690,32 @@ async fn guardian_v2_diagnostic(
         .first()
         .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic source part is absent"))?;
     let first_kind = GuardianV2PartKind::State;
-    let mut malformed_wrapper: serde_json::Value =
-        serde_json::from_slice(first_part.value.bytes.as_ref())?;
+    if !first_part
+        .value
+        .bytes
+        .starts_with(GUARDIAN_V2_PART_ENVELOPE_MAGIC)
+    {
+        anyhow::bail!("Guardian v2 prepared part omitted the compression envelope");
+    }
+    let first_raw = guardian_v2_decode_part(first_part.value.bytes.as_ref())?;
+    let legacy_reference = GuardianV2Reference {
+        sha256: hex::encode(sha256(first_raw.as_ref())),
+        bytes: first_raw.len(),
+    };
+    if guardian_v2_parse_part(first_kind, first_raw.as_ref(), &legacy_reference).is_err() {
+        anyhow::bail!("Guardian v2 part decoder rejected a legacy raw wrapper");
+    }
+    let mut unknown_version = first_part.value.bytes.as_ref().clone();
+    unknown_version[GUARDIAN_V2_PART_ENVELOPE_MAGIC.len()] =
+        GUARDIAN_V2_PART_ENVELOPE_VERSION.saturating_add(1);
+    let unknown_reference = GuardianV2Reference {
+        sha256: hex::encode(sha256(&unknown_version)),
+        bytes: unknown_version.len(),
+    };
+    if guardian_v2_parse_part(first_kind, &unknown_version, &unknown_reference).is_ok() {
+        anyhow::bail!("Guardian v2 part decoder accepted an unknown envelope version");
+    }
+    let mut malformed_wrapper: serde_json::Value = serde_json::from_slice(first_raw.as_ref())?;
     malformed_wrapper
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Guardian v2 diagnostic wrapper is not an object"))?
@@ -3619,10 +3730,11 @@ async fn guardian_v2_diagnostic(
     }
 
     let mut changed_references = parsed_source_head.references.clone();
-    let changed_metrics = guardian_v2_wrapper_bytes(
+    let changed_metrics_raw = guardian_v2_wrapper_bytes(
         GuardianV2PartKind::MetricsRollup,
         serde_json::json!({"guardian_v2_diagnostic": nonce}),
     )?;
+    let changed_metrics = guardian_v2_encode_part(&changed_metrics_raw)?;
     let changed_metrics_sha = hex::encode(sha256(&changed_metrics));
     let original_metrics_sha = changed_references
         .get(GuardianV2PartKind::MetricsRollup.field())
@@ -4173,6 +4285,38 @@ async fn write_replication_batch(
     Ok(stats)
 }
 
+fn guardian_v2_retention_cadence() -> std::time::Duration {
+    std::env::var("HIVE_GUARDIAN_PART_REAP_CHECK_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(600))
+}
+
+async fn run_guardian_v2_retention_pass() {
+    match handle().await {
+        Ok(h) => {
+            let report = guardian_v2_retention_pass(h).await;
+            tracing::info!(
+                status = %report.status,
+                reason = report.reason.as_deref().unwrap_or(""),
+                generations_total = report.generations_total,
+                generations_retired = report.generations_retired,
+                parts_listed = report.parts_listed,
+                parts_retired = report.parts_retired,
+                parts_unrooted_bytes = report.parts_unrooted_bytes,
+                parts_skipped_young = report.parts_skipped_young,
+                cursor = report.cursor.as_deref().unwrap_or(""),
+                "Guardian v2 retention pass"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Guardian v2 retention pass could not open GuardianDB");
+        }
+    }
+}
+
 async fn replication_writer(
     mut receiver: tokio::sync::watch::Receiver<Arc<DesiredReplication>>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -4180,7 +4324,19 @@ async fn replication_writer(
     let mut committed = CommittedReplication::default();
     let mut owned_namespaces = std::collections::BTreeMap::new();
     let mut retry_delay = REPLICATION_RETRY_MIN;
+    let retention_cadence = guardian_v2_retention_cadence();
+    let mut next_retention = tokio::time::Instant::now() + retention_cadence;
     loop {
+        // This deadline is created once and advances only after a pass. Snapshot
+        // notifications cannot reset it: when a change and the deadline become
+        // ready together, the next loop observes the overdue deadline before it
+        // starts another publication. The same task remains the sole writer.
+        if tokio::time::Instant::now() >= next_retention {
+            run_guardian_v2_retention_pass().await;
+            // Skip missed ticks rather than running a catch-up burst after a slow
+            // store operation. Every pass remains bounded and non-overlapping.
+            next_retention = tokio::time::Instant::now() + retention_cadence;
+        }
         let desired = receiver.borrow_and_update().clone();
         set_generation_status(
             desired.generation,
@@ -4206,11 +4362,6 @@ async fn replication_writer(
                     semantic_noop = stats.put_bytes == 0 && stats.deletes == 0,
                     "GuardianDB snapshot batch committed"
                 );
-                let cleanup_secs = std::env::var("HIVE_GUARDIAN_PART_REAP_CHECK_SECS")
-                    .ok()
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-                    .filter(|value| *value > 0)
-                    .unwrap_or(600);
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => return,
@@ -4219,29 +4370,7 @@ async fn replication_writer(
                             return;
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(cleanup_secs)) => {
-                        // The cleanup cadence the writer has always slept on,
-                        // now actually running the v2 retention pass it was
-                        // reserved for. Same sole-writer task, so retention
-                        // can never race a concurrent publication from this
-                        // process; refusals/failures are typed in the report
-                        // and never break the writer loop.
-                        if let Ok(h) = handle().await {
-                            let report = guardian_v2_retention_pass(h).await;
-                            tracing::info!(
-                                status = %report.status,
-                                reason = report.reason.as_deref().unwrap_or(""),
-                                generations_total = report.generations_total,
-                                generations_retired = report.generations_retired,
-                                parts_listed = report.parts_listed,
-                                parts_retired = report.parts_retired,
-                                parts_unrooted_bytes = report.parts_unrooted_bytes,
-                                parts_skipped_young = report.parts_skipped_young,
-                                cursor = report.cursor.as_deref().unwrap_or(""),
-                                "Guardian v2 retention pass"
-                            );
-                        }
-                    }
+                    _ = tokio::time::sleep_until(next_retention) => {}
                 }
             }
             Err(error) => {
@@ -4583,9 +4712,9 @@ async fn guardian_v2_verify_generation(
         if iroh_blobs::Hash::new(&bytes).to_hex() != identity.hash {
             anyhow::bail!("Guardian v2 {} BLAKE3 metadata mismatch", kind.field());
         }
-        let value = guardian_v2_parse_part(kind, &bytes, reference)?;
+        let (value, raw) = guardian_v2_parse_part(kind, &bytes, reference)?;
         part_values.insert(kind.field().to_string(), value);
-        wrapper_bytes.insert(kind.field().to_string(), bytes);
+        wrapper_bytes.insert(kind.field().to_string(), raw.into_owned());
         part_heads.insert(kind.field().to_string(), identity);
     }
 
@@ -5510,6 +5639,144 @@ async fn p2_publish_generation(
     Ok((head, state_part.key.clone(), state_part.value.bytes.len()))
 }
 
+#[cfg(debug_assertions)]
+async fn guardian_v2_writer_cadence_diagnostic() -> anyhow::Result<(String, Option<u64>)> {
+    let enabled = std::env::var("HIVE_GUARDIAN_WRITER_CADENCE_DIAGNOSTIC")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(("skipped".to_string(), None));
+    }
+
+    let cadence = guardian_v2_retention_cadence();
+    anyhow::ensure!(
+        cadence <= std::time::Duration::from_secs(2),
+        "writer cadence diagnostic requires HIVE_GUARDIAN_PART_REAP_CHECK_SECS<=2"
+    );
+    let passes_before = retention_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .passes;
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let accepted_task = accepted.clone();
+    let last_generation_task = last_generation.clone();
+    let producer_window = cadence.saturating_mul(4);
+    let producer = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + producer_window;
+        let delay = std::cmp::max(cadence / 20, std::time::Duration::from_millis(10));
+        let mut serial = 0u64;
+        while tokio::time::Instant::now() < deadline {
+            serial += 1;
+            let snapshot = p2_snapshot(&format!("writer-cadence-{serial}"));
+            if let Some(generation) = replicate(&snapshot) {
+                accepted_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                last_generation_task.store(generation, std::sync::atomic::Ordering::Release);
+            }
+            tokio::time::sleep(delay).await;
+        }
+    });
+    producer.await?;
+
+    let passes_after_flood = retention_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .passes;
+    anyhow::ensure!(
+        passes_after_flood >= passes_before.saturating_add(2),
+        "retention starved under continuous snapshot traffic: passes {passes_before}->{passes_after_flood}"
+    );
+    let admitted = accepted.load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::ensure!(
+        admitted >= 20,
+        "writer cadence diagnostic admitted only {admitted} changes"
+    );
+    let final_generation = last_generation.load(std::sync::atomic::Ordering::Acquire);
+    anyhow::ensure!(
+        final_generation > 0,
+        "writer cadence diagnostic admitted no final generation"
+    );
+    await_final_generation(final_generation, cadence.saturating_mul(10)).await?;
+    let passes_after_commit = retention_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .passes;
+
+    Ok((
+        format!(
+            "passes={passes_before}->{passes_after_flood}->{passes_after_commit} admitted={admitted} final_generation={final_generation} committed_after_pass=true single_writer=true"
+        ),
+        Some(final_generation),
+    ))
+}
+
+#[cfg(debug_assertions)]
+pub async fn writer_cadence_diagnostic() -> anyhow::Result<String> {
+    set_node_name("guardian-writer-cadence-diagnostic");
+    let _ = handle().await?;
+
+    let raw = guardian_v2_wrapper_bytes(
+        GuardianV2PartKind::State,
+        serde_json::json!({"diagnostic": "compressible-compressible-compressible"}),
+    )?;
+    let encoded = guardian_v2_encode_part(&raw)?;
+    anyhow::ensure!(
+        encoded.starts_with(GUARDIAN_V2_PART_ENVELOPE_MAGIC),
+        "writer cadence diagnostic did not emit a compressed part envelope"
+    );
+    anyhow::ensure!(
+        guardian_v2_decode_part(&encoded)?.as_ref() == raw.as_slice(),
+        "writer cadence diagnostic compressed part did not roundtrip"
+    );
+    let legacy_reference = GuardianV2Reference {
+        sha256: hex::encode(sha256(&raw)),
+        bytes: raw.len(),
+    };
+    guardian_v2_parse_part(GuardianV2PartKind::State, &raw, &legacy_reference)?;
+    let mut unknown_version = encoded.clone();
+    unknown_version[GUARDIAN_V2_PART_ENVELOPE_MAGIC.len()] =
+        GUARDIAN_V2_PART_ENVELOPE_VERSION.saturating_add(1);
+    let unknown_reference = GuardianV2Reference {
+        sha256: hex::encode(sha256(&unknown_version)),
+        bytes: unknown_version.len(),
+    };
+    anyhow::ensure!(
+        guardian_v2_parse_part(
+            GuardianV2PartKind::State,
+            &unknown_version,
+            &unknown_reference,
+        )
+        .is_err(),
+        "writer cadence diagnostic accepted an unknown compression envelope version"
+    );
+
+    let (writer, final_generation) = guardian_v2_writer_cadence_diagnostic().await?;
+    let final_generation = final_generation.ok_or_else(|| {
+        anyhow::anyhow!(
+            "writer cadence diagnostic requires HIVE_GUARDIAN_WRITER_CADENCE_DIAGNOSTIC=1"
+        )
+    })?;
+    let retention = {
+        let state = retention_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let last = state.last.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("writer cadence diagnostic observed no retention report")
+        })?;
+        format!(
+            "passes={} last_status={} retired_generations={} retired_parts={}",
+            state.passes, last.status, state.retired_generations_total, state.retired_parts_total
+        )
+    };
+    let shutdown_started = tokio::time::Instant::now();
+    shutdown(Some(final_generation)).await?;
+    let shutdown_ms = shutdown_started.elapsed().as_millis();
+
+    Ok(format!(
+        "GUARDIAN_WRITER_CADENCE_PASS compression=roundtrip legacy=read unknown_version=refused {writer} {retention} shutdown_ms={shutdown_ms}"
+    ))
+}
+
 /// Guardian v2 Phase-2 matrix against the REAL vendored GuardianDB in this
 /// process's disposable HIVE_DATA store: retention keep/grace/budget/cursor,
 /// typed GC refusals (malformed/unknown/missing), confirmed-work byte
@@ -5970,7 +6237,12 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         }
     }
 
-    // S9 (env-gated): final-flush timeout on the REAL writer path. The held
+    // S9: the real replication writer receives changes faster than the cleanup
+    // cadence for several complete intervals. Retention must still advance, and
+    // the last generation admitted after those passes must commit.
+    let (writer_cadence, _) = guardian_v2_writer_cadence_diagnostic().await?;
+
+    // S10 (env-gated): final-flush timeout on the REAL writer path. The held
     // commit must time the drain out while the PREVIOUS verified head stays
     // readable.
     let mut final_flush = "skipped".to_string();
@@ -6005,7 +6277,7 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
          unrooted_bytes={unrooted} cursor_resume={saw_cursor} restart_resume=true noop=true \
          reclaim_exact_bytes=30000 refusal_matrix=3 six_parts_missing=true \
          legacy_true_absence_only=true churn_rounds=3 cancel_prepare=true \
-         final_flush={final_flush}"
+         writer_cadence={writer_cadence} final_flush={final_flush}"
     ))
 }
 
