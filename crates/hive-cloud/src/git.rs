@@ -2680,7 +2680,14 @@ async fn run_build(
                             let mut fetch = Command::new("git");
                             fetch
                                 .env("GIT_TERMINAL_PROMPT", "0")
-                                .env("GIT_ASKPASS", "/bin/echo");
+                                .env("GIT_ASKPASS", "/bin/echo")
+                                // Abort a STALLED transfer instead of hanging the
+                                // build forever: some nodes' GitHub egress wedges
+                                // mid-connection (witnessed 135s+ hangs), and a
+                                // hung fetch left the deploy page frozen at
+                                // "Cloning…" with no failure and no retry.
+                                .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
+                                .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                             let _cred = match apply_credential(&mut fetch, token.as_deref()) {
                                 Ok(cred) => cred,
                                 Err(e) => return (false, format!("credential setup failed: {e}")),
@@ -2739,7 +2746,10 @@ async fn run_build(
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
-                        .env("GIT_ASKPASS", "/bin/echo");
+                        .env("GIT_ASKPASS", "/bin/echo")
+                        // Stall-abort, same rationale as the SHA fetch above.
+                        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
+                        .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                     let _cred = match apply_credential(&mut cmd, token.as_deref()) {
                         Ok(cred) => cred,
                         Err(e) => return (false, format!("credential setup failed: {e}")),
@@ -2775,7 +2785,10 @@ async fn run_build(
                     // shallow clone of the branch tip.
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
-                        .env("GIT_ASKPASS", "/bin/echo");
+                        .env("GIT_ASKPASS", "/bin/echo")
+                        // Stall-abort, same rationale as the SHA fetch above.
+                        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
+                        .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                     let _cred = match apply_credential(&mut cmd, token.as_deref()) {
                         Ok(cred) => cred,
                         Err(e) => return (false, format!("credential setup failed: {e}")),
@@ -2804,14 +2817,60 @@ async fn run_build(
         };
 
         let used_token = git_token.is_some();
-        let (mut ok, mut stderr) = run_clone(used_token).await;
+        // Heartbeat while the clone runs: a large repo emits NOTHING between
+        // "Cloning …" and "Cloning completed" for minutes, which on the deploy
+        // page is indistinguishable from a stall. Drop-guarded so every exit
+        // path (success, ensure! error, cancellation) stops it — an Err return
+        // must never leave a task logging into a finished build.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _heartbeat = AbortOnDrop({
+            let cloud = cloud.clone();
+            let bid = bid.to_string();
+            tokio::spawn(async move {
+                let mut secs = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    secs += 20;
+                    cloud.builds.log(&bid, format!("… still cloning ({secs}s)"));
+                }
+            })
+        });
+        let mut with_token = used_token;
+        let (mut ok, mut stderr) = run_clone(with_token).await;
         // A stored token that is expired / lacks access must never break a repo that
         // would clone fine anonymously (public repos, token rotation): retry once
         // without the credential before surfacing an error.
         if !ok && used_token && auth_failed(&stderr) {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             log("Retrying clone without the stored GitHub credential…".into());
+            with_token = false;
             let (ok2, stderr2) = run_clone(false).await;
+            ok = ok2;
+            stderr = stderr2;
+        }
+        // Transient-network retry. GitHub egress from some fleet nodes fails
+        // (and, before the stall-abort above, hung) transiently — a first-try
+        // network error must not fail the whole deploy. Auth failures are
+        // excluded (already retried anonymously above; a private repo does not
+        // become readable by waiting), and a cancelled build stops retrying.
+        let mut attempt = 1usize;
+        while !ok && !auth_failed(&stderr) && attempt < 3 {
+            if cloud.build_cancels.is_cancelled(bid) {
+                return Err(BuildCancelled.into());
+            }
+            attempt += 1;
+            let cause = stderr.lines().last().unwrap_or("unknown error").to_string();
+            log(format!(
+                "Clone failed ({cause}); retrying (attempt {attempt}/3)…"
+            ));
+            tokio::time::sleep(Duration::from_secs(5 * (attempt as u64 - 1))).await;
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            let (ok2, stderr2) = run_clone(with_token).await;
             ok = ok2;
             stderr = stderr2;
         }
@@ -2838,6 +2897,9 @@ async fn run_build(
                 format!("git clone failed: {stderr}")
             }
         );
+        // Clone finished — stop the heartbeat before the (occasionally slow)
+        // post-clone steps below, or they'd keep logging "still cloning".
+        drop(_heartbeat);
         // `.git/config`'s origin URL was ALWAYS `clone_source_url` (tokenless) —
         // the credential only ever lived in the FD-backed helper, never in a
         // clone URL — so there is nothing to scrub here anymore.
@@ -5411,8 +5473,27 @@ async fn mirror_remote_build(
 ) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
-    let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
-                                              // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
+    // INACTIVITY deadline, not an absolute cap. The old fixed 10-minute cap
+    // declared "remote build timed out" for any legitimately long build (a
+    // large monorepo's install + build alone routinely exceeds it on a 4-core
+    // builder) even while every poll was succeeding and log lines were
+    // streaming. Only a window with ZERO successful state reads now counts
+    // toward giving up; every successful read pushes the deadline out. A much
+    // larger absolute ceiling still bounds the whole mirror so a target wedged
+    // in `Building` forever cannot pin this coordinator task indefinitely.
+    let idle_window_ms = std::env::var("HIVE_BUILD_MIRROR_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10 * 60 * 1000);
+    let ceiling_ms = std::env::var("HIVE_BUILD_MIRROR_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(120 * 60 * 1000);
+    let started = now_ms();
+    let mut deadline = started + idle_window_ms;
+    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
                                               // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
                                               // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
                                               // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
@@ -5433,7 +5514,6 @@ async fn mirror_remote_build(
         .get(bid)
         .map(|b| cloud.projects.team_of(&b.project))
         .unwrap_or_default();
-    let team_qs = crate::admin::mesh_team_qs(&team);
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         // `cancel_build` already fired the kill (local process group or, for a
@@ -5464,6 +5544,14 @@ async fn mirror_remote_build(
         // "lost contact with remote build". A target that advertises an admin
         // URL is therefore NOT evidence that the admin URL is reachable, and
         // the poll must never assume it is.
+        // Minted PER ITERATION, never once before the loop: `mesh_team_qs`
+        // signs a 60-SECOND delegation token, so a single pre-loop mint meant
+        // every poll after the first minute presented an expired token — the
+        // target rejected it (signature fine, expiry only), the coordinator
+        // read nothing for the rest of the build, and any remote build longer
+        // than 60s "stalled" to the deadline and reported lost contact while
+        // the target was building (or already Ready) the whole time.
+        let team_qs = crate::admin::mesh_team_qs(&team);
         let sep = if team_qs.is_empty() { "" } else { "?" };
         let mut tried_http = false;
         let mut v: Option<serde_json::Value> = None;
@@ -5533,6 +5621,8 @@ async fn mirror_remote_build(
             continue;
         };
         polls_failed = 0;
+        // A successful read IS progress — push the inactivity deadline out.
+        deadline = now_ms() + idle_window_ms;
         // Stream any log lines we haven't mirrored yet.
         if let Some(lines) = v.get("lines").and_then(|x| x.as_array()) {
             for line in lines.iter().skip(mirrored) {
@@ -5584,10 +5674,14 @@ async fn mirror_remote_build(
             cloud.builds.log(bid, format!("✗ {node}: build failed"));
             return TargetOutcome::BuildFailed;
         }
-        if now_ms() > deadline {
-            cloud
-                .builds
-                .log(bid, format!("✗ {node}: remote build timed out"));
+        if now_ms().saturating_sub(started) > ceiling_ms {
+            cloud.builds.log(
+                bid,
+                format!(
+                    "✗ {node}: remote build exceeded the {} min mirror ceiling",
+                    ceiling_ms / 60_000
+                ),
+            );
             // Distinct from "lost contact": we COULD read this node's state, so
             // the deploy really did run there and never reached Ready.
             return TargetOutcome::BuildFailed;
