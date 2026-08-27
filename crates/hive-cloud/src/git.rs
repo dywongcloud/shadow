@@ -2153,11 +2153,37 @@ async fn run_build(
             let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
                 || !placement_settings.build.build_command.trim().is_empty();
             if explicit_commands {
+                // `build_isolation_nodes` is FLEET-WIDE, but `targets` (the reason
+                // this arm fired) is region-filtered — reporting only the
+                // fleet-wide count reads as "plenty of capacity exists" when the
+                // real problem is that none of it is IN the requested region(s).
+                // Witnessed live: a project pinned to a single region with only
+                // one capable node there kept refusing while the message claimed
+                // 12 capable nodes fleet-wide, giving no signal that the region
+                // pin was the actual constraint.
+                let region_note = if regions.is_empty() {
+                    String::new()
+                } else {
+                    let in_region = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .filter(|n| {
+                            regions.iter().any(|r| r == &n.region)
+                                && (n.build_isolation_protocol == Some(1)
+                                    || matches!(n.backend.as_str(), "mock" | "litebox"))
+                        })
+                        .count();
+                    format!(
+                        " Of those, {in_region} are in the project's configured region(s) ({}).",
+                        regions.join(", ")
+                    )
+                };
                 let msg = format!(
-                    "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh). No repository-controlled command was run on the host."
+                    "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh).{region_note} No repository-controlled command was run on the host."
                 );
                 log(msg.clone());
-                tracing::warn!(project = %project, build_isolation_nodes, "deploy refused: isolated builder unavailable");
+                tracing::warn!(project = %project, build_isolation_nodes, regions = ?regions, "deploy refused: isolated builder unavailable");
                 return Err(anyhow::anyhow!(msg));
             }
         }
