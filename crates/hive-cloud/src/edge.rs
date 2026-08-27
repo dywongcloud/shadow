@@ -501,8 +501,48 @@ async fn edge_pipeline_inner(
     let local_state = serve_local
         .then(|| cloud.gw.host_deploy_state(&host))
         .flatten();
-    let prefer_peer =
-        serve_local && !matches!(local_state, Some(fluid_core::DeployState::Ready)) && {
+    // A local record that is Ready is not automatically the RIGHT answer: this
+    // node's `select()` only reflects deployments THIS node has itself
+    // registered (a build/publish that ran here), never a production promotion
+    // that happened on a different node. A stale preview left over from an
+    // earlier deploy stays Ready forever and wins the alias by default — this
+    // node has no signal that a newer production deployment exists elsewhere.
+    // Witnessed live (2026-08-26, `express.shadw.app`): fc-sanjose kept
+    // serving its own leftover preview build (Ready, `production: false`)
+    // while fc-frankfurt held the actual promoted production deployment for
+    // the same alias — sanjose never even checked `peer_deployments` because
+    // its local answer was Ready. Detect that gap from the gossiped fleet
+    // deployment list (`peer_deployments`, populated by the SAME
+    // `/v1/fleet-deployments` poll `raw_proxy.rs` already relies on): a peer
+    // deployment for this exact alias is "newer" only if it out-ranks the
+    // local candidate by the same `(production, created_at_ms)` ordering
+    // `set_alias_if_newer` uses locally, so a preview can never pre-empt a
+    // production deploy this node DOES hold correctly.
+    let local_is_stale = serve_local
+        && matches!(local_state, Some(fluid_core::DeployState::Ready))
+        && {
+            let local_rank = cloud
+                .gw
+                .deployment_for_host(&host)
+                .map(|d| (d.production, d.created_at_ms));
+            local_rank.is_some_and(|local_rank| {
+                cloud
+                    .peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .filter(|d| d.state == fluid_core::DeployState::Ready)
+                    .filter(|d| {
+                        [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&host) || a.split('.').next() == Some(sub.as_str()))
+                    })
+                    .any(|d| (d.production, d.created_at_ms) > local_rank)
+            })
+        };
+    let prefer_peer = serve_local
+        && (!matches!(local_state, Some(fluid_core::DeployState::Ready)) || local_is_stale)
+        && {
             // Full-host key first, same as the route lookup below (custom
             // tenant domains are keyed by full hostname in served_hosts).
             let routes = cloud.peer_routes.read();
