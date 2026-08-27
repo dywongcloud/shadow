@@ -10830,6 +10830,21 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
         Err(e) => {
+            // The pre-enqueue `git_poll_seen` write above already advanced the
+            // baseline to `head` (needed to guard the in-flight race against a
+            // slow build / a racing webhook) — but a failed `start_build` means
+            // that commit was never actually deployed. Left uncorrected, the
+            // NEXT poll cycle's `commit_eq(&head, &baseline)` check above would
+            // read this exact same `head` back as the baseline and conclude
+            // "already up to date," permanently and silently dropping the push
+            // with no retry — directly contradicting this log line's own claim.
+            // Revert only if nothing newer raced in while `start_build` ran.
+            {
+                let mut seen = cloud.git_poll_seen.write();
+                if seen.get(&project) == Some(&head) {
+                    seen.insert(project.clone(), baseline.clone());
+                }
+            }
             tracing::warn!(
                 project = %project,
                 repo = %src.repo_url,

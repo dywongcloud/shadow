@@ -3067,7 +3067,27 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         return redirect(status, location);
     }
     // 4) Rewrites map the public path to an internal one (client URL unchanged).
-    let path = dep.manifest.rewrite_path_ctx(&path, &ctx);
+    // A SPA's own catch-all rewrite (typically `/(.*) -> /index.html`, needed so
+    // deep-links into client-side routes work) must not shadow a real static
+    // asset at the ORIGINAL path — Vercel's own Build Output v3 routes encode
+    // this explicitly via `{"handle": "filesystem"}` before any regex route
+    // runs; the legacy `rewrites` list has no such precedence built in, so
+    // `/release.json` (or any other real file) silently rewrote to the SPA
+    // shell instead of being served. Only the exact original path is checked
+    // (matching `serve_static`'s own "try the literal file first" order) —
+    // this never suppresses a rewrite whose SOURCE pattern is more specific
+    // than "everything", since those don't collide with real asset paths.
+    let relative = PathBuf::from(path.trim_start_matches('/'));
+    let skip_rewrite_for_real_asset = !relative.as_os_str().is_empty()
+        && match dep.static_root.as_ref() {
+            Some(root) => static_files::exists(root, &static_dir_path(&dep), &relative).await,
+            None => false,
+        };
+    let path = if skip_rewrite_for_real_asset {
+        path
+    } else {
+        dep.manifest.rewrite_path_ctx(&path, &ctx)
+    };
 
     // 5) Response headers from `vercel.json` `headers` (matched on the incoming
     //    path) are injected onto whatever the route produces.

@@ -179,6 +179,17 @@ export async function switchTeam(slug: string): Promise<void> {
  *  (it authorizes via the server-side Clerk session), so the refresh works even
  *  when the old cookie is already rejected. Guarded to a single retry so a
  *  genuinely unauthorized call (not just an expired cookie) still fails fast. */
+// The backend's own retryable-refusal signature for a mutation that raced a
+// control-plane leadership change (AGENTS.md "Round-robin reads vs
+// leader-forwarded writes": `admin_forward_to_leader` already retries this
+// server-side up to MAX_STALE_EPOCH_RETRIES before giving up and returning it
+// verbatim). The body text says "retry" because it IS meant to be retried —
+// but nothing on the client ever did, so a transient epoch bump during a
+// fleet reconvergence surfaced as a hard, user-visible redeploy failure
+// instead of the transparent success a moment later would have been.
+const STALE_EPOCH_MARKER = "stale control-plane epoch";
+const STALE_EPOCH_RETRY_DELAY_MS = 1500;
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   // Wait for the mount-time session mint to at least have been attempted before
   // this request's FIRST try — see `ensureSessionMinted`'s doc comment below for
@@ -193,7 +204,19 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
       clearTimeout(t);
     }
   };
-  const r = await once();
+  let r = await once();
+  // One transparent retry after a short delay for the stale-epoch refusal —
+  // by then the fleet has very likely converged past the epoch bump that
+  // caused it. Cloning lets us peek at the body without consuming it for the
+  // caller if this DOESN'T match (a real, unrelated 503 must pass through
+  // untouched, body intact, for existing error surfacing to read).
+  if (r.status === 503) {
+    const detail = await r.clone().text().catch(() => "");
+    if (detail.includes(STALE_EPOCH_MARKER)) {
+      await new Promise((resolve) => setTimeout(resolve, STALE_EPOCH_RETRY_DELAY_MS));
+      r = await once();
+    }
+  }
   // 401 = expired/invalid session. 403 ALSO covers the no-cookie-at-all case:
   // the enforced ingress answers a missing hive_jwt with 403 (operator/tenant
   // guard), not 401 — e.g. right after sign-in before the first mint landed, or
