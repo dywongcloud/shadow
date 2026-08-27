@@ -375,6 +375,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::sandboxes_api::routes())
         // ---- Storage broker: Firecracker cell data-image snapshots ----
         .merge(crate::storage_api::routes())
+        // ---- Cloudflare Queues parity (crate::queues) ----
+        .merge(crate::queues_api::routes())
         // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
         .merge(crate::db_rest::routes())

@@ -286,6 +286,7 @@ pub struct CloudState {
     pub container_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
+    pub queues: Arc<crate::queues::QueueStore>,
     /// Managed-inference runtime (this node's own llama-server children +
     /// endpoint statuses) — see `inference::spawn_reconcile`.
     pub inference: crate::inference::InferenceRuntime,
@@ -763,6 +764,7 @@ impl CloudState {
             container_holders: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
+            queues: crate::queues::QueueStore::new(),
             inference: crate::inference::InferenceRuntime::default(),
             metrics: crate::metrics::MetricsStore::new(),
             resp_cache: crate::resp_cache::ResponseCache::new(),

@@ -75,6 +75,13 @@ pub struct PlatformSnapshot {
     /// restore omitting a database record cannot erase them.
     #[serde(default)]
     pub database_studio_replay: crate::databases::StudioReplaySnapshot,
+    /// Cloudflare Queues metadata (queue/consumer records + their tombstones)
+    /// — durable on disk exactly like the `databases` fields above, separate
+    /// from store_sync's cross-node replication path. Message BODIES are
+    /// deliberately excluded (node-local + GuardianDB-mirrored, see
+    /// `crate::queues` module doc) — this snapshot only ever holds metadata.
+    #[serde(default)]
+    pub queues: crate::queues::SyncedQueues,
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
@@ -548,6 +555,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         database_data: cloud.databases.data_snapshot(),
         database_tombstones: cloud.databases.tombstones_snapshot(),
         database_studio_replay: cloud.databases.studio_replay_snapshot(),
+        queues: cloud.queues.snapshot_synced(),
         project_tombstones,
         project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
@@ -1020,6 +1028,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.databases.tombstones_load(snap.database_tombstones);
+    cloud.queues.load(snap.queues);
     cloud.metrics.rollup_load(snap.metrics_rollup);
     // BuildStore::load() already reconciles Queued/Building -> Error for its
     // own per-build log records internally (git.rs) -- no duplicate needed

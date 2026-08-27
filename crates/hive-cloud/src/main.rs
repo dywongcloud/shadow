@@ -67,6 +67,8 @@ mod notifications;
 mod persist;
 mod project_settings;
 mod push;
+mod queues;
+mod queues_api;
 mod raw_ports;
 mod raw_proxy;
 mod relational;
@@ -1678,6 +1680,10 @@ async fn async_main() -> anyhow::Result<()> {
         cloud.clone(),
         cloud.world_queue.clone(),
     ));
+
+    // Cloudflare Queues parity: Worker-consumer push delivery + retention
+    // sweep + GuardianDB recovery (crate::queues).
+    tokio::spawn(crate::queues::spawn_delivery_loop(cloud.clone()));
 
     // Nameserver prover: EVERY node (not leader-only — the whole value is
     // independent vantages) queries every peer that claims a public `:53` and
