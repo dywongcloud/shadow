@@ -3093,9 +3093,31 @@ async fn resolve_direct_launch(
             )))
         }
     };
-    let entry = validated_direct_entry(runtime, &args[0], &reference.guest_workdir)?;
+    // `--experimental-strip-types` is the ONE Node runtime flag the platform's
+    // own exported-server launcher emits (TypeScript entries). It is a loader
+    // toggle with no eval/exec/stdin semantics, so permitting exactly it ahead
+    // of the entry does not widen the launch grammar — every other option
+    // still refuses via validated_direct_entry's leading-dash check. Without
+    // this, litebox refused the platform's OWN launcher shape and every
+    // TypeScript exported-server deploy placed on a litebox node failed
+    // (witnessed live: examples/express on fc-frankfurt).
+    let mut entry_index = 0usize;
+    if runtime == DirectRuntime::Node {
+        while args
+            .get(entry_index)
+            .is_some_and(|arg| arg == "--experimental-strip-types")
+        {
+            entry_index += 1;
+        }
+        anyhow::ensure!(
+            entry_index < args.len(),
+            "{}",
+            launch_refusal("direct Node launch is missing an entry module after runtime flags")
+        );
+    }
+    let entry = validated_direct_entry(runtime, &args[entry_index], &reference.guest_workdir)?;
     validate_archive_main_entry(app_archive, &entry).await?;
-    args[0] = entry;
+    args[entry_index] = entry;
     if runtime == DirectRuntime::Bun {
         validate_bun_arguments(&args)?;
     }
