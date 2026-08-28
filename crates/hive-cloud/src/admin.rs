@@ -3146,6 +3146,7 @@ pub(crate) async fn deploy_zip(
         image_pids: None,
         image_ports: None,
         git_token: None, // zip upload has no git clone
+        marketplace_placement: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -3248,6 +3249,7 @@ pub(crate) async fn deploy_image(
         image_pids: body.pids,
         image_ports: body.ports,
         git_token: None, // prebuilt image deploy has no git clone
+        marketplace_placement: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -6936,6 +6938,7 @@ fn redeploy_request(
         // shape it always did.
         image_ports: None,
         git_token,
+        marketplace_placement: None,
     }
 }
 
@@ -7610,6 +7613,7 @@ async fn git_webhook(
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
+            marketplace_placement: None,
         };
         // Webhook push: not a fanout receiver and no pre-resolved incarnation
         // (`req.project_incarnation` above is `None` too) — `start_build`
@@ -12268,7 +12272,7 @@ async fn database_create(
         .filter(|r| !r.is_empty())
         .and_then(|region| {
             let regions = [region.to_string()];
-            crate::schedule::place(&c, &regions, true, true, false, false, false, false)
+            crate::schedule::place(&c, &regions, true, true, false, false, false, false, None)
                 .into_iter()
                 .next()
         })

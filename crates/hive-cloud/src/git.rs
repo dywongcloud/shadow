@@ -1893,6 +1893,53 @@ fn resolve_build_trust(
     })
 }
 
+/// Extract the only Marketplace policy input Hive is allowed to consume:
+/// authoritative node registry identifiers. Policy retrieval, Clerk
+/// authentication, tenant derivation, and schema validation happen in DevHub's
+/// server-only route; Hive must neither accept identity material nor refetch.
+///
+/// This defensive re-check protects CLI/internal paths from treating an
+/// incomplete Marketplace marker as an ordinary deployment. It intentionally
+/// does not relax to a local-node fallback: an absent eligible approved node is
+/// a placement refusal.
+fn marketplace_approved_nodes(
+    req: &GitDeployRequest,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let Some(snapshot) = req.marketplace_placement.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        snapshot.contract_version == 1 && snapshot.policy_version > 0,
+        "MARKETPLACE_POLICY_INVALID: unsupported Marketplace policy version"
+    );
+    anyhow::ensure!(
+        !snapshot.marketplace_order_id.trim().is_empty()
+            && !snapshot.buyer_tenant_id.trim().is_empty(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace order and buyer tenant are required"
+    );
+    anyhow::ensure!(
+        snapshot.policy.is_object(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace policy snapshot is malformed"
+    );
+    let approved: std::collections::HashSet<String> = snapshot
+        .approved_node_ids
+        .iter()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        !approved.is_empty() && approved.len() == snapshot.approved_node_ids.len(),
+        "MARKETPLACE_POLICY_INVALID: approved_node_ids must be a non-empty unique list of node ids"
+    );
+    Ok(Some(approved))
+}
+
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -1902,6 +1949,11 @@ async fn run_build(
     first_deploy: bool,
 ) -> anyhow::Result<()> {
     cloud.projects.get_exact(&project, incarnation)?;
+    // A Marketplace policy is a deployment-scoped, immutable authorization
+    // snapshot. Do not refetch it here: the Clerk JWT belongs exclusively to
+    // DevHub's server-side consumer. This process uses only the validated,
+    // safe node-id allowlist copied into the request before the build began.
+    let marketplace_approved_nodes = marketplace_approved_nodes(&req)?;
     let region = &cloud.region;
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
@@ -2058,6 +2110,7 @@ async fn run_build(
             },
             !known_container,
             needs_build_isolation,
+            marketplace_approved_nodes.as_ref(),
         );
         let build_isolation_nodes = cloud
             .registry
@@ -2112,6 +2165,12 @@ async fn run_build(
             );
             log(msg.clone());
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
+            return Err(anyhow::anyhow!(msg));
+        }
+        if req.marketplace_placement.is_some() && targets.is_empty() {
+            let msg = "MARKETPLACE_PLACEMENT_UNAVAILABLE: no approved Marketplace node is currently healthy, reachable, and capable. The deployment was not placed outside buyer-authorized nodes.".to_string();
+            log(msg.clone());
+            tracing::warn!(project = %project, "deploy refused: no eligible Marketplace-approved node");
             return Err(anyhow::anyhow!(msg));
         }
         // Same refusal for the wasm runtime, and for the identical reason the GPU
@@ -3971,7 +4030,7 @@ async fn run_build(
             .projects
             .claim_volumes_exact(&project, incarnation, volume_names)?;
     }
-    let info = cloud.gw.deploy_full_with_runtime_exact(
+    let info = cloud.gw.deploy_full_with_runtime_exact_marketplace(
         host_static_root,
         Some(runtime_workdir),
         manifest,
@@ -3985,6 +4044,7 @@ async fn run_build(
         },
         tenant.clone(),
         incarnation,
+        req.marketplace_placement.clone(),
     );
     crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
 
@@ -4367,6 +4427,7 @@ async fn run_build(
             },
             true,
             true,
+            marketplace_approved_nodes.as_ref(),
         );
         if targets
             .iter()
@@ -9681,6 +9742,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_pids: None,
         image_ports: None,
         git_token: token,
+        marketplace_placement: None,
     };
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
