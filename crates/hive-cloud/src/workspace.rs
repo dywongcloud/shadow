@@ -39,15 +39,22 @@ struct Pattern {
     segments: Vec<Segment>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Workspace {
     pub(crate) source: &'static str,
     pub(crate) members: Vec<PathBuf>,
 }
 
-pub(crate) async fn load(root: &Path) -> anyhow::Result<Option<Workspace>> {
-    let (source, raw_patterns) = if let Some(bytes) =
-        read_bounded(&root.join("pnpm-workspace.yaml"), "pnpm-workspace.yaml").await?
-    {
+pub(crate) async fn load_for_manager(
+    root: &Path,
+    package_manager: &fluid_build::PackageManagerDetection,
+) -> anyhow::Result<Option<Workspace>> {
+    let (source, raw_patterns) = if package_manager.manager == "pnpm" {
+        let Some(bytes) =
+            read_bounded(&root.join("pnpm-workspace.yaml"), "pnpm-workspace.yaml").await?
+        else {
+            return Ok(None);
+        };
         let value: serde_yaml::Value = serde_yaml::from_slice(&bytes)
             .map_err(|error| anyhow::anyhow!("invalid pnpm-workspace.yaml: {error}"))?;
         let packages = value

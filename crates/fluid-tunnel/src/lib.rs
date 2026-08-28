@@ -22,7 +22,7 @@ mod server;
 
 pub use client::{TunnelClient, TunnelResponse};
 pub use codec::{Frame, FrameKind};
-pub use server::TunnelServer;
+pub use server::{set_local_connect_permits, TunnelServer};
 
 use serde::{Deserialize, Serialize};
 

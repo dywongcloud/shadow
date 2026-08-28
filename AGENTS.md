@@ -133,6 +133,24 @@ history).
 - Verify the fix by writing through the public round-robin host and reading it
   back several times, AND directly against a node still running the previous
   binary — the old node must still fail. That contrast is the proof.
+- **The stale-epoch 503 is a retryable refusal class, and the fence discloses
+  its epoch.** The `admin_ingress` epoch fence answers a behind-epoch forwarded
+  mutation with 503 `stale control-plane epoch (ownership changed); retry`
+  PLUS an `x-hive-cp-epoch-current` header carrying the receiver's own epoch.
+  `admin_forward_to_leader` treats it as a third provably-not-applied outcome
+  (the fence fires before the receiver's router, same retry-safety argument as
+  `not control-plane leader`): max-merge the disclosed epoch via `adopt_epoch`,
+  re-stamp, retry same-candidate up to `MAX_STALE_EPOCH_RETRIES` (3), then walk
+  candidates and only then return the refusal. The invariant is unchanged — a
+  sender that never converges (genuine ownership divergence) is still refused;
+  the bound, not the fence, is what moved. Why it matters: the epoch is an
+  OBSERVER-LOCAL fencing token that max-merges fleet-wide, so one sick node
+  inflates it for everyone — witnessed 2026-08-24, fc-virginia-2's cgroup-OOM
+  crash loop (restart counter 2652, ~5s process life, 151 stale firecracker
+  processes pinning 13.3 GB of its 16.5 GB cgroup) transiently self-elected on
+  every boot, bumping the fleet epoch ~5/min and fencing ~17% of in-flight
+  forwards (leader log: 442 rejections/h, always exactly one epoch behind,
+  leader itself stable with zero transitions).
 - **Store-sync adoption is WHOLESALE-REPLACE under a per-observer owner
   election, so an owner flap can churn a fresh leader write away fleet-wide.**
   `store_sync::REGISTRY`'s leader-pull entries (teams, billing, projects, …)
@@ -1083,53 +1101,11 @@ releases).
 
 ## Managed Supabase Studio (`DbKind::Supabase`)
 
-- **A self-contained mini-stack per database, not a shared Supabase.**
-  `provision_supabase` (databases.rs) runs three containers on the owning
-  project's DNS-less podman net with deterministic static IPs in bands clear
-  of the managed-DB `.200+` band: `supabase/postgres:15.8.1.085` (named
-  volume `hive-vol-supa-<id8>` — data survives container replacement),
-  `supabase/postgres-meta:v0.95.2` (internal only), and
-  `supabase/studio:2026.02.16-sha-26c615c` (loopback-published, recorded as
-  `studio_port`). This is Studio's REQUIRED dependency set per the upstream
-  compose: its only declared dep is analytics-as-startup-barrier, and its
-  functional env deps are db + pg-meta + a router. GoTrue/PostgREST/
-  Realtime/Storage are deliberately NOT run — Studio's Authentication and
-  Data-API pages degrade; table/SQL editors are full. Do not "complete" the
-  stack silently; adding services is a resource + routing decision.
-- **Kong's two jobs are served by the platform, so no Kong container runs.**
-  Path routing is unnecessary (Studio's server side calls pg-meta directly
-  over the project net via `--add-host`), and the
-  `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` gate Kong applies to its `/`
-  catch-all is enforced by `db_rest::supabase_studio_proxy` — HTTP Basic
-  against the generated `STUDIO_USERNAME`/`STUDIO_PASSWORD`, constant-time,
-  with Kong's `hide_credentials` semantics (the Authorization header is
-  checked, then stripped, never proxied). The proxy streams the studio
-  container over loopback and rewrites `Location` headers that point at
-  internal origins.
-- **The Postgres wire rides the existing db_gateway SNI splice** — the
-  record's `local_port` is the stack's published 5432, so
-  `postgres://postgres:<pw>@<slug>.{db_domain}:5432/postgres?sslmode=require`
-  works exactly like a managed Postgres DSN. `with_external_endpoint` has the
-  Supabase arm that rewrites `DATABASE_URL`/`STUDIO_URL`/`SUPABASE_URL` to
-  the public host; when `HIVE_DB_DOMAIN` is unset the Studio URL stays
-  loopback-honest (reach "internal").
-- **JWT keys are static HS256 over `{role, iss:"supabase", exp:+10y}`** signed
-  with the stack's generated JWT_SECRET (the upstream/supahost derivation,
-  `supabase_api_jwt`) — they identify roles, not sessions; no rotation path
-  in v1.
-- **The record's `container` field is comma-joined (db,meta,studio)** —
-  every teardown site (`database_delete`, `purge_project_resources`) splits
-  on `,`, removes with `-v` (podman lock-pool rule), and removes the named
-  volume explicitly (delete = data destroyed, same semantics as any managed
-  engine delete). Replicas are dropped at provision (a second stack is a
-  divergent database, the SQLite-lane rule). The reconcile loop owns fault
-  tolerance for this lane: it restarts exited members and REBUILDS vanished
-  ones from the record via the same shared builder (`supabase_stack_args`)
-  provision uses — ports/secrets/JWTs ride the connection map
-  (`JWT_SECRET`/`PG_META_CRYPTO_KEY` included for exactly this), and the
-  named volume means a rebuilt db container returns WITH its data. The
-  builder takes the full db id for the deterministic sibling IPs — never
-  reconstruct one from the short container-name suffix.
+A self-contained per-database mini-stack (postgres + postgres-meta + studio
+containers, no Kong — the platform's own edge/db_rest proxy serves Kong's two
+jobs), named volume so data survives container replacement, static HS256 JWTs,
+reconcile-loop self-healing from the stored record. Full detail:
+`recall("managed-supabase-studio-dbkind")`.
 
 ## Browser-replicated databases (the `browser_db` contract)
 
@@ -1439,27 +1415,12 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
 
 ## Compose published ports (`ports: ["9000:9000"]`)
 
-- The HOST side of a compose `ports:` entry is a PUBLISH REQUEST
-  (`PortSpec.preferred_public_port`): the allocator prefers the literal number
-  (reserved set + fleet-uniqueness + bind probe permitting) and the build log
-  names grant-vs-request loudly. A bare `"PORT"` entry stays internal-only.
-- Published Http ports get **TLS termination at the raw proxy** (same SNI
-  resolver/certs as the 443 gateway, ALPN pinned http/1.1) with first-byte
-  sniffing — `https://` and `http://` both work on the same number; raw
-  Tcp/Grpc/Udp bindings stay pure passthrough.
-- The data plane requires per-port loopback publishes on EVERY backend:
-  `FunctionLaunch::tcp_ports` must be emitted as `-p` flags by mock,
-  firecracker AND litebox (the mock-only first cut was connection-refused on
-  the whole FC fleet), resolved via `Lease::tcp_host_port` in `mesh_raw`.
-- **The Tencent security group is part of the path.** Host firewalls admit
-  these ports (HIVE_LOCKDOWN only drops its explicit list), but the VPC edge
-  drops inbound on anything the SG doesn't open — the raw range 20000-29999
-  is open; literal published ports (9000/9001, …) need an SG rule or they
-  time out from EVERYWHERE, node-to-node included. Verify with node→node
-  curls on public IPs, never only from a laptop.
-- A migrated-away public port is QUARANTINED, never re-granted (stale
-  entry-node caches would misroute it cross-tenant); a port swap therefore
-  cannot converge, documented in `claim_local`.
+Host-side port is a publish REQUEST (allocator prefers it, bare `"PORT"` stays
+internal); TLS terminates at the raw proxy on Http ports; every backend (mock/
+firecracker/litebox) must emit `-p` loopback publishes; the Tencent SG (not
+just host firewalls) must open literal published ports (20000-29999 raw range
+is pre-opened); a migrated port is quarantined, never re-granted. Full detail:
+`recall("compose-published-ports-contract")`.
 
 ## Mesh watchdogs & dial discipline (post-2026-08-17-incident shape)
 

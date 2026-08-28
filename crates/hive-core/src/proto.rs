@@ -280,6 +280,7 @@ pub struct TcpPublish {
 }
 
 pub const RUNTIME_ARTIFACT_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION: u16 = 1;
 
 /// Complete host-to-guest wire contract. This version covers every
 /// AgentRequest and AgentEvent variant plus every serialized field and semantic
@@ -494,6 +495,23 @@ pub struct RuntimeArtifactIdentity {
     pub protocol: u16,
     pub id: String,
     pub content_sha256: String,
+}
+
+/// Transfer identity for the deterministic package carrying one semantic runtime
+/// tree. The package digest addresses transport bytes; `semantic_tree_sha256`
+/// remains the backend-neutral execution identity every target must recompute.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeArtifactPackageDescriptor {
+    pub protocol: u16,
+    pub package_sha256: String,
+    pub semantic_tree_sha256: String,
+    pub package_bytes: u64,
+    pub logical_bytes: u64,
+    pub materialized_bytes: u64,
+    pub entries: u64,
+    pub app_rel: String,
+    pub include_rel: Vec<String>,
 }
 
 /// How to launch a long-lived function server inside a cell (Fluid compute).

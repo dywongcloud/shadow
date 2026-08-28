@@ -1968,10 +1968,16 @@ fn env_scope_matches(raw: &str, want: EnvExecutionScope) -> bool {
     match raw.trim().to_ascii_lowercase().as_str() {
         "all" => true,
         "build" => want == EnvExecutionScope::Build,
-        // Empty/unknown values fail toward runtime-only. Empty is the legacy
-        // representation; unknown values must never become an accidental build
-        // grant because a client typoed a new scope.
-        "runtime" | "" => want == EnvExecutionScope::Runtime,
+        // Empty = the legacy/default representation, exposed to BOTH scopes
+        // (Vercel parity: a variable added without an explicit scope choice is
+        // available during the build — witnessed live, a settings DATABASE_URL
+        // never reached `pnpm turbo run build`'s children and the migrate step
+        // failed). An explicit "runtime" remains runtime-only: that IS this
+        // platform's deliberate split when a user chooses it.
+        "" => true,
+        "runtime" => want == EnvExecutionScope::Runtime,
+        // Unknown values still fail toward runtime-only so a typoed new scope
+        // never becomes an accidental build grant.
         _ => want == EnvExecutionScope::Runtime,
     }
 }

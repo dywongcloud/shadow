@@ -356,6 +356,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_admission::routes())
         // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
         .merge(crate::browser_artifacts::routes())
+        // ---- Immutable runtime artifact transfer (bounded, durable, mesh-internal) ----
+        .merge(crate::runtime_artifact_transfer::routes())
         // ---- Browser-replicated database exchange (fleet-initiated pull) ----
         .merge(crate::browser_db::routes())
         // ---- browser_db libsql/Hrana + Upstash REST surface (owner-proxied) ----
@@ -373,6 +375,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::sandboxes_api::routes())
         // ---- Storage broker: Firecracker cell data-image snapshots ----
         .merge(crate::storage_api::routes())
+        // ---- Cloudflare Queues parity (crate::queues) ----
+        .merge(crate::queues_api::routes())
         // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
         .merge(crate::db_rest::routes())

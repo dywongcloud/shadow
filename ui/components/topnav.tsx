@@ -296,6 +296,18 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
 
 const PERSONAL = "__personal__";
 
+/** The ACTIVE tenant's actual subscription tier (hobby | pro | enterprise) from
+ *  its billing account — the same half the Billing page shows, and correct for
+ *  the personal namespace too (it has a billing account but no team row). The
+ *  hive_jwt cookie scopes /v1/billing to the active tenant, and usePoll
+ *  re-fetches on `hive-team-changed` after a switch re-mints it. Returns null
+ *  until known: a badge must render NOTHING rather than assert "Hobby" for an
+ *  account whose real tier simply hasn't loaded yet. */
+function useActivePlan(): string | null {
+  const { data } = usePoll<{ account?: { plan?: string } }>("/v1/billing", 60000);
+  return data?.account?.plan || null;
+}
+
 /** Tenant id for the active Clerk org (its slug, falling back to id), or the
  *  personal sentinel. This is what scopes every data request (`x-hive-team`). */
 function tenantOf(org: { slug?: string | null; id: string } | null | undefined): string {
@@ -316,6 +328,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     userMemberships: { infinite: true },
   });
   const clerk = useClerk();
+  const activePlan = useActivePlan();
   const [open, setOpen] = useState(false);
   // OUR selection is the source of truth for the dashboard view — persisted in
   // localStorage and authoritative over Clerk's (possibly org-forced) active
@@ -519,7 +532,9 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
           </span>
         )}
         <span className="font-medium">{label}</span>
-        <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{isPersonal ? "Hobby" : "Team"}</span>
+        {activePlan && (
+          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{activePlan}</span>
+        )}
         <ChevronsUpDown className="h-3.5 w-3.5 text-muted" />
       </button>
 
@@ -528,7 +543,10 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option
             label={identity.name}
-            hint="Hobby"
+            // The personal namespace's real tier is only known while it IS the
+            // active tenant (/v1/billing is cookie-scoped) — omit the hint
+            // otherwise rather than asserting a tier that may be wrong.
+            hint={isPersonal ? activePlan ?? undefined : undefined}
             icon={<User className="h-3.5 w-3.5" />}
             selected={isPersonal}
             onClick={() => pick(PERSONAL)}
@@ -584,6 +602,7 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
   // in the background on every page). `choose()` already force-refreshes via
   // `hive-team-changed` on switch, so freshness on interaction is unaffected.
   const { data: teams } = usePoll<Team[]>("/v1/teams", 10000, open);
+  const activePlan = useActivePlan();
   const [sel, setSel] = useState<string>(PERSONAL);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -623,7 +642,9 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
 
   const current = sel === PERSONAL ? null : (teams ?? []).find((t) => t.slug === sel);
   const label = current ? current.name : identity.name;
-  const plan = current ? current.plan : "Hobby";
+  // Personal has no team row — its tier comes from the billing account. Null
+  // until known; the badge renders nothing rather than a wrong placeholder.
+  const plan = current ? current.plan : activePlan;
 
   return (
     <div className="relative" ref={ref}>
@@ -643,14 +664,16 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
           </span>
         )}
         <span className="font-medium">{label}</span>
-        <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{plan}</span>
+        {plan && (
+          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{plan}</span>
+        )}
         <ChevronsUpDown className="h-3.5 w-3.5 text-muted" />
       </button>
 
       {open && (
         <div className="absolute left-0 top-full z-40 mt-1.5 w-64 max-w-[90vw] overflow-hidden rounded-lg border border-border bg-card shadow-pop">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
-          <Option label={identity.name} hint="Hobby" icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
+          <Option label={identity.name} hint={sel === PERSONAL ? activePlan ?? undefined : undefined} icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
           <div className="mt-1 border-t border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Teams</div>
           {(teams ?? []).filter((t) => t.slug !== "personal").map((t) => (
             <Option

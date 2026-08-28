@@ -18,7 +18,7 @@
 //! `firecracker` binary exist.
 
 use crate::{
-    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, RuntimeArtifactSpec,
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -2838,26 +2838,29 @@ impl CellBackend for FirecrackerBackend {
         })
     }
 
-    fn delivered_workdir(&self, artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+    fn delivered_workdir(
+        &self,
+        artifact: &SealedRuntimeArtifact,
+    ) -> anyhow::Result<Option<String>> {
         artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
     async fn deliver_build(
         &self,
         image: &str,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(&self.cfg.rootfs_dir).await?;
-        let staged = crate::runtime_artifact::stage_runtime_artifact(
+        let staged = crate::runtime_artifact::stage_sealed_runtime_artifact(
             artifact,
             &self.cfg.rootfs_dir.join(".artifact-staging"),
         )
         .await?;
-        let identity = RuntimeArtifactIdentity {
-            protocol: RUNTIME_ARTIFACT_PROTOCOL_VERSION,
-            id: image.to_string(),
-            content_sha256: staged.content_sha256().to_string(),
-        };
+        let identity = artifact.identity(image)?;
+        anyhow::ensure!(
+            staged.content_sha256() == identity.content_sha256,
+            "verified runtime package materialized a different semantic identity"
+        );
         staged.write_identity(&identity)?;
 
         let out = self.data_image_for(image);

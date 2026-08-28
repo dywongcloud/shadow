@@ -89,6 +89,27 @@ pub(crate) async fn read(
         .map_err(|_| ReadError::Unavailable)?
 }
 
+/// Whether `relative` names a real file under `static_dir`, without reading its
+/// bytes — the same `openat2`/`RESOLVE_BENEATH` security boundary as [`read`],
+/// used to let a rewrite rule (typically a SPA's catch-all `/(.*) -> /index.html`)
+/// skip itself for a path that is actually a real static asset (e.g.
+/// `/release.json`), matching Vercel's own `"handle": "filesystem"` semantics.
+pub(crate) async fn exists(root: &StaticRoot, static_dir: &Path, relative: &Path) -> bool {
+    let root = root.clone();
+    let static_dir = static_dir.to_owned();
+    let relative = relative.to_owned();
+    tokio::task::spawn_blocking(move || exists_blocking(&root, &static_dir, &relative))
+        .await
+        .unwrap_or(false)
+}
+
+fn exists_blocking(root: &StaticRoot, static_dir: &Path, relative: &Path) -> bool {
+    let Ok(file) = open_regular(root, static_dir, relative) else {
+        return false;
+    };
+    metadata_retry(&file).map(|m| m.is_file()).unwrap_or(false)
+}
+
 /// Read a precompressed sibling, then prove the source still names the exact
 /// generation whose bytes were selected. Only a missing sidecar is a benign
 /// cache miss; a forbidden or unavailable sidecar fails closed.

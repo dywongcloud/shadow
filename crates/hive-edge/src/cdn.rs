@@ -114,6 +114,39 @@ impl CdnCache {
         if status != 200 {
             return false;
         }
+        // Integrity gates: a captured body that is provably not the response
+        // the origin declared must NEVER enter the cache — an origin instance
+        // dying mid-stream once otherwise poisons an immutable entry that
+        // every later client replays. Witnessed live (nodes-wtf 2026-08-26):
+        // a 59-byte truncated prefix of a 6142-byte gzip chunk was cached as
+        // a complete `Content-Encoding: gzip` 200 and served to every browser
+        // as ERR_CONTENT_DECODING_FAILED until the next process restart.
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        if let Some(declared) = header("content-length").and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            if declared != body.len() as u64 {
+                return false;
+            }
+        }
+        if header("content-encoding").is_some_and(|v| v.eq_ignore_ascii_case("gzip")) {
+            // Full decode, bounded by the body we already hold in memory: the
+            // only proof a gzip stream is complete is decoding it to its end.
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(body);
+            let mut sink = [0_u8; 16 * 1024];
+            loop {
+                match decoder.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
         let Some((ttl, swr)) = cache_policy(headers) else {
             return false;
         };

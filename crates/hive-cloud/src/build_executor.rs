@@ -76,11 +76,21 @@ const OUTPUT_ROOT: &str = "/artifact";
 const ADMIN_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_PATH: &str = "/workspace/source/node_modules/.bin:/usr/local/bin:/usr/bin:/bin";
-const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 8] = [
+// `directfs` is deliberately absent (runsc's own default, true, applies).
+// Forcing directfs=false makes gVisor fall back to the gofer-only filesystem
+// path, and on this fleet's PVM-patched kernels (6.12.33-pvm+, the CVM/GPU
+// hosts) that path's platform init dies immediately: "initialize systrap:
+// unable to attach: operation not permitted" in the sandbox's own oci-log,
+// surfaced to the podman client only as "cannot read client sync file:
+// waiting for sandbox to start: EOF". Isolated live via single-flag
+// bisection on sj2 (2026-08-28): directfs=false alone, no other flags,
+// reproduces the failure against a bare `podman run --runtime runsc`; every
+// other flag here works individually and combined. hive-cell-agent's own
+// sandboxes never pass --directfs and boot fine on the same kernel.
+const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 7] = [
     "platform=systrap",
     "network=sandbox",
     "gvisor-marker-file=true",
-    "directfs=false",
     "host-uds=none",
     "host-fifo=none",
     "net-raw=false",
@@ -612,16 +622,13 @@ impl BuildExecutor {
             || declaration.builder_manifest_digest.is_some()
             || declaration.builder_config_digest.is_some();
         if archive_pin_present {
-            let archive_path = declaration
-                .builder_archive_path
-                .as_ref()
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_archive_path is required",
-                    )
-                })?;
+            let archive_path = declaration.builder_archive_path.as_ref().ok_or_else(|| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::InvalidConfig,
+                    "load installed BuildExecutor",
+                    "builder archive pin is partial: builder_archive_path is required",
+                )
+            })?;
             let archive_sha = declaration
                 .builder_archive_sha256
                 .as_deref()
@@ -632,25 +639,24 @@ impl BuildExecutor {
                         "builder archive pin is partial: builder_archive_sha256 is required",
                     )
                 })?;
-            let archive_bytes = declaration
-                .builder_archive_bytes
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_archive_bytes is required",
-                    )
-                })?;
-            let manifest_digest = declaration
-                .builder_manifest_digest
-                .as_deref()
-                .ok_or_else(|| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::InvalidConfig,
-                        "load installed BuildExecutor",
-                        "builder archive pin is partial: builder_manifest_digest is required",
-                    )
-                })?;
+            let archive_bytes = declaration.builder_archive_bytes.ok_or_else(|| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::InvalidConfig,
+                    "load installed BuildExecutor",
+                    "builder archive pin is partial: builder_archive_bytes is required",
+                )
+            })?;
+            let manifest_digest =
+                declaration
+                    .builder_manifest_digest
+                    .as_deref()
+                    .ok_or_else(|| {
+                        BuildExecutorError::new(
+                            BuildExecutorErrorCode::InvalidConfig,
+                            "load installed BuildExecutor",
+                            "builder archive pin is partial: builder_manifest_digest is required",
+                        )
+                    })?;
             let config_digest = declaration
                 .builder_config_digest
                 .as_deref()
@@ -674,14 +680,13 @@ impl BuildExecutor {
             }
             validate_trusted_regular_file(archive_path, "reviewed builder OCI archive")?;
             let measured_archive = sha256_file(archive_path).await?;
-            let archive_metadata =
-                tokio::fs::metadata(archive_path).await.map_err(|error| {
-                    BuildExecutorError::new(
-                        BuildExecutorErrorCode::CapabilityUnavailable,
-                        "load installed BuildExecutor",
-                        format!("cannot measure builder archive: {error}"),
-                    )
-                })?;
+            let archive_metadata = tokio::fs::metadata(archive_path).await.map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    "load installed BuildExecutor",
+                    format!("cannot measure builder archive: {error}"),
+                )
+            })?;
             if hex_bytes(&measured_archive) != REVIEWED_BUILDER_ARCHIVE_SHA256
                 || archive_metadata.len() != REVIEWED_BUILDER_ARCHIVE_BYTES
             {
@@ -4021,9 +4026,7 @@ fn verify_image_inspect(bytes: &[u8], reference: &str) -> Result<()> {
     let entrypoint_ok = image_config
         .get("Entrypoint")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|values| {
-            values.len() == 1 && values[0].as_str() == Some(BUILDER_INIT_PATH)
-        });
+        .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some(BUILDER_INIT_PATH));
     let workdir_ok = json_str(image_config, &["WorkingDir"]) == Some(WORKSPACE_MOUNT);
     let label_ok = image_config
         .get("Labels")

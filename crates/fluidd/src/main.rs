@@ -51,6 +51,24 @@ struct Args {
     fc_run_dir: String,
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> anyhow::Result<&'static str> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            Ok("ctrl-c")
+        }
+        _ = terminate.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> anyhow::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("ctrl-c")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -85,10 +103,44 @@ async fn main() -> anyhow::Result<()> {
 
     let fluid = Fluid::start(backend, FluidConfig::default());
     let gw = Gateway::new(fluid, args.image.clone());
+    let public_gateway = gw.clone();
+    let admin_gateway = gw.clone();
+    let mut servers = tokio::spawn(async move {
+        tokio::try_join!(
+            fluid_gateway::serve_public(public_gateway, args.listen),
+            fluid_gateway::serve_admin(admin_gateway, args.admin),
+        )
+        .map(|_| ())
+    });
 
-    // Run both servers concurrently.
-    let public = fluid_gateway::serve_public(gw.clone(), args.listen);
-    let admin = fluid_gateway::serve_admin(gw.clone(), args.admin);
-    tokio::try_join!(public, admin)?;
-    Ok(())
+    let server_result = tokio::select! {
+        joined = &mut servers => match joined {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("fluidd server task failed: {error}")),
+        },
+        signal = shutdown_signal() => match signal {
+            Ok(signal) => {
+                tracing::info!(signal, "fluidd shutdown requested");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
+    };
+    if !servers.is_finished() {
+        servers.abort();
+        let _ = servers.await;
+    }
+
+    let shutdown_result = gw.shutdown().await;
+    match (server_result, shutdown_result) {
+        (Ok(()), Ok(terminated)) => {
+            tracing::info!(terminated, "fluidd shutdown complete");
+            Ok(())
+        }
+        (Err(server), Ok(_)) => Err(server),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(server), Err(shutdown)) => Err(anyhow::anyhow!(
+            "fluidd server failed: {server:#}; shutdown also failed: {shutdown:#}"
+        )),
+    }
 }
