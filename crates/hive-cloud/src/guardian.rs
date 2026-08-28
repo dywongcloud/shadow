@@ -486,7 +486,12 @@ pub async fn my_iroh_addr() -> Option<String> {
 pub fn init_background() {
     tokio::spawn(async move {
         match handle().await {
-            Ok(h) => tracing::info!(keys = h.kv.all().len(), "GuardianDB online"),
+            // `keys()` reads the index's key set only (cheap, no fetch) —
+            // `all().len()` would report 0 here by design now: right after
+            // the cold-start rebuild, values are lazily unfetched (see
+            // refresh_kv_index's doc), so `all()`'s cached-only contract
+            // means an empty map even on a fully-populated store.
+            Ok(h) => tracing::info!(keys = h.kv.keys().len(), "GuardianDB online"),
             Err(e) => {
                 tracing::warn!(error = %e, "GuardianDB init failed (snapshot kept on disk); will retry")
             }
@@ -5250,10 +5255,15 @@ pub async fn delete(key: &str) {
     }
 }
 
-/// Snapshot of all keys currently stored in GuardianDB (durable copy).
+/// Snapshot of all keys currently stored in GuardianDB (durable copy). Uses
+/// `KeyValueStore::keys()`, not `all().into_keys()` — `all()` only returns
+/// values already lazily cached (see `refresh_kv_index`'s doc), so it would
+/// silently under-report the key set for any key never read since the last
+/// index rebuild. `keys()` reads the index's full key set directly and never
+/// triggers a fetch.
 pub async fn keys() -> Vec<String> {
     match handle().await {
-        Ok(h) => h.kv.all().into_keys().collect(),
+        Ok(h) => h.kv.keys(),
         Err(_) => Vec::new(),
     }
 }
