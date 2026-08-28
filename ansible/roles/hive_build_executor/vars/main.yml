@@ -25,11 +25,15 @@ hive_build_executor_runsc_sha256: "048b89aada69dc3333422e139d6e9d02f8ab06bda5239
 hive_build_executor_uid: 65532
 hive_build_executor_gid: 65532
 # Must equal REQUIRED_RUNSC_RUNTIME_FLAGS in build_executor.rs, in order.
+# directfs is deliberately absent: on the fleet's PVM-patched kernels,
+# directfs=false makes gVisor's systrap platform init fail outright
+# ("unable to attach: operation not permitted"). See build_executor.rs's
+# comment on REQUIRED_RUNSC_RUNTIME_FLAGS and the build_executor role's
+# README for the live isolation that found this (sj2, 2026-08-28).
 hive_build_executor_runsc_runtime_flags:
   - "platform=systrap"
   - "network=sandbox"
   - "gvisor-marker-file=true"
-  - "directfs=false"
   - "host-uds=none"
   - "host-fifo=none"
   - "net-raw=false"
