@@ -117,38 +117,28 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
 
   // No usable per-browser cookie (fresh browser, expired, different machine,
   // or — see above — one GitHub just refused).
-  // The cookie was NEVER the source of truth — ask GitHub's REAL installation
-  // record server-to-server with the App's own identity (the SAME source the
-  // node's webhook/token-resolution path uses — see github-installation.ts).
-  // A valid installation means CONNECTED regardless of any browser's cookies.
+  //
+  // `GET /app/installations` (listAppInstallations) is GLOBAL: it lists EVERY
+  // account this GitHub App is installed on across the ENTIRE platform, with
+  // no concept of "which user is asking." It is valid evidence for "is the
+  // App installed on THIS SPECIFIC repo/org" (installationTokenForRepo scopes
+  // it correctly by owner/repo) — it is NEVER valid evidence for "is THIS
+  // BROWSER's user connected." Treating a nonempty global list as "connected,
+  // login = accounts[0]" reported ANOTHER CUSTOMER's org (whichever happened
+  // to be first/only in the list) to any signed-in user with no cookie of
+  // their own — a real cross-tenant leak, witnessed live: a fresh account
+  // saw "@SolutionsAsService · app installation" despite never having
+  // connected anything. Still probe it (below) so `installationState`/
+  // `installationError` carry real operator-facing diagnostic signal, but
+  // NEVER let its result claim this entity is connected — only a per-entity
+  // check (the Composio fallback below, which is genuinely scoped by
+  // `entity`) may do that.
   let installationState: GithubDetail["installationState"];
   let installationError: string | undefined;
   if (installationAuthConfigured()) {
     const inst = await listAppInstallations();
-    if (inst.ok && inst.installations.length > 0) {
-      const accounts = inst.installations.map((i) => i.account_login).filter((l): l is string => !!l);
-      const hasOrg = inst.installations.some((i) => i.account_type === "Organization");
-      const slug = inst.installations.find((i) => i.app_slug)?.app_slug;
-      return {
-        configured: true,
-        connected: true,
-        entity,
-        login: accounts[0] ?? null,
-        scopes: [],
-        hasPrivateAccess: true,
-        hasOrgScope: hasOrg,
-        live: true,
-        provider: "github-app",
-        via: "installation",
-        installationState: "present",
-        installations: accounts,
-        installUrl: slug ? `https://github.com/apps/${slug}/installations/new` : "https://github.com/settings/installations",
-      };
-    }
-    installationState = inst.ok ? "none" : "error";
+    installationState = inst.ok ? (inst.installations.length > 0 ? "present" : "none") : "error";
     if (!inst.ok) installationError = inst.error;
-    // Fall through to Composio — the App record says not-installed (or the
-    // probe failed); a legacy managed connection may still exist.
   } else {
     installationState = "unconfigured";
   }
