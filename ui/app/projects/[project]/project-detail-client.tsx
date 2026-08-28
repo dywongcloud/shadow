@@ -17,6 +17,7 @@ import {
   ChevronRight,
   Activity,
   Loader2,
+  ShieldCheck,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
@@ -26,6 +27,7 @@ import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { CreateDeploymentModal } from "@/components/create-deployment-modal";
 import { AttachedDomains } from "@/components/attached-domains";
+import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -83,6 +85,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   // A redeploy doesn't create a deployment row until its build FINISHES (the live
   // version keeps serving meanwhile). The in-flight "Building" rows come from a
   // PERSISTENT store (localStorage) so they survive navigating away + reload — the
@@ -185,6 +188,9 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           </div>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+            <ShieldCheck className="h-4 w-4" /> Marketplace
+          </Button>
           <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
             {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
           </Button>
@@ -233,6 +239,9 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
               <div className="flex gap-2">
+                <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+                  <ShieldCheck className="h-4 w-4" /> Marketplace
+                </Button>
                 <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
                   <RefreshCw className="h-4 w-4" /> Redeploy
                 </Button>
@@ -339,6 +348,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           <span className="text-sm text-secondary">{mine.length + pendingRows.length} deployment{mine.length + pendingRows.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
             <Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" /> New Deployment</Button>
+            <Button variant="outline" onClick={() => setMarketplaceOpen(true)}><ShieldCheck className="h-4 w-4" /> Marketplace</Button>
           </div>
         </div>
         <Table>
@@ -465,6 +475,16 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           repoUrl={prod?.git?.repo_url ?? ""}
           branch={prod?.git?.branch}
           onClose={() => setCreateOpen(false)}
+          onDone={() => {
+            setTab("deployments");
+            refresh();
+          }}
+        />
+      )}
+      {marketplaceOpen && (
+        <MarketplaceDeploymentModal
+          project={name}
+          onClose={() => setMarketplaceOpen(false)}
           onDone={() => {
             setTab("deployments");
             refresh();

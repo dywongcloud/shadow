@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound, AlertTriangle, RefreshCw } from "lucide-react";
+import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound, AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -13,6 +13,7 @@ import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
 import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
+import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -163,6 +164,7 @@ export default function NewProjectPage() {
   // Set once Create succeeds: drives the "Preparing Git Repository" animation
   // shown between Create and the build-logs view.
   const [preparing, setPreparing] = useState<{ template: Template | null; team: string; src: string; dest: string } | null>(null);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
 
   const TPL_PER = 5;
   const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
@@ -578,6 +580,11 @@ export default function NewProjectPage() {
         </Link>
         .
       </p>
+      <div className="mb-8 flex justify-center">
+        <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+          <ShieldCheck className="h-4 w-4" /> Deploy from Marketplace
+        </Button>
+      </div>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
@@ -694,6 +701,7 @@ export default function NewProjectPage() {
           <GlobeEmptyState title="" desc={undefined} />
         </div>
       </Card>
+      {marketplaceOpen && <MarketplaceDeploymentModal onClose={() => setMarketplaceOpen(false)} />}
     </div>
   );
 }

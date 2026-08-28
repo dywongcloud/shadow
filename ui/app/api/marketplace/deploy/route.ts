@@ -11,6 +11,34 @@ import { authTokenFrom, backend } from "@/lib/gitops-server";
 export const dynamic = "force-dynamic";
 
 const MARKETPLACE_URL = process.env.MARKETPLACE_URL || "";
+const PROJECT = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+function optionalText(body: Record<string, unknown>, field: string, limit: number): string | undefined {
+  const value = body[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > limit) {
+    throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", `${field} must be a string no longer than ${limit} characters.`);
+  }
+  return value.trim() || undefined;
+}
+
+function safeEnv(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "env must be a key/value object.");
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 100) throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "env may contain at most 100 variables.");
+  const env: Record<string, string> = {};
+  for (const [key, item] of entries) {
+    if (!ENV_KEY.test(key) || typeof item !== "string" || item.length > 16_384) {
+      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "Environment variable names or values are invalid.");
+    }
+    env[key] = item;
+  }
+  return env;
+}
 
 /**
  * Marketplace deployment boundary.
@@ -31,6 +59,22 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const repoUrl = optionalText(body, "repo_url", 2048);
+    if (!repoUrl || !/^https?:\/\//i.test(repoUrl)) {
+      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "repo_url must be an HTTP(S) repository URL.");
+    }
+    const project = optionalText(body, "project", 128);
+    if (project && !PROJECT.test(project)) {
+      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "project contains unsupported characters.");
+    }
+    const rootDir = optionalText(body, "root_dir", 512);
+    if (rootDir && (rootDir.startsWith("/") || rootDir.split("/").some((part) => part === ".."))) {
+      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "root_dir must stay within the repository.");
+    }
+    const target = optionalText(body, "target", 32);
+    if (target && target !== "production" && target !== "preview") {
+      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "target must be production or preview.");
+    }
     const session = await auth();
     const buyerTenantId = clerkMarketplaceTenant({ userId: session.userId ?? null, orgId: session.orgId ?? null });
     const marketplaceJwt = await session.getToken({ template: "autheo-marketplace-v1" });
@@ -43,15 +87,18 @@ export async function POST(req: NextRequest) {
     // Copy only ordinary deploy inputs. Never pass through client tenant,
     // buyer/provider/role/policy fields, authorization headers, or hive_jwt.
     const deploy: Record<string, unknown> = {
-      repo_url: typeof body.repo_url === "string" ? body.repo_url : "",
+      repo_url: repoUrl,
       marketplace_placement: marketplacePlacement,
     };
-    for (const field of ["branch", "project", "root_dir", "target"] as const) {
-      if (typeof body[field] === "string") deploy[field] = body[field];
-    }
+    const branch = optionalText(body, "branch", 256);
+    if (branch) deploy.branch = branch;
+    if (project) deploy.project = project;
+    if (rootDir) deploy.root_dir = rootDir;
+    if (target) deploy.target = target;
     if (typeof body.use_cache === "boolean") deploy.use_cache = body.use_cache;
     if (typeof body.redeploy === "boolean") deploy.redeploy = body.redeploy;
-    if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) deploy.env = body.env;
+    const env = safeEnv(body.env);
+    if (env && Object.keys(env).length) deploy.env = env;
 
     // Hive's existing server-to-backend authentication remains local to this
     // application. It is intentionally separate from, and never sent to,

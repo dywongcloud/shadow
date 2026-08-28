@@ -53,3 +53,67 @@ live node registry. Each candidate must still pass current health,
 reachability, isolation/capability, and capacity checks. If no approved node
 passes, the deployment fails with `MARKETPLACE_PLACEMENT_UNAVAILABLE`; Hive
 does not fall back to an unapproved local node.
+
+## DevHub UI and local verification
+
+Developers start a Marketplace deployment from **New Project → Deploy from
+Marketplace** or from a project's **Marketplace** action. The form accepts
+only an order ID and ordinary build inputs: HTTPS repository URL, branch,
+project name, repository root, production/preview target, build-cache choice,
+and environment variables. It has no inputs for tenant or buyer identity,
+providers, roles, JWTs, placement policy JSON, or approved nodes.
+
+On submit, DevHub calls only `POST /api/marketplace/deploy`. That server route
+obtains the `autheo-marketplace-v1` token from the real Clerk session, derives
+the tenant, retrieves the policy server-side, validates it, and forwards the
+immutable snapshot to Hive. It never forwards `hive_jwt` to Marketplace and
+never returns the Clerk token, policy snapshot, private node data, credentials,
+or control-plane metadata to the browser.
+
+The UI reports policy authorization, missing policy, tenant mismatch, expired,
+revoked, suspended, malformed, unsupported-version, and no-eligible-node
+failures in actionable language. A successfully accepted request joins the
+ordinary build-status page and deployment polling flow.
+
+### Minimal local workflow
+
+1. In one terminal, start Hive:
+
+   ```bash
+   cargo run -p hive-cloud -- --admin 127.0.0.1:8786 --listen 127.0.0.1:8787
+   ```
+2. Create/use a real Clerk development instance. Configure DevHub's
+   `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`, then create a
+   JWT template named exactly `autheo-marketplace-v1`.
+3. In a second terminal, start the isolated local Marketplace fixture:
+
+   ```bash
+   cd ui && npm run dev:marketplace
+   ```
+
+   It listens on `http://127.0.0.1:4010`, exposes
+   `GET /v1/marketplace/orders/{order_id}/placement-policy` and validates the
+   Clerk token's issuer, audience, signature, and expiry using Clerk JWKS.
+4. Copy `ui/.env.example` to `ui/.env.local`, set the non-secret URLs and your
+   Clerk keys, then in a third terminal run:
+
+   ```bash
+   cd ui && npm run dev
+   ```
+
+5. Sign in through Clerk, open the Marketplace deployment form, and submit an
+   order whose policy contains the v1 fields described above.
+
+The local `HIVE_DEV_MINT`/DevHub dev-mint behavior is not Clerk and does not
+exercise Marketplace authentication. Do not use static bearer tokens,
+unsigned tokens, fake Clerk claims, M2M credentials, or a Marketplace auth
+bypass for this flow.
+
+For manual verification, the fixture accepts `fixture-valid` and the
+selectable order IDs `fixture-unauthorized`, `fixture-missing`,
+`fixture-tenant-mismatch`, `fixture-expired`, `fixture-revoked`,
+`fixture-suspended`, `fixture-malformed`, `fixture-unsupported`, and
+`fixture-no-eligible-nodes`. It validates authentication before selecting any
+case. This fixture is intentionally isolated and has no static bearer token,
+M2M credential, fake Clerk claim, unsigned-token path, expired-token path, or
+auth bypass.
