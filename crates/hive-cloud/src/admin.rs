@@ -343,7 +343,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
-        .route("/v1/billing/webhook", post(billing_webhook))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
         // ---- Deployment preview / thumbnail ----
@@ -15048,7 +15047,6 @@ pub(crate) async fn billing_get(
     Json(json!({
         "account": acc,
         "plans": crate::billing::PLANS,
-        "stripe": crate::billing::stripe_configured(),
         "rate_card": crate::billing::RATE_CARD,
         "limits": {
             "max_projects": crate::billing::plan_max_projects(&plan),
@@ -15143,6 +15141,39 @@ fn default_kind() -> String {
     "plan".into()
 }
 
+/// Public wallet configuration. Every value comes from operator configuration:
+/// this process never holds a wallet secret and cannot sign a customer payment.
+fn theo_network() -> Result<Value, (StatusCode, String)> {
+    let chain_id = std::env::var("THEO_CHAIN_ID").ok().and_then(|v| v.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_CHAIN_ID is not configured".into()))?;
+    let rpc_url = std::env::var("THEO_RPC_URL").unwrap_or_default();
+    let token_address = std::env::var("THEO_TOKEN_ADDRESS").unwrap_or_default();
+    let treasury_address = std::env::var("THEO_TREASURY_ADDRESS").unwrap_or_default();
+    if !rpc_url.starts_with("https://") || !is_evm_address(&token_address) || !is_evm_address(&treasury_address) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "THEO wallet settlement is not configured safely".into()));
+    }
+    Ok(json!({
+        "chain_id": chain_id,
+        "chain_name": std::env::var("THEO_CHAIN_NAME").unwrap_or_else(|_| "Autheo".into()),
+        "rpc_url": rpc_url,
+        "explorer_url": std::env::var("THEO_EXPLORER_URL").unwrap_or_default(),
+        "token_address": token_address,
+        "treasury_address": treasury_address,
+        "token_decimals": 18,
+    }))
+}
+
+fn is_evm_address(value: &str) -> bool {
+    value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Existing catalog values are hundredths of THEO. Convert only the fixed,
+/// THEO-denominated catalog quantity to ERC-20 atomic units; never consult USD.
+fn checkout_theo_atomic(amount: u64) -> String {
+    (u128::from(amount) * 10u128.pow(16)).to_string()
+}
+
 /// Which purchasable addons this fleet can actually deliver, and when it
 /// cannot, WHY. The dashboard reads this to render a disabled control with the
 /// operator's remedy instead of a Buy button that answers with an HTTP error
@@ -15187,15 +15218,13 @@ async fn billing_checkout(
     // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
-    let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
+    let (plan, amount): (String, u64) =
         match req.kind.as_str() {
             "credits" => {
                 let amt = req.amount_cents.unwrap_or(1000);
                 (
                     "".to_string(),
                     amt,
-                    format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
-                    None,
                 )
             }
             "addon" => {
@@ -15239,8 +15268,6 @@ async fn billing_checkout(
                 (
                     "".to_string(),
                     crate::tencent_eip::PRICE_CENTS,
-                    format!("Dedicated IPv4 — {target}"),
-                    crate::tencent_eip::price_id(),
                 )
             }
             _ => {
@@ -15249,8 +15276,6 @@ async fn billing_checkout(
                 (
                     plan,
                     spec.price_cents,
-                    format!("OpenEdge {} plan", spec.name),
-                    spec.stripe_price_id.map(|s| s.to_string()),
                 )
             }
         };
@@ -15270,9 +15295,7 @@ async fn billing_checkout(
             "switched to a free plan (no checkout needed)",
         );
         crate::persist::persist(&c);
-        return Ok(Json(
-            json!({ "url": "", "mock": false, "applied": true, "account": acc }),
-        ));
+        return Ok(Json(json!({ "url": "", "applied": true, "account": acc })));
     }
     // Same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`,
     // an operator-set testing price, never assumed permanent): route through
@@ -15305,9 +15328,7 @@ async fn billing_checkout(
                     &format!("dedicated_ipv4 for {target} (testing price, $0)"),
                 );
                 crate::persist::persist(&c);
-                return Ok(Json(
-                    json!({ "url": "", "mock": false, "applied": true, "dedicated_ipv4": alloc }),
-                ));
+                return Ok(Json(json!({ "url": "", "applied": true, "dedicated_ipv4": alloc })));
             }
             Err(e) => {
                 tracing::error!(checkout = %co.id, tenant = %t, error = %e, "dedicated_ipv4 provisioning failed ($0 testing path)");
@@ -15327,58 +15348,27 @@ async fn billing_checkout(
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
-    // Real Stripe Checkout when configured; otherwise the local mock checkout.
-    if crate::billing::stripe_configured() {
-        let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-        // An addon purchase is scoped to a project (e.g. dedicated_ipv4) --
-        // land the buyer back where they bought it, not on the unrelated
-        // billing overview page, which has nothing to show for it.
-        let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
-            let enc =
-                percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
-                    .to_string();
-            (
-                format!(
-                    "{base}/projects/{enc}/settings/network?addon_success={}",
-                    co.id
-                ),
-                format!("{base}/projects/{enc}/settings/network?addon_canceled=1"),
-            )
-        } else {
-            (
-                format!("{base}/billing?success={}", co.id),
-                format!("{base}/billing?canceled=1"),
-            )
-        };
-        match crate::billing::stripe_checkout(
-            &c.http,
-            price_id.as_deref(),
-            amount,
-            &label,
-            &success,
-            &cancel,
-            &co.id,
-        )
-        .await
-        {
-            Ok((url, stripe_session_id)) => {
-                c.billing.attach_stripe_session(&co.id, &stripe_session_id);
-                return Ok(Json(json!({ "url": url, "mock": false, "session": co.id })));
-            }
-            Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
-        }
-    }
-    Ok(Json(
-        json!({ "url": format!("/billing/checkout?session={}", co.id), "mock": true, "session": co.id }),
-    ))
+    let network = theo_network()?;
+    Ok(Json(json!({
+        "url": format!("/billing/checkout?session={}", co.id),
+        "session": co.id,
+        "amount_theo_atomic": checkout_theo_atomic(amount),
+        "network": network,
+    })))
 }
 
 pub(crate) async fn billing_checkout_get(
     State(c): State<Arc<CloudState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     if let Some(co) = c.billing.get_checkout(&id) {
-        return Ok(Json(json!(co)));
+        let network = theo_network()?;
+        return Ok(Json(json!({
+            "id": co.id, "tenant": co.tenant, "kind": co.kind, "plan": co.plan,
+            "sku": co.sku, "target": co.target,
+            "amount_theo_atomic": checkout_theo_atomic(co.amount_cents),
+            "network": network,
+        })));
     }
     // Checkouts live in an in-process map on whichever node opened them, and
     // `POST /v1/billing/checkout` is a mutation so it always runs on the billing
@@ -15389,12 +15379,81 @@ pub(crate) async fn billing_checkout_get(
     if let Some(v) = proxy_billing_read(&c, &format!("/v1/billing/checkout/{id}"), "").await {
         return Ok(Json(v));
     }
-    Err(StatusCode::NOT_FOUND)
+    Err((StatusCode::NOT_FOUND, "checkout session not found".into()))
 }
 
 #[derive(Deserialize)]
 struct ConfirmReq {
     session: String,
+    wallet: String,
+    transaction_hash: String,
+}
+
+/// Verify the actual on-chain ERC-20 transfer before consuming a checkout.
+/// Wallets sign in-browser; this only reads a configured public RPC and checks
+/// sender, THEO contract, treasury, amount, successful receipt, and chain.
+async fn verify_theo_settlement(
+    http: &reqwest::Client,
+    checkout: &crate::billing::Checkout,
+    wallet: &str,
+    transaction_hash: &str,
+) -> Result<(), String> {
+    if !is_evm_address(wallet)
+        || transaction_hash.len() != 66
+        || !transaction_hash.starts_with("0x")
+        || !transaction_hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("invalid wallet or transaction hash".into());
+    }
+    let network = theo_network().map_err(|(_, e)| e)?;
+    let rpc = network["rpc_url"].as_str().ok_or("missing RPC URL")?;
+    let expected_chain = network["chain_id"].as_u64().ok_or("missing chain id")?;
+    let chain = theo_rpc(http, rpc, "eth_chainId", json!([])).await?;
+    let chain = chain.as_str().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).ok_or("invalid RPC chain id")?;
+    if chain != expected_chain { return Err("THEO RPC is on the wrong chain".into()); }
+    let tx = theo_rpc(http, rpc, "eth_getTransactionByHash", json!([transaction_hash])).await?;
+    let receipt = theo_rpc(http, rpc, "eth_getTransactionReceipt", json!([transaction_hash])).await?;
+    if tx.is_null() || receipt.is_null() { return Err("THEO transaction is still pending".into()); }
+    if receipt.get("status").and_then(Value::as_str) != Some("0x1") { return Err("THEO transaction failed on-chain".into()); }
+    let lower = |value: Option<&str>| value.unwrap_or_default().to_ascii_lowercase();
+    if lower(tx.get("from").and_then(Value::as_str)) != wallet.to_ascii_lowercase()
+        || lower(tx.get("to").and_then(Value::as_str)) != lower(network["token_address"].as_str())
+    {
+        return Err("transaction sender or THEO token contract does not match checkout".into());
+    }
+    let input = tx.get("input").or_else(|| tx.get("data")).and_then(Value::as_str).unwrap_or("");
+    let expected_to = lower(network["treasury_address"].as_str()).trim_start_matches("0x").to_string();
+    let expected_amount = format!("{:064x}", checkout_theo_atomic(checkout.amount_cents).parse::<u128>().map_err(|_| "invalid checkout amount")?);
+    if input.len() != 138
+        || !input.starts_with("0xa9059cbb")
+        || input[34..74].to_ascii_lowercase() != format!("{expected_to:0>64}")
+        || input[74..].to_ascii_lowercase() != expected_amount
+    {
+        return Err("transaction does not transfer the exact THEO checkout amount".into());
+    }
+    Ok(())
+}
+
+async fn theo_rpc(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let response = http
+        .post(rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        .send()
+        .await
+        .map_err(|_| "THEO RPC unavailable".to_string())?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| "malformed THEO RPC response".to_string())?;
+    if value.get("error").is_some() {
+        return Err("THEO RPC rejected the request".into());
+    }
+    Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn billing_confirm(
@@ -15414,23 +15473,12 @@ async fn billing_confirm(
     if norm(&co.tenant) != t {
         return Err(StatusCode::FORBIDDEN);
     }
-    // When this was a REAL Stripe checkout, verify actual payment with Stripe
-    // before applying anything — the client hitting this endpoint (a redirect
-    // back from Stripe, or a direct call) is NOT proof of payment on its own;
-    // without this check, anyone could open a checkout and immediately call
-    // confirm without ever paying, and receive the plan/credits for free.
-    let mut stripe_customer = String::new();
-    let mut stripe_subscription = String::new();
-    if !co.stripe_session_id.is_empty() {
-        let status = crate::billing::stripe_verify_session(&c.http, &co.stripe_session_id)
-            .await
-            .map_err(|e| { tracing::warn!(error=%e, session=%co.stripe_session_id, "stripe session verification failed"); StatusCode::BAD_GATEWAY })?;
-        if !status.paid {
-            return Err(StatusCode::PAYMENT_REQUIRED);
-        }
-        stripe_customer = status.customer.unwrap_or_default();
-        stripe_subscription = status.subscription.unwrap_or_default();
-    }
+    verify_theo_settlement(&c.http, &co, &req.wallet, &req.transaction_hash)
+        .await
+        .map_err(|e| {
+            tracing::warn!(checkout = %co.id, error = %e, "THEO settlement verification failed");
+            StatusCode::PAYMENT_REQUIRED
+        })?;
     let (co, acc) = c
         .billing
         .confirm_checkout(&req.session)
@@ -15454,10 +15502,6 @@ async fn billing_confirm(
         }
         _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
     }
-    if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
-        c.billing
-            .set_stripe_ids(&co.tenant, &stripe_customer, &stripe_subscription);
-    }
     c.audit.record(
         &t,
         "user",
@@ -15465,10 +15509,10 @@ async fn billing_confirm(
         "billing",
         &co.id,
         &format!(
-            "checkout {} {} ${:.2}",
+            "THEO checkout {} {} {} atomic units",
             co.kind,
             co.plan,
-            co.amount_cents as f64 / 100.0
+            checkout_theo_atomic(co.amount_cents)
         ),
     );
     crate::persist::persist(&c);

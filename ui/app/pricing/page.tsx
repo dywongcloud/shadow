@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { Check } from "lucide-react";
+import { TheoMarketReference } from "@/components/theo-market-reference";
 
 // Perf: prerender this public page (see root layout note).
 export const dynamic = "force-static";
@@ -10,12 +11,12 @@ export const revalidate = 3600;
 export const metadata: Metadata = {
   title: "Pricing — autheo",
   description:
-    "autheo pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+    "autheo pricing plans are denominated and settled in THEO. USD values are display-only market references.",
   alternates: { canonical: "/pricing" },
   openGraph: {
     title: "Pricing — autheo",
     description:
-      "autheo pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+    "autheo pricing plans are denominated and settled in THEO. USD values are display-only market references.",
     url: "/pricing",
     type: "website",
     siteName: "autheo",
@@ -24,7 +25,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Pricing — autheo",
     description:
-      "autheo pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
+    "autheo pricing is denominated and settled in THEO.",
   },
 };
 
@@ -43,7 +44,7 @@ type Tier = {
 const TIERS: Tier[] = [
   {
     name: "Hobby",
-    price: "$0",
+    price: "0 THEO",
     period: "/ forever",
     tagline: "For personal projects and experiments.",
     features: [
@@ -58,7 +59,7 @@ const TIERS: Tier[] = [
   },
   {
     name: "Pro",
-    price: "$20",
+    price: "20 THEO",
     period: "/month",
     tagline: "For growing teams shipping to production.",
     features: [
@@ -76,12 +77,12 @@ const TIERS: Tier[] = [
   },
   {
     name: "Enterprise",
-    price: "$1,000",
+    price: "1,000 THEO",
     period: "/month",
     tagline: "Self-host across your own global mesh.",
     features: [
       "Everything in Pro",
-      "$1,000 of included compute / month",
+      "1,000 THEO of included compute / month",
       "Self-hosted nodes",
       "Data residency & leases",
       "SSO/SAML",
@@ -135,6 +136,7 @@ export default function PricingPage() {
       />
 
       <MarketingSection className="pb-20">
+        <div className="mb-6"><TheoMarketReference /></div>
         <div className="grid gap-6 lg:grid-cols-3">
           {TIERS.map((tier) => (
             <div

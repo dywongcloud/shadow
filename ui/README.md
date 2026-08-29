@@ -31,6 +31,18 @@ return URL. After checkout, Marketplace redirects back with
 through the documented server-side integration contract in
 [`docs/marketplace-project-resources.md`](../docs/marketplace-project-resources.md).
 
+## THEO settlement and market reference
+
+Autheo.dev settles paid plans, credits, and add-ons in $THEO only. The checkout
+uses an EIP-1193-compatible browser wallet to submit an ERC-20 transfer to the
+configured treasury; no wallet secret or card data is collected by the app.
+
+Configure `THEO_CHAIN_ID`, `THEO_RPC_URL`, `THEO_EXPLORER_URL`,
+`THEO_TOKEN_ADDRESS`, and `THEO_TREASURY_ADDRESS` on both the dashboard and
+node. `THEO_MARKET_PAIR_ADDRESS` defaults to the Base/Hydrex pair
+`0x182be47742b81777055d69c50e5c9d2fe803e938`. The Dexscreener THEO/USD quote is
+informational only and is never used to calculate, convert, or settle a charge.
+
 ## Local full-page testing (JWT path)
 
 The stock local node runs **unenforced** (no `HIVE_JWT_SECRET`), so mutations
