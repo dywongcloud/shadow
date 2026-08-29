@@ -4472,12 +4472,27 @@ async fn run_build(
     // World package.
     {
         let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        if (ingested > 0 || py_wdk)
-            && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir)
-        {
+        let opted_out =
+            crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir);
+        tracing::info!(
+            project = %info.project,
+            ingested,
+            py_wdk,
+            opted_out,
+            "workflow World auto-wiring gate evaluated"
+        );
+        if (ingested > 0 || py_wdk) && !opted_out {
             let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
             let team = crate::admin::norm(&tenant).to_string();
+            // Best-effort, same discipline as the `claim_database_exact` guard
+            // below: `put_env_exact`'s `?` used to propagate an incarnation
+            // mismatch straight out of `run_build` with NO log line at all,
+            // silently failing the whole (already-deployed) build. Track
+            // whether either write actually landed so a genuine failure here
+            // skips the Redis provisioning below instead of leaving env vars
+            // half-written, and always leaves a trace either way.
+            let mut queue_env_written = false;
             if let Ok(queue_token) = crate::auth::issue(
                 "world-queue-client",
                 &team,
@@ -4485,7 +4500,7 @@ async fn run_build(
                 false,
                 365 * 24 * 3600,
             ) {
-                cloud.projects.put_env_exact(
+                let endpoint_result = cloud.projects.put_env_exact(
                     &info.project,
                     incarnation,
                     crate::project_settings::EnvVar {
@@ -4496,8 +4511,8 @@ async fn run_build(
                         sensitive: false,
                         updated_ms: now_ms(),
                     },
-                )?;
-                cloud.projects.put_env_exact(
+                );
+                let token_result = cloud.projects.put_env_exact(
                     &info.project,
                     incarnation,
                     crate::project_settings::EnvVar {
@@ -4508,83 +4523,124 @@ async fn run_build(
                         sensitive: true,
                         updated_ms: now_ms(),
                     },
-                )?;
+                );
+                match (endpoint_result, token_result) {
+                    (Ok(()), Ok(())) => queue_env_written = true,
+                    (Err(error), _) | (_, Err(error)) => {
+                        tracing::warn!(
+                            project = %info.project,
+                            %incarnation,
+                            %error,
+                            "workflow queue env write lost project-incarnation authority — skipping World auto-wiring for this build, next deploy will retry"
+                        );
+                        log(
+                            "Vercel Workflow SDK detected, but a concurrent deploy raced the \
+                             queue env write -- skipped for this build; it will retry on the \
+                             next deploy."
+                                .to_string(),
+                        );
+                    }
+                }
             }
-            let req = crate::databases::ProvisionReq {
-                name: "workflow-storage".into(),
-                project: info.project.clone(),
-                team,
-                kind: crate::databases::DbKind::Redis,
-                region: Some(cloud.region.clone()),
-                provider: None,
-                replicas: Vec::new(),
-            };
-            let cloud_ready = cloud.clone();
-            let ready_project = info.project.clone();
-            // Provisioning completes after this build returns. Keep it in the
-            // exact-incarnation drain set so project deletion cannot inventory
-            // storage until this callback has either committed under lifecycle
-            // authority or yielded to the delete.
-            let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
-                ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
-            )));
-            let workflow_database = crate::databases::provision(
-                cloud.databases.clone(),
-                cloud.region.clone(),
-                req,
-                cloud.db_domain.clone(),
-                cloud.node_name.clone(),
-                cloud.api_base(),
-                move |d| {
-                    let cloud_ready = cloud_ready.clone();
-                    let ready_project = ready_project.clone();
-                    let completion_guard = completion_guard.clone();
-                    tokio::spawn(async move {
-                        // `provision` accepts `Fn`, not `FnOnce`, so transfer
-                        // the single reservation out exactly once. Never hold
-                        // it while awaiting the lifecycle writer: deletion owns
-                        // the writer while it drains this exact reservation.
-                        let completion_guard = completion_guard.lock().take();
-                        drop(completion_guard);
-                        let _lifecycle =
-                            crate::project_settings::lifecycle_write(&ready_project).await;
-                        if cloud_ready
-                            .projects
-                            .get_exact(&ready_project, incarnation)
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                project = %ready_project,
-                                %incarnation,
-                                database = %d.id,
-                                "discarded delayed workflow-storage completion for a deleted project incarnation"
-                            );
-                            return;
-                        }
-                        if matches!(d.status, crate::databases::DbStatus::Ready) {
-                            crate::admin::apply_db_egress(&cloud_ready, &d);
-                        }
-                        crate::persist::persist(&cloud_ready);
-                    });
-                },
-            );
-            if let Err(error) = cloud.projects.claim_database_exact(
-                &info.project,
-                incarnation,
-                workflow_database.id.clone(),
-            ) {
-                crate::databases::note_teardown_request(&workflow_database.id);
-                cloud
-                    .databases
-                    .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
-                return Err(anyhow::anyhow!(
-                    "workflow storage lost project-incarnation authority before admission: {error}"
-                ));
+            if queue_env_written {
+                let req = crate::databases::ProvisionReq {
+                    name: "workflow-storage".into(),
+                    project: info.project.clone(),
+                    team,
+                    kind: crate::databases::DbKind::Redis,
+                    region: Some(cloud.region.clone()),
+                    provider: None,
+                    replicas: Vec::new(),
+                };
+                let cloud_ready = cloud.clone();
+                let ready_project = info.project.clone();
+                // Provisioning completes after this build returns. Keep it in
+                // the exact-incarnation drain set so project deletion cannot
+                // inventory storage until this callback has either committed
+                // under lifecycle authority or yielded to the delete.
+                let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
+                    ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
+                )));
+                let workflow_database = crate::databases::provision(
+                    cloud.databases.clone(),
+                    cloud.region.clone(),
+                    req,
+                    cloud.db_domain.clone(),
+                    cloud.node_name.clone(),
+                    cloud.api_base(),
+                    move |d| {
+                        let cloud_ready = cloud_ready.clone();
+                        let ready_project = ready_project.clone();
+                        let completion_guard = completion_guard.clone();
+                        tokio::spawn(async move {
+                            // `provision` accepts `Fn`, not `FnOnce`, so
+                            // transfer the single reservation out exactly
+                            // once. Never hold it while awaiting the
+                            // lifecycle writer: deletion owns the writer
+                            // while it drains this exact reservation.
+                            let completion_guard = completion_guard.lock().take();
+                            drop(completion_guard);
+                            let _lifecycle =
+                                crate::project_settings::lifecycle_write(&ready_project).await;
+                            if cloud_ready
+                                .projects
+                                .get_exact(&ready_project, incarnation)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    project = %ready_project,
+                                    %incarnation,
+                                    database = %d.id,
+                                    "discarded delayed workflow-storage completion for a deleted project incarnation"
+                                );
+                                return;
+                            }
+                            if matches!(d.status, crate::databases::DbStatus::Ready) {
+                                crate::admin::apply_db_egress(&cloud_ready, &d);
+                            }
+                            crate::persist::persist(&cloud_ready);
+                        });
+                    },
+                );
+                // Best-effort, matching the WDK-manifest ingest above: a lost
+                // incarnation race here (a concurrent redeploy of the SAME
+                // project bumped it between this build's entry and this late
+                // pipeline stage — the app itself has typically already
+                // deployed successfully by this point) must never fail the
+                // whole build. This previously returned `Err`, which the
+                // caller (`run_build`'s spawn site) turns into
+                // `DeployState::Error` for the ENTIRE deployment — a
+                // non-critical auxiliary feature (workflow storage
+                // auto-wiring) retroactively failing an already-successful
+                // app deployment. Tear down the orphaned database and just
+                // skip the wiring; the next deploy gets another chance.
+                if let Err(error) = cloud.projects.claim_database_exact(
+                    &info.project,
+                    incarnation,
+                    workflow_database.id.clone(),
+                ) {
+                    crate::databases::note_teardown_request(&workflow_database.id);
+                    cloud
+                        .databases
+                        .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
+                    tracing::warn!(
+                        project = %info.project,
+                        database = %workflow_database.id,
+                        %error,
+                        "workflow storage lost project-incarnation authority before admission — skipping auto-wiring for this build, next deploy will retry"
+                    );
+                    log(
+                        "Vercel Workflow SDK detected, but a concurrent deploy raced the storage \
+                         auto-wiring -- skipped for this build; it will retry on the next deploy."
+                            .to_string(),
+                    );
+                } else {
+                    log(format!(
+                        "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
+                        if ingested > 0 { "JS/TS" } else { "Python" }
+                    ));
+                }
             }
-            log(format!(
-                "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
-                if ingested > 0 { "JS/TS" } else { "Python" }
-            ));
         }
     }
 
@@ -5289,7 +5345,7 @@ async fn fanout_remote(
                 .post(format!("{admin}{RUNTIME_ARTIFACT_FANOUT_PATH}"))
                 .header("x-hive-team", team.clone());
             if crate::auth::enforced() {
-                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
+                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                     rb = rb.bearer_auth(tok);
                 }
             }

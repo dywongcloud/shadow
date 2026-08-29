@@ -285,7 +285,7 @@ fn send_mirrored(
                     .header("x-hive-team", team.clone())
                     .header("x-hive-mirror", "1")
                     .header("content-type", content_type.clone());
-                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
+                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                     rb = rb.header("x-hive-mirror-tok", tok.clone());
                     // Also present as a normal Bearer: auth::require_auth (main.rs)
                     // wraps this ENTIRE router in a mutation gate that only ever

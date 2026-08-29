@@ -1630,7 +1630,7 @@ async fn consume_studio_ticket_nonce(
             .json(&env)
             .timeout(std::time::Duration::from_secs(15));
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", "", "service", false, 60) {
+            if let Ok(token) = crate::auth::issue("mesh-internal", "", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                 request = request.bearer_auth(token);
             }
         }
@@ -2166,7 +2166,7 @@ async fn studio_forward_to_owner(
             .json(&env)
             .timeout(std::time::Duration::from_secs(60));
         if crate::auth::enforced() {
-            if let Ok(tok) = crate::auth::issue("mesh-internal", "", "service", false, 60) {
+            if let Ok(tok) = crate::auth::issue("mesh-internal", "", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                 rb = rb.bearer_auth(tok);
             }
         }

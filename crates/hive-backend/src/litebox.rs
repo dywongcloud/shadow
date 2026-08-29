@@ -3126,6 +3126,66 @@ async fn resolve_direct_launch(
     Ok(DirectLaunch { runtime, bin, args })
 }
 
+/// Kill-and-reap a still-running guest child on ANY exit from the scope this
+/// guard is armed in — a normal `Err` return, an early `?`, or the whole
+/// future being DROPPED because the caller gave up (`ColdStartGuard` in
+/// `fluid-compute` releases the scheduler's own `provisioning` reservation on
+/// exactly that path, but has no reach into this process — a genuinely
+/// separate resource at a different layer). `tokio::process::Child`'s own
+/// `kill_on_drop` sends the signal synchronously but is documented to NOT
+/// reap: the OS keeps the process a zombie until something calls `wait()` on
+/// it. Witnessed live on fc-phoenix (2026-08-29): three real zombie
+/// `litebox-runner` processes, all direct children of the running hive-cloud
+/// PID, accumulated purely from repeated timed-out/abandoned cold starts.
+/// `disarm()` on the success path hands the child back for its normal,
+/// already-correct long life (`terminate()` reaps it then).
+struct ChildReapGuard<'a> {
+    child: Option<&'a mut Child>,
+}
+
+impl<'a> ChildReapGuard<'a> {
+    fn new(child: &'a mut Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Reborrow the guarded child. The guard, not this call, owns the
+    /// underlying reference for its whole lifetime, so callers may reborrow
+    /// through it as many times as needed without ever holding a second
+    /// independent `&mut Child`.
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_deref_mut().expect("guard already disarmed")
+    }
+
+    fn disarm(mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildReapGuard<'_> {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        // `Drop` cannot `.await`; a detached task still guarantees the reap
+        // happens even when THIS guard's own drop is running inside another
+        // future's cancellation teardown (no runtime-context requirement
+        // beyond `tokio::spawn` needing a live handle, true everywhere this
+        // guard is ever constructed).
+        if let Some(pid) = child.id() {
+            tokio::spawn(async move {
+                // SAFETY: reaping our own just-killed child by raw pid — the
+                // `Child` handle itself cannot be moved into this task
+                // because it is still borrowed by the guard's caller scope.
+                let mut status = 0;
+                unsafe {
+                    libc::waitpid(pid as libc::pid_t, &mut status, 0);
+                }
+            });
+        }
+    }
+}
+
 async fn wait_litebox_ready(
     child: &mut Child,
     address: &str,
@@ -3362,20 +3422,55 @@ fn append_litebox_runtime_augmentation_blocking(
     identity: Option<&RuntimeArtifactIdentity>,
     runtime_bin: Option<&Path>,
 ) -> anyhow::Result<()> {
-    const END_MARKER_BYTES: u64 = 1024;
+    const BLOCK_BYTES: u64 = 512;
+    const END_MARKER_BLOCKS: u64 = 2;
     let metadata = archive.metadata()?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() >= END_MARKER_BYTES && metadata.len() % 512 == 0,
+        metadata.is_file()
+            && metadata.len() >= END_MARKER_BLOCKS * BLOCK_BYTES
+            && metadata.len() % BLOCK_BYTES == 0,
         "litebox application authority is not a canonical block-aligned tar"
     );
-    archive.seek(SeekFrom::End(-(END_MARKER_BYTES as i64)))?;
-    let mut prior_end = [0_u8; END_MARKER_BYTES as usize];
-    archive.read_exact(&mut prior_end)?;
+    // GNU tar's real end-of-archive marker is the minimal two-block
+    // (1024-byte) zero terminator required by the format, but `tar -cf`
+    // additionally zero-pads the WHOLE archive out to its own blocking
+    // factor (a full 20-block/10240-byte record by default) — that extra
+    // padding is itself all zero, so a fixed "the terminator is exactly the
+    // last 1024 bytes" assumption reads real trailing padding instead of the
+    // true terminator whenever the archive's length is not already a
+    // multiple of 10240. Truncating at that wrong offset leaves the ACTUAL
+    // double-zero-block sitting a few blocks before wherever this function's
+    // new entries get appended — every standard reader (GNU tar, Python's
+    // `tarfile`, and litebox's own guest-side extractor) stops at that real
+    // terminator and never sees the entries appended after it, so the guest
+    // silently never gets the bind shim it needs.
+    //
+    // Reproduced live on fc-sanjose-3 AND fc-phoenix (`--litebox-probe`
+    // failing on both with `Cannot find module '/hive-litebox-bind-shim.js'`
+    // despite `append_litebox_runtime_augmentation_blocking` returning `Ok`
+    // and genuinely growing the file — the new headers were real bytes on
+    // disk, just placed after the archive's true EOF marker). Fixed by
+    // scanning backward from the end in 512-byte blocks for the actual start
+    // of the trailing zero run, rather than trusting a fixed offset.
+    let total_blocks = metadata.len() / BLOCK_BYTES;
+    let mut zero_block = [0_u8; BLOCK_BYTES as usize];
+    let mut terminator_start_block = total_blocks;
+    let mut index = total_blocks;
+    while index > 0 {
+        let candidate = index - 1;
+        archive.seek(SeekFrom::Start(candidate * BLOCK_BYTES))?;
+        archive.read_exact(&mut zero_block)?;
+        if zero_block.iter().any(|byte| *byte != 0) {
+            break;
+        }
+        terminator_start_block = candidate;
+        index = candidate;
+    }
     anyhow::ensure!(
-        prior_end.iter().all(|byte| *byte == 0),
+        total_blocks - terminator_start_block >= END_MARKER_BLOCKS,
         "litebox application authority has no exact two-block tar terminator"
     );
-    let prefix_bytes = metadata.len() - END_MARKER_BYTES;
+    let prefix_bytes = terminator_start_block * BLOCK_BYTES;
     archive.set_len(prefix_bytes)?;
     archive.seek(SeekFrom::Start(prefix_bytes))?;
 
@@ -4060,8 +4155,14 @@ impl CellBackend for LiteboxBackend {
             });
         }
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
+        // Armed for the whole readiness wait: covers a normal timeout/exit
+        // `Err` AND the future being dropped outright (the caller gave up —
+        // see `ChildReapGuard`'s doc). Disarmed only once the guest has
+        // proven it is listening, at which point `child` moves into
+        // long-lived tracking and `terminate()` becomes the reaper.
+        let mut reap_guard = ChildReapGuard::new(&mut child);
         if let Err(error) =
-            wait_litebox_ready(&mut child, &func_addr, Duration::from_secs(15)).await
+            wait_litebox_ready(reap_guard.child_mut(), &func_addr, Duration::from_secs(15)).await
         {
             // Give the reader a beat to drain what the dying guest wrote.
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -4076,6 +4177,7 @@ impl CellBackend for LiteboxBackend {
             }
             return Err(anyhow::anyhow!("{error}; guest stderr tail: {tail}"));
         }
+        reap_guard.disarm();
         // Guest readiness proves Litebox has materialized the initial tar. Drop
         // the descriptor-relative pathname now; cancellation before this point
         // takes the same Drop cleanup path automatically.

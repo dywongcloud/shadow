@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluid_core::DeployRecord;
-use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef};
+use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef, WorkflowRun};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -149,6 +149,14 @@ pub struct PlatformSnapshot {
     /// ingested during a live deploy, so without this they vanished on reboot.
     #[serde(default)]
     pub workflow_defs: Vec<WorkflowDef>,
+    /// Engine-defined-workflow run history (`hive_edge::WorkflowEngine::runs`).
+    /// Previously pure in-memory and lost on every restart — an in-flight run
+    /// has no way to resume (its driving background task died with the
+    /// process), so `WorkflowEngine::runs_load` reconciles any restored
+    /// Pending/Running row to Failed, the same orphan-reconciliation shape
+    /// `persist::restore` already applies to in-flight deployments below.
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRun>,
     /// Enterprise feature suite state (secrets AEAD-encrypted in-struct). See
     /// [`crate::enterprise::EnterpriseSnapshot`].
     #[serde(default)]
@@ -578,6 +586,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
         workflow_defs: cloud.workflows.defs(),
+        workflow_runs: cloud.workflows.runs_snapshot(),
         enterprise: cloud.enterprise.snapshot(),
         sandboxes: {
             let (sandboxes, commands, snapshots, mounts) = cloud.sandboxes.snapshot();
@@ -1060,6 +1069,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }
+    cloud.workflows.runs_load(snap.workflow_runs);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

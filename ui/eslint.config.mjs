@@ -6,5 +6,5 @@ import next from "eslint-config-next";
 
 export default [
   ...next,
-  { ignores: [".next/**", "node_modules/**", "out/**", "public/**"] },
+  { ignores: [".next/**", "node_modules/**", "out/**", "public/**", "vendor/**"] },
 ];

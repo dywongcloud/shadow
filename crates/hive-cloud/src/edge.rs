@@ -1267,13 +1267,20 @@ async fn edge_pipeline_inner(
                 return cached_response(c, &region, CacheState::Hit);
             }
             Lookup::Stale(c) => {
-                // stale-while-revalidate: serve stale now, refresh in background.
-                spawn_revalidate(
-                    cloud.clone(),
-                    host.clone(),
-                    path_q.clone(),
-                    cache_key.clone(),
-                );
+                // stale-while-revalidate: serve stale now, refresh in background —
+                // unless a prior revalidation attempt failed and hasn't cleared
+                // its 30s backoff yet (Vercel's documented ISR failed-revalidation
+                // retry window): every request against a hot stale key would
+                // otherwise fire its own background refresh and hammer a
+                // possibly-still-failing origin.
+                if !c.revalidation_backoff_active() {
+                    spawn_revalidate(
+                        cloud.clone(),
+                        host.clone(),
+                        path_q.clone(),
+                        cache_key.clone(),
+                    );
+                }
                 let ev = cloud.event(
                     &region,
                     &method,
@@ -1684,11 +1691,17 @@ fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: Cache
 
 /// Background stale-while-revalidate refresh: re-fetch through our own gateway
 /// and update the cache entry (next lookup becomes a fresh HIT / REVALIDATED).
+/// Every early-return path below is a FAILED revalidation in Vercel's documented
+/// ISR sense (network error/timeout, or a status outside the success allowlist —
+/// `maybe_store` itself classifies the latter) and must call
+/// `note_revalidation_failed` so the existing stale entry is preserved and the
+/// 30s retry backoff engages, instead of silently doing nothing and letting the
+/// very next request re-fire another background refresh immediately.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
         // Subdomain host -> gateway. Use the internal gateway via public_base.
         let url = format!("{}{}", cloud.public_base, path_q);
-        if let Ok(resp) = cloud
+        let resp = match cloud
             .http
             .get(url)
             .header("host", &host)
@@ -1696,31 +1709,47 @@ fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: S
             .send()
             .await
         {
-            let status = resp.status().as_u16();
-            let hdrs: Vec<(String, String)> = resp
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|s| (k.as_str().to_string(), s.to_string()))
-                })
-                .collect();
-            if let Ok(body) = resp.bytes().await {
-                if cloud.cdn.maybe_store(&key, status, &hdrs, &body) {
-                    cloud.cdn.note_revalidated();
-                    let ev = cloud.event(
-                        &cloud.region,
-                        "GET",
-                        &host,
-                        &path_q,
-                        status,
-                        "cache-revalidate",
-                        "",
-                    );
-                    cloud.record(ev);
-                }
+            Ok(resp) => resp,
+            Err(_) => {
+                // Connection refused/timeout/DNS failure reaching the origin —
+                // no status code at all, so this can't route through
+                // maybe_store's own allowlist check.
+                cloud.cdn.note_revalidation_failed(&key);
+                return;
             }
+        };
+        let status = resp.status().as_u16();
+        let hdrs: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
+            .collect();
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(_) => {
+                // Status line arrived but the body stream broke mid-read
+                // (origin died mid-response) — same failure class as a
+                // connection error.
+                cloud.cdn.note_revalidation_failed(&key);
+                return;
+            }
+        };
+        if cloud.cdn.maybe_store(&key, status, &hdrs, &body) {
+            cloud.cdn.note_revalidated();
+            let ev = cloud.event(
+                &cloud.region,
+                "GET",
+                &host,
+                &path_q,
+                status,
+                "cache-revalidate",
+                "",
+            );
+            cloud.record(ev);
         }
     });
 }
