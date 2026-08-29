@@ -168,7 +168,7 @@ export async function fetchMarketplacePlacementPolicy(
   try {
     url = new URL(`/v1/marketplace/orders/${encodeURIComponent(marketplaceOrderId)}/placement-policy`, marketplaceUrl);
   } catch {
-    throw new MarketplacePolicyError(500, "MARKETPLACE_CONFIG", "MARKETPLACE_URL is not configured correctly.");
+    throw new MarketplacePolicyError(500, "MARKETPLACE_CONFIG", "NEXT_PUBLIC_MARKETPLACE_URL is not configured correctly.");
   }
   let lastNetworkError: unknown;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {

@@ -11,11 +11,25 @@ cargo run -p hive-cloud -- --region sfo1 --name node-a   # public :8787, admin :
 
 # 2) Start the dashboard (this dir)
 npm install
-npm run dev            # http://localhost:3000
+npm run dev            # http://localhost:3001
 ```
 
 The dashboard proxies `/cloud/*` → the node's admin API (`HIVE_ADMIN`, default
 `http://127.0.0.1:8786`) via a Next.js rewrite, so there's no CORS setup.
+
+## Marketplace
+
+Set `NEXT_PUBLIC_MARKETPLACE_URL=http://localhost:3000` when Marketplace runs
+locally (for example, Autheo.dev on port 3001). In production it defaults to
+`https://marketplace.autheo.dev`; set the same variable only to use a different
+Marketplace origin.
+
+The primary header opens Marketplace as an external link. Project pages include
+Compute and Storage browse links that carry the project ID, resource type, and
+return URL. After checkout, Marketplace redirects back with
+`marketplace_order=<order-id>` and Autheo.dev attaches the authenticated order
+through the documented server-side integration contract in
+[`docs/marketplace-project-resources.md`](../docs/marketplace-project-resources.md).
 
 ## Local full-page testing (JWT path)
 

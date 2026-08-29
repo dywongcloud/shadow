@@ -5,7 +5,7 @@ It is a server-only Next.js route: it reads the verified Clerk session, obtains
 the `autheo-marketplace-v1` Clerk JWT template, and calls:
 
 ```text
-GET {MARKETPLACE_URL}/v1/marketplace/orders/{marketplace_order_id}/placement-policy
+GET {NEXT_PUBLIC_MARKETPLACE_URL}/v1/marketplace/orders/{marketplace_order_id}/placement-policy
 Authorization: Bearer <Clerk JWT>
 ```
 
@@ -94,7 +94,9 @@ ordinary build-status page and deployment polling flow.
    It listens on `http://127.0.0.1:4010`, exposes
    `GET /v1/marketplace/orders/{order_id}/placement-policy` and validates the
    Clerk token's issuer, audience, signature, and expiry using Clerk JWKS.
-4. Copy `ui/.env.example` to `ui/.env.local`, set the non-secret URLs and your
+4. Copy `ui/.env.example` to `ui/.env.local`, set
+   `NEXT_PUBLIC_MARKETPLACE_URL=http://localhost:4010` for the isolated fixture
+   (the normal local Marketplace default is `http://localhost:3000`), then set the non-secret URLs and your
    Clerk keys, then in a third terminal run:
 
    ```bash

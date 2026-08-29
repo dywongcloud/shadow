@@ -40,8 +40,8 @@ function MarketplaceSetupCard() {
   const checklist = `# DevHub Marketplace local checklist
 1. Start Hive with its normal local configuration.
 2. Configure a Clerk instance and create the JWT template: autheo-marketplace-v1.
-3. Set DevHub's NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY, CLERK_SECRET_KEY, HIVE_ADMIN, and MARKETPLACE_URL.
-4. Start Marketplace at MARKETPLACE_URL. It must validate Clerk JWT issuer, audience, signature, and expiry through Clerk JWKS.
+3. Set DevHub's NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY, CLERK_SECRET_KEY, HIVE_ADMIN, and NEXT_PUBLIC_MARKETPLACE_URL.
+4. Start Marketplace at NEXT_PUBLIC_MARKETPLACE_URL. It must validate Clerk JWT issuer, audience, signature, and expiry through Clerk JWKS.
 5. Sign in through Clerk, then use New Project → Deploy from Marketplace.
 6. Verify a valid policy and each invalid case: tenant mismatch, expired, revoked, suspended, malformed, unsupported version, and no eligible approved nodes.`;
   useEffect(() => {
@@ -61,7 +61,7 @@ function MarketplaceSetupCard() {
         <div className="flex items-center gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-white text-neutral-800 shadow-sm"><ShieldCheck className="h-5 w-5" /></span><div><div className="font-semibold">Marketplace deployments</div><div className="text-xs text-muted">Clerk-authenticated placement policies</div></div></div>
         <Badge tone={status?.configured ? "green" : "default"}>{status?.configured ? <><Check className="h-3 w-3" /> Configured</> : "Not configured"}</Badge>
       </div>
-      <p className="text-sm text-secondary">Requires the Clerk JWT template <code className="rounded bg-subtle px-1 py-0.5 text-xs">autheo-marketplace-v1</code>. {status?.configured ? "MARKETPLACE_URL is configured." : "MARKETPLACE_URL is not configured."} Its value is intentionally not displayed.</p>
+      <p className="text-sm text-secondary">Requires the Clerk JWT template <code className="rounded bg-subtle px-1 py-0.5 text-xs">autheo-marketplace-v1</code>. {status?.configured ? "Marketplace URL is configured." : "Marketplace URL is not configured."} Its value is intentionally not displayed.</p>
       <p className="mt-3 text-xs text-muted">DevHub calls <code>{status?.endpoint || "/v1/marketplace/orders/{marketplace_order_id}/placement-policy"}</code> server-side and accepts placement-policy schema v{status?.contract_version ?? 1}. A real Clerk session is required; the local dev-mint bypass does not exercise Marketplace authentication.</p>
       <Button variant="outline" className="mt-4" onClick={copyChecklist}><Copy className="h-3.5 w-3.5" /> {copied ? "Copied" : "Copy local checklist"}</Button>
     </Card>

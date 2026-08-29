@@ -28,6 +28,7 @@ import { RedeployModal } from "@/components/redeploy-modal";
 import { CreateDeploymentModal } from "@/components/create-deployment-modal";
 import { AttachedDomains } from "@/components/attached-domains";
 import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
+import { MarketplaceProjectResources } from "@/components/marketplace-project-resources";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -231,9 +232,13 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
            segmented control replaces the old ?wf= sub-tabs). */
         <WfConsoleFrame project={name} />
       ) : tab === "resources" ? (
-        <DeploymentResources deploymentId={prod?.id} />
+        <>
+          <MarketplaceProjectResources project={name} />
+          <DeploymentResources deploymentId={prod?.id} />
+        </>
       ) : tab === "overview" ? (
         <>
+          <MarketplaceProjectResources project={name} />
           {/* Production Deployment */}
           <Card className="mb-6 p-0">
             <div className="flex items-center justify-between border-b border-border px-5 py-3">

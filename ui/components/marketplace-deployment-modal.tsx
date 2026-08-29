@@ -13,7 +13,7 @@ type Row = { key: string; value: string };
 const ERROR_MESSAGES: Record<string, string> = {
   NO_SESSION: "Sign in with Clerk before submitting a Marketplace deployment.",
   MARKETPLACE_JWT_UNAVAILABLE: "DevHub could not obtain the Clerk token template “autheo-marketplace-v1”. Ask an administrator to create or enable that template.",
-  MARKETPLACE_CONFIG: "Marketplace is not configured correctly. Check MARKETPLACE_URL in DevHub.",
+  MARKETPLACE_CONFIG: "Marketplace is not configured correctly. Check NEXT_PUBLIC_MARKETPLACE_URL in DevHub.",
   MARKETPLACE_UNAVAILABLE: "Marketplace is temporarily unavailable. Verify its URL and try again.",
   MARKETPLACE_HTTP_401: "Marketplace did not authorize this Clerk session.",
   MARKETPLACE_HTTP_403: "Marketplace did not authorize this order for your current tenant.",

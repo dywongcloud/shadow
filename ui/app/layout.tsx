@@ -118,7 +118,7 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 // there bounces back to where it started.
 const allowedRedirectOrigins = (
   process.env.NEXT_PUBLIC_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://localhost:3002,https://autheo.dev,https://www.autheo.dev"
+  "http://localhost:3000,http://localhost:3001,http://localhost:3002,https://autheo.dev,https://www.autheo.dev"
 )
   .split(",")
   .map((s) => s.trim())

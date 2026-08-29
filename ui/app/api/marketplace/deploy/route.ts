@@ -7,10 +7,10 @@ import {
   validateMarketplacePlacementPolicy,
 } from "@/lib/marketplace-placement-policy";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
+import { marketplaceUrl } from "@/lib/marketplace";
 
 export const dynamic = "force-dynamic";
 
-const MARKETPLACE_URL = process.env.MARKETPLACE_URL || "";
 const PROJECT = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
@@ -54,10 +54,6 @@ export async function POST(req: NextRequest) {
   if (!marketplaceOrderId || marketplaceOrderId.length > 256) {
     return NextResponse.json({ error: "A valid marketplace_order_id is required." }, { status: 400 });
   }
-  if (!MARKETPLACE_URL) {
-    return NextResponse.json({ error: "Marketplace deployment is not configured." }, { status: 503 });
-  }
-
   try {
     const repoUrl = optionalText(body, "repo_url", 2048);
     if (!repoUrl || !/^https?:\/\//i.test(repoUrl)) {
@@ -81,7 +77,7 @@ export async function POST(req: NextRequest) {
     if (!marketplaceJwt) {
       throw new MarketplacePolicyError(401, "MARKETPLACE_JWT_UNAVAILABLE", "Could not obtain the Clerk Marketplace token.");
     }
-    const response = await fetchMarketplacePlacementPolicy(MARKETPLACE_URL, marketplaceOrderId, marketplaceJwt);
+    const response = await fetchMarketplacePlacementPolicy(marketplaceUrl(), marketplaceOrderId, marketplaceJwt);
     const marketplacePlacement = validateMarketplacePlacementPolicy(response, marketplaceOrderId, buyerTenantId);
 
     // Copy only ordinary deploy inputs. Never pass through client tenant,
