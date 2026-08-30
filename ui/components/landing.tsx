@@ -160,6 +160,23 @@ export function Landing() {
       <IntroLoader />
       {/* ---------------- Hero ---------------- */}
       <section className="relative overflow-hidden">
+        {/* The developer-workshop neighborhood lives beneath the hero rather than
+            competing with it: its paper-white base is screen-blended into the
+            dark surface, leaving only a quiet green stencil of local builders,
+            racks, edge devices, and mesh links. */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-0 overflow-hidden opacity-20 mix-blend-screen"
+        >
+          <Image
+            src="/images/developer-workshop-streetscape.png"
+            alt=""
+            fill
+            priority
+            sizes="100vw"
+            className="object-cover object-center"
+          />
+        </div>
         {/* Aurora glows: two equal sources on the left and right that bleed inward
             and converge at the navbar centre (top) and a lower horizon band — all
             layered BELOW the hero text (the navbar stays on top, z-20).
@@ -171,7 +188,7 @@ export function Landing() {
             field scales down proportionally — keeping the globe ringed by black on
             phones/tablets instead of being washed out. The %-based positions are
             already viewport-relative and stay as-is. */}
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-0 h-[min(32rem,40vw)]">
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-[1] h-[min(32rem,40vw)]">
           {/* Left source — leans toward centre. */}
           <div className="absolute top-[max(-8rem,-10vw)] left-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-emerald-400/18 blur-[min(130px,10.16vw)]" />
           <div className="absolute top-[max(-6rem,-7.5vw)] left-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-lime-500/14 blur-[min(140px,10.94vw)]" />
@@ -189,7 +206,7 @@ export function Landing() {
             the same `min(rem, vw)` / `max(-rem, -vw)` scheme (1280px reference) so
             they shrink and pull inward on small screens while staying pixel-exact
             to the Solutions hero at ≥1280px. */}
-        <div className="pointer-events-none absolute inset-0">
+        <div className="pointer-events-none absolute inset-0 z-[2]">
           {/* Leftmost glow = the reference video's animated ring: a big rotating
               conic ring anchored off-screen top-left so only its lower-right arc
               sweeps the corner, its colors cycling rose↔violet↔teal as it spins. */}
