@@ -19,10 +19,13 @@ The dashboard proxies `/cloud/*` → the node's admin API (`HIVE_ADMIN`, default
 
 ## Marketplace
 
-Set `NEXT_PUBLIC_MARKETPLACE_URL=http://localhost:3000` when Marketplace runs
-locally (for example, Autheo.dev on port 3001). In production it defaults to
-`https://marketplace.autheo.dev`; set the same variable only to use a different
-Marketplace origin.
+Set `MARKETPLACE_URL=http://localhost:3000` when Marketplace runs locally
+(for example, Autheo.dev on port 3001). This server-only URL is required for
+Marketplace deployment-policy retrieval. Set
+`NEXT_PUBLIC_MARKETPLACE_URL=http://localhost:3000` too when browser navigation
+and project-resource links should point at that local Marketplace. In production
+the public navigation URL defaults to `https://marketplace.autheo.dev`; the
+server-side deployment origin remains explicit.
 
 The primary header opens Marketplace as an external link. Project pages include
 Compute and Storage browse links that carry the project ID, resource type, and
@@ -30,6 +33,11 @@ return URL. After checkout, Marketplace redirects back with
 `marketplace_order=<order-id>` and Autheo.dev attaches the authenticated order
 through the documented server-side integration contract in
 [`docs/marketplace-project-resources.md`](../docs/marketplace-project-resources.md).
+
+For the Clerk-authenticated Marketplace deployment flow, including the
+`autheo-marketplace-v1` JWT template, the isolated JWKS-validating fixture, and
+all manual policy cases, see
+[`docs/devhub-marketplace-placement-policy.md`](../docs/devhub-marketplace-placement-policy.md).
 
 ## THEO settlement and market reference
 

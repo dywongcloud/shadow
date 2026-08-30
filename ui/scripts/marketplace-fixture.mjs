@@ -47,7 +47,7 @@ function placementPolicy(orderId, buyerTenantId, scenario) {
   const policy = {
     contract_version: scenario === "unsupported" ? 2 : 1,
     policy_version: 1,
-    marketplace_order_id: scenario === "malformed" ? "" : orderId,
+    marketplace_order_id: orderId,
     buyer_tenant_id: scenario === "tenant-mismatch" ? "clerk:user:someone-else" : buyerTenantId,
     status: scenario === "suspended" ? "suspended" : "active",
     revocation_state: scenario === "revoked" ? "revoked" : "not_revoked",
@@ -60,6 +60,7 @@ function placementPolicy(orderId, buyerTenantId, scenario) {
     resources: { vcpu: 1, memory_mb: 512, disk_gb: 1 },
     commercial: { currency: "USD", price_cents: 0 },
   };
+  if (scenario === "malformed") policy.unexpected_private_metadata = "rejected";
   return policy;
 }
 

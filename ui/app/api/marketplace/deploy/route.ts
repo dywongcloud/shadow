@@ -7,7 +7,7 @@ import {
   validateMarketplacePlacementPolicy,
 } from "@/lib/marketplace-placement-policy";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
-import { marketplaceUrl } from "@/lib/marketplace";
+import { marketplaceDeploymentUrl } from "@/lib/marketplace-deployment-server";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +21,29 @@ function optionalText(body: Record<string, unknown>, field: string, limit: numbe
     throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", `${field} must be a string no longer than ${limit} characters.`);
   }
   return value.trim() || undefined;
+}
+
+function safeRepositoryUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "repo_url must be an absolute HTTP(S) repository URL.");
+  }
+  if (
+    (url.protocol !== "https:" && url.protocol !== "http:") ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new MarketplacePolicyError(
+      400,
+      "INVALID_DEPLOY_INPUT",
+      "repo_url must be an HTTP(S) repository URL without embedded credentials, a query string, or a fragment.",
+    );
+  }
+  return url.toString();
 }
 
 function safeEnv(value: unknown): Record<string, string> | undefined {
@@ -56,15 +79,14 @@ export async function POST(req: NextRequest) {
   }
   try {
     const repoUrl = optionalText(body, "repo_url", 2048);
-    if (!repoUrl || !/^https?:\/\//i.test(repoUrl)) {
-      throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "repo_url must be an HTTP(S) repository URL.");
-    }
+    if (!repoUrl) throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "repo_url is required.");
+    const safeRepoUrl = safeRepositoryUrl(repoUrl);
     const project = optionalText(body, "project", 128);
     if (project && !PROJECT.test(project)) {
       throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "project contains unsupported characters.");
     }
     const rootDir = optionalText(body, "root_dir", 512);
-    if (rootDir && (rootDir.startsWith("/") || rootDir.split("/").some((part) => part === ".."))) {
+    if (rootDir && (rootDir.startsWith("/") || rootDir.includes("\\") || rootDir.split("/").some((part) => part === ".."))) {
       throw new MarketplacePolicyError(400, "INVALID_DEPLOY_INPUT", "root_dir must stay within the repository.");
     }
     const target = optionalText(body, "target", 32);
@@ -77,13 +99,13 @@ export async function POST(req: NextRequest) {
     if (!marketplaceJwt) {
       throw new MarketplacePolicyError(401, "MARKETPLACE_JWT_UNAVAILABLE", "Could not obtain the Clerk Marketplace token.");
     }
-    const response = await fetchMarketplacePlacementPolicy(marketplaceUrl(), marketplaceOrderId, marketplaceJwt);
+    const response = await fetchMarketplacePlacementPolicy(marketplaceDeploymentUrl(), marketplaceOrderId, marketplaceJwt);
     const marketplacePlacement = validateMarketplacePlacementPolicy(response, marketplaceOrderId, buyerTenantId);
 
     // Copy only ordinary deploy inputs. Never pass through client tenant,
     // buyer/provider/role/policy fields, authorization headers, or hive_jwt.
     const deploy: Record<string, unknown> = {
-      repo_url: repoUrl,
+      repo_url: safeRepoUrl,
       marketplace_placement: marketplacePlacement,
     };
     const branch = optionalText(body, "branch", 256);
