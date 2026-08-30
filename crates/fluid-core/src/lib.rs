@@ -3152,7 +3152,7 @@ fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
             .get("name")
             .and_then(|n| n.as_str())
             .unwrap_or("<unnamed>");
-        let mut check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
+        let check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
             if let Some(p) = v.as_str() {
                 p.parse::<ServiceProtocol>().map_err(|e| {
                     serde_json::Error::custom(format!("function {name:?}{ctx}: {e}"))

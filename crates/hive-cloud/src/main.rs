@@ -380,6 +380,11 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The default hook still prints exactly as before, while this additionally
+    // leaves the first panic on disk for restart_audit. That is essential for
+    // a double-panic abort: Rust's final "panic in a destructor" line hides
+    // the original failure that actually needs fixing.
+    restart_audit::install_panic_hook();
     // Install the process-level rustls CryptoProvider FIRST (later installs
     // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
     // rustls features, so any rustls user that runs before one of the lazy
