@@ -65,7 +65,7 @@ let introPlayed = false;
  *  entirely for prefers-reduced-motion. Rendered from first paint (SSR) so
  *  there's no pre-hydration flash of the hero. All layout is inline styles —
  *  deterministic, no class-generation dependency. */
-function IntroLoader() {
+export function OpeningSplash() {
   // On a remount after the intro already ran this page load, start (and stay)
   // done — no overlay frame at all. On the hydration mount `introPlayed` is
   // still false on both server and client, so SSR and the first client render
@@ -156,7 +156,7 @@ export function Landing() {
   return (
     <MarketingShell>
       {/* Intro loading animation (once per page load): ring + logo, then fade. */}
-      <IntroLoader />
+      <OpeningSplash />
       {/* ---------------- Hero ---------------- */}
       <section className="relative min-h-[44rem] overflow-hidden bg-[#020806]">
         <AutheoHeroLandscape />

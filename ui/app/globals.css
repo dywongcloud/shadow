@@ -87,14 +87,16 @@ body {
 }
 
 /* The workshop illustration is the light dashboard's shared hero canvas, not
-   just the public landing's decoration. It stays anchored behind each route's
-   cards, while the fine grid keeps empty portions of the workspace legible. */
+   just the public landing's decoration. Cover keeps the stencil full-bleed at
+   every viewport size, matching the Marketplace surface rather than leaving
+   the artwork in a narrow centered column. The fine grid keeps empty portions
+   of the workspace legible. */
 body {
   background-image:
     url("/images/developer-workshop-streetscape.png"),
     linear-gradient(to right, hsl(var(--foreground) / 0.01) 1px, transparent 1px),
     linear-gradient(to bottom, hsl(var(--foreground) / 0.01) 1px, transparent 1px);
-  background-size: min(1100px, 96vw) auto, 140px 140px, 140px 140px;
+  background-size: cover, 140px 140px, 140px 140px;
   background-position: center 4rem, -1px -1px, -1px -1px;
   background-repeat: no-repeat, repeat, repeat;
   background-attachment: fixed;
