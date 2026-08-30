@@ -9,6 +9,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
 import { VitalsBeacon } from "@/components/vitals-beacon";
+import { WalletProvider } from "@/components/wallet-connection";
 
 // schema.org JSON-LD so AI search / LLMs (and rich results) can parse what Autheo
 // is — structured, machine-readable content the AI-search era favors. Kept
@@ -138,6 +139,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <VitalsBeacon />
         <Toaster />
         <ThemeProvider>
+          <WalletProvider>
           {/* Dashboard chrome (top nav + footer + overlays) is auth-gated in a
               CLIENT component so it reacts to client-side login/logout — the
               signed-out landing renders its own full-bleed nav/footer. See
@@ -145,6 +147,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <ChromeTop />
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
           <ChromeBottom />
+          </WalletProvider>
         </ThemeProvider>
       </body>
     </html>

@@ -15,6 +15,7 @@ import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, switchTeam, mintSessionToken, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
 import { marketplaceUrl } from "@/lib/marketplace";
+import { WalletConnectionButton } from "@/components/wallet-connection";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
@@ -191,6 +192,7 @@ export function TopNav() {
               <ShieldHalf className="h-3.5 w-3.5" /> Ops
             </Link>
           )}
+          <WalletConnectionButton />
           <RunNodeControl />
           <NotificationBell />
           <ThemeToggle />

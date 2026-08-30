@@ -340,7 +340,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/invoices", get(billing_invoices))
         .route("/v1/billing/checkout", post(billing_checkout))
         .route("/v1/billing/addons", get(billing_addons))
+        .route("/v1/billing/wallet-config", get(billing_wallet_config))
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
+        .route("/v1/billing/checkout/:id/payment-intent", post(billing_payment_intent))
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/admin/billing/grant", post(billing_grant))
@@ -15150,6 +15152,12 @@ fn theo_network() -> Result<Value, (StatusCode, String)> {
     let rpc_url = std::env::var("THEO_RPC_URL").unwrap_or_default();
     let token_address = std::env::var("THEO_TOKEN_ADDRESS").unwrap_or_default();
     let treasury_address = std::env::var("THEO_TREASURY_ADDRESS").unwrap_or_default();
+    let token_decimals = std::env::var("THEO_TOKEN_DECIMALS").ok().and_then(|v| v.parse::<u8>().ok())
+        .filter(|decimals| (2..=36).contains(decimals))
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_TOKEN_DECIMALS is not configured safely".into()))?;
+    let required_confirmations = std::env::var("THEO_REQUIRED_CONFIRMATIONS").ok().and_then(|v| v.parse::<u64>().ok())
+        .filter(|confirmations| *confirmations > 0)
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_REQUIRED_CONFIRMATIONS is not configured safely".into()))?;
     if !rpc_url.starts_with("https://") || !is_evm_address(&token_address) || !is_evm_address(&treasury_address) {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "THEO wallet settlement is not configured safely".into()));
     }
@@ -15160,7 +15168,8 @@ fn theo_network() -> Result<Value, (StatusCode, String)> {
         "explorer_url": std::env::var("THEO_EXPLORER_URL").unwrap_or_default(),
         "token_address": token_address,
         "treasury_address": treasury_address,
-        "token_decimals": 18,
+        "token_decimals": token_decimals,
+        "required_confirmations": required_confirmations,
     }))
 }
 
@@ -15170,8 +15179,17 @@ fn is_evm_address(value: &str) -> bool {
 
 /// Existing catalog values are hundredths of THEO. Convert only the fixed,
 /// THEO-denominated catalog quantity to ERC-20 atomic units; never consult USD.
-fn checkout_theo_atomic(amount: u64) -> String {
-    (u128::from(amount) * 10u128.pow(16)).to_string()
+fn checkout_theo_atomic(amount: u64, token_decimals: u8) -> String {
+    (u128::from(amount) * 10u128.pow(u32::from(token_decimals - 2))).to_string()
+}
+
+/// Public, tenant-authenticated wallet parameters. These are operator-owned
+/// configuration values, never browser-provided addresses or token metadata.
+async fn billing_wallet_config(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
+    Ok(Json(theo_network()?))
 }
 
 /// Which purchasable addons this fleet can actually deliver, and when it
@@ -15349,10 +15367,34 @@ async fn billing_checkout(
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
     let network = theo_network()?;
+    let token_decimals = network["token_decimals"].as_u64().ok_or((StatusCode::SERVICE_UNAVAILABLE, "invalid THEO token decimals".into()))? as u8;
     Ok(Json(json!({
         "url": format!("/billing/checkout?session={}", co.id),
         "session": co.id,
-        "amount_theo_atomic": checkout_theo_atomic(amount),
+        "amount_theo_atomic": checkout_theo_atomic(amount, token_decimals),
+        "network": network,
+    })))
+}
+
+/// Minting this response does not change a checkout. It is the last
+/// server-verified, tenant-scoped intent fetched before a wallet is asked to
+/// sign, so the client cannot select its own recipient, token, or amount.
+async fn billing_payment_intent(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let co = c.billing.get_checkout(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if norm(&co.tenant) != t {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let network = theo_network().map_err(|(status, _)| status)?;
+    let decimals = network["token_decimals"].as_u64().ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8;
+    Ok(Json(json!({
+        "session": co.id,
+        "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),
         "network": network,
     })))
 }
@@ -15363,10 +15405,12 @@ pub(crate) async fn billing_checkout_get(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if let Some(co) = c.billing.get_checkout(&id) {
         let network = theo_network()?;
+        let decimals = network["token_decimals"].as_u64()
+            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "invalid THEO token decimals".into()))? as u8;
         return Ok(Json(json!({
             "id": co.id, "tenant": co.tenant, "kind": co.kind, "plan": co.plan,
             "sku": co.sku, "target": co.target,
-            "amount_theo_atomic": checkout_theo_atomic(co.amount_cents),
+            "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),
             "network": network,
         })));
     }
@@ -15423,13 +15467,24 @@ async fn verify_theo_settlement(
     }
     let input = tx.get("input").or_else(|| tx.get("data")).and_then(Value::as_str).unwrap_or("");
     let expected_to = lower(network["treasury_address"].as_str()).trim_start_matches("0x").to_string();
-    let expected_amount = format!("{:064x}", checkout_theo_atomic(checkout.amount_cents).parse::<u128>().map_err(|_| "invalid checkout amount")?);
+    let token_decimals = network["token_decimals"].as_u64().ok_or("missing token decimals")? as u8;
+    let expected_amount = format!("{:064x}", checkout_theo_atomic(checkout.amount_cents, token_decimals).parse::<u128>().map_err(|_| "invalid checkout amount")?);
     if input.len() != 138
         || !input.starts_with("0xa9059cbb")
         || input[34..74].to_ascii_lowercase() != format!("{expected_to:0>64}")
         || input[74..].to_ascii_lowercase() != expected_amount
     {
         return Err("transaction does not transfer the exact THEO checkout amount".into());
+    }
+    let confirmations = network["required_confirmations"].as_u64().ok_or("missing confirmation policy")?;
+    let receipt_block = receipt.get("blockNumber").and_then(Value::as_str)
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("transaction receipt has no block number")?;
+    let tip = theo_rpc(http, rpc, "eth_blockNumber", json!([])).await?
+        .as_str().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("invalid RPC block number")?;
+    if tip.saturating_sub(receipt_block).saturating_add(1) < confirmations {
+        return Err(format!("THEO transaction is awaiting {confirmations} required confirmations"));
     }
     Ok(())
 }
@@ -15479,10 +15534,16 @@ async fn billing_confirm(
             tracing::warn!(checkout = %co.id, error = %e, "THEO settlement verification failed");
             StatusCode::PAYMENT_REQUIRED
         })?;
-    let (co, acc) = c
+    let (co, acc, already_confirmed) = c
         .billing
-        .confirm_checkout(&req.session)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .confirm_theo_checkout(&req.session, &req.transaction_hash)
+        .map_err(|reason| {
+            tracing::warn!(checkout = %req.session, %reason, "THEO checkout confirmation refused");
+            StatusCode::CONFLICT
+        })?;
+    if already_confirmed {
+        return Ok(Json(json!({ "ok": true, "already_confirmed": true, "account": acc })));
+    }
     // `confirm_checkout` only moves the billing half; the effect for a
     // completed "plan"/"addon" checkout is dispatched here — never inside
     // `confirm_checkout` itself, same single-writer split as the "credits"
@@ -15512,7 +15573,7 @@ async fn billing_confirm(
             "THEO checkout {} {} {} atomic units",
             co.kind,
             co.plan,
-            checkout_theo_atomic(co.amount_cents)
+            checkout_theo_atomic(co.amount_cents, theo_network().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?["token_decimals"].as_u64().ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8)
         ),
     );
     crate::persist::persist(&c);

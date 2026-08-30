@@ -50,3 +50,27 @@ export function TheoMarketReference({ compact = false }: { compact?: boolean }) 
     </div>
   );
 }
+
+/** Secondary display only. The primary amount always remains THEO, including
+ * when the reference is stale or unavailable. */
+export function TheoUsdEstimate({ amountTheo }: { amountTheo: number }) {
+  const [data, setData] = useState<MarketReference | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/market-reference/theo", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((value: MarketReference) => { if (!cancelled) setData(value); })
+      .catch(() => { if (!cancelled) setData({ available: false }); });
+    return () => { cancelled = true; };
+  }, []);
+  if (!data?.available || !data.price_usd) {
+    return <p className="text-xs text-muted">USD reference only — display-only USD estimate unavailable.</p>;
+  }
+  const estimate = amountTheo * data.price_usd;
+  return (
+    <p className={`text-xs ${data.stale ? "text-amber-600" : "text-muted"}`}>
+      USD reference only — display-only USD estimate: ${estimate.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+      {data.stale ? " (market reference stale)" : ""}
+    </p>
+  );
+}
