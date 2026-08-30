@@ -3740,6 +3740,251 @@ async fn run_build(
         return Ok(());
     }
 
+    // Managed World auto-wiring: any project detected to use the Vercel
+    // Workflow SDK (JS/TS via the .well-known manifest the build step above
+    // already emitted, or Python via a vercel.json experimentalServices
+    // __wkf_* worker) gets BOTH halves of hive's own native World -- Queue
+    // (this dispatcher) and Storage (a real provisioned Redis, same
+    // provision() path as a database created from the dashboard) -- wired in
+    // by DEFAULT, unless it already brought its own Upstash/Redis world
+    // config (BYO opt-out) or sets fluid.json `{"workflow":{"world":
+    // "external"}}`. MUST run before `staged.prove_ready()` below, not after
+    // it: an app whose own build config (e.g. next.config.ts calling
+    // `process.env.WORKFLOW_TARGET_WORLD = "@open-workflow/world-redis"`)
+    // constructs its World client eagerly at server-startup import time
+    // throws/crashes with no HIVE_QUEUE_ENDPOINT/UPSTASH_REDIS_REST_URL yet
+    // set -- the process never binds its port, prove_ready() times out, and
+    // the `?` on it aborts run_build before ever reaching this block. Since
+    // this block only ever WROTE env for the NEXT deploy, that made the
+    // very first deploy of any true Workflow-SDK app permanently
+    // unrecoverable: every redeploy re-ran the identical unwired build and
+    // failed at the identical spot before ever getting a chance to wire
+    // itself. Moving it here, before prove_ready(), means a fresh project's
+    // FIRST deploy already has HIVE_QUEUE_ENDPOINT/_TOKEN in the env this
+    // build's own launch reads -- Storage (Redis) still finishes async in
+    // the background as before, since UPSTASH_REDIS_REST_URL only matters
+    // once the app actually calls into the World, not at process boot.
+    // Persisted via put_env (same mechanism/timing as every other project
+    // env var). Idempotent across redeploys: once Storage is provisioned,
+    // apply_db_egress sets UPSTASH_REDIS_REST_URL, which
+    // workflow_world_opted_out treats as BYO on every later deploy, so this
+    // block runs at most once per project. Deliberately does NOT set
+    // WORKFLOW_TARGET_WORLD itself: no @open-workflow/world-hive-equivalent
+    // package is published for tenant apps to import yet, and forcing that
+    // env var without a resolvable module would break an app that never
+    // asked for it -- what's wired now makes both backing services ready
+    // the moment a compatible World package is present (or, as here, the
+    // moment the app's OWN config points itself at world-redis), and
+    // world.rs's dashboard reader already falls back to
+    // UPSTASH_REDIS_REST_URL/_TOKEN so the Workflows tab lights up
+    // immediately once Storage finishes provisioning, independent of the
+    // World package.
+    {
+        let ingested_early = find_workflow_manifest(&build_dir).is_some();
+        let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
+        let opted_out =
+            crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
+        tracing::info!(
+            %project,
+            ingested_early,
+            py_wdk,
+            opted_out,
+            "workflow World auto-wiring gate evaluated (pre-launch)"
+        );
+        if (ingested_early || py_wdk) && !opted_out {
+            let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
+            // `tenant`'s sticky-inherit-from-peers resolution isn't bound
+            // until later in the pipeline; `project_settings.team` (already
+            // loaded above for the runtime-env resolution) is the same
+            // underlying source without that fallback -- fine for this
+            // auxiliary feature, which only tags the queue-client identity
+            // and the provisioned Redis's billing/quota owner.
+            let team = crate::admin::norm(&project_settings.team).to_string();
+            // Best-effort, same discipline as the `claim_database_exact` guard
+            // below: `put_env_exact`'s `?` used to propagate an incarnation
+            // mismatch straight out of `run_build` with NO log line at all,
+            // silently failing the whole (already-deployed) build. Track
+            // whether either write actually landed so a genuine failure here
+            // skips the Redis provisioning below instead of leaving env vars
+            // half-written, and always leaves a trace either way.
+            let mut queue_env_written = false;
+            if let Ok(queue_token) = crate::auth::issue(
+                "world-queue-client",
+                &team,
+                "service",
+                false,
+                365 * 24 * 3600,
+            ) {
+                let endpoint_result = cloud.projects.put_env_exact(
+                    &project,
+                    incarnation,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_ENDPOINT".into(),
+                        value: queue_url,
+                        target: "all".into(),
+                        scope: "runtime".into(),
+                        sensitive: false,
+                        updated_ms: now_ms(),
+                    },
+                );
+                let token_result = cloud.projects.put_env_exact(
+                    &project,
+                    incarnation,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_TOKEN".into(),
+                        value: queue_token,
+                        target: "all".into(),
+                        scope: "runtime".into(),
+                        sensitive: true,
+                        updated_ms: now_ms(),
+                    },
+                );
+                match (endpoint_result, token_result) {
+                    (Ok(()), Ok(())) => queue_env_written = true,
+                    (Err(error), _) | (_, Err(error)) => {
+                        tracing::warn!(
+                            %project,
+                            %incarnation,
+                            %error,
+                            "workflow queue env write lost project-incarnation authority — skipping World auto-wiring for this build, next deploy will retry"
+                        );
+                        log(
+                            "Vercel Workflow SDK detected, but a concurrent deploy raced the \
+                             queue env write -- skipped for this build; it will retry on the \
+                             next deploy."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if queue_env_written {
+                // Stamp HIVE_QUEUE_ENDPOINT/_TOKEN directly onto every
+                // function in THIS build's own manifest so the process this
+                // function is about to launch has them immediately --
+                // writing them via put_env_exact above only updates the
+                // persisted project record, and this build's own env
+                // (`runtime_env`/`env`) was already resolved into
+                // `manifest.functions[].env` earlier in the pipeline, well
+                // before this block runs.
+                if let Ok(fresh) = cloud.projects.get_exact(&project, incarnation) {
+                    let queue_env: Vec<(String, String)> = ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
+                        .into_iter()
+                        .filter_map(|key| {
+                            fresh
+                                .env
+                                .iter()
+                                .find(|e| e.key == key)
+                                .map(|value| (key.to_string(), value.value.clone()))
+                        })
+                        .collect();
+                    for f in manifest.functions.iter_mut() {
+                        for (k, v) in &queue_env {
+                            f.env.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let dbreq = crate::databases::ProvisionReq {
+                    name: "workflow-storage".into(),
+                    project: project.clone(),
+                    team,
+                    kind: crate::databases::DbKind::Redis,
+                    region: Some(cloud.region.clone()),
+                    provider: None,
+                    replicas: Vec::new(),
+                };
+                let cloud_ready = cloud.clone();
+                let ready_project = project.clone();
+                // Provisioning completes after this build returns. Keep it in
+                // the exact-incarnation drain set so project deletion cannot
+                // inventory storage until this callback has either committed
+                // under lifecycle authority or yielded to the delete.
+                let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
+                    ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
+                )));
+                let workflow_database = crate::databases::provision(
+                    cloud.databases.clone(),
+                    cloud.region.clone(),
+                    dbreq,
+                    cloud.db_domain.clone(),
+                    cloud.node_name.clone(),
+                    cloud.api_base(),
+                    move |d| {
+                        let cloud_ready = cloud_ready.clone();
+                        let ready_project = ready_project.clone();
+                        let completion_guard = completion_guard.clone();
+                        tokio::spawn(async move {
+                            // `provision` accepts `Fn`, not `FnOnce`, so
+                            // transfer the single reservation out exactly
+                            // once. Never hold it while awaiting the
+                            // lifecycle writer: deletion owns the writer
+                            // while it drains this exact reservation.
+                            let completion_guard = completion_guard.lock().take();
+                            drop(completion_guard);
+                            let _lifecycle =
+                                crate::project_settings::lifecycle_write(&ready_project).await;
+                            if cloud_ready
+                                .projects
+                                .get_exact(&ready_project, incarnation)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    project = %ready_project,
+                                    %incarnation,
+                                    database = %d.id,
+                                    "discarded delayed workflow-storage completion for a deleted project incarnation"
+                                );
+                                return;
+                            }
+                            if matches!(d.status, crate::databases::DbStatus::Ready) {
+                                crate::admin::apply_db_egress(&cloud_ready, &d);
+                            }
+                            crate::persist::persist(&cloud_ready);
+                        });
+                    },
+                );
+                // Best-effort, matching the WDK-manifest ingest above: a lost
+                // incarnation race here (a concurrent redeploy of the SAME
+                // project bumped it between this build's entry and this
+                // pipeline stage — the app itself has typically already
+                // deployed successfully by this point) must never fail the
+                // whole build. This previously returned `Err`, which the
+                // caller (`run_build`'s spawn site) turns into
+                // `DeployState::Error` for the ENTIRE deployment — a
+                // non-critical auxiliary feature (workflow storage
+                // auto-wiring) retroactively failing an already-successful
+                // app deployment. Tear down the orphaned database and just
+                // skip the wiring; the next deploy gets another chance.
+                if let Err(error) = cloud.projects.claim_database_exact(
+                    &project,
+                    incarnation,
+                    workflow_database.id.clone(),
+                ) {
+                    crate::databases::note_teardown_request(&workflow_database.id);
+                    cloud
+                        .databases
+                        .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
+                    tracing::warn!(
+                        %project,
+                        database = %workflow_database.id,
+                        %error,
+                        "workflow storage lost project-incarnation authority before admission — skipping auto-wiring for this build, next deploy will retry"
+                    );
+                    log(
+                        "Vercel Workflow SDK detected, but a concurrent deploy raced the storage \
+                         auto-wiring -- skipped for this build; it will retry on the next deploy."
+                            .to_string(),
+                    );
+                } else {
+                    log(format!(
+                        "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) active for this deploy, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- fully active from the next deploy.",
+                        if ingested_early { "JS/TS" } else { "Python" }
+                    ));
+                }
+            }
+        }
+    }
+
     // Build-time bytecode-cache warm-up: precompile the server's bytecode INTO
     // the artifact so a fresh microVM's first hit skips parse/compile. Dispatches
     // per the SINGLE resolved runtime (`hive_core::Runtime`, replacing what used
@@ -4440,208 +4685,11 @@ async fn run_build(
     // Ingest any Vercel WDK manifest the app emitted (`.well-known/workflow/v1/
     // manifest.json`) so its workflows + step graphs appear in the Workflows tab
     // and render on the canvas. Best-effort: a non-WDK app simply has none.
-    let ingested = ingest_workflow_manifest(cloud, &info.project, &build_dir).await;
+    let ingested = ingest_workflow_manifest(cloud, &project, &build_dir).await;
     if ingested > 0 {
         log(format!(
             "Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."
         ));
-    }
-
-    // Managed World auto-wiring: any project detected to use the Vercel
-    // Workflow SDK (JS/TS via the .well-known manifest just ingested above, or
-    // Python via a vercel.json experimentalServices __wkf_* worker) gets BOTH
-    // halves of hive's own native World -- Queue (this dispatcher) and Storage
-    // (a real provisioned Redis, same provision() path as a database created
-    // from the dashboard) -- wired in by DEFAULT, unless it already brought
-    // its own Upstash/Redis world config (BYO opt-out) or sets fluid.json
-    // `{"workflow":{"world":"external"}}`. Persisted via put_env (same
-    // mechanism/timing as every other project env var -- takes effect
-    // starting the NEXT deploy, since this build's function manifest is
-    // already finalized by this point in the pipeline). Idempotent across
-    // redeploys: once Storage is provisioned, apply_db_egress sets
-    // UPSTASH_REDIS_REST_URL, which workflow_world_opted_out treats as BYO on
-    // every later deploy, so this block runs at most once per project.
-    // Deliberately does NOT set WORKFLOW_TARGET_WORLD: no
-    // @open-workflow/world-hive-equivalent package is published for tenant
-    // apps to import yet, and forcing that env var without a resolvable
-    // module would break the app rather than help it -- what's wired now
-    // makes both backing services ready the moment a compatible World
-    // package is present, and world.rs's dashboard reader already falls back
-    // to UPSTASH_REDIS_REST_URL/_TOKEN so the Workflows tab lights up
-    // immediately once Storage finishes provisioning, independent of the
-    // World package.
-    {
-        let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        let opted_out =
-            crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir);
-        tracing::info!(
-            project = %info.project,
-            ingested,
-            py_wdk,
-            opted_out,
-            "workflow World auto-wiring gate evaluated"
-        );
-        if (ingested > 0 || py_wdk) && !opted_out {
-            let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
-            let team = crate::admin::norm(&tenant).to_string();
-            // Best-effort, same discipline as the `claim_database_exact` guard
-            // below: `put_env_exact`'s `?` used to propagate an incarnation
-            // mismatch straight out of `run_build` with NO log line at all,
-            // silently failing the whole (already-deployed) build. Track
-            // whether either write actually landed so a genuine failure here
-            // skips the Redis provisioning below instead of leaving env vars
-            // half-written, and always leaves a trace either way.
-            let mut queue_env_written = false;
-            if let Ok(queue_token) = crate::auth::issue(
-                "world-queue-client",
-                &team,
-                "service",
-                false,
-                365 * 24 * 3600,
-            ) {
-                let endpoint_result = cloud.projects.put_env_exact(
-                    &info.project,
-                    incarnation,
-                    crate::project_settings::EnvVar {
-                        key: "HIVE_QUEUE_ENDPOINT".into(),
-                        value: queue_url,
-                        target: "all".into(),
-                        scope: "runtime".into(),
-                        sensitive: false,
-                        updated_ms: now_ms(),
-                    },
-                );
-                let token_result = cloud.projects.put_env_exact(
-                    &info.project,
-                    incarnation,
-                    crate::project_settings::EnvVar {
-                        key: "HIVE_QUEUE_TOKEN".into(),
-                        value: queue_token,
-                        target: "all".into(),
-                        scope: "runtime".into(),
-                        sensitive: true,
-                        updated_ms: now_ms(),
-                    },
-                );
-                match (endpoint_result, token_result) {
-                    (Ok(()), Ok(())) => queue_env_written = true,
-                    (Err(error), _) | (_, Err(error)) => {
-                        tracing::warn!(
-                            project = %info.project,
-                            %incarnation,
-                            %error,
-                            "workflow queue env write lost project-incarnation authority — skipping World auto-wiring for this build, next deploy will retry"
-                        );
-                        log(
-                            "Vercel Workflow SDK detected, but a concurrent deploy raced the \
-                             queue env write -- skipped for this build; it will retry on the \
-                             next deploy."
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            if queue_env_written {
-                let req = crate::databases::ProvisionReq {
-                    name: "workflow-storage".into(),
-                    project: info.project.clone(),
-                    team,
-                    kind: crate::databases::DbKind::Redis,
-                    region: Some(cloud.region.clone()),
-                    provider: None,
-                    replicas: Vec::new(),
-                };
-                let cloud_ready = cloud.clone();
-                let ready_project = info.project.clone();
-                // Provisioning completes after this build returns. Keep it in
-                // the exact-incarnation drain set so project deletion cannot
-                // inventory storage until this callback has either committed
-                // under lifecycle authority or yielded to the delete.
-                let completion_guard = Arc::new(parking_lot::Mutex::new(Some(
-                    ActiveCheckoutGuard::new(build_dir.clone(), &ready_project, incarnation),
-                )));
-                let workflow_database = crate::databases::provision(
-                    cloud.databases.clone(),
-                    cloud.region.clone(),
-                    req,
-                    cloud.db_domain.clone(),
-                    cloud.node_name.clone(),
-                    cloud.api_base(),
-                    move |d| {
-                        let cloud_ready = cloud_ready.clone();
-                        let ready_project = ready_project.clone();
-                        let completion_guard = completion_guard.clone();
-                        tokio::spawn(async move {
-                            // `provision` accepts `Fn`, not `FnOnce`, so
-                            // transfer the single reservation out exactly
-                            // once. Never hold it while awaiting the
-                            // lifecycle writer: deletion owns the writer
-                            // while it drains this exact reservation.
-                            let completion_guard = completion_guard.lock().take();
-                            drop(completion_guard);
-                            let _lifecycle =
-                                crate::project_settings::lifecycle_write(&ready_project).await;
-                            if cloud_ready
-                                .projects
-                                .get_exact(&ready_project, incarnation)
-                                .is_err()
-                            {
-                                tracing::warn!(
-                                    project = %ready_project,
-                                    %incarnation,
-                                    database = %d.id,
-                                    "discarded delayed workflow-storage completion for a deleted project incarnation"
-                                );
-                                return;
-                            }
-                            if matches!(d.status, crate::databases::DbStatus::Ready) {
-                                crate::admin::apply_db_egress(&cloud_ready, &d);
-                            }
-                            crate::persist::persist(&cloud_ready);
-                        });
-                    },
-                );
-                // Best-effort, matching the WDK-manifest ingest above: a lost
-                // incarnation race here (a concurrent redeploy of the SAME
-                // project bumped it between this build's entry and this late
-                // pipeline stage — the app itself has typically already
-                // deployed successfully by this point) must never fail the
-                // whole build. This previously returned `Err`, which the
-                // caller (`run_build`'s spawn site) turns into
-                // `DeployState::Error` for the ENTIRE deployment — a
-                // non-critical auxiliary feature (workflow storage
-                // auto-wiring) retroactively failing an already-successful
-                // app deployment. Tear down the orphaned database and just
-                // skip the wiring; the next deploy gets another chance.
-                if let Err(error) = cloud.projects.claim_database_exact(
-                    &info.project,
-                    incarnation,
-                    workflow_database.id.clone(),
-                ) {
-                    crate::databases::note_teardown_request(&workflow_database.id);
-                    cloud
-                        .databases
-                        .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
-                    tracing::warn!(
-                        project = %info.project,
-                        database = %workflow_database.id,
-                        %error,
-                        "workflow storage lost project-incarnation authority before admission — skipping auto-wiring for this build, next deploy will retry"
-                    );
-                    log(
-                        "Vercel Workflow SDK detected, but a concurrent deploy raced the storage \
-                         auto-wiring -- skipped for this build; it will retry on the next deploy."
-                            .to_string(),
-                    );
-                } else {
-                    log(format!(
-                        "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
-                        if ingested > 0 { "JS/TS" } else { "Python" }
-                    ));
-                }
-            }
-        }
     }
 
     // The host THIS deployment answers on. `info.alias` is the PROJECT's
@@ -7668,6 +7716,37 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
     }
 }
 
+/// Walk up from `dir` looking for `node_modules/next/dist/bin/next` as a
+/// regular file — Next's real CLI entry, independent of npm's `.bin/next`
+/// shim (see `detect_start_cmd`'s doc comment for why the shim path is
+/// broken on this platform's sealed runtime artifacts). Mirrors
+/// `litebox.rs`'s `next_entry_for` walk-up exactly, so both resolve the
+/// identical real path for the identical reason. Returns a path RELATIVE to
+/// `dir` (e.g. `node_modules/next/dist/bin/next` or, in a monorepo,
+/// `../../node_modules/next/dist/bin/next`) — `start_cmd[0]` is resolved
+/// against the deployed workdir at launch time
+/// (`Command::new(&func.start_cmd[0]).current_dir(&workdir)` in mock.rs),
+/// never against this build-time absolute path, which will not exist once
+/// the app is sealed into its own runtime-artifact directory.
+async fn find_next_dist_bin(dir: &Path) -> Option<String> {
+    let mut up = PathBuf::new();
+    let mut base = dir.to_path_buf();
+    loop {
+        let candidate = base.join("node_modules/next/dist/bin/next");
+        if tokio::fs::metadata(&candidate)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
+            let relative = up.join("node_modules/next/dist/bin/next");
+            return Some(relative.to_str()?.to_string());
+        }
+        if !base.pop() {
+            return None;
+        }
+        up.push("..");
+    }
+}
+
 /// The command that boots the built app's production server.
 async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Vec<String> {
     if runtime == Some(hive_core::Runtime::Wasmer) {
@@ -7678,7 +7757,49 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
     let bun = runtime == Some(hive_core::Runtime::Bun);
     if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
-            if v.get("scripts").and_then(|s| s.get("start")).is_some() {
+            if let Some(start_script) = v
+                .get("scripts")
+                .and_then(|s| s.get("start"))
+                .and_then(|s| s.as_str())
+            {
+                // A plain `next start` script resolves through `npm start` ->
+                // `node_modules/.bin/next`, and on every backend that runs this
+                // as a real host process (mock; litebox independently works
+                // around the identical problem at its own layer — see
+                // `litebox.rs`'s `next_entry_for`) `.bin/next` is NOT the npm-
+                // created symlink to `node_modules/next/dist/bin/next`: the
+                // runtime-artifact sealing step (`runtime_artifact.rs`,
+                // `materialize_entry`) dereferences every symlink into a flat
+                // byte-for-byte copy for its content-addressed integrity
+                // hashing, npm .bin shims included. Next's own `bin/next`
+                // script does `require("../server/require-hook")` — a path
+                // valid ONLY relative to its real location
+                // (`next/dist/bin/`) — so the flattened copy at `.bin/next`
+                // throws `Cannot find module '../server/require-hook'` on
+                // EVERY cold start, 100% reproducible, confirmed live against
+                // a real sealed artifact. Preserving symlinks through sealing
+                // is the deeper fix but touches security-critical,
+                // integrity-hashing code shared by every deployment on every
+                // backend; resolving the well-known `next start` shape to
+                // Next's real dist/bin entry here — mirroring the exact
+                // working pattern litebox already uses independently — fixes
+                // it without touching sealing at all. Text-matched, not
+                // shelled out to: `next start` / `next start -p $PORT` /
+                // `next start -p ${PORT}` are the only shapes recognized, so
+                // an app with extra flags or env prefixes (`NODE_ENV=x next
+                // start`) falls through unchanged to the ordinary npm-start
+                // path below.
+                if !bun {
+                    let trimmed = start_script.trim();
+                    let is_plain_next_start = trimmed == "next start"
+                        || trimmed == "next start -p $PORT"
+                        || trimmed == "next start -p ${PORT}";
+                    if is_plain_next_start {
+                        if let Some(next_bin) = find_next_dist_bin(dir).await {
+                            return vec!["node".into(), next_bin, "start".into()];
+                        }
+                    }
+                }
                 // Bun's own script-runner honors package.json#scripts.start
                 // identically to `npm start` (package.json-script INDIRECTION —
                 // the script's own text is executed as a shell command), so
