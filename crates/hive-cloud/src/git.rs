@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "The optional build-cache and runtime-warmup paths remain compiled for capability validation, but are not enabled by the current deployment flow."
+)]
+
 //! Deploy from a git repository with a live, Vercel-style **build log**.
 //!
 //! `start_build` creates a build record (state = building) and returns its id
@@ -689,11 +694,7 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     let out = out
         .trim_matches(|c| c == '-' || c == '.' || c == '_')
         .to_string();
-    if out.is_empty() {
-        "app".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "app".into() } else { out }
 }
 
 pub(crate) fn project_volume_name(
@@ -3005,9 +3006,10 @@ async fn run_build(
             selection.relative.to_string_lossy().replace('\\', "/")
         };
         log(format!(
-            "Auto-detected workspace app: {relative} ({}; evidence: {}).",
+            "Auto-detected workspace app: {relative} ({}; evidence: {}; decision: {}).",
             selection.workspace_source,
-            selection.evidence.join(", ")
+            selection.evidence.join(", "),
+            selection.decision_digest,
         ));
         let selected = if selection.relative.as_os_str().is_empty() {
             checkout_dir.clone()
@@ -3656,8 +3658,7 @@ async fn run_build(
             })
             .collect();
         if !dropped.is_empty() {
-            let msg =
-                format!(
+            let msg = format!(
                 "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
                  `functions[].browser` for {}, but this project builds through the {} path, which \
                  constructs its own function list and cannot carry a per-function browser opt-in. \
@@ -3678,7 +3679,11 @@ async fn run_build(
                     })
                     .collect::<Vec<_>>()
                     .join(", "),
-                if is_container { "container" } else { "framework-detected" },
+                if is_container {
+                    "container"
+                } else {
+                    "framework-detected"
+                },
                 manifest
                     .functions
                     .iter()
@@ -3904,7 +3909,11 @@ async fn run_build(
         Ok(ports) if !ports.is_empty() => {
             log(format!(
                 "Allocated public raw port(s): {} (stable across redeploys).",
-                ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             // A compose publish request asked for a LITERAL host port. Name the
             // outcome for every such spec — grant == request is confirmation,
@@ -4888,22 +4897,22 @@ async fn mirror_remote_build(
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
-                                              // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-                                              // anonymous tenant, `build_owned_by` never matched the build's real
-                                              // team, and every poll 404'd — INCLUDING every poll against a target
-                                              // build that had already finished. Verified live: 400/400 polls failed
-                                              // for a target build that reached `ready` in under 3 seconds, on a
-                                              // reachable node, every single time. This is not a mesh-health symptom;
-                                              // it silently broke remote-build status mirroring for every
-                                              // fanout-placed deployment on the whole fleet, always burning the full
-                                              // 10-minute deadline regardless of how fast the actual remote build was.
-                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
-                                              // every other mesh-internal proxied read (`fetch_from_host` and
-                                              // friends) — the coordinator knows the real owning team from its own
-                                              // local build record, so it can assert it the same way.
+    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
+    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+    // anonymous tenant, `build_owned_by` never matched the build's real
+    // team, and every poll 404'd — INCLUDING every poll against a target
+    // build that had already finished. Verified live: 400/400 polls failed
+    // for a target build that reached `ready` in under 3 seconds, on a
+    // reachable node, every single time. This is not a mesh-health symptom;
+    // it silently broke remote-build status mirroring for every
+    // fanout-placed deployment on the whole fleet, always burning the full
+    // 10-minute deadline regardless of how fast the actual remote build was.
+    // `mesh_team_qs` is the SAME delegation-token minting already used for
+    // every other mesh-internal proxied read (`fetch_from_host` and
+    // friends) — the coordinator knows the real owning team from its own
+    // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -5000,7 +5009,12 @@ async fn mirror_remote_build(
                 );
             }
             if now_ms() > deadline {
-                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
+                cloud.builds.log(
+                    bid,
+                    format!(
+                        "✗ {node}: lost contact with remote build after {polls_failed} failed polls"
+                    ),
+                );
                 // NOT a build failure: this node never told us its app failed —
                 // we simply could not read it. Treated as unreachable so it
                 // degrades capacity instead of vetoing healthy regions.
@@ -5656,7 +5670,9 @@ impl<'a> PackageManagerLauncher<'a> {
 
     fn add_svelte_adapter(&self) -> String {
         let arguments = match self.detection.manager {
-            "npm" => "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\"",
+            "npm" => {
+                "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\""
+            }
             "pnpm" => "add -D --lockfile=false --config.strict-peer-dependencies=false \"$spec\"",
             "yarn" => "add -D \"$spec\"",
             "bun" => "add -d \"$spec\"",
@@ -6311,7 +6327,9 @@ trap - EXIT HUP INT TERM
                     let prm = fluid_build::per_route::discover(&next_dir);
                     log(format!(
                         "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
-                        prm.routes.len(), prm.eligible_count(), prm.fallback_count()
+                        prm.routes.len(),
+                        prm.eligible_count(),
+                        prm.fallback_count()
                     ));
                     // Map build-time classification -> runtime policy (#16), persisted
                     // into the manifest so the serve path can apply route-type-aware
@@ -7485,7 +7503,9 @@ async fn warmup_bun_bytecode(
                 .to_string_lossy()
                 .into_owned();
             let ver = bun_version(&bun_bin).await.unwrap_or_else(|| "?".into());
-            log(format!("Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."));
+            log(format!(
+                "Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."
+            ));
             vec!["bun".to_string(), "run".to_string(), rel]
         }
         Ok(o) => {
@@ -7494,11 +7514,15 @@ async fn warmup_bun_bytecode(
                 .chars()
                 .take(300)
                 .collect();
-            log(format!("Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."));
+            log(format!(
+                "Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."
+            ));
             original
         }
         Err(e) => {
-            log(format!("Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."));
+            log(format!(
+                "Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."
+            ));
             original
         }
     }
@@ -7945,11 +7969,7 @@ async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
         Ok(Ok(output)) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stdout.is_empty() {
-                stderr
-            } else {
-                stdout
-            }
+            if stdout.is_empty() { stderr } else { stdout }
         }
         _ => "unavailable".to_string(),
     }
@@ -8404,8 +8424,8 @@ async fn parse_expose(path: &Path) -> Option<u16> {
 /// trailingSlash, images, crons, and per-function overrides (matched by glob).
 fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
     use fluid_core::{
-        redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
-        Redirect, RemotePattern, Rewrite, RuleCondition,
+        CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern, Redirect,
+        RemotePattern, Rewrite, RuleCondition, redirect_status,
     };
 
     let conv_conds = |cs: &[fluid_build::VercelCondition]| -> Vec<RuleCondition> {
@@ -9978,9 +9998,11 @@ mod tests {
         assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
         // No server function yet → None even for opennext.
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(adapter_manifest("p", "opennext", &dir, None)
-            .await
-            .is_none());
+        assert!(
+            adapter_manifest("p", "opennext", &dir, None)
+                .await
+                .is_none()
+        );
         // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
         std::fs::write(
@@ -10536,13 +10558,15 @@ mod tests {
         assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
         assert_eq!(sanitize_tag(""), "app");
         // Only [a-z0-9._-] survive.
-        assert!(sanitize_tag("Foo/Bar:Baz")
-            .chars()
-            .all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || c == '.'
-                || c == '_'
-                || c == '-'));
+        assert!(
+            sanitize_tag("Foo/Bar:Baz")
+                .chars()
+                .all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == '.'
+                    || c == '_'
+                    || c == '-')
+        );
     }
 
     #[test]

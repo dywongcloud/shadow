@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Snapshot migration helpers must ship alongside the active GuardianDB format so they can be enabled during a controlled data migration."
+)]
+
 //! GuardianDB backend — **always on**, in local/dev and production alike.
 //!
 //! [guardian-db] is an iroh-native, content-addressed store (iroh-docs +
@@ -20,9 +25,9 @@
 
 use std::sync::{Arc, OnceLock};
 
+use guardian_db::guardian::GuardianDB;
 use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::guardian::error::GuardianError;
-use guardian_db::guardian::GuardianDB;
 use guardian_db::p2p::network::client::IrohClient;
 use guardian_db::p2p::network::config::ClientConfig;
 use guardian_db::traits::KeyValueStore;
@@ -164,8 +169,8 @@ static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static INIT_INFLIGHT: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> =
     std::sync::Mutex::new(None);
 
-fn inflight_slot(
-) -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
+fn inflight_slot()
+-> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
     // A poisoned lock here must not take guardian down — the slot holds a
     // JoinHandle, and recovering it is strictly better than failing init.
     INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
@@ -6594,8 +6599,8 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
 /// Served over the mesh at `GET /v1/guardian/heads` (see `admin::guardian_heads`
 /// + `gossip::dispatch`) so a peer can diff against its own without pulling
 /// any content.
-pub async fn namespace_heads(
-) -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
+pub async fn namespace_heads()
+-> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
     let mut out = std::collections::HashMap::new();
     if let Ok(h) = handle().await {
         match h.kv.entry_heads().await {

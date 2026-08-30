@@ -4,22 +4,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, patch, post, put},
-    Json, Router,
 };
 use base64::Engine;
 use fluid_gateway::{RumDevice, RumRaw};
-use hive_core::{now_ms, BuildJob, JobState, ResourceSpec};
+use hive_core::{BuildJob, JobState, ResourceSpec, now_ms};
 use hive_edge::{
+    CronJob, WorkflowDef,
     bot::BotPolicy,
     routing::{Redirect, Rewrite},
     waf::WafRule,
-    CronJob, WorkflowDef,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::state::CloudState;
@@ -346,8 +346,12 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/addons", get(billing_addons))
         .route("/v1/billing/wallet-config", get(billing_wallet_config))
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
-        .route("/v1/billing/checkout/:id/payment-intent", post(billing_payment_intent))
+        .route(
+            "/v1/billing/checkout/:id/payment-intent",
+            post(billing_payment_intent),
+        )
         .route("/v1/billing/confirm", post(billing_confirm))
+        .route("/v1/billing/webhook", post(billing_webhook))
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
@@ -1068,7 +1072,9 @@ pub(crate) async fn project_network_put(
             }
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!("project '{project}' is hosted on node '{node}' but the network-edit forward failed"),
+                format!(
+                    "project '{project}' is hosted on node '{node}' but the network-edit forward failed"
+                ),
             ));
         }
         return Err((
@@ -1426,7 +1432,9 @@ async fn activate_domain_alias(
     }
     Err((
         StatusCode::BAD_GATEWAY,
-        format!("project '{project}' is hosted on node '{node}' but the domain activation forward failed"),
+        format!(
+            "project '{project}' is hosted on node '{node}' but the domain activation forward failed"
+        ),
     ))
 }
 
@@ -3675,11 +3683,7 @@ fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
 
 /// Normalize an owner slug: empty/absent => "personal".
 pub(crate) fn norm(team: &str) -> &str {
-    if team.is_empty() {
-        "personal"
-    } else {
-        team
-    }
+    if team.is_empty() { "personal" } else { team }
 }
 
 /// Multi-tenant ownership guard: resolve the caller's tenant and verify it owns
@@ -7055,7 +7059,9 @@ async fn project_redeploy(
         }
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("The uploaded source for '{project}' is not available on a reachable node — re-upload the archive to redeploy."),
+            format!(
+                "The uploaded source for '{project}' is not available on a reachable node — re-upload the archive to redeploy."
+            ),
         ));
     }
 
@@ -7069,7 +7075,9 @@ async fn project_redeploy(
         let Some(image_ref) = image_ref else {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("The image reference for '{project}' is unavailable — redeploy from a new image."),
+                format!(
+                    "The image reference for '{project}' is unavailable — redeploy from a new image."
+                ),
             ));
         };
         let mut req = redeploy_request(
@@ -7380,7 +7388,9 @@ async fn git_webhook(
                 .into(),
         ));
     } else {
-        tracing::warn!("accepting UNSIGNED webhook delivery (GITHUB_WEBHOOK_ALLOW_UNSIGNED=1) — re-sign this hook to restore signature verification");
+        tracing::warn!(
+            "accepting UNSIGNED webhook delivery (GITHUB_WEBHOOK_ALLOW_UNSIGNED=1) — re-sign this hook to restore signature verification"
+        );
     }
 
     let event = headers
@@ -7522,7 +7532,9 @@ async fn git_webhook(
     let candidates: Vec<String> = if !c.git_index.is_empty() {
         c.git_index.projects_for(&want)
     } else {
-        tracing::warn!("git_webhook: reverse index is empty/uninitialized — falling back to a full project scan");
+        tracing::warn!(
+            "git_webhook: reverse index is empty/uninitialized — falling back to a full project scan"
+        );
         c.projects.snapshot().into_keys().collect()
     };
 
@@ -11221,12 +11233,13 @@ async fn apikeys_list(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    Json(json!(c
-        .apikeys
-        .list(&t)
-        .iter()
-        .map(|k| k.public())
-        .collect::<Vec<_>>()))
+    Json(json!(
+        c.apikeys
+            .list(&t)
+            .iter()
+            .map(|k| k.public())
+            .collect::<Vec<_>>()
+    ))
 }
 
 async fn apikey_create(
@@ -11269,12 +11282,13 @@ async fn integrations_list(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    Json(json!(c
-        .integrations
-        .list(&t)
-        .iter()
-        .map(|i| i.public())
-        .collect::<Vec<_>>()))
+    Json(json!(
+        c.integrations
+            .list(&t)
+            .iter()
+            .map(|i| i.public())
+            .collect::<Vec<_>>()
+    ))
 }
 
 async fn integration_upsert(
@@ -13024,7 +13038,9 @@ fn write_scope(
             return match team {
                 Some(team) if !team.is_empty() => (team, true),
                 _ => {
-                    tracing::warn!("mirror write rejected: missing/invalid x-hive-mirror-tok under enforced auth");
+                    tracing::warn!(
+                        "mirror write rejected: missing/invalid x-hive-mirror-tok under enforced auth"
+                    );
                     (tenant(c, h, claims), false)
                 }
             };
@@ -13941,7 +13957,9 @@ async fn forward_mutation_to_leader(
     let Some(admin) = admin else {
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("this mutation must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"),
+            format!(
+                "this mutation must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"
+            ),
         ));
     };
     let mut req = c
@@ -15150,20 +15168,41 @@ fn default_kind() -> String {
 /// Public wallet configuration. Every value comes from operator configuration:
 /// this process never holds a wallet secret and cannot sign a customer payment.
 fn theo_network() -> Result<Value, (StatusCode, String)> {
-    let chain_id = std::env::var("THEO_CHAIN_ID").ok().and_then(|v| v.parse::<u64>().ok())
+    let chain_id = std::env::var("THEO_CHAIN_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|id| *id > 0)
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_CHAIN_ID is not configured".into()))?;
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_CHAIN_ID is not configured".into(),
+        ))?;
     let rpc_url = std::env::var("THEO_RPC_URL").unwrap_or_default();
     let token_address = std::env::var("THEO_TOKEN_ADDRESS").unwrap_or_default();
     let treasury_address = std::env::var("THEO_TREASURY_ADDRESS").unwrap_or_default();
-    let token_decimals = std::env::var("THEO_TOKEN_DECIMALS").ok().and_then(|v| v.parse::<u8>().ok())
+    let token_decimals = std::env::var("THEO_TOKEN_DECIMALS")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
         .filter(|decimals| (2..=36).contains(decimals))
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_TOKEN_DECIMALS is not configured safely".into()))?;
-    let required_confirmations = std::env::var("THEO_REQUIRED_CONFIRMATIONS").ok().and_then(|v| v.parse::<u64>().ok())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_TOKEN_DECIMALS is not configured safely".into(),
+        ))?;
+    let required_confirmations = std::env::var("THEO_REQUIRED_CONFIRMATIONS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|confirmations| *confirmations > 0)
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "THEO_REQUIRED_CONFIRMATIONS is not configured safely".into()))?;
-    if !rpc_url.starts_with("https://") || !is_evm_address(&token_address) || !is_evm_address(&treasury_address) {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "THEO wallet settlement is not configured safely".into()));
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO_REQUIRED_CONFIRMATIONS is not configured safely".into(),
+        ))?;
+    if !rpc_url.starts_with("https://")
+        || !is_evm_address(&token_address)
+        || !is_evm_address(&treasury_address)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "THEO wallet settlement is not configured safely".into(),
+        ));
     }
     Ok(json!({
         "chain_id": chain_id,
@@ -15178,7 +15217,9 @@ fn theo_network() -> Result<Value, (StatusCode, String)> {
 }
 
 fn is_evm_address(value: &str) -> bool {
-    value.len() == 42 && value.starts_with("0x") && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Existing catalog values are hundredths of THEO. Convert only the fixed,
@@ -15240,67 +15281,57 @@ async fn billing_checkout(
     // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
-    let (plan, amount): (String, u64) =
-        match req.kind.as_str() {
-            "credits" => {
-                let amt = req.amount_cents.unwrap_or(1000);
-                (
-                    "".to_string(),
-                    amt,
-                )
+    let (plan, amount): (String, u64) = match req.kind.as_str() {
+        "credits" => {
+            let amt = req.amount_cents.unwrap_or(1000);
+            ("".to_string(), amt)
+        }
+        "addon" => {
+            if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown addon sku {:?} — the only addon today is {:?}",
+                        req.sku.as_deref().unwrap_or(""),
+                        crate::tencent_eip::SKU
+                    ),
+                ));
             }
-            "addon" => {
-                if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "unknown addon sku {:?} — the only addon today is {:?}",
-                            req.sku.as_deref().unwrap_or(""),
-                            crate::tencent_eip::SKU
-                        ),
-                    ));
-                }
-                target = req.target.clone().unwrap_or_default();
-                if target.is_empty() {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "this addon is purchased for a specific project, but no project was named"
-                            .into(),
-                    ));
-                }
-                if !project_owned_by(&c, &target, norm(&t)) {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!("project {target:?} is not owned by your team"),
-                    ));
-                }
-                // PREFLIGHT before any checkout record exists: discovering
-                // missing config after confirming a checkout left a confirmed
-                // purchase with no address, and told the buyer nothing.
-                if let Err(why) = crate::tencent_eip::preflight() {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "Dedicated IPv4 is not available on this fleet yet: {why}. This is an \
+            target = req.target.clone().unwrap_or_default();
+            if target.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "this addon is purchased for a specific project, but no project was named"
+                        .into(),
+                ));
+            }
+            if !project_owned_by(&c, &target, norm(&t)) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("project {target:?} is not owned by your team"),
+                ));
+            }
+            // PREFLIGHT before any checkout record exists: discovering
+            // missing config after confirming a checkout left a confirmed
+            // purchase with no address, and told the buyer nothing.
+            if let Err(why) = crate::tencent_eip::preflight() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Dedicated IPv4 is not available on this fleet yet: {why}. This is an \
                              operator setup step (Tencent API credentials, EIP region and the \
                              node's CVM instance id) — nothing was purchased or charged."
-                        ),
-                    ));
-                }
-                (
-                    "".to_string(),
-                    crate::tencent_eip::PRICE_CENTS,
-                )
+                    ),
+                ));
             }
-            _ => {
-                let plan = req.plan.unwrap_or_else(|| "pro".into());
-                let spec = crate::billing::plan_spec(&plan);
-                (
-                    plan,
-                    spec.price_cents,
-                )
-            }
-        };
+            ("".to_string(), crate::tencent_eip::PRICE_CENTS)
+        }
+        _ => {
+            let plan = req.plan.unwrap_or_else(|| "pro".into());
+            let spec = crate::billing::plan_spec(&plan);
+            (plan, spec.price_cents)
+        }
+    };
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
@@ -15350,7 +15381,9 @@ async fn billing_checkout(
                     &format!("dedicated_ipv4 for {target} (testing price, $0)"),
                 );
                 crate::persist::persist(&c);
-                return Ok(Json(json!({ "url": "", "applied": true, "dedicated_ipv4": alloc })));
+                return Ok(Json(
+                    json!({ "url": "", "applied": true, "dedicated_ipv4": alloc }),
+                ));
             }
             Err(e) => {
                 tracing::error!(checkout = %co.id, tenant = %t, error = %e, "dedicated_ipv4 provisioning failed ($0 testing path)");
@@ -15371,7 +15404,10 @@ async fn billing_checkout(
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
     let network = theo_network()?;
-    let token_decimals = network["token_decimals"].as_u64().ok_or((StatusCode::SERVICE_UNAVAILABLE, "invalid THEO token decimals".into()))? as u8;
+    let token_decimals = network["token_decimals"].as_u64().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "invalid THEO token decimals".into(),
+    ))? as u8;
     Ok(Json(json!({
         "url": format!("/billing/checkout?session={}", co.id),
         "session": co.id,
@@ -15395,15 +15431,16 @@ async fn billing_payment_intent(
         .get_checkout(&id)
         .ok_or((StatusCode::NOT_FOUND, "checkout not found".into()))?;
     if norm(&co.tenant) != t {
-        return Err((StatusCode::FORBIDDEN, "checkout belongs to another tenant".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "checkout belongs to another tenant".into(),
+        ));
     }
     let network = theo_network()?;
-    let decimals = network["token_decimals"]
-        .as_u64()
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "invalid THEO token decimals".into(),
-        ))? as u8;
+    let decimals = network["token_decimals"].as_u64().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "invalid THEO token decimals".into(),
+    ))? as u8;
     Ok(Json(json!({
         "session": co.id,
         "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),
@@ -15417,8 +15454,10 @@ pub(crate) async fn billing_checkout_get(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if let Some(co) = c.billing.get_checkout(&id) {
         let network = theo_network()?;
-        let decimals = network["token_decimals"].as_u64()
-            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "invalid THEO token decimals".into()))? as u8;
+        let decimals = network["token_decimals"].as_u64().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invalid THEO token decimals".into(),
+        ))? as u8;
         return Ok(Json(json!({
             "id": co.id, "tenant": co.tenant, "kind": co.kind, "plan": co.plan,
             "sku": co.sku, "target": co.target,
@@ -15465,22 +15504,56 @@ async fn verify_theo_settlement(
     let rpc = network["rpc_url"].as_str().ok_or("missing RPC URL")?;
     let expected_chain = network["chain_id"].as_u64().ok_or("missing chain id")?;
     let chain = theo_rpc(http, rpc, "eth_chainId", json!([])).await?;
-    let chain = chain.as_str().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).ok_or("invalid RPC chain id")?;
-    if chain != expected_chain { return Err("THEO RPC is on the wrong chain".into()); }
-    let tx = theo_rpc(http, rpc, "eth_getTransactionByHash", json!([transaction_hash])).await?;
-    let receipt = theo_rpc(http, rpc, "eth_getTransactionReceipt", json!([transaction_hash])).await?;
-    if tx.is_null() || receipt.is_null() { return Err("THEO transaction is still pending".into()); }
-    if receipt.get("status").and_then(Value::as_str) != Some("0x1") { return Err("THEO transaction failed on-chain".into()); }
+    let chain = chain
+        .as_str()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or("invalid RPC chain id")?;
+    if chain != expected_chain {
+        return Err("THEO RPC is on the wrong chain".into());
+    }
+    let tx = theo_rpc(
+        http,
+        rpc,
+        "eth_getTransactionByHash",
+        json!([transaction_hash]),
+    )
+    .await?;
+    let receipt = theo_rpc(
+        http,
+        rpc,
+        "eth_getTransactionReceipt",
+        json!([transaction_hash]),
+    )
+    .await?;
+    if tx.is_null() || receipt.is_null() {
+        return Err("THEO transaction is still pending".into());
+    }
+    if receipt.get("status").and_then(Value::as_str) != Some("0x1") {
+        return Err("THEO transaction failed on-chain".into());
+    }
     let lower = |value: Option<&str>| value.unwrap_or_default().to_ascii_lowercase();
     if lower(tx.get("from").and_then(Value::as_str)) != wallet.to_ascii_lowercase()
         || lower(tx.get("to").and_then(Value::as_str)) != lower(network["token_address"].as_str())
     {
         return Err("transaction sender or THEO token contract does not match checkout".into());
     }
-    let input = tx.get("input").or_else(|| tx.get("data")).and_then(Value::as_str).unwrap_or("");
-    let expected_to = lower(network["treasury_address"].as_str()).trim_start_matches("0x").to_string();
-    let token_decimals = network["token_decimals"].as_u64().ok_or("missing token decimals")? as u8;
-    let expected_amount = format!("{:064x}", checkout_theo_atomic(checkout.amount_cents, token_decimals).parse::<u128>().map_err(|_| "invalid checkout amount")?);
+    let input = tx
+        .get("input")
+        .or_else(|| tx.get("data"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let expected_to = lower(network["treasury_address"].as_str())
+        .trim_start_matches("0x")
+        .to_string();
+    let token_decimals = network["token_decimals"]
+        .as_u64()
+        .ok_or("missing token decimals")? as u8;
+    let expected_amount = format!(
+        "{:064x}",
+        checkout_theo_atomic(checkout.amount_cents, token_decimals)
+            .parse::<u128>()
+            .map_err(|_| "invalid checkout amount")?
+    );
     if input.len() != 138
         || !input.starts_with("0xa9059cbb")
         || input[34..74].to_ascii_lowercase() != format!("{expected_to:0>64}")
@@ -15488,15 +15561,23 @@ async fn verify_theo_settlement(
     {
         return Err("transaction does not transfer the exact THEO checkout amount".into());
     }
-    let confirmations = network["required_confirmations"].as_u64().ok_or("missing confirmation policy")?;
-    let receipt_block = receipt.get("blockNumber").and_then(Value::as_str)
+    let confirmations = network["required_confirmations"]
+        .as_u64()
+        .ok_or("missing confirmation policy")?;
+    let receipt_block = receipt
+        .get("blockNumber")
+        .and_then(Value::as_str)
         .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
         .ok_or("transaction receipt has no block number")?;
-    let tip = theo_rpc(http, rpc, "eth_blockNumber", json!([])).await?
-        .as_str().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    let tip = theo_rpc(http, rpc, "eth_blockNumber", json!([]))
+        .await?
+        .as_str()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
         .ok_or("invalid RPC block number")?;
     if tip.saturating_sub(receipt_block).saturating_add(1) < confirmations {
-        return Err(format!("THEO transaction is awaiting {confirmations} required confirmations"));
+        return Err(format!(
+            "THEO transaction is awaiting {confirmations} required confirmations"
+        ));
     }
     Ok(())
 }
@@ -15554,7 +15635,9 @@ async fn billing_confirm(
             StatusCode::CONFLICT
         })?;
     if already_confirmed {
-        return Ok(Json(json!({ "ok": true, "already_confirmed": true, "account": acc })));
+        return Ok(Json(
+            json!({ "ok": true, "already_confirmed": true, "account": acc }),
+        ));
     }
     // `confirm_checkout` only moves the billing half; the effect for a
     // completed "plan"/"addon" checkout is dispatched here — never inside
@@ -15585,7 +15668,12 @@ async fn billing_confirm(
             "THEO checkout {} {} {} atomic units",
             co.kind,
             co.plan,
-            checkout_theo_atomic(co.amount_cents, theo_network().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?["token_decimals"].as_u64().ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8)
+            checkout_theo_atomic(
+                co.amount_cents,
+                theo_network().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?["token_decimals"]
+                    .as_u64()
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8
+            )
         ),
     );
     crate::persist::persist(&c);
@@ -15614,7 +15702,9 @@ async fn billing_webhook(
 ) -> Result<StatusCode, StatusCode> {
     let secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
     if secret.is_empty() {
-        tracing::warn!("stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured — rejecting (fail closed)");
+        tracing::warn!(
+            "stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured — rejecting (fail closed)"
+        );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let sig = headers
@@ -16079,7 +16169,12 @@ async fn data_create(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Don't let custom docs shadow a typed platform collection.
     if all_collections(&c).iter().any(|(n, _)| *n == collection) {
-        return Err((StatusCode::CONFLICT, format!("'{collection}' is a managed collection — create custom docs in a new collection name")));
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{collection}' is a managed collection — create custom docs in a new collection name"
+            ),
+        ));
     }
     let doc = c.docs.create(&collection, &t, body);
     c.audit
@@ -16157,7 +16252,7 @@ async fn data_delete(
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("'{collection}' rows are managed and can't be deleted here"),
-            ))
+            ));
         }
     };
     if !ok {
@@ -16559,7 +16654,10 @@ mod identity_sync_tests {
         let (tenant2, _org2, is_owner2) =
             resolve_identity_sync(false, None, None, None, "user_x", false);
         assert!(!is_owner2);
-        assert_eq!(tenant2, "personal", "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)");
+        assert_eq!(
+            tenant2, "personal",
+            "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)"
+        );
     }
 }
 
@@ -16627,25 +16725,29 @@ sub      A      9.9.9.9
 "#;
         let recs = parse_zone(zone, "example.com");
         // apex A
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "A" && r.name.is_empty() && r.value == "76.76.21.21"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "A" && r.name.is_empty() && r.value == "76.76.21.21")
+        );
         // www CNAME (trailing dot stripped)
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "CNAME" && r.name == "www" && r.value == "app.example.com"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "CNAME" && r.name == "www" && r.value == "app.example.com")
+        );
         // MX with priority
         let mx = recs.iter().find(|r| r.kind == "MX").expect("mx");
         assert_eq!(mx.priority, Some(10));
         assert_eq!(mx.value, "mail.example.com");
         // TXT keeps content (quotes stripped)
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "TXT" && r.value.contains("v=spf1")));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "TXT" && r.value.contains("v=spf1"))
+        );
         // minimal "name TYPE value" form
-        assert!(recs
-            .iter()
-            .any(|r| r.kind == "A" && r.name == "sub" && r.value == "9.9.9.9"));
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "A" && r.name == "sub" && r.value == "9.9.9.9")
+        );
     }
 
     #[test]

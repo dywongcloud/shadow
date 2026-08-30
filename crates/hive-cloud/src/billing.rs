@@ -995,13 +995,13 @@ impl BillingStore {
         } else {
             tenant
         };
-        let mut checkouts: Vec<Checkout> = self.checkouts
+        let mut checkouts: Vec<Checkout> = self
+            .checkouts
             .read()
             .values()
             .filter(|c| c.tenant == tenant)
             .cloned()
-            .collect()
-            ;
+            .collect();
         checkouts.extend(
             self.confirmed_theo_checkouts
                 .read()
@@ -1143,24 +1143,40 @@ impl BillingStore {
         transaction_hash: &str,
     ) -> Result<(Checkout, BillingAccount, bool), &'static str> {
         if let Some(existing) = self.confirmed_theo_checkouts.read().get(id).cloned() {
-            return if existing.theo_transaction_hash.eq_ignore_ascii_case(transaction_hash) {
+            return if existing
+                .theo_transaction_hash
+                .eq_ignore_ascii_case(transaction_hash)
+            {
                 Ok((existing.clone(), self.account(&existing.tenant), true))
             } else {
                 Err("checkout already confirmed with a different transaction")
             };
         }
-        let checkout = self.checkouts.write().remove(id).ok_or("checkout not found")?;
-        if self.confirmed_theo_checkouts.read().values().any(|co| co.theo_transaction_hash.eq_ignore_ascii_case(transaction_hash)) {
+        let checkout = self
+            .checkouts
+            .write()
+            .remove(id)
+            .ok_or("checkout not found")?;
+        if self.confirmed_theo_checkouts.read().values().any(|co| {
+            co.theo_transaction_hash
+                .eq_ignore_ascii_case(transaction_hash)
+        }) {
             self.checkouts.write().insert(checkout.id.clone(), checkout);
             return Err("transaction has already been used for another checkout");
         }
         let mut checkout = checkout;
         checkout.theo_transaction_hash = transaction_hash.to_ascii_lowercase();
         let account = match checkout.kind.as_str() {
-            "credits" => self.add_credits(&checkout.tenant, checkout.amount_cents, "Credit top-up (checkout)"),
+            "credits" => self.add_credits(
+                &checkout.tenant,
+                checkout.amount_cents,
+                "Credit top-up (checkout)",
+            ),
             _ => self.account(&checkout.tenant),
         };
-        self.confirmed_theo_checkouts.write().insert(checkout.id.clone(), checkout.clone());
+        self.confirmed_theo_checkouts
+            .write()
+            .insert(checkout.id.clone(), checkout.clone());
         Ok((checkout, account, false))
     }
 
@@ -1276,7 +1292,10 @@ impl BillingStore {
         let now = now_ms();
         let mut open = HashMap::new();
         let mut confirmed = HashMap::new();
-        for checkout in checkouts.into_iter().filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS) {
+        for checkout in checkouts
+            .into_iter()
+            .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
+        {
             if checkout.theo_transaction_hash.is_empty() {
                 open.insert(checkout.id.clone(), checkout);
             } else {
@@ -1347,12 +1366,6 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
         status: status.to_string(),
         created_ms: now_ms(),
     }
-}
-
-pub fn stripe_configured() -> bool {
-    std::env::var("STRIPE_SECRET_KEY")
-        .map(|k| !k.is_empty())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1524,7 +1537,7 @@ mod tests {
     fn meter_charges_delta_and_carries_fraction() {
         let s = BillingStore::new();
         s.set_plan("acme", "pro"); // overage plan so balance can go negative
-                                   // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
+        // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
         let half = UsageTotals {
             active_cpu_ms: (3_600_000.0 * 0.5 / 12.8) as u64,
             ..Default::default()
@@ -1539,10 +1552,11 @@ mod tests {
         let c2 = s.meter_usage("acme", onefive);
         assert!(c2 >= 1, "should charge the crossed whole cent, got {c2}");
         // The usage is recorded in the ledger as a negative "usage" entry.
-        assert!(s
-            .ledger("acme")
-            .iter()
-            .any(|e| e.kind == "usage" && e.amount_cents < 0));
+        assert!(
+            s.ledger("acme")
+                .iter()
+                .any(|e| e.kind == "usage" && e.amount_cents < 0)
+        );
     }
 
     #[test]
@@ -1596,14 +1610,16 @@ mod tests {
         s.meter_usage("acme", u);
         let inv = s.current_invoice("acme");
         assert_eq!(inv.status, "draft");
-        assert!(inv
-            .lines
-            .iter()
-            .any(|l| l.description.contains("subscription")));
-        assert!(inv
-            .lines
-            .iter()
-            .any(|l| l.description.contains("Compute usage")));
+        assert!(
+            inv.lines
+                .iter()
+                .any(|l| l.description.contains("subscription"))
+        );
+        assert!(
+            inv.lines
+                .iter()
+                .any(|l| l.description.contains("Compute usage"))
+        );
         // Pro subscription is $20 = 2000¢; total is subtotal of all lines.
         assert!(inv.total_cents >= 2000);
     }
@@ -1624,119 +1640,6 @@ mod tests {
         assert!(!plan_spec("hobby").overage);
         assert!(plan_spec("pro").overage);
     }
-}
-
-/// Create a real Stripe Checkout Session (best-effort). `price_id` is `Some` for
-/// a plan upgrade — a REAL recurring subscription against that Stripe Price
-/// (`mode=subscription`); `None` for a one-time purchase (credit top-ups —
-/// `mode=payment` with ad-hoc `price_data`, since there's no fixed Price object
-/// for an arbitrary top-up amount). `checkout_id` is OUR internal `Checkout.id`,
-/// stamped into the session's `metadata` so the webhook handler (which only
-/// ever hears from Stripe, never from our own client) can find the matching
-/// local record. Returns `(hosted_checkout_url, stripe_session_id)` — the
-/// session id is stored via `BillingStore::attach_stripe_session` so
-/// `billing_confirm` can later verify real payment before applying anything.
-pub async fn stripe_checkout(
-    http: &reqwest::Client,
-    price_id: Option<&str>,
-    amount_cents: u64,
-    product_name: &str,
-    success_url: &str,
-    cancel_url: &str,
-    checkout_id: &str,
-) -> anyhow::Result<(String, String)> {
-    let key = std::env::var("STRIPE_SECRET_KEY")?;
-    let mut params: Vec<(String, String)> = vec![
-        ("success_url".into(), success_url.to_string()),
-        ("cancel_url".into(), cancel_url.to_string()),
-        ("metadata[checkout_id]".into(), checkout_id.to_string()),
-        ("line_items[0][quantity]".into(), "1".into()),
-    ];
-    match price_id {
-        Some(pid) => {
-            params.push(("mode".into(), "subscription".into()));
-            params.push(("line_items[0][price]".into(), pid.to_string()));
-            // Subscriptions need the metadata on the SUBSCRIPTION object too
-            // (not just the checkout session) — that's what the
-            // `customer.subscription.*` webhooks carry, and the session's own
-            // metadata isn't copied onto it automatically.
-            params.push((
-                "subscription_data[metadata][checkout_id]".into(),
-                checkout_id.to_string(),
-            ));
-        }
-        None => {
-            params.push(("mode".into(), "payment".into()));
-            params.push(("line_items[0][price_data][currency]".into(), "usd".into()));
-            params.push((
-                "line_items[0][price_data][unit_amount]".into(),
-                amount_cents.to_string(),
-            ));
-            params.push((
-                "line_items[0][price_data][product_data][name]".into(),
-                product_name.to_string(),
-            ));
-        }
-    }
-    let resp = http
-        .post("https://api.stripe.com/v1/checkout/sessions")
-        .basic_auth(&key, Some(""))
-        .form(&params)
-        .send()
-        .await?;
-    let v: serde_json::Value = resp.json().await?;
-    let url = v
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({v})"))?;
-    let session_id = v
-        .get("id")
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("stripe: no session id ({v})"))?;
-    Ok((url.to_string(), session_id.to_string()))
-}
-
-/// Real payment/subscription status of a Stripe Checkout Session, fetched
-/// directly from Stripe. `paid` is true when the session actually completed
-/// (`payment_status == "paid"` for a one-time charge, or `status ==
-/// "complete"` for a $0-due-now subscription setup) — this is the
-/// authoritative check `billing_confirm` uses instead of trusting an
-/// unauthenticated client's redirect-back as proof of payment.
-pub struct StripeSessionStatus {
-    pub paid: bool,
-    pub customer: Option<String>,
-    pub subscription: Option<String>,
-}
-
-pub async fn stripe_verify_session(
-    http: &reqwest::Client,
-    session_id: &str,
-) -> anyhow::Result<StripeSessionStatus> {
-    let key = std::env::var("STRIPE_SECRET_KEY")?;
-    let resp = http
-        .get(format!(
-            "https://api.stripe.com/v1/checkout/sessions/{session_id}"
-        ))
-        .basic_auth(&key, Some(""))
-        .send()
-        .await?;
-    let v: serde_json::Value = resp.json().await?;
-    if v.get("error").is_some() {
-        anyhow::bail!("stripe: session lookup failed ({v})");
-    }
-    let paid = v.get("payment_status").and_then(|s| s.as_str()) == Some("paid")
-        || v.get("status").and_then(|s| s.as_str()) == Some("complete");
-    Ok(StripeSessionStatus {
-        paid,
-        customer: v
-            .get("customer")
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string()),
-        subscription: v
-            .get("subscription")
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string()),
-    })
 }
 
 /// Verify a Stripe webhook delivery's `Stripe-Signature` header
