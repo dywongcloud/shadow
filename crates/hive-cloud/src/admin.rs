@@ -346,6 +346,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/webhook", post(billing_webhook))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
+        .route(
+            "/v1/admin/projects/:project/team",
+            post(admin_set_project_team),
+        )
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -3510,6 +3514,43 @@ async fn resources_get(
     })))
 }
 
+#[derive(Deserialize)]
+struct SetProjectTeamReq {
+    team: String,
+}
+
+/// Operator-only repair for a project stuck at `__untagged__` (created before
+/// tenancy tagging existed, or a tag write that never landed) — real,
+/// witnessed failure mode: `mien-kamp` had zero deployments, zero relational
+/// rows, and settings.team == "__untagged__", so EVERY ownership check in the
+/// platform (the coordinator's own `authorized` gate in `project_delete`, and
+/// the peer-side gossip cascade's `owns_settings`/`owns_deploys`/
+/// `owns_relational` in `gossip.rs`) correctly refused every tenant,
+/// including the platform owner's own "personal" tenant — an untagged
+/// project the owner created is otherwise permanently undeletable, since
+/// `norm("__untagged__")` is NOT the empty-string case `norm()` maps to
+/// "personal". `spawn_tenancy_reconcile` only ever ADDS a tag when it can
+/// infer one from a deployment/relational record — a project with neither
+/// has nothing to infer from and stays untagged forever without a manual
+/// fix. Mirrors `ProjectStore::set_team`'s existing local-write +
+/// fleet-relational-mirror behavior exactly; this endpoint is just the
+/// missing operator-facing door to it.
+async fn admin_set_project_team(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(body): Json<SetProjectTeamReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let team = body.team.trim();
+    if team.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "team must not be empty".into()));
+    }
+    c.projects.set_team(&project, team);
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "project": project, "team": team })))
+}
+
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
 /// Read-only; peers pull `node_modules` tarballs by content-addressed key.
 async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Response, StatusCode> {
@@ -5530,13 +5571,26 @@ async fn project_delete(
             // 30s — an answer slower than that reads as failure even when the
             // cascade later succeeds. Peers the quick pass could not reach get the
             // full retry budget DETACHED below.
+            //
+            // 28s, not the old 20s: `dispatch_project_delete_with`'s own worst
+            // case chains HTTP-capabilities + HTTP-delete + mesh-capabilities +
+            // mesh-delete (the last kept intentionally generous for discovery
+            // fallback, see its own comment) — even after trimming the other
+            // three legs, that sum is ~31s, so a 20s outer cap could kill the
+            // future before it ever reached the mesh fallback it exists to
+            // provide. Witnessed live: a real project delete failed with
+            // "accepted == 0 across all 23 peers" on every attempt, because
+            // every peer with real-but-imperfect HTTP admin connectivity spent
+            // its entire budget stuck on the HTTP leg. 28s stays under the 30s
+            // proxy ceiling with 2s of margin for the response to actually
+            // return.
             let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
                 let c = c.clone();
                 let project = project.clone();
                 let t = t.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
+                        std::time::Duration::from_secs(28),
                         dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
@@ -5794,11 +5848,24 @@ pub(crate) async fn dispatch_project_delete_with(
         // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
+            // Budgeted, not the old flat 5s/15s/10s/20s: this whole function
+            // runs inside the caller's own 20s-per-peer timeout (team_delete's
+            // quick pass), and unlike a single-shot call this one chains FOUR
+            // network round trips in the worst case (HTTP capabilities, HTTP
+            // delete, mesh capabilities, mesh delete) when the HTTP path is
+            // slow-but-not-dead rather than cleanly absent. The old
+            // 5+15+10+20=50s sum could never fit the 20s budget, so a peer
+            // with imperfect-but-real HTTP admin connectivity burned its
+            // ENTIRE budget on the HTTP leg and never reached the mesh
+            // fallback the function is written to fall back to — exactly the
+            // "accepted == 0 across all peers" failure witnessed live deleting
+            // a real project. Shrunk so the four-hop worst case (3+5+3+6=17s)
+            // leaves headroom inside the 20s cap.
             if !http_generation_v1 {
                 http_generation_v1 = match c
                     .http
                     .get(format!("{admin}/v1/project-delete/capabilities"))
-                    .timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(3))
                     .send()
                     .await
                 {
@@ -5840,7 +5907,7 @@ pub(crate) async fn dispatch_project_delete_with(
                     }
                 }
                 match request
-                    .timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(5))
                     .send()
                     .await
                 {
@@ -5872,6 +5939,16 @@ pub(crate) async fn dispatch_project_delete_with(
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
             if !mesh_generation_v1 {
+                // 6s, not the 10s original NOR the over-corrected 3s: this is
+                // the ONLY transport ever exercised on a Firecracker fleet
+                // (`node_admins` is empty there, so the HTTP leg above never
+                // runs at all — its own timeouts cost nothing real here).
+                // Measured cross-continent mesh dial latency on this fleet
+                // reaches ~4.3s (lax) on a cold connection, so 3s risked
+                // failing the capabilities probe on real, healthy links
+                // rather than fixing anything — the actual bottleneck this
+                // whole change targets is the DELETE call below, which stays
+                // at its original, deliberately generous timeout.
                 mesh_generation_v1 = crate::gossip::request_to(
                     c,
                     &id,
@@ -5879,7 +5956,7 @@ pub(crate) async fn dispatch_project_delete_with(
                     hive_p2p::GOSSIP_GET,
                     "/v1/project-delete/capabilities",
                     &[],
-                    10,
+                    6,
                 )
                 .await
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
