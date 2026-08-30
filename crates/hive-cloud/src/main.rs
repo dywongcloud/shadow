@@ -55,6 +55,7 @@ mod incidents;
 mod inference;
 mod integrations;
 mod lease;
+mod marketplace;
 mod memwatch;
 mod mesh_raw;
 mod meshwatch;
@@ -641,7 +642,10 @@ async fn main() -> anyhow::Result<()> {
     // gateway URL carries a real address other nodes can actually reach.
     let public_base = {
         let port = args.listen.port();
-        match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+        match std::env::var("HIVE_PUBLIC_IP")
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
             Some(v) if !v.is_empty() && v != "0.0.0.0" => format!("http://{}:{}", v, port),
             _ => format!("http://{}", args.listen),
         }
@@ -1749,6 +1753,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        // Marketplace is authenticated with its own service credential inside
+        // the module; it must never consume a DevHub hive_jwt.
+        .merge(crate::marketplace::routes().with_state(cloud.clone()))
         // guardian-growth-and-gc-observability: guardian.rs owns this route's
         // handler/state end-to-end (single-writer scope), so it merges here
         // rather than adding a line inside admin::router() itself. Same
@@ -2353,6 +2360,9 @@ async fn admin_ingress(
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
+            // Separate Marketplace service authentication is checked by its
+            // handlers, never by the DevHub hive_jwt gate.
+            || path.starts_with("/v1/marketplace/")
             // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
             // Per-project browser_db REST bearer, not a platform JWT — see

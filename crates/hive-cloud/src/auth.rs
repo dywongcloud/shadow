@@ -206,6 +206,10 @@ pub async fn require_auth(
         || path == "/v1/zkauth/register"
         || path == "/v1/zkauth/preview-proof"
         || path == "/v1/zkauth/project-team"
+        // Marketplace is a separately authenticated server-to-server
+        // integration. Its routes reject absent/invalid
+        // `x-marketplace-key` themselves and must never accept hive_jwt.
+        || path.starts_with("/v1/marketplace/")
         // This exact collection POST still fails closed in `admit()` via
         // `fresh_user_claims`. Letting it reach that gate is what gives a
         // missing/expired browser session the same structured

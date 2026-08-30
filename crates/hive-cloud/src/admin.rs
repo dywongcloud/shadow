@@ -320,6 +320,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/admin/audit", get(admin_audit))
+        .route(
+            "/v1/admin/marketplace",
+            get(crate::marketplace::operator_view),
+        )
         .route("/v1/admin/data", get(data_collections))
         .route(
             "/v1/admin/data/:collection",
