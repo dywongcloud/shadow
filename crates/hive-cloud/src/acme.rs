@@ -865,7 +865,7 @@ async fn issue(
             if authz.status == AuthorizationStatus::Valid {
                 continue;
             }
-            let mut challenge = authz
+            let challenge = authz
                 .challenge(ChallengeType::Dns01)
                 .ok_or_else(|| anyhow::anyhow!("no dns-01 challenge offered"))?;
             let host = challenge.identifier().to_string();

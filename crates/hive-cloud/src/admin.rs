@@ -15390,12 +15390,20 @@ async fn billing_payment_intent(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let co = c.billing.get_checkout(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let co = c
+        .billing
+        .get_checkout(&id)
+        .ok_or((StatusCode::NOT_FOUND, "checkout not found".into()))?;
     if norm(&co.tenant) != t {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((StatusCode::FORBIDDEN, "checkout belongs to another tenant".into()));
     }
-    let network = theo_network().map_err(|(status, _)| status)?;
-    let decimals = network["token_decimals"].as_u64().ok_or(StatusCode::SERVICE_UNAVAILABLE)? as u8;
+    let network = theo_network()?;
+    let decimals = network["token_decimals"]
+        .as_u64()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invalid THEO token decimals".into(),
+        ))? as u8;
     Ok(Json(json!({
         "session": co.id,
         "amount_theo_atomic": checkout_theo_atomic(co.amount_cents, decimals),

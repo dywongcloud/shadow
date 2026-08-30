@@ -5555,7 +5555,7 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         p2_publish_generation(h, &component, "a", now.saturating_sub(5000)).await?;
     let (_head_b, state_b, state_b_len) =
         p2_publish_generation(h, &component, "b", now.saturating_sub(4000)).await?;
-    let (head_c, state_c, state_c_len) =
+    let (_head_c, state_c, state_c_len) =
         p2_publish_generation(h, &component, "c", now.saturating_sub(3000)).await?;
     if !matches!(
         guardian_v2_probe(h, &encoded).await,

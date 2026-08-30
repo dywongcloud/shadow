@@ -422,14 +422,16 @@ async fn create_allocation(
     )
     .await?;
     let now = hive_core::now_ms();
+    let tenant_id = request.tenant_id.clone();
+    let contract_reference = request.contract_reference.clone();
     let row = Allocation {
         marketplace_order_id: request.marketplace_order_id,
-        tenant_id: request.tenant_id,
+        tenant_id,
         resources: request.resources,
         approved_node_ids: request.approved_node_ids,
         theo_amount: request.theo_amount,
         expires_at_ms: request.expires_at_ms,
-        contract_reference: request.contract_reference,
+        contract_reference,
         advertisement_id: request.advertisement_id,
         status: "accepted".into(),
         routed_build_id: None,
@@ -624,7 +626,7 @@ async fn route_allocation(
         .begin_route(&order_id, hive_core::now_ms())
     {
         Ok(row) => row,
-        Err(existing) if let Some(build_id) = existing.routed_build_id => {
+        Err(existing) if let Some(build_id) = existing.routed_build_id.clone() => {
             return Ok(Json(
                 json!({"order_id": order_id, "build_id": build_id, "status": existing.status}),
             ));
@@ -685,7 +687,7 @@ async fn route_allocation(
         &order_id,
         &format!("build_id={build_id}; existing scheduler dispatch selected approved targets"),
     );
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn fulfill_allocation(

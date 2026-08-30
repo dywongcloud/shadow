@@ -666,7 +666,7 @@ async fn main() -> anyhow::Result<()> {
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
     // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
-    let build_isolation_protocol = match build_executor::init_installed().await {
+    let _build_isolation_protocol = match build_executor::init_installed().await {
         Ok(protocol) => {
             tracing::info!(protocol, "BuildExecutor live probe passed");
             Some(protocol)
@@ -1771,7 +1771,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             admin_max_body,
         ))
-        .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            admin_req_timeout,
+        ));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
