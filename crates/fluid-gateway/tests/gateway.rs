@@ -490,6 +490,7 @@ async fn restore_prefers_production_deployment_for_alias() {
         state: fluid_core::DeployState::Ready,
         project_incarnation: None,
         tenant: "personal".into(),
+        marketplace_placement: None,
     };
 
     // Restore the NEWER production deployment first, then the OLDER non-production

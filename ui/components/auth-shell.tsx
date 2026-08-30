@@ -60,7 +60,7 @@ export function AuthShell({
             ))}
           </ul>
         </div>
-        <div className="relative text-xs text-muted">© {2026} shadw · The peer-to-peer cloud.</div>
+        <div className="relative text-xs text-muted">© {2026} Autheo DevHub · Electric peer-to-peer cloud.</div>
       </div>
 
       {/* Auth panel */}

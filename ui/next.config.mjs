@@ -1,4 +1,7 @@
 /** @type {import('next').NextConfig} */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 // Ops/admin console API base. The developer/API-key surface is `/cloud` -> ADMIN
 // (api.shadw.cloud); the operator console (/admin pages) proxies through `/ops`
@@ -53,6 +56,14 @@ const CLERK_CSP_ORIGINS = (() => {
 })();
 
 const nextConfig = {
+  // Keep Turbopack's module graph and cache rooted at this application. The
+  // repository has a second lockfile at its root; allowing automatic workspace
+  // discovery makes dev chunks span both roots and can leave a stale/truncated
+  // server chunk after rebuilds.
+  turbopack: {
+    root: path.dirname(fileURLToPath(import.meta.url)),
+  },
+
   // Production hardening (Next.js production checklist).
   poweredByHeader: false,
   compress: true,

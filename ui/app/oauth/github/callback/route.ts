@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 
 /**
  * OAuth callback for the platform's first-party GitHub App — the exact URL
- * registered on the App (https://shadw.cloud/oauth/github/callback). Verifies the
+ * registered on the App (https://autheo.dev/oauth/github/callback). Verifies the
  * signed CSRF state, exchanges the code for a user-to-server token, seals it into
  * the encrypted httpOnly cookie, and returns the user to where they started with
  * `?connected=github` (the same contract the Composio flow used, so the

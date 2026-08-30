@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound, AlertTriangle, RefreshCw } from "lucide-react";
+import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound, AlertTriangle, RefreshCw, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -13,6 +13,7 @@ import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
 import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
+import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -163,6 +164,7 @@ export default function NewProjectPage() {
   // Set once Create succeeds: drives the "Preparing Git Repository" animation
   // shown between Create and the build-logs view.
   const [preparing, setPreparing] = useState<{ template: Template | null; team: string; src: string; dest: string } | null>(null);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
 
   const TPL_PER = 5;
   const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
@@ -203,7 +205,7 @@ export default function NewProjectPage() {
           // Surface the FIRST restricting org's approval link (only an org actually
           // blocking the app warrants a CTA — a live, working connection stays quiet).
           if (res?.restricted && res?.approve_url && !restrictedCta) {
-            restrictedCta = { text: "An organization restricts OpenEdge. Approve the app to import its repositories.", approveUrl: res.approve_url };
+            restrictedCta = { text: "An organization restricts DevHub. Approve the app to import its repositories.", approveUrl: res.approve_url };
           }
           for (const r of (res?.repos as GhRepo[]) || []) {
             if (r?.full_name && !seen.has(r.full_name)) { seen.add(r.full_name); merged.push(r); }
@@ -571,13 +573,18 @@ export default function NewProjectPage() {
         )}
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
-        Paste a Git repo URL, or a container image from Docker Hub / Quay / any registry — OpenEdge
+        Paste a Git repo URL, or a container image from Docker Hub / Quay / any registry — DevHub
         creates the project and builds → deploys it (clone &amp; build, or pull the image).{" "}
         <Link href="/new/upload" className="text-secondary underline decoration-dotted underline-offset-2 hover:text-fg">
           No repository? Upload a .zip instead
         </Link>
         .
       </p>
+      <div className="mb-8 flex justify-center">
+        <Button variant="outline" onClick={() => setMarketplaceOpen(true)}>
+          <ShieldCheck className="h-4 w-4" /> Deploy from Marketplace
+        </Button>
+      </div>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
@@ -694,6 +701,7 @@ export default function NewProjectPage() {
           <GlobeEmptyState title="" desc={undefined} />
         </div>
       </Card>
+      {marketplaceOpen && <MarketplaceDeploymentModal onClose={() => setMarketplaceOpen(false)} />}
     </div>
   );
 }

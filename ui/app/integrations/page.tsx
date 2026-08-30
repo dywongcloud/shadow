@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check, AlertTriangle, RefreshCw, Building2, GitBranch } from "lucide-react";
+import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check, AlertTriangle, RefreshCw, Building2, GitBranch, ShieldCheck, Copy } from "lucide-react";
 import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/ui";
 import { cachedJson, invalidate } from "@/lib/cache";
 import { currentTeam } from "@/lib/api";
@@ -27,6 +27,46 @@ interface GhDetail {
   installUrl?: string;
 }
 interface GhOrg { login: string; name?: string }
+interface MarketplaceStatus {
+  configured: boolean;
+  clerk_template: string;
+  endpoint: string;
+  contract_version: number;
+}
+
+function MarketplaceSetupCard() {
+  const [status, setStatus] = useState<MarketplaceStatus | null>(null);
+  const [copied, setCopied] = useState(false);
+  const checklist = `# DevHub Marketplace local checklist
+1. Start Hive with its normal local configuration.
+2. Configure a Clerk instance and create the JWT template: autheo-marketplace-v1.
+3. Set DevHub's NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY, CLERK_SECRET_KEY, HIVE_ADMIN, MARKETPLACE_URL, and NEXT_PUBLIC_MARKETPLACE_URL.
+4. Start Marketplace at MARKETPLACE_URL. It must validate Clerk JWT issuer, audience, signature, and expiry through Clerk JWKS.
+5. Sign in through Clerk, then use New Project → Deploy from Marketplace.
+6. Verify a valid policy and each invalid case: tenant mismatch, expired, revoked, suspended, malformed, unsupported version, and no eligible approved nodes.`;
+  useEffect(() => {
+    fetch("/api/marketplace/status", { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((value) => setStatus(value))
+      .catch(() => setStatus(null));
+  }, []);
+  async function copyChecklist() {
+    await navigator.clipboard.writeText(checklist);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+  return (
+    <Card className="p-5">
+      <div className="mb-3 flex items-start justify-between">
+        <div className="flex items-center gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-white text-neutral-800 shadow-sm"><ShieldCheck className="h-5 w-5" /></span><div><div className="font-semibold">Marketplace deployments</div><div className="text-xs text-muted">Clerk-authenticated placement policies</div></div></div>
+        <Badge tone={status?.configured ? "green" : "default"}>{status?.configured ? <><Check className="h-3 w-3" /> Configured</> : "Not configured"}</Badge>
+      </div>
+      <p className="text-sm text-secondary">Requires the Clerk JWT template <code className="rounded bg-subtle px-1 py-0.5 text-xs">autheo-marketplace-v1</code>. {status?.configured ? "MARKETPLACE_URL is configured." : "MARKETPLACE_URL is not configured."} Its value is intentionally not displayed.</p>
+      <p className="mt-3 text-xs text-muted">DevHub calls <code>{status?.endpoint || "/v1/marketplace/orders/{marketplace_order_id}/placement-policy"}</code> server-side and accepts placement-policy schema v{status?.contract_version ?? 1}. A real Clerk session is required; the local dev-mint bypass does not exercise Marketplace authentication.</p>
+      <Button variant="outline" className="mt-4" onClick={copyChecklist}><Copy className="h-3.5 w-3.5" /> {copied ? "Copied" : "Copy local checklist"}</Button>
+    </Card>
+  );
+}
 
 function Logo({ kind }: { kind: string }) {
   // White tile behind every icon (glyphs forced dark so they read on white in dark mode).
@@ -256,8 +296,8 @@ export default function IntegrationsPage() {
   // The managed hive-cloud data services (always active). GitHub is rendered by the
   // dedicated <GithubCard/> which carries full connection/scope/org management.
   const otherConnected = [
-    { kind: "postgres", name: "OpenEdge Postgres", desc: "Serverless SQL database built for the edge", active: true },
-    { kind: "kv", name: "OpenEdge KV", desc: "Durable Redis database for caching", active: true },
+    { kind: "postgres", name: "DevHub Postgres", desc: "Serverless SQL database built for the edge", active: true },
+    { kind: "kv", name: "DevHub KV", desc: "Durable Redis database for caching", active: true },
   ];
 
   return (
@@ -282,6 +322,7 @@ export default function IntegrationsPage() {
       <h2 className="mb-3 text-base font-semibold">Connected</h2>
       <div className="mb-10 grid grid-cols-1 gap-4 md:grid-cols-3">
         <GithubCard gh={gh} orgs={ghOrgs} onRefresh={refreshGh} />
+        <MarketplaceSetupCard />
         {otherConnected.map((i) => (
           <Card key={i.name} className="p-5">
             <div className="mb-3 flex items-start justify-between">
@@ -392,7 +433,7 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
   }
 
   async function disconnect() {
-    if (!window.confirm("Disconnect GitHub? This removes the authorization from OpenEdge. You can reconnect anytime.")) return;
+    if (!window.confirm("Disconnect GitHub? This removes the authorization from DevHub. You can reconnect anytime.")) return;
     setBusy("disconnect");
     try {
       await fetch("/api/github/disconnect", { method: "POST" });

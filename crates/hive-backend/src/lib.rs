@@ -70,13 +70,6 @@ fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
     Some(raw.saturating_mul(tb.numer as u64) / tb.denom as u64)
 }
 
-#[cfg(target_os = "linux")]
-fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_pid_ppid, cpu) = parse_linux_stat(&stat)?;
-    Some(cpu)
-}
-
 /// Snapshot of every process as `(pid, ppid, cumulative_cpu_ns)`. Lets us sum CPU
 /// over a cell's whole process TREE — a function may run under a wrapper (e.g.
 /// `npm exec next start` spawns `next-server`), so sampling only the direct child
@@ -215,13 +208,6 @@ impl ProcIndex {
         }
         Some(sum)
     }
-}
-
-/// Sum cumulative CPU (ns) over `root` and all its descendants in `procs`.
-/// `None` if `root` isn't present (process gone). Thin wrapper over
-/// [`ProcIndex`] for one-shot callers (the sampler itself keeps a built index).
-fn subtree_cpu_ns(root: u32, procs: &[(u32, u32, u64)]) -> Option<u64> {
-    ProcIndex::build(procs).subtree_cpu_ns(root)
 }
 
 /// Per-cell CPU sampler shared by the backends for `cpu_percent` (#2). Computes

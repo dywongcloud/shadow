@@ -16,7 +16,7 @@ import { timeAgo } from "@/lib/utils";
 import { deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RawPortsBadge } from "@/components/raw-port-connections";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Landing } from "@/components/landing";
+import { Landing, OpeningSplash } from "@/components/landing";
 import { useSettledAuth, resetAuthSettle } from "@/lib/auth-settle";
 
 type View = "grid" | "list";
@@ -171,9 +171,16 @@ function Dashboard() {
   const shown = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
 
   return (
-    <div className="pb-24">
-      {/* Toolbar */}
-      <div className="mb-6 flex items-center gap-2">
+    <>
+      {/* A refresh always starts with the shared opening splash. It is guarded
+          at module scope, so auth settling cannot replay it within this load. */}
+      <OpeningSplash />
+      <div className="pb-24">
+        <h1 className="mb-6 text-3xl font-semibold tracking-tight text-accent sm:text-4xl">
+          Autheo Development Hub
+        </h1>
+        {/* Toolbar */}
+        <div className="mb-6 flex items-center gap-2">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
           <Input
@@ -201,10 +208,10 @@ function Dashboard() {
           </ViewButton>
         </div>
         <AddNewMenu />
-      </div>
+        </div>
 
-      {/* Left column slimmed ~15% (340 → 290). */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[290px_1fr]">
+        {/* Left column slimmed ~15% (340 → 290). */}
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[290px_1fr]">
         {/* LEFT: Vercel-style dashboard boxes */}
         <div className="order-2 flex flex-col gap-6 lg:order-1">
           <UsageBox billing={billing} ledger={ledger ?? []} />
@@ -272,8 +279,9 @@ function Dashboard() {
             </div>
           )}
         </div>
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 

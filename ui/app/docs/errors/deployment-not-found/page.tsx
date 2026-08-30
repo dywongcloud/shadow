@@ -10,22 +10,22 @@ export const dynamic = "force-static";
 export const revalidate = 3600;
 
 const DESC =
-  "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, unattached custom domain, or a region that does not host the deployment.";
+  "Why a request returns 404 DEPLOYMENT_NOT_FOUND on autheo, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, unattached custom domain, or a region that does not host the deployment.";
 
 export const metadata: Metadata = {
-  title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
+  title: "DEPLOYMENT_NOT_FOUND — autheo Docs",
   description: DESC,
   alternates: { canonical: "/docs/errors/deployment-not-found" },
   openGraph: {
-    title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
+    title: "DEPLOYMENT_NOT_FOUND — autheo Docs",
     description: DESC,
     url: "/docs/errors/deployment-not-found",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
+    title: "DEPLOYMENT_NOT_FOUND — autheo Docs",
     description: DESC,
   },
 };
@@ -56,7 +56,7 @@ export default function DeploymentNotFoundPage() {
         <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">DEPLOYMENT_NOT_FOUND</h1>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           A request was made for a deployment that does not exist. The hostname resolved and reached
-          a shadw edge node, but that node found no deployment to serve for it. The response is{" "}
+          an autheo edge node, but that node found no deployment to serve for it. The response is{" "}
           <code className="font-mono text-sm">404</code> with the header{" "}
           <code className="font-mono text-sm">x-hive-error: DEPLOYMENT_NOT_FOUND</code>.
         </p>
@@ -81,7 +81,7 @@ export default function DeploymentNotFoundPage() {
         />
         <p>
           The part before <code className="font-mono text-sm">::</code> is the region that served the
-          response. That matters because shadw resolves the public hostnames round-robin across the
+          response. That matters because autheo resolves the public hostnames round-robin across the
           fleet: if only some requests 404, compare the region prefix on a failing response against a
           succeeding one — a difference points at one node, not at your deployment.
         </p>
@@ -105,7 +105,7 @@ export default function DeploymentNotFoundPage() {
           </Cause>
           <Cause title="A custom domain is not attached to a project">
             <p>
-              DNS can point at shadw while no project claims the hostname — the request arrives and
+              DNS can point at autheo while no project claims the hostname — the request arrives and
               matches nothing. Attach the domain to the project under its domain settings, then
               re-request. Until it is attached, every request for that host returns this error.
             </p>
@@ -129,21 +129,21 @@ export default function DeploymentNotFoundPage() {
             {
               label: "curl",
               lang: "bash",
-              code: "curl -sI https://your-app.shadw.app/ | grep -i 'x-hive-'",
+              code: "curl -sI https://your-app.autheo.app/ | grep -i 'x-hive-'",
             },
           ]}
         />
         <p>
           <code className="font-mono text-sm">x-hive-error</code> confirms the classification and{" "}
           <code className="font-mono text-sm">x-hive-region</code> names the serving region. If the
-          header is absent entirely, the response did not come from a shadw edge node at all — check
+          header is absent entirely, the response did not come from an autheo edge node at all — check
           that the hostname&apos;s DNS still points here before debugging anything else.
         </p>
       </Section>
 
       <Section id="related" title="Related">
         <p>
-          shadw&apos;s error code and 404 screen intentionally mirror Vercel&apos;s, so a URL or
+          autheo&apos;s error code and 404 screen intentionally mirror Vercel&apos;s, so a URL or
           workflow moved between the two platforms surfaces the same diagnosis. Vercel documents the
           equivalent error here:
         </p>
