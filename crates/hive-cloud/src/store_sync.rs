@@ -327,6 +327,26 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
+        // Queue/consumer METADATA only — messages never ride this (node-local
+        // + GuardianDB-mirrored, see queues.rs's module doc). Same
+        // empty-payload guard as `databases`: a fully-empty snapshot means
+        // "the leader hasn't published anything yet", never "delete
+        // everything" — tombstones carry deletions explicitly.
+        name: "queues",
+        snapshot: |c| enc(&c.queues.snapshot_synced()),
+        adopt: |c, b| {
+            let synced: crate::queues::SyncedQueues = serde_json::from_slice(b).ok()?;
+            if synced.queues.is_empty()
+                && synced.consumers.is_empty()
+                && synced.queue_tombstones.is_empty()
+                && synced.consumer_tombstones.is_empty()
+            {
+                return None;
+            }
+            Some(c.queues.merge_synced(synced))
+        },
+    },
+    SyncedStore {
         name: "domains",
         snapshot: |c| enc_sorted(c.domains.snapshot()),
         adopt: |c, b| {

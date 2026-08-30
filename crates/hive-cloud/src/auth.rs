@@ -16,6 +16,24 @@ use axum::{
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
+/// TTL (seconds) for a `mesh-internal` delegation token minted to authenticate
+/// one node-to-node forwarded call (`gossip::team_claims`'s `?tok=`,
+/// `fetch_from_host`/`proxy_get_json`'s `Authorization: Bearer`). Must clear
+/// the iroh mesh's own dial/connect budget with real headroom: `fetch_from_host`
+/// gives `gossip::request_to` up to 20s specifically because `PeerPool::acquire`
+/// can fall back to a fresh-discovery dial when its cached hint is stale — a
+/// token minted just before that fallback fires, plus any receiver-side queuing
+/// under load, was landing on the verifying node already expired. Witnessed
+/// live 2026-08-28: a stuck build-status poller retrying a forwarded
+/// `/v1/builds/:id` read logged "mesh delegation token present but INVALID"
+/// (jsonwebtoken's `ExpiredSignature`) 500+ times/hour against two real build
+/// ids, every retry re-minting a fresh-at-mint-time 60s token that still
+/// expired in transit. 90s clears the 20s dial budget with a wide margin
+/// without meaningfully widening the token's replay window (it is still
+/// single-purpose, mesh-peer-trust-gated, and self-invalidates on use by the
+/// receiver's own expiry check).
+pub const MESH_DELEGATION_TOKEN_TTL_SECS: i64 = 90;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,    // user id

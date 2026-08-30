@@ -29,7 +29,11 @@ use tokio::sync::mpsc;
 
 pub use hive_core::FunctionLaunch;
 pub use runtime_artifact::{
-    RuntimeArtifactPaths, RuntimeArtifactSpec, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+    materialize_runtime_artifact_package, reopen_sealed_runtime_artifact,
+    seal_host_runtime_artifact, validate_runtime_artifact_package_descriptor,
+    RuntimeArtifactPackageDescriptor, RuntimeArtifactPaths, RuntimeArtifactSpec,
+    SealedRuntimeArtifact, VerifiedRuntimeArtifactPackage,
+    RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
 };
 
 /// Sink the backend writes build output to. The box daemon fans this out to
@@ -1753,21 +1757,18 @@ pub trait CellBackend: Send + Sync {
         sink: LogSink,
     ) -> anyhow::Result<BuildResult>;
 
-    /// Make a built deployment available to the cells that will serve it.
-    ///
-    /// The control plane builds on its own host filesystem (`build_dir`), then
-    /// serves via `provision` + `start_function`. For a same-host backend (mock,
-    /// child process) the serving cell already sees `build_dir`, so this is a
-    /// no-op. For an isolated backend (Firecracker microVM) the guest cannot see
-    /// the host's `build_dir`, so this packs it into a per-`image` artifact that
-    /// `provision` later attaches to the cell. Called once per deployment, keyed
-    /// by the same `image` the function pool will provision with.
+    /// Make one exact sealed runtime artifact available to serving cells. A
+    /// backend never receives checkout coordinates and therefore cannot rebuild
+    /// or re-detect independently of the coordinator's immutable authority.
     async fn deliver_build(
         &self,
         _image: &str,
-        _artifact: &RuntimeArtifactSpec,
+        _artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!(
+            "backend {} did not consume the caller-authorized sealed runtime artifact",
+            self.name()
+        )
     }
 
     /// Whether this backend attaches an isolated runtime artifact when serving a
@@ -1792,9 +1793,11 @@ pub trait CellBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Guest cwd for the application selected by `artifact`. Same-host backends
-    /// return `None` and retain the host build cwd.
-    fn delivered_workdir(&self, _artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+    /// Backend cwd for the application selected by the sealed descriptor.
+    fn delivered_workdir(
+        &self,
+        _artifact: &SealedRuntimeArtifact,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 

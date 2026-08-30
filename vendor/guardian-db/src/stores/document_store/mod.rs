@@ -32,12 +32,38 @@ const NAMESPACE_CACHE_KEY: &[u8] = b"_iroh_docs_doc_namespace_id";
 /// Stored as a single byte: 1 = write-capable, 0 = read-only.
 const WRITABLE_CACHE_KEY: &[u8] = b"_iroh_docs_doc_writable";
 
+/// One key's index entry: the content hash is always known cheaply (iroh-docs
+/// entry metadata, no blob transfer), the value is loaded lazily on first
+/// real read and cached from then on. Mirrors `kv_store::IndexSlot` exactly —
+/// same bug, same fix. See `refresh_doc_index`'s doc for why this exists.
+#[derive(Clone)]
+struct IndexSlot {
+    /// iroh-docs content hash (hex). `None` only for eagerly-inserted slots
+    /// that never needed one (a local `put()`/live-sync entry); the
+    /// cold-start hash-only path always sets it.
+    hash: Option<String>,
+    /// Populated on first successful `cat_bytes(hash)`; `None` means
+    /// "known to exist, not yet fetched".
+    value: Option<Vec<u8>>,
+}
+
 /// Local in-memory index that mirrors the iroh-docs document state.
 ///
 /// Updated atomically after each put/delete operation,
-/// serving as a synchronous cache for StoreIndex queries.
+/// serving as a synchronous cache for StoreIndex queries. Values are lazily
+/// materialized (see [`IndexSlot`]) — reading a key whose value has not been
+/// fetched yet requires a durable-storage round trip
+/// (`GuardianDBDocumentStore::get`/`query`'s `cat_bytes` fallback), which is
+/// why the synchronous [`StoreIndex::get_bytes`] can only serve what is
+/// ALREADY cached. Unlike the sibling `kv_store`, this asymmetry is NOT fully
+/// contained to internal callers: `guardian::DocumentStoreWrapper` (the real,
+/// live `DocumentStore` trait impl every `Guardian::docs()` caller uses)
+/// reads through `Store::index()` → `StoreIndex::get_bytes`/`keys()` for its
+/// `get`/`query` methods — so that wrapper was changed to prefer the
+/// concrete store's own async `get`/`query` (which DO lazily fetch) and fall
+/// back to the generic index/oplog scan only when the downcast fails.
 pub struct DocumentStoreIndex {
-    index: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    index: Arc<RwLock<HashMap<String, IndexSlot>>>,
 }
 
 impl Default for DocumentStoreIndex {
@@ -53,26 +79,59 @@ impl DocumentStoreIndex {
         }
     }
 
+    /// Gets a value from the index IF it is already cached — never fetches.
     pub fn get_value(&self, key: &str) -> Option<Vec<u8>> {
         let guard = self.index.read();
-        guard.get(key).cloned()
+        guard.get(key).and_then(|slot| slot.value.clone())
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    /// The content hash for `key`, if known — present even before the value
+    /// itself has been fetched. `None` if the key is genuinely absent.
+    pub fn get_hash(&self, key: &str) -> Option<String> {
+        let guard = self.index.read();
+        guard.get(key).and_then(|slot| slot.hash.clone())
+    }
+
+    /// Records a value fetched lazily for `key`, without disturbing any
+    /// concurrent writer's more recent hash for that key (a `refresh`/live-sync
+    /// racing this fetch always wins).
+    pub fn cache_fetched_value(&self, key: &str, hash: &str, value: Vec<u8>) {
+        let mut guard = self.index.write();
+        if let Some(slot) = guard.get_mut(key) {
+            if slot.hash.as_deref() == Some(hash) {
+                slot.value = Some(value);
+            }
+        }
+    }
+
+    /// All keys currently known to the index. Cheap: no fetch triggered.
+    pub fn key_set(&self) -> Vec<String> {
         let guard = self.index.read();
         guard.keys().cloned().collect()
     }
 
     pub fn insert(&self, key: String, value: Vec<u8>) {
         let mut guard = self.index.write();
-        guard.insert(key, value);
+        guard.insert(
+            key,
+            IndexSlot {
+                hash: None,
+                value: Some(value),
+            },
+        );
     }
 
-    /// Atomically swap in a freshly-rebuilt index, replacing the old contents
-    /// wholesale (vs. many individual `insert` calls racing readers mid-rebuild).
-    pub fn replace_all(&self, new_index: HashMap<String, Vec<u8>>) {
+    /// Inserts a key with ONLY its content hash known — the lazy cold-start
+    /// path. No value bytes are fetched or stored by this call.
+    pub fn insert_hash_only(&self, key: String, hash: String) {
         let mut guard = self.index.write();
-        *guard = new_index;
+        guard.insert(
+            key,
+            IndexSlot {
+                hash: Some(hash),
+                value: None,
+            },
+        );
     }
 
     pub fn remove(&self, key: &str) {
@@ -96,95 +155,61 @@ impl DocumentStoreIndex {
     }
 }
 
-/// Rebuilds the in-memory index from the current state of the iroh-docs document.
-/// Shared between `sync_index_from_docs` and the reactive live-sync task.
+/// Rebuilds the in-memory index's KEY SET from the current state of the
+/// iroh-docs document — hashes only, never values. Shared between
+/// `sync_index_from_docs` (the store's cold-start bring-up) and the reactive
+/// live-sync task's rate-limited safety-net resync.
+///
+/// # Why this fetches no value bytes at all (load-bearing, not an optimization)
+///
+/// This used to `cat_bytes` (a full content fetch) every single entry,
+/// serially, before the store was considered open — the identical bug
+/// already root-caused and fixed in the sibling `kv_store`
+/// (`refresh_kv_index`'s doc has the full incident writeup: unbounded
+/// materialization crossing a 16 GiB self-restart threshold in under two
+/// minutes on every cold start, a self-sustaining crash loop). `docs.get_many`
+/// already returns entry METADATA (key, content hash, timestamp, content
+/// length) with zero blob transfer. Recording only the hash here, and
+/// letting `GuardianDBDocumentStore::get`/`query` fetch a value lazily on
+/// first real read (cached from then on, see
+/// `DocumentStoreIndex::cache_fetched_value`), makes the cold-start rebuild
+/// cost O(entry count × cheap metadata read) instead of O(total document
+/// bytes).
+///
+/// Unlike the pre-fix version, there is no per-entry failure mode here that
+/// can drop a key: reading entry metadata (key + hash) either succeeds for
+/// the whole query or the query itself errors (propagated via `?` above) —
+/// so the previous "serve last-known-good on a failed re-fetch" fallback is
+/// gone because there is nothing left that can fail per-entry during this
+/// walk (a lazy value fetch can still fail on read; see the `get`/`query`
+/// fallback-to-cached-value handling there).
 async fn refresh_doc_index(
     docs: &WillowDocs,
     doc: &Doc,
-    client: &Arc<IrohClient>,
+    _client: &Arc<IrohClient>,
     index: &Arc<DocumentStoreIndex>,
 ) -> Result<usize> {
     let entries = docs
         .get_many(doc, Query::single_latest_per_key().build())
         .await?;
 
-    let mut new_index: HashMap<String, Vec<u8>> = HashMap::new();
+    index.clear_all();
     let mut count = 0;
-    let mut stale_served = 0;
-    // Aggregated reporting for keys with no previous value to fall back to (see
-    // the Err arm). Warning once PER ENTRY produced hundreds of identical lines
-    // per sync — measured on a live node as 366 of them against 18 aggregated
-    // lines from the sibling kv_store — which buried every other log on the box
-    // and still never said how many keys were actually missing.
-    let mut lost = 0usize;
-    let mut first_lost: Option<(String, String)> = None;
 
     for entry in &entries {
-        let key = String::from_utf8_lossy(entry.key()).to_string();
-
         if entry.content_len() == 0 {
             continue;
         }
 
+        let key = String::from_utf8_lossy(entry.key()).to_string();
         let hash_str = entry.content_hash().to_hex();
-        match client.cat_bytes(&hash_str).await {
-            Ok(value) => {
-                new_index.insert(key, value);
-                count += 1;
-            }
-            Err(e) => {
-                // The key->hash CRDT metadata synced fine (this entry is in
-                // `entries` at all), but fetching the content blob itself
-                // failed -- transient holder-unreachable/connection-race
-                // territory, not evidence the row doesn't exist. This used
-                // to unconditionally drop the key from the rebuilt index
-                // (every refresh fully `clear_all()`s first), so a single
-                // flaky `cat_bytes` silently zeroed out a row a PRIOR
-                // refresh had already fetched -- witnessed live as `SELECT
-                // COUNT` on a relational table intermittently returning 0
-                // on healthy, fully-synced fleet nodes. Fall back to
-                // whatever this key held before, so a transient fetch
-                // failure degrades to "serve last-known-good", not to
-                // "row vanished".
-                match index.get_value(&key) {
-                    Some(prev) => {
-                        new_index.insert(key, prev);
-                        stale_served += 1;
-                    }
-                    None => {
-                        lost += 1;
-                        if first_lost.is_none() {
-                            first_lost = Some((key.clone(), format!("{e:?}")));
-                        }
-                    }
-                }
-            }
-        }
+        index.insert_hash_only(key, hash_str);
+        count += 1;
     }
-
-    if stale_served > 0 {
-        debug!(
-            stale_served,
-            "DocumentStore index: served last-known-good content for keys whose blob re-fetch failed this round"
-        );
-    }
-    if lost > 0 {
-        let (k, e) = first_lost
-            .clone()
-            .unwrap_or_else(|| ("<unknown>".to_string(), "<none>".to_string()));
-        warn!(
-            "DocumentStore index sync: {} of {} entries could not be read from iroh-docs and have NO previous value to fall back on, so they are MISSING from the index (first: key={} err={})",
-            lost,
-            lost + count,
-            k,
-            e
-        );
-    }
-    index.replace_all(new_index);
 
     debug!(
-        "DocumentStore index synchronized from iroh-docs: {} entries ({} served stale, {} missing)",
-        count, stale_served, lost
+        "DocumentStore index key set synchronized from iroh-docs: {} entries (values load lazily on read)",
+        count
     );
     Ok(count)
 }
@@ -197,14 +222,15 @@ impl StoreIndex for DocumentStoreIndex {
         Ok(guard.contains_key(key))
     }
 
+    /// Synchronous, cache-only read (see the struct doc) — returns `None`
+    /// both for a genuinely absent key AND for a known key whose value has
+    /// not been lazily fetched yet.
     fn get_bytes(&self, key: &str) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
-        let guard = self.index.read();
-        Ok(guard.get(key).cloned())
+        Ok(self.get_value(key))
     }
 
     fn keys(&self) -> std::result::Result<Vec<String>, Self::Error> {
-        let guard = self.index.read();
-        Ok(guard.keys().cloned().collect())
+        Ok(self.key_set())
     }
 
     fn len(&self) -> std::result::Result<usize, Self::Error> {
@@ -539,6 +565,44 @@ impl GuardianDBDocumentStore {
         refresh_doc_index(&self.docs, &self.doc_handle, &self.client, &self.index).await
     }
 
+    /// The full key set currently known to the index — cheap, never triggers
+    /// a fetch. `pub` so `guardian::DocumentStoreWrapper` can drive a lazy
+    /// full-store scan (see its `query` impl) without going through the
+    /// synchronous, cache-only generic `StoreIndex` path.
+    pub fn index_key_set(&self) -> Vec<String> {
+        self.index.key_set()
+    }
+
+    /// Reads a single key's value, fetching lazily from durable storage on a
+    /// cache miss for a key the index knows about (present with a hash but
+    /// no value yet — the normal state right after a cold-start rebuild, see
+    /// `refresh_doc_index`). Mirrors `kv_store::GuardianDBKeyValue::get_impl`.
+    /// A key genuinely absent from the index returns `Ok(None)` without
+    /// touching the network. A lazy fetch that fails is logged and treated
+    /// as a miss (not propagated as an error) — `get`/`query` are best-effort
+    /// multi-key scans, matching this store's pre-existing skip-on-error
+    /// behavior around deserialization failures. `pub` for the same reason as
+    /// `index_key_set` above.
+    pub async fn get_value_lazy(&self, key: &str) -> Option<Vec<u8>> {
+        if let Some(value) = self.index.get_value(key) {
+            return Some(value);
+        }
+        let hash = self.index.get_hash(key)?;
+        match self.client.cat_bytes(&hash).await {
+            Ok(value) => {
+                self.index.cache_fetched_value(key, &hash, value.clone());
+                Some(value)
+            }
+            Err(e) => {
+                warn!(
+                    "DocumentStore lazy fetch failed for key={} hash={}: {:?}",
+                    key, hash, e
+                );
+                None
+            }
+        }
+    }
+
     /// Starts a background task that keeps the in-memory index synchronized with the
     /// iroh-docs namespace as REMOTE documents arrive via Willow sync.
     fn spawn_live_index_sync(&self) {
@@ -561,48 +625,80 @@ impl GuardianDBDocumentStore {
 
             use futures::StreamExt;
             use iroh_docs::engine::LiveEvent;
-            // Rebuild on every event that can change materialized document state.
-            // Local events matter too: an axum/request future may be cancelled
-            // after the independent iroh-docs actor commits but before the
-            // caller-side index.insert runs.
-            let changes_documents = |event: &std::result::Result<LiveEvent, _>| {
-                matches!(
-                    event,
-                    Ok(LiveEvent::InsertLocal { .. })
-                        | Ok(LiveEvent::InsertRemote { .. })
-                        | Ok(LiveEvent::ContentReady { .. })
-                        | Ok(LiveEvent::PendingContentReady)
-                        | Ok(LiveEvent::SyncFinished(_))
-                )
-            };
-            const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-            let mut dirty = false;
+            // INCREMENTAL application, not full rebuild — same change and same
+            // measured reason as the sibling kv_store live sync (see its comment:
+            // the debounced full rebuild re-fetched every value in the doc several
+            // times a minute under fleet gossip and was a top allocation site of
+            // the leader-OOM RSS balloon). Local events are applied incrementally
+            // too, and still matter: an axum/request future may be cancelled after
+            // the independent iroh-docs actor commits but before the caller-side
+            // index.insert runs — applying the InsertLocal entry here closes that
+            // gap without a full refetch. The rate-limited full resync remains as
+            // the safety net for dropped subscription events.
+            const FULL_RESYNC_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
+            const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut pending: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut full_dirty = false;
+            let mut last_full = std::time::Instant::now();
             loop {
-                if dirty {
-                    match tokio::time::timeout(DEBOUNCE, stream.next()).await {
-                        Ok(Some(event)) => {
-                            if changes_documents(&event) {
-                                dirty = true;
-                            }
-                            continue;
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            dirty = false;
-                            if let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
-                                warn!("Failed to update Document index via live sync: {:?}", e);
+                match tokio::time::timeout(IDLE_TICK, stream.next()).await {
+                    Ok(None) => break,
+                    Err(_) => {}
+                    Ok(Some(Ok(
+                        LiveEvent::InsertRemote { entry, .. } | LiveEvent::InsertLocal { entry },
+                    ))) => {
+                        let key = String::from_utf8_lossy(entry.key()).to_string();
+                        if entry.content_len() == 0 {
+                            index.remove(&key);
+                            pending.retain(|_, keys| {
+                                keys.retain(|k| k != &key);
+                                !keys.is_empty()
+                            });
+                        } else {
+                            let hash_str = entry.content_hash().to_hex().to_string();
+                            match client.cat_bytes(&hash_str).await {
+                                Ok(value) => index.insert(key, value),
+                                Err(_) => {
+                                    pending.entry(hash_str).or_default().push(key);
+                                }
                             }
                         }
                     }
-                } else {
-                    match stream.next().await {
-                        Some(event) => {
-                            if changes_documents(&event) {
-                                dirty = true;
+                    Ok(Some(Ok(LiveEvent::ContentReady { hash }))) => {
+                        let hash_str = hash.to_hex().to_string();
+                        if let Some(keys) = pending.remove(&hash_str) {
+                            match client.cat_bytes(&hash_str).await {
+                                Ok(value) => {
+                                    for key in keys {
+                                        index.insert(key, value.clone());
+                                    }
+                                }
+                                Err(_) => full_dirty = true,
                             }
                         }
-                        None => break,
                     }
+                    Ok(Some(Ok(LiveEvent::SyncFinished(_))))
+                    | Ok(Some(Ok(LiveEvent::PendingContentReady))) => {
+                        full_dirty = true;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(e))) => {
+                        debug!(
+                            "Document live sync subscription error (scheduling resync): {:?}",
+                            e
+                        );
+                        full_dirty = true;
+                    }
+                }
+                if full_dirty && last_full.elapsed() >= FULL_RESYNC_MIN_INTERVAL {
+                    full_dirty = false;
+                    pending.clear();
+                    if let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
+                        warn!("Failed to update Document index via live sync: {:?}", e);
+                    }
+                    last_full = std::time::Instant::now();
                 }
             }
             debug!("Live index sync terminated for Document store");
@@ -932,7 +1028,7 @@ impl GuardianDBDocumentStore {
 
         let mut documents: Vec<Document> = Vec::new();
 
-        for index_key in self.index.keys() {
+        for index_key in self.index.key_set() {
             let mut index_key_for_search = index_key.clone();
 
             if opts.case_insensitive {
@@ -952,7 +1048,7 @@ impl GuardianDBDocumentStore {
                 continue;
             }
 
-            if let Some(value_bytes) = self.index.get_value(&index_key) {
+            if let Some(value_bytes) = self.get_value_lazy(&index_key).await {
                 let doc: Document = serde_json::from_slice(&value_bytes).map_err(|e| {
                     GuardianError::Serialization(format!(
                         "Unable to deserialize the value for key {}: {}",
@@ -1000,8 +1096,14 @@ impl GuardianDBDocumentStore {
         self.ensure_writable()?;
         let _entered = self.span.enter();
 
-        // Check whether the entry exists in the local index.
-        if self.index.get_value(document_id).is_none() {
+        // Existence check via contains_key, NOT get_value: post-cold-start a
+        // real key can have a known hash with no value fetched yet, and
+        // get_value alone would misreport it as absent (see IndexSlot's doc).
+        if !self
+            .index
+            .contains_key(document_id)
+            .unwrap_or(false)
+        {
             return Err(GuardianError::NotFound(format!(
                 "No entry with key '{}' in the database",
                 document_id
@@ -1072,7 +1174,11 @@ impl GuardianDBDocumentStore {
         self.ensure_writable()?;
         let _entered = self.span.enter();
 
-        if self.index.get_value(document_id).is_none() {
+        if !self
+            .index
+            .contains_key(document_id)
+            .unwrap_or(false)
+        {
             return Err(GuardianError::NotFound(format!(
                 "No entry with key '{}' in the database",
                 document_id
@@ -1172,6 +1278,20 @@ impl GuardianDBDocumentStore {
         Ok(Operation::new(first_key, "PUTALL".to_string(), None))
     }
 
+    /// Synchronous, CACHED-ONLY scan — never triggers a lazy fetch (the
+    /// filter closure is sync, so it cannot `.await` one). A key whose value
+    /// hasn't been lazily loaded yet (the normal state for most keys right
+    /// after a cold-start rebuild, see `refresh_doc_index`) is silently
+    /// skipped rather than fetched. No caller of this method exists anywhere
+    /// in the repo today (confirmed by search) — real document queries go
+    /// through `GuardianDBDocumentStore::query`'s async counterpart on the
+    /// `DocumentStore` trait, reached via `DocumentStoreWrapper`, which does
+    /// have full lazy-fetch coverage (see `guardian::mod`'s
+    /// `get_all_documents_from_index`/`search_documents_by_key` now
+    /// preferring this store's own async `get`/`query`). If a future caller
+    /// needs a synchronous-but-complete scan, warm the index first via
+    /// `sync_index_from_docs` plus a bulk `get`/`get_value_lazy` pass, or add
+    /// an async variant instead of forcing a fetch from a sync context.
     #[instrument(level = "debug", skip(self, filter))]
     pub fn query<F>(&self, mut filter: F) -> Result<Vec<Document>>
     where
@@ -1179,7 +1299,7 @@ impl GuardianDBDocumentStore {
     {
         let mut results: Vec<Document> = Vec::new();
 
-        for index_key in self.index.keys() {
+        for index_key in self.index.key_set() {
             if let Some(doc_bytes) = self.index.get_value(&index_key) {
                 let doc: Document = serde_json::from_slice(&doc_bytes).map_err(|e| {
                     GuardianError::Serialization(format!(

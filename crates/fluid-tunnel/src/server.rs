@@ -35,6 +35,47 @@ use tokio::sync::mpsc;
 /// streaming bursts so the counter signals a genuinely slow/stalled consumer.
 const BACKPRESSURE_HWM: u64 = 256;
 
+/// How many CONCURRENT local connections one upstream address may receive
+/// across every tunnel in this process. Hosts multiplex fine (default 64,
+/// effectively unlimited); a backend whose guests can only service one
+/// connection at a time lowers it at init — litebox's guest network stack
+/// re-arms a single listener serially, so overlapping connects were
+/// accept-closed and every collision surfaced as a "function closed before
+/// headers" 502 (witnessed live: ~50% of uncached fetches on a busy guest,
+/// while strictly sequential probes never failed). Queueing at the connect is
+/// the correct shape: requests WAIT the microseconds a busy guest needs
+/// instead of failing.
+static LOCAL_CONNECT_PERMITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(64);
+
+/// Set by the backend that owns this process's cells, once, at init.
+pub fn set_local_connect_permits(permits: usize) {
+    LOCAL_CONNECT_PERMITS.store(permits.max(1), Ordering::Relaxed);
+}
+
+/// Per-upstream-address gates. Keyed by the literal `local_http` string; the
+/// map only ever holds one entry per live function address, and is cleared if
+/// it somehow grows past a bound so a churn of ephemeral ports cannot leak.
+fn connect_gate(local_http: &str) -> Arc<tokio::sync::Semaphore> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = gates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if map.len() > 4096 {
+        map.clear();
+    }
+    map.entry(local_http.to_string())
+        .or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                LOCAL_CONNECT_PERMITS.load(Ordering::Relaxed),
+            ))
+        })
+        .clone()
+}
+
 /// Byte + backpressure metering for one tunnel (#14). All counters are cumulative
 /// except `queued`, which is the live write-queue depth (enqueued minus flushed).
 #[derive(Default)]
@@ -241,7 +282,45 @@ impl TunnelServer {
 }
 
 async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) {
-    if let Err(e) = proxy_local(id, &payload, local_http, out).await {
+    // An idempotent request whose upstream connection died BEFORE any response
+    // frame was emitted is retried against a fresh connection. Litebox guests
+    // intermittently accept-then-close a connect that lands while another is
+    // being serviced (single-listener re-arm in the guest network stack), so
+    // without this a straight 50% of uncached GETs through a busy guest
+    // surfaced as `upstream error: function closed before headers` 502s —
+    // witnessed live on nodes-wtf /favicon.ico while direct sequential probes
+    // of the same guest never failed once. Retry is ONLY safe while nothing
+    // has been sent (`head_sent` guards it): after the response head frame is
+    // out, a second attempt would interleave two responses on one stream.
+    let idempotent = payload
+        .get(0..4)
+        .and_then(|len| Some(u32::from_be_bytes(len.try_into().ok()?) as usize))
+        .and_then(|meta_len| payload.get(4..4 + meta_len))
+        .and_then(|meta| serde_json::from_slice::<ReqMeta>(meta).ok())
+        .map(|meta| matches!(meta.method.as_str(), "GET" | "HEAD"))
+        .unwrap_or(false);
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut head_sent = false;
+        match proxy_local(id, &payload, local_http, out, &mut head_sent).await {
+            Ok(()) => return,
+            Err(error) => {
+                if head_sent || !idempotent || attempt + 1 == MAX_ATTEMPTS {
+                    if head_sent {
+                        // Frames already flowed; emitting a 502 head now would
+                        // corrupt the stream. The caller sees the truncation.
+                        return;
+                    }
+                    last_error = Some(error);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+    if let Some(e) = last_error {
         // Make sure the caller gets *something* terminal.
         let meta = RespMeta {
             status: 502,
@@ -267,6 +346,7 @@ async fn proxy_local(
     payload: &[u8],
     local_http: &str,
     out: &MeteredSender,
+    head_sent: &mut bool,
 ) -> anyhow::Result<()> {
     // Split payload: [u32 meta_len][meta json][body].
     anyhow::ensure!(payload.len() >= 4, "short request payload");
@@ -275,6 +355,10 @@ async fn proxy_local(
     let meta: ReqMeta = serde_json::from_slice(&payload[4..4 + meta_len])?;
     let body = &payload[4 + meta_len..];
 
+    // Held for the whole request/response exchange (`Connection: close`
+    // delimits it), so a serial-accept guest is never offered an overlapping
+    // connect — see `set_local_connect_permits`.
+    let _connect_permit = connect_gate(local_http).acquire_owned().await?;
     let mut conn = TcpStream::connect(local_http).await?;
 
     // Write HTTP/1.1 request, Connection: close so EOF delimits the response.
@@ -353,12 +437,14 @@ async fn proxy_local(
         }
     }
 
-    // Send response head, then stream the body.
+    // Send response head, then stream the body. `head_sent` flips FIRST: once
+    // any frame may have reached the wire, the caller must never retry.
     let meta = RespMeta {
         status,
         headers,
         wait_until_ms,
     };
+    *head_sent = true;
     out.send(Frame::new(
         id,
         FrameKind::RespHead,

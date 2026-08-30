@@ -236,7 +236,11 @@ function dataSaverActive(): boolean {
 export function useRunNode() {
   const [status, setStatusState] = useState<RunNodeStatus>(initialRunNodeStatus());
   // Stable per-instance identity for the presence-publisher claim below.
-  const ownerToken = useRef<object>({}).current;
+  // useState (not useRef().current) because reading a ref's .current during
+  // render is unsafe (react-hooks/refs) — useState's lazy initializer runs
+  // once and yields the same stable object on every render without a
+  // render-time ref read.
+  const [ownerToken] = useState<object>(() => ({}));
   // Network policy (bn-ui-mobile-lifecycle): distinct from `status.lastError`
   // (a worker-reported failure) — this is a CLIENT-SIDE policy refusal that
   // never reaches the worker at all, so it needs its own state rather than

@@ -4,7 +4,7 @@
 //! native output directory, and which **primitive** the output maps to.
 
 use crate::{BuildContractError, BuildContractErrorCode, OutputDirectory};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -184,7 +184,7 @@ pub fn preset(slug: &str) -> Option<&'static FrameworkPreset> {
 /// Where the selected package manager came from — surfaced in build logs and
 /// deployment metadata so a conflicting-lockfile situation is auditable, never
 /// a silent guess.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageManagerSource {
     /// A valid, exact `package.json#packageManager` declaration.
@@ -203,7 +203,7 @@ pub enum PackageManagerSource {
     InvalidDeclaration,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageManagerDeclaration {
     /// Byte-for-byte package.json declaration. npm/pnpm/Yarn declarations are
     /// safe for Corepack after validation; Bun remains a native pinned-builder
@@ -215,7 +215,7 @@ pub struct PackageManagerDeclaration {
 
 /// Full package-manager detection result, including the exact root declaration
 /// rather than only its manager name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageManagerLockfile {
     Bun,
@@ -458,7 +458,7 @@ pub fn detect_package_manager_checked(repo: &Path) -> anyhow::Result<PackageMana
     let npm_lock = regular_signal(repo, "package-lock.json")?;
     let pnpm_workspace = regular_signal(repo, "pnpm-workspace.yaml")?;
 
-    let (mut manager, mut source, declaration) = declaration
+    let (manager, source, declaration) = declaration
         .map(|(manager, declaration)| {
             (
                 manager,
@@ -471,18 +471,6 @@ pub fn detect_package_manager_checked(repo: &Path) -> anyhow::Result<PackageMana
         .or_else(|| yarn_lock.then_some(("yarn", PackageManagerSource::YarnLock, None)))
         .or_else(|| npm_lock.then_some(("npm", PackageManagerSource::NpmLock, None)))
         .unwrap_or(("npm", PackageManagerSource::Default, None));
-
-    if pnpm_workspace {
-        if source == PackageManagerSource::Default {
-            manager = "pnpm";
-            source = PackageManagerSource::PnpmWorkspace;
-        } else {
-            anyhow::ensure!(
-                manager == "pnpm",
-                "pnpm-workspace.yaml requires pnpm, but {manager} was independently selected from {source:?}"
-            );
-        }
-    }
 
     let mut conflicting = Vec::new();
     if bun_lock && manager != "bun" {
@@ -497,13 +485,13 @@ pub fn detect_package_manager_checked(repo: &Path) -> anyhow::Result<PackageMana
     if npm_lock && manager != "npm" {
         conflicting.push("package-lock.json");
     }
+    if pnpm_workspace && manager != "pnpm" {
+        conflicting.push("pnpm-workspace.yaml (non-authoritative workspace metadata)");
+    }
     let conflict_warning = (!conflicting.is_empty()).then(|| {
         let selector = match source {
             PackageManagerSource::PackageJson => {
                 format!("package.json#packageManager selects \"{manager}\" exactly")
-            }
-            PackageManagerSource::PnpmWorkspace => {
-                format!("pnpm-workspace.yaml selects \"{manager}\"")
             }
             _ => format!("lockfile precedence (bun > pnpm > yarn > npm) selects \"{manager}\""),
         };
@@ -750,6 +738,20 @@ fn detect_with_package(
         }
         if dep("@vue/cli-service") {
             return preset("vue").unwrap();
+        }
+        // A Node server FRAMEWORK dependency => a server app even with no
+        // start script. Without this, a repo like vercel/vercel's
+        // examples/express (dependency `express`, no scripts at all) fell all
+        // the way through to the static preset and shipped its raw source tree
+        // as a website — a silently wrong deployment the readiness probe then
+        // refused with an unrelated-looking error. Detecting the server intent
+        // routes it to the Node lane, where a missing runnable entry fails
+        // LOUDLY with the existing "no usable production server entry" gate
+        // naming the real remedy (a start script) instead.
+        for server_dep in ["express", "fastify", "koa", "@nestjs/core", "hono"] {
+            if dep(server_dep) {
+                return preset("node").unwrap();
+            }
         }
         // A server start script => treat as a Node serverless app.
         if package

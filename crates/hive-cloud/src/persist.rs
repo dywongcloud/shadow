@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluid_core::DeployRecord;
-use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef};
+use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef, WorkflowRun};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -75,6 +75,13 @@ pub struct PlatformSnapshot {
     /// restore omitting a database record cannot erase them.
     #[serde(default)]
     pub database_studio_replay: crate::databases::StudioReplaySnapshot,
+    /// Cloudflare Queues metadata (queue/consumer records + their tombstones)
+    /// — durable on disk exactly like the `databases` fields above, separate
+    /// from store_sync's cross-node replication path. Message BODIES are
+    /// deliberately excluded (node-local + GuardianDB-mirrored, see
+    /// `crate::queues` module doc) — this snapshot only ever holds metadata.
+    #[serde(default)]
+    pub queues: crate::queues::SyncedQueues,
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
@@ -146,6 +153,14 @@ pub struct PlatformSnapshot {
     /// ingested during a live deploy, so without this they vanished on reboot.
     #[serde(default)]
     pub workflow_defs: Vec<WorkflowDef>,
+    /// Engine-defined-workflow run history (`hive_edge::WorkflowEngine::runs`).
+    /// Previously pure in-memory and lost on every restart — an in-flight run
+    /// has no way to resume (its driving background task died with the
+    /// process), so `WorkflowEngine::runs_load` reconciles any restored
+    /// Pending/Running row to Failed, the same orphan-reconciliation shape
+    /// `persist::restore` already applies to in-flight deployments below.
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRun>,
     /// Enterprise feature suite state (secrets AEAD-encrypted in-struct). See
     /// [`crate::enterprise::EnterpriseSnapshot`].
     #[serde(default)]
@@ -552,6 +567,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         database_data: cloud.databases.data_snapshot(),
         database_tombstones: cloud.databases.tombstones_snapshot(),
         database_studio_replay: cloud.databases.studio_replay_snapshot(),
+        queues: cloud.queues.snapshot_synced(),
         project_tombstones,
         project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
@@ -575,6 +591,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
         workflow_defs: cloud.workflows.defs(),
+        workflow_runs: cloud.workflows.runs_snapshot(),
         enterprise: cloud.enterprise.snapshot(),
         sandboxes: {
             let (sandboxes, commands, snapshots, mounts) = cloud.sandboxes.snapshot();
@@ -822,6 +839,49 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             "persist::restore: skipped deployment records that lack active project-incarnation authority"
         );
     }
+    let ready_for_authority = deployments
+        .iter()
+        .filter(|record| record.state == fluid_core::DeployState::Ready)
+        .map(|record| {
+            (
+                record.id.clone(),
+                record.project.clone(),
+                record.created_at_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let restore_authority = cloud
+        .deployment_ledger
+        .authorize_restore_batch(&ready_for_authority)
+        .unwrap_or_else(|error| panic!("deployment restore authority failed closed: {error:#}"));
+    let mut legacy_ready = 0usize;
+    let before_readiness_filter = deployments.len();
+    deployments.retain(|record| {
+        if record.state != fluid_core::DeployState::Ready {
+            return true;
+        }
+        match restore_authority.get(&record.id) {
+            Some(crate::deployment_ledger::RestoreAuthority::Proven) => true,
+            Some(crate::deployment_ledger::RestoreAuthority::LegacyMigration) => {
+                legacy_ready += 1;
+                true
+            }
+            Some(crate::deployment_ledger::RestoreAuthority::Refused) | None => false,
+        }
+    });
+    let readiness_rejected = before_readiness_filter - deployments.len();
+    if legacy_ready > 0 {
+        tracing::warn!(
+            count = legacy_ready,
+            "persist::restore: preserved pre-ledger Ready deployment(s) as explicit legacy predecessors; they are not readiness proof and cannot authorize promotion"
+        );
+    }
+    if readiness_rejected > 0 {
+        tracing::error!(
+            count = readiness_rejected,
+            "persist::restore: refused Ready deployment(s) without published acceptance evidence"
+        );
+    }
     let n = deployments.len();
     // Reconcile orphaned in-flight builds. A deployment/build persisted with
     // state Queued/Building was mid-flight in an async task on the PREVIOUS
@@ -987,6 +1047,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.databases.tombstones_load(snap.database_tombstones);
+    cloud.queues.load(snap.queues);
     cloud.metrics.rollup_load(snap.metrics_rollup);
     // BuildStore::load() already reconciles Queued/Building -> Error for its
     // own per-build log records internally (git.rs) -- no duplicate needed
@@ -1018,6 +1079,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }
+    cloud.workflows.runs_load(snap.workflow_runs);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

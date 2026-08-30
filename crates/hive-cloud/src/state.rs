@@ -200,6 +200,13 @@ pub struct CloudState {
     /// process, which does not survive a restart (and a restarted node
     /// already finalizes any Queued/Building record to `Error` on boot).
     pub build_cancels: crate::git::BuildCancelRegistry,
+    /// Node-local write-ahead evidence for accepted deployments, production
+    /// alias revisions, and retryable lifecycle delivery.
+    pub deployment_ledger: Arc<crate::deployment_ledger::DeploymentLedger>,
+    /// Bounded, durable receiver for exact runtime-artifact packages. Every
+    /// mutation is serialized by its owned worker and bound to the current
+    /// project incarnation before it enters the queue.
+    pub runtime_artifact_transfer: Arc<crate::runtime_artifact_transfer::TransferService>,
     pub cluster: Arc<crate::cluster::Cluster>,
     pub teams: crate::teams::TeamStore,
     pub gitops: crate::gitops::GitOpsStore,
@@ -279,6 +286,7 @@ pub struct CloudState {
     pub container_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
+    pub queues: Arc<crate::queues::QueueStore>,
     /// Managed-inference runtime (this node's own llama-server children +
     /// endpoint statuses) — see `inference::spawn_reconcile`.
     pub inference: crate::inference::InferenceRuntime,
@@ -601,6 +609,26 @@ impl CloudState {
             );
         }
         let cluster = crate::cluster::Cluster::new(node_name.clone());
+        let deployment_ledger = crate::deployment_ledger::DeploymentLedger::open(
+            crate::persist::data_dir().join("deployment-ledger-v1.json"),
+            &node_name,
+        )
+        .unwrap_or_else(|error| panic!("deployment ledger failed closed: {error:#}"));
+        let runtime_artifact_transfer = crate::runtime_artifact_transfer::TransferService::open(
+            crate::persist::data_dir().join("runtime-artifacts-v1"),
+            node_name.clone(),
+            deployment_ledger.boot_nonce(),
+            gw.clone(),
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(
+                %error,
+                "runtime artifact transfer receiver is disabled; node serving remains available"
+            );
+            crate::runtime_artifact_transfer::TransferService::disabled(format!(
+                "runtime artifact transfer receiver failed to initialize: {error:#}"
+            ))
+        });
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
         // The platform-admin set: HIVE_ADMIN_EMAILS (comma-separated) plus the
@@ -665,7 +693,7 @@ impl CloudState {
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();
-        Arc::new(CloudState {
+        let state = Arc::new(CloudState {
             region,
             node_name,
             boot_ms: hive_core::now_ms(),
@@ -708,6 +736,8 @@ impl CloudState {
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
             build_cancels: crate::git::BuildCancelRegistry::new(),
+            deployment_ledger,
+            runtime_artifact_transfer,
             cluster,
             teams,
             gitops: crate::gitops::GitOpsStore::new(),
@@ -737,6 +767,7 @@ impl CloudState {
             container_holders: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
+            queues: crate::queues::QueueStore::new(),
             inference: crate::inference::InferenceRuntime::default(),
             metrics: crate::metrics::MetricsStore::new(),
             resp_cache: crate::resp_cache::ResponseCache::new(),
@@ -764,7 +795,25 @@ impl CloudState {
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),
             blocked_count: Mutex::new(0),
-        })
+        });
+        // Bind the transfer receiver's durable-persistence hook now that the
+        // state Arc exists (the service is constructed before it). A remote
+        // generation Commit publishes a Ready record only when the SAME
+        // durable write the local deploy path performs succeeds; a Weak
+        // capture keeps the service from pinning the state in a cycle and
+        // fails closed if the state is ever gone.
+        {
+            let weak_state = Arc::downgrade(&state);
+            state
+                .runtime_artifact_transfer
+                .bind_persist(Arc::new(move || {
+                    weak_state
+                        .upgrade()
+                        .map(|state| crate::persist::persist_durable(&state))
+                        .unwrap_or(false)
+                }));
+        }
+        state
     }
 
     /// Mark a successful control-plane (gossip) sync (#25).

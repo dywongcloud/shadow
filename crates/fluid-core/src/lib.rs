@@ -3129,6 +3129,33 @@ pub struct Manifest {
     pub framework: String,
 }
 
+/// Domain separator for [`normalized_manifest_sha256`]. One contract, one
+/// formula: every producer (the build coordinator sealing a generation) and
+/// every consumer (a transfer receiver re-proving the manifest it was handed)
+/// must hash exactly `domain || canonical_manifest_bytes`.
+pub const NORMALIZED_MANIFEST_DOMAIN: &[u8] = b"hive-normalized-manifest-v1\0";
+
+/// The ONE canonical byte encoding of a finalized deployment manifest.
+///
+/// serde_json emits struct fields in declaration order and every map inside
+/// [`Manifest`] is a `BTreeMap`, so encoding is deterministic and
+/// `canonical_manifest_bytes(&decode(bytes)) == bytes` holds for bytes this
+/// function produced — which is exactly the round-trip equality a receiver
+/// enforces before trusting a wire manifest.
+pub fn canonical_manifest_bytes(manifest: &Manifest) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(manifest)
+}
+
+/// SHA-256 identity of one canonical manifest encoding, domain-separated so a
+/// manifest digest can never be confused with any other platform digest.
+pub fn normalized_manifest_sha256(canonical_manifest: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(NORMALIZED_MANIFEST_DOMAIN);
+    hash.update(canonical_manifest);
+    format!("{:x}", hash.finalize())
+}
+
 /// Strict deploy-time protocol validation for raw `fluid.json` text: walk
 /// every `functions[*].protocol` and `functions[*].ports[*].protocol` string
 /// in the RAW JSON and reject unrecognized values via the strict
@@ -3615,9 +3642,9 @@ pub struct MarketplacePlacementSnapshot {
     pub policy: serde_json::Value,
 }
 
-/// Admin API: request to create a deployment. For the mock backend the gateway
-/// reads files directly from `root` (same host); a real deploy would upload a
-/// tarball / build artifact instead.
+/// Admin API: request to create a direct local deployment. `root` is source
+/// acquisition input only; the gateway seals it before registration, and serving
+/// uses paths derived from that immutable artifact.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployRequest {
     pub root: String,

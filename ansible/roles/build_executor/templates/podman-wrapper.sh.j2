@@ -2,11 +2,24 @@
 # {{ ansible_managed }}
 set -euo pipefail
 
+# Only GLOBAL podman flags (those that precede the subcommand) can override the
+# pinned runtime/storage/connection. They must be rejected, but ONLY while still
+# scanning global args: once the first non-flag token (the subcommand, e.g.
+# `create`/`run`) is seen, every remaining argument belongs to the subcommand or
+# the CONTAINER's own command (e.g. `/bin/sh -c "…"`, where `-c` is sh's flag,
+# not podman's) and must pass through untouched.
 for argument in "$@"; do
     case "$argument" in
-        --runtime|--runtime=*|--runtime-flag|--runtime-flag=*|--hooks-dir|--hooks-dir=*|--module|--module=*|--root|--root=*|--runroot|--runroot=*|--imagestore|--imagestore=*|--storage-driver|--storage-driver=*|--storage-opt|--storage-opt=*|--transient-store|--transient-store=*|--db-backend|--db-backend=*|--conmon|--conmon=*|--network-cmd-path|--network-cmd-path=*|--helper-binary-dir|--helper-binary-dir=*|--tmpdir|--tmpdir=*|--volumepath|--volumepath=*|--namespace|--namespace=*|--remote|--url|--url=*|--connection|--connection=*|--identity|--identity=*|-r|-c)
-            printf 'BuildExecutor Podman wrapper rejects runtime/config override: %s\n' "$argument" >&2
-            exit 64
+        -*)
+            case "$argument" in
+                --runtime|--runtime=*|--runtime-flag|--runtime-flag=*|--hooks-dir|--hooks-dir=*|--module|--module=*|--root|--root=*|--runroot|--runroot=*|--imagestore|--imagestore=*|--storage-driver|--storage-driver=*|--storage-opt|--storage-opt=*|--transient-store|--transient-store=*|--db-backend|--db-backend=*|--conmon|--conmon=*|--network-cmd-path|--network-cmd-path=*|--helper-binary-dir|--helper-binary-dir=*|--tmpdir|--tmpdir=*|--volumepath|--volumepath=*|--namespace|--namespace=*|--remote|--url|--url=*|--connection|--connection=*|--identity|--identity=*|-r|-c)
+                    printf 'BuildExecutor Podman wrapper rejects runtime/config override: %s\n' "$argument" >&2
+                    exit 64
+                    ;;
+            esac
+            ;;
+        *)
+            break
             ;;
     esac
 done
