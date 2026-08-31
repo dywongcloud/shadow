@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, use } from "react";
+import { useRouter } from "next/navigation";
 import { ExternalLink } from "lucide-react";
 import { Button, SettingCard, Switch } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type CronJob, type ProjectSettings } from "@/lib/api";
@@ -31,6 +32,7 @@ function describeSchedule(expr: string): string | null {
 export function CronSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
   const project = decodeURIComponent(params.project);
+  const router = useRouter();
   const { data: allJobs, refresh } = usePoll<CronJob[]>("/v1/cron", 5000);
   const [settings, setSettings] = useState<ProjectSettings | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -124,7 +126,7 @@ export function CronSettings({ paramsPromise }: { paramsPromise: Promise<{ proje
                   <Button
                     variant="outline"
                     onClick={() => {
-                      window.location.href = `/projects/${encodeURIComponent(project)}/logs?q=${encodeURIComponent(j.path)}`;
+                      router.push(`/projects/${encodeURIComponent(project)}/logs?q=${encodeURIComponent(j.path)}`);
                     }}
                   >
                     View Logs

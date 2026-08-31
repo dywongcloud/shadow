@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { useRouter } from "next/navigation";
 import {
   Github,
@@ -87,7 +87,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState("");
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const [all, s] = await Promise.all([
         apiGet<Deployment[]>("/deployments").catch(() => [] as Deployment[]),
@@ -101,12 +101,14 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
     } finally {
       setLoaded(true);
     }
-  }
+  }, [project]);
 
   useEffect(() => {
+    // Fetch-on-mount/project-change: load() sets state only after its
+    // internal awaits resolve, syncing external (server) settings into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after internal awaits, not synchronously
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project]);
+  }, [load]);
 
   const hasGit = !!dep?.git;
 

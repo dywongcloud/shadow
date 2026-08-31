@@ -499,16 +499,28 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   const [pv, setPv] = useState<Preview | null>(null);
   const [imgError, setImgError] = useState(false);
 
-  useEffect(() => {
-    let stop = false;
+  // Reset when the deployment identity changes — adjusted during render
+  // (React's "adjusting state when a prop changes" pattern) instead of an
+  // effect, so the stale preview/image-error never flashes before the fetch
+  // below replaces it.
+  const identity = `${project}:${prod?.id ?? ""}`;
+  const [prevIdentity, setPrevIdentity] = useState(identity);
+  if (identity !== prevIdentity) {
+    setPrevIdentity(identity);
     setImgError(false);
     setPv(null);
+  }
+
+  useEffect(() => {
+    let stop = false;
     if (!prod) return;
+    // Fetch-on-mount/identity-change: setPv is called only after the awaited
+    // request resolves, syncing external (server) preview data into React.
     apiGet<Preview>(`/v1/projects/${encodeURIComponent(project)}/preview`)
       .then((d) => { if (!stop) setPv(d); })
       .catch(() => { if (!stop) setPv({ kind: "none" }); });
     return () => { stop = true; };
-  }, [project, prod?.id]);
+  }, [project, prod]);
 
   const box = "relative h-56 overflow-hidden rounded-lg border border-border";
 

@@ -132,7 +132,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       className={`${GeistSans.variable} ${GeistMono.variable} ${display.variable} ${electrolize.variable}`}
     >
       <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
-        {/* eslint-disable-next-line react/no-danger */}
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(STRUCTURED_DATA) }} />
         <PwaRegister />
         <VitalsBeacon />

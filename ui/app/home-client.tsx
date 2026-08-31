@@ -116,30 +116,31 @@ function Dashboard() {
   const { data: notifications } = usePoll<NotificationFeed>("/v1/notifications", 8000);
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
-  const [view, setView] = useState<View>("grid");
-
-  // Restore the saved card/list preference.
-  useEffect(() => {
+  // Lazy initializer: reads the saved card/list preference synchronously on
+  // mount. SSR-safe — `typeof window === "undefined"` on the server matches
+  // the "grid" default, so no hydration mismatch.
+  const [view, setView] = useState<View>(() => {
     const v = typeof window !== "undefined" ? localStorage.getItem("oe_projects_view") : null;
-    if (v === "grid" || v === "list") setView(v);
-  }, []);
+    return v === "grid" || v === "list" ? v : "grid";
+  });
   function chooseView(v: View) {
     setView(v);
     if (typeof window !== "undefined") localStorage.setItem("oe_projects_view", v);
   }
 
   // Favorites (starred projects) — persisted client-side; collapsible section.
-  const [favorites, setFavorites] = useState<string[]>([]);
+  // Lazy initializers: read localStorage synchronously on mount. SSR-safe —
+  // `typeof window === "undefined"` on the server matches each default
+  // ([] / false), so no hydration mismatch.
+  const [favorites, setFavorites] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    try { const f = localStorage.getItem("oe_favorites"); return f ? JSON.parse(f) : []; } catch { return []; }
+  });
   // COLLAPSED by default for everyone; only an explicit expand (persisted as
   // oe_fav_open="1") re-opens it on later visits. The old polarity (default
   // open, only "0" collapsed) had every end user start with the section
   // expanded whether or not they ever used favorites.
-  const [favOpen, setFavOpen] = useState(false);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try { const f = localStorage.getItem("oe_favorites"); if (f) setFavorites(JSON.parse(f)); } catch { /* ignore */ }
-    if (localStorage.getItem("oe_fav_open") === "1") setFavOpen(true);
-  }, []);
+  const [favOpen, setFavOpen] = useState(() => typeof window !== "undefined" && localStorage.getItem("oe_fav_open") === "1");
   function toggleFav(project: string) {
     setFavorites((prev) => {
       const next = prev.includes(project) ? prev.filter((p) => p !== project) : [...prev, project];
@@ -288,6 +289,13 @@ function BoxLabel({ children }: { children: React.ReactNode }) {
 function UsageBox({ billing, ledger }: { billing: BillingInfo | null; ledger: LedgerEntry[] }) {
   const [expanded, setExpanded] = useState(false);
   const acc = billing?.account;
+  // Date.now() read directly during render is flagged as impure by the
+  // react-compiler-era rule, but this is a "current time for a countdown
+  // display" case: the value only needs to be approximately fresh (it
+  // re-renders every billing poll, 8s via usePoll) and turning it into real
+  // state would require a ticking interval, changing behavior beyond this
+  // display. Deliberate, targeted exception.
+  // eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate countdown display; see comment above
   const days = acc ? Math.max(0, Math.ceil((acc.period_end_ms - Date.now()) / 86_400_000)) : 0;
   const pct = acc && acc.included_cents ? Math.min(1, acc.used_cents / acc.included_cents) : 0;
   const onDemand = acc ? Math.max(0, -acc.balance_cents) : 0;

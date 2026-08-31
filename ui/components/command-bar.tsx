@@ -59,6 +59,7 @@ export function CommandBar() {
   // On open: reset, focus, and load projects for jump-to.
   useEffect(() => {
     if (!open) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resets dialog-local state each time `open` flips true, not derivable at mount since the same component re-opens repeatedly
     setQ("");
     setIdx(0);
     setTimeout(() => inputRef.current?.focus(), 0);
@@ -120,6 +121,7 @@ export function CommandBar() {
     return commands.filter((c) => (c.label + " " + c.group + " " + (c.keywords ?? "")).toLowerCase().includes(s));
   }, [q, commands]);
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- resets highlighted index whenever the query changes, a derived-reset-on-change sync, not an initial-mount value
   useEffect(() => { setIdx(0); }, [q]);
 
   if (!open) return null;

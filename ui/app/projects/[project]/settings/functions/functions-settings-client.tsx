@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { ChevronDown, ExternalLink } from "lucide-react";
 import { Button, Switch, Input, SettingCard } from "@/components/ui";
 import { RegionMap } from "@/components/region-map";
@@ -22,7 +22,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
   const planMax = plan === "enterprise" ? 3600 : plan === "pro" ? 800 : 300;
   const canFailover = plan === "enterprise";
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const s = await apiGet<{ functions: FunctionSettings }>(
         `/v1/projects/${encodeURIComponent(project)}/settings`
@@ -45,12 +45,15 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
     } catch (e) {
       setErr(String(e));
     }
-  }
+  }, [project]);
   useEffect(() => {
+    // Fetch-on-mount/project-change: each of these sets state only after its
+    // own await resolves, syncing external (server) settings into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
     apiGet<RegionCatalog>("/v1/regions/catalog").then(setCatalog).catch(() => {});
     apiGet<{ account?: { plan?: string } }>("/v1/billing").then((d) => setPlan(d.account?.plan || "hobby")).catch(() => {});
-  }, [project]);
+  }, [load]);
 
   async function save(next: FunctionSettings) {
     setFs(next);

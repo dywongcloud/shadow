@@ -26,7 +26,10 @@ export function ApiSidebar() {
   const [open, setOpen] = useState<Set<string>>(() => new Set(activeCat ? [activeCat] : []));
 
   // Keep the active category expanded as you navigate between its endpoints.
+  // Resyncs `open` from the route-derived `activeCat` on every navigation —
+  // not fixable by a lazy initializer since it must react to later changes.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncs open-set from route changes after mount, not just initial render
     if (activeCat) setOpen((s) => (s.has(activeCat) ? s : new Set(s).add(activeCat)));
   }, [activeCat]);
 

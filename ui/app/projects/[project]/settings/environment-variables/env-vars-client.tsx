@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { Search, Lock, Plus, Trash2 } from "lucide-react";
 import { Card, Button, Input, Badge, Switch } from "@/components/ui";
 import { apiGet, apiSend, type EnvVar, type ProjectSettings } from "@/lib/api";
@@ -39,7 +39,7 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [editTarget, setEditTarget] = useState("production");
   const [editScope, setEditScope] = useState<"runtime" | "build" | "all">("runtime");
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const s = await apiGet<ProjectSettings>(`/v1/projects/${project}/settings`);
       setVars(s.env ?? []);
@@ -49,8 +49,13 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
       // swallowed error here looked like "my variables disappeared".
       setLoadErr(String(e));
     }
-  }
-  useEffect(() => { load(); }, [project]);
+  }, [project]);
+  useEffect(() => {
+    // Fetch-on-mount/project-change: load() sets state only after its
+    // internal await resolves, syncing external (server) settings into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
+    load();
+  }, [load]);
 
   async function add() {
     if (!k || busy) return;

@@ -59,6 +59,15 @@ const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: false,
 
+  // Pin the Turbopack workspace root to this app. The monorepo's outer
+  // package.json is an empty stub with its own near-empty lockfile — without
+  // this, Turbopack's root inference warns on every build and (more than
+  // cosmetic) could resolve module/cache boundaries against the wrong root,
+  // undermining 16.3's filesystem cache correctness.
+  turbopack: {
+    root: import.meta.dirname,
+  },
+
   // The upstream @workflow/web console (mounted at /workflows via
   // app/wf-console/[[...slug]]/route.ts) loads its compiled Express app from
   // node_modules at runtime — keep it (and express) external so Next doesn't

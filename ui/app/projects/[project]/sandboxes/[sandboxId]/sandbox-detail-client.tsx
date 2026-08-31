@@ -109,6 +109,11 @@ function Mini({ label, value }: { label: string; value: string }) {
 }
 
 function StatusCard({ sandbox }: { sandbox: SandboxRecord }) {
+  // Date.now() read directly during render is flagged as impure, but this is
+  // a countdown display that already re-renders every 3s from the parent's
+  // usePoll — approximately fresh is the intended behavior, and a real
+  // ticking-clock state would change behavior beyond this display.
+  // eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate countdown display; already re-renders every 3s via the parent's usePoll
   const remaining = sandbox.timeout_expires_at ? Math.max(0, sandbox.timeout_expires_at - Date.now()) : 0;
   const mins = Math.floor(remaining / 60000);
   return <Mini label="Timeout remaining" value={sandbox.status === "running" ? `${mins}m` : "—"} />;

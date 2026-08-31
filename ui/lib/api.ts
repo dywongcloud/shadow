@@ -617,6 +617,10 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true, initi
   const refresh = useCallback(() => load(false), [load]);
 
   useEffect(() => {
+    // load() is async and only calls setState after its own await (a real
+    // network fetch) resolves — the legitimate "fetch on mount" pattern, not
+    // a synchronous setState-during-effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(false); // initial mount: cache-eligible (helps cross-nav + co-mounted siblings)
     // Recurring ticks RESPECT the per-path TTL (load(false)): a live path (short
     // default TTL) still refreshes ~every tick, while a stable path (long TTL,
@@ -715,6 +719,10 @@ export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true, in
   const refresh = useCallback(() => load(false), [load]);
 
   useEffect(() => {
+    // Same as usePoll above: load() is async, setState only runs after its
+    // own network await resolves — legitimate fetch-on-mount, not a
+    // synchronous setState-during-effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(false);
     const id = active ? setInterval(() => load(false), intervalMs) : null; // respect per-path TTL
     const onTeam = () => { setData(null); setError(null); setLoading(true); load(true); };

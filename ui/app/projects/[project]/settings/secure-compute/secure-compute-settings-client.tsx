@@ -36,6 +36,9 @@ export function SecureComputeSettings({ paramsPromise }: { paramsPromise: Promis
                   <Td className="font-mono text-xs text-secondary">{l.local_addr}</Td>
                   <Td className="font-mono text-xs">{l.env_var || <span className="text-muted">—</span>}</Td>
                   <Td><Badge tone={l.status === "active" ? "green" : "default"}>{l.status}</Badge></Td>
+                  {/* Date.now() read directly during render is flagged as impure, but this list
+                      already re-renders every 4s from usePoll — approximately fresh is intended. */}
+                  {/* eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate "expires in" display; already re-renders every 4s via usePoll */}
                   <Td className="text-secondary">{l.status === "active" ? `in ${Math.max(0, Math.round((l.expires_ms - Date.now()) / 60000))}m` : "—"}</Td>
                   <Td><button onClick={() => remove(l.id)} className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button></Td>
                 </tr>
@@ -97,7 +100,7 @@ function ConnectModal({ project, onClose, onDone }: { project: string; onClose: 
               <input value={ttl} onChange={(e) => setTtl(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none" />
             </div>
           </div>
-          <p className="text-xs text-muted">{project}.{envVar || "ENV"} will be set to the connector's local address.</p>
+          <p className="text-xs text-muted">{project}.{envVar || "ENV"} will be set to the connector&apos;s local address.</p>
           {err && <p className="text-xs text-red-500">{err}</p>}
         </div>
         <div className="mt-6 flex justify-end gap-2">

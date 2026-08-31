@@ -204,7 +204,7 @@ export function DomainWizard({
           {step === "domain" && (
             <>
               <p className="text-secondary">
-                Enter the domain you want on <strong className="text-fg">{project || "your project"}</strong>. We'll
+                Enter the domain you want on <strong className="text-fg">{project || "your project"}</strong>. We&apos;ll
                 check its current DNS, then walk you through exactly what to change — at your registrar, with real
                 steps for where it lives today.
               </p>
@@ -280,7 +280,7 @@ export function DomainWizard({
               </div>
               {scan && (
                 <div className="max-h-56 overflow-auto rounded-md border border-border">
-                  {scan.length === 0 && <p className="p-3 text-xs text-muted">Nothing publicly visible (or the domain doesn't resolve yet).</p>}
+                  {scan.length === 0 && <p className="p-3 text-xs text-muted">Nothing publicly visible (or the domain doesn&apos;t resolve yet).</p>}
                   {scan.map((r, i) => (
                     <div key={i} className="flex items-center gap-3 border-b border-border px-3 py-1.5 font-mono text-xs last:border-0">
                       <span className="w-14 shrink-0 text-muted">{r.type}</span>
@@ -297,7 +297,7 @@ export function DomainWizard({
             <>
               <p className="text-secondary">
                 {path === "records"
-                  ? <>Add these records where <strong className="text-fg">{clean}</strong>'s DNS is managed today:</>
+                  ? <>Add these records where <strong className="text-fg">{clean}</strong>&apos;s DNS is managed today:</>
                   : <>Change the nameservers for <strong className="text-fg">{clean}</strong> at <strong className="text-fg">{registrar}</strong>:</>}
               </p>
               <div className="flex flex-wrap gap-1.5">
@@ -335,7 +335,7 @@ export function DomainWizard({
                             <span>
                               {registrar} has no apex ALIAS/ANAME record. Easiest: go back a step and choose
                               <strong className="text-fg"> Delegate DNS to us</strong> — we then manage every record
-                              for you. Staying here? Add each A record below, and update them whenever the platform's
+                              for you. Staying here? Add each A record below, and update them whenever the platform&apos;s
                               edge set changes.
                             </span>
                           </p>
@@ -370,7 +370,7 @@ export function DomainWizard({
                     <p className="text-[11px] text-muted">The fleet has IPv6 edge nodes — AAAA records are served automatically, so no AAAA record is needed from you.</p>
                   )}
                   <p className="text-xs text-secondary">
-                    On the next step we'll also give you a short TXT record to prove ownership — required before the
+                    On the next step we&apos;ll also give you a short TXT record to prove ownership — required before the
                     domain goes live here.
                   </p>
                 </div>
@@ -456,7 +456,7 @@ export function DomainWizard({
                 may not answer immediately. {path === "records"
                   ? "Once your records resolve, the domain answers from the platform edge."
                   : "Once the nameserver change propagates, your zone is served here and the records above answer."}
-                {" "}You can watch it on the domain's page.
+                {" "}You can watch it on the domain&apos;s page.
               </p>
               <Button variant="outline" onClick={onClose}>Open the domain page</Button>
             </div>

@@ -31,6 +31,7 @@ export function NotificationBell() {
     // requestPermission() on an already-decided permission just re-resolves
     // instantly with no OS prompt, so this read as "it keeps prompting me."
     const alreadyDecided = "Notification" in window && window.Notification.permission !== "default";
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reads browser-only Notification.permission/localStorage, not available at SSR so can't be a lazy initializer
     setPushDismissed(alreadyDecided || localStorage.getItem("oe_push_dismissed") === "1");
   }, []);
   useEffect(() => {

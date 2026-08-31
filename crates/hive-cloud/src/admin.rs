@@ -7096,7 +7096,7 @@ async fn project_redeploy(
             );
             let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
                 .await
-                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
             return Ok(Json(json!({ "build_id": build_id })));
         }
         if let Some(host) = host_node_for_source_ids(&c, &source_ids) {
@@ -7121,7 +7121,7 @@ async fn project_redeploy(
                         Some(incarnation),
                     )
                     .await
-                    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                    .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
             }
@@ -7161,7 +7161,7 @@ async fn project_redeploy(
         req.image_ref = Some(image_ref);
         let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
             .await
-            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+            .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
@@ -7179,7 +7179,7 @@ async fn project_redeploy(
     );
     let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(json!({ "build_id": build_id })))
 }
 

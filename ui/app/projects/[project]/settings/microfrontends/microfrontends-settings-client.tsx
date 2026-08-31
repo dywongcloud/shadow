@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { ChevronDown, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
 import { Badge, Button, Card, Input, SettingCard, Switch, Triangle } from "@/components/ui";
 import { apiGet, apiSend } from "@/lib/api";
@@ -65,7 +65,7 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
   const [showCreate, setShowCreate] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const d = await apiGet<ProjectMfe>(`/v1/projects/${encodeURIComponent(project)}/settings/microfrontends`, { fresh: true });
       setData(d);
@@ -73,10 +73,13 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
     } catch (e) {
       setErr(errText(e));
     }
-  }
-  useEffect(() => {
-    load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [project]);
+  useEffect(() => {
+    // Fetch-on-mount/project-change: load() sets state only after its
+    // internal await resolves, syncing external (server) settings into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
+    load();
+  }, [load]);
 
   async function call(method: string, path: string, body?: unknown) {
     setErr("");

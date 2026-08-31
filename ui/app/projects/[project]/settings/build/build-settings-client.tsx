@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type BuildConfig, type ProjectSettings } from "@/lib/api";
 
@@ -11,11 +11,16 @@ export function BuildSettings({ paramsPromise }: { paramsPromise: Promise<{ proj
   const project = decodeURIComponent(params.project);
   const [b, setB] = useState<BuildConfig | null>(null);
 
-  async function load() {
+  const load = useCallback(async () => {
     const s = await apiGet<ProjectSettings>(`/v1/projects/${project}/settings`);
     setB(s.build);
-  }
-  useEffect(() => { load(); }, [project]);
+  }, [project]);
+  useEffect(() => {
+    // Fetch-on-mount/project-change: load() sets state only after its
+    // internal await resolves, syncing external (server) settings into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
+    load();
+  }, [load]);
 
   async function save() {
     if (!b) return;

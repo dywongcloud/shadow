@@ -213,7 +213,6 @@ export default function NewProjectPage() {
       }
       setRepos(merged);
     }).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Build the env map for the quick git-URL deploy from its editor rows.

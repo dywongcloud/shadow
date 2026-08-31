@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type RoutingConfig } from "@/lib/api";
 
@@ -16,12 +16,16 @@ export function RoutingSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const [rwSource, setRwSource] = useState("");
   const [rwDest, setRwDest] = useState("");
 
-  async function load() {
+  const load = useCallback(async () => {
     setCfg(await apiGet<RoutingConfig>(`/v1/routing`));
-  }
-  useEffect(() => {
-    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `project` isn't read by the request itself, but reloading on project switch is intended (server scopes /v1/routing by current session/team)
   }, [project]);
+  useEffect(() => {
+    // Fetch-on-mount/project-change: load() sets state only after its
+    // internal await resolves, syncing external (server) config into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
+    load();
+  }, [load]);
 
   async function addRedirect() {
     if (!rdSource.trim() || !rdDest.trim()) return;

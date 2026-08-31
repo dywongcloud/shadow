@@ -72,6 +72,9 @@ function useDatabases() {
   const [provisioning, setProvisioning] = useState(false);
   const { data: managed, error, refresh } = usePoll<Database[]>("/v1/databases", provisioning ? 3000 : 12000);
   useEffect(() => {
+    // Feeds back into usePoll's own interval above (adaptive polling), so it
+    // must persist as state across renders -- not a pure inline derivation.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setProvisioning((managed ?? []).some((d) => d.status === "provisioning"));
   }, [managed]);
 
@@ -124,7 +127,12 @@ export default function StoragePage() {
 
   // Deep-link: /storage?browse opens the Browse Storage panel directly.
   useEffect(() => {
+    // window.location.search is client-only; a lazy initializer would return
+    // true on the client's first render but false on the server's, causing a
+    // hydration mismatch. Deferring to after mount (open starts false on both
+    // server and client) avoids that.
     if (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("browse")) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setOpen(true);
     }
   }, []);

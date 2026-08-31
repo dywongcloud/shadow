@@ -380,7 +380,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     // it kept authenticating this session as the old user/tenant, silently
     // serving their data under the freshly-signed-in account's view.
     if (firstIdentity) void switchTeam(PERSONAL);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity.id]);
 
   // Initialize the selection ONCE: restore the user's saved choice if any,
@@ -414,7 +413,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       // authenticated as under the newly-adopted org's view.
       void switchTeam(slug);
     }
-  }, [isLoaded, organization?.id]);
+  }, [isLoaded, organization]);
 
   // Resync the navbar's selection with `hive_team` on every `hive-team-changed`
   // — same-tab (a no-op here since `pick`/the effects above already set

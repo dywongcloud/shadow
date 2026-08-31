@@ -1,3 +1,0 @@
-(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["chunks/_0o_tvsk._.js",10977,e=>{"use strict";async function t(){console.log("[instrumentation] OpenEdge dashboard ready · runtime=edge")}e.s(["onRequestError",0,function(e){console.error("[instrumentation] request error:",e)},"register",0,t])},59858,(e,t,n)=>{self._ENTRIES||={};let r=Promise.resolve().then(()=>e.i(10977));r.catch(()=>{}),self._ENTRIES.middleware_instrumentation=new Proxy(r,{get(e,t){if("then"===t)return(t,n)=>e.then(t,n);let n=(...n)=>e.then(e=>(0,e[t])(...n));return n.then=(n,r)=>e.then(e=>e[t]).then(n,r),n}})}]);
-
-//# sourceMappingURL=_0o_tvsk._.js.map

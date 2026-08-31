@@ -31,7 +31,7 @@
   },
   "devDependencies": {
     "@types/d3-geo": "3.1.1",
-    "@types/node": "20.14.14",
+    "@types/node": "^24.13.3",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@types/topojson-client": "3.1.5",
@@ -40,7 +40,7 @@
     "eslint-config-next": "^16.3.3",
     "postcss": "8.4.41",
     "tailwindcss": "3.4.9",
-    "typescript": "5.5.4"
+    "typescript": "^5.5.4"
   },
   "overrides": {
     "@tremor/react": {

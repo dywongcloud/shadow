@@ -136,6 +136,15 @@ export function WfConsoleFrame({
       document.removeEventListener("visibilitychange", onVis);
       warm.remove();
     };
+    // `resolvedTheme` is intentionally excluded: this effect's syncConsoleTheme
+    // call is a one-time PRE-MOUNT seed (frame is null — the comment above
+    // explains why), not the live sync path — that's the separate
+    // `[resolvedTheme, frameName]` effect below. Re-running this effect on
+    // every theme toggle would needlessly re-mint the session, re-create the
+    // prefetch <link>, and restart the remint interval. `src` is a
+    // useState-with-lazy-initializer value that never changes after mount
+    // (no setter is ever called), so omitting it changes nothing at runtime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
   // Live theme sync: every platform toggle re-writes the console's storage

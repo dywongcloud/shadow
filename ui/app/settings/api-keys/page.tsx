@@ -52,7 +52,7 @@ export default function ApiKeysPage() {
       {created?.token && (
         <Card className="mb-6 border-amber-500/40 bg-amber-500/[0.04]">
           <div className="mb-2 flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-400">
-            <TriangleAlert className="h-4 w-4" /> Copy your API key now — it won't be shown again.
+            <TriangleAlert className="h-4 w-4" /> Copy your API key now — it won&apos;t be shown again.
           </div>
           <div className="flex items-center gap-2">
             <code className="min-w-0 flex-1 truncate rounded-md border border-border bg-card px-3 py-2 font-mono text-sm">{created.token}</code>

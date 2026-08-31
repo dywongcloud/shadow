@@ -29,17 +29,18 @@ function BillingInner() {
   const [msg, setMsg] = useState("");
 
   // Complete a returning checkout (?success=<session>) — applies the plan/credits.
+  const success = params.get("success");
   useEffect(() => {
-    const success = params.get("success");
     if (success && success !== "1") {
       apiSend("POST", "/v1/billing/confirm", { session: success })
         .then(() => { setMsg("Payment successful — your plan is updated."); refresh(); router.replace("/billing"); })
         .catch(() => {});
     } else if (success === "1") {
+      // Responds to a URL param change (external system), not a synchronous render cascade.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setMsg("Payment successful.");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [success, refresh, router]);
 
   async function checkout(kind: "plan" | "credits", body: Record<string, unknown>) {
     setBusy(kind + JSON.stringify(body));
@@ -54,6 +55,11 @@ function BillingInner() {
         refresh();
         return;
       }
+      // r.url is a real cross-origin Stripe checkout URL (or the mock
+      // fallback's internal path) -- a full navigation via window.location is
+      // required here, not a render-time mutation. Same idiom used across
+      // every other checkout/OAuth redirect in this codebase.
+      // eslint-disable-next-line react-hooks/immutability
       window.location.href = r.url;
     } catch (e) {
       setMsg(String(e));

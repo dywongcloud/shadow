@@ -291,6 +291,12 @@ export function useSettledAuth(): SettledAuthView {
     const l = () => setView(viewFor(null));
     listeners.add(l);
     initClient();
+    // NOT redundant with the useState lazy initializer above: initClient()
+    // can synchronously mutate module-level `degraded`/`committed` (cross-load
+    // flap history), and this re-read picks that up in the same tick — a
+    // legitimate "subscribe + sync from external system" effect, not a
+    // duplicate of the initial render value.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setView(viewFor(isLoaded ? (isSignedIn ? "in" : "out") : null));
     return () => {
       listeners.delete(l);
