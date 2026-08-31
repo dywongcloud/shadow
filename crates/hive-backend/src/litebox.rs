@@ -3635,6 +3635,146 @@ fn append_litebox_runtime_augmentation_blocking(
     anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
 }
 
+/// The interactive-shell binary plus a small, fixed coreutils set — every
+/// program the SHELL ITSELF might `exec()` inside the guest (`fork()`+`exec()`
+/// each, on the `AnEntrypoint/litebox` base this platform tracks: see
+/// `ansible/roles/litebox/files/PATCHES.md`'s "litebox fork tracking"
+/// section) must be staged into the guest tar with its exact host path,
+/// same as `append_litebox_runtime_augmentation_blocking`'s own comment on
+/// `runtime_bin` explains: only the FIRST exec'd binary loads from the host
+/// directly, every later exec (from inside the now-separate guest
+/// filesystem) resolves through what's actually staged here. Deliberately
+/// small and fixed rather than "whatever's on $PATH" — a sandbox shell that
+/// can't find `grep` fails loudly and obviously; one that can silently run
+/// anything the host happens to have installed is a much larger, unaudited
+/// surface for a tenant-facing feature.
+const SHELL_GUEST_PROGRAMS: &[&str] = &[
+    "/bin/sh",
+    "/usr/bin/ls",
+    "/usr/bin/cat",
+    "/usr/bin/pwd",
+    "/usr/bin/echo",
+    "/usr/bin/mkdir",
+    "/usr/bin/rm",
+    "/usr/bin/cp",
+    "/usr/bin/mv",
+    "/usr/bin/grep",
+    "/usr/bin/head",
+    "/usr/bin/tail",
+    "/usr/bin/wc",
+    "/usr/bin/find",
+    "/usr/bin/env",
+];
+
+/// Async half of shell-guest-tar construction: resolves every staged
+/// program's `ldd` closure (a real subprocess spawn — cannot run inside the
+/// blocking tar-writer below) and merges/dedupes them with the programs
+/// themselves before handing the whole set to the blocking writer.
+async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
+    let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
+    let mut deps: Vec<PathBuf> = Vec::new();
+    for program in &programs {
+        deps.extend(ldd_closure(program).await?);
+    }
+    // Same legacy-soname compat stubs `ensure_combined_tar_locked` stages —
+    // a coreutils build linked against a split libpthread/libdl/librt/libutil
+    // (rare on a modern glibc host, but the failure mode if it happens is a
+    // guest-side dlopen ENOENT with no useful error) gets them for free.
+    for stub in [
+        "/lib64/libpthread.so.0",
+        "/lib64/libdl.so.2",
+        "/lib64/librt.so.1",
+        "/lib64/libutil.so.1",
+    ] {
+        let path = PathBuf::from(stub);
+        if !deps.contains(&path)
+            && std::path::Path::new(stub)
+                .metadata()
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        {
+            deps.push(path);
+        }
+    }
+    programs.append(&mut deps);
+    programs.sort();
+    programs.dedup();
+    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs))
+        .await
+        .context("litebox shell guest tar construction task failed")?
+}
+
+#[cfg(target_os = "linux")]
+fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<()> {
+    let root = File::open("/").context("open root filesystem")?;
+    let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut builder = tar::Builder::new(archive);
+    builder.mode(tar::HeaderMode::Deterministic);
+    builder.follow_symlinks(false);
+
+    for path in paths {
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("shell guest path {} is not absolute", path.display()))?;
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty(),
+            "shell guest path is the root directory"
+        );
+        let mut file = crate::runtime_artifact::openat2_required(
+            &root,
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            crate::runtime_artifact::RESOLVE_BENEATH
+                | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
+        )
+        .with_context(|| format!("openat2 failed for shell guest path {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        anyhow::ensure!(
+            before.is_file(),
+            "shell guest path is not a file: {}",
+            path.display()
+        );
+        // Some hosts symlink e.g. /bin -> /usr/bin, or a dependency's
+        // resolved path collides with an already-staged program; caught here
+        // rather than double-staging the same inode under two tar entries.
+        if !seen_inodes.insert((before.dev(), before.ino())) {
+            continue;
+        }
+        let mut header = litebox_tar_header(before.len(), before.mode())?;
+        builder
+            .append_data(&mut header, relative, &mut file)
+            .with_context(|| format!("append shell guest path {}", path.display()))?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mode() == after.mode()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "shell guest path changed while staging: {}",
+            path.display()
+        );
+    }
+
+    builder
+        .finish()
+        .context("finish litebox shell guest tar")?;
+    let archive = builder
+        .into_inner()
+        .context("close litebox shell guest tar writer")?;
+    archive.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_shell_tar_blocking(_archive: File, _paths: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::bail!("descriptor-relative tar construction requires Linux openat2")
+}
+
 #[async_trait]
 impl CellBackend for LiteboxBackend {
     fn name(&self) -> &'static str {
@@ -4267,4 +4407,217 @@ impl CellBackend for LiteboxBackend {
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
+
+    async fn exec_pty(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+        crate::PtyIo,
+    )> {
+        // litebox has no separate guest kernel/agent — the guest IS this
+        // host's own `litebox-runner` child process (syscall interception,
+        // not virtualization), so unlike Firecracker's vsock-agent-protocol
+        // exec_pty, no wire protocol is needed at all: a REAL host pty
+        // allocated here and handed to the runner as its stdin/stdout/stderr
+        // gives the guest shell genuine raw-mode terminal behavior for free
+        // (the `AnEntrypoint/litebox` base this platform tracks also
+        // implements its own guest-internal /dev/ptmx pty subsystem — see
+        // ansible/roles/litebox/files/PATCHES.md's "litebox fork tracking"
+        // section — but wiring THIS host-side pty is simpler and needs none
+        // of that: the shell's own line discipline runs against a real
+        // kernel pty exactly as it would over SSH, the same technique
+        // `hive-cell-agent`'s Firecracker-guest PTY support uses on the
+        // OTHER side of the vsock boundary).
+        let net = self
+            .cell_nets
+            .lock()
+            .await
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+                    cell.id
+                )
+            })?;
+
+        let directories = self.prepare_artifact_dirs()?;
+        directories.verify_bindings()?;
+        let shell_tar = self.allocate_temp_file(&directories.temporary, "shell", ".tar")?;
+        build_shell_tar(shell_tar.file.try_clone()?).await?;
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &shell_tar.file)?;
+
+        let (master_fd, slave_fd) = open_pty_pair(req.cols, req.rows)
+            .context("litebox: failed to allocate a host pty for the sandbox shell")?;
+
+        let shell = if req.shell.is_empty() {
+            "/bin/sh".to_string()
+        } else {
+            req.shell.clone()
+        };
+        let cwd = if req.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            req.cwd.clone()
+        };
+
+        let mut command = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut command);
+        let initial_files_path = crate::runtime_artifact::inherit_file_path(
+            &mut command,
+            &initial_files_alias.directory,
+        )?
+        .join(INITIAL_FILES_ALIAS_NAME);
+        command
+            .arg("-Z")
+            .arg("--rewrite-syscalls")
+            .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
+            .arg(format!("--initial-files={}", initial_files_path.display()))
+            .arg("--")
+            .arg(&shell)
+            .env_clear()
+            .envs(&req.env)
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            .current_dir(&cwd)
+            // SAFETY: dup'd fds are valid, open, and owned until this Stdio
+            // takes them — the runner inherits them across exec as its own
+            // fd 0/1/2, exactly the real-terminal shape a login shell expects.
+            .stdin(Stdio::from(slave_fd.try_clone()?))
+            .stdout(Stdio::from(slave_fd.try_clone()?))
+            .stderr(Stdio::from(slave_fd))
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to spawn litebox runner for interactive shell at {}: {error}",
+                self.cfg.runner_bin.display()
+            )
+        })?;
+        let session_id = req.id.clone();
+        let cell_id = cell.id.clone();
+        let funcs = self.funcs.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut master_read = tokio::fs::File::from_std(master_fd.try_clone()?.into());
+        let tx_reader = tx.clone();
+        let id_reader = session_id.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match master_read.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx_reader
+                            .send(hive_core::AgentEvent::PtyOutput {
+                                id: id_reader.clone(),
+                                bytes: buffer[..n].to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // EIO on a pty master is the normal "slave closed" signal
+                    // once the shell (and everything else holding the slave
+                    // open) has exited — not a real error.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let id_waiter = session_id.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await.ok();
+            let exit_code = status.and_then(|s| s.code());
+            let _ = tx.send(hive_core::AgentEvent::PtyExited {
+                id: id_waiter,
+                exit_code,
+            });
+            // Drop this cell's placeholder from `funcs` if a real function
+            // launch never claimed the slot — best-effort, the interactive
+            // shell was never registered there to begin with, this just
+            // guards a hypothetical future caller that keys off cell_id.
+            let _ = funcs.lock().await.remove(&cell_id);
+        });
+
+        let master_for_io = std::sync::Arc::new(master_fd);
+        let master_input = master_for_io.clone();
+        let master_resize = master_for_io;
+        let pty = crate::PtyIo::new(
+            move |bytes: Vec<u8>| {
+                use std::io::Write;
+                let mut f = &*master_input;
+                let _ = f.write_all(&bytes);
+            },
+            move |cols: u16, rows: u16| {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    libc::ioctl(
+                        std::os::fd::AsRawFd::as_raw_fd(&*master_resize),
+                        libc::TIOCSWINSZ as _,
+                        &ws,
+                    );
+                }
+            },
+        );
+        Ok((rx, pty))
+    }
+}
+
+/// Allocate a real host pty (`openpty(3)`) sized to `cols`x`rows`, returned as
+/// a `(master, slave)` pair of owned fds. Used by `LiteboxBackend::exec_pty`
+/// to give an interactive sandbox shell genuine raw-mode terminal behavior —
+/// see that method's own doc comment for why a host-side pty is sufficient
+/// here (litebox's guest and this host process share one address space, so
+/// handing the slave straight to the spawned runner as its stdin/stdout/
+/// stderr works exactly like a real terminal session, no in-guest pty
+/// subsystem required).
+#[cfg(target_os = "linux")]
+fn open_pty_pair(cols: u16, rows: u16) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: openpty is given valid out-params and a stack winsize; on
+    // success both fds are open, valid, and owned by this process.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    anyhow::ensure!(rc == 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: both fds were just returned by a successful openpty() call
+    // above and are not owned anywhere else yet.
+    let master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    Ok((master, slave))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pty_pair(_cols: u16, _rows: u16) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    anyhow::bail!("litebox interactive shell requires a real Linux pty (openpty)")
 }
