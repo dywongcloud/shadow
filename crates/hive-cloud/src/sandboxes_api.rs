@@ -3,6 +3,7 @@
 //! (`require_project` tenant/project authz, audit + persist after every write).
 
 use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, patch, post, put},
@@ -80,6 +81,10 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route(
             "/v1/projects/:project/sandboxes/:sandbox_id/domain",
             get(get_domain),
+        )
+        .route(
+            "/v1/projects/:project/sandboxes/:sandbox_id/shell",
+            get(open_shell),
         )
 }
 
@@ -596,6 +601,127 @@ async fn kill_command(
         "",
     );
     Ok(Json(json!(rec)))
+}
+
+// ---------------------------------------------------------------------------
+// Interactive shell (websocket)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShellQuery {
+    #[serde(default = "default_cols")]
+    cols: u16,
+    #[serde(default = "default_rows")]
+    rows: u16,
+}
+fn default_cols() -> u16 {
+    80
+}
+fn default_rows() -> u16 {
+    24
+}
+
+/// Interactive terminal — real pty (`vim`/`less`/`^C`/tab-completion), NOT the
+/// line-buffered polling `commands`/`logs` pair above. Sandboxes have no
+/// independent placement (`proxy_to_owner`'s doc comment: the current
+/// control-plane owner is the only node that ever provisions a sandbox's
+/// cell), and unlike a JSON GET a websocket cannot be transparently proxied
+/// through `fetch_from_host`'s request/response shape — so this endpoint only
+/// actually opens the pty on the owning node. A client landing on any other
+/// node gets a clear typed close (never a silent hang or a half-open socket)
+/// naming the owner so the browser can reconnect directly against that node's
+/// own public host, the same way a sandbox's `domain()` preview URL already
+/// requires a direct per-node address.
+async fn open_shell(
+    ws: WebSocketUpgrade,
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Path((project, sandbox_id)): Path<(String, String)>,
+    Query(q): Query<ShellQuery>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    if !c.is_control_plane_leader() {
+        let owner = c.control_plane_leader();
+        return Ok(ws.on_upgrade(move |mut socket| async move {
+            let _ = socket
+                .send(Message::Text(
+                    json!({
+                        "type": "wrong_node",
+                        "owner": owner,
+                        "message": "this sandbox's cell is hosted on a different node; reconnect against the owner directly",
+                    })
+                    .to_string(),
+                ))
+                .await;
+            let _ = socket.close().await;
+        }));
+    }
+
+    // Fail BEFORE the upgrade for a genuine not-found/unauthorized sandbox —
+    // an HTTP error response here is far more useful to the caller than a
+    // websocket that opens and immediately closes with no status code.
+    c.sandboxes
+        .get_sandbox(&project, &sandbox_id)
+        .await
+        .map_err(sandbox_err)?;
+    c.audit.record(&t, "user", "open_shell", "sandbox", &sandbox_id, "");
+
+    let (rx, pty) = c
+        .sandboxes
+        .open_shell(&project, &sandbox_id, q.cols, q.rows)
+        .await
+        .map_err(sandbox_err)?;
+
+    Ok(ws.on_upgrade(move |socket| pump_shell(socket, rx, pty)))
+}
+
+async fn pump_shell(
+    mut socket: WebSocket,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+    pty: hive_backend::PtyIo,
+) {
+    loop {
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Some(hive_core::AgentEvent::PtyOutput { bytes, .. }) => {
+                    if socket.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(hive_core::AgentEvent::PtyExited { exit_code, .. }) => {
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({ "type": "exited", "exit_code": exit_code }).to_string(),
+                        ))
+                        .await;
+                    break;
+                }
+                // Not applicable on this session's event stream.
+                Some(_) => {}
+                None => break,
+            },
+            client = socket.recv() => match client {
+                Some(Ok(Message::Binary(bytes))) => pty.input(bytes),
+                Some(Ok(Message::Text(t))) => {
+                    // Control channel: `{"type":"resize","cols":N,"rows":N}`.
+                    // Raw keystrokes ALWAYS ride Binary frames above — Text is
+                    // reserved for control messages so a literal `{` typed
+                    // into the terminal is never misparsed as JSON.
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        if v.get("type").and_then(|x| x.as_str()) == Some("resize") {
+                            let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(80) as u16;
+                            let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(24) as u16;
+                            pty.resize(cols, rows);
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(_)) => break,
+                _ => {}
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

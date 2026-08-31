@@ -474,6 +474,46 @@ impl SandboxProvider for PlatformSandboxProvider {
         self.get_command(project_id, id, &cmd_id).await
     }
 
+    async fn open_shell(
+        &self,
+        project_id: &str,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    > {
+        let sandbox = self.get_sandbox(project_id, id).await?;
+        let backend = self.backend.as_ref().ok_or_else(|| {
+            SandboxError::EngineUnavailable("no isolation backend on this node".into())
+        })?;
+        let handle = self.ensure_cell(&sandbox).await?;
+        let session_id = format!("sh_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+
+        let env = sandbox
+            .env_refs
+            .iter()
+            .map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let req = hive_core::ExecPtyRequest {
+            id: session_id,
+            shell: String::new(),
+            cwd: String::new(),
+            env,
+            cols,
+            rows,
+        };
+        backend
+            .exec_pty(&handle, req)
+            .await
+            .map_err(|e| SandboxError::EngineUnavailable(format!("pty failed to start: {e}")))
+    }
+
     async fn list_commands(
         &self,
         project_id: &str,

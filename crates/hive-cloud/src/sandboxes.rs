@@ -597,8 +597,8 @@ pub struct MountConfigInput {
 
 /// Provider-neutral sandbox backend. The UI/API talk to this trait, never to a
 /// concrete engine directly — [`crate::sandboxes_platform::PlatformSandboxProvider`]
-/// (podman) is the production implementation; [`MockSandboxProvider`] exists
-/// ONLY for unit tests.
+/// (Firecracker/Litebox) is the production implementation; [`MockSandboxProvider`]
+/// exists ONLY for unit tests.
 #[async_trait::async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError>;
@@ -645,6 +645,27 @@ pub trait SandboxProvider: Send + Sync {
         id: &str,
         command_id: &str,
     ) -> Result<SandboxCommandRecord, SandboxError>;
+    /// Open an interactive terminal session against the sandbox's cell (real
+    /// pty: `vim`/`less`/`^C`/tab-completion all work). Returns an event
+    /// receiver (`hive_core::AgentEvent::PtyOutput`* then one `PtyExited`)
+    /// plus a [`hive_backend::PtyIo`] the caller uses to push typed bytes /
+    /// resize events back — mirrors `run_command`'s shape but duplex and
+    /// long-lived instead of one-shot. `EngineUnavailable` on a node with no
+    /// real isolation backend, or one whose backend doesn't implement PTY
+    /// support yet (`CellBackend::exec_pty`'s own unsupported default).
+    async fn open_shell(
+        &self,
+        project_id: &str,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    >;
     async fn write_files(
         &self,
         project_id: &str,
@@ -931,6 +952,23 @@ impl SandboxProvider for MockSandboxProvider {
         c.status = CommandStatus::Killed;
         c.finished_at = Some(3);
         Ok(c.clone())
+    }
+    async fn open_shell(
+        &self,
+        _project_id: &str,
+        _id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    > {
+        Err(SandboxError::EngineUnavailable(
+            "MockSandboxProvider does not support interactive shells".into(),
+        ))
     }
     async fn write_files(
         &self,
