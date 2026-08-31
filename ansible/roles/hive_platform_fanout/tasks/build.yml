@@ -132,7 +132,7 @@
       - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
       - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
       - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
-      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(31) | int)
     fail_msg: >-
       The glibc lane built a cell agent whose exact rootfs schema,
       runtime-artifact protocol, wire protocol or capability set disagrees with

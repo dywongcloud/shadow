@@ -1,0 +1,170 @@
+diff --git a/litebox/src/platform/mod.rs b/litebox/src/platform/mod.rs
+index 3b354a4d..13918196 100644
+--- a/litebox/src/platform/mod.rs
++++ b/litebox/src/platform/mod.rs
+@@ -91,6 +91,73 @@ pub trait ThreadProvider: RawPointerProvider {
+     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+         f()
+     }
++
++    /// Fork the CALLING thread into a real new OS process (guest `fork()`/
++    /// `vfork()` support, unlike `spawn_thread` which starts a NEW thread
++    /// while this one keeps running).
++    ///
++    /// # Rough v0 -- explicit, load-bearing limitations
++    ///
++    /// This is a first, narrowly-scoped cut, not a complete implementation:
++    ///
++    /// - **Only supported when the calling guest process has EXACTLY ONE live
++    ///   thread at the moment of the call.** A real host `fork()` continues
++    ///   ONLY the calling thread into the child; every OTHER guest pthread
++    ///   this process's `spawn_thread` may have started simply vanishes in
++    ///   the child while this shim's OWN `Process`/`ThreadState` bookkeeping
++    ///   still believes they exist -- a real correctness hazard this v0 does
++    ///   not attempt to reconcile. Callers MUST check the guest's live thread
++    ///   count and refuse (`ENOSYS`/`EINVAL`) rather than call this with more
++    ///   than one thread live.
++    /// - **No fork-safety audit against locks held by ANOTHER host thread at
++    ///   fork time.** Only the calling thread survives into the child; a
++    ///   `Mutex`/`RwLock` held by a different thread at the instant of
++    ///   `fork()` is permanently poisoned/deadlocked in the child. This
++    ///   default trait method's own callers are responsible for verifying
++    ///   (or accepting the risk of) this for their platform's own lock usage
++    ///   until a real audit lands.
++    /// - **The default implementation is simply unsupported** (every
++    ///   platform except a real fork()-capable OS process gets this for
++    ///   free, matching every other optional-capability default in this
++    ///   trait family). Only [`crate::platform::linux_userland`]-shaped
++    ///   platforms with a real host `fork(2)` can meaningfully implement it.
++    ///
++    /// Returns `Ok(true)` in the child (guest `fork()` return value 0),
++    /// `Ok(Some(pid))`'s caller then encodes the parent-side return value
++    /// (the real host child pid) -- see the concrete return type below.
++    fn fork_process(&self) -> Result<ForkOutcome, ForkError> {
++        Err(ForkError::Unsupported)
++    }
++}
++
++/// Result of [`ThreadProvider::fork_process`] on the SURVIVING side after the
++/// real host fork -- both the parent and the child call this same function
++/// and get a DIFFERENT variant back, exactly like real POSIX `fork()`'s
++/// contract (0 in the child, the child's pid in the parent).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ForkOutcome {
++    /// This is the PARENT; the real host pid of the newly forked child.
++    Parent(u32),
++    /// This is the CHILD (a real, separate host OS process from this point on).
++    Child,
++}
++
++#[non_exhaustive]
++#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ForkError {
++    /// This platform has no real fork() support (every platform except a
++    /// real fork()-capable host OS process, e.g. Windows userland, bare
++    /// metal, SNP, LVBS, OP-TEE, and the default for any platform that has
++    /// not opted in).
++    #[error("this platform does not support fork()")]
++    Unsupported,
++    /// The v0 single-thread-at-fork-time constraint (see `fork_process`'s
++    /// own doc) was violated -- the guest has more than one live thread.
++    #[error("fork() with more than one live guest thread is not supported yet")]
++    MultiThreaded,
++    /// The real host `fork(2)` syscall itself failed (e.g. resource limits).
++    #[error("host fork() failed: {0}")]
++    HostForkFailed(i32),
+ }
+ 
+ #[non_exhaustive]
+diff --git a/litebox_platform_linux_userland/src/lib.rs b/litebox_platform_linux_userland/src/lib.rs
+index 7006a876..2b0e5ff1 100644
+--- a/litebox_platform_linux_userland/src/lib.rs
++++ b/litebox_platform_linux_userland/src/lib.rs
+@@ -1004,6 +1004,31 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
+ 
+         ThreadHandle::run_with_handle(f)
+     }
++
++    /// Rough v0 -- see `litebox::platform::ThreadProvider::fork_process`'s own
++    /// doc for the full, load-bearing list of what this does NOT handle yet
++    /// (multi-threaded-at-fork, cross-thread lock safety). The caller
++    /// (`litebox_shim_linux`'s `do_clone`) is responsible for the
++    /// single-live-thread precondition; this method trusts it and just does
++    /// the real host fork.
++    fn fork_process(&self) -> Result<litebox::platform::ForkOutcome, litebox::platform::ForkError> {
++        // SAFETY: fork() itself is always safe to CALL -- the danger it
++        // carries is entirely in what code the child runs afterward (locks
++        // held by other threads at the instant of the call are never
++        // released in the child), which is exactly the hazard this method's
++        // own doc comment, and its trait-level doc, name explicitly and
++        // leave to the v0 single-thread precondition rather than solve here.
++        let pid = unsafe { libc::fork() };
++        if pid < 0 {
++            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
++            return Err(litebox::platform::ForkError::HostForkFailed(errno));
++        }
++        if pid == 0 {
++            Ok(litebox::platform::ForkOutcome::Child)
++        } else {
++            Ok(litebox::platform::ForkOutcome::Parent(pid as u32))
++        }
++    }
+ }
+ 
+ impl litebox::platform::TimerProvider for LinuxUserland {
+diff --git a/litebox_shim_linux/src/syscalls/process.rs b/litebox_shim_linux/src/syscalls/process.rs
+index 6024e091..1a5de4d3 100644
+--- a/litebox_shim_linux/src/syscalls/process.rs
++++ b/litebox_shim_linux/src/syscalls/process.rs
+@@ -593,6 +593,51 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+             flags.remove(CloneFlags::DETACHED);
+         }
+ 
++        // Rough v0 real-fork() support (Sandboxes interactive shell): glibc's
++        // fork() lowers to `clone(SIGCHLD, NULL, ...)` on x86_64 -- i.e. a
++        // Clone request with NO flags at all (just the exit signal in the low
++        // byte, already split into `exit_signal` above). This is
++        // deliberately narrower than a general fork(): vfork() (CLONE_VM |
++        // CLONE_VFORK) is NOT handled here and falls through to the ordinary
++        // unsupported-flags rejection below -- it shares the parent's address
++        // space until exec, a genuinely different and harder problem than a
++        // real copy. See `litebox::platform::ThreadProvider::fork_process`'s
++        // own doc for the full list of what this rough cut does NOT solve
++        // (multi-threaded-at-fork, cross-thread lock safety at the moment of
++        // the real host fork()).
++        if flags.is_empty() && stack == 0 && !clone3 {
++            if self.process().nr_threads() != 1 {
++                log_unsupported!(
++                    "fork() with {} live guest threads is not supported yet (v0 is single-thread-only)",
++                    self.process().nr_threads()
++                );
++                return Err(Errno::ENOSYS);
++            }
++            return match self.global.platform.fork_process() {
++                Ok(litebox::platform::ForkOutcome::Child) => {
++                    // We ARE the child now (a real, separate host OS
++                    // process). Guest fork() contract: return 0.
++                    Ok(0)
++                }
++                Ok(litebox::platform::ForkOutcome::Parent(child_pid)) => {
++                    // Guest fork() contract: return the child's pid. NOTE:
++                    // this is the REAL host pid, not a litebox-assigned
++                    // guest tid like the thread-clone path below uses --
++                    // litebox has no wait4/waitid implementation yet to
++                    // reap it (tracked separately; a v0 gap, not silently
++                    // hidden).
++                    Ok(usize::try_from(child_pid).unwrap_or(0))
++                }
++                Err(litebox::platform::ForkError::Unsupported)
++                | Err(litebox::platform::ForkError::MultiThreaded) => Err(Errno::ENOSYS),
++                Err(litebox::platform::ForkError::HostForkFailed(errno)) => {
++                    log_unsupported!("host fork() failed: errno {errno}");
++                    Err(Errno::ENOMEM)
++                }
++                Err(_) => Err(Errno::ENOSYS),
++            };
++        }
++
+         let required_clone_flags =
+             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
+ 

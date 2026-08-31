@@ -5,7 +5,7 @@ hive_runtime_artifact_rootfs_drained: false
 hive_runtime_artifact_rootfs_schema_expected: 2
 hive_runtime_artifact_protocol_expected: 1
 hive_agent_wire_protocol_expected: 2
-hive_agent_wire_capabilities_expected: 15
+hive_agent_wire_capabilities_expected: 31
 # Complete cell-agent release-fact envelope consumed by the rootfs builder.
 hive_cell_agent_release_schema_expected: 2
 hive_cell_agent_protocol_timeout_seconds: 5

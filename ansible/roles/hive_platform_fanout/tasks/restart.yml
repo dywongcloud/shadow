@@ -100,7 +100,7 @@
     CELL_AGENT_ROOTFS_SCHEMA_EXPECTED: "{{ hive_runtime_artifact_rootfs_schema_expected | default(2) | string }}"
     CELL_AGENT_PROTOCOL_EXPECTED: "{{ hive_runtime_artifact_protocol_expected | default(1) | string }}"
     CELL_AGENT_WIRE_PROTOCOL_EXPECTED: "{{ hive_agent_wire_protocol_expected | default(2) | string }}"
-    CELL_AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | default(15) | string }}"
+    CELL_AGENT_WIRE_CAPABILITIES_EXPECTED: "{{ hive_agent_wire_capabilities_expected | default(31) | string }}"
     CELL_AGENT_PROTOCOL_TIMEOUT_SECS: "{{ hive_cell_agent_protocol_timeout_seconds | default(5) | string }}"
     CELL_AGENT_RELEASE_FACT: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
   register: _cell_agent_install
@@ -119,7 +119,7 @@
       - (_fact.rootfs_schema | int) == (hive_runtime_artifact_rootfs_schema_expected | default(2) | int)
       - (_fact.runtime_artifact_protocol | int) == (hive_runtime_artifact_protocol_expected | default(1) | int)
       - (_fact.agent_wire_protocol | int) == (hive_agent_wire_protocol_expected | default(2) | int)
-      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(15) | int)
+      - (_fact.agent_wire_capabilities | int) == (hive_agent_wire_capabilities_expected | default(31) | int)
       - _fact.agent_sha256 == hostvars[hive_group_build_host].hive_group_cell_agent_sha256
     fail_msg: >-
       {{ hive_name }} did not publish the exact built cell-agent digest, rootfs
