@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::admin::{require_project, tenant};
+use crate::admin::{require_auth_read_or_internal, require_project, tenant};
 use crate::sandboxes::*;
 use crate::state::CloudState;
 
@@ -85,6 +85,10 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route(
             "/v1/projects/:project/sandboxes/:sandbox_id/shell",
             get(open_shell),
+        )
+        .route(
+            "/v1/internal/sandboxes/delegate-create",
+            post(delegate_create_sandbox),
         )
 }
 
@@ -184,6 +188,38 @@ async fn proxy_to_owner(c: &Arc<CloudState>, path: &str, team: &str) -> Option<V
     crate::admin::fetch_from_host(c, &leader, path, team).await
 }
 
+/// This node's local record for `sandbox_id`, if any, mapped to whether THIS
+/// node is the owner. `None` means no local record at all (caller should
+/// treat that like any other not-found — `owner_node` is only meaningful once
+/// a record exists). Never proxies itself — callers combine this with
+/// `proxy_mutation_to_owner` below.
+async fn local_owner_mismatch(c: &Arc<CloudState>, project: &str, sandbox_id: &str) -> Option<String> {
+    let rec = c.sandboxes.get_sandbox(project, sandbox_id).await.ok()?;
+    if rec.owner_node.is_empty() || rec.owner_node == c.node_name {
+        None
+    } else {
+        Some(rec.owner_node)
+    }
+}
+
+/// Proxy a cell-touching MUTATION verbatim to `owner` (the node that actually
+/// holds the live `CellHandle`) via the same internal-trust POST forward
+/// `create_sandbox`'s delegation uses. `path`+`body` are re-sent exactly as
+/// this node received the (already-authorized) request — the receiver
+/// re-derives tenant scope from `team` the same way `post_to_host_json`'s
+/// other callers already do. Returns `None` on any forward failure so the
+/// caller can fall back to its own (locally-doomed but honest) attempt
+/// rather than silently dropping the request.
+async fn proxy_mutation_to_owner(
+    c: &Arc<CloudState>,
+    owner: &str,
+    path: &str,
+    team: &str,
+    body: &Value,
+) -> Option<Value> {
+    crate::admin::post_to_host_json(c, owner, path, team, body).await
+}
+
 /// True for every "not found" flavor `SandboxError` has — a missing command/
 /// snapshot/mount on a NON-owner node is exactly as likely to mean "this node
 /// never had the parent sandbox at all" as "the sandbox exists but this
@@ -270,6 +306,73 @@ struct EnvVarReq {
     sensitive: bool,
 }
 
+/// A node with a REAL isolation backend, per the same gossiped `NodeInfo.backend`
+/// field `main.rs` stamps at boot ("firecracker" | "litebox" | "mock") — the
+/// identical signal the platform's own placement/dashboard code already reads
+/// for capacity decisions elsewhere, so this introduces no new gossiped state.
+/// "mock" is deliberately excluded: a Mock node reports `EngineUnavailable`
+/// honestly for sandboxes too, so delegating there would just move the same
+/// failure to a different node instead of fixing it.
+fn is_capable_backend(backend: &str) -> bool {
+    matches!(backend, "firecracker" | "litebox")
+}
+
+/// Pick ONE capable peer for a sandbox this node itself cannot provision.
+/// Deterministic by node name (not random/first-in-list) so retries and the
+/// dashboard's own capability view agree on the same candidate; excludes
+/// this node itself (it already proved incapable, that's why we're here).
+fn pick_capable_peer(c: &Arc<CloudState>) -> Option<String> {
+    let mut candidates: Vec<String> = c
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.name != c.node_name && is_capable_backend(&n.backend))
+        .map(|n| n.name)
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Body for the internal node-to-node delegated-create call — a plain mirror
+/// of `CreateReq` (can't reuse `CreateReq` directly: it's a request-body-only
+/// type with no `Serialize`, and duplicating it here keeps the wire contract
+/// explicit rather than accidentally coupling to the public API's shape).
+#[derive(Deserialize, serde::Serialize)]
+struct DelegateCreateReq {
+    tenant: String,
+    project: String,
+    input_json: Value,
+}
+
+/// Internal-only: "please provision this exact sandbox HERE, you have real
+/// isolation and I don't." Called by `create_sandbox` on the control-plane
+/// leader when its own local backend is unavailable but the live registry
+/// shows a capable peer. Runs `PlatformSandboxProvider::create_sandbox`
+/// verbatim on THIS node — the resulting record's `owner_node` (stamped by
+/// `sandboxes_platform.rs` on a successful provision) is what the caller
+/// reads back to learn who actually owns the cell. Trusts only the internal
+/// fleet secret (`x-hive-internal`/`HIVE_INTERNAL_TOKEN`) — this is a
+/// service-to-service hop, never a tenant-facing route, and carries no
+/// tenant bearer token to re-validate.
+async fn delegate_create_sandbox(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Json(b): Json<DelegateCreateReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read_or_internal(&headers, claims.as_ref().map(|e| &e.0))
+        .map_err(|e| (e.0, e.1))?;
+    let input: CreateSandboxInput =
+        serde_json::from_value(b.input_json).map_err(|e| bad(&format!("bad input: {e}")))?;
+    let rec = c
+        .sandboxes
+        .create_sandbox(&b.tenant, &b.project, input)
+        .await
+        .map_err(sandbox_err)?;
+    crate::persist::persist(&c);
+    Ok(Json(json!(masked_sandbox(rec))))
+}
+
 async fn create_sandbox(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -330,6 +433,67 @@ async fn create_sandbox(
         source_kind: b.source_kind,
         source_ref: b.source_ref,
     };
+
+    // Capability-aware placement: sandbox mutations are still forced onto the
+    // control-plane leader (unchanged — see `proxy_to_owner`'s doc comment),
+    // but the LEADER may not itself have a real isolation backend even when
+    // other fleet nodes do (confirmed live: fc-sanjose, currently first in
+    // HIVE_CP_OWNER_CHAIN, has neither Firecracker nor litebox_verified,
+    // while fc-sanjose-3/4/5 and fc-phoenix are litebox_verified and
+    // fc-virginia has real Firecracker). Rather than accept whatever the
+    // leader can offer, ask a capable peer to provision for real and adopt
+    // its record — `owner_node` on the result then correctly names the peer,
+    // not this node, so every downstream cell-reaching path (interactive
+    // shell, run_command's re-entry via ensure_cell) targets the right node.
+    if c.sandboxes.local_backend_capable() {
+        let rec = c
+            .sandboxes
+            .create_sandbox(&t, &project, input)
+            .await
+            .map_err(sandbox_err)?;
+        c.audit
+            .record(&t, "user", "create", "sandbox", &rec.id, &rec.name);
+        crate::persist::persist(&c);
+        return Ok(Json(json!(masked_sandbox(rec))));
+    }
+    if let Some(peer) = pick_capable_peer(&c) {
+        let input_json = serde_json::to_value(&input).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not encode delegated create: {e}"),
+            )
+        })?;
+        let body = json!(DelegateCreateReq {
+            tenant: t.clone(),
+            project: project.clone(),
+            input_json,
+        });
+        if let Some(v) =
+            crate::admin::post_to_host_json(&c, &peer, "/v1/internal/sandboxes/delegate-create", &t, &body)
+                .await
+        {
+            if let Ok(rec) = serde_json::from_value::<SandboxRecord>(v) {
+                // The record lives for real on `peer` (it holds the live
+                // CellHandle), but THIS node still needs a local copy: every
+                // sandbox mutation keeps landing here (leader-forwarded,
+                // unchanged), and a mutation handler that finds nothing
+                // locally has no `owner_node` to proxy to. Metadata-only —
+                // no cell is provisioned here.
+                c.sandboxes.adopt_record(rec.clone());
+                c.audit
+                    .record(&t, "user", "create", "sandbox", &rec.id, &rec.name);
+                crate::persist::persist(&c);
+                return Ok(Json(json!(masked_sandbox(rec))));
+            }
+        }
+        tracing::warn!(
+            peer = %peer,
+            "sandbox create delegation to a capable peer failed (network/deser) — falling back to a local (simulated) record"
+        );
+    }
+    // No capable peer reachable (or delegation failed): fall through to the
+    // existing local path, which honestly reports EngineUnavailable — never
+    // silently drop the request.
     let rec = c
         .sandboxes
         .create_sandbox(&t, &project, input)
@@ -405,6 +569,19 @@ async fn delete_sandbox(
     Path((project, sandbox_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require(&c, &headers, &claims, &project)?;
+    // A delegated sandbox's live cell lives on `owner_node`, not necessarily
+    // here (see `create_sandbox`'s delegation doc). `delete_sandbox` tears
+    // down the cell, so it must run WHERE the cell is — proxy verbatim if
+    // this node only holds the adopted metadata copy.
+    if let Some(owner) = local_owner_mismatch(&c, &project, &sandbox_id).await {
+        let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}");
+        if let Some(v) = proxy_mutation_to_owner(&c, &owner, &path, &t, &json!({})).await {
+            // Owner deleted its copy; drop this node's adopted metadata too.
+            let _ = c.sandboxes.delete_sandbox(&project, &sandbox_id).await;
+            crate::persist::persist(&c);
+            return Ok(Json(v));
+        }
+    }
     c.sandboxes
         .delete_sandbox(&project, &sandbox_id)
         .await
@@ -422,6 +599,16 @@ async fn stop_sandbox(
     Path((project, sandbox_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require(&c, &headers, &claims, &project)?;
+    if let Some(owner) = local_owner_mismatch(&c, &project, &sandbox_id).await {
+        let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/stop");
+        if let Some(v) = proxy_mutation_to_owner(&c, &owner, &path, &t, &json!({})).await {
+            if let Ok(rec) = serde_json::from_value::<SandboxRecord>(v.clone()) {
+                c.sandboxes.adopt_record(rec);
+            }
+            crate::persist::persist(&c);
+            return Ok(Json(v));
+        }
+    }
     let rec = c
         .sandboxes
         .stop_sandbox(&project, &sandbox_id)
@@ -465,6 +652,17 @@ async fn run_command(
     validate_argv(&b.cmd, &b.args).map_err(sandbox_err)?;
     let project_allows_sudo = c.projects.get(&project).sandbox_allow_sudo;
     validate_sudo(b.sudo, project_allows_sudo).map_err(sandbox_err)?;
+
+    if let Some(owner) = local_owner_mismatch(&c, &project, &sandbox_id).await {
+        let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands");
+        let body = json!({
+            "cmd": b.cmd, "args": b.args, "cwd": b.cwd, "env": b.env,
+            "sudo": b.sudo, "detached": b.detached, "shell": b.shell,
+        });
+        if let Some(v) = proxy_mutation_to_owner(&c, &owner, &path, &t, &body).await {
+            return Ok(Json(v));
+        }
+    }
 
     let input = RunCommandInput {
         cmd: b.cmd,
@@ -622,16 +820,17 @@ fn default_rows() -> u16 {
 }
 
 /// Interactive terminal — real pty (`vim`/`less`/`^C`/tab-completion), NOT the
-/// line-buffered polling `commands`/`logs` pair above. Sandboxes have no
-/// independent placement (`proxy_to_owner`'s doc comment: the current
-/// control-plane owner is the only node that ever provisions a sandbox's
-/// cell), and unlike a JSON GET a websocket cannot be transparently proxied
-/// through `fetch_from_host`'s request/response shape — so this endpoint only
-/// actually opens the pty on the owning node. A client landing on any other
-/// node gets a clear typed close (never a silent hang or a half-open socket)
-/// naming the owner so the browser can reconnect directly against that node's
-/// own public host, the same way a sandbox's `domain()` preview URL already
-/// requires a direct per-node address.
+/// line-buffered polling `commands`/`logs` pair above. A sandbox's live cell
+/// lives on exactly one node — `SandboxRecord::owner_node` — which is now NOT
+/// always the control-plane leader: `create_sandbox` delegates provisioning
+/// to a capable peer when the leader itself lacks a real isolation backend
+/// (see that handler's doc comment). Unlike a JSON GET a websocket cannot be
+/// transparently proxied through `fetch_from_host`'s request/response shape,
+/// so this endpoint only actually opens the pty on the owning node — a
+/// client landing on any other node gets a clear typed close (never a silent
+/// hang or a half-open socket) naming the owner so the browser can reconnect
+/// directly against that node's own public host, the same way a sandbox's
+/// `domain()` preview URL already requires a direct per-node address.
 async fn open_shell(
     ws: WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
@@ -641,30 +840,86 @@ async fn open_shell(
     Query(q): Query<ShellQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let t = require(&c, &headers, &claims, &project)?;
-    if !c.is_control_plane_leader() {
-        let owner = c.control_plane_leader();
-        return Ok(ws.on_upgrade(move |mut socket| async move {
-            let _ = socket
-                .send(Message::Text(
-                    json!({
-                        "type": "wrong_node",
-                        "owner": owner,
-                        "message": "this sandbox's cell is hosted on a different node; reconnect against the owner directly",
-                    })
-                    .to_string(),
-                ))
-                .await;
-            let _ = socket.close().await;
-        }));
-    }
 
     // Fail BEFORE the upgrade for a genuine not-found/unauthorized sandbox —
     // an HTTP error response here is far more useful to the caller than a
-    // websocket that opens and immediately closes with no status code.
-    c.sandboxes
-        .get_sandbox(&project, &sandbox_id)
-        .await
-        .map_err(sandbox_err)?;
+    // websocket that opens and immediately closes with no status code. A
+    // local miss proxies to the record's owner (the leader always has SOME
+    // record for a sandbox it created, even a delegated one, since
+    // `delegate_create_sandbox` returns the peer's record directly to the
+    // leader's own `create_sandbox` caller — but a client landing on a
+    // THIRD node needs this same proxy the read-fallback pattern already
+    // uses elsewhere in this file).
+    let rec = match c.sandboxes.get_sandbox(&project, &sandbox_id).await {
+        Ok(rec) => rec,
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}");
+            match proxy_to_owner(&c, &path, &t).await {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("bad owner record: {e}"))
+                })?,
+                None => return Err(sandbox_err(e)),
+            }
+        }
+        Err(e) => return Err(sandbox_err(e)),
+    };
+
+    if rec.owner_node != c.node_name {
+        // Cross-node forward over the existing mesh RawTarget surface
+        // (`mesh_shell.rs`) instead of redirecting the browser: this fleet
+        // has no cert-covered per-node hostname to redirect TO (confirmed:
+        // `acme.rs` issues certs only for `*.{apps_domain}` and a fixed list
+        // under `{platform_domain}`), so a `wrong_node` message left the
+        // client permanently disconnected with no way to actually reconnect
+        // — witnessed live on `sbx_253aa161efc04c5b`. The browser's
+        // websocket to THIS node's `api.<domain>` stays open the whole
+        // session; only the server-side plumbing crosses the mesh.
+        let owner = rec.owner_node.clone();
+        let cols = q.cols;
+        let rows = q.rows;
+        let mesh = c.mesh.read().clone();
+        let node = c.registry.nodes().into_iter().find(|n| n.name == owner);
+        let (Some(mesh), Some(addr_json)) =
+            (mesh, node.and_then(|n| n.iroh_addr))
+        else {
+            return Ok(ws.on_upgrade(move |mut socket| async move {
+                let _ = socket
+                    .send(Message::Text(
+                        json!({
+                            "type": "wrong_node",
+                            "owner": owner,
+                            "message": "this sandbox's cell is hosted on a different node, and this node has no mesh path to reach it right now; try again shortly",
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+            }));
+        };
+        let target = crate::mesh_shell::shell_target(&sandbox_id, cols, rows);
+        let raw = match mesh.open_raw_to_port(&owner, &addr_json, &target).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(owner = %owner, sandbox = %sandbox_id, error = %e, "sandbox shell mesh forward failed");
+                return Ok(ws.on_upgrade(move |mut socket| async move {
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({
+                                "type": "wrong_node",
+                                "owner": owner,
+                                "message": "could not reach this sandbox's owning node over the mesh; try again shortly",
+                            })
+                            .to_string(),
+                        ))
+                        .await;
+                    let _ = socket.close().await;
+                }));
+            }
+        };
+        c.audit.record(&t, "user", "open_shell", "sandbox", &sandbox_id, "");
+        return Ok(ws.on_upgrade(move |socket| crate::mesh_shell::bridge_client_side(socket, raw)));
+    }
+
     c.audit.record(&t, "user", "open_shell", "sandbox", &sandbox_id, "");
 
     let (rx, pty) = c

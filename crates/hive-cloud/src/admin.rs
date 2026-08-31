@@ -1953,7 +1953,7 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
 /// Body-carrying POST forward to a specific node's admin surface — the POST
 /// counterpart of `put_to_host` (PUT), same node_admins-then-iroh-mesh
 /// fallback shape.
-async fn post_to_host_json(
+pub(crate) async fn post_to_host_json(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,

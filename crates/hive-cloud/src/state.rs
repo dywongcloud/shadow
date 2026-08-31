@@ -691,6 +691,7 @@ impl CloudState {
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();
+        let node_name_for_sandboxes = node_name.clone();
         let state = Arc::new(CloudState {
             region,
             node_name,
@@ -785,6 +786,7 @@ impl CloudState {
             sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(
                 region_for_sandboxes,
                 sandbox_backend,
+                node_name_for_sandboxes,
             )),
             firecracker,
             owner_email,

@@ -167,6 +167,22 @@ pub struct SandboxRecord {
     /// sandbox is simulated"), mirroring the DB-provisioning "simulated" idiom.
     #[serde(default)]
     pub note: String,
+    /// The node that actually holds this sandbox's `CellHandle` — NOT
+    /// necessarily the control-plane leader. Sandbox mutations are still
+    /// forwarded to the leader (single-writer-per-tenant-state, unchanged),
+    /// but the leader itself may lack a real isolation backend; when it does,
+    /// it delegates the actual cell provisioning to a capable peer (real
+    /// Firecracker or `litebox_verified`, picked from the live `NodeInfo`
+    /// registry's `backend` field) and stamps ITS name here instead of its
+    /// own. Every code path that needs to reach the live cell (the
+    /// interactive shell websocket, `run_command`, `open_shell`) must check
+    /// THIS field, never assume owner == leader. Empty string on a
+    /// pre-migration record (created before this field existed) or on a
+    /// record whose sandbox was never successfully provisioned anywhere
+    /// (`EngineUnavailable` on every candidate) — both read as "no live
+    /// owner", the same as today's fully-simulated state.
+    #[serde(default)]
+    pub owner_node: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -548,7 +564,7 @@ pub struct SandboxesSnapshot {
 // Provider abstraction
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSandboxInput {
     pub name: String,
     pub runtime: String,
@@ -815,6 +831,7 @@ impl SandboxProvider for MockSandboxProvider {
             deleted_at: None,
             container: String::new(),
             note: String::new(),
+            owner_node: "mock".into(),
         };
         self.sandboxes.lock().push(rec.clone());
         Ok(rec)

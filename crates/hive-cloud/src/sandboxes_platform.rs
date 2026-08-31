@@ -62,10 +62,19 @@ pub struct PlatformSandboxProvider {
     killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     backend: Option<Arc<dyn CellBackend>>,
     region: String,
+    /// This node's own name — stamped onto `SandboxRecord::owner_node` when a
+    /// cell is provisioned locally, and compared against a delegated
+    /// creation's response to confirm the delegate actually claimed
+    /// ownership. See `crate::sandboxes_api::create_sandbox`'s
+    /// capability-aware delegation for why this matters: the control-plane
+    /// leader is the sole node that ever WRITES a sandbox record (mutations
+    /// are leader-forwarded, unchanged), but the leader itself may not be the
+    /// node that ends up OWNING the live cell.
+    node_name: String,
 }
 
 impl PlatformSandboxProvider {
-    pub fn new(region: String, backend: Option<Arc<dyn CellBackend>>) -> Self {
+    pub fn new(region: String, backend: Option<Arc<dyn CellBackend>>, node_name: String) -> Self {
         PlatformSandboxProvider {
             sandboxes: Arc::new(PLRwLock::new(Vec::new())),
             commands: Arc::new(PLRwLock::new(Vec::new())),
@@ -75,6 +84,7 @@ impl PlatformSandboxProvider {
             killers: Arc::new(PLRwLock::new(HashMap::new())),
             backend,
             region,
+            node_name,
         }
     }
 
@@ -111,6 +121,52 @@ impl PlatformSandboxProvider {
                 rec.status = SandboxStatus::Stopped;
             }
         }
+    }
+
+    /// Does THIS node have a real isolation backend it can provision a
+    /// sandbox against right now? `sandboxes_api::create_sandbox` checks this
+    /// before deciding whether to delegate to a capable peer instead — kept
+    /// as a real method (not a bare `self.backend.is_some()` at the call
+    /// site) so the capability test lives in exactly one place.
+    pub fn local_backend_capable(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// Adopt an already-provisioned record from a DELEGATE peer as local
+    /// metadata — never attempts to provision a cell (that already happened
+    /// on `rec.owner_node`). Used by `create_sandbox` on the control-plane
+    /// leader after a successful delegated create: sandbox MUTATIONS keep
+    /// landing on the leader (admin_ingress forwards every POST/PUT/DELETE/
+    /// PATCH there, unchanged), so the leader needs its OWN local copy of
+    /// the record to answer them — without this, every follow-up mutation
+    /// (`stop`, `delete`, `run_command`, ...) 404s locally on the leader
+    /// even though the sandbox is real and running elsewhere. A duplicate
+    /// adopt (same id already present) replaces in place, never appends —
+    /// keeps the store idempotent under a retried delegate call.
+    pub fn adopt_record(&self, rec: SandboxRecord) {
+        let mut w = self.sandboxes.write();
+        if let Some(existing) = w.iter_mut().find(|s| s.id == rec.id) {
+            *existing = rec;
+        } else {
+            w.push(rec);
+        }
+    }
+
+    /// Look up a sandbox by id ALONE, no project scope — used only by
+    /// `mesh_shell::resolve_sandbox_shell`, whose `RawTarget` handshake
+    /// (a fixed `{project,function,port,proto}` shape defined in `hive-p2p`,
+    /// deliberately not modified for this hive-cloud-local feature) has no
+    /// project field to carry. Safe specifically because the caller checks
+    /// `owner_node == this node` immediately after — a sandbox id collision
+    /// across two different tenants' projects is already precluded by the
+    /// id's own generation (a random suffix, not tenant input), so this adds
+    /// no cross-tenant leak beyond what the id itself already guarantees.
+    pub fn get_sandbox_by_id(&self, id: &str) -> Option<SandboxRecord> {
+        self.sandboxes
+            .read()
+            .iter()
+            .find(|s| s.id == id && s.deleted_at.is_none())
+            .cloned()
     }
 
     pub fn count_for_project(&self, project_id: &str) -> u32 {
@@ -300,6 +356,7 @@ impl SandboxProvider for PlatformSandboxProvider {
             deleted_at: None,
             container: String::new(),
             note: String::new(),
+            owner_node: String::new(),
         };
         rec.timeout_expires_at = Some(now + rec.timeout_ms);
 
@@ -309,6 +366,12 @@ impl SandboxProvider for PlatformSandboxProvider {
                 rec.provider_sandbox_id = handle.endpoint.clone();
                 rec.container = cell_id_for(&rec.id).to_string();
                 rec.last_started_at = Some(now);
+                // Only a genuinely PROVISIONED cell gets an owner stamp — a
+                // failed/simulated record has no live cell anywhere, so
+                // leaving this empty lets `create_sandbox` (sandboxes_api.rs)
+                // correctly try a capable peer next instead of reading THIS
+                // node as the (non-existent) owner.
+                rec.owner_node = self.node_name.clone();
             }
             Err(e) => {
                 rec.status = SandboxStatus::Failed;

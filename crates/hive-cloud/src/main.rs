@@ -59,6 +59,7 @@ mod integrations;
 mod lease;
 mod memwatch;
 mod mesh_raw;
+mod mesh_shell;
 mod meshwatch;
 mod metrics;
 mod microfrontends;
