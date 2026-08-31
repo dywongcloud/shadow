@@ -113,6 +113,18 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
+        // HMAC replay facts and payment intents must follow the same
+        // leader-written/read-anywhere model as allocations.
+        name: "marketplace_security",
+        snapshot: |c| serde_json::to_vec(&c.marketplace_security.snapshot()).unwrap_or_default(),
+        adopt: |c, b| {
+            let snapshot: crate::marketplace::MarketplaceSecuritySnapshot =
+                serde_json::from_slice(b).ok()?;
+            c.marketplace_security.load(snapshot);
+            Some(1)
+        },
+    },
+    SyncedStore {
         name: "browser_admissions",
         // Unlike durable business stores, an empty active set is authoritative:
         // tombstones + the monotonic version prove it is a revocation, not a

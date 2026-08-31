@@ -98,6 +98,8 @@ pub struct PlatformSnapshot {
     #[serde(default)]
     pub marketplace_allocations: Vec<crate::marketplace::Allocation>,
     #[serde(default)]
+    pub marketplace_security: crate::marketplace::MarketplaceSecuritySnapshot,
+    #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
     /// Web-push subscriptions / SMS targets / delivery watermarks / VAPID keys.
     #[serde(default)]
@@ -557,6 +559,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         metrics_rollup: cloud.metrics.rollup_snapshot(),
         builds: cloud.builds.snapshot(),
         marketplace_allocations: cloud.marketplace_allocations.snapshot(),
+        marketplace_security: cloud.marketplace_security.snapshot(),
         incidents: cloud.incidents.snapshot(),
         push: cloud.push.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
@@ -790,6 +793,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             .marketplace_allocations
             .load(snap.marketplace_allocations.clone());
     }
+    cloud
+        .marketplace_security
+        .load(snap.marketplace_security.clone());
     cloud.projects.merge_synced(SyncedProjects {
         rows: snap.projects.into_iter().collect(),
         tombstones: snap.project_tombstones,
