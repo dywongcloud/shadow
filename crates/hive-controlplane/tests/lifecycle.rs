@@ -43,6 +43,7 @@ fn test_hive(warm: BTreeMap<String, usize>, provision_ms: u64) -> Arc<Hive> {
         root: std::env::temp_dir().join(format!("hive-test-{uid}")),
         provision_latency: Duration::from_millis(provision_ms),
         cache_root: std::env::temp_dir().join(format!("hive-test-cache-{uid}")),
+        receipts_dir: std::env::temp_dir().join(format!("hive-test-{uid}")),
     }));
     Hive::start(cfg, backend)
 }

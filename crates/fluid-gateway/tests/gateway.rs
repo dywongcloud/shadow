@@ -34,6 +34,7 @@ async fn gateway_handles_concurrent_requests() {
 
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw-test-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw-test-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("gw-cache-{}", std::process::id())),
     }));
@@ -125,6 +126,7 @@ async fn max_duration_504_and_error_isolation() {
     };
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw2-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw2-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("gw2-cache-{}", std::process::id())),
     }));
@@ -258,6 +260,7 @@ async fn wait_until_lease_held_open_after_response_for_a_bun_function() {
     };
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw-bun-wu-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw-bun-wu-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("gw-bun-wu-cache-{}", std::process::id())),
     }));
@@ -357,6 +360,7 @@ async fn no_context_leak_across_concurrent_requests_on_one_instance() {
     };
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw3-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw3-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("gw3-cache-{}", std::process::id())),
     }));
@@ -463,6 +467,7 @@ async fn no_context_leak_across_concurrent_requests_on_one_instance() {
 async fn restore_prefers_production_deployment_for_alias() {
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw-restore-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw-restore-{}", std::process::id())),
         provision_latency: Duration::from_millis(1),
         cache_root: std::env::temp_dir().join(format!("gw-restore-cache-{}", std::process::id())),
     }));
@@ -583,6 +588,7 @@ async fn promotion_does_not_repin_or_merge_prior_version_pool() {
 fn test_gw() -> Arc<Gateway> {
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw-alias-{}-{:p}", std::process::id(), &0u8)),
+        receipts_dir: std::env::temp_dir().join(format!("gw-alias-{}-{:p}", std::process::id(), &0u8)),
         provision_latency: Duration::from_millis(1),
         cache_root: std::env::temp_dir().join(format!("gw-alias-cache-{}", std::process::id())),
     }));
@@ -855,6 +861,7 @@ async fn target_environment_is_immutable_across_promotion() {
 async fn deployment_for_host_resolves_target_for_every_alias() {
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("gw-target-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("gw-target-{}", std::process::id())),
         provision_latency: Duration::from_millis(1),
         cache_root: std::env::temp_dir().join(format!("gw-target-cache-{}", std::process::id())),
     }));

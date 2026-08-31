@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             root: std::env::temp_dir().join("fluid-cells"),
             provision_latency: Duration::from_millis(300),
             cache_root: std::env::temp_dir().join("fluid-cache"),
+            receipts_dir: std::env::temp_dir().join("fluid-cells"),
         })),
         Backend::Firecracker => {
             let fc = FirecrackerBackend::new(FirecrackerConfig {

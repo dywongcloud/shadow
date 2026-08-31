@@ -35,6 +35,13 @@ pub struct MockConfig {
     pub provision_latency: Duration,
     /// Shared build cache root (cross-cell, like Netlify's shared cache storage).
     pub cache_root: PathBuf,
+    /// Durable directory backing the runtime-artifact receipt sidecar (see
+    /// `RUNTIME_ARTIFACT_RECEIPTS_FILE`). Must survive a `hive-node` restart —
+    /// unlike `root`/`cache_root`, which are disposable cell scratch space.
+    /// Callers should point this at the same durable store the sealed
+    /// artifacts themselves live under (`$HIVE_DATA/runtime-artifacts-v1`),
+    /// not at a tempdir.
+    pub receipts_dir: PathBuf,
 }
 
 impl Default for MockConfig {
@@ -44,6 +51,7 @@ impl Default for MockConfig {
             // A nod to the blog: cold provisioning is the slow path warm pools hide.
             provision_latency: Duration::from_millis(800),
             cache_root: std::env::temp_dir().join("hive-cache"),
+            receipts_dir: std::env::temp_dir().join("hive-cells"),
         }
     }
 }
@@ -77,10 +85,61 @@ impl Drop for RootRollback {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct MockRuntimeArtifactReceipt {
     identity: RuntimeArtifactIdentity,
     app_root: PathBuf,
+}
+
+/// File name for the durable sidecar backing `MockBackend::runtime_artifacts`.
+///
+/// The map itself used to be purely in-memory: a `hive-node` restart on any
+/// mock-backend node silently wiped every previously-"ready" deployment's
+/// artifact receipt even though the sealed bytes were still on disk under
+/// `runtime-artifacts-v1/`, surfacing as a permanent NODE_IMAGE_MISSING crash
+/// loop with no operator remedy short of a manual re-deploy. This sidecar
+/// persists the receipts (small: one entry per live image id) so a restart
+/// reloads exactly what it had, instead of orphaning ready deployments.
+const RUNTIME_ARTIFACT_RECEIPTS_FILE: &str = "runtime-artifact-receipts.json";
+
+fn load_runtime_artifact_receipts(
+    root: &std::path::Path,
+) -> HashMap<String, MockRuntimeArtifactReceipt> {
+    let path = root.join(RUNTIME_ARTIFACT_RECEIPTS_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return HashMap::new();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "runtime artifact receipts sidecar unreadable, starting empty"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+fn save_runtime_artifact_receipts(
+    root: &std::path::Path,
+    artifacts: &HashMap<String, MockRuntimeArtifactReceipt>,
+) {
+    let path = root.join(RUNTIME_ARTIFACT_RECEIPTS_FILE);
+    let tmp = root.join(format!(
+        "{RUNTIME_ARTIFACT_RECEIPTS_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    let Ok(bytes) = serde_json::to_vec(artifacts) else {
+        return;
+    };
+    if std::fs::create_dir_all(root).is_err() {
+        return;
+    }
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 pub struct MockBackend {
@@ -105,9 +164,16 @@ pub struct MockBackend {
 
 impl MockBackend {
     pub fn new(cfg: MockConfig) -> Self {
+        let restored = load_runtime_artifact_receipts(&cfg.receipts_dir);
+        if !restored.is_empty() {
+            tracing::info!(
+                count = restored.len(),
+                "restored runtime artifact receipts from disk"
+            );
+        }
         MockBackend {
             cfg,
-            runtime_artifacts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            runtime_artifacts: Arc::new(std::sync::Mutex::new(restored)),
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -276,18 +342,22 @@ impl CellBackend for MockBackend {
             identity: artifact.identity(image)?,
             app_root: artifact.host_app_root()?,
         };
-        let mut artifacts = self
-            .runtime_artifacts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = artifacts.get(image) {
-            anyhow::ensure!(
-                existing == &receipt,
-                "runtime artifact image id {image:?} is already bound to different immutable content"
-            );
-            return Ok(());
-        }
-        artifacts.insert(image.to_string(), receipt);
+        let snapshot = {
+            let mut artifacts = self
+                .runtime_artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = artifacts.get(image) {
+                anyhow::ensure!(
+                    existing == &receipt,
+                    "runtime artifact image id {image:?} is already bound to different immutable content"
+                );
+                return Ok(());
+            }
+            artifacts.insert(image.to_string(), receipt);
+            artifacts.clone()
+        };
+        save_runtime_artifact_receipts(&self.cfg.receipts_dir, &snapshot);
         Ok(())
     }
 
@@ -1063,6 +1133,7 @@ mod tenant_tests {
             root: root.clone(),
             provision_latency: Duration::from_millis(0),
             cache_root: root.join("cache"),
+            receipts_dir: root.join("cache"),
         });
 
         let a = be.provision(&spec("alpha")).await.unwrap();
@@ -1171,6 +1242,7 @@ mod tenant_tests {
             root: root.clone(),
             provision_latency: Duration::from_millis(0),
             cache_root: root.join("cache"),
+            receipts_dir: root.join("cache"),
         });
         let h = be.provision(&spec("../../etc")).await.unwrap();
         assert!(

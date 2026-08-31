@@ -624,6 +624,9 @@ async fn async_main() -> anyhow::Result<()> {
                 root: std::env::temp_dir().join("hive-cloud-cells"),
                 provision_latency: Duration::from_millis(200),
                 cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+                // Durable: must survive a hive-node restart, unlike root/cache_root
+                // above. Lives next to the sealed artifacts it describes.
+                receipts_dir: crate::persist::data_dir().join("runtime-artifacts-v1"),
             })),
             "mock",
             resources::RuntimeCapabilitySource::mock(),
