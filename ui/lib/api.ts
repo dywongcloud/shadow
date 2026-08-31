@@ -248,16 +248,25 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   // 401 = expired/invalid session. 403 ALSO covers the no-cookie-at-all case:
   // the enforced ingress answers a missing hive_jwt with 403 (operator/tenant
   // guard), not 401 — e.g. right after sign-in before the first mint landed, or
-  // when an earlier mint failed. Both get ONE transparent re-mint + retry; a
-  // genuine authorization denial (wrong tenant/role) simply fails again on the
-  // retry and propagates, so this cannot loop per-request. The cooldown keeps a
-  // PERSISTENTLY-403 endpoint on a 3-4s poll from turning every cycle into an
-  // /api/token round trip: one automatic re-mint per window is plenty (a
+  // when an earlier mint failed. `x-hive-anon: 1` is the THIRD, GET-specific
+  // case: a read is never rejected for missing auth (backend `auth.rs`'s
+  // `require_auth` lets every GET/HEAD through), so an unauthenticated one
+  // silently resolves to `admin::ANON_TENANT` and returns a real 200 with a
+  // wrongly-scoped empty/anonymous body — a stale/expired cookie or a
+  // mint-race renders as a permanently-empty list with no error, since 200 is
+  // never what the pre-existing 401/403 branch below was watching for
+  // (live-reported: the API Keys page appearing to silently drop a just-created
+  // key on refresh). All three get ONE transparent re-mint + retry; a genuine
+  // authorization denial (wrong tenant/role) simply fails again on the retry
+  // and propagates, so this cannot loop per-request. The cooldown keeps a
+  // PERSISTENTLY-anonymous endpoint on a 3-4s poll from turning every cycle into
+  // an /api/token round trip: one automatic re-mint per window is plenty (a
   // successful mint fixes every subsequent request anyway). This is an
   // AUTOMATIC mint path, so it also respects the shared failure budget: while
   // minting is in backoff or suspended (`failed`), re-minting here cannot
   // succeed any harder than it just did, so the response propagates as-is.
-  if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && MINT_ON) {
+  const isAnon = r.headers.get("x-hive-anon") === "1";
+  if ((r.status === 401 || r.status === 403 || isAnon) && typeof window !== "undefined" && MINT_ON) {
     const now = Date.now();
     if (mintState === "failed" || now < mintNextAutoAttemptAt) return r;
     if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;

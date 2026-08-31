@@ -253,7 +253,30 @@ pub async fn require_auth(
         // the same shape as `/v1/sqlite/`'s per-database bearer above.
         || path.starts_with("/v1/drive/webdav/");
     if !is_mutation || open {
-        return next.run(req).await;
+        let mut resp = next.run(req).await;
+        // A GET/HEAD is never rejected for missing auth (reads stay reachable
+        // even mid-mint-race) — but an unauthenticated one silently resolves
+        // to `admin::ANON_TENANT` (`resolve_tenant`'s own fail-closed design:
+        // scope to a namespace that owns nothing, never leak the real
+        // tenant's data to a tokenless caller). That produces a real 200 with
+        // a wrongly-scoped empty/anonymous body, which is indistinguishable
+        // from "you really have zero X" to the caller and — critically —
+        // never a 401/403, the ONLY status `ui/lib/api.ts`'s `fetchWithTimeout`
+        // treats as "re-mint the session and retry." A cookie that expires
+        // mid-session (the 1h TTL, `SessionToken`'s 50-min proactive re-mint
+        // notwithstanding — a tab backgrounded past that cadence, a failed
+        // re-mint) or a genuine mint-race on a fresh load therefore renders a
+        // permanently-empty list with no error and nothing that ever
+        // corrects it (live-reported: API keys page). Stamping this header
+        // lets the client apply the exact same re-mint-and-retry it already
+        // has for 401/403, without weakening the read path's own
+        // stay-reachable posture (still a real 200; still whatever an
+        // exempted caller with no session is supposed to see).
+        if !authed && !open {
+            resp.headers_mut()
+                .insert("x-hive-anon", axum::http::HeaderValue::from_static("1"));
+        }
+        return resp;
     }
     if authed {
         next.run(req).await
