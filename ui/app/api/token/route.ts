@@ -38,6 +38,28 @@ function jwtPlatformAdmin(token: string): boolean | null {
 }
 
 /**
+ * Parent-domain scope for the `hive_jwt` cookie (e.g. `.shadw.cloud` from a
+ * `shadw.cloud`/`dashboard.shadw.cloud` request host), so the SAME cookie the
+ * dashboard's same-origin `/cloud` proxy relies on is ALSO sent on the
+ * sandbox terminal's cross-subdomain websocket handshake to
+ * `wss://api.<domain>` (`ui/lib/api.ts`'s `wsBase()` derives that exact
+ * target from the identical two-label-suffix rule). Without an explicit
+ * `domain`, a cookie defaults to the exact host that set it and is invisible
+ * to any other subdomain — the websocket would silently 401/close, not fail
+ * loudly, since a browser WebSocket handshake can't attach a header to work
+ * around it (this cookie is httpOnly by design). `localhost`/`127.0.0.1`/a
+ * bare single-label host get `undefined` (browsers reject a `Domain`
+ * attribute on those anyway) so local dev is unaffected.
+ */
+function cookieDomain(req: NextRequest): string | undefined {
+  const host = (req.headers.get("host") || "").split(":")[0];
+  if (!host || host === "localhost" || host === "127.0.0.1") return undefined;
+  const parts = host.split(".");
+  if (parts.length < 2) return undefined;
+  return `.${parts.slice(-2).join(".")}`;
+}
+
+/**
  * Mint a short-lived platform JWT for the signed-in user and set it as an
  * httpOnly `hive_jwt` cookie, so the dashboard's same-origin `/cloud` calls are
  * authenticated at the admin ingress WITHOUT exposing the token to browser JS.
@@ -95,6 +117,7 @@ export async function POST(req: NextRequest) {
         httpOnly: true,
         secure: false, // local-only branch (NODE_ENV !== "production" above)
         sameSite: "lax",
+        domain: cookieDomain(req),
         path: "/",
         maxAge: Math.max(60, expiresIn - 30),
       });
@@ -230,6 +253,7 @@ export async function POST(req: NextRequest) {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
+    domain: cookieDomain(req),
     path: "/",
     maxAge: Math.max(60, expiresIn - 30),
   });

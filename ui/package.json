@@ -13,6 +13,8 @@
     "@clerk/themes": "^2.4.57",
     "@tremor/react": "3.18.7",
     "@workflow/web": "^4.1.13",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "@xyflow/react": "^12.11.2",
     "cbor-x": "^1.6.4",
     "clsx": "2.1.1",

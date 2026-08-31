@@ -4,6 +4,34 @@ import { useEffect, useState, useCallback } from "react";
 
 const BASE = "/cloud";
 
+/**
+ * Base `ws(s)://` origin for routes that need a real websocket — the sandbox
+ * interactive shell is the first one. Next.js's `rewrites()` (what `/cloud`
+ * uses for every other API call) proxies plain HTTP only; it cannot forward
+ * a websocket `Upgrade` handshake, so this connects DIRECTLY to the admin
+ * host instead of going through `/cloud`.
+ *
+ * `NEXT_PUBLIC_HIVE_WS_ADMIN` (e.g. `wss://api.shadw.cloud`), when set at
+ * build time, wins outright. Otherwise derive same-domain from the
+ * dashboard's own hostname (`shadw.cloud` → `api.shadw.cloud`, the
+ * `HIVE_PLATFORM_DOMAIN`/`api.` convention this platform already uses
+ * everywhere else) so a fresh deploy needs no extra config; local dev
+ * (`localhost`/`127.0.0.1`) falls back to this browser's own admin port.
+ */
+export function wsBase(): string {
+  const configured = process.env.NEXT_PUBLIC_HIVE_WS_ADMIN;
+  if (configured) return configured.replace(/\/$/, "");
+  if (typeof window === "undefined") return "";
+  const { protocol, hostname } = window.location;
+  const wsProto = protocol === "https:" ? "wss:" : "ws:";
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
+    return `${wsProto}//${hostname}:8786`;
+  }
+  const parts = hostname.split(".");
+  const apiHost = parts.length > 2 ? `api.${parts.slice(-2).join(".")}` : `api.${hostname}`;
+  return `${wsProto}//${apiHost}`;
+}
+
 /** Current tenant (team) for scoping all dashboard reads/writes.
  *
  * MULTI-TENANCY: an ORG scope resolves to the org slug (already isolated). The

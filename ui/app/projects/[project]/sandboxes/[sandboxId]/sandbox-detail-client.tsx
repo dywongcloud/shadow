@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
+import { TerminalPanel } from "./terminal-panel";
 
 function statusTone(s: string): "green" | "amber" | "red" | "default" {
   if (s === "running") return "green";
@@ -85,6 +86,7 @@ export function SandboxDetail({ paramsPromise }: { paramsPromise: Promise<{ proj
       </div>
 
       <div className="flex flex-col gap-6">
+        {sandbox.status === "running" ? <TerminalPanel project={project} sandboxId={sandboxId} /> : null}
         <RunCommandPanel project={project} sandboxId={sandboxId} />
         <FilesPanel project={project} sandboxId={sandboxId} />
         <PortsCard project={project} sandbox={sandbox} />

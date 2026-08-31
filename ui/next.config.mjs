@@ -206,7 +206,10 @@ const nextConfig = {
     // CSP is now ENFORCING (promoted from report-only). The policy allows the
     // app's real origins (verified from the codebase: client data goes
     // same-origin through /cloud + /api/* server proxies → `connect-src 'self'`;
-    // Clerk auth origins; GitHub avatar images via `img-src https:`). `script-src`
+    // the sandbox interactive-shell websocket is the one exception — Next.js
+    // rewrites proxy plain HTTP only, never a websocket Upgrade handshake, so
+    // it dials `wss://<admin-host>` directly, hence `wss://*.shadw.cloud`
+    // below; Clerk auth origins; GitHub avatar images via `img-src https:`). `script-src`
     // carries `'unsafe-inline'` because Next.js emits inline hydration/bootstrap
     // scripts and this build has no per-request nonce pipeline — the OTHER
     // directives still deliver the high-value protections (connect-src bounds
@@ -240,7 +243,7 @@ const nextConfig = {
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud wss://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
       `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",
@@ -259,7 +262,7 @@ const nextConfig = {
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud wss://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
       `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",
