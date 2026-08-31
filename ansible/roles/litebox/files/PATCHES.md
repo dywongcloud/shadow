@@ -1,3 +1,79 @@
+# litebox fork tracking
+
+`ansible/roles/litebox/defaults/main.yml`'s `litebox_repo_url`/`litebox_commit`
+point at `AnEntrypoint/litebox` (currently pinned
+`19532929bbe59769ce9653fdde3c69852d85b9b3`), not upstream
+`microsoft/litebox`. This is a deliberate, user-approved switch — record here
+why, what was checked before switching, and what changed.
+
+## Why
+
+The Sandboxes interactive-terminal feature
+(`crates/hive-cloud/src/sandboxes_platform.rs`'s `open_shell`, the guest-side
+`ExecPty` protocol in `crates/hive-cell-agent`) needs a real interactive Linux
+shell inside the guest — a shell that can `fork()`+`exec()` every command a
+user types (`ls`, `cat`, `vim`, `tmux`, ...), report exit codes via
+`wait4()`/`waitpid()`, and drive a real pty (`setsid()`/`TIOCSCTTY`, raw mode,
+job control). Upstream `microsoft/litebox` at the previously-pinned commit
+(`e7984422ce1aab181305ac7b9085c3e84e7bb27c`) has **no process concept at
+all** — `do_clone` only supports thread creation
+(`CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES` required), `execve`
+tears down and replaces the current guest state in-place rather than
+spawning anything new, and there is no `wait4`/`waitid` implementation
+anywhere in the crate (confirmed by direct source reading and exhaustive
+grep this session, before the switch).
+
+A first-cut, narrowly-scoped patch against upstream (`fork.patch`, real host
+`fork(2)`, single-guest-thread-only, no `wait4`) was written and verified
+compiling this session, but `AnEntrypoint/litebox` turned out to already
+solve the same problem far more completely and was independently verified
+(not taken on faith) before switching to it — see "What was checked" below.
+The v0 patch is superseded and removed; nothing in this repo references it
+anymore.
+
+## What was checked before switching
+
+- **Legitimacy.** `AnEntrypoint/litebox` is a real, MIT-licensed (matching
+  upstream's own license), actively developed repository — 500+ commits at
+  the time of the pin, spanning real dated history (not a single dump).
+  `GET /repos/AnEntrypoint/litebox` reports `fork: false` (it is not a
+  GitHub-registered fork of `microsoft/litebox`, i.e. no shared commit
+  ancestry via GitHub's fork graph) — its origin/lineage relative to
+  upstream was not independently re-derived beyond that; treat it as an
+  independent MIT-licensed reimplementation/continuation, not a byte-for-byte
+  upstream-plus-patches tree.
+- **The feature claims are real, not just README prose.** Searched the
+  repo's actual commit history (GitHub commit search) for `fork_process` —
+  85 real, individually dated commits (spanning at least 2026-08-11 through
+  2026-08-17) implementing and hardening exactly this: `fork()` with correct
+  POSIX signal-state isolation between parent and child (a genuine
+  correctness bug — sharing `shared_pending`/`handlers` between parent and
+  child, matching a real live bug class), `wait4`/`waitid` with a real
+  cross-process child registry, `setpgid`/`getpgid` targeting a live
+  fork()ed child, `kill()` reaching a live child/process-group. Spot-read
+  the actual pinned commit's `litebox_shim_linux/src/syscalls/process.rs`
+  directly (not just the README) and confirmed `required_clone_flags` no
+  longer exists at all — `do_clone` was substantially rewritten to support
+  real `fork()` unconditionally, not gated behind a thread-only flag check
+  the way upstream is.
+- **Compiles for real.** `cargo check --target x86_64-unknown-linux-gnu` for
+  `litebox`, `litebox_shim_linux`, `litebox_platform_linux_userland`, and the
+  real `litebox_runner_linux_userland` binary crate (a much larger dependency
+  tree than upstream's equivalent check — this build also carries real
+  wgpu/winit/wayland desktop-shell support) — all clean, at the exact pinned
+  commit, both before and after `networking.patch` (below) is applied.
+
+## What was NOT independently re-verified
+
+Runtime behavior of the fork()/pty/job-control machinery itself (spawn a
+guest shell, actually type at it, observe `vim`/`tmux` working) — this
+session confirmed the code compiles and the commit history is real and
+substantial, not that every claimed fix behaves correctly on real hardware.
+That is exactly what `hive-cloud --litebox-probe` (extended to actually spawn
+an interactive session, once the CellBackend `exec_pty` implementation for
+`LiteboxBackend` lands) needs to prove before `HIVE_LITEBOX_VERIFIED=1` is
+set on any node relying on this.
+
 # litebox networking.patch
 
 Applied by `ansible/roles/litebox/tasks/main.yml` via `git apply` right after
@@ -8,36 +84,48 @@ against each future commit bump before updating the pin — same discipline as
 
 ## Base
 
-`microsoft/litebox` at `e7984422ce1aab181305ac7b9085c3e84e7bb27c` (the pin at
-the time this patch was written, 2026-08-08).
+`AnEntrypoint/litebox` at `19532929bbe59769ce9653fdde3c69852d85b9b3` (the pin
+at the time this patch was rebased, 2026-08-31 — see "litebox fork tracking"
+above for why this base changed from the original `microsoft/litebox` pin
+this patch was first written against, 2026-08-08).
 
 ## What it does, and why
 
-Two independent problems, found live on fc-frankfurt and confirmed by
-research against litebox's own source
-(`crates/hive-backend/src/litebox.rs`'s module doc, "Networking" section, has
-the full narrative):
+Two independent problems, originally found live on fc-frankfurt against
+upstream `microsoft/litebox` and confirmed by research against litebox's own
+source (`crates/hive-backend/src/litebox.rs`'s module doc, "Networking"
+section, has the full narrative) — **re-verified against the new
+`AnEntrypoint/litebox` base before rebasing this patch**, since the base
+switch (above) independently fixed part of problem 1 already:
 
-1. **Wildcard bind never worked.** `litebox/src/net/mod.rs`'s `bind()` (TCP
-   and UDP) and the implicit-bind-on-`listen()` path all unconditionally
-   built `smoltcp::wire::IpListenEndpoint { addr: Some(addr), .. }`, even
-   when the guest asked for the wildcard address (`0.0.0.0`/omitted). smoltcp
-   itself already has correct wildcard-listen support
+1. **Wildcard bind.** litebox's `bind()` (TCP and UDP) and the
+   implicit-bind-on-`listen()` path all originally built
+   `smoltcp::wire::IpListenEndpoint { addr: Some(addr), .. }` unconditionally,
+   even when the guest asked for the wildcard address (`0.0.0.0`/omitted).
+   smoltcp itself already has correct wildcard-listen support
    (`IpListenEndpoint.addr: Option<Address>`, `None` = "any address",
-   confirmed in smoltcp 0.12.0 — litebox's own exact pinned version) — this
-   was purely litebox's integration code never using the `None` sentinel it
-   was already given the means to use. The patch changes all three sites to
-   map an unspecified address to `None` instead of `Some(0.0.0.0)`. This is
-   the root-cause fix for what this repo's docs call "Problem 2" — and it
-   fixes EVERY guest language (the interface has exactly one real address,
-   the cell's assigned IP, so `None` correctly matches every real inbound
-   packet), not just Node/Bun.
-2. **The guest's own IP/gateway were hardcoded at compile time**, with no
+   confirmed in smoltcp 0.12.0 — the pinned version on both the original and
+   the new base) — this was purely integration code never using the `None`
+   sentinel it was already given the means to use.
+   **`AnEntrypoint/litebox` already independently fixed 2 of the 3 sites**
+   (the explicit TCP `bind()` arm and the UDP `bind()` arm both already use
+   `addr: None` for an unspecified address, with comments matching this
+   patch's own original reasoning nearly verbatim) — confirmed by reading
+   the pinned commit's `litebox/src/net/mod.rs` directly before rebasing.
+   The one remaining site is the implicit-bind-on-`listen()` path (`listen()`
+   called with no prior explicit `bind()`), still using
+   `Some(IpAddress::v4(0,0,0,0))` — this patch fixes that one remaining
+   site. Fixing it (like the other two) matters for every guest language,
+   not just Node/Bun: the interface has exactly one real address, the
+   cell's assigned IP, so `None` correctly matches every real inbound
+   packet.
+2. **The guest's own IP/gateway are hardcoded at compile time**, with no
    override of any kind — `litebox/src/net/mod.rs`:
    `const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);` /
-   `const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);`, both
-   already marked `// TODO: Make this configurable` by litebox's own authors.
-   Every concurrent litebox process therefore believed it was the identical
+   `const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);`, both still
+   marked `// TODO: Make this configurable` on the new base too — this part
+   of the original patch was NOT independently fixed by the base switch.
+   Every concurrent litebox process therefore believes it is the identical
    address — unusable for a platform running many concurrent sandboxed
    instances that each need their own reachable identity. The patch adds
    `Network::new_with_addrs`/`LinuxShimBuilder::build_with_net_config`
@@ -46,149 +134,28 @@ the full narrative):
    litebox's own test suite, needs no changes) and wires
    `litebox_runner_linux_userland`'s `run()` to read
    `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` from the environment. Unset =
-   byte-identical to upstream behavior.
+   byte-identical to the base's own behavior.
 
 ## Why not wait for upstream, and why not switch to the `ulitebox` branch
 
-A parallel, unreleased litebox rewrite (branch `ulitebox`, an actively
-churning personal branch of a Microsoft engineer, not on `main`, no
-merge-to-main PR as of this patch) replaces the whole smoltcp/TUN stack with
-a broker process issuing real host socket syscalls — a more thorough fix for
-loopback, but its own `authorize_socket_bind` policy hard-DENIES wildcard
-binds by design (confirmed via its own unit test), so it would not remove
-the need for problem 1's fix even if adopted. It is also unstable and
-undocumented. Not worth the risk for production; worth revisiting only once
-it stabilizes and merges to `main`.
+(Reasoning from when this patch targeted upstream `microsoft/litebox`;
+unaffected by the base switch to `AnEntrypoint/litebox`, which is a fully
+separate concern from the `ulitebox` branch discussed here.) A parallel,
+unreleased litebox rewrite (branch `ulitebox` on `microsoft/litebox`, an
+actively churning personal branch of a Microsoft engineer, not on `main`, no
+merge-to-main PR) replaces the whole smoltcp/TUN stack with a broker process
+issuing real host socket syscalls — a more thorough fix for loopback, but its
+own `authorize_socket_bind` policy hard-DENIES wildcard binds by design
+(confirmed via its own unit test), so it would not remove the need for
+problem 1's fix even if adopted. It is also unstable and undocumented.
 
 ## Verified
 
-`cargo check -p litebox` (macOS/aarch64, so most of the crate's
-`target_os = "linux"`-gated code doesn't compile there either way) shows the
-same 11 pre-existing, patch-unrelated errors (an x86_64-specific exception
-table macro) before and after this patch — confirmed via `git stash`. The
-three files this patch touches compile clean in isolation. Full functional
-verification (the wildcard-bind fix and the multi-instance addressing both
-actually working) happens via `hive-cloud --litebox-probe`'s network check on
-a real x86_64 Linux host, not locally.
-
-# litebox fork.patch
-
-Applied right after `networking.patch` (same task sequence, same idempotent
-apply-every-run discipline — the clone step always resets tracked files to
-pristine first). Composes cleanly with `networking.patch` — disjoint files,
-verified by applying both in sequence against a fresh pinned clone.
-
-## Base
-
-Same pin as `networking.patch`: `microsoft/litebox` at
-`e7984422ce1aab181305ac7b9085c3e84e7bb27c`.
-
-## What it does, and why
-
-Adds a **rough v0** of real process `fork()` support, for the Sandboxes
-interactive-terminal feature (`crates/hive-cloud/src/sandboxes_platform.rs`'s
-`open_shell` / the guest-side `ExecPty` protocol in
-`crates/hive-cell-agent`) — a shell needs to `fork()`+`exec()` every command
-a user types (`ls`, `cat`, `vim`, ...), and litebox had **no process concept
-at all** before this patch, confirmed by direct source reading:
-
-- `litebox_shim_linux/src/syscalls/process.rs`'s `do_clone` REQUIRED
-  `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES` — thread-only.
-  Guest "threads" are real host pthreads sharing ONE
-  `litebox_runner_linux_userland` process's real address space (guest
-  `mmap`/`brk` are real host `mmap` calls — the syscall-rewriting model means
-  the guest's memory literally IS host process memory).
-- `sys_execve` tears down and replaces the CURRENT guest state in-place — an
-  in-process ELF loader, never spawns anything new.
-- **No `wait4`/`waitid` implementation existed anywhere in the crate** —
-  confirmed by exhaustive grep. A forked shell reaping its child would
-  currently get `ENOSYS`. This patch does **not** fix that gap — see
-  "What this does NOT cover" below.
-
-### The design: a real host `fork(2)`, not an emulated one
-
-`litebox_shim_linux` is `#![no_std]` with no real OS access at all — a raw
-`fork()` syscall is structurally impossible to issue from `do_clone` itself.
-The only crate with real host access is `litebox_platform_linux_userland`,
-already reached from `do_clone` via the existing
-`self.global.platform.spawn_thread(...)` call (the `ThreadProvider` trait
-hook every guest-thread-clone already goes through). This patch adds a
-sibling trait method, `ThreadProvider::fork_process`, with a
-default-unsupported implementation (every platform except a real
-fork()-capable host OS process — Windows userland, bare-metal kernel, SNP,
-LVBS, OP-TEE — inherits this unchanged, matching every other
-optional-capability default already in this trait). `LinuxUserland` is the
-one implementer: it calls the real `libc::fork()` and returns a
-`ForkOutcome::Parent(child_pid)` / `ForkOutcome::Child` enum mirroring
-POSIX `fork()`'s own return-value contract.
-
-`do_clone` detects the real-`fork()` shape (glibc lowers `fork()` to
-`clone(SIGCHLD, NULL, ...)` on x86_64 — i.e. a `Clone` request with **no**
-flags at all, not even `CLONE_VM`) as an early branch before the existing
-`required_clone_flags` rejection, calls `fork_process`, and returns 0 in the
-child / the child's real host pid in the parent — exactly POSIX `fork()`
-semantics. `vfork()` (`CLONE_VM | CLONE_VFORK`) is deliberately **not**
-handled — it shares the parent's address space until `exec()`, a genuinely
-different and harder problem than a real copy, and falls through to the
-existing unsupported-flags rejection unchanged.
-
-### What this v0 does NOT cover (load-bearing, not hidden)
-
-- **Single-guest-thread-at-fork-time ONLY.** A real host `fork()` continues
-  only the calling thread into the child; every OTHER guest pthread this
-  process's `spawn_thread` may have started simply vanishes in the child
-  while litebox's own `Process`/`ThreadState` bookkeeping still believes
-  they exist. `do_clone` checks `Process::nr_threads() == 1` (a pre-existing
-  public accessor, an atomic already tracked for `wait_for_exit`) before
-  calling `fork_process` and returns `ENOSYS` otherwise — a real, load-bearing
-  guard, not a TODO. A shell immediately after launch (before it starts any
-  of its own background threads) satisfies this; a shell mid-job-control
-  with backgrounded jobs holding extra threads would not.
-- **No fork-safety audit against locks held by a DIFFERENT host thread at
-  the instant of `fork()`.** Only the calling thread survives into the
-  child; any `Mutex`/`RwLock` (e.g. `Process::inner`) held by another thread
-  at that exact moment is permanently poisoned/deadlocked in the child. This
-  patch's own doc comments on `ThreadProvider::fork_process` name this
-  explicitly as unaudited — a real audit of `Process<Platform>`'s and
-  `ThreadState<Platform>`'s lock usage against realistic concurrent syscall
-  timing is genuinely separate, harder work this patch does not attempt.
-- **No `wait4`/`waitid` implementation.** litebox has zero wait-family
-  syscall support today; a forked child's exit status cannot currently be
-  reaped by the guest shell at all. A real shell needs this to report exit
-  codes and avoid zombie accumulation — without it, this fork() is real but
-  incomplete for actual interactive use. Tracked as explicitly open, not
-  silently assumed away.
-- **`vfork()` unsupported** (see above — falls through to the existing
-  rejection, unchanged behavior).
-- Every platform except Linux userland (Windows userland, bare-metal kernel,
-  SNP, LVBS, OP-TEE) inherits the default `Unsupported` — no fork() anywhere
-  but the one platform this patch actually targets.
-
-## Why a real host fork() instead of reimplementing it in the emulator
-
-The alternative — building fork semantics entirely inside litebox's own
-guest-memory emulation layer — would mean re-inventing copy-on-write address
-space duplication from scratch. Since litebox's guest memory already IS real
-host process memory (the syscall-rewriting model, not a software MMU), a
-real host `fork(2)` gets that exact semantic for free from the host kernel.
-This is the same reasoning `networking.patch` already documents for why a
-small forked patch beats fighting litebox's architecture from outside it.
-
-## Verified
-
-`cargo check --target x86_64-unknown-linux-gnu` (real Linux target, not the
-macOS-limited surface `networking.patch`'s own verification was confined to)
-for `litebox`, `litebox_shim_linux`, `litebox_platform_linux_userland`,
-`litebox_platform_linux_kernel`, `litebox_platform_multiplex`, and the real
-`litebox_runner_linux_userland` binary crate — all clean, both standalone
-and with `networking.patch` applied first (the actual deployment order).
-`git apply --check` confirmed against a completely fresh clone at the pinned
-commit, standalone and stacked on `networking.patch`. NOT verified: actual
-runtime behavior (no real Linux box with a litebox-capable kernel was
-available in this session) — a fork() that type-checks and a fork() that
-correctly hands off guest execution to a real, distinguishable child process
-are different claims, and only the first one is proven here. Needs a real
-`--litebox-probe`-style functional test (spawn a guest shell, fork it, exec
-`/bin/true` in the child, observe the parent still running) on actual
-target hardware before this is anything more than a structurally-sound
-starting point.
+`cargo check --target x86_64-unknown-linux-gnu` for `litebox`,
+`litebox_shim_linux`, `litebox_platform_linux_userland`, and the real
+`litebox_runner_linux_userland` binary crate — all clean, at the pinned
+`AnEntrypoint/litebox` commit, with this patch applied. `git apply --check`
+confirmed against a completely fresh clone at the pinned commit. Full
+functional verification (the wildcard-bind fix and the multi-instance
+addressing both actually working) happens via `hive-cloud --litebox-probe`'s
+network check on a real x86_64 Linux host, not locally.

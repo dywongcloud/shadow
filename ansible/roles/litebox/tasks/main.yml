@@ -1,10 +1,12 @@
 ---
-# Build + stage Microsoft's LiteBox (https://github.com/microsoft/litebox) —
-# an unprivileged Linux syscall-sandboxing library — for hive-cloud's Litebox
-# CellBackend (crates/hive-backend/src/litebox.rs). Targets nodes where
-# neither real Firecracker microVMs nor the PVM software-virt fallback can
-# safely run (see that module's doc comment and AGENTS.md's "PVM kernels"
-# section for why fc-frankfurt specifically is in that state today).
+# Build + stage LiteBox (an unprivileged Linux syscall-sandboxing library
+# originally from Microsoft, https://github.com/microsoft/litebox — this
+# role tracks AnEntrypoint/litebox instead, see files/PATCHES.md's "litebox
+# fork tracking" section for why) for hive-cloud's Litebox CellBackend
+# (crates/hive-backend/src/litebox.rs). Targets nodes where neither real
+# Firecracker microVMs nor the PVM software-virt fallback can safely run
+# (see that module's doc comment and AGENTS.md's "PVM kernels" section for
+# why fc-frankfurt specifically is in that state today).
 #
 # litebox ships no release binaries, so it's built from source the same way
 # hive_platform builds hive-cloud itself (rustup already installed
@@ -75,31 +77,6 @@
       -- re-diff it against the new pin before proceeding. Building unpatched
       would silently ship the wildcard-bind bug and the hardcoded
       single-instance guest IP back.
-
-- name: Copy the fleet-hive fork patch to the target host (rough v0 real process fork() support for the Sandboxes interactive shell)
-  ansible.builtin.copy:
-    src: fork.patch
-    dest: "{{ litebox_src_dir }}/../litebox-fork.patch"
-    mode: "0644"
-
-- name: Apply it (same idempotent-every-run discipline as networking.patch, applied on top of it)
-  ansible.builtin.command:
-    cmd: git apply ../litebox-fork.patch
-    chdir: "{{ litebox_src_dir }}"
-  register: _fork_patch_apply
-  changed_when: true
-  failed_when: false
-
-- name: Fail loudly if the fork patch no longer applies cleanly (litebox_commit moved -- re-diff files/fork.patch, see files/PATCHES.md)
-  ansible.builtin.assert:
-    that: _fork_patch_apply.rc == 0
-    fail_msg: >-
-      files/fork.patch (see files/PATCHES.md, "litebox fork.patch" section)
-      no longer applies cleanly against litebox_commit={{ litebox_commit }}:
-      {{ _fork_patch_apply.stderr }} -- re-diff it against the new pin before
-      proceeding. This is a rough v0 (single-guest-thread-at-fork-time only,
-      no wait4/waitid support yet) -- building without it silently loses
-      Sandboxes interactive-shell fork() support, not a security regression.
 
 - name: Build litebox_runner_linux_userland (release) -- long-running, first build is the slow one
   ansible.builtin.command:
