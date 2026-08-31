@@ -576,12 +576,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
     // backend — gossiped so the placement scheduler only auto-targets
     // production isolation backends (never the local/mock Mac nodes).
-    // `sandbox_fc` retains the CONCRETE type (Sandboxes' exec/kill methods are
-    // Firecracker-specific, not part of the generic `CellBackend` trait object
-    // every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
-    let sandbox_fc: Option<Arc<FirecrackerBackend>> =
-        sandbox_fc_supported.then(|| firecracker.clone());
     // Litebox Tier 2: NEVER auto-detected live (see `LiteboxBackend::smoke_test`'s
     // doc comment and AGENTS.md's PVM two-tier precedent) — an operator runs
     // `--litebox-probe` once during bring-up on an idle node and only then
@@ -593,6 +588,22 @@ async fn async_main() -> anyhow::Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
+    // Sandboxes' own backend selection mirrors the main isolation-backend
+    // ranking one step behind (Firecracker -> Litebox -> none, never Mock —
+    // an unsandboxed dev host reports EngineUnavailable instead of a fake
+    // "sandbox" that doesn't isolate anything). `exec_command`/`exec_pty` are
+    // now generic `CellBackend` trait methods (previously Firecracker-only
+    // inherent methods), so this can hold a trait object like every other
+    // subsystem instead of the concrete Firecracker type.
+    let sandbox_backend: Option<Arc<dyn CellBackend>> = if sandbox_fc_supported {
+        Some(firecracker.clone())
+    } else if litebox_supported {
+        Some(litebox.clone())
+    } else {
+        None
+    };
+    let sandbox_firecracker: Option<Arc<FirecrackerBackend>> =
+        sandbox_fc_supported.then(|| firecracker.clone());
     let litebox_runtime_capabilities = resources::RuntimeCapabilitySource::litebox(litebox.clone());
     let (backend, backend_name, runtime_capability_source): (
         Arc<dyn CellBackend>,
@@ -1074,7 +1085,8 @@ async fn async_main() -> anyhow::Result<()> {
         gw.clone(),
         fluid,
         hive,
-        sandbox_fc,
+        sandbox_firecracker,
+        sandbox_backend,
     );
     // Fill the embedded relay's deferred AccessControl cell now that
     // CloudState finally exists (it was constructed and wired into the relay

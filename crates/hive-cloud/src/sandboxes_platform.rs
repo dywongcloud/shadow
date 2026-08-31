@@ -1,23 +1,29 @@
 //! `PlatformSandboxProvider` — the production [`SandboxProvider`]: real
-//! Firecracker microVMs (`hive_backend::firecracker::FirecrackerBackend`), the
-//! SAME isolation tech Fluid serverless functions already use on this fleet —
-//! reused, not duplicated, per the platform's own "one microVM runtime" design.
+//! isolated cells via the generic `hive_backend::CellBackend` trait — real
+//! Firecracker microVMs when available (the SAME isolation tech Fluid
+//! serverless functions use on this fleet), falling back to Litebox on nodes
+//! where microVMs are unavailable/suppressed and Litebox has been verified
+//! (`HIVE_LITEBOX_VERIFIED=1`, mirroring `main.rs`'s own backend-selection
+//! ranking) — reused, not duplicated, per the platform's "one isolation
+//! selection" design. Never Mock: an unsandboxed node honestly reports
+//! `EngineUnavailable` rather than presenting a fake "sandbox" that isolates
+//! nothing.
 //!
 //! A sandbox is a long-lived cell (`CellBackend::provision`, never torn down
-//! until `stop`/`delete`/idle-timeout). Command execution rides a NEW guest-
-//! agent protocol addition (`AgentRequest::Exec`/`KillExec`, `hive-core/proto.rs`)
+//! until `stop`/`delete`/idle-timeout). Command execution rides the guest-
+//! agent protocol's `AgentRequest::Exec`/`KillExec` (`hive-core/proto.rs`)
 //! that runs one argv command per call over its own vsock connection, streaming
-//! `ExecOutput` (stdout/stderr kept distinct) then one `ExecDone` — see
-//! `FirecrackerBackend::exec_command`/`kill_exec`.
+//! `ExecOutput` (stdout/stderr kept distinct) then one `ExecDone`; the
+//! interactive terminal rides the sibling `ExecPty`/`PtyInput`/`PtyResize`/
+//! `PtyOutput`/`PtyExited` messages — see `CellBackend::exec_command`/
+//! `kill_exec`/`exec_pty`.
 //!
-//! On a node whose isolation backend is NOT Firecracker (mock/dev), every
-//! operation reports `EngineUnavailable` with a clear note — mirroring the
-//! platform's existing "simulated" idiom (e.g. DB provisioning when podman is
-//! absent) rather than silently downgrading to a different, undisclosed
-//! isolation technology.
+//! On a node with no selected backend, every operation reports
+//! `EngineUnavailable` with a clear note — mirroring the platform's existing
+//! "simulated" idiom (e.g. DB provisioning when podman is absent) rather than
+//! silently downgrading to a different, undisclosed isolation technology.
 
 use crate::sandboxes::*;
-use hive_backend::firecracker::FirecrackerBackend;
 use hive_backend::{CellBackend, CellHandle, CellSpec};
 use hive_core::{CellId, ExecRequest as GuestExecRequest, ResourceSpec};
 use parking_lot::RwLock as PLRwLock;
@@ -54,12 +60,12 @@ pub struct PlatformSandboxProvider {
     /// Live kill-channels for detached execs, keyed by command id, so
     /// `kill_command` can stop draining even if the guest-side kill races.
     killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
-    backend: Option<Arc<FirecrackerBackend>>,
+    backend: Option<Arc<dyn CellBackend>>,
     region: String,
 }
 
 impl PlatformSandboxProvider {
-    pub fn new(region: String, backend: Option<Arc<FirecrackerBackend>>) -> Self {
+    pub fn new(region: String, backend: Option<Arc<dyn CellBackend>>) -> Self {
         PlatformSandboxProvider {
             sandboxes: Arc::new(PLRwLock::new(Vec::new())),
             commands: Arc::new(PLRwLock::new(Vec::new())),
@@ -171,7 +177,7 @@ impl PlatformSandboxProvider {
             return Ok(h);
         }
         let backend = self.backend.as_ref().ok_or_else(|| {
-            SandboxError::EngineUnavailable("this node has no Firecracker isolation backend (Linux + /dev/kvm required) — sandboxes are simulated here".into())
+            SandboxError::EngineUnavailable("this node has no real isolation backend (Firecracker needs Linux + /dev/kvm; Litebox needs HIVE_LITEBOX_VERIFIED=1) — sandboxes are simulated here".into())
         })?;
         let image = sandbox
             .current_snapshot_id
@@ -396,7 +402,7 @@ impl SandboxProvider for PlatformSandboxProvider {
         validate_argv(&input.cmd, &input.args)?;
         let sandbox = self.get_sandbox(project_id, id).await?;
         let backend = self.backend.as_ref().ok_or_else(|| {
-            SandboxError::EngineUnavailable("no Firecracker backend on this node".into())
+            SandboxError::EngineUnavailable("no isolation backend on this node".into())
         })?;
         let handle = self.ensure_cell(&sandbox).await?;
         let secrets = self.secret_values(&sandbox);

@@ -3,11 +3,13 @@
 //! workloads (Vercel Sandbox parity). This module owns the PURE model:
 //! records, validation, secret redaction, and the [`SandboxProvider`]
 //! abstraction. The concrete production backend
-//! ([`crate::sandboxes_platform::PlatformSandboxProvider`]) is podman-backed —
-//! this platform is a self-hosted cloud, not a Vercel customer, so "production
-//! provider" means the platform's OWN isolated-container tech (the same
-//! primitives functions/containers already use), not a call out to Vercel's
-//! commercial API. [`MockSandboxProvider`] here is strictly for tests.
+//! ([`crate::sandboxes_platform::PlatformSandboxProvider`]) runs real
+//! isolated cells via `hive_backend::CellBackend` (Firecracker microVMs, or
+//! Litebox where verified) — this platform is a self-hosted cloud, not a
+//! Vercel customer, so "production provider" means the platform's OWN
+//! microVM/sandbox tech (the same primitives serverless functions already
+//! use), not a call out to Vercel's commercial API. [`MockSandboxProvider`]
+//! here is strictly for tests.
 //!
 //! SECURITY (ZeroTrust): every record is tenant + project scoped
 //! (`SandboxRecord.tenant_id`/`project_id`); every mutation is authorized via
@@ -698,7 +700,7 @@ pub trait SandboxProvider: Send + Sync {
 
 /// In-memory provider used ONLY by unit/integration tests exercising the
 /// service layer (authz, quotas, validation) without spinning up real
-/// containers. `ProductionProvider ≡ PlatformSandboxProvider` — this type must
+/// microVMs. `ProductionProvider ≡ PlatformSandboxProvider` — this type must
 /// never be constructed outside `#[cfg(test)]`.
 #[cfg(test)]
 pub struct MockSandboxProvider {

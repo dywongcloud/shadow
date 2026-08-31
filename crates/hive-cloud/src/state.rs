@@ -585,6 +585,7 @@ impl CloudState {
         fluid: Arc<Fluid>,
         hive: Arc<Hive>,
         firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
+        sandbox_backend: Option<Arc<dyn hive_backend::CellBackend>>,
     ) -> Arc<CloudState> {
         let configured_trusted_peer_ids = configured_endpoint_ids("HIVE_TRUSTED_NODE_IDS")
             .unwrap_or_else(|error| panic!("invalid mesh trust configuration: {error}"));
@@ -783,7 +784,7 @@ impl CloudState {
             enterprise: Arc::new(crate::enterprise::EnterpriseStore::new()),
             sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(
                 region_for_sandboxes,
-                firecracker.clone(),
+                sandbox_backend,
             )),
             firecracker,
             owner_email,
