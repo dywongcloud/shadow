@@ -1,75 +1,76 @@
-//! Marketplace control-plane integration.
+//! Marketplace L0 capacity allocation boundary.
 //!
-//! Marketplace settlement is deliberately not a mesh capability: this module
-//! accepts only authenticated service calls, verifies a configured settlement
-//! authority, and then hands a normal deployment to `git`/`schedule`.  Nodes
-//! never receive Marketplace credentials or a browser-provided placement choice.
+//! This is deliberately a narrow server-to-server API. Marketplace never gets
+//! topology or credentials and DevHub never constructs or relays a buyer's
+//! transaction. Settlement is accepted only after DevHub verifies its receipt.
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 use uuid::Uuid;
 
 use crate::{schedule, state::CloudState};
 
 type HmacSha256 = Hmac<Sha256>;
 
+const BASE_CHAIN_ID: u64 = 8453;
+const THEO_TOKEN: &str = "0xebe516a20238f79dc20b07ead6768e08891ed309";
+const FEE_BPS: u16 = 500;
+const CONFIRMATIONS: u64 = 2;
 const ADVERTISEMENT_TTL_MS: u64 = 60_000;
 const INTENT_TTL_MS: u64 = 15 * 60_000;
-const MARKETPLACE_CLOCK_SKEW_MS: u64 = 5 * 60_000;
-const MARKETPLACE_NONCE_TTL_MS: u64 = 10 * 60_000;
+const CLOCK_SKEW_MS: u64 = 5 * 60_000;
+const NONCE_TTL_MS: u64 = 10 * 60_000;
+const SETTLEMENT_SIGNATURE: &str =
+    "Settlement(bytes32,address,address,uint256,address,uint256,address,uint256,uint256)";
 
 #[derive(Serialize)]
 struct ApiError {
     error: &'static str,
 }
 
-#[derive(Debug)]
-struct MarketplaceError(StatusCode, &'static str);
-
+struct MarketplaceError(axum::http::StatusCode, &'static str);
 impl IntoResponse for MarketplaceError {
     fn into_response(self) -> Response {
         (self.0, Json(ApiError { error: self.1 })).into_response()
     }
 }
-
 type ApiResult<T> = Result<Json<T>, MarketplaceError>;
 
-/// Replicated replay and idempotency facts.  These contain no credentials,
-/// topology, or buyer transaction data beyond the immutable service records.
+fn error(status: axum::http::StatusCode, value: &'static str) -> MarketplaceError {
+    MarketplaceError(status, value)
+}
+
+/// Replicated, durable facts required for round-robin API requests.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct MarketplaceSecuritySnapshot {
     #[serde(default)]
     nonces: BTreeMap<String, u64>,
+    #[serde(default)]
+    deployments: BTreeMap<String, ListedDeployment>,
     #[serde(default)]
     payment_intents: BTreeMap<String, PaymentIntent>,
     #[serde(default)]
     payment_idempotency: BTreeMap<String, String>,
     #[serde(default)]
     allocation_idempotency: BTreeMap<String, String>,
-    #[serde(default)]
-    advertisements: BTreeMap<String, InternalAdvertisement>,
 }
 
 #[derive(Default)]
 pub struct MarketplaceSecurityStore(RwLock<MarketplaceSecuritySnapshot>);
-
 impl MarketplaceSecurityStore {
     pub fn snapshot(&self) -> MarketplaceSecuritySnapshot {
         self.0.read().clone()
@@ -77,94 +78,115 @@ impl MarketplaceSecurityStore {
     pub fn load(&self, snapshot: MarketplaceSecuritySnapshot) {
         *self.0.write() = snapshot;
     }
-    fn consume_nonce(&self, nonce: String, expires_at_ms: u64, now: u64) -> bool {
-        let mut value = self.0.write();
-        value.nonces.retain(|_, expiry| *expiry > now);
-        if value.nonces.contains_key(&nonce) {
+    fn consume_nonce(&self, key: String, now: u64) -> bool {
+        let mut state = self.0.write();
+        state.nonces.retain(|_, expires| *expires > now);
+        if state.nonces.contains_key(&key) {
             return false;
         }
-        value.nonces.insert(nonce, expires_at_ms);
+        state.nonces.insert(key, now + NONCE_TTL_MS);
         true
     }
-    fn put_advertisement(&self, advertisement: InternalAdvertisement) {
-        let mut value = self.0.write();
-        value
-            .advertisements
-            .retain(|_, item| item.expires_at_ms > hive_core::now_ms());
-        value
-            .advertisements
-            .insert(advertisement.id.clone(), advertisement);
+    fn replace_deployments(&self, listed: Vec<ListedDeployment>) {
+        let mut state = self.0.write();
+        state.deployments.retain(|_, entry| entry.expires_at_ms > hive_core::now_ms());
+        for entry in listed {
+            state.deployments.insert(entry.deployment_id.clone(), entry);
+        }
     }
-    fn advertisement(&self, id: &str) -> Option<InternalAdvertisement> {
-        self.0.read().advertisements.get(id).cloned()
+    fn deployment(&self, id: &str) -> Option<ListedDeployment> {
+        self.0.read().deployments.get(id).cloned()
     }
     fn intent_for_key(&self, key: &str) -> Option<PaymentIntent> {
-        let value = self.0.read();
-        value
+        let state = self.0.read();
+        state
             .payment_idempotency
             .get(key)
-            .and_then(|id| value.payment_intents.get(id))
+            .and_then(|id| state.payment_intents.get(id))
             .cloned()
     }
-    fn put_intent_if_absent(&self, key: String, intent: PaymentIntent) -> PaymentIntent {
-        let mut value = self.0.write();
-        if let Some(existing_id) = value.payment_idempotency.get(&key) {
-            if let Some(existing) = value.payment_intents.get(existing_id) {
-                return existing.clone();
+    fn put_intent(&self, key: String, intent: PaymentIntent) -> PaymentIntent {
+        let mut state = self.0.write();
+        if let Some(id) = state.payment_idempotency.get(&key) {
+            if let Some(old) = state.payment_intents.get(id) {
+                return old.clone();
             }
         }
-        value.payment_idempotency.insert(key, intent.id.clone());
-        value
+        state.payment_idempotency.insert(key, intent.payment_intent_id.clone());
+        state
             .payment_intents
-            .insert(intent.id.clone(), intent.clone());
+            .insert(intent.payment_intent_id.clone(), intent.clone());
         intent
     }
     fn intent(&self, id: &str) -> Option<PaymentIntent> {
         self.0.read().payment_intents.get(id).cloned()
     }
     fn update_intent(&self, intent: PaymentIntent) {
-        self.0
-            .write()
-            .payment_intents
-            .insert(intent.id.clone(), intent);
+        self.0.write().payment_intents.insert(intent.payment_intent_id.clone(), intent);
     }
-    fn bind_allocation_key(&self, key: String, order_id: String) {
-        self.0.write().allocation_idempotency.insert(key, order_id);
-    }
-    fn allocation_key(&self, key: &str) -> Option<String> {
+    fn allocation_for_key(&self, key: &str) -> Option<String> {
         self.0.read().allocation_idempotency.get(key).cloned()
     }
+    fn bind_allocation_key(&self, key: String, id: String) {
+        self.0.write().allocation_idempotency.insert(key, id);
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct InternalAdvertisement {
-    id: String,
-    expires_at_ms: u64,
-    node_ids: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct FeeSplit {
-    gross_amount_atomic: String,
+struct ListedDeployment {
+    deployment_id: String,
+    provider_id: String,
+    canonical_node_id: String,
     provider_recipient: String,
-    provider_amount_atomic: String,
+    region: String,
+    runtime: String,
+    capabilities: Capabilities,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Capabilities {
+    vcpu: u32,
+    ram_mib: u64,
+    gpu: Gpu,
+    storage_gib: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Gpu {
+    model: Option<String>,
+    count: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SettlementConfig {
+    currency: String,
+    chain_id: u64,
+    token_contract: String,
+    token_decimals: u8,
     fee_recipient: String,
-    fee_amount_atomic: String,
     fee_bps: u16,
+    settlement_contract: String,
+    settlement_event_signature: String,
+    confirmation_policy: ConfirmationPolicy,
+    configuration_reference: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct ConfirmationPolicy {
+    minimum_confirmations: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PaymentIntent {
-    id: String,
-    order_reference: String,
-    allocation: AllocationRequest,
-    amount_atomic: String,
+    payment_intent_id: String,
     expires_at_ms: u64,
+    order_reference: String,
+    gross_amount_atomic: String,
+    buyer_address: String,
+    deployment: ListedDeployment,
+    provider_amount_atomic: String,
+    fee_amount_atomic: String,
     settlement: SettlementConfig,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fee_split: Option<FeeSplit>,
     verification_status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     transaction_hash: Option<String>,
 }
 
@@ -199,200 +221,148 @@ pub struct Allocation {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
-
 #[derive(Default)]
 pub struct AllocationStore(RwLock<BTreeMap<String, Allocation>>);
-
 impl AllocationStore {
     pub fn snapshot(&self) -> Vec<Allocation> {
         self.0.read().values().cloned().collect()
     }
     pub fn load(&self, rows: Vec<Allocation>) {
-        let mut values = self.0.write();
-        values.clear();
-        values.extend(
-            rows.into_iter()
-                .map(|row| (row.marketplace_order_id.clone(), row)),
-        );
+        let mut state = self.0.write();
+        state.clear();
+        state.extend(rows.into_iter().map(|row| (row.marketplace_order_id.clone(), row)));
     }
     fn get(&self, id: &str) -> Option<Allocation> {
         self.0.read().get(id).cloned()
     }
-    fn put_if_absent(&self, row: Allocation) -> Result<Allocation, Allocation> {
-        let mut values = self.0.write();
-        if let Some(old) = values.get(&row.marketplace_order_id) {
+    fn put_if_absent(&self, allocation: Allocation) -> Result<Allocation, Allocation> {
+        let mut state = self.0.write();
+        if let Some(old) = state.get(&allocation.marketplace_order_id) {
             return Err(old.clone());
         }
-        values.insert(row.marketplace_order_id.clone(), row.clone());
-        Ok(row)
+        state.insert(allocation.marketplace_order_id.clone(), allocation.clone());
+        Ok(allocation)
     }
-    fn update(&self, row: Allocation) {
-        self.0.write().insert(row.marketplace_order_id.clone(), row);
+    fn update(&self, allocation: Allocation) {
+        self.0.write().insert(allocation.marketplace_order_id.clone(), allocation);
     }
-    /// Atomically claim an accepted allocation for one routing attempt.
-    fn begin_route(&self, id: &str, now: u64) -> Result<Allocation, Allocation> {
-        let mut values = self.0.write();
-        let row = values
-            .get_mut(id)
-            .expect("caller checked allocation exists");
-        if row.routed_build_id.is_some() || row.status == "routing" || row.status == "fulfilled" {
-            return Err(row.clone());
-        }
-        row.status = "routing".into();
-        row.updated_at_ms = now;
-        Ok(row.clone())
-    }
-}
-
-#[derive(Serialize)]
-struct AdvertisementResponse {
-    advertisement_id: String,
-    issued_at_ms: u64,
-    expires_at_ms: u64,
-    attestation: String,
-    settlement: SettlementConfig,
-    nodes: Vec<Value>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SettlementConfig {
-    chain_id: String,
-    token_contract: String,
-    token_decimals: u8,
-    confirmation_policy: u64,
-    configuration_reference: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct AllocationRequest {
-    marketplace_order_id: String,
-    tenant_id: String,
-    resources: ResourceRequirements,
-    #[serde(default)]
-    approved_node_ids: Vec<String>,
-    theo_amount: String,
-    expires_at_ms: u64,
-    contract_reference: String,
-    advertisement_id: String,
-    #[serde(default)]
-    advertisement_attestation: String,
 }
 
 #[derive(Deserialize)]
 struct PaymentIntentRequest {
-    allocation: AllocationRequest,
-    idempotency_key: String,
+    deployment_id: String,
+    provider_id: String,
+    canonical_node_id: String,
+    order_reference: String,
     gross_amount_atomic: String,
+    buyer_address: String,
 }
-
 #[derive(Deserialize)]
 struct PaymentVerificationRequest {
     payment_intent_id: String,
     transaction_hash: String,
 }
-
 #[derive(Deserialize)]
-struct MarketplaceAllocationRequest {
+struct AllocationRequest {
     payment_intent_id: String,
-    allocation: AllocationRequest,
-    idempotency_key: String,
-    deployment: fluid_core::GitDeployRequest,
-}
-
-#[derive(Deserialize)]
-struct RouteRequest {
-    // The deployment payload is ordinary DevHub build input, but placement and
-    // orchestration fields below are always overwritten by the backend.
+    tenant_id: String,
+    resources: ResourceRequirements,
     deployment: fluid_core::GitDeployRequest,
 }
 
 pub fn routes() -> Router<Arc<CloudState>> {
     Router::new()
-        .route("/v1/marketplace/l0/advertisements", get(advertise_capacity))
-        .route(
-            "/v1/marketplace/settlement-config",
-            get(get_settlement_config),
-        )
-        .route(
-            "/v1/marketplace/payment-intents",
-            post(create_payment_intent),
-        )
+        .route("/v1/marketplace/l0/deployments", get(list_deployments))
+        .route("/v1/marketplace/settlement-config", get(get_settlement_config))
+        .route("/v1/marketplace/payment-intents", post(create_payment_intent))
         .route("/v1/marketplace/payments/verify", post(verify_payment))
         .route("/v1/marketplace/l0/allocations", post(submit_allocation))
 }
 
-/// DevHub operator visibility is intentionally a separate route from the
-/// Marketplace service API: an operator never needs the Marketplace credential
-/// merely to inspect what the control plane has accepted.
+/// Operator-only visibility intentionally remains separate from the
+/// Marketplace service API and exposes no Marketplace credentials.
 pub async fn operator_view(
     State(cloud): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     crate::admin::require_operator(claims.as_ref().map(|claim| &claim.0))?;
-    let eligible: Vec<Value> = cloud
-        .registry
-        .nodes()
-        .iter()
-        .filter(|node| eligible_node(&cloud, node))
-        .map(|node| {
-            json!({
-                "node_id": node.id,
-                "region": node.region,
-                "backend": node.backend,
-                "cpu_cores": node.cpu_cores,
-                "memory_mb": node.mem_total_mb,
-                "disk_free_gb": node.disk_free_gb,
-                "gpu_count": node.gpu_count,
-                "wasmer": node.wasm_runtime == Some(true),
-                "bun": node.bun_runtime == Some(true)
-            })
-        })
-        .collect();
     Ok(Json(json!({
-        "eligible_nodes": eligible,
+        "eligible_deployments": listed_deployments(&cloud).into_iter().map(|entry| json!({
+            "deployment_id": entry.deployment_id,
+            "provider_id": entry.provider_id,
+            "canonical_node_id": entry.canonical_node_id,
+            "region": entry.region
+        })).collect::<Vec<_>>(),
         "allocations": cloud.marketplace_allocations.snapshot()
     })))
 }
 
-fn marketplace_key() -> Result<Vec<u8>, (StatusCode, String)> {
-    std::env::var("HIVE_MARKETPLACE_API_KEY")
+fn required_env(name: &str) -> Result<String, MarketplaceError> {
+    std::env::var(name)
         .ok()
-        .filter(|value| !value.is_empty())
-        .map(|value| value.into_bytes())
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Marketplace integration is not configured".into(),
-        ))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "marketplace_unavailable"))
 }
 
-fn require_marketplace(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    let secret = marketplace_key()?;
-    let supplied = headers
-        .get("x-marketplace-key")
-        .and_then(|value| value.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "missing Marketplace authentication".into(),
-        ))?;
-    let mut expected =
-        HmacSha256::new_from_slice(&secret).expect("HMAC accepts arbitrary key length");
-    expected.update(b"hive-marketplace-v1");
-    expected
-        .verify_slice(&hex::decode(supplied).unwrap_or_default())
-        .map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                "invalid Marketplace authentication".into(),
-            )
+fn normalized_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[2..].bytes().any(|byte| byte != b'0'))
+    .then(|| value.to_ascii_lowercase())
+}
+
+fn settlement_config() -> Result<SettlementConfig, MarketplaceError> {
+    // A mainnet address is not a test switch. This explicit operator gate keeps
+    // the endpoint unavailable until the named deployment has been audited and
+    // approved for this exact configuration version.
+    if std::env::var("HIVE_MARKETPLACE_ATOMIC_SPLIT_AUDITED").ok().as_deref() != Some("1") {
+        return Err(error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"));
+    }
+    let settlement_contract = normalized_address(&required_env("HIVE_MARKETPLACE_ATOMIC_SPLIT_CONTRACT")?)
+        .ok_or_else(|| error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"))?;
+    let fee_recipient = normalized_address(&required_env("HIVE_MARKETPLACE_FEE_RECIPIENT")?)
+        .ok_or_else(|| error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"))?;
+    let reference = required_env("HIVE_MARKETPLACE_SETTLEMENT_CONFIGURATION_REFERENCE")?;
+    if reference != "base-theo-atomic-split-v1" {
+        return Err(error(axum::http::StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"));
+    }
+    Ok(SettlementConfig {
+        currency: "THEO".into(),
+        chain_id: BASE_CHAIN_ID,
+        token_contract: THEO_TOKEN.into(),
+        token_decimals: 18,
+        fee_recipient,
+        fee_bps: FEE_BPS,
+        settlement_contract,
+        settlement_event_signature: SETTLEMENT_SIGNATURE.into(),
+        confirmation_policy: ConfirmationPolicy { minimum_confirmations: CONFIRMATIONS },
+        configuration_reference: reference,
+    })
+}
+
+fn provider_registry() -> BTreeMap<String, String> {
+    // This is operator-owned registry data, never Marketplace input. Every
+    // advertised provider must have a verified recipient entry.
+    let configured = std::env::var("HIVE_MARKETPLACE_PROVIDER_RECIPIENTS").unwrap_or_default();
+    configured
+        .split(',')
+        .filter_map(|entry| {
+            let (provider, recipient) = entry.split_once('=')?;
+            normalized_address(recipient).map(|recipient| (provider.trim().to_owned(), recipient))
         })
+        .collect()
 }
 
-fn api_error(status: StatusCode, error: &'static str) -> MarketplaceError {
-    MarketplaceError(status, error)
+fn hmac_secret(key_id: &str) -> Option<String> {
+    std::env::var("HIVE_MARKETPLACE_HMAC_KEYS")
+        .ok()?
+        .split(',')
+        .filter_map(|entry| entry.split_once(':'))
+        .find_map(|(id, secret)| (id == key_id && !secret.is_empty()).then(|| secret.to_owned()))
 }
 
-/// Authenticate the complete request before parsing it.  The nonce is kept in
-/// replicated durable state because reads may land on a different API node.
 fn verify_marketplace_request(
     cloud: &Arc<CloudState>,
     method: &str,
@@ -400,240 +370,156 @@ fn verify_marketplace_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(), MarketplaceError> {
-    let secret = std::env::var("HIVE_MARKETPLACE_HMAC_SECRET")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "marketplace_unavailable"))?;
     let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    let key_id = header("x-marketplace-key-id")
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+    let secret = hmac_secret(key_id)
+        .ok_or_else(|| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_key"))?;
     let timestamp = header("x-marketplace-timestamp")
         .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+        .ok_or_else(|| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
     let nonce = header("x-marketplace-nonce")
         .filter(|value| !value.is_empty() && value.len() <= 128)
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+        .ok_or_else(|| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+    let digest = hex::encode(Sha256::digest(body));
+    if header("x-marketplace-content-sha256")
+        .map(|value| value.eq_ignore_ascii_case(&digest))
+        != Some(true)
+    {
+        return Err(error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_digest"));
+    }
     let signature = header("x-marketplace-signature")
         .and_then(|value| hex::decode(value).ok())
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+        .ok_or_else(|| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
     let now = hive_core::now_ms();
-    if now.abs_diff(timestamp) > MARKETPLACE_CLOCK_SKEW_MS {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "marketplace_request_expired",
-        ));
+    if now.abs_diff(timestamp) > CLOCK_SKEW_MS {
+        return Err(error(axum::http::StatusCode::UNAUTHORIZED, "marketplace_request_expired"));
     }
-    let digest = hex::encode(Sha256::digest(body));
-    let canonical = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        method.to_ascii_uppercase(),
-        path,
-        timestamp,
-        nonce,
-        digest
-    );
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts arbitrary key length");
+    let canonical = format!("{}\n{}\n{}\n{}\n{}", method, path, timestamp, nonce, digest);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC supports all key sizes");
     mac.update(canonical.as_bytes());
     mac.verify_slice(&signature)
-        .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
-    if !cloud.marketplace_security.consume_nonce(
-        nonce.to_string(),
-        now + MARKETPLACE_NONCE_TTL_MS,
-        now,
-    ) {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "marketplace_nonce_replayed",
-        ));
+        .map_err(|_| error(axum::http::StatusCode::UNAUTHORIZED, "invalid_marketplace_signature"))?;
+    if !cloud.marketplace_security.consume_nonce(format!("{key_id}:{nonce}"), now) {
+        return Err(error(axum::http::StatusCode::CONFLICT, "marketplace_nonce_replayed"));
     }
     crate::persist::persist(cloud);
     Ok(())
 }
 
-fn settlement_config() -> Result<SettlementConfig, (StatusCode, String)> {
-    let required = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("{name} is not configured"),
-            ))
-    };
-    Ok(SettlementConfig {
-        // Reuse the existing THEO settlement settings; Marketplace must not
-        // become a second source for contract, treasury, decimals, or chain.
-        chain_id: required("THEO_CHAIN_ID")?,
-        token_contract: required("THEO_TOKEN_ADDRESS")?,
-        token_decimals: required("THEO_TOKEN_DECIMALS")?.parse().map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "THEO_TOKEN_DECIMALS is invalid".into(),
-            )
-        })?,
-        confirmation_policy: required("THEO_REQUIRED_CONFIRMATIONS")?
-            .parse()
-            .map_err(|_| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "THEO_REQUIRED_CONFIRMATIONS is invalid".into(),
-                )
-            })?,
-        configuration_reference: std::env::var(
-            "HIVE_MARKETPLACE_SETTLEMENT_CONFIGURATION_REFERENCE",
-        )
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "theo-v1".into()),
-    })
+fn idempotency_key(headers: &HeaderMap) -> Result<String, MarketplaceError> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| error(axum::http::StatusCode::BAD_REQUEST, "missing_idempotency_key"))
 }
 
-fn fee_split(gross_amount_atomic: &str) -> Option<FeeSplit> {
-    let fee_bps = std::env::var("HIVE_MARKETPLACE_FEE_BPS")
-        .ok()?
-        .parse::<u16>()
-        .ok()?;
-    let provider_recipient = std::env::var("HIVE_MARKETPLACE_PROVIDER_RECIPIENT").ok()?;
-    let fee_recipient = std::env::var("HIVE_MARKETPLACE_FEE_RECIPIENT").ok()?;
-    // Fee splitting needs the separately deployed contract that enforces and
-    // emits both recipient legs. Configuration alone cannot make a plain
-    // ERC-20 transfer safe to settle.
-    std::env::var("HIVE_MARKETPLACE_FEE_SPLIT_CONTRACT").ok()?;
-    if fee_bps > 10_000 || provider_recipient.is_empty() || fee_recipient.is_empty() {
-        return None;
-    }
-    let gross = gross_amount_atomic.parse::<u128>().ok()?;
-    let fee = gross.checked_mul(fee_bps as u128)?.checked_div(10_000)?;
-    Some(FeeSplit {
-        gross_amount_atomic: gross.to_string(),
-        provider_recipient,
-        provider_amount_atomic: gross.checked_sub(fee)?.to_string(),
-        fee_recipient,
-        fee_amount_atomic: fee.to_string(),
-        fee_bps,
-    })
+fn listed_deployments(cloud: &CloudState) -> Vec<ListedDeployment> {
+    let recipients = provider_registry();
+    let expires_at_ms = hive_core::now_ms() + ADVERTISEMENT_TTL_MS;
+    cloud.registry.nodes().into_iter().filter_map(|node| {
+        let provider_id = node.provider.clone()?.trim().to_owned();
+        let provider_recipient = recipients.get(&provider_id)?.clone();
+        eligible_node(cloud, &node).then(|| ListedDeployment {
+            deployment_id: format!("dep_{}", &hex::encode(Sha256::digest(format!("{provider_id}:{}", node.id)))[..24]),
+            provider_id,
+            canonical_node_id: node.id,
+            provider_recipient,
+            region: node.region,
+            runtime: node.backend,
+            capabilities: Capabilities {
+                vcpu: node.cpu_cores,
+                ram_mib: node.mem_total_mb,
+                gpu: Gpu { model: node.gpu_model, count: node.gpu_count },
+                storage_gib: node.disk_total_gb,
+            },
+            expires_at_ms,
+        })
+    }).collect()
+}
+
+async fn list_deployments(
+    State(cloud): State<Arc<CloudState>>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    verify_marketplace_request(&cloud, "GET", "/v1/marketplace/l0/deployments", &headers, &[])?;
+    let now = hive_core::now_ms();
+    let listed = listed_deployments(&cloud);
+    cloud.marketplace_security.replace_deployments(listed.clone());
+    crate::persist::persist(&cloud);
+    Ok(Json(json!({"data": listed.into_iter().map(|entry| json!({
+        "deployment_id": entry.deployment_id, "provider_id": entry.provider_id,
+        "canonical_node_id": entry.canonical_node_id, "provider_recipient": entry.provider_recipient,
+        "region": entry.region, "runtime": entry.runtime, "capabilities": entry.capabilities,
+        "availability": {"available": true, "capacity_units": 1}, "health": "healthy",
+        "issued_at": iso_timestamp(now),
+        "expires_at": iso_timestamp(entry.expires_at_ms),
+        "revoked_at": Value::Null, "configuration_reference": "l0-config-v1"
+    })).collect::<Vec<_>>() })))
 }
 
 async fn get_settlement_config(
     State(cloud): State<Arc<CloudState>>,
     headers: HeaderMap,
 ) -> ApiResult<Value> {
-    verify_marketplace_request(
-        &cloud,
-        "GET",
-        "/v1/marketplace/settlement-config",
-        &headers,
-        &[],
-    )?;
-    let config = settlement_config()
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"))?;
-    Ok(Json(json!({
-        "chain_id": config.chain_id,
-        "token_contract": config.token_contract,
-        "token_decimals": config.token_decimals,
-        "confirmation_policy": config.confirmation_policy,
-        "configuration_reference": config.configuration_reference,
-    })))
-}
-
-async fn advertise_capacity(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-) -> ApiResult<Value> {
-    verify_marketplace_request(
-        &cloud,
-        "GET",
-        "/v1/marketplace/l0/advertisements",
-        &headers,
-        &[],
-    )?;
-    let now = hive_core::now_ms();
-    let eligible: Vec<_> = cloud
-        .registry
-        .nodes()
-        .into_iter()
-        .filter(|node| eligible_node(&cloud, node))
-        .collect();
-    let internal = InternalAdvertisement {
-        id: format!("adv_{}", Uuid::new_v4()),
-        expires_at_ms: now + ADVERTISEMENT_TTL_MS,
-        node_ids: eligible.iter().map(|node| node.id.clone()).collect(),
-    };
-    cloud
-        .marketplace_security
-        .put_advertisement(internal.clone());
-    crate::persist::persist(&cloud);
-    // The public service contract intentionally aggregates capacity. Node
-    // identities, addresses, relays, and connection state never leave DevHub.
-    Ok(Json(json!({
-        "advertisement_id": internal.id,
-        "issued_at": now,
-        "expires_at": internal.expires_at_ms,
-        "capacity": {
-            "available_units": internal.node_ids.len(),
-            "gpu_units": eligible.iter().filter(|node| node.gpu_count > 0).count(),
-        }
-    })))
+    verify_marketplace_request(&cloud, "GET", "/v1/marketplace/settlement-config", &headers, &[])?;
+    Ok(Json(json!({"settlement": settlement_config()?})))
 }
 
 async fn create_payment_intent(
     State(cloud): State<Arc<CloudState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<PaymentIntent> {
-    verify_marketplace_request(
-        &cloud,
-        "POST",
-        "/v1/marketplace/payment-intents",
-        &headers,
-        &body,
-    )?;
+) -> ApiResult<Value> {
+    verify_marketplace_request(&cloud, "POST", "/v1/marketplace/payment-intents", &headers, &body)?;
+    let key = idempotency_key(&headers)?;
+    if let Some(intent) = cloud.marketplace_security.intent_for_key(&key) {
+        return Ok(Json(payment_intent_response(&intent)));
+    }
     let request: PaymentIntentRequest = serde_json::from_slice(&body)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_idempotency_key",
-        ));
+        .map_err(|_| error(axum::http::StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let deployment = cloud.marketplace_security.deployment(&request.deployment_id)
+        .filter(|entry| entry.expires_at_ms > hive_core::now_ms())
+        .filter(|entry| entry.provider_id == request.provider_id && entry.canonical_node_id == request.canonical_node_id)
+        .ok_or_else(|| error(axum::http::StatusCode::CONFLICT, "deployment_unavailable"))?;
+    let buyer_address = normalized_address(&request.buyer_address)
+        .ok_or_else(|| error(axum::http::StatusCode::BAD_REQUEST, "invalid_buyer_address"))?;
+    if !valid_order_reference(&request.order_reference) {
+        return Err(error(axum::http::StatusCode::BAD_REQUEST, "invalid_order_reference"));
     }
-    if let Some(intent) = cloud
-        .marketplace_security
-        .intent_for_key(&request.idempotency_key)
-    {
-        return Ok(Json(intent));
-    }
-    let advertisement = cloud
-        .marketplace_security
-        .advertisement(&request.allocation.advertisement_id)
-        .filter(|advertisement| advertisement.expires_at_ms > hive_core::now_ms())
-        .ok_or_else(|| api_error(StatusCode::CONFLICT, "advertisement_unavailable"))?;
-    if request.allocation.marketplace_order_id.trim().is_empty()
-        || request.allocation.tenant_id.trim().is_empty()
-        || request.allocation.expires_at_ms <= hive_core::now_ms()
-        || request.allocation.expires_at_ms > advertisement.expires_at_ms
-        || !request.allocation.approved_node_ids.is_empty()
-    {
-        return Err(api_error(StatusCode::BAD_REQUEST, "invalid_allocation"));
-    }
-    let settlement = settlement_config()
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"))?;
-    let split = fee_split(&request.gross_amount_atomic)
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "settlement_unavailable"))?;
+    let gross = canonical_atomic(&request.gross_amount_atomic)
+        .ok_or_else(|| error(axum::http::StatusCode::BAD_REQUEST, "invalid_amount"))?;
+    // 500 / 10_000 is exactly 1 / 20. Decimal long division keeps the full
+    // EVM uint256 range instead of narrowing an atomic amount to u128.
+    let fee = decimal_divide_small(&gross, 20);
+    let provider_amount = decimal_subtract(&gross, &fee)
+        .expect("fee is floor(gross / 20) and can never exceed gross");
     let intent = PaymentIntent {
-        id: format!("pi_{}", Uuid::new_v4().simple()),
-        order_reference: request.allocation.marketplace_order_id.clone(),
-        allocation: request.allocation,
-        amount_atomic: split.gross_amount_atomic.clone(),
+        payment_intent_id: format!("pi_{}", Uuid::new_v4().simple()),
         expires_at_ms: hive_core::now_ms() + INTENT_TTL_MS,
-        settlement,
-        fee_split: Some(split),
+        order_reference: request.order_reference.to_ascii_lowercase(),
+        gross_amount_atomic: gross,
+        buyer_address,
+        deployment,
+        provider_amount_atomic: provider_amount,
+        fee_amount_atomic: fee,
+        settlement: settlement_config()?,
         verification_status: "pending".into(),
         transaction_hash: None,
     };
-    let intent = cloud
-        .marketplace_security
-        .put_intent_if_absent(request.idempotency_key, intent);
+    let intent = cloud.marketplace_security.put_intent(key, intent);
     crate::persist::persist(&cloud);
-    Ok(Json(intent))
+    Ok(Json(payment_intent_response(&intent)))
+}
+
+fn payment_intent_response(intent: &PaymentIntent) -> Value {
+    json!({"payment_intent_id": intent.payment_intent_id,
+        "expires_at": iso_timestamp(intent.expires_at_ms),
+        "amount_atomic": intent.gross_amount_atomic, "order_reference": intent.order_reference,
+        "settlement": intent.settlement})
 }
 
 async fn verify_payment(
@@ -641,123 +527,65 @@ async fn verify_payment(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Value> {
-    verify_marketplace_request(
-        &cloud,
-        "POST",
-        "/v1/marketplace/payments/verify",
-        &headers,
-        &body,
-    )?;
+    verify_marketplace_request(&cloud, "POST", "/v1/marketplace/payments/verify", &headers, &body)?;
     let request: PaymentVerificationRequest = serde_json::from_slice(&body)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let mut intent = cloud
-        .marketplace_security
-        .intent(&request.payment_intent_id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "payment_intent_not_found"))?;
-    if intent.expires_at_ms <= hive_core::now_ms() {
-        intent.verification_status = "failed".into();
-    } else if intent
-        .transaction_hash
-        .as_deref()
-        .is_some_and(|hash| hash != request.transaction_hash)
-    {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "payment_intent_already_bound",
-        ));
-    } else if !valid_transaction_hash(&request.transaction_hash) {
-        intent.verification_status = "failed".into();
-    } else {
+        .map_err(|_| error(axum::http::StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let mut intent = cloud.marketplace_security.intent(&request.payment_intent_id)
+        .ok_or_else(|| error(axum::http::StatusCode::NOT_FOUND, "payment_intent_not_found"))?;
+    if intent.transaction_hash.as_deref().is_some_and(|old| old != request.transaction_hash) {
+        return Err(error(axum::http::StatusCode::CONFLICT, "payment_intent_already_bound"));
+    }
+    if intent.verification_status != "verified" {
         intent.transaction_hash = Some(request.transaction_hash);
         intent.verification_status = verify_payment_chain(&cloud, &intent).await;
+        cloud.marketplace_security.update_intent(intent.clone());
+        crate::persist::persist(&cloud);
     }
-    cloud.marketplace_security.update_intent(intent.clone());
-    crate::persist::persist(&cloud);
-    Ok(Json(json!({
-        "payment_intent_id": intent.id,
-        "status": intent.verification_status,
-        "expires_at": intent.expires_at_ms,
-    })))
+    Ok(Json(json!({"payment_intent_id": intent.payment_intent_id, "status": intent.verification_status})))
 }
 
-fn valid_transaction_hash(hash: &str) -> bool {
-    hash.len() == 66
-        && hash.starts_with("0x")
-        && hash[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-/// This verifies chain identity, successful inclusion and confirmation count
-/// locally. `verified` is deliberately withheld until the fee-split contract
-/// provides its canonical event ABI: inspecting generic calldata cannot prove
-/// both recipient legs or the order reference.
 async fn verify_payment_chain(cloud: &CloudState, intent: &PaymentIntent) -> String {
-    let Some(rpc_url) = std::env::var("THEO_RPC_URL")
-        .ok()
-        .filter(|url| url.starts_with("https://"))
-    else {
-        return "failed".into();
-    };
-    let Some(tx_hash) = intent.transaction_hash.as_deref() else {
-        return "pending".into();
-    };
-    let rpc = |method, params| async {
-        cloud
-            .http
-            .post(&rpc_url)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await
-            .ok()?
-            .json::<Value>()
-            .await
-            .ok()?
-            .get("result")
-            .cloned()
-    };
-    let Some(chain) = rpc("eth_chainId", json!([]))
-        .await
-        .and_then(|value| value.as_str().map(str::to_owned))
-    else {
-        return "pending".into();
-    };
-    let expected = intent
-        .settlement
-        .chain_id
-        .parse::<u64>()
-        .ok()
-        .map(|id| format!("0x{id:x}"));
-    if Some(chain.to_ascii_lowercase()) != expected.map(|id| id.to_ascii_lowercase()) {
+    if intent.expires_at_ms <= hive_core::now_ms() || !valid_transaction_hash(intent.transaction_hash.as_deref().unwrap_or_default()) {
         return "failed".into();
     }
-    let Some(receipt) = rpc("eth_getTransactionReceipt", json!([tx_hash])).await else {
-        return "pending".into();
-    };
-    if receipt.is_null() {
-        return "pending".into();
+    let Ok(rpc_url) = required_env("THEO_RPC_URL") else { return "failed".into() };
+    if !rpc_url.starts_with("https://") { return "failed".into() }
+    let chain = marketplace_rpc(cloud, &rpc_url, "eth_chainId", json!([])).await.and_then(|value| hex_u64(&value));
+    if chain != Some(BASE_CHAIN_ID) { return "failed".into() }
+    let Some(receipt) = marketplace_rpc(cloud, &rpc_url, "eth_getTransactionReceipt", json!([intent.transaction_hash])).await else { return "pending".into() };
+    if receipt.is_null() { return "pending".into() }
+    if receipt.get("status").and_then(Value::as_str) != Some("0x1") { return "failed".into() }
+    let Some(block) = receipt.get("blockNumber").and_then(Value::as_str).and_then(hex_u64_str) else { return "failed".into() };
+    let Some(tip) = marketplace_rpc(cloud, &rpc_url, "eth_blockNumber", json!([])).await.and_then(|value| value.as_str().and_then(hex_u64_str)) else { return "pending".into() };
+    if tip.saturating_sub(block).saturating_add(1) < CONFIRMATIONS { return "awaiting_confirmations".into() }
+    if receipt.get("logs").and_then(Value::as_array).is_some_and(|logs| logs.iter().any(|log| valid_settlement_log(log, intent))) {
+        "verified".into()
+    } else {
+        "failed".into()
     }
-    if receipt.get("status").and_then(Value::as_str) != Some("0x1") {
-        return "failed".into();
-    }
-    let Some(block) = receipt
-        .get("blockNumber")
-        .and_then(Value::as_str)
-        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-    else {
-        return "failed".into();
-    };
-    let Some(tip) = rpc("eth_blockNumber", json!([])).await.and_then(|value| {
-        value
-            .as_str()
-            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-    }) else {
-        return "pending".into();
-    };
-    if tip.saturating_sub(block).saturating_add(1) < intent.settlement.confirmation_policy {
-        return "awaiting_confirmations".into();
-    }
-    // Never manufacture a verified result without the contract's event
-    // semantics. The contract integration supplies this verifier in a follow-up.
-    "failed".into()
+}
+async fn marketplace_rpc(cloud: &CloudState, url: &str, method: &str, params: Value) -> Option<Value> {
+    cloud.http.post(url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        .send().await.ok()?.json::<Value>().await.ok()?.get("result").cloned()
+}
+
+fn valid_settlement_log(log: &Value, intent: &PaymentIntent) -> bool {
+    if log.get("address").and_then(Value::as_str).and_then(normalized_address).as_deref()
+        != Some(intent.settlement.settlement_contract.as_str()) { return false }
+    let expected_topic = format!("0x{}", hex::encode(Keccak256::digest(SETTLEMENT_SIGNATURE.as_bytes())));
+    if log.get("topics").and_then(Value::as_array).and_then(|topics| topics.first())
+        .and_then(Value::as_str).is_none_or(|topic| !topic.eq_ignore_ascii_case(&expected_topic)) { return false }
+    let Some(bytes) = log.get("data").and_then(Value::as_str).and_then(decode_hex) else { return false };
+    if bytes.len() != 32 * 9 { return false }
+    word(&bytes, 0).as_deref() == Some(intent.order_reference.as_str())
+        && address_word(&bytes, 1).as_deref() == Some(intent.buyer_address.as_str())
+        && address_word(&bytes, 2).as_deref() == Some(THEO_TOKEN)
+        && uint_word(&bytes, 3).as_deref() == Some(intent.gross_amount_atomic.as_str())
+        && address_word(&bytes, 4).as_deref() == Some(intent.deployment.provider_recipient.as_str())
+        && uint_word(&bytes, 5).as_deref() == Some(intent.provider_amount_atomic.as_str())
+        && address_word(&bytes, 6).as_deref() == Some(intent.settlement.fee_recipient.as_str())
+        && uint_word(&bytes, 7).as_deref() == Some(intent.fee_amount_atomic.as_str())
+        && uint_word(&bytes, 8).as_deref() == Some(FEE_BPS.to_string().as_str())
 }
 
 async fn submit_allocation(
@@ -765,618 +593,159 @@ async fn submit_allocation(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Value> {
-    verify_marketplace_request(
-        &cloud,
-        "POST",
-        "/v1/marketplace/l0/allocations",
-        &headers,
-        &body,
-    )?;
-    let request: MarketplaceAllocationRequest = serde_json::from_slice(&body)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_idempotency_key",
-        ));
+    verify_marketplace_request(&cloud, "POST", "/v1/marketplace/l0/allocations", &headers, &body)?;
+    let key = idempotency_key(&headers)?;
+    if let Some(id) = cloud.marketplace_security.allocation_for_key(&key) {
+        if let Some(allocation) = cloud.marketplace_allocations.get(&id) {
+            return Ok(Json(json!({"allocation_id": id, "status": allocation.status})));
+        }
+        return Err(error(axum::http::StatusCode::CONFLICT, "allocation_idempotency_conflict"));
     }
-    if let Some(order_id) = cloud
-        .marketplace_security
-        .allocation_key(&request.idempotency_key)
-    {
-        let allocation = cloud
-            .marketplace_allocations
-            .get(&order_id)
-            .ok_or_else(|| api_error(StatusCode::CONFLICT, "allocation_idempotency_conflict"))?;
-        return Ok(Json(
-            json!({"allocation_id": allocation.marketplace_order_id, "status": allocation.status}),
-        ));
-    }
-    let intent = cloud
-        .marketplace_security
-        .intent(&request.payment_intent_id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "payment_intent_not_found"))?;
+    let request: AllocationRequest = serde_json::from_slice(&body)
+        .map_err(|_| error(axum::http::StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let intent = cloud.marketplace_security.intent(&request.payment_intent_id)
+        .ok_or_else(|| error(axum::http::StatusCode::NOT_FOUND, "payment_intent_not_found"))?;
     if intent.verification_status != "verified" {
-        return Ok(Json(
-            json!({"payment_intent_id": intent.id, "status": intent.verification_status}),
-        ));
+        return Err(error(axum::http::StatusCode::CONFLICT, "settlement_not_verified"));
     }
-    if serde_json::to_vec(&intent.allocation).ok() != serde_json::to_vec(&request.allocation).ok() {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "allocation_does_not_match_payment_intent",
-        ));
-    }
-    let advertisement = cloud
-        .marketplace_security
-        .advertisement(&request.allocation.advertisement_id)
-        .filter(|advertisement| advertisement.expires_at_ms > hive_core::now_ms());
-    let Some(advertisement) = advertisement else {
-        return Ok(Json(json!({"status": "capacity_no_longer_available"})));
+    // Immediately before scheduling, derive the current listing from the
+    // authoritative registry again; no stale listing can substitute a node.
+    let current = listed_deployments(&cloud).into_iter()
+        .find(|item| item.deployment_id == intent.deployment.deployment_id
+            && item.provider_id == intent.deployment.provider_id
+            && item.canonical_node_id == intent.deployment.canonical_node_id
+            && item.provider_recipient == intent.deployment.provider_recipient);
+    let Some(current) = current else {
+        return Err(error(axum::http::StatusCode::CONFLICT, "deployment_unavailable"));
     };
-    if request.allocation.marketplace_order_id.trim().is_empty()
-        || request.allocation.tenant_id.trim().is_empty()
-        || request.allocation.expires_at_ms <= hive_core::now_ms()
-        || request.allocation.expires_at_ms > advertisement.expires_at_ms
-        || !request.allocation.approved_node_ids.is_empty()
-    {
-        return Ok(Json(json!({"status": "capacity_no_longer_available"})));
-    }
-    let approved: HashSet<String> = advertisement.node_ids.iter().cloned().collect();
-    let regions: Vec<String> = request
-        .allocation
-        .resources
-        .region
-        .iter()
-        .cloned()
-        .collect();
-    if schedule::place(
-        &cloud,
-        &regions,
-        false,
-        false,
-        request.allocation.resources.gpu,
-        schedule::InterpreterNeeds::default(),
-        false,
-        false,
-        Some(&approved),
-    )
-    .is_empty()
-    {
-        return Ok(Json(json!({"status": "capacity_no_longer_available"})));
+    let approved = std::collections::HashSet::from([current.canonical_node_id.clone()]);
+    let regions = request.resources.region.iter().cloned().collect::<Vec<_>>();
+    if schedule::place(&cloud, &regions, false, false, request.resources.gpu,
+        schedule::InterpreterNeeds::default(), false, false, Some(&approved)).is_empty() {
+        return Err(error(axum::http::StatusCode::CONFLICT, "capacity_unavailable"));
     }
     let now = hive_core::now_ms();
     let allocation = Allocation {
-        marketplace_order_id: request.allocation.marketplace_order_id.clone(),
-        tenant_id: request.allocation.tenant_id.clone(),
-        resources: request.allocation.resources.clone(),
-        approved_node_ids: advertisement.node_ids.clone(),
-        theo_amount: intent.amount_atomic.clone(),
-        expires_at_ms: request.allocation.expires_at_ms,
-        contract_reference: intent.id.clone(),
-        advertisement_id: request.allocation.advertisement_id.clone(),
-        status: "submitted".into(),
-        routed_build_id: None,
-        created_at_ms: now,
-        updated_at_ms: now,
+        marketplace_order_id: intent.order_reference.clone(), tenant_id: request.tenant_id.clone(),
+        resources: request.resources.clone(), approved_node_ids: vec![current.canonical_node_id],
+        theo_amount: intent.gross_amount_atomic.clone(), expires_at_ms: intent.expires_at_ms,
+        contract_reference: intent.payment_intent_id.clone(), advertisement_id: intent.deployment.deployment_id.clone(),
+        status: "submitted".into(), routed_build_id: None, created_at_ms: now, updated_at_ms: now,
     };
     let allocation = match cloud.marketplace_allocations.put_if_absent(allocation) {
-        Ok(value) => value,
-        Err(existing) => {
-            return Ok(Json(
-                json!({"allocation_id": existing.marketplace_order_id, "status": existing.status}),
-            ))
-        }
+        Ok(row) => row, Err(old) => return Ok(Json(json!({"allocation_id": old.marketplace_order_id, "status": old.status}))),
     };
-    cloud.marketplace_security.bind_allocation_key(
-        request.idempotency_key,
-        allocation.marketplace_order_id.clone(),
-    );
+    cloud.marketplace_security.bind_allocation_key(key, allocation.marketplace_order_id.clone());
     crate::persist::persist(&cloud);
     let mut deployment = request.deployment;
     deployment.no_fanout = false;
     deployment.fanout_secondary = false;
     deployment.project_incarnation = None;
     deployment.marketplace_placement = Some(fluid_core::MarketplacePlacementSnapshot {
-        contract_version: 1,
-        policy_version: 1,
-        marketplace_order_id: allocation.marketplace_order_id.clone(),
-        buyer_tenant_id: allocation.tenant_id.clone(),
-        retrieved_at_ms: now,
+        contract_version: 1, policy_version: 1, marketplace_order_id: allocation.marketplace_order_id.clone(),
+        buyer_tenant_id: allocation.tenant_id.clone(), retrieved_at_ms: now,
         approved_node_ids: allocation.approved_node_ids.clone(),
-        policy: json!({"source":"marketplace-payment-intent","payment_intent_id":intent.id}),
+        policy: json!({"source":"marketplace-verified-settlement","payment_intent_id": intent.payment_intent_id}),
     });
     match crate::admin::start_named_deploy(&cloud, &allocation.tenant_id, deployment, None).await {
         Ok(result) => {
-            let mut stored = allocation;
-            stored.status = "scheduled".into();
-            stored.routed_build_id = result["build_id"].as_str().map(str::to_owned);
-            stored.updated_at_ms = hive_core::now_ms();
-            cloud.marketplace_allocations.update(stored.clone());
+            let mut allocation = allocation;
+            allocation.status = "scheduled".into();
+            allocation.routed_build_id = result["build_id"].as_str().map(ToOwned::to_owned);
+            allocation.updated_at_ms = hive_core::now_ms();
+            cloud.marketplace_allocations.update(allocation.clone());
             crate::persist::persist(&cloud);
-            Ok(Json(
-                json!({"allocation_id": stored.marketplace_order_id, "status": "scheduled", "build_id": stored.routed_build_id}),
-            ))
+            Ok(Json(json!({"allocation_id": allocation.marketplace_order_id, "status": allocation.status, "build_id": allocation.routed_build_id})))
         }
         Err(_) => {
-            let mut stored = allocation;
-            stored.status = "failed".into();
-            stored.updated_at_ms = hive_core::now_ms();
-            cloud.marketplace_allocations.update(stored.clone());
+            let mut allocation = allocation;
+            allocation.status = "failed".into();
+            allocation.updated_at_ms = hive_core::now_ms();
+            cloud.marketplace_allocations.update(allocation.clone());
             crate::persist::persist(&cloud);
-            Ok(Json(
-                json!({"allocation_id": stored.marketplace_order_id, "status": "failed"}),
-            ))
+            Err(error(axum::http::StatusCode::CONFLICT, "provisioning_failed"))
         }
     }
-}
-
-fn attestation_secret() -> Result<Vec<u8>, (StatusCode, String)> {
-    std::env::var("HIVE_MARKETPLACE_ADVERTISEMENT_SECRET")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(String::into_bytes)
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "HIVE_MARKETPLACE_ADVERTISEMENT_SECRET is not configured".into(),
-        ))
-}
-
-#[derive(Serialize, Deserialize)]
-struct Attestation {
-    id: String,
-    expires_at_ms: u64,
-    node_ids: Vec<String>,
-}
-
-fn sign_attestation(value: &Attestation) -> Result<String, (StatusCode, String)> {
-    let payload = serde_json::to_vec(value).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "attestation serialization failed".into(),
-        )
-    })?;
-    let mut mac = HmacSha256::new_from_slice(&attestation_secret()?)
-        .expect("HMAC accepts arbitrary key length");
-    mac.update(&payload);
-    Ok(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(payload),
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    ))
-}
-
-fn verify_attestation(id: &str, token: &str) -> Result<Attestation, (StatusCode, String)> {
-    let (payload, tag) = token.split_once('.').ok_or((
-        StatusCode::BAD_REQUEST,
-        "malformed advertisement attestation".into(),
-    ))?;
-    let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "malformed advertisement attestation".into(),
-        )
-    })?;
-    let tag = URL_SAFE_NO_PAD.decode(tag).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "malformed advertisement attestation".into(),
-        )
-    })?;
-    let mut mac = HmacSha256::new_from_slice(&attestation_secret()?)
-        .expect("HMAC accepts arbitrary key length");
-    mac.update(&payload);
-    mac.verify_slice(&tag).map_err(|_| {
-        (
-            StatusCode::FORBIDDEN,
-            "invalid advertisement attestation".into(),
-        )
-    })?;
-    let value: Attestation = serde_json::from_slice(&payload).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "malformed advertisement attestation".into(),
-        )
-    })?;
-    if value.id != id || value.expires_at_ms <= hive_core::now_ms() {
-        return Err((
-            StatusCode::CONFLICT,
-            "advertisement is expired or does not match".into(),
-        ));
-    }
-    Ok(value)
 }
 
 fn eligible_node(cloud: &CloudState, node: &hive_edge::NodeInfo) -> bool {
-    let connected = node.name == cloud.node_name
-        || cloud.node_admins.read().contains_key(&node.name)
+    let connected = node.name == cloud.node_name || cloud.node_admins.read().contains_key(&node.name)
         || (node.peer_id.is_some() && node.iroh_addr.is_some());
-    node.healthy
-        && connected
-        && (node.backend == "firecracker"
-            || (node.backend == "litebox" && schedule::runtime_artifact_capable(node, true)))
-        && node.mem_total_mb >= 1024
-        && (node.disk_free_gb == 0 || node.disk_free_gb >= 20)
+    node.healthy && connected
+        && (node.backend == "firecracker" || (node.backend == "litebox" && schedule::runtime_artifact_capable(node, true)))
+        && node.mem_total_mb >= 1024 && (node.disk_free_gb == 0 || node.disk_free_gb >= 20)
 }
-
-async fn advertise_nodes(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-) -> Result<Json<AdvertisementResponse>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    let settlement = settlement_config()?;
-    let now = hive_core::now_ms();
-    let nodes: Vec<Value> = cloud.registry.nodes().iter().filter(|node| eligible_node(&cloud, node)).map(|node| {
-        let runtimes: Vec<&str> = [(node.wasm_runtime == Some(true)).then_some("wasmer"), (node.bun_runtime == Some(true)).then_some("bun")]
-            .into_iter().flatten().collect();
-        json!({"node_id": node.id, "region": node.region, "capabilities": {
-            "backend": node.backend, "cpu_cores": node.cpu_cores, "memory_mb": node.mem_total_mb,
-            "gpu_count": node.gpu_count, "gpu_model": node.gpu_model, "gpu_vram_mb": node.gpu_vram_mb
-        }, "available_capacity": {"disk_free_gb": node.disk_free_gb, "gpu_free_mb": node.gpu_free_mb},
-        "supported_runtimes": runtimes, "pricing": marketplace_pricing()})
-    }).collect();
-    let attested = Attestation {
-        id: format!("adv_{}", Uuid::new_v4()),
-        expires_at_ms: now + ADVERTISEMENT_TTL_MS,
-        node_ids: nodes
-            .iter()
-            .filter_map(|node| node["node_id"].as_str().map(str::to_string))
-            .collect(),
-    };
-    let attestation = sign_attestation(&attested)?;
-    cloud.audit.record(
-        "marketplace",
-        "marketplace-service",
-        "issue",
-        "marketplace_advertisement",
-        &attested.id,
-        &format!(
-            "nodes={} expires_at_ms={}",
-            attested.node_ids.len(),
-            attested.expires_at_ms
-        ),
-    );
-    Ok(Json(AdvertisementResponse {
-        advertisement_id: attested.id,
-        issued_at_ms: now,
-        expires_at_ms: attested.expires_at_ms,
-        attestation,
-        settlement,
-        nodes,
-    }))
+fn valid_order_reference(value: &str) -> bool {
+    value.len() == 66 && value.starts_with("0x") && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
-
-fn marketplace_pricing() -> Value {
-    json!({"currency": "THEO", "terms_reference": std::env::var("HIVE_MARKETPLACE_PRICING_TERMS").unwrap_or_default()})
+fn iso_timestamp(timestamp_ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms as i64)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
-
-async fn create_allocation(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    Json(request): Json<AllocationRequest>,
-) -> Result<Json<Allocation>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    let _config = settlement_config()?;
-    let attestation = verify_attestation(
-        &request.advertisement_id,
-        &request.advertisement_attestation,
-    )?;
-    validate_allocation_request(&request, &attestation)?;
-    verify_settlement(
-        &cloud,
-        &request.marketplace_order_id,
-        &request.contract_reference,
-        &request.theo_amount,
-    )
-    .await?;
-    let now = hive_core::now_ms();
-    let tenant_id = request.tenant_id.clone();
-    let contract_reference = request.contract_reference.clone();
-    let row = Allocation {
-        marketplace_order_id: request.marketplace_order_id,
-        tenant_id,
-        resources: request.resources,
-        approved_node_ids: request.approved_node_ids,
-        theo_amount: request.theo_amount,
-        expires_at_ms: request.expires_at_ms,
-        contract_reference,
-        advertisement_id: request.advertisement_id,
-        status: "accepted".into(),
-        routed_build_id: None,
-        created_at_ms: now,
-        updated_at_ms: now,
-    };
-    match cloud.marketplace_allocations.put_if_absent(row) {
-        Ok(row) => {
-            crate::persist::persist(&cloud);
-            cloud.audit.record(
-                &row.tenant_id,
-                "marketplace-service",
-                "accept",
-                "marketplace_allocation",
-                &row.marketplace_order_id,
-                "settlement verified",
-            );
-            Ok(Json(row))
+fn valid_transaction_hash(value: &str) -> bool { valid_order_reference(value) }
+fn hex_u64(value: &Value) -> Option<u64> { value.as_str().and_then(hex_u64_str) }
+fn hex_u64_str(value: &str) -> Option<u64> { u64::from_str_radix(value.strip_prefix("0x")?, 16).ok() }
+fn decode_hex(value: &str) -> Option<Vec<u8>> { hex::decode(value.strip_prefix("0x")?).ok() }
+fn word(bytes: &[u8], index: usize) -> Option<String> {
+    bytes.get(index * 32..(index + 1) * 32).map(|word| format!("0x{}", hex::encode(word)))
+}
+fn address_word(bytes: &[u8], index: usize) -> Option<String> {
+    bytes.get(index * 32 + 12..(index + 1) * 32).map(|word| format!("0x{}", hex::encode(word)))
+}
+fn uint_word(bytes: &[u8], index: usize) -> Option<String> {
+    let word = bytes.get(index * 32..(index + 1) * 32)?;
+    // uint256 to decimal, without a lossy host-integer conversion.
+    let mut digits = vec![0u8];
+    for byte in word {
+        let mut carry = *byte as u16;
+        for digit in &mut digits {
+            let value = (*digit as u16) * 256 + carry;
+            *digit = (value % 10) as u8;
+            carry = value / 10;
         }
-        Err(existing) => {
-            if existing.tenant_id == request.tenant_id
-                && existing.contract_reference == request.contract_reference
-            {
-                Ok(Json(existing))
-            } else {
-                Err((
-                    StatusCode::CONFLICT,
-                    "marketplace order id is already bound to a different allocation".into(),
-                ))
-            }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
         }
     }
+    Some(digits.into_iter().rev().map(|digit| (b'0' + digit) as char).collect())
 }
-
-fn validate_allocation_request(
-    request: &AllocationRequest,
-    attestation: &Attestation,
-) -> Result<(), (StatusCode, String)> {
-    if request.marketplace_order_id.trim().is_empty()
-        || request.tenant_id.trim().is_empty()
-        || request.contract_reference.trim().is_empty()
-        || request.theo_amount.trim().is_empty()
-        || request.expires_at_ms <= hive_core::now_ms()
-        || request.approved_node_ids.is_empty()
-        || request.expires_at_ms > attestation.expires_at_ms
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "allocation has missing or expired required fields".into(),
-        ));
-    }
-    let approved: HashSet<_> = request.approved_node_ids.iter().collect();
-    if approved.len() != request.approved_node_ids.len()
-        || !approved.iter().all(|id| attestation.node_ids.contains(*id))
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "approved nodes are not a unique subset of the live advertisement".into(),
-        ));
-    }
-    Ok(())
+fn canonical_atomic(value: &str) -> Option<String> {
+    const MAX_UINT256: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.trim_start_matches('0').to_owned())
+        .filter(|value| !value.is_empty() && (value.len() < MAX_UINT256.len()
+            || (value.len() == MAX_UINT256.len() && value.as_str() <= MAX_UINT256)))
 }
-
-async fn verify_settlement(
-    cloud: &CloudState,
-    order_id: &str,
-    contract_reference: &str,
-    amount: &str,
-) -> Result<(), (StatusCode, String)> {
-    let url = std::env::var("HIVE_MARKETPLACE_SETTLEMENT_VERIFY_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "HIVE_MARKETPLACE_SETTLEMENT_VERIFY_URL is not configured".into(),
-        ))?;
-    let key = std::env::var("HIVE_MARKETPLACE_SETTLEMENT_API_KEY")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "HIVE_MARKETPLACE_SETTLEMENT_API_KEY is not configured".into(),
-        ))?;
-    let config = settlement_config()?;
-    let treasury = std::env::var("THEO_TREASURY_ADDRESS").unwrap_or_default();
-    let response = cloud.http.post(url).header("x-marketplace-settlement-key", key).json(&json!({
-        "order_id": order_id, "contract_reference": contract_reference, "amount": amount,
-        "chain_id": config.chain_id, "token_contract": config.token_contract, "treasury": treasury,
-        "decimals": config.token_decimals, "required_confirmations": config.confirmation_policy
-    })).send().await.map_err(|_| (StatusCode::BAD_GATEWAY, "settlement verifier is unavailable".into()))?;
-    let verified: Value = response.json().await.map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "settlement verifier returned invalid data".into(),
-        )
-    })?;
-    if !verified["confirmed"].as_bool().unwrap_or(false)
-        || verified["order_id"].as_str() != Some(order_id)
-        || verified["contract_reference"].as_str() != Some(contract_reference)
-        || verified["amount"].as_str() != Some(amount)
-        || verified["chain_id"].as_str() != Some(&config.chain_id)
-        || verified["token_contract"].as_str() != Some(&config.token_contract)
-        || verified["treasury"].as_str() != Some(treasury.as_str())
-        || verified["decimals"].as_u64() != Some(config.token_decimals as u64)
-        || verified["confirmations"].as_u64().unwrap_or(0) < config.confirmation_policy
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "settlement is not confirmed for this allocation".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn list_allocations(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<Allocation>>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    Ok(Json(cloud.marketplace_allocations.snapshot()))
-}
-async fn get_allocation(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    Path(order_id): Path<String>,
-) -> Result<Json<Allocation>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    cloud
-        .marketplace_allocations
-        .get(&order_id)
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "allocation not found".into()))
-}
-
-async fn route_allocation(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    Path(order_id): Path<String>,
-    Json(mut request): Json<RouteRequest>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    let allocation = cloud
-        .marketplace_allocations
-        .get(&order_id)
-        .ok_or((StatusCode::NOT_FOUND, "allocation not found".into()))?;
-    if allocation.expires_at_ms <= hive_core::now_ms() || allocation.status == "revoked" {
-        return Err((
-            StatusCode::CONFLICT,
-            "allocation is expired or revoked".into(),
-        ));
-    }
-    verify_settlement(
-        &cloud,
-        &allocation.marketplace_order_id,
-        &allocation.contract_reference,
-        &allocation.theo_amount,
-    )
-    .await?;
-    let approved: HashSet<String> = allocation.approved_node_ids.iter().cloned().collect();
-    let regions: Vec<String> = allocation.resources.region.iter().cloned().collect();
-    let targets = schedule::place(
-        &cloud,
-        &regions,
-        false,
-        false,
-        allocation.resources.gpu,
-        schedule::InterpreterNeeds::default(),
-        false,
-        false,
-        Some(&approved),
-    );
-    if targets.is_empty() {
-        cloud.audit.record(
-            &allocation.tenant_id,
-            "marketplace-service",
-            "reject",
-            "marketplace_route",
-            &order_id,
-            "no approved node currently eligible",
-        );
-        return Err((
-            StatusCode::CONFLICT,
-            "no advertised approved node is currently eligible".into(),
-        ));
-    }
-    if let Some(build_id) = allocation.routed_build_id.clone() {
-        return Ok(Json(
-            json!({"order_id": order_id, "build_id": build_id, "status": allocation.status}),
-        ));
-    }
-    let mut allocation = match cloud
-        .marketplace_allocations
-        .begin_route(&order_id, hive_core::now_ms())
-    {
-        Ok(row) => row,
-        Err(existing) if let Some(build_id) = existing.routed_build_id.clone() => {
-            return Ok(Json(
-                json!({"order_id": order_id, "build_id": build_id, "status": existing.status}),
-            ));
+fn decimal_divide_small(value: &str, divisor: u8) -> String {
+    let mut remainder = 0u16;
+    let mut output = String::new();
+    for byte in value.bytes() {
+        let quotient = (remainder * 10 + (byte - b'0') as u16) / divisor as u16;
+        remainder = (remainder * 10 + (byte - b'0') as u16) % divisor as u16;
+        if !output.is_empty() || quotient != 0 {
+            output.push((b'0' + quotient as u8) as char);
         }
-        Err(_) => {
-            return Err((
-                StatusCode::CONFLICT,
-                "allocation routing is already in progress".into(),
-            ))
-        }
-    };
-    crate::persist::persist(&cloud);
-    // Marketplace cannot submit a per-target/internal deployment. Those flags
-    // skip `git.rs`'s scheduler and would bypass the approved-node allowlist.
-    request.deployment.no_fanout = false;
-    request.deployment.fanout_secondary = false;
-    request.deployment.project_incarnation = None;
-    request.deployment.marketplace_placement = Some(fluid_core::MarketplacePlacementSnapshot {
-        contract_version: 1,
-        policy_version: 1,
-        marketplace_order_id: allocation.marketplace_order_id.clone(),
-        buyer_tenant_id: allocation.tenant_id.clone(),
-        retrieved_at_ms: hive_core::now_ms(),
-        approved_node_ids: allocation.approved_node_ids.clone(),
-        policy: json!({"source":"hive-marketplace-allocation","contract_reference":allocation.contract_reference,"expires_at_ms":allocation.expires_at_ms}),
-    });
-    let result =
-        crate::admin::start_named_deploy(&cloud, &allocation.tenant_id, request.deployment, None)
-            .await;
-    let result = match result {
-        Ok(value) => value,
-        Err(error) => {
-            allocation.status = "accepted".into();
-            allocation.updated_at_ms = hive_core::now_ms();
-            cloud.marketplace_allocations.update(allocation);
-            crate::persist::persist(&cloud);
-            return Err(error);
-        }
-    };
-    let build_id = result["build_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "deployment admission returned no build id".into(),
-        ))?
-        .to_string();
-    allocation.status = "routed".into();
-    allocation.routed_build_id = Some(build_id.clone());
-    allocation.updated_at_ms = hive_core::now_ms();
-    cloud.marketplace_allocations.update(allocation.clone());
-    crate::persist::persist(&cloud);
-    cloud.audit.record(
-        &allocation.tenant_id,
-        "marketplace-service",
-        "route",
-        "marketplace_allocation",
-        &order_id,
-        &format!("build_id={build_id}; existing scheduler dispatch selected approved targets"),
-    );
-    Ok(result)
+    }
+    if output.is_empty() { "0".into() } else { output }
 }
-
-async fn fulfill_allocation(
-    State(cloud): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    Path(order_id): Path<String>,
-) -> Result<Json<Allocation>, (StatusCode, String)> {
-    require_marketplace(&headers)?;
-    let mut row = cloud
-        .marketplace_allocations
-        .get(&order_id)
-        .ok_or((StatusCode::NOT_FOUND, "allocation not found".into()))?;
-    if row.status == "fulfilled" {
-        return Ok(Json(row));
+fn decimal_subtract(value: &str, subtrahend: &str) -> Option<String> {
+    let mut result = Vec::with_capacity(value.len());
+    let mut borrow = 0i16;
+    let mut left = value.bytes().rev();
+    let mut right = subtrahend.bytes().rev();
+    loop {
+        let Some(a) = left.next() else { break };
+        let b = right.next().map(|byte| (byte - b'0') as i16).unwrap_or(0);
+        let mut digit = (a - b'0') as i16 - b - borrow;
+        borrow = if digit < 0 { digit += 10; 1 } else { 0 };
+        result.push((b'0' + digit as u8) as char);
     }
-    if row.status != "routed" || row.expires_at_ms <= hive_core::now_ms() || row.status == "revoked"
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "only an active routed allocation may be fulfilled".into(),
-        ));
-    }
-    verify_settlement(
-        &cloud,
-        &row.marketplace_order_id,
-        &row.contract_reference,
-        &row.theo_amount,
-    )
-    .await?;
-    row.status = "fulfilled".into();
-    row.updated_at_ms = hive_core::now_ms();
-    cloud.marketplace_allocations.update(row.clone());
-    crate::persist::persist(&cloud);
-    cloud.audit.record(
-        &row.tenant_id,
-        "marketplace-service",
-        "fulfill",
-        "marketplace_allocation",
-        &order_id,
-        "settlement re-verified server-side",
-    );
-    Ok(Json(row))
+    (borrow == 0).then(|| {
+        let output: String = result.into_iter().rev().collect();
+        let output = output.trim_start_matches('0');
+        if output.is_empty() { "0".into() } else { output.to_owned() }
+    })
 }

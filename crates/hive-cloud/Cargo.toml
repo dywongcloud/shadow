@@ -141,6 +141,7 @@ dav-server = { version = "0.11.0", default-features = false }
 # universal ZIP compression method). No bzip2/zstd/xz — those are not used in
 # the upload path and would pull extra native code.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+sha3 = "0.10.9"
 
 [features]
 # `zkauth` is DEFAULT-ON: it implements preview-deployment access protection
