@@ -3953,6 +3953,34 @@ pub(crate) fn require_auth_read(
     }
 }
 
+/// Like [`require_auth_read`], but also honors the internal node-to-node
+/// forward trust (`x-hive-internal` == `HIVE_INTERNAL_TOKEN`, constant-time
+/// compare — the same trust `require_operator_or_internal` grants). Needed by
+/// handlers a peer node probes for its OWN infra facts (not tenant data) on a
+/// caller's behalf, e.g. `billing_addons`'s leader-preflight forward — that
+/// hop carries no bearer token and must not require one to answer a
+/// node-local capability check.
+pub(crate) fn require_auth_read_or_internal(
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+) -> Result<(), (StatusCode, String)> {
+    if require_auth_read(claims).is_ok() {
+        return Ok(());
+    }
+    if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+        if !t.trim().is_empty()
+            && headers
+                .get("x-hive-internal")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ct_eq(v, &t))
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
+}
+
 /// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
 /// (virginia→iad, bangkok→sin, san-jose→sfo, los-angeles→lax). Unknown regions
 /// return "" so the dashboard falls back to the legacy region-agnostic zone URL.
@@ -15224,12 +15252,32 @@ fn default_kind() -> String {
 /// cannot, WHY. The dashboard reads this to render a disabled control with the
 /// operator's remedy instead of a Buy button that answers with an HTTP error
 /// only after the user clicks it. Tenant-authed (same read bar as billing).
+///
+/// GETs are served node-local (see `main.rs`'s admin_ingress dispatch doc) —
+/// correct for gossip-replicated tenant state, wrong here: Tencent
+/// credentials are NODE-LOCAL infrastructure config, so different nodes give
+/// genuinely different (not just eventually-consistent) answers. A tenant
+/// landing on a non-Tencent or not-yet-configured node saw "not available"
+/// even on a fleet where the purchase path (leader-forwarded, always a
+/// credentialed node per `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a
+/// local preflight failure, ask the leader's own view before answering
+/// "unavailable" — the leader is always Tencent-credentialed by the same
+/// invariant `provision_from_checkout` already relies on. Fail OPEN toward
+/// the local answer if the leader can't be reached, never hang the endpoint.
 async fn billing_addons(
-    State(_c): State<Arc<CloudState>>,
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
-    let (available, reason) = match crate::tencent_eip::preflight() {
+    require_auth_read_or_internal(&headers, claims.as_ref().map(|e| &e.0))
+        .map_err(|e| (e.0, e.1))?;
+    let mut result = crate::tencent_eip::preflight();
+    if result.is_err() && !c.is_control_plane_leader() {
+        if let Some(leader_result) = crate::tencent_eip::leader_preflight(&c).await {
+            result = leader_result;
+        }
+    }
+    let (available, reason) = match result {
         Ok(()) => (true, String::new()),
         Err(why) => (
             false,

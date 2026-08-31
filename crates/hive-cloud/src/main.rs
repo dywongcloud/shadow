@@ -2576,7 +2576,7 @@ const MAX_STALE_EPOCH_RETRIES: u32 = 3;
 /// The connect timeout is separate from (and far tighter than) the overall
 /// request timeout: a candidate whose address black-holes must not burn the
 /// whole 30s budget before the next candidate is tried.
-fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
+pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
     > = std::sync::OnceLock::new();
@@ -2619,7 +2619,7 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
 /// NOT health-filtered, because the stale health verdict is precisely the input
 /// that just misled us. Self is skipped (we already know we are not the leader,
 /// so a round trip to our own public address can only refuse again).
-fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
+pub(crate) fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
     let nodes = cloud.registry.nodes();
     let addr_of = |name: &str| -> Option<String> {
         nodes

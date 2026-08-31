@@ -82,6 +82,53 @@ pub fn preflight() -> Result<(), String> {
     Ok(())
 }
 
+/// Ask the control-plane leader's own `preflight()` verdict when THIS node's
+/// is `Err` — see `admin::billing_addons`'s doc comment for why a node-local
+/// answer alone is wrong for this specific check. Best-effort: `None` means
+/// "could not ask" (leader unreachable, no candidates, bad response) and the
+/// caller must fall back to the local verdict — never turn a reachability
+/// hiccup into a harder "unavailable" than the local check already gave.
+pub async fn leader_preflight(cloud: &Arc<CloudState>) -> Option<Result<(), String>> {
+    let api_host = format!("api.{}", cloud.platform_domain);
+    for (_name, ip) in crate::leader_forward_candidates(cloud) {
+        let client = match crate::leader_client(&ip, &api_host) {
+            Some(c) => c,
+            None => continue,
+        };
+        let url = format!("https://{api_host}/v1/billing/addons");
+        let mut req = client.get(&url).header("host", &api_host);
+        if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+            if !token.trim().is_empty() {
+                req = req.header("x-hive-internal", token);
+            }
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let addon = body.get("addons").and_then(|a| a.get(0));
+        let Some(available) = addon.and_then(|a| a.get("available")).and_then(|v| v.as_bool())
+        else {
+            continue;
+        };
+        return Some(if available {
+            Ok(())
+        } else {
+            let reason = addon
+                .and_then(|a| a.get("unavailable_reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unavailable on the control-plane leader")
+                .to_string();
+            Err(reason)
+        });
+    }
+    None
+}
+
 pub async fn provision_from_checkout(
     c: &Arc<CloudState>,
     co: &crate::billing::Checkout,
