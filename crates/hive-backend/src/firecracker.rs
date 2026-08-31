@@ -18,7 +18,8 @@
 //! `firecracker` binary exist.
 
 use crate::{
-    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, PtyIo,
+    SealedRuntimeArtifact,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -3157,6 +3158,35 @@ impl CellBackend for FirecrackerBackend {
             procs.get(&cell.id).and_then(|c| c.id())?
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
+    }
+
+    async fn exec_command(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>> {
+        FirecrackerBackend::exec_command(self, cell, req).await
+    }
+
+    async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
+        FirecrackerBackend::kill_exec(self, cell, exec_id).await
+    }
+
+    async fn exec_pty(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>, PtyIo)> {
+        let (rx, sender) = FirecrackerBackend::exec_pty(self, cell, req).await?;
+        let input_sender = sender.clone();
+        let resize_sender = sender;
+        Ok((
+            rx,
+            PtyIo::new(
+                move |bytes| input_sender.input(bytes),
+                move |cols, rows| resize_sender.resize(cols, rows),
+            ),
+        ))
     }
 }
 

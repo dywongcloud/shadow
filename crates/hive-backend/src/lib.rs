@@ -24,6 +24,7 @@ pub mod snapshot;
 use async_trait::async_trait;
 use hive_core::{BuildJob, BuildResult, CellId, LogLine, ResourceSpec};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -1840,6 +1841,73 @@ pub trait CellBackend: Send + Sync {
     /// guessing from latency (which would wrongly penalize I/O-bound work).
     async fn cpu_percent(&self, _cell: &CellHandle) -> Option<f32> {
         None
+    }
+
+    /// Run one argv command inside an already-provisioned, long-lived cell
+    /// (Sandboxes). Unlike `run_build`'s one-shot self-destructing cell, the
+    /// cell accepts many commands over its life. Returns as soon as the
+    /// command has started; the caller drains the channel for
+    /// `AgentEvent::ExecOutput`* then one `AgentEvent::ExecDone`. Default:
+    /// unsupported (mock/container backends have no such exec channel yet).
+    async fn exec_command(
+        &self,
+        _cell: &CellHandle,
+        _req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>> {
+        anyhow::bail!("backend {} does not support exec_command", self.name())
+    }
+
+    /// Signal a still-running `exec_command` (by the id it was started with)
+    /// to stop. Default: unsupported, matching `exec_command`.
+    async fn kill_exec(&self, _cell: &CellHandle, _exec_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("backend {} does not support kill_exec", self.name())
+    }
+
+    /// Open one interactive pty session inside `cell` (Sandboxes terminal —
+    /// real `vim`/`less`/`^C`/tab-completion support, unlike `exec_command`'s
+    /// line-buffered batch output). Returns an `AgentEvent` receiver
+    /// (`PtyOutput`* then one `PtyExited`) plus a sender the caller uses to
+    /// push typed bytes / resize events back on the same session. Default:
+    /// unsupported.
+    async fn exec_pty(
+        &self,
+        _cell: &CellHandle,
+        _req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+        PtyIo,
+    )> {
+        anyhow::bail!("backend {} does not support exec_pty", self.name())
+    }
+}
+
+/// Backend-agnostic write side of an `exec_pty` session — a thin
+/// `Fn`-closure wrapper so each backend can plug in its own transport
+/// (`FirecrackerBackend::PtySender`'s channel, litebox's own guest-shim
+/// call) without `CellBackend` depending on any one backend's concrete type.
+#[derive(Clone)]
+pub struct PtyIo {
+    input: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    resize: Arc<dyn Fn(u16, u16) + Send + Sync>,
+}
+
+impl PtyIo {
+    pub fn new(
+        input: impl Fn(Vec<u8>) + Send + Sync + 'static,
+        resize: impl Fn(u16, u16) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            input: Arc::new(input),
+            resize: Arc::new(resize),
+        }
+    }
+
+    pub fn input(&self, bytes: Vec<u8>) {
+        (self.input)(bytes)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        (self.resize)(cols, rows)
     }
 }
 
