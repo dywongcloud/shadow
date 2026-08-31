@@ -2580,7 +2580,9 @@ impl CellBackend for FirecrackerBackend {
                     | AgentEvent::FunctionError(_)
                     | AgentEvent::FunctionFault(_)
                     | AgentEvent::ExecOutput { .. }
-                    | AgentEvent::ExecDone { .. } => {}
+                    | AgentEvent::ExecDone { .. }
+                    | AgentEvent::PtyOutput { .. }
+                    | AgentEvent::PtyExited { .. } => {}
                 }
             }
         };
@@ -3207,6 +3209,61 @@ impl FirecrackerBackend {
         Ok(rx)
     }
 
+    /// Open one interactive pty session inside `cell` and return an
+    /// `AgentEvent` receiver (`PtyOutput`* then one `PtyExited`) plus a
+    /// [`PtySender`] the caller uses to push typed bytes / resize events back
+    /// on the SAME connection — unlike `exec_command`, this is a duplex
+    /// session, not a one-shot request/stream.
+    pub async fn exec_pty(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedReceiver<AgentEvent>, PtySender)> {
+        let uds = cell
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
+        let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
+        let payload = serde_json::to_vec(&AgentRequest::ExecPty(req))?;
+        write_frame(&mut stream, &payload).await?;
+
+        let (mut read_half, mut write_half) = stream.into_split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let frame = match read_frame(&mut read_half).await {
+                    Ok(f) => f,
+                    Err(_) => break, // connection closed — caller treats as exited
+                };
+                let ev: AgentEvent = match serde_json::from_slice(&frame) {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                let is_exited = matches!(ev, AgentEvent::PtyExited { .. });
+                if tx.send(ev).is_err() {
+                    break; // receiver dropped (caller stopped listening)
+                }
+                if is_exited {
+                    break;
+                }
+            }
+        });
+
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<AgentRequest>();
+        tokio::spawn(async move {
+            while let Some(req) = in_rx.recv().await {
+                let Ok(payload) = serde_json::to_vec(&req) else {
+                    continue;
+                };
+                if write_frame(&mut write_half, &payload).await.is_err() {
+                    break; // connection closed — further sends are silently dropped
+                }
+            }
+        });
+
+        Ok((rx, PtySender(in_tx)))
+    }
+
     /// Signal a still-running exec (by the id it was started with) to stop.
     /// Opens a FRESH connection (the exec's own connection is busy streaming
     /// output) — the guest agent's process-global exec registry finds the
@@ -3225,6 +3282,23 @@ impl FirecrackerBackend {
         // delivered to the guest, not just queued on the wire.
         let _ = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
         Ok(())
+    }
+}
+
+/// The write half of an [`FirecrackerBackend::exec_pty`] session — cheap to
+/// clone, backed by an unbounded channel feeding the connection's dedicated
+/// writer task, so a caller (the websocket handler) can hold one per browser
+/// tab without juggling a raw stream.
+#[derive(Clone)]
+pub struct PtySender(tokio::sync::mpsc::UnboundedSender<AgentRequest>);
+
+impl PtySender {
+    pub fn input(&self, bytes: Vec<u8>) {
+        let _ = self.0.send(AgentRequest::PtyInput { bytes });
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.0.send(AgentRequest::PtyResize { cols, rows });
     }
 }
 
