@@ -310,17 +310,42 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
                     if head_sent {
                         // Frames already flowed; emitting a 502 head now would
                         // corrupt the stream. The caller sees the truncation.
+                        tracing::warn!(
+                            id,
+                            attempt,
+                            error = %error,
+                            "tunnel: upstream request failed after response head was already sent — truncating stream"
+                        );
                         return;
                     }
                     last_error = Some(error);
                     break;
                 }
+                tracing::debug!(
+                    id,
+                    attempt,
+                    error = %error,
+                    "tunnel: upstream request attempt failed, retrying"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)))
                     .await;
             }
         }
     }
     if let Some(e) = last_error {
+        // This path was previously silent — a 502 body reached the client but
+        // nothing was logged, making every occurrence invisible in the
+        // journal (confirmed live on fc-frankfurt: an active 502 correlated
+        // with zero log lines). Log it so a persistent failure (retries
+        // exhausted, not just one transient race) is diagnosable without a
+        // live reproduction.
+        tracing::warn!(
+            id,
+            attempts = MAX_ATTEMPTS,
+            idempotent,
+            error = %e,
+            "tunnel: upstream request failed after exhausting retries"
+        );
         // Make sure the caller gets *something* terminal.
         let meta = RespMeta {
             status: 502,
