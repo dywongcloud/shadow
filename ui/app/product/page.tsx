@@ -19,10 +19,6 @@ import {
   Radar,
 } from "lucide-react";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "Product — shadw",
   description:

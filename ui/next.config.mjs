@@ -68,6 +68,21 @@ const nextConfig = {
     root: import.meta.dirname,
   },
 
+  // Next.js 16.3 Instant Navigations: Cache Components (Partial Prerendering
+  // + the `use cache` model) and Partial Prefetching (one reusable shell per
+  // ROUTE instead of per link). Adopted INCREMENTALLY, per Vercel's own
+  // migration guide: every route started opted out of instant-navigation
+  // validation via `instant = false` (the cache-components-instant-false
+  // codemod), then converted one at a time, verified via `npm run build` +
+  // a live `next start` smoke test after each batch. 52 of 53 routes are now
+  // fully adopted (real PPR — see the build output's ◐ markers). The one
+  // holdout is app/layout.tsx: Clerk's own <SignIn>/<SignUp> call
+  // usePathname() internally with no Suspense boundary of their own, inside
+  // <ClerkProvider> which wraps this whole tree — see that file's own
+  // comment for the full trace. Not fixable from app code alone.
+  cacheComponents: true,
+  partialPrefetching: true,
+
   // The upstream @workflow/web console (mounted at /workflows via
   // app/wf-console/[[...slug]]/route.ts) loads its compiled Express app from
   // node_modules at runtime — keep it (and express) external so Next doesn't

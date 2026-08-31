@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
 import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
-export const dynamic = "force-dynamic";
-
 /**
  * Set up GitOps for a tenant: optionally CREATE the GitHub config repo itself,
  * link it, then auto-generate the full spec/config/meta artifact tree and commit

@@ -3,10 +3,6 @@ import type { Metadata } from "next";
 import { ArrowRight } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 
 export const metadata: Metadata = {
   title: "Getting Started — shadw Docs",

@@ -11,8 +11,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, toolkitStatus, connectionCredentials, composioConfigured } from "@/lib/composio";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
 
-export const dynamic = "force-dynamic";
-
 /** Normalize a toolkit slug + credential key into an ENV var name, e.g.
  *  ("google-sheets", "api_key") -> "GOOGLE_SHEETS_API_KEY". */
 function envName(slug: string, key: string): string {

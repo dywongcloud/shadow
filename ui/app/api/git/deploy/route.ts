@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
 
-export const dynamic = "force-dynamic";
-
 /**
  * Deploy-from-Git entry point. The dashboard posts the deploy body here (instead of
  * straight to the backend `/v1/git/deploy`) so we can attach the signed-in user's

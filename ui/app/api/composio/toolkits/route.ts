@@ -12,8 +12,6 @@ import { composioConfigured, listToolkits } from "@/lib/composio";
 // lookup) and issues no-store fetches, so — unlike Next 14's route-segment
 // `revalidate` (which Next 16 rejects as a conflict with a no-store fetch) — the
 // route is not Full-Route-Cached; the guardian-db + s-maxage header ARE the cache.
-export const dynamic = "force-dynamic";
-
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 // The global integration-index collection is operator-gated (data_create ->

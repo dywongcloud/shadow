@@ -7,9 +7,6 @@ import { auth, clerkClient } from "@clerk/nextjs/server";
 // signed-in user is actually a member of the requested team (Clerk org) before
 // enrolling them on the node (locked behind HIVE_INTERNAL_TOKEN). No-op for
 // teams the user doesn't belong to.
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 const PERSONAL = new Set(["personal", "__personal__", ""]);

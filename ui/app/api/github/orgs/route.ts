@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { githubOrgs, resolveEntity } from "@/lib/github";
 
-export const dynamic = "force-dynamic";
-
 /**
  * The organizations the connected GitHub user belongs to — powers the org picker
  * (replacing the free-text org login) and lets the UI show which orgs a connection

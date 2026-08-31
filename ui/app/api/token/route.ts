@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
 
-export const dynamic = "force-dynamic";
-
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;

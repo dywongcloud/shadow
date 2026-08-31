@@ -3,8 +3,6 @@ import { composioConfigured, githubConnect, resolveEntity } from "@/lib/composio
 import { authorizeUrl, currentUserId, githubAppConfigured, makeState, stateCookieName } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
 
-export const dynamic = "force-dynamic";
-
 export async function POST(req: NextRequest) {
   // Allow callers (e.g. the onboarding modal) to return to where they started.
   const body = await req.json().catch(() => ({} as any));

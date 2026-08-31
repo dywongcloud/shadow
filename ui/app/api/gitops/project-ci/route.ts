@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/github";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
-export const dynamic = "force-dynamic";
-
 /** Parse "owner/repo" from a clone URL or full_name. */
 function parseRepo(input: string): { owner: string; repo: string } | null {
   let s = (input || "").trim().toLowerCase();

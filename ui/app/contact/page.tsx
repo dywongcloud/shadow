@@ -3,10 +3,6 @@ import type { Metadata } from "next";
 import { Mail, MessageSquare, Building2 } from "lucide-react";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "Contact — shadw",
   description:

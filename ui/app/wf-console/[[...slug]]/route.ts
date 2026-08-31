@@ -39,9 +39,6 @@ import { expressToFetch } from "@/lib/wf-console/express-bridge";
 
 type ExpressApp = any;
 
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
-
 type WfRequestContext = { team?: string; authToken?: string; project?: string };
 
 const ALS_KEY = Symbol.for("hive.wfConsole.requestContext");

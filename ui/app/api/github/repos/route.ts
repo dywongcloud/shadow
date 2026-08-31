@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubRepos, githubOrgRepos, resolveEntity } from "@/lib/github";
 
-export const dynamic = "force-dynamic";
-
 export async function GET(req: NextRequest) {
   // Same stable entity as status/connect — so a connected user's repos actually
   // resolve instead of coming back empty under a mismatched id.

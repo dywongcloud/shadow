@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
@@ -9,6 +10,22 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
 import { VitalsBeacon } from "@/components/vitals-beacon";
+
+// Still opted out, for a DIFFERENT reason than before (the app-chrome
+// usePathname() gap below is fixed — see the Suspense wrapping around
+// ChromeTop/ChromeBottom). The remaining blocker is Clerk's own <SignIn>/
+// <SignUp> components: they call usePathname() internally
+// (@clerk/nextjs's usePathnameWithoutCatchAll), with no Suspense boundary
+// of their own, on the /sign-in and /sign-up catch-all routes specifically.
+// That call happens INSIDE <ClerkProvider>, which wraps this entire tree —
+// there is no seam in this file to add a boundary around a third-party
+// component's own internals. Confirmed via `next dev`'s exact error
+// attribution (digest: CLIENT_HOOK_DYNAMIC, points at the ClerkProvider
+// line). Not fixable from app code; would need either an upstream Clerk fix
+// or moving ClerkProvider itself to wrap only the auth routes (a much larger
+// restructure of the whole app's auth boundary, out of scope for this pass).
+// See: https://nextjs.org/docs/app/guides/migrating-to-cache-components
+export const instant = false;
 
 // schema.org JSON-LD so AI search / LLMs (and rich results) can parse what shadw
 // is — structured, machine-readable content the AI-search era favors. Kept
@@ -140,10 +157,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           {/* Dashboard chrome (top nav + footer + overlays) is auth-gated in a
               CLIENT component so it reacts to client-side login/logout — the
               signed-out landing renders its own full-bleed nav/footer. See
-              `app-chrome.tsx` for why this must not live in the server layout. */}
-          <ChromeTop />
+              `app-chrome.tsx` for why this must not live in the server layout.
+              Suspense-wrapped: TopNav/Footer read usePathname(), a client hook
+              that needs a boundary under Cache Components to prerender the
+              shell (see instant=false's removal). fallback={null} is exactly
+              correct — both components already conditionally render nothing
+              until auth settles, so this introduces no visible change. */}
+          <Suspense fallback={null}>
+            <ChromeTop />
+          </Suspense>
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
-          <ChromeBottom />
+          <Suspense fallback={null}>
+            <ChromeBottom />
+          </Suspense>
         </ThemeProvider>
       </body>
     </html>

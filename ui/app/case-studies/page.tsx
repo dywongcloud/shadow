@@ -3,10 +3,6 @@ import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { ArrowRight } from "lucide-react";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "Case Studies — shadw",
   description:

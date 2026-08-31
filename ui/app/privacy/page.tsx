@@ -1,10 +1,6 @@
 import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection } from "@/components/marketing-shell";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "Privacy Policy — shadw",
   description:

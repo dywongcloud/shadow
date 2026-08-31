@@ -8,8 +8,6 @@ import { resolveTeam, fetchSpeedInsightsSummary, BackendFetchError } from "@/lib
  * offers, not the request-count windows Observability offers. Conflating the
  * two allow-lists is exactly the drift this route avoids by owning its own.
  */
-export const runtime = "nodejs";
-
 /** Same values as summary/route.ts — a multi-day RUM aggregate moves even
  *  slower than a request-count window, so this is if anything conservative. */
 const S_MAXAGE = 30;
