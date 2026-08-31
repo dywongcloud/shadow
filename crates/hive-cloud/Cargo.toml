@@ -38,13 +38,6 @@ parking_lot = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 hyper = { version = "1", features = ["http1"] }
-# Outbound (client-side) websocket dialing for the sandbox interactive-shell
-# route's owner-proxy leg — a non-owner node bridges the browser's inbound
-# axum websocket to a client websocket it opens against the owning node's
-# admin URL. Already resolved transitively (axum's own `ws` feature depends
-# on it); pinned to the SAME version already in the lockfile so this adds no
-# new dependency footprint, only a direct name for it.
-tokio-tungstenite = "0.24"
 hyper-util = { version = "0.1", features = ["tokio"] }
 uuid = { workspace = true }
 jsonwebtoken = "9"

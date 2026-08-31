@@ -2715,7 +2715,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
- "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http",
