@@ -1123,6 +1123,12 @@ async fn submit_allocation(
                 "payment_intent_not_found",
             )
         })?;
+    if settlement_config(&cloud).await?.profile != intent.settlement.profile {
+        return Err(error(
+            axum::http::StatusCode::CONFLICT,
+            "settlement_profile_changed",
+        ));
+    }
     if intent.verification_status != "verified" {
         return Err(error(
             axum::http::StatusCode::CONFLICT,
