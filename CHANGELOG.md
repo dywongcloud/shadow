@@ -69,6 +69,29 @@ AGENTS.md "Deploys"):
     install/build commands inside the fluid.json lane is PRD
     `fluid-json-lane-honor-build-commands`.
 
+Live witnesses after the roll (canary `--limit fr,va`, then all 22 hosts, both
+glibc lanes; fr's first 45 s on the new binary showed zero cached-hint dial
+timeouts against ten in a comparable span before):
+
+- `POST /v1/projects/express/redeploy` on the new leader → `dpl-cf08186c74`:
+  `Placement: region-aware scheduler → fc-frankfurt, fc-tokyo`,
+  `→ fc-frankfurt: dispatching deploy (via iroh)`, `[fc-frankfurt] Running
+  build`, `Sealed runtime artifact 1023774e301e`, `✓ fc-frankfurt: deployment
+  ready` (tokyo likewise), state `ready`, aliased to express.shadw.app. The
+  leader opened a trunk to fr within seconds of booting and logged 2
+  cached-hint timeouts in 3 minutes where it had logged 45 per 5 minutes.
+  The fallback walk was not needed on that run and is therefore not yet
+  exercised live.
+- The same repo and branch deployed fresh under a throwaway project
+  (`gm-preflight-witness`, deleted afterwards) → `dpl-0f4ab200cf` state
+  `error` with `Launch preflight failed for function "web" (functions[0]):
+  main entry "server.js" — chosen by fluid.json functions[0].start_cmd =
+  ["node", "server.js"] — does not exist in the deployment tree about to be
+  sealed … package.json declares scripts.start = "next start", scripts.build
+  = "next build". A fluid.json deployment ships the repository checkout
+  AS-IS …` and no `Sealed runtime artifact`, `NodeBackendUnavailable` or
+  `tar:` line.
+
 ## 2026-09-01 — Sandbox execs get a supervisor (deadline, kill, terminate sweep); litebox fork-child corruption root-caused
 
 The first live proof after the fleet roll below created a real Litebox sandbox
