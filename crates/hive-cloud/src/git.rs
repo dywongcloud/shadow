@@ -5422,17 +5422,47 @@ async fn fanout_remote(
                     "{RUNTIME_ARTIFACT_FANOUT_PATH}?{}",
                     crate::admin::mesh_team_qs(&team)
                 );
-                match crate::gossip::request_to(
-                    cloud,
-                    id,
-                    addr,
-                    hive_p2p::GOSSIP_POST,
-                    &path,
-                    &body,
-                    20,
-                )
-                .await
-                {
+                // `PeerPool::request`'s own doc is explicit that it retries a
+                // PRE-send failure once internally but deliberately leaves a
+                // POST-send failure (the request already on the wire) to the
+                // caller's own failover judgment — see hive-p2p's
+                // `request_stream` doc. For a node whose ONLY route is iroh
+                // (no HTTP admin — see `Target`'s doc), a single post-send
+                // firstbyte timeout on an otherwise-healthy trunk (intermittent
+                // path degradation, not the peer being down) used to end the
+                // whole dispatch attempt with no second try. `run_build`'s
+                // request body is idempotent from the target's perspective
+                // (the target's own stateful fanout-replica guard governs
+                // whether it actually starts a build), so retrying it here is
+                // safe. Bounded at 2 attempts total, same shape as the
+                // pre-send retries elsewhere in this stack.
+                let mut iroh_result = None;
+                let mut last_failure = String::new();
+                for iroh_attempt in 1..=2 {
+                    match crate::gossip::request_to(
+                        cloud,
+                        id,
+                        addr,
+                        hive_p2p::GOSSIP_POST,
+                        &path,
+                        &body,
+                        20,
+                    )
+                    .await
+                    {
+                        Some(b) => {
+                            iroh_result = Some(b);
+                            break;
+                        }
+                        None => {
+                            last_failure = "iroh: no reply (peer unreachable over the mesh, or timed out after 20s)".into();
+                            if iroh_attempt < 2 {
+                                cloud.builds.log(bid, format!("→ {}: iroh dispatch timed out, retrying once", t.node));
+                            }
+                        }
+                    }
+                }
+                match iroh_result {
                     Some(b) => match serde_json::from_slice(&b) {
                         Ok(v) => Some(v),
                         Err(e) => {
@@ -5441,8 +5471,7 @@ async fn fanout_remote(
                         }
                     },
                     None => {
-                        attempt_failures
-                            .push("iroh: no reply (peer unreachable over the mesh, or timed out after 20s)".into());
+                        attempt_failures.push(last_failure);
                         None
                     }
                 }
