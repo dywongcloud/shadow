@@ -19,6 +19,18 @@ which is why one-shot commands worked and shells never did.
 `crates/hive-backend/src/litebox.rs`: the pty waiter now owns both guards
 exactly like the exec waiter.
 
+With that fixed the shell died a second way, with no output and status 21.
+Litebox has no job-control tty ioctls (`tcsetpgrp` answers ENOSYS, -38): a
+shell whose stderr IS the pty goes interactive by itself, enters job-control
+setup, and the runner exits `exit_group(277)` before a prompt byte —
+measured with the staged tar for `/bin/sh`, `+m`, `--norc +m` and `-i +m`
+alike, while `/bin/sh -i` with stderr off the pty prints its prompt, runs
+input and exits cleanly, warning once "cannot set terminal process group
+(-38)" / "no job control in this shell". `exec_pty` now keeps stdin/stdout on
+the pty, gives the runner a stderr pipe pumped into the same terminal stream
+(those two one-line warnings filtered), and passes `-i`. Job control inside
+a sandbox shell stays a litebox gap (PRD `litebox-guest-exec-pty-support`).
+
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
 Two production failures reported together, root-caused as two different

@@ -4925,6 +4925,20 @@ impl CellBackend for LiteboxBackend {
         } else {
             req.shell.clone()
         };
+        // Litebox does not implement the job-control tty ioctls (tcsetpgrp
+        // answers ENOSYS, -38). A shell whose stderr IS the pty goes
+        // interactive on its own, runs job-control setup, and the runner dies
+        // with status 21 before a single prompt byte — measured 2026-09-01 on
+        // fc-sanjose for `/bin/sh`, `+m`, `--norc +m` and `-i +m` alike. With
+        // stderr OFF the pty the very same shell (`-i`) prints its prompt,
+        // executes input and exits cleanly, warning once "cannot set terminal
+        // process group (-38)" / "no job control in this shell". So: stdin
+        // and stdout stay on the pty (echo, line discipline, readline all
+        // real), stderr is a PIPE pumped into the same terminal stream below,
+        // and `-i` asks for the interactive shell that stderr-not-a-tty would
+        // otherwise suppress. Every shell this platform offers (sh, bash,
+        // dash, zsh, fish) accepts `-i`.
+        let shell_args: Vec<&str> = vec!["-i"];
         let cwd = if req.cwd.is_empty() {
             "/".to_string()
         } else {
@@ -4946,6 +4960,7 @@ impl CellBackend for LiteboxBackend {
             .arg(format!("--initial-files={}", initial_files_path.display()))
             .arg("--")
             .arg(&shell)
+            .args(&shell_args)
             .env_clear()
             .envs(&req.env)
             .env("HOME", "/root")
@@ -4956,10 +4971,10 @@ impl CellBackend for LiteboxBackend {
             .current_dir(&cwd)
             // SAFETY: dup'd fds are valid, open, and owned until this Stdio
             // takes them — the runner inherits them across exec as its own
-            // fd 0/1/2, exactly the real-terminal shape a login shell expects.
+            // fd 0/1; stderr is deliberately a pipe (see `shell_args`).
             .stdin(Stdio::from(slave_fd.try_clone()?))
-            .stdout(Stdio::from(slave_fd.try_clone()?))
-            .stderr(Stdio::from(slave_fd))
+            .stdout(Stdio::from(slave_fd))
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Own process group, tracked in `execs` under the session id exactly
         // like a one-shot exec, so `terminate` can kill a shell (and whatever
@@ -4992,6 +5007,38 @@ impl CellBackend for LiteboxBackend {
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // The runner's stderr rides the same terminal stream, line by line,
+        // minus the two one-line litebox job-control warnings every session
+        // would otherwise open with (they describe the runner, not the
+        // tenant's shell, and are documented on `shell_args` above). Anything
+        // else the runner or the shell writes to stderr — a real error — is
+        // shown verbatim.
+        if let Some(stderr) = child.stderr.take() {
+            let tx_err = tx.clone();
+            let id_err = session_id.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.contains("cannot set terminal process group")
+                        || line.contains("no job control in this shell")
+                    {
+                        continue;
+                    }
+                    let mut bytes = line.into_bytes();
+                    bytes.extend_from_slice(b"\r\n");
+                    if tx_err
+                        .send(hive_core::AgentEvent::PtyOutput {
+                            id: id_err.clone(),
+                            bytes,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
         let mut master_read = tokio::fs::File::from_std(master_fd.try_clone()?.into());
         let tx_reader = tx.clone();
         let id_reader = session_id.clone();
