@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-01 — Sandbox terminals no longer disconnect instantly: the pty runner's guest tar outlived by its waiter
+
+Every dashboard sandbox terminal closed the moment it opened. Reproduced
+against the leader's own listener and through the public round-robin host:
+the websocket upgrade succeeded (101) and the server immediately sent
+`Error: No such file or directory (os error 2)` followed by
+`{"type":"exited","exit_code":1}`. Standalone, the same runner with the same
+tar runs an interactive shell on a pty fine, so the defect was in how
+`LiteboxBackend::exec_pty` spawned it: it built the shell tar and its
+descriptor-bound alias (`/proc/self/fd/N/initial-files.tar`), spawned the
+runner, and returned — dropping both guards at the end of the function.
+Their Drop impls unlink the alias name and its scratch directory, and the
+runner's own open of `--initial-files` a few milliseconds later found nothing
+(the inherited directory fd still existed; the entry did not). `exec_command`
+moves both guards into its waiter task and drops them after the runner exits,
+which is why one-shot commands worked and shells never did.
+`crates/hive-backend/src/litebox.rs`: the pty waiter now owns both guards
+exactly like the exec waiter.
+
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
 Two production failures reported together, root-caused as two different

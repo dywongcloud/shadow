@@ -5035,6 +5035,19 @@ impl CellBackend for LiteboxBackend {
             // shell was never registered there to begin with, this just
             // guards a hypothetical future caller that keys off cell_id.
             let _ = funcs.lock().await.remove(&cell_id);
+            // The guest tar and its descriptor-bound alias MUST outlive the
+            // runner: their Drop guards unlink the alias name and its scratch
+            // directory. Dropping them at the end of `exec_pty` (as this
+            // function once did) raced the runner's own open of
+            // `--initial-files=/proc/self/fd/N/initial-files.tar` — the entry
+            // was gone a few milliseconds after spawn, litebox died with a bare
+            // `No such file or directory (os error 2)` on the pty, and every
+            // dashboard terminal "instantly disconnected" (witnessed
+            // 2026-09-01 on fc-sanjose: 101 upgrade, then that error frame and
+            // `{"type":"exited","exit_code":1}`). `exec_command` has always
+            // held both in its waiter; this is the same discipline.
+            drop(initial_files_alias);
+            drop(shell_tar);
         });
 
         let master_for_io = std::sync::Arc::new(master_fd);
