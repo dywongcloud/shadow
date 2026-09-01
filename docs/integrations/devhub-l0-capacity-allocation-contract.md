@@ -24,6 +24,11 @@ accepts only Base (8453), THEO
 `0xebE516a20238F79DC20b07eaD6768e08891Ed309`, 18 decimals, a 500-bps fee,
 two confirmations, and the named configuration reference.
 
+Base Mainnet and the separately reviewed Autheo Testnet configuration are
+documented in [Marketplace settlement profiles](../marketplace-settlement-profiles.md).
+The testnet profile is selected only by its explicit profile name; its
+environment values cannot repoint or otherwise alter the Base Mainnet profile.
+
 Each request signs the canonical UTF-8 string:
 
 ```text
@@ -42,7 +47,7 @@ logged.
 Discovery records are short-lived (60 seconds), contain only the public safe
 schema, and derive a provider recipient solely from the operator-owned
 provider registry. Payment intents snapshot the selected deployment binding,
-buyer address, Base/THEO settlement configuration, and exact split:
+buyer address, complete selected settlement configuration, and exact split:
 `fee = floor(gross / 20)` and `provider = gross - fee`. Amounts remain decimal
 atomic integers through the full EVM `uint256` range.
 
