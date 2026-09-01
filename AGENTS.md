@@ -1388,6 +1388,23 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   answer 200 from every vantage. Diagnose a sick pair from THREE vantages: the
   leader logged 1014 cached-hint timeouts to fc-frankfurt in 24h while
   fc-sanjose-3 logged 5 — the pair was sick, not the node.
+- **A direct-entry function whose entry does not exist fails the BUILD, never
+  the launch, and never as a node fault.** `git::preflight_direct_entries`
+  runs before `seal_host_runtime_artifact` for every Node/Bun function whose
+  argv is a plain `node <entry>` / `bun <entry>`: the entry (or its
+  `.js/.mjs/.cjs`, or a directory) must exist under
+  `checkout_root/app_rel/cwd_relative`, and the refusal names the entry, the
+  path examined, the sealed root's listing, package.json
+  `scripts.start`/`scripts.build`/`main`, and the deciding field
+  (`fluid.json functions[N].start_cmd` vs build-derived). The `fluid.json`
+  lane ships the checkout AS-IS — `produce_manifest` runs no install/build —
+  so `start_cmd: ["node","server.js"]` for a Next.js repo can never work
+  (witnessed: shoomoo2 / serverless-clawdbot@xstate, surfaced as
+  `NodeBackendUnavailable` at the readiness launch and charged to the NODE).
+  `litebox::validate_archive_main_entry` keeps a second net for artifacts
+  sealed by older binaries: a tar member miss is `DEPLOYMENT_START_FAILED`,
+  never `NODE_BACKEND_UNAVAILABLE`. Honoring install/build commands inside
+  the fluid.json lane is PRD `fluid-json-lane-honor-build-commands`.
 
 ## Deployment lifecycle: generations, previews, and the relocation reaper
 
