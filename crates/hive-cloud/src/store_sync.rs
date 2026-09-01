@@ -95,6 +95,36 @@ fn enc_sorted<T: serde::Serialize>(v: Vec<T>) -> Vec<u8> {
 
 pub static REGISTRY: &[SyncedStore] = &[
     SyncedStore {
+        // Allocation state is written on the leader but read on any API node;
+        // replicate it rather than trusting a node-local cache after DNS
+        // round-robin changes.
+        name: "marketplace_allocations",
+        snapshot: |c| enc_sorted(c.marketplace_allocations.snapshot()),
+        adopt: |c, b| {
+            let rows: Vec<crate::marketplace::Allocation> = serde_json::from_slice(b).ok()?;
+            // An empty leader response is ambiguous during cold start, so never
+            // wipe a follower's known authorizations from it.
+            if rows.is_empty() {
+                return None;
+            }
+            let count = rows.len();
+            c.marketplace_allocations.load(rows);
+            Some(count)
+        },
+    },
+    SyncedStore {
+        // HMAC replay facts and payment intents must follow the same
+        // leader-written/read-anywhere model as allocations.
+        name: "marketplace_security",
+        snapshot: |c| serde_json::to_vec(&c.marketplace_security.snapshot()).unwrap_or_default(),
+        adopt: |c, b| {
+            let snapshot: crate::marketplace::MarketplaceSecuritySnapshot =
+                serde_json::from_slice(b).ok()?;
+            c.marketplace_security.load(snapshot);
+            Some(1)
+        },
+    },
+    SyncedStore {
         name: "browser_admissions",
         // Unlike durable business stores, an empty active set is authoritative:
         // tombstones + the monotonic version prove it is a revocation, not a

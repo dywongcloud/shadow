@@ -57,6 +57,7 @@ mod incidents;
 mod inference;
 mod integrations;
 mod lease;
+mod marketplace;
 mod memwatch;
 mod mesh_raw;
 mod mesh_shell;
@@ -415,6 +416,11 @@ async fn async_main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The default hook still prints exactly as before, while this additionally
+    // leaves the first panic on disk for restart_audit. That is essential for
+    // a double-panic abort: Rust's final "panic in a destructor" line hides
+    // the original failure that actually needs fixing.
+    restart_audit::install_panic_hook();
     // Install the process-level rustls CryptoProvider FIRST (later installs
     // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
     // rustls features, so any rustls user that runs before one of the lazy
@@ -720,7 +726,7 @@ async fn async_main() -> anyhow::Result<()> {
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
     // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
-    let build_isolation_protocol = match build_executor::init_installed().await {
+    let _build_isolation_protocol = match build_executor::init_installed().await {
         Ok(protocol) => {
             tracing::info!(protocol, "BuildExecutor live probe passed");
             Some(protocol)
@@ -1857,6 +1863,9 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        // Marketplace is authenticated with its own service credential inside
+        // the module; it must never consume a DevHub hive_jwt.
+        .merge(crate::marketplace::routes().with_state(cloud.clone()))
         // guardian-growth-and-gc-observability: guardian.rs owns this route's
         // handler/state end-to-end (single-writer scope), so it merges here
         // rather than adding a line inside admin::router() itself. Same
@@ -1872,7 +1881,10 @@ async fn async_main() -> anyhow::Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             admin_max_body,
         ))
-        .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            admin_req_timeout,
+        ));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
@@ -2472,6 +2484,9 @@ async fn admin_ingress(
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
+            // Separate Marketplace service authentication is checked by its
+            // handlers, never by the DevHub hive_jwt gate.
+            || path.starts_with("/v1/marketplace/")
             // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
             // Per-project browser_db REST bearer, not a platform JWT — see

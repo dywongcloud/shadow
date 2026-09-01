@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { Twitter, Github, Linkedin, Dribbble, Menu, X } from "lucide-react";
-import Image from "next/image";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
 
@@ -57,17 +56,19 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
 ];
 
 function Logo({ className = "h-7" }: { className?: string }) {
-  // Wordmark is 1826×407 (≈ 4.49:1). Sized by height so it always fits the nav row
-  // and scales responsively; `w-auto` preserves the aspect ratio. `priority` because
-  // it is the above-the-fold brand LCP on every marketing page.
-  return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto select-none`} />;
+  return (
+    <span className={`inline-flex items-center font-display font-bold tracking-tight text-white ${className}`} style={{ lineHeight: 1 }}>
+      autheo<span className="text-emerald-400">.dev</span>
+      <span className="ml-2 text-[0.42em] uppercase tracking-[0.2em] text-emerald-300/90">DevHub</span>
+    </span>
+  );
 }
 
 export function MarketingShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
-  // The marketing/landing surface is ALWAYS the dark brand surface (#0c0d10),
+  // The marketing/landing surface is ALWAYS the dark brand surface (#050b07),
   // independent of the platform light/dark theme. Force the ROOT (html/body)
   // background to match so the overscroll/rubber-band area and any gutter show the
   // same dark — not the theme background (white in light mode). `color-scheme:dark`
@@ -84,13 +85,13 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
     //
     // Why not snapshot-and-restore the background too: on a fast logout→login the
     // shell can re-mount while the forced dark values are still applied, so a
-    // snapshot would capture `#0c0d10` and then "restore" it onto the dashboard —
+    // snapshot would capture `#050b07` and then "restore" it onto the dashboard —
     // leaving the dashboard on a dark body (looks unstyled/broken) until a manual
     // refresh. Clearing to "" reverts to `--background` every time, regardless of
     // mount ordering / StrictMode double-invoke.
     const prevScheme = html.style.colorScheme;
-    html.style.backgroundColor = "#0c0d10";
-    body.style.backgroundColor = "#0c0d10";
+    html.style.backgroundColor = "#050b07";
+    body.style.backgroundColor = "#050b07";
     html.style.colorScheme = "dark";
     body.style.overflowX = "clip";
     return () => {
@@ -123,11 +124,11 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div
-      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-[#0c0d10] text-white"
+      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-[#050b07] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
-      {/* Top nav — blue lining matches the SVG globe's blue streaks (#218CFF). */}
-      <header className="relative z-30 border-b border-[#218cff]/50 bg-[#0c0d10]/80 backdrop-blur">
+      {/* Top nav */}
+      <header className="relative z-30 border-b border-emerald-400/40 bg-[#050b07]/80 backdrop-blur">
         <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
           <Link href="/" className="shrink-0"><Logo className="h-7 sm:h-8" /></Link>
           <nav className="hidden items-center gap-8 font-semibold uppercase text-[18px] text-zinc-300 lg:flex">
@@ -170,9 +171,9 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       {menuOpen &&
         typeof document !== "undefined" &&
         createPortal(
-          <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
+          <div className="fixed inset-0 z-[200] flex flex-col bg-[#050b07] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
             {/* Top bar: logo + close button (mirrors the navbar). */}
-            <div className="flex items-center justify-between border-b border-[#218cff]/50 px-6 py-4">
+            <div className="flex items-center justify-between border-b border-emerald-400/40 px-6 py-4">
               <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
                 <Logo className="h-7" />
               </Link>
@@ -217,14 +218,14 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       {children}
 
       {/* Footer */}
-      <footer className="relative overflow-hidden bg-[#0c0d10]">
+      <footer className="relative overflow-hidden bg-[#050b07]">
         {/* Aurora glows rising from the bottom edge — light blue, aqua, turquoise,
             indigo and pink fuchsia. Dimmer + slightly larger radii for softer wash. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]">
-          <div className="absolute -bottom-44 left-[6%] h-[25.2rem] w-[25.2rem] rounded-full bg-teal-400/36 blur-[126px]" />
-          <div className="absolute -bottom-52 left-[33%] h-[31.5rem] w-[31.5rem] rounded-full bg-indigo-600/45 blur-[137px]" />
-          <div className="absolute -bottom-44 left-[55%] h-[25.2rem] w-[25.2rem] rounded-full bg-fuchsia-600/30 blur-[126px]" />
-          <div className="absolute -bottom-48 right-[6%] h-[27.3rem] w-[27.3rem] rounded-full bg-cyan-400/30 blur-[126px]" />
+          <div className="absolute -bottom-44 left-[6%] h-[25.2rem] w-[25.2rem] rounded-full bg-emerald-400/35 blur-[126px]" />
+          <div className="absolute -bottom-52 left-[33%] h-[31.5rem] w-[31.5rem] rounded-full bg-lime-500/35 blur-[137px]" />
+          <div className="absolute -bottom-44 left-[55%] h-[25.2rem] w-[25.2rem] rounded-full bg-green-500/30 blur-[126px]" />
+          <div className="absolute -bottom-48 right-[6%] h-[27.3rem] w-[27.3rem] rounded-full bg-teal-400/28 blur-[126px]" />
         </div>
         {/* Giant brand watermark — sits at the very bottom of the page, bleeding off
             the bottom edge, behind the footer content and lit by the glows. */}
@@ -235,12 +236,12 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               fontSize: "clamp(7rem, 30vw, 28rem)",
               opacity: 0.16,
               transform: "translateY(26%)",
-              backgroundImage: "linear-gradient(100deg, #5eead4 0%, #22d3ee 30%, #818cf8 60%, #e879f9 100%)",
+              backgroundImage: "linear-gradient(100deg, #34d399 0%, #22c55e 30%, #84cc16 60%, #86efac 100%)",
               maskImage: "linear-gradient(to top, black 30%, transparent 95%)",
               WebkitMaskImage: "linear-gradient(to top, black 30%, transparent 95%)",
             }}
           >
-            shadw
+            autheo
           </span>
         </div>
         <div className="relative z-10 mx-auto max-w-[1500px] px-6 pt-14 lg:px-10">
@@ -266,7 +267,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="mt-12 flex flex-col items-center justify-between gap-4 pt-6 sm:flex-row">
-            <span className="text-sm text-zinc-600">2026 Shadw. All rights reserved.</span>
+            <span className="text-sm text-zinc-600">2026 Autheo DevHub. All rights reserved.</span>
             <div className="flex items-center gap-5 text-zinc-500">
               <a href="#" aria-label="Twitter" className="transition-colors hover:text-white"><Twitter className="h-4 w-4" /></a>
               <a href="#" aria-label="GitHub" className="transition-colors hover:text-white"><Github className="h-4 w-4" /></a>

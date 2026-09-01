@@ -46,8 +46,8 @@
 use hive_core::now_ms;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How fresh a peer's gossiped `last_seen_ms` must be to count as independent
 /// proof of liveness.
@@ -112,14 +112,6 @@ fn mark_cold_key(key: String) -> bool {
     map.retain(|_, exp| *exp > now);
     COLD_MARKS.fetch_add(1, Ordering::Relaxed);
     map.insert(key, until).is_none()
-}
-
-/// Record a node-local routing penalty against the peer's current immutable
-/// endpoint identity. Unknown peers cannot create an unresolvable penalty.
-pub fn mark_cold(registry: &hive_edge::region::NodeRegistry, node: &str) -> bool {
-    registry
-        .peer_identity(node)
-        .is_some_and(|identity| mark_cold_key(cold_key(&identity)))
 }
 
 /// Is the peer's current immutable identity inside its local routing penalty

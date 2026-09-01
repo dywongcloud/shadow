@@ -41,8 +41,10 @@
 //!   host whose kernel buffer has rolled or is unreadable this is all the
 //!   evidence there is, and calling it `oom_kill` would be a lie the operator
 //!   cannot audit.
-//! * otherwise → **unclean_exit** (panic, SIGKILL from something else, power
-//!   loss with no boot-id change... also worth knowing, also invisible today).
+//! * a panic hook record naming the prior process → **panic_abort** (including
+//!   the original panic that a later destructor panic would otherwise bury).
+//! * otherwise → **unclean_exit** (SIGKILL from something else, power loss
+//!   with no boot-id change... also worth knowing, also invisible today).
 //!
 //! Every verdict is appended to a bounded history file, so "this node cycles
 //! every 2–3 hours" is a readable list of timestamps and uptimes rather than
@@ -57,7 +59,7 @@
 use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Bounded — this is a diagnostic tail, not a log.
@@ -78,6 +80,27 @@ fn marker_path() -> std::path::PathBuf {
 
 fn history_path() -> std::path::PathBuf {
     crate::persist::data_dir().join("restart_history.json")
+}
+
+/// The first panic observed in a process. Persisting this separately matters:
+/// a second panic in a destructor aborts Rust before the original panic's
+/// useful context can survive in the usual log tail.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PanicRecord {
+    #[serde(default)]
+    pid: u32,
+    #[serde(default)]
+    ts_ms: u64,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    location: String,
+}
+
+fn last_panic_path() -> std::path::PathBuf {
+    crate::persist::data_dir().join("last_panic.json")
 }
 
 /// The previous process's witness statement. Every field `serde(default)` so a
@@ -117,7 +140,7 @@ struct Marker {
 pub struct RestartRecord {
     pub ts_ms: u64,
     /// `first_boot` | `clean_restart` | `oom_kill` | `oom_suspected` |
-    /// `host_reboot` | `unclean_exit`
+    /// `host_reboot` | `panic_abort` | `unclean_exit`
     pub verdict: String,
     /// Human-readable statement of WHAT was observed, never a restatement of
     /// the verdict — an operator must be able to disagree with the conclusion
@@ -380,13 +403,68 @@ fn save_history(records: &[RestartRecord]) {
     }
 }
 
+fn read_last_panic() -> Option<PanicRecord> {
+    std::fs::read_to_string(last_panic_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// Preserve the first panic for the next boot, then delegate to Rust's default
+/// hook so stderr/backtraces remain unchanged. The hook deliberately avoids
+/// tracing and locks: it can run while another thread is unwinding.
+pub fn install_panic_hook() {
+    static PANIC_RECORDED: AtomicBool = AtomicBool::new(false);
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        if PANIC_RECORDED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".into());
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let record = PanicRecord {
+            pid: std::process::id(),
+            ts_ms: now_ms(),
+            thread: std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string(),
+            message,
+            location,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&record) {
+            write_atomic(&last_panic_path(), &bytes);
+        }
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // The audit itself.
 // ---------------------------------------------------------------------------
 
 /// Classify the previous process's exit from its marker plus live host
 /// evidence. Pure given its inputs; the I/O is all in [`audit_boot`].
-fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> RestartRecord {
+fn classify(
+    prev: &Marker,
+    now_boot_id: Option<&str>,
+    suspect_pct: u64,
+    panic: Option<&PanicRecord>,
+) -> RestartRecord {
     let now = now_ms();
     let uptime = prev.heartbeat_ms.saturating_sub(prev.started_ms);
     let limit = if prev.mem_limit_bytes > 0 {
@@ -410,6 +488,15 @@ fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> Resta
     if prev.clean_exit {
         rec.verdict = "clean_restart".into();
         rec.evidence = "previous process recorded a graceful shutdown (SIGTERM path ran)".into();
+        return rec;
+    }
+
+    if let Some(panic) = panic.filter(|panic| panic.pid == prev.pid) {
+        rec.verdict = "panic_abort".into();
+        rec.evidence = format!(
+            "panic hook captured {} on thread {:?} at {} (epoch-ms {}) before the process terminated",
+            panic.message, panic.thread, panic.location, panic.ts_ms
+        );
         return rec;
     }
 
@@ -483,9 +570,10 @@ pub fn audit_boot(node: &str) -> Value {
     STARTED_MS.store(now_ms(), Ordering::Relaxed);
     let suspect_pct = env_u64("HIVE_OOM_SUSPECT_PCT", 90).min(100);
     let now_boot = boot_id();
+    let last_panic = read_last_panic();
 
     let rec = match read_marker() {
-        Some(prev) => classify(&prev, now_boot.as_deref(), suspect_pct),
+        Some(prev) => classify(&prev, now_boot.as_deref(), suspect_pct, last_panic.as_ref()),
         None => RestartRecord {
             ts_ms: now_ms(),
             verdict: "first_boot".into(),
@@ -556,6 +644,14 @@ pub fn audit_boot(node: &str) -> Value {
             prev_uptime_secs = rec.prev_uptime_ms / 1000,
             restarts_24h,
             "UNCLEAN RESTART: the previous process died without a graceful shutdown"
+        ),
+        "panic_abort" => tracing::error!(
+            node,
+            evidence = %rec.evidence,
+            prev_pid = rec.prev_pid,
+            prev_uptime_secs = rec.prev_uptime_ms / 1000,
+            restarts_24h,
+            "PANIC RESTART: the previous process panicked before aborting"
         ),
         "host_reboot" => tracing::warn!(
             node,

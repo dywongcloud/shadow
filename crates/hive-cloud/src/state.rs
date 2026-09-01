@@ -304,6 +304,12 @@ pub struct CloudState {
     pub domains: crate::dns::DomainStore,
     pub docs: crate::docstore::DocStore,
     pub billing: crate::billing::BillingStore,
+    /// Marketplace allocations are replicated control-plane records. They
+    /// contain authorization metadata only; no mesh credentials or workloads.
+    pub marketplace_allocations: crate::marketplace::AllocationStore,
+    /// Durable HMAC nonce replay facts, opaque advertisements, and Marketplace
+    /// payment intents. This is replicated because public API reads round-robin.
+    pub marketplace_security: crate::marketplace::MarketplaceSecurityStore,
     pub audit: crate::audit::AuditLog,
     pub notifications: crate::notifications::NotificationStore,
     /// Web-push subscriptions + SMS targets + delivery watermarks (see
@@ -779,6 +785,8 @@ impl CloudState {
             domains: crate::dns::DomainStore::new(),
             docs: crate::docstore::DocStore::new(),
             billing: crate::billing::BillingStore::new(),
+            marketplace_allocations: crate::marketplace::AllocationStore::default(),
+            marketplace_security: crate::marketplace::MarketplaceSecurityStore::default(),
             audit: crate::audit::AuditLog::new(crate::persist::data_dir().join("audit.jsonl")),
             notifications: crate::notifications::NotificationStore::new(),
             push: crate::push::PushStore::new(),

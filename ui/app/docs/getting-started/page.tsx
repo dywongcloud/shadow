@@ -5,23 +5,23 @@ import { CodeBlock } from "@/components/code-block";
 
 
 export const metadata: Metadata = {
-  title: "Getting Started — shadw Docs",
+  title: "Getting Started — autheo Docs",
   description:
-    "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+    "Deploy your first app on autheo. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
   alternates: { canonical: "/docs/getting-started" },
   openGraph: {
-    title: "Getting Started — shadw Docs",
+    title: "Getting Started — autheo Docs",
     description:
-      "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+      "Deploy your first app on autheo. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
     url: "/docs/getting-started",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Getting Started — shadw Docs",
+    title: "Getting Started — autheo Docs",
     description:
-      "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions over the Iroh QUIC mesh, custom domains, the CLI, and self-hosting.",
+      "Deploy your first app on autheo: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions over the Iroh QUIC mesh, custom domains, the CLI, and self-hosting.",
   },
 };
 
@@ -57,7 +57,7 @@ export default function GettingStarted() {
         <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">Documentation</div>
         <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">Getting started</h1>
         <p className="mt-4 text-lg text-secondary">
-          Everything you need to deploy and run apps on <strong className="text-fg">shadw</strong> — the
+          Everything you need to deploy and run apps on <strong className="text-fg">autheo</strong> — the
           self-hosted, peer-to-peer cloud.
         </p>
       </div>
@@ -65,7 +65,7 @@ export default function GettingStarted() {
       <div className="space-y-2">
         <Section id="introduction" eyebrow="Overview" title="Introduction">
           <p>
-            shadw turns any machine you run into a region. Nodes find each other over a real peer-to-peer mesh
+            autheo turns any machine you run into a region. Nodes find each other over a real peer-to-peer mesh
             (Iroh QUIC, with NAT traversal + relay fallback) and serve your deployments by anycast — no data
             center, no public IPs. The platform is two layers over one isolation backend:
           </p>
@@ -73,12 +73,12 @@ export default function GettingStarted() {
             <li><strong className="text-fg">Builds</strong> — turn a git repo into build output (framework detection or a Dockerfile).</li>
             <li><strong className="text-fg">Fluid compute</strong> — serve functions on long-lived instances that handle many concurrent requests, autoscale, and scale to zero.</li>
           </ul>
-          <p>Everything below talks to the platform <strong className="text-fg">API</strong> at <In>https://api.shadw.cloud</In>. (Self-hosting? The same endpoints live on your node&apos;s admin API — default <In>127.0.0.1:8786</In>.)</p>
+          <p>Everything below talks to the platform <strong className="text-fg">API</strong> at <In>https://api.autheo.dev</In>. (Self-hosting? The same endpoints live on your node&apos;s admin API — default <In>127.0.0.1:8786</In>.)</p>
         </Section>
 
         <Section id="quickstart" eyebrow="Get started" title="Quickstart">
           <p>From the dashboard, click <strong className="text-fg">New Project</strong>, pick a template or paste a Git URL, and deploy. Or via the API:</p>
-          <One lang="bash" filename="deploy.sh" code={`curl -X POST https://api.shadw.cloud/v1/git/deploy \\
+          <One lang="bash" filename="deploy.sh" code={`curl -X POST https://api.autheo.dev/v1/git/deploy \\
   -H 'content-type: application/json' -H 'x-hive-team: personal' \\
   -d '{ "repo_url": "https://github.com/acme/app", "project": "my-app", "production": true }'
 # -> { "build_id": "dpl-…", "project": "my-app" }`} />
@@ -86,11 +86,11 @@ export default function GettingStarted() {
         </Section>
 
         <Section id="deploying" eyebrow="Builds" title="Deploying apps">
-          <p>shadw detects how to build your repo and produces a deployment routed by its subdomain.</p>
+          <p>autheo detects how to build your repo and produces a deployment routed by its subdomain.</p>
           <H3>From a Git repository</H3>
           <p>Framework-Defined Infrastructure detects Next.js, Vite, React, SvelteKit, Nuxt, Vue, Astro, Remix, Express and more — runs install/build and normalizes the output into static assets and/or a serverless server.</p>
           <H3>Containers (Dockerfile)</H3>
-          <p>If a <In>Dockerfile</In> is present, shadw builds the image and runs it as a container (Railway-style). Stateful container singletons use consensus-free leases + fencing, so a node failure triggers automatic failover.</p>
+          <p>If a <In>Dockerfile</In> is present, autheo builds the image and runs it as a container (Railway-style). Stateful container singletons use consensus-free leases + fencing, so a node failure triggers automatic failover.</p>
           <H3>Build configuration</H3>
           <p>Override detection per project under <strong className="text-fg">Settings → Build</strong>: install/build commands, output directory, and root directory (monorepos).</p>
           <Callout>The latest production deploy owns the project&apos;s domain; each deploy also gets a per-deployment URL. Roll back instantly by promoting a prior deployment.</Callout>
@@ -100,14 +100,14 @@ export default function GettingStarted() {
           <p>Set variables when creating a project or under <strong className="text-fg">Settings → Environment Variables</strong>. They&apos;re injected into <strong className="text-fg">both build and runtime</strong> — so <In>NEXT_PUBLIC_*</In>, <In>VITE_*</In> and server config all work.</p>
           <H3>Secrets are encrypted at rest</H3>
           <p>Variables marked <strong className="text-fg">Sensitive</strong> are sealed with ChaCha20-Poly1305 before they touch disk — stored as <In>enc:v1:…</In>, masked in API responses, and decrypted only when injected.</p>
-          <One lang="bash" filename="env.sh" code={`curl -X POST https://api.shadw.cloud/v1/projects/my-app/env \\
+          <One lang="bash" filename="env.sh" code={`curl -X POST https://api.autheo.dev/v1/projects/my-app/env \\
   -H 'content-type: application/json' -H 'x-hive-team: personal' \\
   -d '{ "key": "API_KEY", "value": "sk-live-…", "target": "all", "sensitive": true }'`} />
           <Callout tone="warn">Back up <In>$HIVE_DATA/secret.key</In> (or set <In>HIVE_SECRET_KEY</In>) — without it, sealed secrets can&apos;t be decrypted.</Callout>
         </Section>
 
         <Section id="gitops" eyebrow="Automation" title="GitOps">
-          <p>Connect GitHub once and shadw manages your org <strong className="text-fg">as code</strong>: it commits project config to a repo as <In>openedge.yaml</In> and keeps it in sync.</p>
+          <p>Connect GitHub once and autheo manages your org <strong className="text-fg">as code</strong>: it commits project config to a repo as <In>openedge.yaml</In> and keeps it in sync.</p>
           <ul className="list-disc space-y-1.5 pl-5">
             <li><strong className="text-fg">Push to deploy</strong> — a push triggers a build &amp; deploy via an installed GitHub Action + webhook.</li>
             <li><strong className="text-fg">Config-as-code</strong> — declarative config, versioned in git.</li>
@@ -140,12 +140,12 @@ hivectl submit --image node:20 -c 'npm ci' -c 'npm run build' --follow`} />
         </Section>
 
         <Section id="api" eyebrow="Reference" title="API reference">
-          <p>All endpoints live under <In>https://api.shadw.cloud</In> (self-hosting: your node&apos;s admin API). Authenticate with a platform <strong className="text-fg">API key</strong> (<In>hive_…</In>, created under Settings → API Keys or <In>POST /v1/apikeys</In>) via <In>Authorization: Bearer</In> — the key is bound to its team, so no team header is needed. Without a key, the <In>x-hive-team</In> header scopes requests in dev mode; when <In>HIVE_JWT_SECRET</In> is set, mutations require a JWT minted with <In>POST /v1/token</In>.</p>
+          <p>All endpoints live under <In>https://api.autheo.dev</In> (self-hosting: your node&apos;s admin API). Authenticate with a platform <strong className="text-fg">API key</strong> (<In>hive_…</In>, created under Settings → API Keys or <In>POST /v1/apikeys</In>) via <In>Authorization: Bearer</In> — the key is bound to its team, so no team header is needed. Without a key, the <In>x-hive-team</In> header scopes requests in dev mode; when <In>HIVE_JWT_SECRET</In> is set, mutations require a JWT minted with <In>POST /v1/token</In>.</p>
           <ApiTable />
         </Section>
 
         <Section id="self-hosting" eyebrow="Operations" title="Self-hosting">
-          <p>shadw is one node binary. Run at least two for the full mesh (anycast, failover):</p>
+          <p>autheo is one node binary. Run at least two for the full mesh (anycast, failover):</p>
           <One lang="bash" filename="cluster.sh" code={`hive-cloud --name node-a --listen 127.0.0.1:8787 --admin 127.0.0.1:8786
 
 HIVE_DATA=~/.hive-cloud-b HIVE_DNS_ADDR=127.0.0.1:5355 HIVE_TLS_ADDR=127.0.0.1:8444 \\
@@ -164,7 +164,7 @@ HIVE_DATA=~/.hive-cloud-b HIVE_DNS_ADDR=127.0.0.1:5355 HIVE_TLS_ADDR=127.0.0.1:8
       </div>
 
       <footer className="mt-16 flex items-center justify-between border-t border-border pt-6 text-sm text-muted">
-        <span>© 2026 shadw.cloud</span>
+        <span>© 2026 autheo.dev</span>
         <Link href="/docs" className="hover:text-fg">← Back to docs</Link>
       </footer>
     </div>

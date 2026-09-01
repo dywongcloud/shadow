@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "The sealed-output and cache APIs are compiled with the executor so their capability checks stay reviewed, but the production build flow has not enabled those optional paths."
+)]
+
 //! Fail-closed execution boundary for repository-controlled build commands.
 //!
 //! The executor deliberately has no host-process or alternate-runtime path. A

@@ -8,7 +8,7 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!proces
 // other accounts are isolated under `u_<uid>`). Mirrors the backend's
 // HIVE_OWNER_EMAIL authoritative check. Determined HERE from the verified Clerk
 // email rather than from `/v1/identity/sync`, because that endpoint is an
-// auth-gated mutation and 401s at the enforced api.shadw.cloud ingress BEFORE we
+// auth-gated mutation and 401s at the enforced api.autheo.dev ingress BEFORE we
 // hold a token (the mint is the token bootstrap). The tenant we compute is only
 // trusted by the backend because the mint (`/v1/token`) is `x-hive-internal`-
 // gated — a non-owner can neither reach the mint nor be assigned "personal" here.

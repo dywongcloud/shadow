@@ -1207,7 +1207,7 @@ impl Gateway {
             state,
             tenant,
             None,
-            true,
+            None,
         )
     }
 
@@ -1227,6 +1227,38 @@ impl Gateway {
         tenant: String,
         project_incarnation: ProjectIncarnation,
     ) -> DeploymentInfo {
+        self.deploy_full_with_runtime_exact_marketplace(
+            host_static_root,
+            runtime_workdir,
+            manifest,
+            creator,
+            git,
+            production,
+            state,
+            tenant,
+            project_incarnation,
+            None,
+        )
+    }
+
+    /// Exact-incarnation deployment registration with a previously validated,
+    /// immutable Marketplace placement snapshot. Only the server-side DevHub
+    /// Marketplace consumer supplies this; callers cannot mutate it after this
+    /// point because it is copied directly into the deployment record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deploy_full_with_runtime_exact_marketplace(
+        &self,
+        host_static_root: String,
+        runtime_workdir: Option<String>,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+        state: fluid_core::DeployState,
+        tenant: String,
+        project_incarnation: ProjectIncarnation,
+        marketplace_placement: Option<fluid_core::MarketplacePlacementSnapshot>,
+    ) -> DeploymentInfo {
         self.deploy_full_with_runtime_incarnation(
             host_static_root,
             runtime_workdir,
@@ -1237,7 +1269,7 @@ impl Gateway {
             state,
             tenant,
             Some(project_incarnation),
-            true,
+            marketplace_placement,
         )
     }
 
@@ -1323,7 +1355,7 @@ impl Gateway {
         mut state: fluid_core::DeployState,
         tenant: String,
         project_incarnation: Option<ProjectIncarnation>,
-        publish_routes: bool,
+        marketplace_placement: Option<fluid_core::MarketplacePlacementSnapshot>,
     ) -> DeploymentInfo {
         // Normalize the owner once at the boundary so the stored record, the
         // function pools, and every cell agree on the tenant (empty => "personal").
@@ -1400,6 +1432,7 @@ impl Gateway {
                 "preview".into()
             },
             tenant,
+            marketplace_placement,
         };
         let info = view_of(&dep);
         // A typed Build Contract refusal (including one caught HERE, at deploy
@@ -2207,6 +2240,7 @@ impl Gateway {
                 target: d.target.clone(),
                 state: d.state,
                 tenant: d.tenant.clone(),
+                marketplace_placement: d.marketplace_placement.clone(),
             })
             .collect()
     }
@@ -2294,6 +2328,7 @@ impl Gateway {
             // pre-tenancy snapshot, or one written by a stale/rolling-upgrade
             // binary. Fail closed: never adopt it into a live tenant.
             tenant: restored_tenant,
+            marketplace_placement: rec.marketplace_placement,
         };
         let project = dep.project.clone();
         let static_root = static_files::StaticRoot::open(&dep.root).ok();
@@ -5635,6 +5670,7 @@ mod route_policy_tests {
             production: true,
             target: "production".into(),
             tenant: String::new(),
+            marketplace_placement: None,
         }
     }
 

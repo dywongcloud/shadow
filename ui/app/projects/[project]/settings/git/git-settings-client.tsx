@@ -142,7 +142,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
           for (const res of results) {
             if (res?.restricted && res?.approve_url && !restrictedCta) {
               restrictedCta = {
-                text: "An organization restricts OpenEdge. Approve the app to import its repositories.",
+                text: "An organization restricts DevHub. Approve the app to import its repositories.",
                 approveUrl: res.approve_url,
               };
             }

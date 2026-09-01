@@ -4,23 +4,23 @@ import { Mail, MessageSquare, Building2 } from "lucide-react";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 
 export const metadata: Metadata = {
-  title: "Contact — shadw",
+  title: "Contact — autheo",
   description:
-    "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
+    "Get in touch with autheo about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
   alternates: { canonical: "/contact" },
   openGraph: {
-    title: "Contact — shadw",
+    title: "Contact — autheo",
     description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
+      "Get in touch with autheo about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
     url: "/contact",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Contact — shadw",
+    title: "Contact — autheo",
     description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise, or send us a message.",
+      "Get in touch with autheo about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise, or send us a message.",
   },
 };
 
@@ -40,9 +40,9 @@ export default function ContactPage() {
 
       <MarketingSection className="grid gap-6 py-16 md:grid-cols-3">
         {[
-          { icon: MessageSquare, title: "Sales", desc: "Talk through your use case and self-hosting plan.", cta: "sales@shadw.cloud" },
-          { icon: Mail, title: "Support", desc: "Get help with deployments, domains, or the mesh.", cta: "support@shadw.cloud" },
-          { icon: Building2, title: "Enterprise", desc: "Data residency, SSO, audit logs and SLAs.", cta: "enterprise@shadw.cloud" },
+          { icon: MessageSquare, title: "Sales", desc: "Talk through your use case and self-hosting plan.", cta: "sales@autheo.dev" },
+          { icon: Mail, title: "Support", desc: "Get help with deployments, domains, or the mesh.", cta: "support@autheo.dev" },
+          { icon: Building2, title: "Enterprise", desc: "Data residency, SSO, audit logs and SLAs.", cta: "enterprise@autheo.dev" },
         ].map((c) => (
           <GlowCard key={c.title}>
             <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5">

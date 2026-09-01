@@ -384,7 +384,7 @@ export function sqliteRow(db: SqliteDb): UnifiedDb {
     href: `/storage/${encodeURIComponent(sqliteRouteId(db.project))}`,
     name: db.project,
     kind: "browser_sqlite",
-    provider: "OpenEdge SQLite (browser-replicated)",
+    provider: "DevHub SQLite (browser-replicated)",
     project: db.project,
     region: "global",
     regionTitle:
