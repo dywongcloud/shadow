@@ -157,6 +157,70 @@ struct Gpu {
     count: u32,
 }
 
+/// The intentionally narrow Marketplace L0 advertisement contract.
+///
+/// Internal listings retain the additional scheduling data needed for
+/// settlement and placement. This projection prevents that data from becoming
+/// part of the Marketplace response by accident.
+#[derive(Serialize)]
+struct MarketplaceDeploymentsResponse {
+    data: Vec<MarketplaceDeployment>,
+}
+
+#[derive(Serialize)]
+struct MarketplaceDeployment {
+    deployment_id: String,
+    provider_id: String,
+    canonical_node_id: String,
+    provider_recipient: String,
+    region: String,
+    runtime: String,
+    capabilities: MarketplaceCapabilities,
+    availability: MarketplaceAvailability,
+    health: &'static str,
+    issued_at: String,
+    expires_at: String,
+    revoked_at: Option<String>,
+    configuration_reference: &'static str,
+}
+
+#[derive(Serialize)]
+struct MarketplaceCapabilities {
+    vcpu: u32,
+    ram_mib: u64,
+    storage_gib: u64,
+}
+
+#[derive(Serialize)]
+struct MarketplaceAvailability {
+    available: bool,
+    capacity_units: u8,
+}
+
+impl MarketplaceDeployment {
+    fn from_listed(entry: ListedDeployment, issued_at_ms: u64) -> Self {
+        Self {
+            deployment_id: entry.deployment_id,
+            provider_id: entry.provider_id,
+            canonical_node_id: entry.canonical_node_id,
+            provider_recipient: entry.provider_recipient,
+            region: entry.region,
+            runtime: entry.runtime,
+            capabilities: MarketplaceCapabilities {
+                vcpu: entry.capabilities.vcpu,
+                ram_mib: entry.capabilities.ram_mib,
+                storage_gib: entry.capabilities.storage_gib,
+            },
+            availability: MarketplaceAvailability { available: true, capacity_units: 1 },
+            health: "healthy",
+            issued_at: iso_millis_timestamp(issued_at_ms),
+            expires_at: iso_millis_timestamp(entry.expires_at_ms),
+            revoked_at: None,
+            configuration_reference: "l0-config-v1",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SettlementConfig {
     currency: String,
@@ -444,21 +508,18 @@ fn listed_deployments(cloud: &CloudState) -> Vec<ListedDeployment> {
 async fn list_deployments(
     State(cloud): State<Arc<CloudState>>,
     headers: HeaderMap,
-) -> ApiResult<Value> {
+) -> ApiResult<MarketplaceDeploymentsResponse> {
     verify_marketplace_request(&cloud, "GET", "/v1/marketplace/l0/deployments", &headers, &[])?;
     let now = hive_core::now_ms();
     let listed = listed_deployments(&cloud);
     cloud.marketplace_security.replace_deployments(listed.clone());
     crate::persist::persist(&cloud);
-    Ok(Json(json!({"data": listed.into_iter().map(|entry| json!({
-        "deployment_id": entry.deployment_id, "provider_id": entry.provider_id,
-        "canonical_node_id": entry.canonical_node_id, "provider_recipient": entry.provider_recipient,
-        "region": entry.region, "runtime": entry.runtime, "capabilities": entry.capabilities,
-        "availability": {"available": true, "capacity_units": 1}, "health": "healthy",
-        "issued_at": iso_timestamp(now),
-        "expires_at": iso_timestamp(entry.expires_at_ms),
-        "revoked_at": Value::Null, "configuration_reference": "l0-config-v1"
-    })).collect::<Vec<_>>() })))
+    Ok(Json(MarketplaceDeploymentsResponse {
+        data: listed
+            .into_iter()
+            .map(|entry| MarketplaceDeployment::from_listed(entry, now))
+            .collect(),
+    }))
 }
 
 async fn get_settlement_config(
@@ -681,6 +742,11 @@ fn valid_order_reference(value: &str) -> bool {
 fn iso_timestamp(timestamp_ms: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms as i64)
         .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+fn iso_millis_timestamp(timestamp_ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms as i64)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
 }
 fn valid_transaction_hash(value: &str) -> bool { valid_order_reference(value) }
