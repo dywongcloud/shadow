@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { disconnectGithub, githubConfigured, resolveEntity } from "@/lib/github";
 
-export const dynamic = "force-dynamic";
-
 /**
  * Disconnect the signed-in user's GitHub connection (deletes EVERY Composio
  * connected_account the entity has for GitHub, so a later reconnect binds a fresh

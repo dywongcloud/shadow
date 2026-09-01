@@ -8,11 +8,13 @@
 //! workloads (Vercel Sandbox parity). This module owns the PURE model:
 //! records, validation, secret redaction, and the [`SandboxProvider`]
 //! abstraction. The concrete production backend
-//! ([`crate::sandboxes_platform::PlatformSandboxProvider`]) is podman-backed —
-//! this platform is a self-hosted cloud, not a Vercel customer, so "production
-//! provider" means the platform's OWN isolated-container tech (the same
-//! primitives functions/containers already use), not a call out to Vercel's
-//! commercial API. [`MockSandboxProvider`] here is strictly for tests.
+//! ([`crate::sandboxes_platform::PlatformSandboxProvider`]) runs real
+//! isolated cells via `hive_backend::CellBackend` (Firecracker microVMs, or
+//! Litebox where verified) — this platform is a self-hosted cloud, not a
+//! Vercel customer, so "production provider" means the platform's OWN
+//! microVM/sandbox tech (the same primitives serverless functions already
+//! use), not a call out to Vercel's commercial API. [`MockSandboxProvider`]
+//! here is strictly for tests.
 //!
 //! SECURITY (ZeroTrust): every record is tenant + project scoped
 //! (`SandboxRecord.tenant_id`/`project_id`); every mutation is authorized via
@@ -161,15 +163,28 @@ pub struct SandboxRecord {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<u64>,
-    /// Internal: the podman container name backing this sandbox (empty for
-    /// simulated/unavailable-engine sandboxes). Never exposed to a different
-    /// tenant/project since the whole record is scoped.
+    /// Internal: the cell id backing this sandbox on its owner node. Never
+    /// exposed to a different tenant/project since the whole record is scoped.
     #[serde(default)]
     pub container: String,
-    /// Human-readable note for degraded states (e.g. "podman unavailable — this
-    /// sandbox is simulated"), mirroring the DB-provisioning "simulated" idiom.
+    /// Human-readable operator note for degraded states (e.g. a record whose
+    /// cell was lost to a node restart and is re-provisioned on next use).
+    /// A provisioning FAILURE never produces a record at all —
+    /// `PlatformSandboxProvider::create_sandbox` fails closed with a typed
+    /// `EngineUnavailable`, so this is never a "simulated" marker.
     #[serde(default)]
     pub note: String,
+    /// The node that holds this sandbox's live cell — the ONLY node that can
+    /// run commands, open a shell, stop or delete it. Sandbox mutations are
+    /// still forwarded to the control-plane leader (`admin_ingress`), but the
+    /// leader itself may have no exec-capable backend (fc-sanjose runs Mock),
+    /// in which case `sandboxes_api::create_sandbox` delegates provisioning to
+    /// a capable peer and adopts the peer's record; every cell-reaching
+    /// operation then re-routes to THIS node. Empty only on a record persisted
+    /// before this field existed — readers treat that as "the leader" (the
+    /// pre-field placement rule).
+    #[serde(default)]
+    pub owner_node: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,6 +296,13 @@ pub enum SandboxError {
     SnapshotNotFound(String),
     MountNotFound(String),
     AlreadyExists(String),
+    /// No node in the live registry advertises an exec-capable sandbox backend
+    /// (or every one that does refused/timed out) — the create was applied
+    /// NOWHERE. Carries the candidates tried and why each failed.
+    NoCapableNode(String),
+    /// The record names an owner node that could not be reached for a
+    /// cell-touching operation — nothing was applied; retry later.
+    OwnerUnreachable(String),
 }
 impl SandboxError {
     pub fn code(&self) -> &'static str {
@@ -298,6 +320,8 @@ impl SandboxError {
             SandboxError::SnapshotNotFound(_) => "SANDBOX_SNAPSHOT_NOT_FOUND",
             SandboxError::MountNotFound(_) => "SANDBOX_MOUNT_NOT_FOUND",
             SandboxError::AlreadyExists(_) => "SANDBOX_ALREADY_EXISTS",
+            SandboxError::NoCapableNode(_) => "SANDBOX_NO_CAPABLE_NODE",
+            SandboxError::OwnerUnreachable(_) => "SANDBOX_OWNER_UNREACHABLE",
         }
     }
     pub fn message(&self) -> String {
@@ -314,9 +338,23 @@ impl SandboxError {
             | SandboxError::CommandNotFound(s)
             | SandboxError::SnapshotNotFound(s)
             | SandboxError::MountNotFound(s)
-            | SandboxError::AlreadyExists(s) => s.clone(),
+            | SandboxError::AlreadyExists(s)
+            | SandboxError::NoCapableNode(s)
+            | SandboxError::OwnerUnreachable(s) => s.clone(),
         }
     }
+}
+
+/// THE capability predicate: can a node whose gossiped `NodeInfo::backend` is
+/// `backend` provision a sandbox cell AND execute commands / open a PTY inside
+/// it? One function, used by every caller — the local "may I provision here"
+/// check and the remote candidate filter — so the two can never disagree.
+/// "firecracker" runs `hive-cell-agent`'s `Exec`/`KillExec`/`ExecPty` over
+/// vsock; "litebox" runs `LiteboxBackend::exec_command`/`kill_exec`/`exec_pty`
+/// against a host-spawned guest. "mock" (and anything unknown / a pre-upgrade
+/// peer's empty string) has no real isolation and is never a candidate.
+pub fn sandbox_exec_capable(backend: &str) -> bool {
+    matches!(backend, "firecracker" | "litebox")
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +589,9 @@ pub struct SandboxesSnapshot {
 // Provider abstraction
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+/// Also the wire shape of a leader→owner delegated create (serde derives), so
+/// the delegate provisions from EXACTLY the input the leader validated.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSandboxInput {
     pub name: String,
     pub runtime: String,
@@ -600,8 +640,8 @@ pub struct MountConfigInput {
 
 /// Provider-neutral sandbox backend. The UI/API talk to this trait, never to a
 /// concrete engine directly — [`crate::sandboxes_platform::PlatformSandboxProvider`]
-/// (podman) is the production implementation; [`MockSandboxProvider`] exists
-/// ONLY for unit tests.
+/// (Firecracker/Litebox) is the production implementation; [`MockSandboxProvider`]
+/// exists ONLY for unit tests.
 #[async_trait::async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError>;
@@ -648,6 +688,27 @@ pub trait SandboxProvider: Send + Sync {
         id: &str,
         command_id: &str,
     ) -> Result<SandboxCommandRecord, SandboxError>;
+    /// Open an interactive terminal session against the sandbox's cell (real
+    /// pty: `vim`/`less`/`^C`/tab-completion all work). Returns an event
+    /// receiver (`hive_core::AgentEvent::PtyOutput`* then one `PtyExited`)
+    /// plus a [`hive_backend::PtyIo`] the caller uses to push typed bytes /
+    /// resize events back — mirrors `run_command`'s shape but duplex and
+    /// long-lived instead of one-shot. `EngineUnavailable` on a node with no
+    /// real isolation backend, or one whose backend doesn't implement PTY
+    /// support yet (`CellBackend::exec_pty`'s own unsupported default).
+    async fn open_shell(
+        &self,
+        project_id: &str,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    >;
     async fn write_files(
         &self,
         project_id: &str,
@@ -703,7 +764,7 @@ pub trait SandboxProvider: Send + Sync {
 
 /// In-memory provider used ONLY by unit/integration tests exercising the
 /// service layer (authz, quotas, validation) without spinning up real
-/// containers. `ProductionProvider ≡ PlatformSandboxProvider` — this type must
+/// microVMs. `ProductionProvider ≡ PlatformSandboxProvider` — this type must
 /// never be constructed outside `#[cfg(test)]`.
 #[cfg(test)]
 pub struct MockSandboxProvider {
@@ -797,6 +858,7 @@ impl SandboxProvider for MockSandboxProvider {
             deleted_at: None,
             container: String::new(),
             note: String::new(),
+            owner_node: "mock".into(),
         };
         self.sandboxes.lock().push(rec.clone());
         Ok(rec)
@@ -934,6 +996,23 @@ impl SandboxProvider for MockSandboxProvider {
         c.status = CommandStatus::Killed;
         c.finished_at = Some(3);
         Ok(c.clone())
+    }
+    async fn open_shell(
+        &self,
+        _project_id: &str,
+        _id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    > {
+        Err(SandboxError::EngineUnavailable(
+            "MockSandboxProvider does not support interactive shells".into(),
+        ))
     }
     async fn write_files(
         &self,

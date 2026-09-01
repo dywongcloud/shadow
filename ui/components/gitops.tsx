@@ -212,7 +212,6 @@ export function GitOps() {
     if (scope === "org" && !org) return; // wait for a login before listing org repos
     const t = setTimeout(() => loadRepos(org), 350);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, mode, scope, orgLogin, status.connected]);
 
   const finishOnboarding = useCallback(() => {
@@ -254,7 +253,6 @@ export function GitOps() {
     };
     window.addEventListener("hive-open-gitops", open);
     return () => window.removeEventListener("hive-open-gitops", open);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Decide whether to show the modal, and at which step.

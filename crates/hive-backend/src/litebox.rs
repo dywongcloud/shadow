@@ -244,7 +244,7 @@
 //! kernels (KVM without hardware virt)").
 
 use crate::{
-    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, RuntimeArtifactSpec,
+    CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
 };
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -254,7 +254,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{Read as StdRead, Write as StdWrite};
+use std::io::{Read as StdRead, Seek as StdSeek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -450,11 +450,25 @@ struct LiteboxFunctionProcess {
     _initial_files: File,
 }
 
+/// One in-flight `exec_command` (Sandboxes): the runner was spawned as the
+/// LEADER of its own process group, so `pgid` names the whole guest process
+/// tree — the runner plus every child the guest forks (the AnEntrypoint base
+/// tracks guest `fork()` as real host forks, which inherit the group) — and
+/// `kill_exec` terminates all of it with one `killpg`. Removed by the waiter
+/// task the moment the runner is reaped, so a late kill is a no-op.
+#[derive(Clone)]
+struct LiteboxExec {
+    cell: CellId,
+    pgid: i32,
+}
+
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
     /// Long-lived function processes (the litebox runner itself — guest and
     /// runner are one process), keyed by cell, killed on terminate.
     funcs: Arc<AsyncMutex<HashMap<CellId, LiteboxFunctionProcess>>>,
+    /// Live sandbox execs keyed by `ExecRequest.id` — see [`LiteboxExec`].
+    execs: Arc<AsyncMutex<HashMap<String, LiteboxExec>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
     /// Per-cell host-container ownership. Container cells bypass litebox and run
@@ -1268,9 +1282,31 @@ fn remove_cache_directory_contents(directory: &ArtifactDirectory) -> anyhow::Res
 
 impl LiteboxBackend {
     pub fn new(cfg: LiteboxConfig) -> Self {
+        // Reap guests orphaned by a previous hive-cloud incarnation. The
+        // service runs KillMode=process (load-bearing — see AGENTS.md) so
+        // systemd never kills runner children, and the controlled-restart path
+        // exits via `process::exit`, which skips every `kill_on_drop`
+        // destructor — each restart therefore stranded at least one guest,
+        // still bound to its TUN address and still serving its OLD build.
+        // When a fresh cell later reused the same net index, the two guests
+        // shared one /30 and requests interleaved between builds: corrupted
+        // compressed bodies (ERR_CONTENT_DECODING_FAILED in browsers),
+        // "function closed before headers" 502s, and stale chunk names —
+        // all witnessed live on nodes-wtf 2026-08-26. At construction this
+        // process owns every litebox cell on the node and none may be running,
+        // so any surviving runner is definitionally stale.
+        Self::reap_orphaned_runners(&cfg.runner_bin);
+        // The guest network stack services ONE inbound connection at a time
+        // (single-listener serial re-arm); overlapping tunnel connects were
+        // accept-closed as "function closed before headers". Queue them at the
+        // tunnel's connect gate instead — a request waits microseconds rather
+        // than failing. Process-wide is correct: a node runs exactly one
+        // backend, and every function on a litebox node is a litebox guest.
+        fluid_tunnel::set_local_connect_permits(1);
         LiteboxBackend {
             cfg,
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
+            execs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
             cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1278,6 +1314,53 @@ impl LiteboxBackend {
             artifact_lock: Arc::new(AsyncMutex::new(())),
             sampler: Arc::new(crate::CpuSampler::new()),
         }
+    }
+
+    /// SIGKILL every process whose executable is this backend's runner binary.
+    /// Boot-time only: after construction, live runners belong to THIS process
+    /// and must never be swept. Identification is by `/proc/<pid>/exe` against
+    /// the configured runner path (never by name substring, which could match
+    /// a tenant process), and this process's own children cannot exist yet.
+    fn reap_orphaned_runners(runner_bin: &Path) {
+        #[cfg(target_os = "linux")]
+        {
+            let canonical = runner_bin.canonicalize().ok();
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return;
+            };
+            let mut reaped = 0u32;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if pid == std::process::id() {
+                    continue;
+                }
+                let exe = std::fs::read_link(entry.path().join("exe")).ok();
+                let matches = match (&exe, &canonical) {
+                    (Some(exe), Some(canonical)) => exe == canonical || exe.as_path() == runner_bin,
+                    (Some(exe), None) => exe.as_path() == runner_bin,
+                    _ => false,
+                };
+                if matches {
+                    // SAFETY: kill(2) with a specific pid and no pointer args.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    reaped += 1;
+                }
+            }
+            if reaped > 0 {
+                tracing::warn!(
+                    reaped,
+                    runner = %runner_bin.display(),
+                    "reaped litebox guest(s) orphaned by a previous hive-cloud incarnation"
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = runner_bin;
     }
 
     fn unique_temp_name(&self, label: &str, suffix: &str) -> OsString {
@@ -1421,79 +1504,15 @@ impl LiteboxBackend {
         Ok(alias)
     }
 
-    fn write_scratch_file(
-        scratch: &mut ArtifactScratch,
-        name: &str,
-        bytes: &[u8],
-    ) -> anyhow::Result<()> {
-        #[cfg(not(unix))]
-        anyhow::bail!("litebox artifact publication requires Unix descriptors");
-        #[cfg(unix)]
-        {
-            let name = OsString::from(name);
-            let name_c = cache_component(&name)?;
-            let fd = unsafe {
-                libc::openat(
-                    scratch.directory.as_raw_fd(),
-                    name_c.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o444,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("create litebox artifact scratch file");
-            }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            scratch.children.push(name);
-            Ok(())
-        }
-    }
-
-    /// Append the two platform-owned preloads through held file and directory
-    /// descriptors. Cancellation kills tar; Drop unlinks the private scratch
-    /// names without resolving the mutable cache pathname.
+    /// Append the two platform-owned preloads to an existing canonical tar.
+    /// The helper removes the prior end marker and writes exactly one new marker
+    /// after both entries, so later tar readers cannot stop before augmentation.
     async fn stage_bind_shim(
         &self,
-        directories: &ArtifactDirectories,
+        _directories: &ArtifactDirectories,
         archive: &ArtifactTemp,
     ) -> anyhow::Result<()> {
-        let mut scratch = self.allocate_scratch_directory(&directories.temporary, "preloads")?;
-        let bind_name = GUEST_BIND_SHIM_PATH.trim_start_matches('/');
-        let guard_name = GUEST_RUNTIME_GUARD_PATH.trim_start_matches('/');
-        Self::write_scratch_file(&mut scratch, bind_name, NODE_BIND_SHIM_JS.as_bytes())?;
-        Self::write_scratch_file(&mut scratch, guard_name, RUNTIME_GUARD_JS.as_bytes())?;
-        let mut command = Command::new("tar");
-        let scratch_path =
-            crate::runtime_artifact::inherit_file_path(&mut command, &scratch.directory)?;
-        let archive_path = crate::runtime_artifact::inherit_file_path(&mut command, &archive.file)?;
-        let out = command
-            .arg("-C")
-            .arg(scratch_path)
-            .arg("--mtime=@0")
-            .arg("--owner=0")
-            .arg("--group=0")
-            .arg("--numeric-owner")
-            .arg("-rf")
-            .arg(archive_path)
-            .arg(bind_name)
-            .arg(guard_name)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to run tar: {error}"))?;
-        anyhow::ensure!(
-            out.status.success(),
-            "tar failed staging litebox runtime preloads: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        Ok(())
+        append_litebox_runtime_augmentation(archive.file.try_clone()?, Vec::new(), None, None).await
     }
 
     /// Allocate a fresh TUN device + real `/30` for one cell — mirrors
@@ -1815,9 +1834,9 @@ impl LiteboxBackend {
     async fn package_metadata(
         &self,
         staged: &crate::runtime_artifact::StagedRuntimeArtifact,
-        artifact: &RuntimeArtifactSpec,
+        app_rel: &Path,
     ) -> anyhow::Result<(BTreeMap<String, String>, Option<String>)> {
-        let package_relative = artifact.app_rel.join("package.json");
+        let package_relative = app_rel.join("package.json");
         let scripts = if let Some(bytes) =
             staged.read_regular(&package_relative, MAX_PACKAGE_JSON_BYTES)?
         {
@@ -1846,7 +1865,7 @@ impl LiteboxBackend {
             BTreeMap::new()
         };
 
-        let mut base = artifact.app_rel.clone();
+        let mut base = app_rel.to_path_buf();
         let next_entry = loop {
             let relative = base.join("node_modules/next/dist/bin/next");
             if staged.is_regular_file(&relative)? {
@@ -1867,11 +1886,37 @@ impl LiteboxBackend {
         bin: &Path,
         reference: &mut LiteboxImageReference,
     ) -> anyhow::Result<File> {
-        let deps = ldd_closure(bin).await?;
+        let mut deps = ldd_closure(bin).await?;
+        // Modern glibc merged libpthread/libdl/librt/libutil into libc, so the
+        // runtime binary's own closure never names them — but native addons in
+        // the application tree (e.g. @next/swc-linux-x64-gnu) still declare
+        // those legacy sonames as NEEDED, and the guest's dlopen fails with
+        // "cannot open shared object file" for stubs every glibc host actually
+        // ships. Stage the compat stubs (a few KB each) whenever they exist;
+        // absent ones are skipped, not errors.
+        for stub in [
+            "/lib64/libpthread.so.0",
+            "/lib64/libdl.so.2",
+            "/lib64/librt.so.1",
+            "/lib64/libutil.so.1",
+        ] {
+            let path = PathBuf::from(stub);
+            if !deps.contains(&path)
+                && std::path::Path::new(stub)
+                    .metadata()
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false)
+            {
+                deps.push(path);
+            }
+        }
+        deps.sort();
+        deps.dedup();
         let source_sha256 = runtime_source_sha256(
             bin,
             &deps,
             &reference.app_archive_sha256,
+            &reference.identity,
             NODE_BIND_SHIM_JS,
             RUNTIME_GUARD_JS,
         )
@@ -1903,17 +1948,20 @@ impl LiteboxBackend {
             tokio::io::copy(&mut input, &mut output).await?;
             output.sync_all().await?;
         }
-        if !deps.is_empty() {
-            append_ldd_closure_to_tar(&mut temp.file, &deps).with_context(|| {
-                format!("failed to append LDD closure to tar for {}", bin.display())
-            })?;
-        }
-        self.stage_bind_shim(directories, &temp).await?;
+        append_litebox_runtime_augmentation(
+            temp.file.try_clone()?,
+            deps.clone(),
+            Some(reference.identity.clone()),
+            Some(bin.to_path_buf()),
+        )
+        .await
+        .with_context(|| format!("failed to augment runtime tar for {}", bin.display()))?;
         temp.file.sync_all()?;
         let after = runtime_source_sha256(
             bin,
             &deps,
             &reference.app_archive_sha256,
+            &reference.identity,
             NODE_BIND_SHIM_JS,
             RUNTIME_GUARD_JS,
         )
@@ -2515,6 +2563,7 @@ async fn runtime_source_sha256(
     bin: &Path,
     deps: &[PathBuf],
     app_archive_sha256: &str,
+    identity: &RuntimeArtifactIdentity,
     bind_shim: &str,
     runtime_guard: &str,
 ) -> anyhow::Result<String> {
@@ -2526,6 +2575,9 @@ async fn runtime_source_sha256(
     let mut hasher = Sha256::new();
     hasher.update(b"hive-litebox-runtime-source-v1\0");
     hasher.update(app_archive_sha256.as_bytes());
+    let identity_bytes = serde_json::to_vec(identity)?;
+    hasher.update((identity_bytes.len() as u64).to_le_bytes());
+    hasher.update(&identity_bytes);
     hasher.update((bind_shim.len() as u64).to_le_bytes());
     hasher.update(bind_shim.as_bytes());
     hasher.update((runtime_guard.len() as u64).to_le_bytes());
@@ -3056,15 +3108,97 @@ async fn resolve_direct_launch(
             )))
         }
     };
-    let entry = validated_direct_entry(runtime, &args[0], &reference.guest_workdir)?;
+    // `--experimental-strip-types` is the ONE Node runtime flag the platform's
+    // own exported-server launcher emits (TypeScript entries). It is a loader
+    // toggle with no eval/exec/stdin semantics, so permitting exactly it ahead
+    // of the entry does not widen the launch grammar — every other option
+    // still refuses via validated_direct_entry's leading-dash check. Without
+    // this, litebox refused the platform's OWN launcher shape and every
+    // TypeScript exported-server deploy placed on a litebox node failed
+    // (witnessed live: examples/express on fc-frankfurt).
+    let mut entry_index = 0usize;
+    if runtime == DirectRuntime::Node {
+        while args
+            .get(entry_index)
+            .is_some_and(|arg| arg == "--experimental-strip-types")
+        {
+            entry_index += 1;
+        }
+        anyhow::ensure!(
+            entry_index < args.len(),
+            "{}",
+            launch_refusal("direct Node launch is missing an entry module after runtime flags")
+        );
+    }
+    let entry = validated_direct_entry(runtime, &args[entry_index], &reference.guest_workdir)?;
     validate_archive_main_entry(app_archive, &entry).await?;
-    args[0] = entry;
+    args[entry_index] = entry;
     if runtime == DirectRuntime::Bun {
         validate_bun_arguments(&args)?;
     }
     let bin = resolve_bin(name).await;
     let bin = tokio::fs::canonicalize(&bin).await.unwrap_or(bin);
     Ok(DirectLaunch { runtime, bin, args })
+}
+
+/// Kill-and-reap a still-running guest child on ANY exit from the scope this
+/// guard is armed in — a normal `Err` return, an early `?`, or the whole
+/// future being DROPPED because the caller gave up (`ColdStartGuard` in
+/// `fluid-compute` releases the scheduler's own `provisioning` reservation on
+/// exactly that path, but has no reach into this process — a genuinely
+/// separate resource at a different layer). `tokio::process::Child`'s own
+/// `kill_on_drop` sends the signal synchronously but is documented to NOT
+/// reap: the OS keeps the process a zombie until something calls `wait()` on
+/// it. Witnessed live on fc-phoenix (2026-08-29): three real zombie
+/// `litebox-runner` processes, all direct children of the running hive-cloud
+/// PID, accumulated purely from repeated timed-out/abandoned cold starts.
+/// `disarm()` on the success path hands the child back for its normal,
+/// already-correct long life (`terminate()` reaps it then).
+struct ChildReapGuard<'a> {
+    child: Option<&'a mut Child>,
+}
+
+impl<'a> ChildReapGuard<'a> {
+    fn new(child: &'a mut Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Reborrow the guarded child. The guard, not this call, owns the
+    /// underlying reference for its whole lifetime, so callers may reborrow
+    /// through it as many times as needed without ever holding a second
+    /// independent `&mut Child`.
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_deref_mut().expect("guard already disarmed")
+    }
+
+    fn disarm(mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildReapGuard<'_> {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        // `Drop` cannot `.await`; a detached task still guarantees the reap
+        // happens even when THIS guard's own drop is running inside another
+        // future's cancellation teardown (no runtime-context requirement
+        // beyond `tokio::spawn` needing a live handle, true everywhere this
+        // guard is ever constructed).
+        if let Some(pid) = child.id() {
+            tokio::spawn(async move {
+                // SAFETY: reaping our own just-killed child by raw pid — the
+                // `Child` handle itself cannot be moved into this task
+                // because it is still borrowed by the guard's caller scope.
+                let mut status = 0;
+                unsafe {
+                    libc::waitpid(pid as libc::pid_t, &mut status, 0);
+                }
+            });
+        }
+    }
 }
 
 async fn wait_litebox_ready(
@@ -3250,125 +3384,125 @@ fn validate_ldd_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-const POSIX_TAR_BLOCK_SIZE: usize = 512;
+async fn append_litebox_runtime_augmentation(
+    archive: File,
+    deps: Vec<PathBuf>,
+    identity: Option<RuntimeArtifactIdentity>,
+    runtime_bin: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        append_litebox_runtime_augmentation_blocking(
+            archive,
+            &deps,
+            identity.as_ref(),
+            runtime_bin.as_deref(),
+        )
+    })
+    .await
+    .context("litebox runtime tar augmentation task failed")?
+}
 
-/// Write a single POSIX tar entry (header + content + padding) to `archive`.
-/// The entry name is stored as-is (absolute path, matching the prior `tar
-/// --absolute-names` behaviour).
-fn write_posix_tar_entry(archive: &mut File, name: &[u8], content: &[u8]) -> anyhow::Result<()> {
-    let mut header = [0u8; POSIX_TAR_BLOCK_SIZE];
+#[cfg(target_os = "linux")]
+fn litebox_tar_header(length: u64, mode: u32) -> anyhow::Result<tar::Header> {
+    let mut header = tar::Header::new_gnu();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_mode(mode & 0o777);
+    header.set_size(length);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_cksum();
+    Ok(header)
+}
 
-    // Split name into prefix + name if > 100 bytes
-    let (prefix, name_part) = if name.len() > 100 {
-        // Find the last '/' within the last 155 bytes of the directory part
-        let split_at = name[..name.len().min(155)]
-            .iter()
-            .rposition(|&b| b == b'/')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        if split_at == 0 || split_at > 155 || name.len() - split_at > 100 {
-            anyhow::bail!(
-                "tar path too long: {} (prefix={}, name={})",
-                String::from_utf8_lossy(name),
-                split_at,
-                name.len() - split_at
-            );
-        }
-        (&name[..split_at], &name[split_at..])
-    } else {
-        (b"" as &[u8], name)
-    };
-
-    // Name (100 bytes)
-    let name_len = name_part.len().min(100);
-    header[..name_len].copy_from_slice(&name_part[..name_len]);
-
-    // Mode: "0000644\0"
-    header[100..108].copy_from_slice(b"0000644\0");
-
-    // Uid: "0000000\0"
-    header[108..116].copy_from_slice(b"0000000\0");
-
-    // Gid: "0000000\0"
-    header[116..124].copy_from_slice(b"0000000\0");
-
-    // Size (12 bytes, octal)
-    let size_octal = format!("{:011o}\0", content.len());
-    header[124..124 + size_octal.len()].copy_from_slice(size_octal.as_bytes());
-
-    // Mtime: "00000000000\0" (epoch 0)
-    header[136..148].copy_from_slice(b"00000000000\0");
-
-    // Typeflag: '0' (regular file)
-    header[156] = b'0';
-
-    // Linkname (100 bytes) — empty
-    // Magic: "ustar\0"
-    header[257..263].copy_from_slice(b"ustar\0");
-
-    // Version: "00"
-    header[263..265].copy_from_slice(b"00");
-
-    // Uname: "root"
-    header[265..297].fill(0);
-    header[265..269].copy_from_slice(b"root");
-
-    // Gname: "root"
-    header[297..329].fill(0);
-    header[297..301].copy_from_slice(b"root");
-
-    // Devmajor/devminor: 0 (already zeroed)
-
-    // Prefix (155 bytes) at offset 345
-    if !prefix.is_empty() {
-        let prefix_len = prefix.len().min(155);
-        header[345..345 + prefix_len].copy_from_slice(&prefix[..prefix_len]);
-    }
-
-    // Chksum: sum of all bytes treating chksum field (148-156) as spaces
-    let mut chksum: u64 = 0;
-    for b in header.iter() {
-        chksum += *b as u64;
-    }
-    // Add 8 spaces for the chksum field
-    chksum += 8 * (b' ' as u64);
-    let chksum_str = format!("{:06o}\0 ", chksum);
-    header[148..148 + chksum_str.len()].copy_from_slice(chksum_str.as_bytes());
-
-    archive.write_all(&header).context("write tar header")?;
-    archive.write_all(content).context("write tar content")?;
-
-    // Pad to 512-byte block boundary
-    let pad =
-        (POSIX_TAR_BLOCK_SIZE - (content.len() % POSIX_TAR_BLOCK_SIZE)) % POSIX_TAR_BLOCK_SIZE;
-    if pad > 0 {
-        archive
-            .write_all(&vec![0u8; pad])
-            .context("write tar padding")?;
-    }
-
+#[cfg(target_os = "linux")]
+fn append_platform_tar_entry(
+    builder: &mut tar::Builder<File>,
+    path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut header = litebox_tar_header(bytes.len() as u64, 0o444)?;
+    builder
+        .append_data(&mut header, path, bytes)
+        .with_context(|| format!("append litebox platform file {}", path.display()))?;
     Ok(())
 }
 
-/// Append the LDD closure files to a tar archive using descriptor-relative
-/// openat2, replacing the prior `tar -h` shell invocation. Each path is
-/// opened against the root filesystem with RESOLVE_BENEATH |
-/// RESOLVE_NO_MAGICLINKS, the real path is resolved via /proc/self/fd,
-/// validated against the allowlist, and the file content is appended with
-/// a POSIX tar header.
 #[cfg(target_os = "linux")]
-fn append_ldd_closure_to_tar(archive: &mut File, deps: &[PathBuf]) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
+fn append_litebox_runtime_augmentation_blocking(
+    mut archive: File,
+    deps: &[PathBuf],
+    identity: Option<&RuntimeArtifactIdentity>,
+    runtime_bin: Option<&Path>,
+) -> anyhow::Result<()> {
+    const BLOCK_BYTES: u64 = 512;
+    const END_MARKER_BLOCKS: u64 = 2;
+    let metadata = archive.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.len() >= END_MARKER_BLOCKS * BLOCK_BYTES
+            && metadata.len() % BLOCK_BYTES == 0,
+        "litebox application authority is not a canonical block-aligned tar"
+    );
+    // GNU tar's real end-of-archive marker is the minimal two-block
+    // (1024-byte) zero terminator required by the format, but `tar -cf`
+    // additionally zero-pads the WHOLE archive out to its own blocking
+    // factor (a full 20-block/10240-byte record by default) — that extra
+    // padding is itself all zero, so a fixed "the terminator is exactly the
+    // last 1024 bytes" assumption reads real trailing padding instead of the
+    // true terminator whenever the archive's length is not already a
+    // multiple of 10240. Truncating at that wrong offset leaves the ACTUAL
+    // double-zero-block sitting a few blocks before wherever this function's
+    // new entries get appended — every standard reader (GNU tar, Python's
+    // `tarfile`, and litebox's own guest-side extractor) stops at that real
+    // terminator and never sees the entries appended after it, so the guest
+    // silently never gets the bind shim it needs.
+    //
+    // Reproduced live on fc-sanjose-3 AND fc-phoenix (`--litebox-probe`
+    // failing on both with `Cannot find module '/hive-litebox-bind-shim.js'`
+    // despite `append_litebox_runtime_augmentation_blocking` returning `Ok`
+    // and genuinely growing the file — the new headers were real bytes on
+    // disk, just placed after the archive's true EOF marker). Fixed by
+    // scanning backward from the end in 512-byte blocks for the actual start
+    // of the trailing zero run, rather than trusting a fixed offset.
+    let total_blocks = metadata.len() / BLOCK_BYTES;
+    let mut zero_block = [0_u8; BLOCK_BYTES as usize];
+    let mut terminator_start_block = total_blocks;
+    let mut index = total_blocks;
+    while index > 0 {
+        let candidate = index - 1;
+        archive.seek(SeekFrom::Start(candidate * BLOCK_BYTES))?;
+        archive.read_exact(&mut zero_block)?;
+        if zero_block.iter().any(|byte| *byte != 0) {
+            break;
+        }
+        terminator_start_block = candidate;
+        index = candidate;
+    }
+    anyhow::ensure!(
+        total_blocks - terminator_start_block >= END_MARKER_BLOCKS,
+        "litebox application authority has no exact two-block tar terminator"
+    );
+    let prefix_bytes = terminator_start_block * BLOCK_BYTES;
+    archive.set_len(prefix_bytes)?;
+    archive.seek(SeekFrom::Start(prefix_bytes))?;
+
     let root = File::open("/").context("open root filesystem")?;
     let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut builder = tar::Builder::new(archive);
+    builder.mode(tar::HeaderMode::Deterministic);
+    builder.follow_symlinks(false);
     for dep in deps {
         let relative = dep
             .strip_prefix("/")
             .map_err(|_| anyhow::anyhow!("LDD path {} is not absolute", dep.display()))?;
-        if relative.as_os_str().is_empty() {
-            anyhow::bail!("LDD path is the root directory");
-        }
-        let fd = crate::runtime_artifact::openat2_required(
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty(),
+            "LDD path is the root directory"
+        );
+        let mut file = crate::runtime_artifact::openat2_required(
             &root,
             relative.as_os_str(),
             libc::O_RDONLY | libc::O_CLOEXEC,
@@ -3377,62 +3511,414 @@ fn append_ldd_closure_to_tar(archive: &mut File, deps: &[PathBuf]) -> anyhow::Re
                 | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
         )
         .with_context(|| format!("openat2 failed for {}", dep.display()))?;
-        let resolved = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        let resolved = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .canonicalize()
             .with_context(|| format!("cannot resolve real path for {}", dep.display()))?;
         let resolved_str = resolved.to_string_lossy();
-        let allowed = ALLOWED_LIBRARY_DIRS
-            .iter()
-            .any(|prefix| resolved_str.starts_with(prefix));
         anyhow::ensure!(
-            allowed,
+            ALLOWED_LIBRARY_DIRS
+                .iter()
+                .any(|prefix| resolved_str.starts_with(prefix)),
             "LDD path {} resolves to {} which is outside the approved library directory allowlist",
             dep.display(),
             resolved.display()
         );
-        let meta = fd
+        let before = file
             .metadata()
             .with_context(|| format!("cannot stat {}", dep.display()))?;
-        let ino = (meta.dev(), meta.ino());
         anyhow::ensure!(
-            seen_inodes.insert(ino),
-            "symlink loop detected: {} already staged (dev={}, ino={})",
-            dep.display(),
-            ino.0,
-            ino.1
+            before.is_file(),
+            "LDD path is not a file: {}",
+            dep.display()
         );
-        let file_size = meta.len();
-        let mut content = vec![0u8; file_size as usize];
-        let mut remaining = &mut content[..];
-        {
-            let mut reader = &fd;
-            while !remaining.is_empty() {
-                let n = reader
-                    .read(remaining)
-                    .with_context(|| format!("read error on {}", dep.display()))?;
-                if n == 0 {
-                    anyhow::bail!(
-                        "{} truncated mid-read (expected {} bytes, got {})",
-                        dep.display(),
-                        file_size,
-                        file_size as usize - remaining.len()
-                    );
-                }
-                remaining = &mut remaining[n..];
-            }
-        }
-        write_posix_tar_entry(archive, dep.as_os_str().as_encoded_bytes(), &content)?;
+        anyhow::ensure!(
+            seen_inodes.insert((before.dev(), before.ino())),
+            "duplicate LDD inode detected while staging {} (dev={}, ino={})",
+            dep.display(),
+            before.dev(),
+            before.ino()
+        );
+        let mut header = litebox_tar_header(before.len(), before.mode())?;
+        builder
+            .append_data(&mut header, relative, &mut file)
+            .with_context(|| format!("append linked library {}", dep.display()))?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mode() == after.mode()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "linked library changed while staging: {}",
+            dep.display()
+        );
     }
-    // Two zero blocks mark end of archive
-    archive
-        .write_all(&[0u8; POSIX_TAR_BLOCK_SIZE * 2])
-        .context("write tar terminator")?;
+
+    // The runner loads the INITIAL program ELF from the host, so a
+    // single-process guest (the network smoke test's `node -e`) runs without
+    // the binary staged — but a guest-side `execve` (Next.js `next start`
+    // spawning its server worker, any app child process re-execing
+    // `process.execPath`) resolves the executable through the GUEST
+    // filesystem, which is fully separate from the host by design. Without
+    // the runtime binary staged at its exact launch path, every such spawn
+    // died with the runner's bare "failed to open the ELF file: ENOENT" —
+    // witnessed live on nodes-wtf (Next 16). Same openat2/no-follow staging
+    // discipline as the library closure above; the executable is exempt from
+    // the library-directory allowlist (it legitimately lives in /usr/bin,
+    // /usr/local/bin, or a version-manager prefix) but must still be a real
+    // regular file reached without following a magic link.
+    if let Some(bin) = runtime_bin {
+        let relative = bin
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("runtime binary {} is not absolute", bin.display()))?;
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty(),
+            "runtime binary path is the root directory"
+        );
+        let mut file = crate::runtime_artifact::openat2_required(
+            &root,
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            crate::runtime_artifact::RESOLVE_BENEATH
+                | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
+        )
+        .with_context(|| format!("openat2 failed for runtime binary {}", bin.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("cannot stat runtime binary {}", bin.display()))?;
+        anyhow::ensure!(
+            before.is_file(),
+            "runtime binary is not a file: {}",
+            bin.display()
+        );
+        if seen_inodes.insert((before.dev(), before.ino())) {
+            let mut header = litebox_tar_header(before.len(), before.mode())?;
+            builder
+                .append_data(&mut header, relative, &mut file)
+                .with_context(|| format!("append runtime binary {}", bin.display()))?;
+            let after = file.metadata()?;
+            anyhow::ensure!(
+                before.dev() == after.dev()
+                    && before.ino() == after.ino()
+                    && before.len() == after.len()
+                    && before.mode() == after.mode()
+                    && before.mtime() == after.mtime()
+                    && before.mtime_nsec() == after.mtime_nsec(),
+                "runtime binary changed while staging: {}",
+                bin.display()
+            );
+        }
+    }
+
+    if let Some(identity) = identity {
+        let identity_bytes = serde_json::to_vec(identity)?;
+        append_platform_tar_entry(
+            &mut builder,
+            &Path::new("workspace").join(hive_core::RUNTIME_ARTIFACT_MARKER_FILE),
+            &identity_bytes,
+        )?;
+    }
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new(GUEST_BIND_SHIM_PATH.trim_start_matches('/')),
+        NODE_BIND_SHIM_JS.as_bytes(),
+    )?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new(GUEST_RUNTIME_GUARD_PATH.trim_start_matches('/')),
+        RUNTIME_GUARD_JS.as_bytes(),
+    )?;
+    builder
+        .finish()
+        .context("finish litebox combined runtime tar")?;
+    let archive = builder
+        .into_inner()
+        .context("close litebox combined runtime tar writer")?;
+    archive.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn append_ldd_closure_to_tar(_archive: &mut File, _deps: &[PathBuf]) -> anyhow::Result<()> {
-    anyhow::bail!("descriptor-relative tar append requires Linux openat2")
+fn append_litebox_runtime_augmentation_blocking(
+    _archive: File,
+    _deps: &[PathBuf],
+    _identity: Option<&RuntimeArtifactIdentity>,
+    _runtime_bin: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
+}
+
+/// The interactive-shell binary plus a small, fixed coreutils set — every
+/// program the SHELL ITSELF might `exec()` inside the guest (`fork()`+`exec()`
+/// each, on the `AnEntrypoint/litebox` base this platform tracks: see
+/// `ansible/roles/litebox/files/PATCHES.md`'s "litebox fork tracking"
+/// section) must be staged into the guest tar with its exact host path,
+/// same as `append_litebox_runtime_augmentation_blocking`'s own comment on
+/// `runtime_bin` explains: only the FIRST exec'd binary loads from the host
+/// directly, every later exec (from inside the now-separate guest
+/// filesystem) resolves through what's actually staged here. Deliberately
+/// small and fixed rather than "whatever's on $PATH" — a sandbox shell that
+/// can't find `grep` fails loudly and obviously; one that can silently run
+/// anything the host happens to have installed is a much larger, unaudited
+/// surface for a tenant-facing feature.
+const SHELL_GUEST_PROGRAMS: &[&str] = &[
+    "/bin/sh",
+    "/usr/bin/ls",
+    "/usr/bin/cat",
+    "/usr/bin/pwd",
+    "/usr/bin/echo",
+    "/usr/bin/mkdir",
+    "/usr/bin/rm",
+    "/usr/bin/cp",
+    "/usr/bin/mv",
+    "/usr/bin/grep",
+    "/usr/bin/head",
+    "/usr/bin/tail",
+    "/usr/bin/wc",
+    "/usr/bin/find",
+    "/usr/bin/env",
+];
+
+/// Host directories a bare `exec_command` name (`node`, `ls`, `python3`) is
+/// resolved against — the guest `PATH` this backend hands the runner, plus
+/// `/usr/local/bin` for operator-installed runtimes. The resolved binary is
+/// STAGED into the guest tar (with its `ldd` closure) exactly like the fixed
+/// shell set, so a command that exists on the host runs in the guest; one
+/// that does not fails loudly at start, never mid-run with a bare ENOENT.
+const EXEC_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// Upper bound on one `ExecOutput` line's bytes before it is truncated (the
+/// provider bounds again at 16 KiB); keeps a newline-free firehose from
+/// growing the pump's buffer without limit.
+const EXEC_MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Resolve the program a sandbox `exec_command` names to the HOST binary the
+/// runner will load (the first exec'd ELF loads from the host; every later
+/// guest-side `execve` resolves through the staged tar, which is why the
+/// caller stages this same path). A relative path is refused: the guest's
+/// cwd and the host's are different filesystems by design.
+fn resolve_guest_program(cmd: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !cmd.trim().is_empty() && !cmd.contains('\0'),
+        "sandbox command must be a non-empty program name"
+    );
+    if cmd.contains('/') {
+        let path = PathBuf::from(cmd);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "sandbox command path must be absolute inside a litebox guest: {cmd}"
+        );
+        anyhow::ensure!(
+            path.is_file(),
+            "command {cmd} is not available inside this litebox sandbox"
+        );
+        return Ok(path);
+    }
+    for dir in EXEC_PROGRAM_DIRS {
+        let candidate = Path::new(dir).join(cmd);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "command '{cmd}' is not available inside this litebox sandbox (searched {})",
+        EXEC_PROGRAM_DIRS.join(":")
+    )
+}
+
+/// Pump one exec pipe into `ExecOutput` events, one per line, each bounded
+/// to `EXEC_MAX_LINE_BYTES`. Keeps DRAINING (discarding) after the receiver
+/// goes away: a guest blocked on a full pipe would otherwise never exit and
+/// never be reaped, leaking the runner until `kill_exec`/`terminate`.
+async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    stream: hive_core::LogStream,
+    id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<hive_core::AgentEvent>,
+) {
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut chunk = [0_u8; 8192];
+    let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    let mut discard = false;
+    let mut emit = |line: &[u8], discard: &mut bool| {
+        if *discard {
+            return;
+        }
+        let mut line = line;
+        while line.last().is_some_and(|b| *b == b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let text = if line.len() > EXEC_MAX_LINE_BYTES {
+            let mut end = EXEC_MAX_LINE_BYTES;
+            while end > 0 && std::str::from_utf8(&line[..end]).is_err() {
+                end -= 1;
+            }
+            format!("{}… [truncated]", String::from_utf8_lossy(&line[..end]))
+        } else {
+            String::from_utf8_lossy(line).into_owned()
+        };
+        if tx
+            .send(hive_core::AgentEvent::ExecOutput {
+                id: id.clone(),
+                stream,
+                line: text,
+            })
+            .is_err()
+        {
+            *discard = true;
+        }
+    };
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
+                while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=nl).collect();
+                    emit(&line[..line.len() - 1], &mut discard);
+                }
+                if pending.len() > EXEC_MAX_LINE_BYTES {
+                    let line: Vec<u8> = pending.drain(..).collect();
+                    emit(&line, &mut discard);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        emit(&pending, &mut discard);
+    }
+}
+
+/// Async half of guest-tar construction for interactive shells AND one-shot
+/// execs: the fixed shell/coreutils set plus `extra` programs (the resolved
+/// `exec_command` binary), each with its `ldd` closure (a real subprocess
+/// spawn — cannot run inside the blocking tar-writer below), merged/deduped
+/// and handed to the blocking writer. A closure failure on an EXTRA program
+/// (a static binary or a script has none) stages the program alone; the
+/// fixed set's closure stays strict, as it always was.
+async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<()> {
+    let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
+    let mut deps: Vec<PathBuf> = Vec::new();
+    for program in &programs {
+        deps.extend(ldd_closure(program).await?);
+    }
+    for program in extra {
+        match ldd_closure(&program).await {
+            Ok(closure) => deps.extend(closure),
+            Err(error) => tracing::debug!(
+                program = %program.display(),
+                %error,
+                "litebox exec: no dynamic closure for program; staging it alone"
+            ),
+        }
+        programs.push(program);
+    }
+    // Same legacy-soname compat stubs `ensure_combined_tar_locked` stages —
+    // a coreutils build linked against a split libpthread/libdl/librt/libutil
+    // (rare on a modern glibc host, but the failure mode if it happens is a
+    // guest-side dlopen ENOENT with no useful error) gets them for free.
+    for stub in [
+        "/lib64/libpthread.so.0",
+        "/lib64/libdl.so.2",
+        "/lib64/librt.so.1",
+        "/lib64/libutil.so.1",
+    ] {
+        let path = PathBuf::from(stub);
+        if !deps.contains(&path)
+            && std::path::Path::new(stub)
+                .metadata()
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        {
+            deps.push(path);
+        }
+    }
+    programs.append(&mut deps);
+    programs.sort();
+    programs.dedup();
+    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs))
+        .await
+        .context("litebox shell guest tar construction task failed")?
+}
+
+/// The interactive-shell tar: the fixed set only.
+async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
+    build_guest_tar(archive, Vec::new()).await
+}
+
+#[cfg(target_os = "linux")]
+fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<()> {
+    let root = File::open("/").context("open root filesystem")?;
+    let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut builder = tar::Builder::new(archive);
+    builder.mode(tar::HeaderMode::Deterministic);
+    builder.follow_symlinks(false);
+
+    for path in paths {
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| anyhow::anyhow!("shell guest path {} is not absolute", path.display()))?;
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty(),
+            "shell guest path is the root directory"
+        );
+        let mut file = crate::runtime_artifact::openat2_required(
+            &root,
+            relative.as_os_str(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+            crate::runtime_artifact::RESOLVE_BENEATH
+                | crate::runtime_artifact::RESOLVE_NO_MAGICLINKS,
+        )
+        .with_context(|| format!("openat2 failed for shell guest path {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        anyhow::ensure!(
+            before.is_file(),
+            "shell guest path is not a file: {}",
+            path.display()
+        );
+        // Some hosts symlink e.g. /bin -> /usr/bin, or a dependency's
+        // resolved path collides with an already-staged program; caught here
+        // rather than double-staging the same inode under two tar entries.
+        if !seen_inodes.insert((before.dev(), before.ino())) {
+            continue;
+        }
+        let mut header = litebox_tar_header(before.len(), before.mode())?;
+        builder
+            .append_data(&mut header, relative, &mut file)
+            .with_context(|| format!("append shell guest path {}", path.display()))?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mode() == after.mode()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "shell guest path changed while staging: {}",
+            path.display()
+        );
+    }
+
+    builder
+        .finish()
+        .context("finish litebox shell guest tar")?;
+    let archive = builder
+        .into_inner()
+        .context("close litebox shell guest tar writer")?;
+    archive.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_shell_tar_blocking(_archive: File, _paths: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::bail!("descriptor-relative tar construction requires Linux openat2")
 }
 
 #[async_trait]
@@ -3538,13 +4024,13 @@ impl CellBackend for LiteboxBackend {
         crate::mock::run_build_process(cell, job, sink, &self.cfg.cache_root).await
     }
 
-    /// Publishes one exact, validated checkout snapshot beneath `/workspace`.
-    /// The immutable tar is addressed by its own SHA-256; the platform-issued
-    /// image name points to it through a separately-fsynced atomic reference.
+    /// Publishes the exact universal package as immutable application authority.
+    /// Backend-only runtime closure and identity bytes are added later to a
+    /// separately addressed combined archive; no checkout is re-read here.
     async fn deliver_build(
         &self,
         image: &str,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             valid_identity_id(image),
@@ -3552,26 +4038,56 @@ impl CellBackend for LiteboxBackend {
         );
         let publication = self.artifact_lock.clone().lock_owned().await;
         let directories = self.prepare_artifact_dirs()?;
-        let (staged, _publication) = crate::runtime_artifact::stage_runtime_artifact_serialized(
-            artifact,
-            directories.staging.descriptor.try_clone()?,
-            publication,
-        )
-        .await?;
-        let identity = RuntimeArtifactIdentity {
-            protocol: hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION,
-            id: image.to_string(),
-            content_sha256: staged.content_sha256().to_string(),
-        };
+        let package_descriptor = artifact.package_descriptor().clone();
+        let app_rel = PathBuf::from(&package_descriptor.app_rel);
+        let (staged, _publication) =
+            crate::runtime_artifact::stage_sealed_runtime_artifact_serialized(
+                artifact,
+                directories.staging.descriptor.try_clone()?,
+                publication,
+            )
+            .await?;
+        let identity = artifact.identity(image)?;
+        anyhow::ensure!(
+            staged.content_sha256() == identity.content_sha256,
+            "verified runtime package materialized a different semantic identity"
+        );
+        anyhow::ensure!(
+            staged
+                .read_regular(
+                    Path::new(hive_core::RUNTIME_ARTIFACT_MARKER_FILE),
+                    MAX_REFERENCE_BYTES,
+                )?
+                .is_none(),
+            "selected application collides with the platform runtime identity marker"
+        );
         let guest_workdir = artifact.guest_workdir(DELIVERED_WORKDIR)?;
         validate_guest_workdir(&guest_workdir)?;
-        let (package_scripts, next_entry) = self.package_metadata(&staged, artifact).await?;
-        staged.write_identity(&identity)?;
+        let (package_scripts, next_entry) = self.package_metadata(&staged, &app_rel).await?;
 
+        let (mut package, verified_descriptor) = artifact.verified_package()?.into_parts();
+        anyhow::ensure!(
+            verified_descriptor == package_descriptor,
+            "sealed universal package descriptor changed during litebox delivery"
+        );
+        package.seek(SeekFrom::Start(0))?;
         let mut temp = self.allocate_temp_file(&directories.temporary, "app", ".tar")?;
-        staged.package_workspace(&temp.file).await?;
-        temp.file.sync_all()?;
+        let copied = {
+            let mut input = tokio::fs::File::from_std(package.try_clone()?);
+            let mut output = tokio::fs::File::from_std(temp.file.try_clone()?);
+            let copied = tokio::io::copy(&mut input, &mut output).await?;
+            output.sync_all().await?;
+            copied
+        };
+        anyhow::ensure!(
+            copied == package_descriptor.package_bytes,
+            "sealed universal package length changed during litebox delivery"
+        );
         let app_archive_sha256 = sha256_open_file(&temp.file).await?;
+        anyhow::ensure!(
+            app_archive_sha256 == package_descriptor.package_sha256,
+            "sealed universal package bytes changed during litebox delivery"
+        );
         let destination_name = Self::app_archive_name(&app_archive_sha256);
         self.publish_immutable_locked(
             &directories,
@@ -3628,7 +4144,10 @@ impl CellBackend for LiteboxBackend {
         Ok(Some(reference.identity))
     }
 
-    fn delivered_workdir(&self, artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+    fn delivered_workdir(
+        &self,
+        artifact: &SealedRuntimeArtifact,
+    ) -> anyhow::Result<Option<String>> {
         artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
@@ -3873,7 +4392,15 @@ impl CellBackend for LiteboxBackend {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Piped, not nulled: a runtime that exits before listening is
+            // reported to the tenant/operator only through the launch error, so
+            // a discarded stderr turned every guest-side failure (shim panic,
+            // module resolution, bind refusal) into an unexplained "exit
+            // status: 1" — witnessed live on nodes-wtf. A bounded tail of it is
+            // folded into that error; a HEALTHY guest's stderr keeps draining
+            // into the same bounded buffer so the pipe can never fill and
+            // backpressure the app.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if runtime == DirectRuntime::Node {
             command.env(
@@ -3893,8 +4420,50 @@ impl CellBackend for LiteboxBackend {
                 self.cfg.runner_bin.display()
             )
         })?;
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        if let Some(mut pipe) = child.stderr.take() {
+            const STDERR_TAIL_CAP: usize = 8 * 1024;
+            let tail = stderr_tail.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = pipe.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tail.extend_from_slice(&buffer[..read]);
+                    if tail.len() > STDERR_TAIL_CAP {
+                        let excess = tail.len() - STDERR_TAIL_CAP;
+                        tail.drain(..excess);
+                    }
+                }
+            });
+        }
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
-        wait_litebox_ready(&mut child, &func_addr, Duration::from_secs(15)).await?;
+        // Armed for the whole readiness wait: covers a normal timeout/exit
+        // `Err` AND the future being dropped outright (the caller gave up —
+        // see `ChildReapGuard`'s doc). Disarmed only once the guest has
+        // proven it is listening, at which point `child` moves into
+        // long-lived tracking and `terminate()` becomes the reaper.
+        let mut reap_guard = ChildReapGuard::new(&mut child);
+        if let Err(error) =
+            wait_litebox_ready(reap_guard.child_mut(), &func_addr, Duration::from_secs(15)).await
+        {
+            // Give the reader a beat to drain what the dying guest wrote.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let tail = {
+                let tail = stderr_tail
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                String::from_utf8_lossy(&tail).trim().to_string()
+            };
+            if tail.is_empty() {
+                return Err(error);
+            }
+            return Err(anyhow::anyhow!("{error}; guest stderr tail: {tail}"));
+        }
+        reap_guard.disarm();
         // Guest readiness proves Litebox has materialized the initial tar. Drop
         // the descriptor-relative pathname now; cancellation before this point
         // takes the same Drop cleanup path automatically.
@@ -3984,4 +4553,406 @@ impl CellBackend for LiteboxBackend {
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
+
+    /// One argv command inside `cell` (Sandboxes `run_command`) — the SAME
+    /// guest mechanism `exec_pty` uses: a fresh `litebox-runner` spawned
+    /// against the cell's TUN device with a guest tar holding the fixed
+    /// shell/coreutils set plus the resolved program and its `ldd` closure.
+    /// stdout/stderr are separate pipes streamed as distinct `ExecOutput`
+    /// lines, then exactly one `ExecDone { exit_code }` — `None` when the
+    /// runner died by signal (a `kill_exec`), never a fake `Some(0)`. The
+    /// runner is its own process-group leader so `kill_exec` can terminate
+    /// the whole guest tree by exec id. Returns as soon as the runner is
+    /// spawned; the caller drains the channel.
+    async fn exec_command(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>> {
+        anyhow::ensure!(
+            !req.id.is_empty(),
+            "litebox exec requires a non-empty exec id"
+        );
+        // The runner is an unprivileged host process; there is no `sudo` in
+        // the guest and no privilege to elevate to. Refuse loudly at start.
+        anyhow::ensure!(
+            !req.sudo,
+            "litebox sandboxes cannot elevate privileges: sudo is not available inside a litebox guest"
+        );
+        if self.execs.lock().await.contains_key(&req.id) {
+            anyhow::bail!("exec id {} is already running on this node", req.id);
+        }
+        let net = self
+            .cell_nets
+            .lock()
+            .await
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+                    cell.id
+                )
+            })?;
+
+        let (program, args) = if req.shell {
+            let mut line = req.cmd.clone();
+            for arg in &req.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            (PathBuf::from("/bin/sh"), vec!["-c".to_string(), line])
+        } else {
+            (resolve_guest_program(&req.cmd)?, req.args.clone())
+        };
+
+        let directories = self.prepare_artifact_dirs()?;
+        directories.verify_bindings()?;
+        let exec_tar = self.allocate_temp_file(&directories.temporary, "exec", ".tar")?;
+        build_guest_tar(exec_tar.file.try_clone()?, vec![program.clone()]).await?;
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &exec_tar.file)?;
+
+        let cwd = if req.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            req.cwd.clone()
+        };
+        let mut command = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut command);
+        let initial_files_path = crate::runtime_artifact::inherit_file_path(
+            &mut command,
+            &initial_files_alias.directory,
+        )?
+        .join(INITIAL_FILES_ALIAS_NAME);
+        command
+            .arg("-Z")
+            .arg("--rewrite-syscalls")
+            .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
+            .arg(format!("--initial-files={}", initial_files_path.display()))
+            .arg("--")
+            .arg(&program)
+            .args(&args)
+            .env_clear()
+            .envs(&req.env)
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Own process group: `kill_exec` sends SIGKILL to the GROUP, which
+        // reaches every process the guest forked, not only the runner.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command.spawn().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to spawn litebox runner for sandbox exec at {}: {error}",
+                self.cfg.runner_bin.display()
+            )
+        })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("litebox runner exited before its pid could be read"))?;
+        let pgid = i32::try_from(pid).context("litebox runner pid does not fit a pgid")?;
+        self.execs.lock().await.insert(
+            req.id.clone(),
+            LiteboxExec {
+                cell: cell.id.clone(),
+                pgid,
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stdout = tokio::spawn(pump_exec_lines(
+            child.stdout.take(),
+            hive_core::LogStream::Stdout,
+            req.id.clone(),
+            tx.clone(),
+        ));
+        let stderr = tokio::spawn(pump_exec_lines(
+            child.stderr.take(),
+            hive_core::LogStream::Stderr,
+            req.id.clone(),
+            tx.clone(),
+        ));
+        let execs = self.execs.clone();
+        let exec_id = req.id.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            // Every output line precedes the terminal event.
+            let _ = stdout.await;
+            let _ = stderr.await;
+            execs.lock().await.remove(&exec_id);
+            // `code()` is `None` for a signal death — exactly the "killed"
+            // meaning the protocol reserves for `exit_code: None`.
+            let exit_code = status.ok().and_then(|s| s.code());
+            let _ = tx.send(hive_core::AgentEvent::ExecDone {
+                id: exec_id,
+                exit_code,
+            });
+            // The runner has exited, so the guest tar and its private alias
+            // are provably no longer being read; their Drop guards unlink.
+            drop(initial_files_alias);
+            drop(exec_tar);
+        });
+        Ok(rx)
+    }
+
+    /// Terminate a still-running `exec_command` by id: SIGKILL to the whole
+    /// process group the runner leads (the guest's forked descendants
+    /// included). Idempotent — an id that already finished is a no-op. The
+    /// waiter task then observes the signal death and emits
+    /// `ExecDone { exit_code: None }`.
+    async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
+        let entry = self.execs.lock().await.get(exec_id).cloned();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            entry.cell == cell.id,
+            "exec {exec_id} belongs to cell {}, not {}",
+            entry.cell,
+            cell.id
+        );
+        #[cfg(unix)]
+        {
+            // SAFETY: killpg(2) with a pgid this process spawned and a signal
+            // number; no pointer arguments.
+            let rc = unsafe { libc::killpg(entry.pgid, libc::SIGKILL) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                // ESRCH: the group is already gone (raced its own exit) —
+                // the waiter reports the real exit either way.
+                anyhow::ensure!(
+                    error.raw_os_error() == Some(libc::ESRCH),
+                    "killpg({}) for exec {exec_id} failed: {error}",
+                    entry.pgid
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("litebox exec kill requires a Unix process group")
+        }
+    }
+
+    async fn exec_pty(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+        crate::PtyIo,
+    )> {
+        // litebox has no separate guest kernel/agent — the guest IS this
+        // host's own `litebox-runner` child process (syscall interception,
+        // not virtualization), so unlike Firecracker's vsock-agent-protocol
+        // exec_pty, no wire protocol is needed at all: a REAL host pty
+        // allocated here and handed to the runner as its stdin/stdout/stderr
+        // gives the guest shell genuine raw-mode terminal behavior for free
+        // (the `AnEntrypoint/litebox` base this platform tracks also
+        // implements its own guest-internal /dev/ptmx pty subsystem — see
+        // ansible/roles/litebox/files/PATCHES.md's "litebox fork tracking"
+        // section — but wiring THIS host-side pty is simpler and needs none
+        // of that: the shell's own line discipline runs against a real
+        // kernel pty exactly as it would over SSH, the same technique
+        // `hive-cell-agent`'s Firecracker-guest PTY support uses on the
+        // OTHER side of the vsock boundary).
+        let net = self
+            .cell_nets
+            .lock()
+            .await
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+                    cell.id
+                )
+            })?;
+
+        let directories = self.prepare_artifact_dirs()?;
+        directories.verify_bindings()?;
+        let shell_tar = self.allocate_temp_file(&directories.temporary, "shell", ".tar")?;
+        build_shell_tar(shell_tar.file.try_clone()?).await?;
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &shell_tar.file)?;
+
+        let (master_fd, slave_fd) = open_pty_pair(req.cols, req.rows)
+            .context("litebox: failed to allocate a host pty for the sandbox shell")?;
+
+        let shell = if req.shell.is_empty() {
+            "/bin/sh".to_string()
+        } else {
+            req.shell.clone()
+        };
+        let cwd = if req.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            req.cwd.clone()
+        };
+
+        let mut command = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut command);
+        let initial_files_path = crate::runtime_artifact::inherit_file_path(
+            &mut command,
+            &initial_files_alias.directory,
+        )?
+        .join(INITIAL_FILES_ALIAS_NAME);
+        command
+            .arg("-Z")
+            .arg("--rewrite-syscalls")
+            .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
+            .arg(format!("--initial-files={}", initial_files_path.display()))
+            .arg("--")
+            .arg(&shell)
+            .env_clear()
+            .envs(&req.env)
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            .current_dir(&cwd)
+            // SAFETY: dup'd fds are valid, open, and owned until this Stdio
+            // takes them — the runner inherits them across exec as its own
+            // fd 0/1/2, exactly the real-terminal shape a login shell expects.
+            .stdin(Stdio::from(slave_fd.try_clone()?))
+            .stdout(Stdio::from(slave_fd.try_clone()?))
+            .stderr(Stdio::from(slave_fd))
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to spawn litebox runner for interactive shell at {}: {error}",
+                self.cfg.runner_bin.display()
+            )
+        })?;
+        let session_id = req.id.clone();
+        let cell_id = cell.id.clone();
+        let funcs = self.funcs.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut master_read = tokio::fs::File::from_std(master_fd.try_clone()?.into());
+        let tx_reader = tx.clone();
+        let id_reader = session_id.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match master_read.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx_reader
+                            .send(hive_core::AgentEvent::PtyOutput {
+                                id: id_reader.clone(),
+                                bytes: buffer[..n].to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // EIO on a pty master is the normal "slave closed" signal
+                    // once the shell (and everything else holding the slave
+                    // open) has exited — not a real error.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let id_waiter = session_id.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await.ok();
+            let exit_code = status.and_then(|s| s.code());
+            let _ = tx.send(hive_core::AgentEvent::PtyExited {
+                id: id_waiter,
+                exit_code,
+            });
+            // Drop this cell's placeholder from `funcs` if a real function
+            // launch never claimed the slot — best-effort, the interactive
+            // shell was never registered there to begin with, this just
+            // guards a hypothetical future caller that keys off cell_id.
+            let _ = funcs.lock().await.remove(&cell_id);
+        });
+
+        let master_for_io = std::sync::Arc::new(master_fd);
+        let master_input = master_for_io.clone();
+        let master_resize = master_for_io;
+        let pty = crate::PtyIo::new(
+            move |bytes: Vec<u8>| {
+                use std::io::Write;
+                let mut f = &*master_input;
+                let _ = f.write_all(&bytes);
+            },
+            move |cols: u16, rows: u16| {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    libc::ioctl(
+                        std::os::fd::AsRawFd::as_raw_fd(&*master_resize),
+                        libc::TIOCSWINSZ as _,
+                        &ws,
+                    );
+                }
+            },
+        );
+        Ok((rx, pty))
+    }
+}
+
+/// Allocate a real host pty (`openpty(3)`) sized to `cols`x`rows`, returned as
+/// a `(master, slave)` pair of owned fds. Used by `LiteboxBackend::exec_pty`
+/// to give an interactive sandbox shell genuine raw-mode terminal behavior —
+/// see that method's own doc comment for why a host-side pty is sufficient
+/// here (litebox's guest and this host process share one address space, so
+/// handing the slave straight to the spawned runner as its stdin/stdout/
+/// stderr works exactly like a real terminal session, no in-guest pty
+/// subsystem required).
+#[cfg(target_os = "linux")]
+fn open_pty_pair(cols: u16, rows: u16) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: openpty is given valid out-params and a stack winsize; on
+    // success both fds are open, valid, and owned by this process.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    anyhow::ensure!(rc == 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: both fds were just returned by a successful openpty() call
+    // above and are not owned anywhere else yet.
+    let master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    Ok((master, slave))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pty_pair(_cols: u16, _rows: u16) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    anyhow::bail!("litebox interactive shell requires a real Linux pty (openpty)")
 }

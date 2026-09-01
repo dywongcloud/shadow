@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useUser } from "@clerk/nextjs";
+import Link from "next/link";
 
 // Protected-preview unlock interstitial. Clean, theme-aware "Authenticating"
 // screen (spoke spinner + title in the foreground color) with a terminal-style
@@ -42,10 +43,19 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
     const qs = window.location.search;
     const p = new URLSearchParams(qs);
     if (!p.get("host") || !p.get("project")) {
+      // Depends on window.location.search (client-only) plus the async
+      // Clerk-resolved `loaded`/`signedIn` props -- genuinely can't be a lazy
+      // initializer; this whole effect is a one-time, ref-guarded auth/redirect
+      // flow, not a synchronous render-time derivation.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setError("This unlock link is missing deployment details.");
       return;
     }
     if (clerkEnabled && !signedIn) {
+      // Hard navigation, not useRouter().push(): this leaves the whole
+      // unauthenticated interstitial for Clerk's hosted sign-in flow, which
+      // needs a fresh page load to initialize correctly.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
       window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
       return;
     }
@@ -78,6 +88,8 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
       clearInterval(tick);
       const { status, body } = res as { status: number; body: any };
       if (status === 401 && body?.signin) {
+        // Same hard-navigation reasoning as the earlier redirect above.
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
         window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
         return;
       }
@@ -100,7 +112,7 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
       {error ? (
         <>
           <p className="mt-3 max-w-sm text-center text-sm text-secondary">{error}</p>
-          <a href="/" className="mt-6 rounded-full border border-border px-4 py-2 text-sm hover:bg-subtle">Back to dashboard</a>
+          <Link href="/" className="mt-6 rounded-full border border-border px-4 py-2 text-sm hover:bg-subtle">Back to dashboard</Link>
         </>
       ) : (
         <pre className="mt-7 max-w-[90vw] whitespace-pre-wrap break-all text-left font-mono text-[12px] font-semibold leading-relaxed text-green-700 dark:text-[#3dfa7e] sm:text-[13px]">

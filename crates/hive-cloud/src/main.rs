@@ -19,6 +19,7 @@ mod browser_db_rest;
 // bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
 mod browser_metering;
 mod browser_presence;
+mod build_coordinates;
 mod build_executor;
 mod cluster;
 mod compose;
@@ -27,6 +28,7 @@ mod db_gateway;
 mod db_replicate;
 mod db_rest;
 mod dedicated_ipv4_listener;
+mod deployment_ledger;
 mod dht_probe;
 mod discovery;
 mod dns;
@@ -58,6 +60,7 @@ mod lease;
 mod marketplace;
 mod memwatch;
 mod mesh_raw;
+mod mesh_shell;
 mod meshwatch;
 mod metrics;
 mod microfrontends;
@@ -66,14 +69,23 @@ mod notifications;
 mod persist;
 mod project_settings;
 mod push;
+mod queues;
+mod queues_api;
 mod raw_ports;
 mod raw_proxy;
 mod relational;
+mod repository_build;
 mod resources;
 mod resp;
 mod resp_cache;
 mod restart_audit;
 mod retry;
+mod runtime_artifact_transfer;
+mod runtime_artifact_transfer_fs;
+mod runtime_artifact_transfer_sender;
+mod runtime_artifact_transfer_service;
+mod runtime_artifact_transfer_store;
+mod runtime_artifact_transfer_wire;
 mod sandboxes;
 mod sandboxes_api;
 mod sandboxes_platform;
@@ -371,10 +383,34 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long = "guardian-lifecycle-diagnostic")]
     guardian_lifecycle_diagnostic: bool,
+    /// Focused debug-build-only real-store witness for compression plus the
+    /// replication-writer retention cadence under continuous snapshot traffic.
+    /// Requires disposable HIVE_DATA, HIVE_GUARDIAN_WRITER_CADENCE_DIAGNOSTIC=1,
+    /// and HIVE_GUARDIAN_PART_REAP_CHECK_SECS<=2. Release binaries omit it.
+    #[cfg(debug_assertions)]
+    #[arg(long = "guardian-writer-cadence-diagnostic")]
+    guardian_writer_cadence_diagnostic: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// Explicit runtime instead of #[tokio::main] for ONE reason: worker stack
+// size. run_build's async pipeline compiles to poll frames large enough to
+// blow tokio's default 2 MiB worker stack — witnessed live: every deploy on a
+// debug binary died `thread 'tokio-rt-worker' has overflowed its stack` the
+// moment the build task started (the CI acceptance node crashed on its first
+// deploy, red since f75aa2c5), and release binaries sit close enough to the
+// edge that the same class killed nodes under real load. 16 MiB is virtual
+// address space per worker, not resident memory — pages are only committed
+// when touched — so the cost is nil and the whole failure class is gone.
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -395,6 +431,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
+    #[cfg(debug_assertions)]
+    if args.guardian_writer_cadence_diagnostic {
+        println!("{}", guardian::writer_cadence_diagnostic().await?);
+        return Ok(());
+    }
     #[cfg(debug_assertions)]
     if args.guardian_lifecycle_diagnostic {
         println!("{}", guardian::lifecycle_diagnostic().await?);
@@ -542,12 +583,7 @@ async fn main() -> anyhow::Result<()> {
     // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
     // backend — gossiped so the placement scheduler only auto-targets
     // production isolation backends (never the local/mock Mac nodes).
-    // `sandbox_fc` retains the CONCRETE type (Sandboxes' exec/kill methods are
-    // Firecracker-specific, not part of the generic `CellBackend` trait object
-    // every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
-    let sandbox_fc: Option<Arc<FirecrackerBackend>> =
-        sandbox_fc_supported.then(|| firecracker.clone());
     // Litebox Tier 2: NEVER auto-detected live (see `LiteboxBackend::smoke_test`'s
     // doc comment and AGENTS.md's PVM two-tier precedent) — an operator runs
     // `--litebox-probe` once during bring-up on an idle node and only then
@@ -559,6 +595,22 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
     let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
+    // Sandboxes' own backend selection mirrors the main isolation-backend
+    // ranking one step behind (Firecracker -> Litebox -> none, never Mock —
+    // an unsandboxed dev host reports EngineUnavailable instead of a fake
+    // "sandbox" that doesn't isolate anything). `exec_command`/`exec_pty` are
+    // now generic `CellBackend` trait methods (previously Firecracker-only
+    // inherent methods), so this can hold a trait object like every other
+    // subsystem instead of the concrete Firecracker type.
+    let sandbox_backend: Option<Arc<dyn CellBackend>> = if sandbox_fc_supported {
+        Some(firecracker.clone())
+    } else if litebox_supported {
+        Some(litebox.clone())
+    } else {
+        None
+    };
+    let sandbox_firecracker: Option<Arc<FirecrackerBackend>> =
+        sandbox_fc_supported.then(|| firecracker.clone());
     let litebox_runtime_capabilities = resources::RuntimeCapabilitySource::litebox(litebox.clone());
     let (backend, backend_name, runtime_capability_source): (
         Arc<dyn CellBackend>,
@@ -590,6 +642,9 @@ async fn main() -> anyhow::Result<()> {
                 root: std::env::temp_dir().join("hive-cloud-cells"),
                 provision_latency: Duration::from_millis(200),
                 cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+                // Durable: must survive a hive-node restart, unlike root/cache_root
+                // above. Lives next to the sealed artifacts it describes.
+                receipts_dir: crate::persist::data_dir().join("runtime-artifacts-v1"),
             })),
             "mock",
             resources::RuntimeCapabilitySource::mock(),
@@ -976,6 +1031,10 @@ async fn main() -> anyhow::Result<()> {
         // The executor may be initialized above, but this stays fail-closed until
         // every git build surface consumes it in this binary.
         build_isolation_protocol: None,
+        // Published after CloudState::new proves the transfer receiver actually
+        // initialized (its worker, durable store and recovery all succeeded) —
+        // never asserted from this literal.
+        artifact_transfer_protocol: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
         provider: std::env::var("HIVE_CLOUD_PROVIDER")
@@ -1033,7 +1092,8 @@ async fn main() -> anyhow::Result<()> {
         gw.clone(),
         fluid,
         hive,
-        sandbox_fc,
+        sandbox_firecracker,
+        sandbox_backend,
     );
     // Fill the embedded relay's deferred AccessControl cell now that
     // CloudState finally exists (it was constructed and wired into the relay
@@ -1041,6 +1101,16 @@ async fn main() -> anyhow::Result<()> {
     // `Weak` deliberately: the AccessControl impl must never be the thing
     // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
+    // Advertise the sealed-artifact transfer receiver only after CloudState
+    // construction PROVED it initialized (durable store opened, worker
+    // spawned, interrupted transactions recovered). A receiver that failed
+    // closed keeps advertising `None`, so no coordinator ever selects this
+    // node as an immutable-generation transfer target.
+    if cloud.runtime_artifact_transfer.enabled() {
+        cloud.registry.set_self_artifact_transfer_protocol(Some(
+            crate::runtime_artifact_transfer_wire::PROTOCOL_VERSION,
+        ));
+    }
 
     // Tell the gateway the PUBLIC domain user deployments are reachable on, so
     // the URLs it reports (`DeploymentInfo::alias` and friends, which the
@@ -1066,6 +1136,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the coalescing background persister: after this, persist() marks dirty
     // + wakes the writer instead of fsync-ing the whole state on the request thread.
     persist::spawn_persister(cloud.clone());
+    deployment_ledger::spawn_outbox(cloud.clone());
     // Metrics hour/day rollups (metrics.rs's RollupSnapshot, the only durable slice
     // of MetricsStore) are the sole exception to "persist() runs after every
     // mutation": state.rs's record() — called on every single HTTP request — never
@@ -1130,6 +1201,29 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 None => tracing::info!("shutdown signal received; beginning graceful shutdown"),
             }
+            // HARD DEADLINE on the whole graceful sequence. Several steps below
+            // await work that is not individually bounded (the runtime-artifact
+            // transfer drain, the platform-state flush, guardian shutdown), and a
+            // wedge in any of them leaves the process alive but dark — witnessed
+            // live on fc-sanjose (2026-08-26): memwatch requested a MemoryPressure
+            // restart at rss 12GB, "beginning graceful shutdown" logged, and the
+            // process then sat frozen for 5+ minutes serving nothing while the
+            // fleet treated the dark leader as current. The watchdog turns any
+            // wedged step into the bounded restart the caller asked for; the exit
+            // code matches what the normal tail would have used.
+            {
+                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 90));
+                let code = if requested_reason.is_some() { 17 } else { 0 };
+                tokio::spawn(async move {
+                    tokio::time::sleep(deadline).await;
+                    tracing::error!(
+                        ?deadline,
+                        exit_code = code,
+                        "graceful shutdown exceeded its hard deadline — forcing exit now"
+                    );
+                    std::process::exit(code);
+                });
+            }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
                 tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
@@ -1138,6 +1232,13 @@ async fn main() -> anyhow::Result<()> {
                 // the grace window; wait for it here since exit() below would
                 // otherwise kill them the instant this task returns regardless.
                 tokio::time::sleep(grace).await;
+            }
+            tracing::info!("shutdown requested → draining runtime artifact transfers");
+            if let Err(error) = flush_cloud.runtime_artifact_transfer.shutdown().await {
+                tracing::error!(
+                    %error,
+                    "runtime artifact transfer worker did not drain cleanly; continuing shutdown"
+                );
             }
             tracing::info!("shutdown requested → flushing platform state");
             let final_guardian_generation = match persist::flush_blocking() {
@@ -1601,6 +1702,10 @@ async fn main() -> anyhow::Result<()> {
         cloud.clone(),
         cloud.world_queue.clone(),
     ));
+
+    // Cloudflare Queues parity: Worker-consumer push delivery + retention
+    // sweep + GuardianDB recovery (crate::queues).
+    tokio::spawn(crate::queues::spawn_delivery_loop(cloud.clone()));
 
     // Nameserver prover: EVERY node (not leader-only — the whole value is
     // independent vantages) queries every peer that claims a public `:53` and
@@ -2094,6 +2199,17 @@ fn owner_routed(path: &str) -> bool {
         // than stored since there is no `Database` record to carry a host_node.
         || path.starts_with("/v1/browser-db/")
         || (path.starts_with("/v1/projects/") && path.ends_with("/browser-db/rest-mesh"))
+        // Runtime artifact transfers are addressed to the immutable request's
+        // exact target node. Sending a chunk to the control-plane leader would
+        // mutate a different host's transaction journal (or fail WrongTarget)
+        // and make resumable delivery impossible across leader changes.
+        || path.starts_with("/v1/runtime-artifact-transfer/v1/")
+        // Sandbox owner RPCs (`sandboxes_api`'s delegate-create / owner-op) are
+        // addressed by the LEADER to the exact node that holds — or is being
+        // asked to provision — the cell. Bouncing them back to the leader would
+        // re-run the create on a node with no exec backend (the fail-closed
+        // refusal the delegation exists to route around) or deadlock the hop.
+        || path.starts_with("/v1/internal/sandboxes/")
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
@@ -2482,7 +2598,7 @@ const MAX_STALE_EPOCH_RETRIES: u32 = 3;
 /// The connect timeout is separate from (and far tighter than) the overall
 /// request timeout: a candidate whose address black-holes must not burn the
 /// whole 30s budget before the next candidate is tried.
-fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
+pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
     > = std::sync::OnceLock::new();
@@ -2525,7 +2641,7 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
 /// NOT health-filtered, because the stale health verdict is precisely the input
 /// that just misled us. Self is skipped (we already know we are not the leader,
 /// so a round trip to our own public address can only refuse again).
-fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
+pub(crate) fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
     let nodes = cloud.registry.nodes();
     let addr_of = |name: &str| -> Option<String> {
         nodes

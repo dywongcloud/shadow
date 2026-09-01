@@ -239,7 +239,17 @@ pub fn runtime_artifact_capable(n: &NodeInfo, needed: bool) -> bool {
 /// probe proved the complete BuildExecutor v1 contract. An absent field is an
 /// old node that still builds on the host and is therefore known-incapable.
 pub fn build_isolation_capable(n: &NodeInfo, needed: bool) -> bool {
-    !needed || n.build_isolation_protocol == Some(1)
+    // A node can run repository build commands when either: it advertises the
+    // isolated BuildExecutor (required for the Firecracker microVM backend,
+    // whose guest cannot exec host build commands), OR it runs a HOST-EXEC
+    // backend (mock/litebox) that builds directly on the host — the byte-
+    // identical `crate::mock::run_build_process` path litebox and mock have
+    // always used. A host-exec backend never needed the microVM-era executor,
+    // so requiring it there would exclude every litebox/mock node from source
+    // builds and refuse the deploy fleet-wide.
+    !needed
+        || n.build_isolation_protocol == Some(1)
+        || matches!(n.backend.as_str(), "mock" | "litebox")
 }
 
 /// Minimum free disk (GiB) a node must report to be eligible for new placement.
@@ -651,6 +661,7 @@ mod tests {
             bun_runtime: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
+            artifact_transfer_protocol: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

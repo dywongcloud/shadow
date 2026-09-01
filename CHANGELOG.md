@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-09-01 — Sandboxes fail closed and route to a real owner; Linux mock nodes become Litebox
+
+Commit `59357cdac9` carries ALL of this under a subject that names only its
+Tencent hunk — the `git_commit` verb ignored its `paths` argument and staged
+the whole tree (PRD row `gm-git-commit-ignores-paths`). This entry is the
+honest description of that commit. It is the replay of local `138815cd20`
+onto `dff7bf99c3` (cross-node terminal forwarding over the mesh,
+`mesh_shell.rs`); the merge keeps that forwarding and points it at
+`SandboxRecord::owner_node` — a non-owner node now tunnels the interactive
+shell to the real owner over the existing `RawTarget` mesh surface and sends
+`wrong_node` only when no mesh path to the owner exists.
+
+- **Sandbox creation never returns a simulated success again.**
+  `PlatformSandboxProvider::create_sandbox` fails CLOSED: a provisioning
+  error is a typed `EngineUnavailable` naming the node and its backend, no
+  record is persisted, and a Drop guard releases the half-provisioned cell.
+  The previous path stored `status=failed` + note and returned `Ok` — the
+  "this node has no real isolation backend … sandboxes are simulated here"
+  records (e.g. `sbx_52b6a2da81324dc0`) came from the control-plane leader
+  itself, which runs `MockBackend`.
+- **The leader is a router, not a fallback provisioner.** `POST
+  …/sandboxes` mints the id, then delegates to healthy exec-capable peers
+  (`backend ∈ {firecracker, litebox}`, same region first, name order) with
+  bounded per-peer and total budgets over the existing owner-hop transport
+  (HTTP admin, else the gossip `POST` arm); exhaustion is a typed 503
+  `SANDBOX_NO_CAPABLE_NODE` listing every candidate tried. Records carry
+  `owner_node`; stop/delete/run/kill ride one typed owner RPC
+  (`/v1/internal/sandboxes/owner-op`) that re-derives authority on the owner
+  and never re-proxies; reads proxy to the owner. Internal hops require the
+  fleet token or a tenant-bound `mesh-internal` JWT; `/v1/internal/sandboxes/`
+  is exempt from both leader gates.
+- **`LiteboxBackend` can run sandbox commands.** `exec_command`/`kill_exec`
+  implemented on the same guest mechanism as `exec_pty` (fresh runner on the
+  cell's TUN, guest tar with the program's `ldd` closure, separate
+  stdout/stderr `ExecOutput` streams, exactly one `ExecDone`, `killpg` by exec
+  id).
+- **The pinned AnEntrypoint Litebox runner now works on RHEL-family hosts.**
+  `roles/litebox/files/networking.patch` gained a third hunk: uid 0 gets
+  `CAP_DAC_OVERRIDE` semantics in the guest in-memory FS. Without it the
+  runner panicked at `lib.rs:293 NoWritePerms` because `/usr/bin` is 0555.
+  With it `hive-cloud --litebox-probe` PASSES on fc-tokyo, fc-seoul,
+  fc-virginia-4/5 (runner `f970bfe70ac86d4e`, byte-identical),
+  fc-sanjose-cvm-1/2 (`cb20b4e9f3cf03f5`) and fc-sanjose; the first six run
+  `backend=litebox` in production, the leader flips on its next restart.
+  Details in `PATCHES.md`; `hosts.ini.example` documents the `[litebox]` group
+  and the per-host `litebox_verified` mark; the AGENTS.md Litebox section is
+  drained to pointers.
+- **Tencent dedicated IPv4.** `AllocateAddresses` tags use `{Key, Value}`;
+  `TagKey`/`TagValue` is the filter type and was rejected with
+  `UnknownParameter: Tags.0.TagKey` before any address was purchased.
+
 ## (pending) — Browser functions run against a real Node API
 
 A browser function may now be written the way a Node function is written. The

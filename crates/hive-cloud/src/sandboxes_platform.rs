@@ -1,28 +1,95 @@
 //! `PlatformSandboxProvider` — the production [`SandboxProvider`]: real
-//! Firecracker microVMs (`hive_backend::firecracker::FirecrackerBackend`), the
-//! SAME isolation tech Fluid serverless functions already use on this fleet —
-//! reused, not duplicated, per the platform's own "one microVM runtime" design.
+//! isolated cells via the generic `hive_backend::CellBackend` trait — real
+//! Firecracker microVMs when available (the SAME isolation tech Fluid
+//! serverless functions use on this fleet), falling back to Litebox on nodes
+//! where microVMs are unavailable/suppressed and Litebox has been verified
+//! (`HIVE_LITEBOX_VERIFIED=1`, mirroring `main.rs`'s own backend-selection
+//! ranking) — reused, not duplicated, per the platform's "one isolation
+//! selection" design. Never Mock: an unsandboxed node honestly reports
+//! `EngineUnavailable` rather than presenting a fake "sandbox" that isolates
+//! nothing.
 //!
 //! A sandbox is a long-lived cell (`CellBackend::provision`, never torn down
-//! until `stop`/`delete`/idle-timeout). Command execution rides a NEW guest-
-//! agent protocol addition (`AgentRequest::Exec`/`KillExec`, `hive-core/proto.rs`)
+//! until `stop`/`delete`/idle-timeout). Command execution rides the guest-
+//! agent protocol's `AgentRequest::Exec`/`KillExec` (`hive-core/proto.rs`)
 //! that runs one argv command per call over its own vsock connection, streaming
-//! `ExecOutput` (stdout/stderr kept distinct) then one `ExecDone` — see
-//! `FirecrackerBackend::exec_command`/`kill_exec`.
+//! `ExecOutput` (stdout/stderr kept distinct) then one `ExecDone`; the
+//! interactive terminal rides the sibling `ExecPty`/`PtyInput`/`PtyResize`/
+//! `PtyOutput`/`PtyExited` messages — see `CellBackend::exec_command`/
+//! `kill_exec`/`exec_pty`.
 //!
-//! On a node whose isolation backend is NOT Firecracker (mock/dev), every
-//! operation reports `EngineUnavailable` with a clear note — mirroring the
-//! platform's existing "simulated" idiom (e.g. DB provisioning when podman is
-//! absent) rather than silently downgrading to a different, undisclosed
-//! isolation technology.
+//! On a node with no selected backend, every cell-touching operation reports
+//! `EngineUnavailable`, and `create_sandbox` FAILS CLOSED: no record is
+//! persisted, no success-shaped "failed" row exists, and a partially
+//! provisioned cell is released by a Drop guard on the error/cancel path.
+//! There is no simulation mode — a sandbox either has a real isolated cell on
+//! `SandboxRecord::owner_node` or it does not exist. Placement onto a node
+//! that CAN provision is `sandboxes_api::create_sandbox`'s job (it delegates
+//! from an incapable leader to a capable peer); this provider only ever
+//! provisions locally.
 
 use crate::sandboxes::*;
-use hive_backend::firecracker::FirecrackerBackend;
 use hive_backend::{CellBackend, CellHandle, CellSpec};
 use hive_core::{CellId, ExecRequest as GuestExecRequest, ResourceSpec};
 use parking_lot::RwLock as PLRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Holds a freshly provisioned cell between `provision` returning and the
+/// sandbox record being committed. Armed by construction: if the create path
+/// errors or the request future is dropped (axum drops it when the client goes
+/// away — `AGENTS.md`'s "request cancellation is a failure mode") before
+/// `commit`, the cell is terminated and never leaks as an untracked microVM /
+/// litebox process. `commit` publishes the handle into the provider's live
+/// `cells` map and disarms.
+struct ProvisionedCellGuard {
+    sandbox_id: String,
+    handle: Option<CellHandle>,
+    backend: Arc<dyn CellBackend>,
+    cells: Arc<PLRwLock<HashMap<String, CellHandle>>>,
+}
+
+impl ProvisionedCellGuard {
+    fn commit(mut self) -> CellHandle {
+        let handle = self
+            .handle
+            .take()
+            .expect("ProvisionedCellGuard::commit called twice");
+        self.cells
+            .write()
+            .insert(self.sandbox_id.clone(), handle.clone());
+        handle
+    }
+}
+
+impl Drop for ProvisionedCellGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return; // committed
+        };
+        let backend = self.backend.clone();
+        let sandbox_id = self.sandbox_id.clone();
+        tracing::warn!(
+            sandbox = %sandbox_id,
+            cell = %handle.id,
+            "releasing a provisioned sandbox cell whose record was never committed (create failed or was cancelled)"
+        );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = backend.terminate(&handle).await {
+                    tracing::warn!(sandbox = %sandbox_id, %error, "uncommitted sandbox cell teardown failed");
+                }
+            });
+        }
+    }
+}
+
+/// Mint a platform sandbox id — `sbx_` + 16 lowercase hex. Called by the
+/// leader BEFORE any transport so a delegated create that times out and is
+/// retried carries the same id, which the owner treats as the same request.
+pub fn mint_sandbox_id() -> String {
+    format!("sbx_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
+}
 
 fn runtime_image(runtime: &str) -> &'static str {
     match runtime {
@@ -54,12 +121,15 @@ pub struct PlatformSandboxProvider {
     /// Live kill-channels for detached execs, keyed by command id, so
     /// `kill_command` can stop draining even if the guest-side kill races.
     killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
-    backend: Option<Arc<FirecrackerBackend>>,
+    backend: Option<Arc<dyn CellBackend>>,
     region: String,
+    /// This node's own name — stamped onto `SandboxRecord::owner_node` for
+    /// every cell provisioned HERE, and what `owns` compares against.
+    node_name: String,
 }
 
 impl PlatformSandboxProvider {
-    pub fn new(region: String, backend: Option<Arc<FirecrackerBackend>>) -> Self {
+    pub fn new(region: String, backend: Option<Arc<dyn CellBackend>>, node_name: String) -> Self {
         PlatformSandboxProvider {
             sandboxes: Arc::new(PLRwLock::new(Vec::new())),
             commands: Arc::new(PLRwLock::new(Vec::new())),
@@ -69,7 +139,74 @@ impl PlatformSandboxProvider {
             killers: Arc::new(PLRwLock::new(HashMap::new())),
             backend,
             region,
+            node_name,
         }
+    }
+
+    /// Can THIS node provision a sandbox cell and execute commands in it? The
+    /// same `sandbox_exec_capable` predicate the remote-candidate filter uses,
+    /// applied to the locally selected backend's advertised name — so a node
+    /// never provisions locally what it would refuse to place on a peer.
+    pub fn local_exec_capable(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|b| sandbox_exec_capable(b.name()))
+    }
+
+    /// Name of the locally selected backend ("firecracker"/"litebox"), or
+    /// `None` when this node has no real isolation backend at all.
+    pub fn backend_name(&self) -> Option<&'static str> {
+        self.backend.as_ref().map(|b| b.name())
+    }
+
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    /// Adopt a record provisioned on ANOTHER node (its `owner_node` names the
+    /// peer) as local metadata — never provisions a cell here. The leader
+    /// keeps a copy so every later leader-forwarded mutation can find the
+    /// owner to route to; a duplicate adopt (same id) replaces in place so a
+    /// retried delegation stays idempotent.
+    pub fn adopt_record(&self, rec: SandboxRecord) {
+        let mut w = self.sandboxes.write();
+        if let Some(existing) = w.iter_mut().find(|s| s.id == rec.id) {
+            *existing = rec;
+        } else {
+            w.push(rec);
+        }
+    }
+
+    /// Drop the local metadata copy of a sandbox the OWNER has already deleted
+    /// (no cell is touched here — this node never held one).
+    pub fn forget_record(&self, project_id: &str, id: &str) {
+        let now = hive_core::now_ms();
+        let mut w = self.sandboxes.write();
+        if let Some(rec) = w
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id && s.deleted_at.is_none())
+        {
+            rec.deleted_at = Some(now);
+            rec.status = SandboxStatus::Stopped;
+            rec.updated_at = now;
+        }
+    }
+
+    /// Look up a sandbox by id ALONE, no project scope — used only by
+    /// `mesh_shell::resolve_sandbox_shell`, whose `RawTarget` handshake (a
+    /// fixed `{project,function,port,proto}` shape defined in `hive-p2p`,
+    /// deliberately not modified for this hive-cloud-local feature) has no
+    /// project field to carry. Safe specifically because the caller checks
+    /// that THIS node owns the record immediately after — a sandbox id
+    /// collision across two tenants' projects is already precluded by the id's
+    /// own generation (`mint_sandbox_id`: a random suffix, never tenant input),
+    /// so this adds no cross-tenant leak beyond what the id already guarantees.
+    pub fn get_sandbox_by_id(&self, id: &str) -> Option<SandboxRecord> {
+        self.sandboxes
+            .read()
+            .iter()
+            .find(|s| s.id == id && s.deleted_at.is_none())
+            .cloned()
     }
 
     pub fn snapshot(
@@ -137,6 +274,10 @@ impl PlatformSandboxProvider {
             .filter(|s| {
                 s.status == SandboxStatus::Running
                     && s.timeout_expires_at.map(|t| now >= t).unwrap_or(false)
+                    // Only the OWNER reaps: an adopted metadata copy (leader)
+                    // has no cell to tear down, and flipping it to Stopped
+                    // here would claim a state the owner has not reached.
+                    && (s.owner_node.is_empty() || s.owner_node == self.node_name)
             })
             .map(|s| (s.project_id.clone(), s.id.clone()))
             .collect();
@@ -164,15 +305,28 @@ impl PlatformSandboxProvider {
             .ok_or_else(|| SandboxError::NotFound(id.to_string()))
     }
 
-    /// Provision (or re-provision, if the cell was lost to a restart) the
-    /// sandbox's microVM and return its handle. Idempotent per sandbox id.
-    async fn ensure_cell(&self, sandbox: &SandboxRecord) -> Result<CellHandle, SandboxError> {
-        if let Some(h) = self.cells.read().get(&sandbox.id).cloned() {
-            return Ok(h);
-        }
-        let backend = self.backend.as_ref().ok_or_else(|| {
-            SandboxError::EngineUnavailable("this node has no Firecracker isolation backend (Linux + /dev/kvm required) — sandboxes are simulated here".into())
-        })?;
+    /// The typed refusal every cell-touching path on a backend-less node
+    /// returns. Names the real cause (which backend this node lacks), never
+    /// a "simulated" state.
+    fn engine_unavailable(&self) -> SandboxError {
+        SandboxError::EngineUnavailable(format!(
+            "node {} has no exec-capable isolation backend for sandboxes (Firecracker needs Linux + /dev/kvm; Litebox needs a verified runner + HIVE_LITEBOX_VERIFIED=1); backend here: {}",
+            self.node_name,
+            self.backend_name().unwrap_or("none")
+        ))
+    }
+
+    /// Provision a cell for `sandbox` WITHOUT publishing it: the returned guard
+    /// owns the cell until `commit` (which inserts it into `cells`) — dropping
+    /// the guard on any error/cancel path terminates the cell.
+    async fn provision_cell(
+        &self,
+        sandbox: &SandboxRecord,
+    ) -> Result<ProvisionedCellGuard, SandboxError> {
+        let backend = self
+            .backend
+            .clone()
+            .ok_or_else(|| self.engine_unavailable())?;
         let image = sandbox
             .current_snapshot_id
             .clone()
@@ -190,56 +344,82 @@ impl PlatformSandboxProvider {
             container: None,
         };
         let handle = backend.provision(&spec).await.map_err(|e| {
-            SandboxError::EngineUnavailable(format!("failed to provision sandbox microVM: {e}"))
+            SandboxError::EngineUnavailable(format!(
+                "node {} ({}) failed to provision the sandbox cell: {e:#}",
+                self.node_name,
+                backend.name()
+            ))
         })?;
-        self.cells
-            .write()
-            .insert(sandbox.id.clone(), handle.clone());
-        Ok(handle)
+        Ok(ProvisionedCellGuard {
+            sandbox_id: sandbox.id.clone(),
+            handle: Some(handle),
+            backend,
+            cells: self.cells.clone(),
+        })
     }
 
-    async fn terminate_cell(&self, sandbox_id: &str) {
-        let handle = self.cells.write().remove(sandbox_id);
-        if let (Some(handle), Some(backend)) = (handle, self.backend.as_ref()) {
-            let _ = backend.terminate(&handle).await;
+    /// Provision (or re-provision, if the cell was lost to a restart) the
+    /// sandbox's cell and return its handle. Idempotent per sandbox id.
+    async fn ensure_cell(&self, sandbox: &SandboxRecord) -> Result<CellHandle, SandboxError> {
+        if let Some(h) = self.cells.read().get(&sandbox.id).cloned() {
+            return Ok(h);
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl SandboxProvider for PlatformSandboxProvider {
-    async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError> {
-        Ok(self
-            .sandboxes
-            .read()
-            .iter()
-            .filter(|s| s.project_id == project_id && s.deleted_at.is_none())
-            .cloned()
-            .collect())
+        if !sandbox.owner_node.is_empty() && sandbox.owner_node != self.node_name {
+            // A metadata copy adopted from the real owner: provisioning a
+            // SECOND cell here would fork the sandbox across two nodes.
+            return Err(SandboxError::OwnerUnreachable(format!(
+                "sandbox {} is owned by node {}; this node ({}) only holds its metadata",
+                sandbox.id, sandbox.owner_node, self.node_name
+            )));
+        }
+        let guard = self.provision_cell(sandbox).await?;
+        Ok(guard.commit())
     }
 
-    async fn create_sandbox(
+    /// Owner-side create with a CALLER-MINTED id (the leader mints before any
+    /// transport). Idempotent on that id: a retry after a timed-out delegation
+    /// returns the record the first attempt already committed instead of
+    /// provisioning twice. Fails closed — an `ensure_cell`/provision failure
+    /// returns the typed `EngineUnavailable` and persists NOTHING.
+    pub async fn create_sandbox_with_id(
         &self,
         tenant_id: &str,
         project_id: &str,
+        id: &str,
         input: CreateSandboxInput,
     ) -> Result<SandboxRecord, SandboxError> {
         validate_name(&input.name)?;
         validate_runtime(&input.runtime)?;
         validate_network_policy(&input.network_policy)?;
-        if self
-            .sandboxes
-            .read()
-            .iter()
-            .any(|s| s.project_id == project_id && s.name == input.name && s.deleted_at.is_none())
-        {
-            return Err(SandboxError::AlreadyExists(format!(
-                "sandbox '{}' already exists in this project",
-                input.name
+        if id.is_empty() || !id.starts_with("sbx_") || id.len() > 64 {
+            return Err(SandboxError::InvalidName(format!(
+                "sandbox id '{id}' is not a platform-minted id"
             )));
         }
+        {
+            let r = self.sandboxes.read();
+            if let Some(existing) = r.iter().find(|s| s.id == id && s.deleted_at.is_none()) {
+                if existing.tenant_id == tenant_id && existing.project_id == project_id {
+                    return Ok(existing.clone());
+                }
+                return Err(SandboxError::AlreadyExists(format!(
+                    "sandbox id {id} already exists under a different project"
+                )));
+            }
+            if r
+                .iter()
+                .any(|s| s.project_id == project_id && s.name == input.name && s.deleted_at.is_none())
+            {
+                return Err(SandboxError::AlreadyExists(format!(
+                    "sandbox '{}' already exists in this project",
+                    input.name
+                )));
+            }
+        }
+        if !self.local_exec_capable() {
+            return Err(self.engine_unavailable());
+        }
 
-        let id = format!("sbx_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
         let now = hive_core::now_ms();
         let env_refs: Vec<EnvRef> = input
             .env
@@ -251,11 +431,11 @@ impl SandboxProvider for PlatformSandboxProvider {
             .collect();
 
         let mut rec = SandboxRecord {
-            id: id.clone(),
+            id: id.to_string(),
             tenant_id: tenant_id.to_string(),
             project_id: project_id.to_string(),
             provider: "platform".into(),
-            provider_sandbox_name: id.clone(),
+            provider_sandbox_name: id.to_string(),
             provider_sandbox_id: None,
             name: input.name,
             status: SandboxStatus::Pending,
@@ -294,24 +474,72 @@ impl SandboxProvider for PlatformSandboxProvider {
             deleted_at: None,
             container: String::new(),
             note: String::new(),
+            owner_node: self.node_name.clone(),
         };
         rec.timeout_expires_at = Some(now + rec.timeout_ms);
 
-        match self.ensure_cell(&rec).await {
-            Ok(handle) => {
-                rec.status = SandboxStatus::Running;
-                rec.provider_sandbox_id = handle.endpoint.clone();
-                rec.container = cell_id_for(&rec.id).to_string();
-                rec.last_started_at = Some(now);
+        // Fail closed: a provisioning error propagates typed, no record is
+        // written, and the guard releases the cell if anything between here
+        // and the commit below errors or is cancelled.
+        let guard = self.provision_cell(&rec).await?;
+        {
+            // Re-check under the write lock: a concurrent create for the same
+            // id/name may have committed while we were provisioning. The guard
+            // (still armed) tears our duplicate cell down on the early return.
+            let mut w = self.sandboxes.write();
+            if let Some(existing) = w.iter().find(|s| s.id == rec.id && s.deleted_at.is_none()) {
+                return Ok(existing.clone());
             }
-            Err(e) => {
-                rec.status = SandboxStatus::Failed;
-                rec.note = e.message();
-                tracing::warn!(sandbox = %rec.id, error = %rec.note, "sandbox microVM provisioning failed — simulated");
+            if w.iter().any(|s| {
+                s.project_id == rec.project_id && s.name == rec.name && s.deleted_at.is_none()
+            }) {
+                return Err(SandboxError::AlreadyExists(format!(
+                    "sandbox '{}' already exists in this project",
+                    rec.name
+                )));
             }
+            let handle = guard.commit();
+            rec.status = SandboxStatus::Running;
+            rec.provider_sandbox_id = handle.endpoint.clone();
+            rec.container = cell_id_for(&rec.id).to_string();
+            rec.last_started_at = Some(now);
+            w.push(rec.clone());
         }
-        self.sandboxes.write().push(rec.clone());
+        tracing::info!(sandbox = %rec.id, node = %self.node_name, backend = self.backend_name().unwrap_or("none"), "sandbox cell provisioned");
         Ok(rec)
+    }
+
+    async fn terminate_cell(&self, sandbox_id: &str) {
+        let handle = self.cells.write().remove(sandbox_id);
+        if let (Some(handle), Some(backend)) = (handle, self.backend.as_ref()) {
+            let _ = backend.terminate(&handle).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxProvider for PlatformSandboxProvider {
+    async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError> {
+        Ok(self
+            .sandboxes
+            .read()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.deleted_at.is_none())
+            .cloned()
+            .collect())
+    }
+
+    /// Local create with a freshly minted id — see `create_sandbox_with_id`
+    /// for the fail-closed contract (this is the same path, id minted here).
+    async fn create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError> {
+        let id = mint_sandbox_id();
+        self.create_sandbox_with_id(tenant_id, project_id, &id, input)
+            .await
     }
 
     async fn get_sandbox(
@@ -338,6 +566,22 @@ impl SandboxProvider for PlatformSandboxProvider {
         input: CreateSandboxInput,
     ) -> Result<SandboxRecord, SandboxError> {
         if let Ok(existing) = self.get_sandbox(project_id, &input.name).await {
+            // A `Failed` row can only be a pre-fail-closed persisted record
+            // (this provider no longer writes one). Returning it would present
+            // a sandbox that never had a cell as "existing" — surface it as
+            // the typed failure it is instead of masking it.
+            if existing.status == SandboxStatus::Failed {
+                return Err(SandboxError::EngineUnavailable(format!(
+                    "sandbox '{}' ({}) has no cell — it was recorded as failed ({}); delete it and create again",
+                    existing.name,
+                    existing.id,
+                    if existing.note.is_empty() {
+                        "no detail recorded"
+                    } else {
+                        existing.note.as_str()
+                    }
+                )));
+            }
             return Ok(existing);
         }
         self.create_sandbox(tenant_id, project_id, input).await
@@ -395,9 +639,10 @@ impl SandboxProvider for PlatformSandboxProvider {
     ) -> Result<SandboxCommandRecord, SandboxError> {
         validate_argv(&input.cmd, &input.args)?;
         let sandbox = self.get_sandbox(project_id, id).await?;
-        let backend = self.backend.as_ref().ok_or_else(|| {
-            SandboxError::EngineUnavailable("no Firecracker backend on this node".into())
-        })?;
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or_else(|| self.engine_unavailable())?;
         let handle = self.ensure_cell(&sandbox).await?;
         let secrets = self.secret_values(&sandbox);
         let cmd_id = format!("cmd_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
@@ -466,6 +711,47 @@ impl SandboxProvider for PlatformSandboxProvider {
         drain_exec_events(&mut rx, &self.commands, &cmd_id, &secrets, notify).await;
         self.killers.write().remove(&cmd_id);
         self.get_command(project_id, id, &cmd_id).await
+    }
+
+    async fn open_shell(
+        &self,
+        project_id: &str,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+            hive_backend::PtyIo,
+        ),
+        SandboxError,
+    > {
+        let sandbox = self.get_sandbox(project_id, id).await?;
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or_else(|| self.engine_unavailable())?;
+        let handle = self.ensure_cell(&sandbox).await?;
+        let session_id = format!("sh_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+
+        let env = sandbox
+            .env_refs
+            .iter()
+            .map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let req = hive_core::ExecPtyRequest {
+            id: session_id,
+            shell: String::new(),
+            cwd: String::new(),
+            env,
+            cols,
+            rows,
+        };
+        backend
+            .exec_pty(&handle, req)
+            .await
+            .map_err(|e| SandboxError::EngineUnavailable(format!("pty failed to start: {e}")))
     }
 
     async fn list_commands(

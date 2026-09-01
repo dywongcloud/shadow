@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/github";
 import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
-export const dynamic = "force-dynamic";
-
 /**
  * Regenerate the org's full GitOps artifact tree and commit it to the linked repo
  * as a single atomic commit (`git add .`-style). Idempotent: if the generated

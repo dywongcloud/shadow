@@ -382,7 +382,8 @@
         (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).rc == 0
       - >-
         'implements Prometheus metrics HTTP endpoint' in
-        (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).stdout
+        ((_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).stdout ~
+         (_build_executor_gvisor_bin_help.results | selectattr('item.binary', 'equalto', 'runsc-metric-server') | first).stderr)
     fail_msg: >-
       A gvisor-bin support binary did not reproduce the real CLI behavior
       observed live against the pinned release; the installed bundle may be

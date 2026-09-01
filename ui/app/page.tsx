@@ -7,12 +7,15 @@ import { HomeClient } from "./home-client";
 // server shell's auth region is EMPTY for everyone, and the client's first
 // (hydration) render is identically empty until clerk-js resolves. There is
 // deliberately no SSR/CSR auth mismatch here; the one visible flip happens
-// client-side when Clerk settles. `force-dynamic` is kept (as a server shell —
-// route config from a "use client" page is ignored) so the apex document is
-// always the current build, never a prerendered/ISR-cached shell; the proxy
-// serves it `no-store` to match. Every OTHER page is static/ISR or a static
+// client-side when Clerk settles. Every OTHER page is static/ISR or a static
 // shell (see the root layout note).
-export const dynamic = "force-dynamic";
+//
+// Genuinely static shell under Cache Components: HomeClient is entirely
+// "use client" with ZERO server-side data access (no cookies()/headers(), no
+// per-request fetch) — the prerendered HTML is identical for every visitor
+// and every deploy, so there's no "serving a stale build as current" risk to
+// guard against. The whole landing↔dashboard flip already happens client-side
+// post-hydration regardless of whether this shell is cached.
 
 export default function Page() {
   return <HomeClient />;

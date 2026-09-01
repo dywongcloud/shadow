@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { githubConnectionDetail, resolveEntity } from "@/lib/github";
 
-export const dynamic = "force-dynamic";
-
 /**
  * HONEST GitHub connection status: whether the connection is ACTIVE *and live*
  * (Composio keeps ACTIVE after GitHub revokes a token), plus the granted scopes,

@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
 
-export const dynamic = "force-dynamic";
-
 /**
  * Redeploy entry point (the Vercel-style "Redeploy" modal). Same purpose as
  * /api/git/deploy: attach the signed-in user's connected-GitHub token SERVER-SIDE so

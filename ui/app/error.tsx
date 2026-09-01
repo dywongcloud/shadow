@@ -31,6 +31,10 @@ export default function Error({ error }: { error: Error & { digest?: string }; r
           Try again
         </button>
         <button
+          // Hard navigation, not useRouter().push(): same reasoning as the reload
+          // button above — client-side router navigation reuses the exact React
+          // tree/bundle that just crashed, so it can't reliably recover.
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
           onClick={() => (window.location.href = "/")}
           className="rounded-md border border-border px-3 py-1.5 text-sm text-secondary hover:bg-subtle"
         >

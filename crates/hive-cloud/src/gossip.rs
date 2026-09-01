@@ -149,6 +149,16 @@ pub async fn request_to_with_response_cap(
 /// the SAME endpoints that answer HTTP gossip, so the two transports are
 /// byte-equivalent. Returns the response body bytes.
 pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u8]) -> Vec<u8> {
+    dispatch_verified(cloud, method, path, body, None).await
+}
+
+async fn dispatch_verified(
+    cloud: &Arc<CloudState>,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    signer: Option<&str>,
+) -> Vec<u8> {
     match path {
         "/v1/nodes/announce" if method == hive_p2p::GOSSIP_POST => {
             if let Ok(node) = serde_json::from_slice::<hive_edge::NodeInfo>(body) {
@@ -689,6 +699,37 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 .unwrap_or_default();
             jb(crate::zkauth::mint_rpc(&team, &user, &project).await)
         }
+        // Bounded immutable runtime-artifact transfer. Exact versioned operation
+        // paths must stay ahead of every broader runtime/deploy arm: old peers
+        // answer an unknown path with an empty body, which the sender treats as
+        // NO_HANDLER rather than letting a legacy deploy handler rebuild source.
+        // Unlike `team_claims`, this arm accepts only a verified short-lived
+        // service token and the iroh transport's verified endpoint signer.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some("/v1/runtime-artifact-transfer/v1/begin")
+                    | Some("/v1/runtime-artifact-transfer/v1/chunk")
+                    | Some("/v1/runtime-artifact-transfer/v1/query")
+                    | Some("/v1/runtime-artifact-transfer/v1/finalize")
+                    | Some("/v1/runtime-artifact-transfer/v1/abort")
+            ) =>
+        {
+            let operation = p
+                .split('?')
+                .next()
+                .and_then(|path| path.rsplit('/').next())
+                .unwrap_or_default();
+            let token = qparam(p, "tok");
+            crate::runtime_artifact_transfer::mesh_dispatch(
+                cloud,
+                operation,
+                signer,
+                token.as_deref(),
+                body,
+            )
+            .await
+        }
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
         // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
         // since the iroh transport carries no HTTP headers. The versioned path is
@@ -764,6 +805,74 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                     }
                 },
                 Err(_) => Vec::new(),
+            }
+        }
+        // Sandbox owner hops (leader -> owner), the mesh half of
+        // `sandboxes_api::internal_hop`: a delegated CREATE on a node whose
+        // backend can exec (the leader's cannot), and the ONE typed owner RPC
+        // every cell-touching mutation rides (stop/delete/run/kill). Both
+        // handlers re-derive authority on the receiving node (fleet service
+        // credential + tenant binding via `require_internal_hop`, owner ==
+        // self via the record) and never re-proxy. A handler refusal is
+        // wrapped in `refused_envelope` so the leader can tell a typed "no"
+        // (nothing applied) from a dead transport (unknown). Same
+        // `x-hive-internal` posture as the provision-local arm above.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some(crate::sandboxes_api::DELEGATE_CREATE_PATH)
+                    | Some(crate::sandboxes_api::OWNER_OP_PATH)
+            ) =>
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+                    headers.insert("x-hive-internal", hv);
+                }
+            }
+            let is_create = p.split('?').next() == Some(crate::sandboxes_api::DELEGATE_CREATE_PATH);
+            let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            let outcome = if is_create {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::delegate_create_sandbox(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad delegate body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            } else {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::owner_op(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad owner-op body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            };
+            match outcome {
+                Ok(j) => jb(j),
+                Err((status, body)) => crate::sandboxes_api::refused_envelope(status, &body),
             }
         }
         // Companion to the provision-local arm above: `admin::database_delete`
@@ -1895,7 +2004,7 @@ pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
                 )
                 .unwrap_or_default();
             }
-            dispatch(&cloud, method, &path, &body).await
+            dispatch_verified(&cloud, method, &path, &body, signer.as_deref()).await
         })
     })
 }
@@ -1988,7 +2097,7 @@ pub async fn fetch(
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
     if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             req = req.header("authorization", format!("Bearer {tok}"));
         }
     }

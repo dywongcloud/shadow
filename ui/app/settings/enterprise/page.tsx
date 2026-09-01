@@ -59,9 +59,8 @@ function ErrMsg({ msg }: { msg: string | null }) {
 }
 
 export default function EnterprisePage() {
-  const [team, setTeam] = useState("personal");
+  const [team, setTeam] = useState(() => currentTeam());
   useEffect(() => {
-    setTeam(currentTeam());
     const on = () => setTeam(currentTeam());
     window.addEventListener("hive-team-changed", on);
     return () => window.removeEventListener("hive-team-changed", on);
@@ -110,6 +109,9 @@ function IpBlocking() {
     }
   }, []);
   useEffect(() => {
+    // setState calls inside load() happen after its await, in a later
+    // microtask -- not synchronously during this effect's commit.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -201,6 +203,9 @@ function SamlSso() {
     }
   }, []);
   useEffect(() => {
+    // setState calls inside load() happen after its await, in a later
+    // microtask -- not synchronously during this effect's commit.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -305,6 +310,9 @@ function ScimSync() {
     }
   }, []);
   useEffect(() => {
+    // setState calls inside load() happen after its await, in a later
+    // microtask -- not synchronously during this effect's commit.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -418,6 +426,9 @@ function SiemStreaming() {
     }
   }, []);
   useEffect(() => {
+    // setState calls inside load() happen after its await, in a later
+    // microtask -- not synchronously during this effect's commit.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -523,6 +534,9 @@ function Microfrontends() {
     }
   }, []);
   useEffect(() => {
+    // setState calls inside load() happen after its await, in a later
+    // microtask -- not synchronously during this effect's commit.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 

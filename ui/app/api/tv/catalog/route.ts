@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cacheLife } from "next/cache";
 
 // Server-side proxy for the iptv-org catalog. The browser cannot fetch
 // iptv-org.github.io directly — the app's CSP `connect-src` is deliberately
@@ -9,11 +10,6 @@ import { NextResponse } from "next/server";
 //
 // Coverage is EVERY country iptv-org has a playable https HLS stream for — not
 // just the fleet's serving regions — so the world map can surface all of them.
-
-export const dynamic = "force-dynamic";
-// The catalog changes rarely; cache the joined result for an hour so repeat
-// visits (and every node) don't re-pull iptv-org.
-export const revalidate = 3600;
 
 const CHANNELS_URL = "https://iptv-org.github.io/api/channels.json";
 const STREAMS_URL = "https://iptv-org.github.io/api/streams.json";
@@ -39,10 +35,9 @@ async function fetchJson<T>(url: string): Promise<T> {
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(url, {
-        next: { revalidate: 3600 },
-        signal: AbortSignal.timeout(20_000),
-      });
+      // Caching is controlled by the outer `use cache` scope's cacheLife, not
+      // this fetch's own options.
+      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
       if (res.ok) return (await res.json()) as T;
       lastErr = new Error(`upstream ${res.status}`);
     } catch (e) {
@@ -52,39 +47,52 @@ async function fetchJson<T>(url: string): Promise<T> {
   throw lastErr ?? new Error("upstream unavailable");
 }
 
+// The catalog changes rarely; cache the joined result for an hour so repeat
+// visits (and every node) don't re-pull iptv-org. `use cache` can't apply to
+// the GET export itself, so the data access lives in this cached helper.
+async function getCatalog(): Promise<Record<
+  string,
+  { id: string; name: string; country: string; categories: string[]; url: string }[]
+>> {
+  "use cache";
+  cacheLife("hours");
+  const [channels, streams] = await Promise.all([
+    fetchJson<IptvChannel[]>(CHANNELS_URL),
+    fetchJson<IptvStream[]>(STREAMS_URL),
+  ]);
+
+  // First https HLS stream per channel id.
+  const streamByChannel = new Map<string, string>();
+  for (const s of streams) {
+    if (!s.channel || streamByChannel.has(s.channel)) continue;
+    if (!s.url?.startsWith("https://") || !s.url.includes(".m3u8")) continue;
+    streamByChannel.set(s.channel, s.url);
+  }
+
+  // country → channels with a playable stream. Every country iptv-org covers,
+  // minus NSFW/closed channels and any without an https HLS stream.
+  const byCountry: Record<
+    string,
+    { id: string; name: string; country: string; categories: string[]; url: string }[]
+  > = {};
+  for (const c of channels) {
+    if (!c.country || c.is_nsfw || c.closed) continue;
+    const url = streamByChannel.get(c.id);
+    if (!url) continue;
+    (byCountry[c.country] ??= []).push({
+      id: c.id,
+      name: c.name,
+      country: c.country,
+      categories: c.categories ?? [],
+      url,
+    });
+  }
+  return byCountry;
+}
+
 export async function GET() {
   try {
-    const [channels, streams] = await Promise.all([
-      fetchJson<IptvChannel[]>(CHANNELS_URL),
-      fetchJson<IptvStream[]>(STREAMS_URL),
-    ]);
-
-    // First https HLS stream per channel id.
-    const streamByChannel = new Map<string, string>();
-    for (const s of streams) {
-      if (!s.channel || streamByChannel.has(s.channel)) continue;
-      if (!s.url?.startsWith("https://") || !s.url.includes(".m3u8")) continue;
-      streamByChannel.set(s.channel, s.url);
-    }
-
-    // country → channels with a playable stream. Every country iptv-org covers,
-    // minus NSFW/closed channels and any without an https HLS stream.
-    const byCountry: Record<
-      string,
-      { id: string; name: string; country: string; categories: string[]; url: string }[]
-    > = {};
-    for (const c of channels) {
-      if (!c.country || c.is_nsfw || c.closed) continue;
-      const url = streamByChannel.get(c.id);
-      if (!url) continue;
-      (byCountry[c.country] ??= []).push({
-        id: c.id,
-        name: c.name,
-        country: c.country,
-        categories: c.categories ?? [],
-        url,
-      });
-    }
+    const byCountry = await getCatalog();
     return NextResponse.json(
       { byCountry },
       { headers: { "cache-control": "public, max-age=3600, s-maxage=3600" } },

@@ -81,11 +81,21 @@ const OUTPUT_ROOT: &str = "/artifact";
 const ADMIN_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_PATH: &str = "/workspace/source/node_modules/.bin:/usr/local/bin:/usr/bin:/bin";
-const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 8] = [
+// `directfs` is deliberately absent (runsc's own default, true, applies).
+// Forcing directfs=false makes gVisor fall back to the gofer-only filesystem
+// path, and on this fleet's PVM-patched kernels (6.12.33-pvm+, the CVM/GPU
+// hosts) that path's platform init dies immediately: "initialize systrap:
+// unable to attach: operation not permitted" in the sandbox's own oci-log,
+// surfaced to the podman client only as "cannot read client sync file:
+// waiting for sandbox to start: EOF". Isolated live via single-flag
+// bisection on sj2 (2026-08-28): directfs=false alone, no other flags,
+// reproduces the failure against a bare `podman run --runtime runsc`; every
+// other flag here works individually and combined. hive-cell-agent's own
+// sandboxes never pass --directfs and boot fine on the same kernel.
+const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 7] = [
     "platform=systrap",
     "network=sandbox",
     "gvisor-marker-file=true",
-    "directfs=false",
     "host-uds=none",
     "host-fifo=none",
     "net-raw=false",

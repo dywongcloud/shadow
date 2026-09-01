@@ -28,7 +28,6 @@ import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore — express ships without bundled type defs; treat as opaque.
 import express from "express";
 
@@ -38,11 +37,7 @@ import "@workflow/web/server";
 
 import { expressToFetch } from "@/lib/wf-console/express-bridge";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExpressApp = any;
-
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
 
 type WfRequestContext = { team?: string; authToken?: string; project?: string };
 

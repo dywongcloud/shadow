@@ -201,72 +201,110 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Fire an event to all subscribed webhooks for `project`, signed + recorded.
-/// Spawns background tasks; returns immediately.
+/// Spawns one background delivery round and returns immediately.
 pub fn dispatch(store: &Arc<WebhookStore>, project: &str, event: &str, payload: Value) {
+    let store = store.clone();
+    let project = project.to_string();
+    let event = event.to_string();
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let created_ms = now_ms();
+    tokio::spawn(async move {
+        let _ = dispatch_durable(&store, &event_id, created_ms, &project, &event, payload).await;
+    });
+}
+
+/// Deliver one durable lifecycle-outbox entry. The stable event id and creation
+/// time survive retries, and success means every currently subscribed endpoint
+/// acknowledged with 2xx (or there were no subscribers).
+pub async fn dispatch_durable(
+    store: &Arc<WebhookStore>,
+    event_id: &str,
+    created_ms: u64,
+    project: &str,
+    event: &str,
+    payload: Value,
+) -> bool {
     let targets: Vec<Webhook> = store
         .hooks
         .read()
         .iter()
-        .filter(|w| (w.project == project || w.project == "*") && w.subscribed(event))
+        .filter(|webhook| {
+            (webhook.project == project || webhook.project == "*") && webhook.subscribed(event)
+        })
         .cloned()
         .collect();
     if targets.is_empty() {
-        return;
+        return true;
     }
     let body = json!({
+        "id": event_id,
         "type": event,
-        "createdAt": now_ms(),
+        "createdAt": created_ms,
         "project": project,
         "payload": payload,
     });
-    let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
-    for w in targets {
+    let body_str = match serde_json::to_string(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, %event_id, "durable webhook body serialization failed");
+            return false;
+        }
+    };
+    let deliveries = targets.into_iter().map(|webhook| {
         let store = store.clone();
         let body_str = body_str.clone();
         let event = event.to_string();
-        tokio::spawn(async move {
+        let event_id = event_id.to_string();
+        async move {
             // decrypt() is a safe no-op passthrough for an already-plaintext
             // legacy secret (backward compatible with pre-existing webhooks).
-            let sig = sign(&crate::secrets::decrypt(&w.secret), &body_str);
-            let res = store
+            let signature = sign(&crate::secrets::decrypt(&webhook.secret), &body_str);
+            let response = store
                 .http
-                .post(&w.url)
+                .post(&webhook.url)
                 .header("content-type", "application/json")
                 .header("x-hive-event", &event)
-                .header("x-hive-signature", &sig)
+                .header("x-hive-delivery", &event_id)
+                .header("x-hive-signature", &signature)
                 .header("user-agent", "Hive-Webhooks/1.0")
                 .body(body_str)
                 .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await;
-            let delivery = match res {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
+            let delivery = match response {
+                Ok(response) => {
+                    let status = response.status().as_u16();
                     Delivery {
-                        id: format!("evt_{}", uuid::Uuid::new_v4().simple()),
-                        webhook_id: w.id.clone(),
+                        id: event_id,
+                        webhook_id: webhook.id.clone(),
                         event,
-                        url: w.url.clone(),
+                        url: webhook.url.clone(),
                         status,
                         ok: (200..300).contains(&status),
                         ts_ms: now_ms(),
                         error: String::new(),
                     }
                 }
-                Err(e) => Delivery {
-                    id: format!("evt_{}", uuid::Uuid::new_v4().simple()),
-                    webhook_id: w.id.clone(),
+                Err(error) => Delivery {
+                    id: event_id,
+                    webhook_id: webhook.id.clone(),
                     event,
-                    url: w.url.clone(),
+                    url: webhook.url.clone(),
                     status: 0,
                     ok: false,
                     ts_ms: now_ms(),
-                    error: e.to_string(),
+                    error: error.to_string(),
                 },
             };
+            let ok = delivery.ok;
             store.record_delivery(delivery);
-        });
-    }
+            ok
+        }
+    });
+    futures::future::join_all(deliveries)
+        .await
+        .into_iter()
+        .all(|delivered| delivered)
 }
 
 #[cfg(test)]

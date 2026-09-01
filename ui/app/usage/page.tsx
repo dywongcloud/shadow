@@ -4,9 +4,6 @@ import UsageView from "./usage-view";
 // route sets its own segment config) -- force-static + revalidate gives this page
 // real ISR/prerender benefit, and it's auth-safe since UsageView carries no server
 // data itself (see [[m-usage-static-auth-safe]]).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export default function UsagePage() {
   return <UsageView />;
 }

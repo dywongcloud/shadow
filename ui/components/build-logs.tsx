@@ -13,7 +13,7 @@ import type { Build } from "@/lib/api";
 export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   const [q, setQ] = useState("");
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
   const logRef = useRef<HTMLDivElement>(null);
 
   const state = build?.state ?? "queued";
@@ -30,7 +30,7 @@ export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; 
 
   const elapsed = build ? Math.max(0, Math.round(((build.finished_ms ?? now) - build.started_ms) / 1000)) : 0;
 
-  const allLines = build?.lines ?? [];
+  const allLines = useMemo(() => build?.lines ?? [], [build?.lines]);
   const lines = useMemo(
     () => (q ? allLines.filter((l) => l.line.toLowerCase().includes(q.toLowerCase())) : allLines),
     [allLines, q],

@@ -1,1 +1,0 @@
-{"version":3,"sources":["../../../../app/cdn/layout.tsx"],"sourcesContent":["export default function CdnLayout({ children }: { children: React.ReactNode }) {\n  return <>{children}</>;\n}\n"],"names":["CdnLayout","children"],"mappings":"wEAAe,SAASA,AAAU,UAAEC,CAAQ,CAAiC,EAC3E,MAAO,CAAA,EAAA,EAAA,GAAA,EAAA,EAAA,QAAA,CAAA,UAAGA,GACZ"}

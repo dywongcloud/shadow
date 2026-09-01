@@ -195,6 +195,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
 
   // Switching country/region resets to its first channel.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resets channel index whenever the target prop changes, a derived-reset-on-change sync
     setIdx(0);
   }, [target]);
 
@@ -208,6 +209,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
   );
   const [project, setProject] = useState<string>("");
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- picks a default project once the async deployments poll resolves; projects aren't known at mount so this can't be a lazy initializer
     if (!project && projects.length) setProject(projects[0]);
   }, [projects, project]);
   const [mins, setMins] = useState(30);
@@ -263,6 +265,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
   useEffect(() => () => handleRef.current?.stop(), []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- clears a stale error banner from the previous channel before starting the new stream's load/subscribe sequence below
     setErr(null);
     const video = videoRef.current;
     if (!video || !channel) return;

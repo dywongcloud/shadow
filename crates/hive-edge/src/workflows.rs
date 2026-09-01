@@ -107,6 +107,38 @@ impl WorkflowEngine {
         self.runs.read().get(id).cloned()
     }
 
+    /// Snapshot every run for `PlatformSnapshot` (see `persist.rs`'s
+    /// `capture`/`restore`) — engine-defined-workflow run history was
+    /// previously pure in-memory and vanished on every restart, unlike
+    /// `defs` (already captured via `defs()`/`define()` above).
+    pub fn runs_snapshot(&self) -> Vec<WorkflowRun> {
+        self.runs.read().values().cloned().collect()
+    }
+
+    /// Restore run history from a loaded snapshot (boot restore). An
+    /// in-flight run (`Pending`/`Running`) died with the previous process —
+    /// no background task exists to resume it on this fresh engine — so it
+    /// is reconciled to `Failed`, mirroring `persist::restore`'s own
+    /// orphaned-`Building`-deployment handling: an infinite "Running" run
+    /// with no activity is a worse, less actionable state than an honest,
+    /// retryable failure.
+    pub fn runs_load(&self, runs: Vec<WorkflowRun>) {
+        let mut map = self.runs.write();
+        for mut run in runs {
+            if matches!(run.status, RunStatus::Pending | RunStatus::Running) {
+                run.status = RunStatus::Failed;
+                run.finished_ms.get_or_insert_with(now_ms);
+                for step in &mut run.steps {
+                    if matches!(step.status, RunStatus::Pending | RunStatus::Running) {
+                        step.status = RunStatus::Failed;
+                        step.finished_ms.get_or_insert_with(now_ms);
+                    }
+                }
+            }
+            map.insert(run.id.clone(), run);
+        }
+    }
+
     /// Start a run; steps execute sequentially in a background task. Returns the
     /// run id immediately.
     pub fn start(self: &Arc<Self>, def_id: &str, invoke: StepInvoker) -> anyhow::Result<String> {

@@ -60,6 +60,11 @@ export function useNodeEventLog(nodes: NodeInfo[] | null | undefined): NodeLogEn
     }
 
     if (events.length) {
+      // Genuinely derived from diffing this render's `nodes` against the
+      // ref-held previous snapshot — cannot be a lazy initializer (needs the
+      // cross-render comparison), and only fires when a real transition was
+      // observed. The documented "synchronize with an external system" case.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLog((cur) => [...events.reverse(), ...cur].slice(0, MAX_ENTRIES));
     }
   }, [nodes]);

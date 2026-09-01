@@ -124,7 +124,18 @@ export default function DataBrowserPage() {
       .catch(() => setRows({ collection: col, total: 0, matched: 0, rows: [] }))
       .finally(() => setLoading(false));
   }
-  useEffect(() => { loadRows(active, ""); setQ(""); setEditMode(false); setDrafts({}); setEditCell(null); }, [active]);
+  // Local editing state (search query, edit mode, drafts, cell selection)
+  // resets whenever the collection changes -- but that's a response to the
+  // user's OWN table-switch actions (both setActive call sites below), so it
+  // belongs at those event sites, not synced from an effect keyed on `active`.
+  useEffect(() => { loadRows(active, ""); }, [active]);
+  function switchActive(name: string) {
+    setQ("");
+    setEditMode(false);
+    setDrafts({});
+    setEditCell(null);
+    setActive(name);
+  }
 
   function setDraft(rowId: string, col: string, val: string) {
     setDrafts((d) => ({ ...d, [rowId]: { ...(d[rowId] || {}), [col]: val } }));
@@ -189,7 +200,7 @@ export default function DataBrowserPage() {
       await opsSend("POST", `/v1/admin/data/${encodeURIComponent(newCollection)}`, body);
       setNewOpen(false);
       loadCollections();
-      setActive(newCollection);
+      switchActive(newCollection);
       loadRows(newCollection, "");
     } catch (e) { setErr(e instanceof SyntaxError ? "Invalid JSON" : String(e)); }
     finally { setBusy(false); }
@@ -282,7 +293,7 @@ export default function DataBrowserPage() {
           {(meta?.collections ?? []).map((c) => (
             <button
               key={c.name}
-              onClick={() => setActive(c.name)}
+              onClick={() => switchActive(c.name)}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm transition-colors ${active === c.name ? "bg-card font-medium text-fg shadow-card" : "text-secondary hover:bg-card hover:text-fg"}`}
             >
               <span className="flex items-center gap-2"><Database className="h-3.5 w-3.5" /> {LABELS[c.name] ?? c.name}</span>

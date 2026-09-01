@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
@@ -133,7 +134,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       className={`${GeistSans.variable} ${GeistMono.variable} ${display.variable} ${electrolize.variable}`}
     >
       <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
-        {/* eslint-disable-next-line react/no-danger */}
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(STRUCTURED_DATA) }} />
         <PwaRegister />
         <VitalsBeacon />
@@ -143,8 +143,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           {/* Dashboard chrome (top nav + footer + overlays) is auth-gated in a
               CLIENT component so it reacts to client-side login/logout — the
               signed-out landing renders its own full-bleed nav/footer. See
-              `app-chrome.tsx` for why this must not live in the server layout. */}
-          <ChromeTop />
+              `app-chrome.tsx` for why this must not live in the server layout.
+              Suspense-wrapped: TopNav/Footer read usePathname(), a client hook
+              that needs a boundary under Cache Components to prerender the
+              shell (see instant=false's removal). fallback={null} is exactly
+              correct — both components already conditionally render nothing
+              until auth settles, so this introduces no visible change. */}
+          <Suspense fallback={null}>
+            <ChromeTop />
+          </Suspense>
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
           <ChromeBottom />
           </WalletProvider>

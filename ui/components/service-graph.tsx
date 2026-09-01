@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import {
   ReactFlow,
   Background, BackgroundVariant, Controls, Handle, Position, MiniMap,
@@ -318,10 +318,10 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
   const myFns = (fnstats ?? []).filter((f) => prod && f.key.startsWith(prod.id));
   const instances = myFns.reduce((a, f) => a + (f.instances || 0), 0) || (kind === "static" ? 0 : 1);
   const memory = settings?.functions?.memory_mib ?? 512;
-  const conns = [
+  const conns = useMemo(() => [
     ...(dbs ?? []).map((d) => ({ id: d.id, name: d.name, sub: `${d.provider || d.kind}`, img: providerImg(d.provider), tunnel: false, envKey: d.kind === "blob" ? envKeyForKind("blob") : envKeyForKind(d.kind) })),
     ...(links ?? []).filter((l) => l.project === project).map((l) => ({ id: l.id, name: l.target, sub: "Secure tunnel", img: null as string | null, tunnel: true, envKey: l.env_var || null })),
-  ];
+  ], [dbs, links, project]);
 
   /** Provision a database and seed the matching project env var, then refresh. */
   const onAdd = useCallback(async (kind: AddKind, provider: string, suffix: string) => {

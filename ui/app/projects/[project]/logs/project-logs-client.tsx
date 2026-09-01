@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useCallback, useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Search, Play, RotateCw, X, ChevronDown, MapPin, ShieldCheck, Zap } from "lucide-react";
@@ -32,20 +32,33 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [q, setQ] = useState(() => searchParams.get("q") ?? "");
   const [live, setLive] = useState(true);
   const [sel, setSel] = useState<Event | null>(null);
+  // Synthetic display-only "Request ID" suffix, generated once at selection
+  // time (an event handler, not render) so it stays stable for as long as
+  // that event is selected instead of rerolling on every re-render.
+  const [selRequestId, setSelRequestId] = useState("");
   const [range, setRange] = useState("Last 30 minutes");
 
-  async function load() {
+  function selectEvent(e: Event) {
+    setSel(e);
+    // eslint-disable-next-line react-hooks/purity -- runs only from a click handler (never during render); generates a display-only synthetic id at selection time
+    setSelRequestId(Math.random().toString(36).slice(2, 8));
+  }
+
+  const load = useCallback(async () => {
     try {
       const e = await apiGet<Event[]>(`/v1/logs?limit=300&project=${encodeURIComponent(project)}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
       setEvents(e);
     } catch {}
-  }
+  }, [project, q]);
   useEffect(() => {
+    // Fetch-on-mount + poll: load() sets state only after its internal await
+    // resolves, syncing external (server) log data into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount/poll; state is set only after an internal await, not synchronously
     load();
     if (!live) return;
     const id = setInterval(load, 1500);
     return () => clearInterval(id);
-  }, [project, q, live]);
+  }, [load, live]);
 
   const counts = {
     warning: events.filter((e) => e.action.includes("stale") || e.action === "rewrite").length,
@@ -119,7 +132,7 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                 </thead>
                 <tbody className="font-mono text-xs">
                   {events.map((e, i) => (
-                    <tr key={i} onClick={() => setSel(e)} className={cn("cursor-pointer border-t border-border hover:bg-subtle", sel === e && "bg-subtle")}>
+                    <tr key={i} onClick={() => selectEvent(e)} className={cn("cursor-pointer border-t border-border hover:bg-subtle", sel === e && "bg-subtle")}>
                       <td className="whitespace-nowrap px-3 py-2 text-secondary">{fmtTime(e.ts_ms)}</td>
                       <td className={cn("px-3 py-2", statusTone(e.status))}>{e.method} {e.status || "---"}</td>
                       <td className="max-w-[200px] truncate px-3 py-2 text-secondary">{e.host}</td>
@@ -138,7 +151,7 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                   <span className="font-mono text-xs">{sel.method} {sel.path}</span>
                   <button onClick={() => setSel(null)} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button>
                 </div>
-                <Field label="Request ID" value={`${Math.random().toString(36).slice(2, 8)}-${sel.ts_ms}`} mono />
+                <Field label="Request ID" value={`${selRequestId}-${sel.ts_ms}`} mono />
                 <Field label="Path" value={sel.path} mono />
                 <Field label="Host" value={sel.host} mono />
                 <Field label="Status" value={String(sel.status || "—")} />

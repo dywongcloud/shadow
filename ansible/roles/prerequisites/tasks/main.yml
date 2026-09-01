@@ -41,6 +41,16 @@
       - podman
       - policycoreutils-python-utils   # semanage, for podman/SELinux interplay
       - jq
+      # bindgen (vendor/cr-sqlite's sqlite3_capi build.rs) needs a real
+      # libclang.so at build time -- absent on a stock Rocky image, so
+      # `make loadable` panics "Unable to find libclang" partway through
+      # `hive_platform`'s release build. clang-devel pulls in clang-libs
+      # (the actual libclang.so.N shared object bindgen dlopen()s), never
+      # just clang. Witnessed live 2026-08-29: fc-sanjose (the control-plane
+      # leader) failed this exact step, halting a fleet rollout there --
+      # every other already-provisioned node had it from an earlier, more
+      # complete manual bring-up and never revealed the gap.
+      - clang-devel
     state: present
 
 # The fleet's SOLE firewall is scripts/hive-lockdown.sh's own iptables/nft
@@ -312,18 +322,41 @@
         checksum: "sha256:{{ hive_bun_sha256 }}"
         force: true
 
-    - name: Extract bun from the v1.4.0 archive into /usr/local
+    # unarchive's `dest` does NOT create the directory (unlike get_url's
+    # `dest`) -- unlike the copy-paste-adjacent wasmer block above, this one
+    # never had its own `file: state=directory` step, so it only ever
+    # "worked" on already-provisioned fleet nodes where /usr/local/bun-v1.4.0
+    # happened to pre-exist from an earlier manual bring-up. Witnessed live
+    # 2026-08-29: fails "dest '/usr/local/bun-v1.4.0' must be an existing
+    # dir" on 3 genuinely fresh Rocky 10.2 nodes (sj3/sj4/sj5).
+    - name: Create versioned install dir /usr/local/bun-v1.4.0
+      ansible.builtin.file:
+        path: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}"
+        state: directory
+        mode: "0755"
+
+    # Versioned extract dir (the wasmer convention two blocks up): an
+    # unversioned dir plus `creates` would skip extraction on a future version
+    # bump, leaving the symlink on the old binary while the check demands the
+    # new one.
+    # No `extra_opts` member-filter here (unlike wasmer's tar.gz extract
+    # above): ansible's unarchive module places extra_opts in a position in
+    # the constructed `unzip` argv that does NOT work as a member selector for
+    # zip archives -- witnessed live 2026-08-29, `unzip -o bun-linux-x64/bun
+    # /tmp/....zip -d dest` (archive and member swapped), "cannot find or
+    # open bun-linux-x64/bun". The bun release zip ships ONLY the `bun`
+    # binary under one directory (see this block's own doc comment above), so
+    # a full extract is equivalent to a filtered one anyway.
+    - name: Extract bun from the v1.4.0 archive into /usr/local/bun-v1.4.0
       ansible.builtin.unarchive:
         src: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
-        dest: /usr/local
+        dest: /usr/local/bun-v1.4.0
         remote_src: true
-        extra_opts:
-          - "{{ hive_bun_asset }}/bun"
-        creates: "/usr/local/{{ hive_bun_asset }}/bun"
+        creates: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}/bun"
 
     - name: Symlink bun + bunx into /usr/local/bin (on hive-node.service's Environment PATH)
       ansible.builtin.file:
-        src: "/usr/local/{{ hive_bun_asset }}/bun"
+        src: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}/bun"
         dest: "/usr/local/bin/{{ item }}"
         state: link
         force: true

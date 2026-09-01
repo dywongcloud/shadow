@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createRepo, githubConfigured, resolveEntity } from "@/lib/github";
 
-export const dynamic = "force-dynamic";
-
 // Create a GitHub repository using THIS user's GitHub connection (first-party
 // GitHub App preferred, Composio fallback), so the in-browser Git page can make a
 // repo without a pasted PAT. The repo is created EMPTY (autoInit:false) so the

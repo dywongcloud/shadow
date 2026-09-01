@@ -1,10 +1,12 @@
 ---
-# Build + stage Microsoft's LiteBox (https://github.com/microsoft/litebox) —
-# an unprivileged Linux syscall-sandboxing library — for hive-cloud's Litebox
-# CellBackend (crates/hive-backend/src/litebox.rs). Targets nodes where
-# neither real Firecracker microVMs nor the PVM software-virt fallback can
-# safely run (see that module's doc comment and AGENTS.md's "PVM kernels"
-# section for why fc-frankfurt specifically is in that state today).
+# Build + stage LiteBox (an unprivileged Linux syscall-sandboxing library
+# originally from Microsoft, https://github.com/microsoft/litebox — this
+# role tracks AnEntrypoint/litebox instead, see files/PATCHES.md's "litebox
+# fork tracking" section for why) for hive-cloud's Litebox CellBackend
+# (crates/hive-backend/src/litebox.rs). Targets nodes where neither real
+# Firecracker microVMs nor the PVM software-virt fallback can safely run
+# (see that module's doc comment and AGENTS.md's "PVM kernels" section for
+# why fc-frankfurt specifically is in that state today).
 #
 # litebox ships no release binaries, so it's built from source the same way
 # hive_platform builds hive-cloud itself (rustup already installed

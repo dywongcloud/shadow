@@ -24,7 +24,50 @@ const WORKDIR = process.env.HIVE_RUNTIME_WORKDIR;
 if (WORKDIR) {
   process.chdir(WORKDIR);
 }
+// Litebox's shim does not implement the native realpath fast path libuv uses,
+// so `fs.realpathSync.native` / `fs.realpath.native` fail ENOENT on paths that
+// demonstrably exist, while the pure-JS implementations (lstat + readlink)
+// work. Next.js's `getProjectDir` calls the NATIVE variant, which turned every
+// `next start` in this guest into "Invalid project directory provided, no such
+// directory: <workdir>" -- witnessed live on nodes-wtf. Route the native
+// variants onto the JS implementations; in this guest the artifact tree is
+// symlink-free by construction, so the two are semantically identical.
+const fs = require('fs');
+if (typeof fs.realpathSync === 'function') {
+  fs.realpathSync.native = fs.realpathSync.bind(fs);
+}
+if (typeof fs.realpath === 'function') {
+  fs.realpath.native = fs.realpath.bind(fs);
+}
 const GUEST_IP = process.env.LITEBOX_GUEST_IP;
+// Litebox does not implement `uv_interface_addresses`, so
+// `os.networkInterfaces()` throws ERR_SYSTEM_ERROR (errno 97) — which Next.js
+// calls unconditionally right after `listening` fires (get-network-host.js) to
+// print its "Network:" banner, turning a successfully LISTENING server into an
+// unhandled-rejection crash. Witnessed live on nodes-wtf. Answer with this
+// cell's real TUN address when the native call fails; the address is genuinely
+// this guest's routable interface, so callers get truth, not a stub.
+const os = require('os');
+const origNetworkInterfaces = os.networkInterfaces.bind(os);
+os.networkInterfaces = function () {
+  try {
+    return origNetworkInterfaces();
+  } catch (_) {
+    if (GUEST_IP) {
+      return {
+        lb0: [{
+          address: GUEST_IP,
+          netmask: '255.255.255.252',
+          family: 'IPv4',
+          mac: '00:00:00:00:00:00',
+          internal: false,
+          cidr: GUEST_IP + '/30',
+        }],
+      };
+    }
+    return {};
+  }
+};
 const NEEDS_REWRITE = new Set(['0.0.0.0', '::', '127.0.0.1', '::1', 'localhost']);
 if (GUEST_IP) {
   const orig = net.Server.prototype._listen2;

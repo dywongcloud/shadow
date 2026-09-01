@@ -8,8 +8,6 @@ import {
 } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
 
-export const dynamic = "force-dynamic";
-
 /**
  * OAuth callback for the platform's first-party GitHub App — the exact URL
  * registered on the App (https://autheo.dev/oauth/github/callback). Verifies the

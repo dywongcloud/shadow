@@ -73,6 +73,7 @@ export function OpeningSplash() {
   const [phase, setPhase] = useState<"show" | "fade" | "done">(() => (introPlayed ? "done" : "show"));
   useEffect(() => {
     if (introPlayed) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- re-syncs against the module-level `introPlayed` flag, which can flip between this render and effect commit on a fast remount; the lazy initializer alone can't observe that
       setPhase("done"); // no-op when the initializer already started at "done"
       return;
     }

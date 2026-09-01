@@ -13,8 +13,6 @@ import { NextRequest, NextResponse } from "next/server";
 // viewing bytes on the node's egress; acceptable for a nice-to-have TV feature
 // and the only CSP-clean way to play arbitrary IPTV.
 
-export const dynamic = "force-dynamic";
-
 const SELF_PATH = "/api/tv/hls";
 
 function proxied(absUrl: string): string {

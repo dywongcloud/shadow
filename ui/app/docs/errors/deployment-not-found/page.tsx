@@ -6,9 +6,6 @@ import { CodeBlock } from "@/components/code-block";
 // Perf: prerender this public page (see root layout note). This page is linked
 // from the edge's own 404 screen, so it must render for signed-out visitors and
 // must not depend on any request-time data.
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 const DESC =
   "Why a request returns 404 DEPLOYMENT_NOT_FOUND on autheo, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, unattached custom domain, or a region that does not host the deployment.";
 

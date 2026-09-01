@@ -105,6 +105,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
   // Mobile nav menu (below lg, where the inline nav is hidden).
   const [menuOpen, setMenuOpen] = useState(false);
   // Close the menu on navigation.
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- resets menu-open state whenever the route changes, a derived-reset-on-change sync
   useEffect(() => setMenuOpen(false), [pathname]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);

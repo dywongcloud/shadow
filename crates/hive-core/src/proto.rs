@@ -280,6 +280,7 @@ pub struct TcpPublish {
 }
 
 pub const RUNTIME_ARTIFACT_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION: u16 = 1;
 
 /// Complete host-to-guest wire contract. This version covers every
 /// AgentRequest and AgentEvent variant plus every serialized field and semantic
@@ -297,12 +298,17 @@ pub const AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT: u64 = 1 << 2;
 /// Node-attributed launch failures use a typed event whose origin is independent
 /// of tenant-controlled process diagnostics.
 pub const AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS: u64 = 1 << 3;
+/// The peer implements `ExecPty`/`PtyInput`/`PtyResize`/`PtyOutput`/`PtyExited`
+/// (Sandboxes interactive terminal) — a real `openpty`/`forkpty` session, not
+/// just line-buffered `Exec`.
+pub const AGENT_WIRE_CAPABILITY_EXEC_PTY: u64 = 1 << 4;
 /// Exact capability set for AGENT_WIRE_PROTOCOL_VERSION. Peers require equality,
 /// not subset negotiation, so an unknown launch shape is never silently dropped.
 pub const AGENT_WIRE_CAPABILITIES: u64 = AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA
     | AGENT_WIRE_CAPABILITY_FUNCTION_LAUNCH
     | AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT
-    | AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS;
+    | AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS
+    | AGENT_WIRE_CAPABILITY_EXEC_PTY;
 pub const AGENT_HANDSHAKE_NONCE_BYTES: usize = 32;
 pub const AGENT_HANDSHAKE_TRANSCRIPT_DOMAIN: &[u8] = b"hive-agent-wire-handshake-v2\0";
 
@@ -494,6 +500,23 @@ pub struct RuntimeArtifactIdentity {
     pub protocol: u16,
     pub id: String,
     pub content_sha256: String,
+}
+
+/// Transfer identity for the deterministic package carrying one semantic runtime
+/// tree. The package digest addresses transport bytes; `semantic_tree_sha256`
+/// remains the backend-neutral execution identity every target must recompute.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeArtifactPackageDescriptor {
+    pub protocol: u16,
+    pub package_sha256: String,
+    pub semantic_tree_sha256: String,
+    pub package_bytes: u64,
+    pub logical_bytes: u64,
+    pub materialized_bytes: u64,
+    pub entries: u64,
+    pub app_rel: String,
+    pub include_rel: Vec<String>,
 }
 
 /// How to launch a long-lived function server inside a cell (Fluid compute).
@@ -851,6 +874,45 @@ pub struct ExecRequest {
     pub shell: bool,
 }
 
+/// A single interactive PTY session inside an already-booted, long-lived cell
+/// — the Sandboxes interactive-terminal path. Unlike [`ExecRequest`] (one-shot
+/// argv, line-buffered output, no stdin), this allocates a real pseudo-terminal
+/// in the guest (`openpty`/`forkpty`) running the caller's shell: raw byte
+/// stream in both directions, so `vim`/`less`/tab-completion/`^C` all work
+/// exactly as they would over SSH. One dedicated vsock connection per session,
+/// held open for the session's whole life; `PtyInput`/`PtyResize` ride the
+/// SAME connection (the agent's accept loop distinguishes them by frame type,
+/// not by a fresh connection per call — unlike `KillExec`, which the caller
+/// may not have a live connection to send on).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecPtyRequest {
+    /// Caller-chosen id (echoed on every `PtyOutput`/`PtyExited` event) — the
+    /// platform's `SandboxShellSession.id`.
+    pub id: String,
+    /// Shell to launch, e.g. `/bin/sh` or `/bin/bash`. Empty = agent picks a
+    /// sane default (`$SHELL`, falling back to `/bin/sh`).
+    #[serde(default)]
+    pub shell: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Initial terminal size; a real `struct winsize` is set on the pty before
+    /// the shell forks so full-screen programs (vim, less, htop) render
+    /// correctly from their very first frame.
+    #[serde(default = "default_pty_cols")]
+    pub cols: u16,
+    #[serde(default = "default_pty_rows")]
+    pub rows: u16,
+}
+
+fn default_pty_cols() -> u16 {
+    80
+}
+fn default_pty_rows() -> u16 {
+    24
+}
+
 /// Message the box daemon (host) sends to the cell daemon (guest) over vsock.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentRequest {
@@ -873,6 +935,18 @@ pub enum AgentRequest {
     /// connection — the agent tracks live exec child PIDs in a process-global
     /// registry keyed by `ExecRequest.id`.
     KillExec { id: String },
+    /// Open an interactive PTY session (Sandboxes terminal). Mandatory FIRST
+    /// frame on its own dedicated connection — every subsequent frame on that
+    /// same connection is `PtyInput`/`PtyResize` for this exact session until
+    /// the connection closes or the shell exits.
+    ExecPty(ExecPtyRequest),
+    /// Raw bytes typed into the terminal — sent on the SAME connection
+    /// `ExecPty` opened, any number of times.
+    PtyInput { bytes: Vec<u8> },
+    /// Browser terminal was resized — sent on the SAME connection `ExecPty`
+    /// opened. The agent applies it via `TIOCSWINSZ` and the shell's own
+    /// `SIGWINCH` handling takes it from there (full-screen programs redraw).
+    PtyResize { cols: u16, rows: u16 },
 }
 
 /// Messages the cell daemon streams back to the box daemon over vsock.
@@ -923,6 +997,15 @@ pub enum AgentEvent {
         id: String,
         exit_code: Option<i32>,
     },
+    /// Raw bytes read from the pty master (shell stdout+stderr interleaved, as
+    /// a real terminal produces) — unlike `ExecOutput`, NOT line-buffered:
+    /// forwarded to the browser as soon as the agent reads them, so a program
+    /// that repaints a line in place (a progress bar, `vim`'s status line)
+    /// looks correct.
+    PtyOutput { id: String, bytes: Vec<u8> },
+    /// The pty's shell exited (normally or killed) or the session was torn
+    /// down. Same `exit_code = None` meaning as `ExecDone`.
+    PtyExited { id: String, exit_code: Option<i32> },
 }
 
 #[cfg(test)]

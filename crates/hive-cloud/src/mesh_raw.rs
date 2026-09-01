@@ -65,6 +65,14 @@ fn proto_matches(spec: fluid_core::ServiceProtocol, proto: RawProto) -> bool {
 /// whose deployment lives on THIS node (no mesh hop) — one resolution path for
 /// both the owner side of a mesh stream and a locally-served session.
 pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<RawTargetConn> {
+    // Sandbox interactive-shell targets (`mesh_shell::shell_target`) are a
+    // DISTINCT target kind riding this same `RawTarget` wire shape — checked
+    // first so a sandbox id never falls through into (or is shadowed by) the
+    // deployment-lease resolution below, which reads different fields (`t.
+    // project`/`t.function` mean something else for those).
+    if let Some(conn) = crate::mesh_shell::resolve_sandbox_shell(cloud, &t).await {
+        return Some(conn);
+    }
     // 1. The deployment record serving this target on THIS node: an explicit
     //    pin wins; otherwise the project's current serving deployment (prod
     //    alias holder first, then newest ready).

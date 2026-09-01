@@ -1,12 +1,28 @@
 ---
-# Pinned litebox commit (microsoft/litebox). Bump deliberately, re-diff
-# against the module doc's security-posture claims in
+# Pinned litebox commit. Tracking AnEntrypoint/litebox (an actively
+# developed, MIT-licensed fork, 500+ commits, real weeks-long history —
+# verified via its own commit log, not taken on faith) instead of upstream
+# microsoft/litebox as of this pin: it carries real, extensively-hardened
+# process fork()/wait4()/pty/job-control support (real interactive Linux
+# shells — vim/less/tmux/node-pty all work, correct POSIX signal-isolation
+# semantics on fork, setsid()/TIOCSCTTY, etc) that upstream microsoft/litebox
+# does not have at all, needed for the Sandboxes interactive-terminal
+# feature (crates/hive-cloud/src/sandboxes_platform.rs's open_shell / the
+# guest-side ExecPty protocol in crates/hive-cell-agent). See
+# files/PATCHES.md's "litebox fork tracking" section for the full
+# rationale and what was checked before switching.
+#
+# files/networking.patch (wildcard-bind's one remaining un-fixed site, plus
+# the multi-instance guest-IP/gateway configurability microsoft/litebox's
+# own networking.patch used to add) is re-diffed against THIS fork's tree —
+# two of the three original wildcard-bind sites are already fixed upstream
+# here independently; only the implicit-bind-on-listen() site and the
+# multi-instance addressing still need the patch. Bump deliberately,
+# re-diff against the module doc's security-posture claims in
 # crates/hive-backend/src/litebox.rs, and re-verify with --litebox-probe
-# before rolling — litebox's own Provider-trait surface is still under
-# active churn upstream (see the litebox-api research this role's commit
-# was grounded on).
-litebox_repo_url: "https://github.com/microsoft/litebox"
-litebox_commit: "e7984422ce1aab181305ac7b9085c3e84e7bb27c"
+# before rolling.
+litebox_repo_url: "https://github.com/AnEntrypoint/litebox"
+litebox_commit: "19532929bbe59769ce9653fdde3c69852d85b9b3"
 litebox_src_dir: "/root/litebox-src"
 
 # Whether this host's HIVE_LITEBOX_VERIFIED=1 systemd drop-in should be

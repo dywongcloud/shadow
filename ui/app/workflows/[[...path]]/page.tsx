@@ -12,20 +12,29 @@ import { WfConsoleFrame } from "@/components/wf-console-frame";
 // WfConsoleFrame reads useSearchParams (client hook) — Next needs the
 // boundary to server-render the shell without bailing the whole route to CSR.
 //
+// `params` is awaited INSIDE the Suspense-wrapped component (not at the top
+// of the page) so the catch-all's static shell can still prerender for the
+// no-params case per Cache Components' rules — awaiting it here would block
+// the shell for every deep link.
+//
 // Catch-all so deep links (/workflows/run/<id>) open the matching console view
 // directly; /workflows/runs/<id> legacy links are redirected by next.config.
 // ---------------------------------------------------------------------------
 
-export default async function WorkflowsPage({
+export default function WorkflowsPage({
   params,
 }: {
   params: Promise<{ path?: string[] }>;
 }) {
-  const { path } = await params;
-  const sub = (path ?? []).join("/");
   return (
     <Suspense fallback={<div className="h-40" />}>
-      <WfConsoleFrame initialPath={sub} syncUrl bleed />
+      <WorkflowsConsole params={params} />
     </Suspense>
   );
+}
+
+async function WorkflowsConsole({ params }: { params: Promise<{ path?: string[] }> }) {
+  const { path } = await params;
+  const sub = (path ?? []).join("/");
+  return <WfConsoleFrame initialPath={sub} syncUrl bleed />;
 }

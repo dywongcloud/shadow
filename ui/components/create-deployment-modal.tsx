@@ -83,12 +83,23 @@ export function CreateDeploymentModal({
       const isUrl = /^(https?:\/\/|git@)/.test(source.trim());
       const repo_url = isUrl ? source.trim() : repoUrl;
       const ref = isUrl ? branch : source.trim();
+      // A pasted full (40-hex) or short (7-40-hex) commit SHA must go through
+      // the backend's `commit` field (GitDeployRequest.commit), NOT `branch` —
+      // sending it as `branch` fed `git clone --branch <sha>`, which fails for
+      // a bare commit hash (a shallow clone's `--branch` needs an advertised
+      // ref, not an arbitrary commit) and silently fell back to the connected
+      // repo's default branch tip instead of the requested exact commit. A
+      // short SHA (<40 hex) is excluded from the "full SHA" branch label below
+      // only in the sense that both send through `commit` identically here;
+      // the length distinction only matters for display, not for this request.
+      const isSha = /^[0-9a-f]{7,40}$/i.test(ref || "");
       const env = buildEnv();
       // Via the server route so a PRIVATE github repo gets the user's GitHub token
       // attached server-side (never in the browser) for the clone.
       const r = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url,
-        branch: ref || undefined,
+        branch: isSha ? undefined : ref || undefined,
+        commit: isSha ? ref : undefined,
         project,
         target,
         production: target === "production",

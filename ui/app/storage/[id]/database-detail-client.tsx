@@ -42,6 +42,9 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
   const [provisioning, setProvisioning] = useState(true);
   const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, provisioning ? 3000 : 20000);
   useEffect(() => {
+    // Feeds back into usePoll's own interval above (adaptive polling), so it
+    // must persist as state across renders -- not a pure inline derivation.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (db) setProvisioning(db.status === "provisioning");
   }, [db]);
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);

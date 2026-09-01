@@ -186,7 +186,7 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
   const [build, setBuild] = useState<Build | null>(null);
   const [logsOpen, setLogsOpen] = useState(true);
   const [q, setQ] = useState("");
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
   const [unreachable, setUnreachable] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
