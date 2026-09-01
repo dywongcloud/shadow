@@ -425,6 +425,19 @@ releases).
   the runner kept a core); shells are tracked in `execs` like execs; and
   `SHELL_GUEST_OPTIONAL_PROGRAMS` stages the ordinary tool set where the host
   has it so a routine command is not the worst case.
+- **The guest tar and its descriptor-bound alias belong to the runner's
+  WAITER task, never to the function that spawns the runner.** Both
+  `allocate_temp_file` and `allocate_initial_files_alias` return Drop guards
+  that unlink their names; the runner opens
+  `--initial-files=/proc/self/fd/N/initial-files.tar` only after it has
+  started, milliseconds after `spawn()` returns. `exec_command` moves both
+  guards into the task that awaits `child.wait()`; `exec_pty` once dropped
+  them at function end, and every dashboard terminal died at birth with a
+  bare `Error: No such file or directory (os error 2)` on the pty (witnessed
+  2026-09-01: 101 upgrade, that frame, `{"type":"exited","exit_code":1}`,
+  while the same runner and tar ran an interactive shell fine standalone). A
+  new runner spawn site copies the waiter shape; a guard that is not moved
+  into the waiter is the bug.
 
 ## Bringing a node into the mesh
 
