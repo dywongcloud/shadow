@@ -158,29 +158,26 @@ pub struct SandboxRecord {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<u64>,
-    /// Internal: the podman container name backing this sandbox (empty for
-    /// simulated/unavailable-engine sandboxes). Never exposed to a different
-    /// tenant/project since the whole record is scoped.
+    /// Internal: the cell id backing this sandbox on its owner node. Never
+    /// exposed to a different tenant/project since the whole record is scoped.
     #[serde(default)]
     pub container: String,
-    /// Human-readable note for degraded states (e.g. "podman unavailable — this
-    /// sandbox is simulated"), mirroring the DB-provisioning "simulated" idiom.
+    /// Human-readable operator note for degraded states (e.g. a record whose
+    /// cell was lost to a node restart and is re-provisioned on next use).
+    /// A provisioning FAILURE never produces a record at all —
+    /// `PlatformSandboxProvider::create_sandbox` fails closed with a typed
+    /// `EngineUnavailable`, so this is never a "simulated" marker.
     #[serde(default)]
     pub note: String,
-    /// The node that actually holds this sandbox's `CellHandle` — NOT
-    /// necessarily the control-plane leader. Sandbox mutations are still
-    /// forwarded to the leader (single-writer-per-tenant-state, unchanged),
-    /// but the leader itself may lack a real isolation backend; when it does,
-    /// it delegates the actual cell provisioning to a capable peer (real
-    /// Firecracker or `litebox_verified`, picked from the live `NodeInfo`
-    /// registry's `backend` field) and stamps ITS name here instead of its
-    /// own. Every code path that needs to reach the live cell (the
-    /// interactive shell websocket, `run_command`, `open_shell`) must check
-    /// THIS field, never assume owner == leader. Empty string on a
-    /// pre-migration record (created before this field existed) or on a
-    /// record whose sandbox was never successfully provisioned anywhere
-    /// (`EngineUnavailable` on every candidate) — both read as "no live
-    /// owner", the same as today's fully-simulated state.
+    /// The node that holds this sandbox's live cell — the ONLY node that can
+    /// run commands, open a shell, stop or delete it. Sandbox mutations are
+    /// still forwarded to the control-plane leader (`admin_ingress`), but the
+    /// leader itself may have no exec-capable backend (fc-sanjose runs Mock),
+    /// in which case `sandboxes_api::create_sandbox` delegates provisioning to
+    /// a capable peer and adopts the peer's record; every cell-reaching
+    /// operation then re-routes to THIS node. Empty only on a record persisted
+    /// before this field existed — readers treat that as "the leader" (the
+    /// pre-field placement rule).
     #[serde(default)]
     pub owner_node: String,
 }
@@ -294,6 +291,13 @@ pub enum SandboxError {
     SnapshotNotFound(String),
     MountNotFound(String),
     AlreadyExists(String),
+    /// No node in the live registry advertises an exec-capable sandbox backend
+    /// (or every one that does refused/timed out) — the create was applied
+    /// NOWHERE. Carries the candidates tried and why each failed.
+    NoCapableNode(String),
+    /// The record names an owner node that could not be reached for a
+    /// cell-touching operation — nothing was applied; retry later.
+    OwnerUnreachable(String),
 }
 impl SandboxError {
     pub fn code(&self) -> &'static str {
@@ -311,6 +315,8 @@ impl SandboxError {
             SandboxError::SnapshotNotFound(_) => "SANDBOX_SNAPSHOT_NOT_FOUND",
             SandboxError::MountNotFound(_) => "SANDBOX_MOUNT_NOT_FOUND",
             SandboxError::AlreadyExists(_) => "SANDBOX_ALREADY_EXISTS",
+            SandboxError::NoCapableNode(_) => "SANDBOX_NO_CAPABLE_NODE",
+            SandboxError::OwnerUnreachable(_) => "SANDBOX_OWNER_UNREACHABLE",
         }
     }
     pub fn message(&self) -> String {
@@ -327,9 +333,23 @@ impl SandboxError {
             | SandboxError::CommandNotFound(s)
             | SandboxError::SnapshotNotFound(s)
             | SandboxError::MountNotFound(s)
-            | SandboxError::AlreadyExists(s) => s.clone(),
+            | SandboxError::AlreadyExists(s)
+            | SandboxError::NoCapableNode(s)
+            | SandboxError::OwnerUnreachable(s) => s.clone(),
         }
     }
+}
+
+/// THE capability predicate: can a node whose gossiped `NodeInfo::backend` is
+/// `backend` provision a sandbox cell AND execute commands / open a PTY inside
+/// it? One function, used by every caller — the local "may I provision here"
+/// check and the remote candidate filter — so the two can never disagree.
+/// "firecracker" runs `hive-cell-agent`'s `Exec`/`KillExec`/`ExecPty` over
+/// vsock; "litebox" runs `LiteboxBackend::exec_command`/`kill_exec`/`exec_pty`
+/// against a host-spawned guest. "mock" (and anything unknown / a pre-upgrade
+/// peer's empty string) has no real isolation and is never a candidate.
+pub fn sandbox_exec_capable(backend: &str) -> bool {
+    matches!(backend, "firecracker" | "litebox")
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +584,8 @@ pub struct SandboxesSnapshot {
 // Provider abstraction
 // ---------------------------------------------------------------------------
 
+/// Also the wire shape of a leader→owner delegated create (serde derives), so
+/// the delegate provisions from EXACTLY the input the leader validated.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSandboxInput {
     pub name: String,

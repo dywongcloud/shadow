@@ -60,3 +60,21 @@ hive_cp_owner_chain=fc-example1,fc-example2,fc-example3
 [browser_nodes]
 va-example
 sj-example
+
+# Hosts eligible for the Litebox CellBackend (roles/litebox,
+# crates/hive-backend/src/litebox.rs) -- the syscall-sandbox fallback for a
+# host with no safe microVM path (no /dev/kvm, or a PVM kernel that resets the
+# host). Membership is ELIGIBILITY only: the role builds + stages the runner
+# from the pinned AnEntrypoint/litebox commit and restarts nothing.
+#
+# Enabling is a per-host, per-probe decision recorded ON THE HOST LINE:
+#   1. run the role once (build + stage), 2. on that host as root run
+#   `hive-cloud --litebox-probe` and require a real PASS, 3. add
+#   `litebox_verified=true` to the host's line, 4. run the role again (writes
+#   the HIVE_LITEBOX_VERIFIED=1 drop-in and restarts hive-node).
+# The inventory mark is load-bearing: a role re-run on a host WITHOUT it removes
+# the drop-in and silently downgrades that node to MockBackend. Never set it on
+# a macOS node (the flag selects the Linux backend, which cannot exist there).
+[litebox]
+# fr-example
+# sj-example   litebox_verified=true   # example of a probed, enabled host

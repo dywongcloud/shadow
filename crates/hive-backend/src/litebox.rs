@@ -450,11 +450,25 @@ struct LiteboxFunctionProcess {
     _initial_files: File,
 }
 
+/// One in-flight `exec_command` (Sandboxes): the runner was spawned as the
+/// LEADER of its own process group, so `pgid` names the whole guest process
+/// tree — the runner plus every child the guest forks (the AnEntrypoint base
+/// tracks guest `fork()` as real host forks, which inherit the group) — and
+/// `kill_exec` terminates all of it with one `killpg`. Removed by the waiter
+/// task the moment the runner is reaped, so a late kill is a no-op.
+#[derive(Clone)]
+struct LiteboxExec {
+    cell: CellId,
+    pgid: i32,
+}
+
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
     /// Long-lived function processes (the litebox runner itself — guest and
     /// runner are one process), keyed by cell, killed on terminate.
     funcs: Arc<AsyncMutex<HashMap<CellId, LiteboxFunctionProcess>>>,
+    /// Live sandbox execs keyed by `ExecRequest.id` — see [`LiteboxExec`].
+    execs: Arc<AsyncMutex<HashMap<String, LiteboxExec>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
     /// Per-cell host-container ownership. Container cells bypass litebox and run
@@ -1292,6 +1306,7 @@ impl LiteboxBackend {
         LiteboxBackend {
             cfg,
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
+            execs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
             cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -3666,15 +3681,141 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
     "/usr/bin/env",
 ];
 
-/// Async half of shell-guest-tar construction: resolves every staged
-/// program's `ldd` closure (a real subprocess spawn — cannot run inside the
-/// blocking tar-writer below) and merges/dedupes them with the programs
-/// themselves before handing the whole set to the blocking writer.
-async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
+/// Host directories a bare `exec_command` name (`node`, `ls`, `python3`) is
+/// resolved against — the guest `PATH` this backend hands the runner, plus
+/// `/usr/local/bin` for operator-installed runtimes. The resolved binary is
+/// STAGED into the guest tar (with its `ldd` closure) exactly like the fixed
+/// shell set, so a command that exists on the host runs in the guest; one
+/// that does not fails loudly at start, never mid-run with a bare ENOENT.
+const EXEC_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// Upper bound on one `ExecOutput` line's bytes before it is truncated (the
+/// provider bounds again at 16 KiB); keeps a newline-free firehose from
+/// growing the pump's buffer without limit.
+const EXEC_MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Resolve the program a sandbox `exec_command` names to the HOST binary the
+/// runner will load (the first exec'd ELF loads from the host; every later
+/// guest-side `execve` resolves through the staged tar, which is why the
+/// caller stages this same path). A relative path is refused: the guest's
+/// cwd and the host's are different filesystems by design.
+fn resolve_guest_program(cmd: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !cmd.trim().is_empty() && !cmd.contains('\0'),
+        "sandbox command must be a non-empty program name"
+    );
+    if cmd.contains('/') {
+        let path = PathBuf::from(cmd);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "sandbox command path must be absolute inside a litebox guest: {cmd}"
+        );
+        anyhow::ensure!(
+            path.is_file(),
+            "command {cmd} is not available inside this litebox sandbox"
+        );
+        return Ok(path);
+    }
+    for dir in EXEC_PROGRAM_DIRS {
+        let candidate = Path::new(dir).join(cmd);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "command '{cmd}' is not available inside this litebox sandbox (searched {})",
+        EXEC_PROGRAM_DIRS.join(":")
+    )
+}
+
+/// Pump one exec pipe into `ExecOutput` events, one per line, each bounded
+/// to `EXEC_MAX_LINE_BYTES`. Keeps DRAINING (discarding) after the receiver
+/// goes away: a guest blocked on a full pipe would otherwise never exit and
+/// never be reaped, leaking the runner until `kill_exec`/`terminate`.
+async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    stream: hive_core::LogStream,
+    id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<hive_core::AgentEvent>,
+) {
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut chunk = [0_u8; 8192];
+    let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    let mut discard = false;
+    let mut emit = |line: &[u8], discard: &mut bool| {
+        if *discard {
+            return;
+        }
+        let mut line = line;
+        while line.last().is_some_and(|b| *b == b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let text = if line.len() > EXEC_MAX_LINE_BYTES {
+            let mut end = EXEC_MAX_LINE_BYTES;
+            while end > 0 && std::str::from_utf8(&line[..end]).is_err() {
+                end -= 1;
+            }
+            format!("{}… [truncated]", String::from_utf8_lossy(&line[..end]))
+        } else {
+            String::from_utf8_lossy(line).into_owned()
+        };
+        if tx
+            .send(hive_core::AgentEvent::ExecOutput {
+                id: id.clone(),
+                stream,
+                line: text,
+            })
+            .is_err()
+        {
+            *discard = true;
+        }
+    };
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
+                while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=nl).collect();
+                    emit(&line[..line.len() - 1], &mut discard);
+                }
+                if pending.len() > EXEC_MAX_LINE_BYTES {
+                    let line: Vec<u8> = pending.drain(..).collect();
+                    emit(&line, &mut discard);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        emit(&pending, &mut discard);
+    }
+}
+
+/// Async half of guest-tar construction for interactive shells AND one-shot
+/// execs: the fixed shell/coreutils set plus `extra` programs (the resolved
+/// `exec_command` binary), each with its `ldd` closure (a real subprocess
+/// spawn — cannot run inside the blocking tar-writer below), merged/deduped
+/// and handed to the blocking writer. A closure failure on an EXTRA program
+/// (a static binary or a script has none) stages the program alone; the
+/// fixed set's closure stays strict, as it always was.
+async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
     let mut deps: Vec<PathBuf> = Vec::new();
     for program in &programs {
         deps.extend(ldd_closure(program).await?);
+    }
+    for program in extra {
+        match ldd_closure(&program).await {
+            Ok(closure) => deps.extend(closure),
+            Err(error) => tracing::debug!(
+                program = %program.display(),
+                %error,
+                "litebox exec: no dynamic closure for program; staging it alone"
+            ),
+        }
+        programs.push(program);
     }
     // Same legacy-soname compat stubs `ensure_combined_tar_locked` stages —
     // a coreutils build linked against a split libpthread/libdl/librt/libutil
@@ -3702,6 +3843,11 @@ async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs))
         .await
         .context("litebox shell guest tar construction task failed")?
+}
+
+/// The interactive-shell tar: the fixed set only.
+async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
+    build_guest_tar(archive, Vec::new()).await
 }
 
 #[cfg(target_os = "linux")]
@@ -4406,6 +4552,195 @@ impl CellBackend for LiteboxBackend {
             funcs.get(&cell.id).and_then(|c| c.child.id())?
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
+    }
+
+    /// One argv command inside `cell` (Sandboxes `run_command`) — the SAME
+    /// guest mechanism `exec_pty` uses: a fresh `litebox-runner` spawned
+    /// against the cell's TUN device with a guest tar holding the fixed
+    /// shell/coreutils set plus the resolved program and its `ldd` closure.
+    /// stdout/stderr are separate pipes streamed as distinct `ExecOutput`
+    /// lines, then exactly one `ExecDone { exit_code }` — `None` when the
+    /// runner died by signal (a `kill_exec`), never a fake `Some(0)`. The
+    /// runner is its own process-group leader so `kill_exec` can terminate
+    /// the whole guest tree by exec id. Returns as soon as the runner is
+    /// spawned; the caller drains the channel.
+    async fn exec_command(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>> {
+        anyhow::ensure!(
+            !req.id.is_empty(),
+            "litebox exec requires a non-empty exec id"
+        );
+        // The runner is an unprivileged host process; there is no `sudo` in
+        // the guest and no privilege to elevate to. Refuse loudly at start.
+        anyhow::ensure!(
+            !req.sudo,
+            "litebox sandboxes cannot elevate privileges: sudo is not available inside a litebox guest"
+        );
+        if self.execs.lock().await.contains_key(&req.id) {
+            anyhow::bail!("exec id {} is already running on this node", req.id);
+        }
+        let net = self
+            .cell_nets
+            .lock()
+            .await
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+                    cell.id
+                )
+            })?;
+
+        let (program, args) = if req.shell {
+            let mut line = req.cmd.clone();
+            for arg in &req.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            (PathBuf::from("/bin/sh"), vec!["-c".to_string(), line])
+        } else {
+            (resolve_guest_program(&req.cmd)?, req.args.clone())
+        };
+
+        let directories = self.prepare_artifact_dirs()?;
+        directories.verify_bindings()?;
+        let exec_tar = self.allocate_temp_file(&directories.temporary, "exec", ".tar")?;
+        build_guest_tar(exec_tar.file.try_clone()?, vec![program.clone()]).await?;
+        let initial_files_alias =
+            self.allocate_initial_files_alias(&directories.temporary, &exec_tar.file)?;
+
+        let cwd = if req.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            req.cwd.clone()
+        };
+        let mut command = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut command);
+        let initial_files_path = crate::runtime_artifact::inherit_file_path(
+            &mut command,
+            &initial_files_alias.directory,
+        )?
+        .join(INITIAL_FILES_ALIAS_NAME);
+        command
+            .arg("-Z")
+            .arg("--rewrite-syscalls")
+            .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
+            .arg(format!("--initial-files={}", initial_files_path.display()))
+            .arg("--")
+            .arg(&program)
+            .args(&args)
+            .env_clear()
+            .envs(&req.env)
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Own process group: `kill_exec` sends SIGKILL to the GROUP, which
+        // reaches every process the guest forked, not only the runner.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command.spawn().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to spawn litebox runner for sandbox exec at {}: {error}",
+                self.cfg.runner_bin.display()
+            )
+        })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("litebox runner exited before its pid could be read"))?;
+        let pgid = i32::try_from(pid).context("litebox runner pid does not fit a pgid")?;
+        self.execs.lock().await.insert(
+            req.id.clone(),
+            LiteboxExec {
+                cell: cell.id.clone(),
+                pgid,
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stdout = tokio::spawn(pump_exec_lines(
+            child.stdout.take(),
+            hive_core::LogStream::Stdout,
+            req.id.clone(),
+            tx.clone(),
+        ));
+        let stderr = tokio::spawn(pump_exec_lines(
+            child.stderr.take(),
+            hive_core::LogStream::Stderr,
+            req.id.clone(),
+            tx.clone(),
+        ));
+        let execs = self.execs.clone();
+        let exec_id = req.id.clone();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            // Every output line precedes the terminal event.
+            let _ = stdout.await;
+            let _ = stderr.await;
+            execs.lock().await.remove(&exec_id);
+            // `code()` is `None` for a signal death — exactly the "killed"
+            // meaning the protocol reserves for `exit_code: None`.
+            let exit_code = status.ok().and_then(|s| s.code());
+            let _ = tx.send(hive_core::AgentEvent::ExecDone {
+                id: exec_id,
+                exit_code,
+            });
+            // The runner has exited, so the guest tar and its private alias
+            // are provably no longer being read; their Drop guards unlink.
+            drop(initial_files_alias);
+            drop(exec_tar);
+        });
+        Ok(rx)
+    }
+
+    /// Terminate a still-running `exec_command` by id: SIGKILL to the whole
+    /// process group the runner leads (the guest's forked descendants
+    /// included). Idempotent — an id that already finished is a no-op. The
+    /// waiter task then observes the signal death and emits
+    /// `ExecDone { exit_code: None }`.
+    async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
+        let entry = self.execs.lock().await.get(exec_id).cloned();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            entry.cell == cell.id,
+            "exec {exec_id} belongs to cell {}, not {}",
+            entry.cell,
+            cell.id
+        );
+        #[cfg(unix)]
+        {
+            // SAFETY: killpg(2) with a pgid this process spawned and a signal
+            // number; no pointer arguments.
+            let rc = unsafe { libc::killpg(entry.pgid, libc::SIGKILL) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                // ESRCH: the group is already gone (raced its own exit) —
+                // the waiter reports the real exit either way.
+                anyhow::ensure!(
+                    error.raw_os_error() == Some(libc::ESRCH),
+                    "killpg({}) for exec {exec_id} failed: {error}",
+                    entry.pgid
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("litebox exec kill requires a Unix process group")
+        }
     }
 
     async fn exec_pty(

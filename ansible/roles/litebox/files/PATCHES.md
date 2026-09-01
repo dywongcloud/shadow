@@ -136,6 +136,27 @@ switch (above) independently fixed part of problem 1 already:
    `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` from the environment. Unset =
    byte-identical to the base's own behavior.
 
+3. **Root DAC override in the guest in-memory filesystem** (added
+   2026-09-01, found live on fc-tokyo — a Rocky 10.2 host — the first time
+   the `AnEntrypoint/litebox` pin was ever built and probed on a fleet
+   node). `hive-cloud --litebox-probe` failed instantly:
+   `litebox_runner_linux_userland/src/lib.rs:293:22: called Result::unwrap()
+   on an Err value: NoWritePerms`, inside
+   `FileSystem::with_root_privileges`. The runner stages the guest program
+   by recreating its ancestor directories in the in-mem FS with the HOST's
+   mode bits; RHEL-family hosts ship `/usr/bin` as `0555`, and the fork's
+   `Permissions::can_write_by` (`litebox/src/fs/in_mem.rs`) honours the mode
+   bits even for `UserInfo::ROOT`, so the `CREAT` open of `/usr/bin/echo`
+   is refused. Reproduced deterministically: the identical command with the
+   program copied under a `0755` directory exits 0 and prints its argument;
+   the microsoft `e7984422` runner (which never enforced DAC) passes the
+   same probe on fr/phx/sj3. The hunk gives uid 0 Linux `CAP_DAC_OVERRIDE`
+   semantics in both permission checkers (`in_mem.rs` `can_read_by`/
+   `can_write_by` return true for root, `can_execute_by` requires any x
+   bit; the same three in `litebox/src/fs/resolver.rs`). No other user is
+   affected. Reported to the fork's maintainer session so the next pin can
+   drop this hunk.
+
 ## Why not wait for upstream, and why not switch to the `ulitebox` branch
 
 (Reasoning from when this patch targeted upstream `microsoft/litebox`;
@@ -155,7 +176,26 @@ problem 1's fix even if adopted. It is also unstable and undocumented.
 `litebox_shim_linux`, `litebox_platform_linux_userland`, and the real
 `litebox_runner_linux_userland` binary crate — all clean, at the pinned
 `AnEntrypoint/litebox` commit, with this patch applied. `git apply --check`
-confirmed against a completely fresh clone at the pinned commit. Full
-functional verification (the wildcard-bind fix and the multi-instance
-addressing both actually working) happens via `hive-cloud --litebox-probe`'s
-network check on a real x86_64 Linux host, not locally.
+confirmed against a completely fresh clone at the pinned commit.
+
+**Live, 2026-09-01, fc-tokyo (Rocky 10.2, glibc 2.39, no /dev/kvm, idle —
+0 containers, 0 cells):** `roles/litebox` cloned the pin, applied this patch
+cleanly, built the runner (`cargo build --release`, rustup `stable`
+1.98.0), and `hive-cloud --litebox-probe` (the fleet binary the unit runs,
+`/root/fc-target/release/hive-cloud`) reported `litebox smoke test: PASS —
+both the syscall rewriter AND a full real HTTP round trip through the
+per-cell-TUN + patched-litebox + bind-shim networking pipeline succeeded`
+in 2 s with zero leftover TUN devices or runner processes. Without hunk 3
+the same probe failed instantly (`NoWritePerms`, see above); hunk 3 is the
+only difference between the two runs. Runner sha256 at PASS:
+`f970bfe70ac86d4e…`. The same day fc-seoul, fc-virginia-4 and
+fc-virginia-5 (same OS image, also idle) built a byte-identical runner
+(`f970bfe70ac86d4e…` on all three — the build is reproducible across hosts)
+from the same pin + patch and each passed the identical probe in 1–2 s.
+fc-sanjose-cvm-1 and fc-sanjose-cvm-2 (TencentOS 4, glibc 2.38, rustup
+`stable` 1.97.1) built their own identical pair (`cb20b4e9f3cf03f5…` on
+both — the digest differs from the Rocky group's only by toolchain/glibc,
+never by source) and passed the probe in 3 s each while serving 7 and 29
+live containers; `hive-node` stayed active throughout. Full sandbox
+exec/PTY behaviour on top of this runner is verified separately per node
+before `HIVE_LITEBOX_VERIFIED=1` is set.

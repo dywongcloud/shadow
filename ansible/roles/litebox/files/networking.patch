@@ -1,3 +1,78 @@
+diff --git a/litebox/src/fs/in_mem.rs b/litebox/src/fs/in_mem.rs
+index 1961f5e..9adfab8 100644
+--- a/litebox/src/fs/in_mem.rs
++++ b/litebox/src/fs/in_mem.rs
+@@ -1370,6 +1370,15 @@ impl UserInfo {
+ 
+ impl Permissions {
+     fn can_read_by(&self, current: UserInfo) -> bool {
++        // Fleet patch (hive): CAP_DAC_OVERRIDE semantics -- uid 0 bypasses the
++        // discretionary read/write bits (and may execute when any x bit is set),
++        // exactly as Linux root does. Without this the runner cannot even stage
++        // its own program: RHEL-family hosts ship /usr/bin as 0555, the runner
++        // recreates that directory in the in-mem FS with the host mode, and the
++        // CREAT open under with_root_privileges then fails with NoWritePerms.
++        if current.user == 0 {
++            return true;
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::RUSR)
+         } else if self.userinfo.group == current.group {
+@@ -1379,6 +1388,9 @@ impl Permissions {
+         }
+     }
+     fn can_write_by(&self, current: UserInfo) -> bool {
++        if current.user == 0 {
++            return true;
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::WUSR)
+         } else if self.userinfo.group == current.group {
+@@ -1388,6 +1400,9 @@ impl Permissions {
+         }
+     }
+     fn can_execute_by(&self, current: UserInfo) -> bool {
++        if current.user == 0 {
++            return self.mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::XUSR)
+         } else if self.userinfo.group == current.group {
+diff --git a/litebox/src/fs/resolver.rs b/litebox/src/fs/resolver.rs
+index d84d9b5..c523118 100644
+--- a/litebox/src/fs/resolver.rs
++++ b/litebox/src/fs/resolver.rs
+@@ -102,6 +102,10 @@ impl Context {
+     }
+ 
+     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
++        // Fleet patch (hive): CAP_DAC_OVERRIDE semantics for uid 0 -- see in_mem.rs.
++        if self.user_info.user == 0 {
++            return permissions.mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::XUSR)
+         } else if self.user_info.group == permissions.owner.group {
+@@ -112,6 +116,9 @@ impl Context {
+     }
+ 
+     fn can_read(&self, permissions: &PermissionInfo) -> bool {
++        if self.user_info.user == 0 {
++            return true;
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::RUSR)
+         } else if self.user_info.group == permissions.owner.group {
+@@ -122,6 +129,9 @@ impl Context {
+     }
+ 
+     fn can_write(&self, permissions: &PermissionInfo) -> bool {
++        if self.user_info.user == 0 {
++            return true;
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::WUSR)
+         } else if self.user_info.group == permissions.owner.group {
 diff --git a/litebox/src/net/mod.rs b/litebox/src/net/mod.rs
 index 6dd9bb7..1d79326 100644
 --- a/litebox/src/net/mod.rs

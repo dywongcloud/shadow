@@ -102,12 +102,20 @@ pub(crate) async fn resolve_sandbox_shell(
         .and_then(|(c, r)| Some((c.parse().ok()?, r.parse().ok()?)))
         .unwrap_or((80u16, 24u16));
 
-    // Real ownership check — a sandbox record with a DIFFERENT owner_node
-    // (or none at all) must not be served here even if the id happens to
-    // match something local (e.g. a stale adopted-metadata copy on a node
-    // that isn't the real owner).
+    // Real ownership check — a sandbox record with a DIFFERENT owner_node must
+    // not be served here even if the id happens to match something local
+    // (e.g. a stale adopted-metadata copy on a node that isn't the real
+    // owner). An EMPTY owner_node is a record persisted before the field
+    // existed, which the leader-placement rule owned — the same reading
+    // `sandboxes_api::open_shell` applies on the forwarding side, so the two
+    // ends can never disagree about who serves a legacy record.
     let rec = cloud.sandboxes.get_sandbox_by_id(&sandbox_id)?;
-    if rec.owner_node != cloud.node_name {
+    let owned_here = if rec.owner_node.is_empty() {
+        cloud.is_control_plane_leader()
+    } else {
+        rec.owner_node == cloud.node_name
+    };
+    if !owned_here {
         return None;
     }
     let (rx, pty) = cloud

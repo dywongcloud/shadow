@@ -807,6 +807,74 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
+        // Sandbox owner hops (leader -> owner), the mesh half of
+        // `sandboxes_api::internal_hop`: a delegated CREATE on a node whose
+        // backend can exec (the leader's cannot), and the ONE typed owner RPC
+        // every cell-touching mutation rides (stop/delete/run/kill). Both
+        // handlers re-derive authority on the receiving node (fleet service
+        // credential + tenant binding via `require_internal_hop`, owner ==
+        // self via the record) and never re-proxy. A handler refusal is
+        // wrapped in `refused_envelope` so the leader can tell a typed "no"
+        // (nothing applied) from a dead transport (unknown). Same
+        // `x-hive-internal` posture as the provision-local arm above.
+        p if method == hive_p2p::GOSSIP_POST
+            && matches!(
+                p.split('?').next(),
+                Some(crate::sandboxes_api::DELEGATE_CREATE_PATH)
+                    | Some(crate::sandboxes_api::OWNER_OP_PATH)
+            ) =>
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+                    headers.insert("x-hive-internal", hv);
+                }
+            }
+            let is_create = p.split('?').next() == Some(crate::sandboxes_api::DELEGATE_CREATE_PATH);
+            let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            let outcome = if is_create {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::delegate_create_sandbox(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad delegate body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            } else {
+                match serde_json::from_value(parsed) {
+                    Ok(req) => {
+                        crate::sandboxes_api::owner_op(
+                            State(cloud.clone()),
+                            headers,
+                            team_claims(p),
+                            axum::Json(req),
+                        )
+                        .await
+                    }
+                    Err(e) => Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({ "error": format!("bad owner-op body: {e}") })
+                            .to_string(),
+                    )),
+                }
+            };
+            match outcome {
+                Ok(j) => jb(j),
+                Err((status, body)) => crate::sandboxes_api::refused_envelope(status, &body),
+            }
+        }
         // Companion to the provision-local arm above: `admin::database_delete`
         // proxies backing-container/volume teardown here when the record's
         // `host_node` is a peer (the same gap the create-side fix opened —

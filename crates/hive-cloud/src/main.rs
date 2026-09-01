@@ -2192,6 +2192,12 @@ fn owner_routed(path: &str) -> bool {
         // mutate a different host's transaction journal (or fail WrongTarget)
         // and make resumable delivery impossible across leader changes.
         || path.starts_with("/v1/runtime-artifact-transfer/v1/")
+        // Sandbox owner RPCs (`sandboxes_api`'s delegate-create / owner-op) are
+        // addressed by the LEADER to the exact node that holds — or is being
+        // asked to provision — the cell. Bouncing them back to the leader would
+        // re-run the create on a node with no exec backend (the fail-closed
+        // refusal the delegation exists to route around) or deadlock the hop.
+        || path.starts_with("/v1/internal/sandboxes/")
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied

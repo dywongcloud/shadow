@@ -195,7 +195,12 @@ async fn allocate_eip(
         &serde_json::json!({
             "AddressCount": 1,
             "InternetChargeType": "BANDWIDTH_PACKAGE",
-            "Tags": [{"TagKey": "hive-project", "TagValue": project}],
+            // Tencent's VPC `Tag` struct is `{Key, Value}`; the `TagKey`/`TagValue`
+            // spelling belongs to the *filter* type and is rejected by
+            // AllocateAddresses with `UnknownParameter: Tags.0.TagKey`
+            // (witnessed live, 2026-09-01) — which failed every dedicated-IPv4
+            // provision before a single address was purchased.
+            "Tags": [{"Key": "hive-project", "Value": project}],
         }),
     )
     .await?;
