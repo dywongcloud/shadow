@@ -74,6 +74,32 @@ pub async fn probe(
 /// functions). Falls back to `addr_json` unchanged when `node_id` isn't found in
 /// the registry (e.g. a bootstrap seed never gossiped as a full `NodeInfo`).
 fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) -> String {
+    // A relay in `addr_json` is the peer's OWN home relay — the one it is
+    // actually attached to, straight from its signed gossip (`iroh_addr`) —
+    // and a relay only carries traffic to peers attached to it. Steering the
+    // dial away from it to `relay_url` (the embedded relay the peer SERVES,
+    // `http://<public-ip>:3341`) replaced a live transport with a dead one
+    // fleet-wide: measured 2026-09-01 from fc-frankfurt, fc-sanjose and
+    // fc-sanjose-3, every Tencent host's :3341 is TCP-unreachable from every
+    // other Tencent host (and from itself via its public IP — the security
+    // group, not the listener), while every `*.relay.shadw.app:3343` answers
+    // 200 from all three. With the dead hint substituted, a dial to
+    // fc-frankfurt had exactly one path (direct UDP) and timed out at the 5s
+    // cached-hint budget ~10 times a minute whenever that path flapped — the
+    // eight failed express deploys. So: keep the peer's own relay when it has
+    // one; steer ONLY an addr that carries no relay at all (a peer learned
+    // second-hand before it ever gossiped its home relay), which is the case
+    // `with_relay_hint` was written for.
+    if serde_json::from_str::<iroh::EndpointAddr>(addr_json)
+        .map(|a| {
+            a.addrs
+                .iter()
+                .any(|t| matches!(t, iroh::TransportAddr::Relay(_)))
+        })
+        .unwrap_or(false)
+    {
+        return addr_json.to_string();
+    }
     let nodes = cloud.registry.nodes();
     // Match on endpoint id OR node name. `node_id` here is whatever the caller had:
     // `request_to`'s callers pass a 64-hex `peer_id`, but `fetch` pulls its tuple

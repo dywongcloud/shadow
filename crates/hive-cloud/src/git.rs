@@ -2232,7 +2232,7 @@ async fn run_build(
             // Pure remote placement: do NOT build/host locally. Dispatch to the
             // chosen region node(s), mirror their build into this build record,
             // then remove the project from any other node that still hosts it.
-            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+            let mut names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             log(format!(
                 "Placement: region-aware scheduler → {}",
                 names.join(", ")
@@ -2256,7 +2256,96 @@ async fn run_build(
             // `run_build`), collapsing the deploy to the primary region only —
             // while a STATELESS multi-region fanout proceeds on every target
             // exactly as before.
-            let ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            let mut ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            // DISPATCH FALLBACK. `nothing_ran` means every placed target was
+            // UNREACHABLE — the request never arrived anywhere, so nothing is
+            // known about the app and no node holds a half-finished build.
+            // That is exactly the condition under which trying the next
+            // capable node is free of side effects, and refusing to is how a
+            // single cold trunk failed eight consecutive deploys of one
+            // project (see `schedule::dispatch_fallbacks`). Candidates are
+            // tried ONE AT A TIME, each with `fanout_remote`'s own bounded
+            // per-target budget (HTTP 15s, then 2 x 20s iroh), and the loop
+            // stops the moment any node actually RAN the deploy — Ready,
+            // BuildFailed or Declined all mean the app was executed and the
+            // verdict below is about the app, not the fleet.
+            //
+            // Never for a project whose live container lease is held by one of
+            // the unreachable targets: its state volume lives on that node, and
+            // "deploying somewhere else" would silently fork it (the
+            // `place_for_project` stickiness rule). That deploy stays an honest
+            // reachability failure.
+            let mut fallback_landed: Option<String> = None;
+            if ok.nothing_ran() && !cloud.build_cancels.is_cancelled(bid) {
+                let pinned = cloud
+                    .leases
+                    .owner_of(&project)
+                    .filter(|holder| names.iter().any(|n| n == holder));
+                if let Some(holder) = pinned {
+                    log(format!(
+                        "No dispatch fallback: {holder} holds this project's live container lease (its state volume lives there), so the deploy is not moved to another node."
+                    ));
+                } else {
+                    let fallbacks = crate::schedule::dispatch_fallbacks(
+                        cloud,
+                        &regions,
+                        known_container,
+                        needs_gpu,
+                        crate::schedule::InterpreterNeeds {
+                            wasm: known_wasm,
+                            bun: known_bun,
+                        },
+                        !known_container,
+                        needs_build_isolation,
+                        &names,
+                    );
+                    let max = dispatch_fallback_max().min(fallbacks.len());
+                    if fallbacks.is_empty() {
+                        log("No dispatch fallback available: no other healthy, capable, reachable node is known to the mesh.".into());
+                    }
+                    let node_region: std::collections::HashMap<String, String> = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .map(|n| (n.name, n.region))
+                        .collect();
+                    for (idx, cand) in fallbacks.iter().take(max).enumerate() {
+                        if cloud.build_cancels.is_cancelled(bid) {
+                            break;
+                        }
+                        let region = node_region.get(&cand.node).cloned().unwrap_or_default();
+                        let in_region = regions
+                            .iter()
+                            .any(|r| r.trim().eq_ignore_ascii_case(&region));
+                        log(format!(
+                            "→ fallback {}/{}: {} ({}{}) — {} could not be reached, dispatching the deploy there instead",
+                            idx + 1,
+                            max,
+                            cand.node,
+                            region,
+                            if in_region { "" } else { ", outside the configured region(s)" },
+                            ok.unreachable().join(", ")
+                        ));
+                        let attempt = fanout_remote(
+                            cloud,
+                            bid,
+                            &req,
+                            &project,
+                            incarnation,
+                            std::slice::from_ref(cand),
+                            true,
+                        )
+                        .await;
+                        names.push(cand.node.clone());
+                        let ran = !attempt.nothing_ran();
+                        ok.per_target.extend(attempt.per_target);
+                        if ran {
+                            fallback_landed = Some(cand.node.clone());
+                            break;
+                        }
+                    }
+                }
+            }
             // Atomic promotion (Vercel convention): only relocate — i.e. remove the
             // project from nodes that still host the PREVIOUS deployment — once the
             // new placement actually built & is serving. A FAILED build must never
@@ -2290,7 +2379,12 @@ async fn run_build(
                 // DEGRADED, not failed: name every target the deploy could not
                 // be delivered to, so the operator sees reduced replication
                 // instead of silence, and so a later reconcile can repair it.
-                if !unreachable.is_empty() {
+                if let Some(landed) = fallback_landed.as_deref().filter(|_| ok.ready() > 0) {
+                    log(format!(
+                        "⚠ Deployed on {landed} because {} could not be reached. The configured region is a preference, not a fence: the next deploy re-evaluates placement and lands back in region once that node is reachable again.",
+                        unreachable.join(", ")
+                    ));
+                } else if !unreachable.is_empty() {
                     log(format!(
                         "⚠ Deployed to {} of {} target(s). Could not reach: {} — those regions ran \
                          nothing and are DEGRADED, not failed; replication is repaired when they \
@@ -4261,6 +4355,27 @@ async fn run_build(
             artifact_relative.to_path_buf(),
         )
     };
+    // Launch-shape preflight BEFORE sealing: a direct-interpreter function
+    // (`node <entry>` / `bun <entry>`) whose entry module is not in the tree
+    // about to be sealed can never start anywhere, so it fails HERE — naming
+    // the entry, where it was looked for, and the fluid.json/package.json
+    // field that chose it — instead of at the post-registration readiness
+    // launch, where litebox answered with a `tar: … Not found in archive`
+    // dump under a NODE-fault marker (witnessed: serverless-clawdbot@xstate,
+    // dpl-0123447de0 on fc-sanjose-3 — fluid.json `start_cmd: ["node",
+    // "server.js"]` for a Next.js repo with no server.js; the fluid.json
+    // lane runs no install/build, so nothing could have produced it).
+    if !build_failed && !is_container {
+        let fluid_json_present = build_dir.join("fluid.json").is_file();
+        if let Err(error) =
+            preflight_direct_entries(&manifest, &runtime_artifact, fluid_json_present).await
+        {
+            let msg = format!("{error:#}");
+            log(msg.clone());
+            tracing::warn!(project = %project, %msg, "launch-shape preflight refused the build");
+            return Err(error);
+        }
+    }
     let image = format!("dpl-{}", sanitize_tag(bid));
     let (host_static_root, runtime_workdir, runtime_artifact_identity, sealed_runtime_artifact) =
         if !build_failed && !is_container {
@@ -5231,6 +5346,19 @@ pub(crate) enum TargetOutcome {
     Declined,
 }
 
+/// How many fallback candidates a pure-remote deploy tries after EVERY placed
+/// target proved unreachable (`HIVE_DEPLOY_DISPATCH_FALLBACK_MAX`, default 3).
+/// Each candidate is bounded by `fanout_remote`'s own per-target budget, so the
+/// worst case is `(1 + this) x (15s HTTP + 2 x 20s iroh)` of pure dispatch time
+/// before the deploy is declared unreachable — sized like the sandbox
+/// delegation's candidate walk, not an unbounded fleet sweep.
+fn dispatch_fallback_max() -> usize {
+    std::env::var("HIVE_DEPLOY_DISPATCH_FALLBACK_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
 /// The aggregate verdict over every target of one fan-out.
 pub(crate) struct FanoutOutcome {
     pub per_target: Vec<(String, TargetOutcome)>,
@@ -5263,6 +5391,17 @@ impl FanoutOutcome {
     /// Targets that deliberately refused to host (stateful single-writer guard).
     pub(crate) fn declined(&self) -> usize {
         self.count(TargetOutcome::Declined)
+    }
+    /// Every target was unreachable: the request arrived NOWHERE, so no node
+    /// ran, declined or failed the app. The one condition under which trying
+    /// another node is free of side effects — see the dispatch fallback in
+    /// `run_build`.
+    pub(crate) fn nothing_ran(&self) -> bool {
+        !self.per_target.is_empty()
+            && self
+                .per_target
+                .iter()
+                .all(|(_, o)| *o == TargetOutcome::DispatchFailed)
     }
     /// PROMOTION POLICY: at least one target is genuinely serving.
     ///
@@ -5439,6 +5578,7 @@ async fn fanout_remote(
                 let mut iroh_result = None;
                 let mut last_failure = String::new();
                 for iroh_attempt in 1..=2 {
+                    let t0 = std::time::Instant::now();
                     match crate::gossip::request_to(
                         cloud,
                         id,
@@ -5455,7 +5595,20 @@ async fn fanout_remote(
                             break;
                         }
                         None => {
-                            last_failure = "iroh: no reply (peer unreachable over the mesh, or timed out after 20s)".into();
+                            // Name the MEASURED elapsed time. The previous text
+                            // claimed "timed out after 20s" for every failure,
+                            // while the witnessed ones (2026-09-01, eight
+                            // express deploys) all failed in 5-15s: the DIAL
+                            // failed (cached-hint connect timeout + fresh-
+                            // discovery giving up) long before the 20s request
+                            // budget — a different fault than a peer that
+                            // accepted the stream and never answered.
+                            let elapsed_ms = t0.elapsed().as_millis();
+                            last_failure = if elapsed_ms >= 19_500 {
+                                format!("iroh: no reply within the 20s request budget ({elapsed_ms}ms; the peer accepted nothing or answered nothing)")
+                            } else {
+                                format!("iroh: dial failed after {elapsed_ms}ms (no QUIC path to the peer: cached-hint connect timed out and fresh discovery gave up)")
+                            };
                             if iroh_attempt < 2 {
                                 cloud.builds.log(bid, format!("→ {}: iroh dispatch timed out, retrying once", t.node));
                             }
@@ -6372,6 +6525,227 @@ async fn produce_manifest(
         )
         .await
     }
+}
+
+/// The module a direct-interpreter `start_cmd` names, when the argv is one
+/// plain `node <entry>` / `bun <entry>` / `bun run <entry>` launch. `None`
+/// for every other shape — package-manager and script indirection (`npm
+/// start`, `bun run start`), `next start`, container/python/command runtimes,
+/// stdin/eval/REPL forms, and any Node option that takes the NEXT argv as its
+/// value (`-r x`, `--require x`, `--import x`, `--loader x`), because there
+/// the first non-option argument is not the entry. `None` means "not this
+/// check's business": the backend's own launch validation still runs. Only
+/// `--flag` / `--flag=value` options are skipped ahead of the entry; a
+/// short `-x` option bails out for the same reason.
+fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
+    let first = start_cmd.first()?;
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let mut rest = start_cmd[1..].iter();
+    let candidate = match base {
+        "node" | "nodejs" => loop {
+            let arg = rest.next()?;
+            if !arg.starts_with('-') {
+                break arg;
+            }
+            let value_taking = matches!(
+                arg.as_str(),
+                "--require"
+                    | "--import"
+                    | "--loader"
+                    | "--experimental-loader"
+                    | "--eval"
+                    | "--print"
+                    | "--input-type"
+                    | "--interactive"
+            );
+            if value_taking || !arg.starts_with("--") {
+                return None;
+            }
+        },
+        "bun" => {
+            let arg = rest.find(|arg| !arg.starts_with('-'))?;
+            let arg = if arg == "run" {
+                rest.find(|arg| !arg.starts_with('-'))?
+            } else {
+                arg
+            };
+            let path_shaped = arg.contains('/')
+                || Path::new(arg).extension().is_some_and(|extension| {
+                    matches!(
+                        extension.to_str(),
+                        Some("js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx")
+                    )
+                });
+            if !path_shaped {
+                return None;
+            }
+            arg
+        }
+        _ => return None,
+    };
+    let path = Path::new(candidate);
+    let plain_relative = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+        && path.components().any(|component| matches!(component, Component::Normal(_)));
+    plain_relative.then(|| candidate.clone())
+}
+
+/// Build-time launch-shape preflight: every function whose `start_cmd` is a
+/// direct `node`/`bun` launch ([`direct_launch_entry`]) must have its entry
+/// module present in the runtime artifact tree that is about to be sealed
+/// (`checkout_root/app_rel/cwd_relative/<entry>`, plus Node's extensionless
+/// `.js`/`.mjs`/`.cjs` resolution; a directory counts, Node resolves its
+/// `index.js`). Deliberately conservative — it fires only when NOTHING exists
+/// at the entry, the one case that is provably unlaunchable on every backend
+/// (mock spawns `node <entry>` from the same tree; litebox refuses the launch
+/// against the same sealed bytes; the microVM agent execs the same path).
+/// The refusal names the function, the entry, the exact checkout-relative
+/// path examined, what the sealed root actually contains, and the field that
+/// chose the entry: `fluid.json functions[N].start_cmd` — whose lane ships
+/// the checkout as-is with no install/build command — or the build-derived
+/// start command (package.json `scripts.start` / framework detection).
+async fn preflight_direct_entries(
+    manifest: &Manifest,
+    runtime_artifact: &hive_backend::RuntimeArtifactSpec,
+    fluid_json_present: bool,
+) -> anyhow::Result<()> {
+    let host_root = runtime_artifact.host_static_root()?;
+    for (index, function) in manifest.functions.iter().enumerate() {
+        let runtime = hive_core::Runtime::resolve(&function.runtime, &function.start_cmd);
+        if !matches!(runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun) {
+            continue;
+        }
+        let Some(entry) = direct_launch_entry(&function.start_cmd) else {
+            continue;
+        };
+        let cwd = function
+            .cwd_relative
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty() && *cwd != ".")
+            .map(Path::new);
+        let base = match cwd {
+            Some(cwd) => host_root.join(cwd),
+            None => host_root.clone(),
+        };
+        let candidates: Vec<PathBuf> = std::iter::once(base.join(&entry))
+            .chain(
+                ["js", "mjs", "cjs"]
+                    .iter()
+                    .map(|extension| base.join(format!("{entry}.{extension}"))),
+            )
+            .collect();
+        let mut present = false;
+        for candidate in &candidates {
+            if tokio::fs::symlink_metadata(candidate).await.is_ok() {
+                present = true;
+                break;
+            }
+        }
+        if present {
+            continue;
+        }
+
+        let mut examined = runtime_artifact.app_rel.clone();
+        if let Some(cwd) = cwd {
+            examined.push(cwd);
+        }
+        examined.push(&entry);
+        let examined = examined
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut root_listing: Vec<String> = match tokio::fs::read_dir(&base).await {
+            Ok(mut entries) => {
+                let mut names = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let mut name = entry.file_name().to_string_lossy().into_owned();
+                    if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                        name.push('/');
+                    }
+                    names.push(name);
+                }
+                names
+            }
+            Err(_) => Vec::new(),
+        };
+        root_listing.sort();
+        let shown = root_listing.len().min(16);
+        let mut listing = root_listing[..shown].join(", ");
+        if root_listing.len() > shown {
+            listing.push_str(&format!(", … ({} more)", root_listing.len() - shown));
+        }
+        let scripts = tokio::fs::read_to_string(base.join("package.json"))
+            .await
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|package| {
+                let pick = |key: &str| {
+                    package
+                        .get("scripts")
+                        .and_then(|scripts| scripts.get(key))
+                        .and_then(|value| value.as_str())
+                        .map(|value| format!("scripts.{key} = {value:?}"))
+                };
+                let main = package
+                    .get("main")
+                    .and_then(|value| value.as_str())
+                    .map(|value| format!("main = {value:?}"));
+                [pick("start"), pick("build"), main]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|summary| !summary.is_empty());
+        let interpreter = function.start_cmd.first().cloned().unwrap_or_default();
+        let function_label = if function.name.is_empty() {
+            format!("functions[{index}]")
+        } else {
+            format!("{:?} (functions[{index}])", function.name)
+        };
+        let deciding_field = if fluid_json_present {
+            format!(
+                "fluid.json functions[{index}].start_cmd = {:?}",
+                function.start_cmd
+            )
+        } else {
+            format!(
+                "the build-derived start command {:?} (package.json scripts.start / framework detection)",
+                function.start_cmd
+            )
+        };
+        let lane = if fluid_json_present {
+            "A fluid.json deployment ships the repository checkout AS-IS — no install or build \
+             command runs (\"Detected fluid.json — using project configuration\") — so the entry \
+             must be committed to the repository. Fix one of: commit the file the start_cmd \
+             names; point start_cmd at a committed file; or remove fluid.json so framework \
+             detection runs the install + build and derives the start command from package.json."
+                .to_string()
+        } else {
+            "The install/build steps that ran did not produce it — check the build output and \
+             the framework's output directory, or set an explicit start command in the project's \
+             build settings."
+                .to_string()
+        };
+        let msg = format!(
+            "Launch preflight failed for function {function_label}: main entry {entry:?} — chosen \
+             by {deciding_field} — does not exist in the deployment tree about to be sealed. \
+             Looked for {examined:?} (and {entry}.js/.mjs/.cjs) relative to the repository \
+             checkout; the deployment root contains [{listing}]{}. {lane} The `{interpreter}` \
+             process would exit immediately on every backend, so the deployment was NOT \
+             registered.",
+            scripts
+                .map(|summary| format!("; package.json declares {summary}"))
+                .unwrap_or_default(),
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+    Ok(())
 }
 
 /// Whether to use `npm ci` (a clean, lockfile-exact install) instead of

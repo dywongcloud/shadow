@@ -259,6 +259,214 @@ fn disk_floor_gb() -> u64 {
         .unwrap_or(20)
 }
 
+/// Build the dispatch route for a chosen node: self (both None), else EVERY
+/// transport that node currently has — HTTP admin URL and/or iroh (id, addr).
+///
+/// Both are filled when both are known. They fail independently (a security
+/// group blocking 8786/8787 kills HTTP while iroh is fine; a degraded mesh path
+/// fails the other way), so populating only the preferred one left the
+/// dispatcher no second option and turned one transport hiccup into a failed
+/// deployment. `fanout_remote` prefers HTTP and falls back to iroh.
+fn target_of(cloud: &Arc<CloudState>, n: &NodeInfo) -> Target {
+    if n.name == cloud.node_name {
+        return Target {
+            node: n.name.clone(),
+            admin: None,
+            iroh: None,
+        };
+    }
+    Target {
+        node: n.name.clone(),
+        admin: cloud.node_admins.read().get(&n.name).cloned(),
+        iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
+            (Some(id), Some(addr)) => Some((id, addr)),
+            _ => None,
+        },
+    }
+}
+
+/// A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
+/// over the iroh mesh (has a peer id + dialable address). The last case is what lets
+/// a NAT'd coordinator place deploys on FC nodes after the SSH tunnels were cut.
+fn reachable(cloud: &Arc<CloudState>, n: &NodeInfo) -> bool {
+    n.name == cloud.node_name
+        || cloud.node_admins.read().contains_key(&n.name)
+        || (n.peer_id.is_some() && n.iroh_addr.is_some())
+}
+
+/// Capability filter. Containers run through host podman on every backend;
+/// ordinary functions require a production isolation backend. Firecracker is
+/// intrinsically eligible, verified Litebox proves that status by advertising
+/// the current runtime-artifact protocol, and Mock remains container-only.
+fn capable(
+    n: &NodeInfo,
+    is_container: bool,
+    needs_gpu: bool,
+    needs_interpreter: InterpreterNeeds,
+    needs_runtime_artifact: bool,
+    needs_build_isolation: bool,
+) -> bool {
+    if needs_gpu && n.gpu_count == 0 {
+        return false;
+    }
+    // Wasmer capability, same hard-filter shape as the GPU gate above.
+    // See `wasm_capable` for why `None` excludes rather than admits.
+    if !wasm_capable(n, needs_interpreter.wasm) {
+        return false;
+    }
+    // Bun capability, identical shape and identical reasoning — see
+    // `bun_capable`.
+    if !bun_capable(n, needs_interpreter.bun) {
+        return false;
+    }
+    if !runtime_artifact_capable(n, needs_runtime_artifact) {
+        return false;
+    }
+    if !build_isolation_capable(n, needs_build_isolation) {
+        return false;
+    }
+    // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
+    // filtered on health/region/GPU and then sorted by deployment COUNT, a
+    // metric that says nothing about space. So the node with the most free
+    // capacity and the node with none scored identically, and a full node
+    // kept winning. Witnessed 2026-07-31 — fc-sanjose hit 0 bytes free and
+    // took 9 customer deployments down ("host disk critically low ... after
+    // GC") while fc-frankfurt and both CVM nodes sat under 10% used with
+    // ~920 GiB free each.
+    //
+    // A HARD filter, not another term in the score, because disk is not like
+    // CPU or memory: it does not drain on its own once a deployment lands,
+    // so a node that is out of space is out until something is deleted. A
+    // weighted score would still let it win when peers look busy.
+    //
+    // The floor is deliberately larger than the per-cold-start requirement
+    // (`FLOOR_BYTES`, 3 GiB in hive-backend): placement must leave room for
+    // the deployment it is about to create PLUS the next one, or it just
+    // hands the node to the very check that will reject it.
+    //
+    // `disk_free_gb == 0` means UNKNOWN, not full — a pre-upgrade peer does
+    // not report it. Excluding those would empty the candidate set during a
+    // rollout, so unknown is admitted and only a positive, genuinely-low
+    // reading rejects.
+    let floor_gb = disk_floor_gb();
+    if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
+        return false;
+    }
+    if is_container {
+        // A container deployment is served on this node's own public host —
+        // never through the microVM guest network — so a node with NO public
+        // address can win placement (it's `reachable()` for build DISPATCH via
+        // admin/iroh) but the resulting deployment is then unreachable by any
+        // real client: only 127.0.0.1. Witnessed as a live risk when the local
+        // Mac dev nodes moved region to san-jose — the mock-backend widening
+        // below exists so containers can run on them at all, but a
+        // region-pinned container could land there and silently never serve.
+        // Require a public address for EITHER family, on every backend
+        // (firecracker included — a NAT'd FC node has the identical problem,
+        // this is not mock-specific), so an unreachable node simply isn't a
+        // candidate rather than winning and quietly failing to serve.
+        let has_public = n.public_ip.is_some() || n.public_ip6.is_some();
+        has_public && (eligible(n) || (n.healthy && n.backend == "mock"))
+    } else {
+        eligible(n)
+    }
+}
+
+/// Ordered DISPATCH FALLBACKS for a build whose placed target(s) could not be
+/// REACHED — the deploy request never arrived, nothing ran. Every other remote
+/// node that is healthy, dispatchable and `capable` of this exact deployment
+/// (the same predicate `place` filters on — never the explicit-region widening,
+/// because a fallback must genuinely be able to build and host it), minus
+/// `exclude` (the targets already tried) and this node.
+///
+/// Order is a preference, not a fence: nodes in the project's configured
+/// region(s) first, in request order, then everything else by proximity to
+/// this coordinator; ties by load, then most free disk, then name (so every
+/// retry and every observer agree on the sequence — the `capable_peers`
+/// convention in `sandboxes_api`). A region-pinned project whose only in-region
+/// node is unreachable therefore lands OUT of region rather than failing
+/// outright, and the build log says so; the next deploy re-evaluates placement.
+///
+/// Witnessed 2026-09-01: project `express`, region frankfurt, sole target
+/// fc-frankfurt. Eight consecutive deploys in 75 minutes failed "iroh: no
+/// reply" while the leader's trunk to fc-frankfurt was cold (its cached-hint
+/// dials timing out ~10/min) yet fc-frankfurt stayed HEALTHY in the registry
+/// (still gossiping via other peers — a single-observer transport fault must
+/// not withdraw it from placement). Placement produced exactly one candidate
+/// and the coordinator gave up: ten other capable litebox/firecracker nodes
+/// sat idle the whole time.
+pub fn dispatch_fallbacks(
+    cloud: &Arc<CloudState>,
+    regions: &[String],
+    is_container: bool,
+    needs_gpu: bool,
+    needs_interpreter: impl Into<InterpreterNeeds>,
+    needs_runtime_artifact: bool,
+    needs_build_isolation: bool,
+    exclude: &[String],
+) -> Vec<Target> {
+    let needs_interpreter = needs_interpreter.into();
+    let nodes = cloud.registry.nodes();
+    let me = cloud.node_name.clone();
+    let load = load_map(cloud);
+    let load_of = |name: &str| -> usize { load.get(name).copied().unwrap_or(0) };
+    let regions: Vec<String> = regions
+        .iter()
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let region_rank = |n: &NodeInfo| -> usize {
+        regions
+            .iter()
+            .position(|r| n.region.eq_ignore_ascii_case(r))
+            .unwrap_or(regions.len())
+    };
+    let self_geo = nodes
+        .iter()
+        .find(|n| n.name == me)
+        .and_then(|n| match (n.lat, n.lon) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        });
+    let dist = |n: &NodeInfo| -> f64 {
+        match (self_geo, n.lat, n.lon) {
+            (Some(s), Some(a), Some(b)) => haversine_km(s, (a, b)),
+            _ => f64::MAX,
+        }
+    };
+    let mut cands: Vec<&NodeInfo> = nodes
+        .iter()
+        .filter(|n| {
+            !n.is_self
+                && n.name != me
+                && n.healthy
+                && !exclude.iter().any(|x| x.eq_ignore_ascii_case(&n.name))
+                && reachable(cloud, n)
+                && capable(
+                    n,
+                    is_container,
+                    needs_gpu,
+                    needs_interpreter,
+                    needs_runtime_artifact,
+                    needs_build_isolation,
+                )
+        })
+        .collect();
+    cands.sort_by(|a, b| {
+        region_rank(a)
+            .cmp(&region_rank(b))
+            .then_with(|| {
+                dist(a)
+                    .partial_cmp(&dist(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
+            .then_with(|| b.disk_free_gb.cmp(&a.disk_free_gb))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    cands.into_iter().map(|n| target_of(cloud, n)).collect()
+}
+
 /// Choose placement targets. See module docs for the policy. `is_container` routes
 /// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
 /// mock/podman backend) — Firecracker nodes can't run them, so placing a container
@@ -320,108 +528,20 @@ pub fn place(
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
     let load_of = |name: &str| -> usize { load.get(name).copied().unwrap_or(0) };
-    // Build the dispatch route for a chosen node: self (both None), else EVERY
-    // transport that node currently has — HTTP admin URL and/or iroh (id, addr).
-    //
-    // Both are filled when both are known. They fail independently (a security
-    // group blocking 8786/8787 kills HTTP while iroh is fine; a degraded mesh path
-    // fails the other way), so populating only the preferred one left the
-    // dispatcher no second option and turned one transport hiccup into a failed
-    // deployment. `dispatch_deploy` prefers HTTP and falls back to iroh.
-    let target_of = |n: &NodeInfo| -> Target {
-        if n.name == me {
-            return Target {
-                node: n.name.clone(),
-                admin: None,
-                iroh: None,
-            };
-        }
-        Target {
-            node: n.name.clone(),
-            admin: cloud.node_admins.read().get(&n.name).cloned(),
-            iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
-                (Some(id), Some(addr)) => Some((id, addr)),
-                _ => None,
-            },
-        }
-    };
-    // A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
-    // over the iroh mesh (has a peer id + dialable address). The last case is what lets
-    // a NAT'd coordinator place deploys on FC nodes after the SSH tunnels were cut.
-    let reachable = |n: &NodeInfo| -> bool {
-        n.name == me
-            || cloud.node_admins.read().contains_key(&n.name)
-            || (n.peer_id.is_some() && n.iroh_addr.is_some())
-    };
-    // Capability filter. Containers run through host podman on every backend;
-    // ordinary functions require a production isolation backend. Firecracker is
-    // intrinsically eligible, verified Litebox proves that status by advertising
-    // the current runtime-artifact protocol, and Mock remains container-only.
+    // ONE definition each for the dispatch route, the reachability test and the
+    // capability filter — shared with `dispatch_fallbacks`, so a fallback can
+    // never be a node this placement would have refused.
+    let target_of = |n: &NodeInfo| -> Target { target_of(cloud, n) };
+    let reachable = |n: &NodeInfo| -> bool { reachable(cloud, n) };
     let capable = |n: &NodeInfo| -> bool {
-        if needs_gpu && n.gpu_count == 0 {
-            return false;
-        }
-        // Wasmer capability, same hard-filter shape as the GPU gate above.
-        // See `wasm_capable` for why `None` excludes rather than admits.
-        if !wasm_capable(n, needs_interpreter.wasm) {
-            return false;
-        }
-        // Bun capability, identical shape and identical reasoning — see
-        // `bun_capable`.
-        if !bun_capable(n, needs_interpreter.bun) {
-            return false;
-        }
-        if !runtime_artifact_capable(n, needs_runtime_artifact) {
-            return false;
-        }
-        if !build_isolation_capable(n, needs_build_isolation) {
-            return false;
-        }
-        // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
-        // filtered on health/region/GPU and then sorted by deployment COUNT, a
-        // metric that says nothing about space. So the node with the most free
-        // capacity and the node with none scored identically, and a full node
-        // kept winning. Witnessed 2026-07-31 — fc-sanjose hit 0 bytes free and
-        // took 9 customer deployments down ("host disk critically low ... after
-        // GC") while fc-frankfurt and both CVM nodes sat under 10% used with
-        // ~920 GiB free each.
-        //
-        // A HARD filter, not another term in the score, because disk is not like
-        // CPU or memory: it does not drain on its own once a deployment lands,
-        // so a node that is out of space is out until something is deleted. A
-        // weighted score would still let it win when peers look busy.
-        //
-        // The floor is deliberately larger than the per-cold-start requirement
-        // (`FLOOR_BYTES`, 3 GiB in hive-backend): placement must leave room for
-        // the deployment it is about to create PLUS the next one, or it just
-        // hands the node to the very check that will reject it.
-        //
-        // `disk_free_gb == 0` means UNKNOWN, not full — a pre-upgrade peer does
-        // not report it. Excluding those would empty the candidate set during a
-        // rollout, so unknown is admitted and only a positive, genuinely-low
-        // reading rejects.
-        let floor_gb = disk_floor_gb();
-        if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
-            return false;
-        }
-        if is_container {
-            // A container deployment is served on this node's own public host —
-            // never through the microVM guest network — so a node with NO public
-            // address can win placement (it's `reachable()` for build DISPATCH via
-            // admin/iroh) but the resulting deployment is then unreachable by any
-            // real client: only 127.0.0.1. Witnessed as a live risk when the local
-            // Mac dev nodes moved region to san-jose — the mock-backend widening
-            // below exists so containers can run on them at all, but a
-            // region-pinned container could land there and silently never serve.
-            // Require a public address for EITHER family, on every backend
-            // (firecracker included — a NAT'd FC node has the identical problem,
-            // this is not mock-specific), so an unreachable node simply isn't a
-            // candidate rather than winning and quietly failing to serve.
-            let has_public = n.public_ip.is_some() || n.public_ip6.is_some();
-            has_public && (eligible(n) || (n.healthy && n.backend == "mock"))
-        } else {
-            eligible(n)
-        }
+        capable(
+            n,
+            is_container,
+            needs_gpu,
+            needs_interpreter,
+            needs_runtime_artifact,
+            needs_build_isolation,
+        )
     };
 
     let regions: Vec<String> = regions

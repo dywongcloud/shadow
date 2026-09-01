@@ -689,7 +689,7 @@ impl SandboxProvider for PlatformSandboxProvider {
         };
         self.commands.write().push(base_rec.clone());
 
-        let mut rx = backend
+        let rx = backend
             .exec_command(&handle, guest_req)
             .await
             .map_err(|e| SandboxError::EngineUnavailable(format!("exec failed to start: {e}")))?;
@@ -697,19 +697,38 @@ impl SandboxProvider for PlatformSandboxProvider {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.killers.write().insert(cmd_id.clone(), notify.clone());
 
+        // The drain runs in a task of its own for BOTH modes. A blocking
+        // caller's request future is dropped by axum the instant the client
+        // gives up (curl's timeout, a closed tab, the leader's forward budget),
+        // and a drain awaited inline dies with it: the runner keeps running
+        // with nobody watching and the record stays `running` forever — the
+        // `ColdStartGuard` rule (release on Drop, never only on the Err
+        // branch) applied to a guest process. The deadline lives in the same
+        // task for the same reason: a hung guest (witnessed: a litebox fork
+        // child spinning at 100% CPU) must be killed whether or not anyone is
+        // still waiting for it.
+        let deadline = if input.detached {
+            detached_exec_ceiling(sandbox.timeout_ms)
+        } else {
+            blocking_run_deadline()
+        };
+        let supervisor = tokio::spawn(supervise_exec(
+            rx,
+            self.commands.clone(),
+            self.killers.clone(),
+            cmd_id.clone(),
+            secrets,
+            notify,
+            backend.clone(),
+            handle.clone(),
+            deadline,
+        ));
         if input.detached {
-            let commands = self.commands.clone();
-            let killers = self.killers.clone();
-            let cmd_id2 = cmd_id.clone();
-            tokio::spawn(async move {
-                drain_exec_events(&mut rx, &commands, &cmd_id2, &secrets, notify).await;
-                killers.write().remove(&cmd_id2);
-            });
             return Ok(base_rec);
         }
-
-        drain_exec_events(&mut rx, &self.commands, &cmd_id, &secrets, notify).await;
-        self.killers.write().remove(&cmd_id);
+        // Awaited by JoinHandle: if THIS future is dropped the task carries on
+        // and finalizes the record on its own.
+        let _ = supervisor.await;
         self.get_command(project_id, id, &cmd_id).await
     }
 
@@ -1125,6 +1144,104 @@ impl SandboxProvider for PlatformSandboxProvider {
         }
         Ok(())
     }
+}
+
+/// Wall clock a BLOCKING `run_command` may hold the guest: the leader→owner
+/// forward's own budget (`HIVE_SANDBOX_RUN_MS`, 110 s in `sandboxes_api`)
+/// minus headroom, so the owner has killed the guest and finalized the record
+/// BEFORE the forward gives up on it — one knob, two consistent bounds.
+fn blocking_run_deadline() -> std::time::Duration {
+    let forward_ms = env_u64("HIVE_SANDBOX_RUN_MS", 110_000);
+    std::time::Duration::from_millis(forward_ms.saturating_sub(10_000).max(1_000))
+}
+
+/// Ceiling for a DETACHED exec: the sandbox's own remaining life is the
+/// natural bound (its timeout reaper tears the cell down regardless), capped
+/// by `HIVE_SANDBOX_EXEC_MAX_MS` (default one hour) so a guest that ignores
+/// its stdio can never outlive that — a spinning fork child, a runaway loop.
+fn detached_exec_ceiling(sandbox_timeout_ms: u64) -> std::time::Duration {
+    let cap = env_u64("HIVE_SANDBOX_EXEC_MAX_MS", 3_600_000).max(1_000);
+    let ms = if sandbox_timeout_ms > 0 {
+        sandbox_timeout_ms.min(cap)
+    } else {
+        cap
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Grace between the deadline kill and closing the record by hand: the
+/// backend's waiter reports the signal death as `ExecDone { None }` within
+/// milliseconds, so this only ever runs out when the runner is unkillable.
+const EXEC_KILL_GRACE_MS: u64 = 3_000;
+
+/// Drain one exec to completion under a hard deadline, then finalize its
+/// record — in a task of its own (see `run_command`). On expiry the guest's
+/// whole process group is killed through the backend (`kill_exec` = `killpg`
+/// on litebox, the agent's `KillExec` on firecracker), the drain gets
+/// `EXEC_KILL_GRACE_MS` to observe the resulting `ExecDone`, and a record
+/// still `running` after that is closed as `killed` with the reason appended
+/// to its stderr — a hung guest never leaves a command "running" forever, and
+/// the tenant reads WHY in the same logs they were already polling.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_exec(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+    commands: Arc<PLRwLock<Vec<SandboxCommandRecord>>>,
+    killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    cmd_id: String,
+    secrets: Vec<String>,
+    notify: Arc<tokio::sync::Notify>,
+    backend: Arc<dyn CellBackend>,
+    handle: CellHandle,
+    deadline: std::time::Duration,
+) {
+    let started = std::time::Instant::now();
+    let drained = tokio::time::timeout(
+        deadline,
+        drain_exec_events(&mut rx, &commands, &cmd_id, &secrets, notify.clone()),
+    )
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            command = %cmd_id,
+            cell = %handle.id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            deadline_ms = deadline.as_millis() as u64,
+            "sandbox exec exceeded its deadline; killing the guest process group"
+        );
+        if let Err(e) = backend.kill_exec(&handle, &cmd_id).await {
+            tracing::warn!(command = %cmd_id, error = %e, "sandbox exec deadline kill failed");
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(EXEC_KILL_GRACE_MS),
+            drain_exec_events(&mut rx, &commands, &cmd_id, &secrets, notify),
+        )
+        .await;
+        let now = hive_core::now_ms();
+        let mut w = commands.write();
+        if let Some(rec) = w.iter_mut().find(|c| c.id == cmd_id) {
+            rec.stderr.push(LogLine {
+                ts_ms: now,
+                line: format!(
+                    "[hive] command exceeded its {} ms deadline and its process group was killed",
+                    deadline.as_millis()
+                ),
+            });
+            if matches!(rec.status, CommandStatus::Running) {
+                rec.status = CommandStatus::Killed;
+                rec.exit_code = None;
+                rec.finished_at = Some(now);
+            }
+            rec.updated_at = now;
+        }
+    }
+    killers.write().remove(&cmd_id);
 }
 
 /// Drain one exec's event channel into its `SandboxCommandRecord`, redacting

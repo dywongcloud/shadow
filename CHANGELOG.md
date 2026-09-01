@@ -1,5 +1,122 @@
 # Changelog
 
+## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
+
+Two production failures reported together, root-caused as two different
+projects (`crates/hive-cloud/src/git.rs`, `schedule.rs`, `gossip.rs`;
+AGENTS.md "Deploys"):
+
+- **`express` (regions frankfurt, tokyo): `Placement → fc-frankfurt`,
+  `deploy dispatch failed — iroh: no reply`, `Could not reach any target`.**
+  Eight consecutive builds over 75 minutes failed the same way, each in
+  5–15 s (the dial failed; the 20 s budget never elapsed), while ten capable
+  nodes sat idle: the leader had marked fc-tokyo unhealthy, so `place()`
+  returned ONE candidate and the coordinator gave up after it. Only three of
+  the eight fell inside any restart window. fr builds fine (3/3 ready in
+  48 h) — "builds failing on frankfurt" were dispatches that never arrived.
+  The leader↔fr iroh pair is chronically sick for a proven reason:
+  `gossip::relay_hinted_addr` replaced fr's real home relay
+  (`https://fc-virginia.relay.shadw.app:3343/`, carried in its `iroh_addr`)
+  with its embedded `http://162.62.83.144:3341`, and every Tencent `:3341` is
+  a TCP timeout from every vantage (security group) — so a cached-hint dial
+  had exactly one path, direct UDP, and when that flapped it timed out at 5 s
+  and fell into discovery (1,014 such timeouts in 24 h).
+  - `schedule::dispatch_fallbacks`: an ordered list of capable + reachable
+    remote candidates (configured regions first in request order, then
+    distance/load/free disk/name), excluding tried targets and self.
+  - `git::run_build`'s pure-remote branch walks that list when nothing ran
+    (`HIVE_DEPLOY_DISPATCH_FALLBACK_MAX`, default 3; each attempt bounded by
+    the existing 15 s HTTP + 2×20 s iroh budgets), logs
+    `→ fallback i/n: <node> (<region>) — <unreachable> could not be reached…`,
+    stops when any node ran, keeps a container-lease holder sacrosanct, and
+    ends with `⚠ Deployed on X because Y could not be reached`. The iroh
+    failure text now carries measured elapsed ms and distinguishes
+    dial-failed from budget-elapsed. `Could not reach any target` is only
+    ever printed after the whole list is exhausted.
+  - `relay_hinted_addr` keeps the peer's own home relay when its address
+    carries one and steers only relay-less addrs. This is a dial-side mesh
+    change and is rolled canary-first (`--limit fr,va`) with a `/v1/mesh`
+    assertion before fan-out, per the retain_dialable lesson.
+  - Characterized, not fixed (PRD `leader-relay-actor-saturation-transport-wedge`):
+    the leader logged 459,062 `Dropping received relay packet: no available
+    capacity` in 24 h and the transport-wedge signature 60×, through two
+    restarts.
+- **`shoomoo2` (github fatbearsk/serverless-clawdbot@xstate) on
+  fc-sanjose-3: `main entry "/workspace/server.js" is missing from the
+  immutable application archive`.** The repository has no `server.js` (a
+  Next.js 16 app; `scripts.build = "next build"`), and a `fluid.json` lane
+  runs ZERO install/build commands (`produce_manifest` returns
+  `Manifest::from_json` untouched), so `start_cmd: ["node","server.js"]`
+  can never have worked. The platform defect was how it surfaced: at the
+  post-registration readiness launch, as `NodeBackendUnavailable` — a NODE
+  fault charged to the pool for a tenant file that does not exist.
+  - `git.rs` `preflight_direct_entries`: before sealing, every Node/Bun
+    function whose argv is a plain `node <entry>` / `bun <entry>` must have
+    that entry in the checkout; the refusal names the function, the entry,
+    the exact path examined, the sealed root's listing, package.json
+    `scripts.start`/`scripts.build`/`main`, the deciding field
+    (`fluid.json functions[N].start_cmd` vs build-derived), the lane rule and
+    the three fixes. Verified not to false-positive on the platform's own
+    launch shapes (FDI Next dist-bin, SvelteKit `node build`, exported-app
+    launcher, Build Output v3 launcher, `bun run --bun start`, `npm start`).
+  - `litebox.rs` `validate_archive_main_entry`: a `Not found in archive` tar
+    miss is `DEPLOYMENT_START_FAILED` with a message naming the entry and the
+    fields, never `NODE_BACKEND_UNAVAILABLE`; other tar failures keep the
+    launch refusal.
+  - The tenant fix is on the user's side: remove `fluid.json` (framework
+    detection then runs install + `next build` and derives the start command
+    from `scripts.start`) or commit a self-contained server. Honoring
+    install/build commands inside the fluid.json lane is PRD
+    `fluid-json-lane-honor-build-commands`.
+
+## 2026-09-01 — Sandbox execs get a supervisor (deadline, kill, terminate sweep); litebox fork-child corruption root-caused
+
+The first live proof after the fleet roll below created a real Litebox sandbox
+on the leader (`owner_node: fc-sanjose`, `provider: platform`, no "simulated"
+note — the thing the whole day was about) and then hung on its first command:
+`POST …/commands` timed out at 60 s with zero bytes, `DELETE` answered 200,
+and the `litebox-runner` for that sandbox was still alive seven minutes later
+at 99.9% CPU until killed by hand.
+
+Root cause, established standalone with the exact staged tar rather than
+inferred (`crates/hive-backend/src/litebox.rs`, `SHELL_GUEST_OPTIONAL_PROGRAMS`
+doc; AGENTS.md "Litebox"): the litebox `fork()` emulation gives a child whose
+glibc state still points into the parent's mapping. Fork + immediate `exec`
+works; a pipeline/subshell child aborts (`malloc(): unaligned tcache chunk
+detected`), a child that touches stdio aborts (`glibc detected an invalid
+stdio handle`), and two consecutive not-found commands make the second child
+spin forever. The repro was handed to the litebox fork's owning session
+(their Task #51); nothing here changes fork semantics.
+
+What changed on this side:
+
+- `sandboxes_platform::run_command` no longer drains the exec inline. A new
+  `supervise_exec` task drains BOTH blocking and detached runs, so a dropped
+  request future (client timeout, closed tab, the leader→owner forward's
+  budget) can no longer orphan a running guest with its record stuck at
+  `running`. It enforces a deadline — `HIVE_SANDBOX_RUN_MS` − 10 s for
+  blocking runs (one knob with the forward budget, owner finalizes first), the
+  sandbox's `timeout_ms` capped by `HIVE_SANDBOX_EXEC_MAX_MS` (1 h) for
+  detached — and on expiry kills the guest process group via `kill_exec`,
+  gives the waiter 3 s to report `ExecDone`, then closes the record `killed`
+  with `[hive] command exceeded its N ms deadline …` on its stderr.
+- `LiteboxBackend::terminate` kills every live exec and interactive-shell
+  process group of the cell before tearing down its TUN; `exec_pty` runners
+  now get their own process group and are tracked in `execs` under the
+  session id, so a shell dies with its sandbox too.
+- `SHELL_GUEST_OPTIONAL_PROGRAMS`: `uname`, `id`, `sed`, `awk`, `sort`,
+  `xargs`, `tar`, … staged when the host has them (absent = skipped, never an
+  exec failure). Under the fork defect a not-found command is the WORST case,
+  so this is hang-avoidance as much as convenience.
+- The `LiteboxExec` doc no longer claims guest forks are host forks: on the
+  fleet's runner build the "child" is a second thread of the runner (gdb,
+  `pgrep -P` empty); the group kill stays correct either way.
+
+Fleet state this entry ships into: the roll below completed
+`BACKEND VERIFIED: 22/22`; the leader fc-sanjose restarted as
+`isolation backend: Litebox` with the 27-id trust list loaded and its 218
+tenant containers surviving the restart (`KillMode=process`).
+
 ## 2026-09-01 — Sandboxes fail closed and route to a real owner; Linux mock nodes become Litebox
 
 Commit `59357cdac9` carries ALL of this under a subject that names only its

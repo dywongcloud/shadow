@@ -399,6 +399,32 @@ releases).
   unclosed gap — directly relevant since Node.js is built on V8, a JIT. Full
   reasoning in the module doc's "Security posture" section; never let this
   backend be silently substituted for Firecracker capability anywhere.
+- **A litebox guest child must `execve` immediately or it is unsound — and
+  the platform never waits on a guest without a deadline.** litebox's
+  `fork()` emulation hands the child a copy whose glibc heap/stdio/stack-list
+  pointers still reference the PARENT's mapping. Measured 2026-09-01 on
+  fc-sanjose with the exact staged tar (`/root/lb-exec-repro.tar`): a pipeline
+  or `$(...)` child dies `malloc(): unaligned tcache chunk detected`, a child
+  that touches stdio (`2>/dev/null`, a not-found command's error message) dies
+  `glibc detected an invalid stdio handle`, and two consecutive not-found
+  commands (`uname -a; id`) leave the second child SPINNING at 100% CPU
+  forever — gdb shows a fork-child `reclaim_stacks`-shaped list walk that
+  never reaches its head; fork + immediate `exec` works. The defect lives in
+  the litebox fork tree (the peer session's Task #51, acceptance = those four
+  commands), so never "fix" the hang by staging more tools alone: any pipeline
+  or subshell still dies until fork is sound. What this side guarantees:
+  `sandboxes_platform::supervise_exec` runs EVERY exec drain in its own task
+  (a dropped request future — curl's timeout, a closed tab, the leader
+  forward's budget — must not orphan a runner; the `ColdStartGuard` rule
+  applied to a guest process) under a deadline (`HIVE_SANDBOX_RUN_MS` minus
+  10 s for blocking runs; the sandbox's own `timeout_ms` capped by
+  `HIVE_SANDBOX_EXEC_MAX_MS` for detached), on expiry kills the guest's
+  process group and closes the record `killed` with the reason on its stderr;
+  `LiteboxBackend::terminate` kills every live exec AND interactive-shell
+  group of the cell before its TUN goes (a `DELETE` used to answer 200 while
+  the runner kept a core); shells are tracked in `execs` like execs; and
+  `SHELL_GUEST_OPTIONAL_PROGRAMS` stages the ordinary tool set where the host
+  has it so a routine command is not the worst case.
 
 ## Bringing a node into the mesh
 
@@ -1330,6 +1356,38 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   add a deploy path that bypasses that SHA check. A public repo needs no
   credential; a private repo reuses `git_webhook`'s token resolution
   (`github_app_auth` install token, else node `GITHUB_TOKEN`).
+- **A single unreachable node never fails a deploy.** The pure-remote
+  placement branch of `run_build` dispatches to the scheduler's target(s) and,
+  when `FanoutOutcome::nothing_ran()` (every target `DispatchFailed` — the
+  request arrived NOWHERE, so no node holds a half-run build), walks
+  `schedule::dispatch_fallbacks` one candidate at a time: same `capable` +
+  `reachable` predicates as `place` (never the region widening), configured
+  region(s) first, then proximity/load/disk/name, minus the targets already
+  tried and this node, bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3) with
+  `fanout_remote`'s own per-target budget (15s HTTP, 2×20s iroh). The loop
+  stops the moment any node RAN the deploy (Ready/BuildFailed/Declined are
+  verdicts about the app, never a reason to try elsewhere), and it is skipped
+  when an unreachable target holds the project's live container lease (its
+  state volume is there; landing elsewhere would fork it). Every candidate's
+  failure is named in the build log, and only an exhausted list says "Could
+  not reach any target". Witnessed 2026-09-01: eight consecutive `express`
+  deploys failed in 75 min with sole target fc-frankfurt while the leader's
+  trunk to it was cold (cached-hint dials timing out ~10/min) yet fc-frankfurt
+  stayed HEALTHY (still gossiping via other peers — by design); ten other
+  capable nodes sat idle. The `"iroh: no reply"` text now carries the measured
+  elapsed ms: those failures took 5–15s (the DIAL failed), not "20s".
+- **A relay hint must name the relay the peer is ATTACHED to, never merely
+  one it serves.** `gossip::relay_hinted_addr` keeps the relay carried in the
+  peer's own gossiped `iroh_addr` (its home relay, from signed gossip) and
+  steers via `hive_edge::select_relay_hint` ONLY when the addr has no relay at
+  all. Preferring `NodeInfo::relay_url` (the embedded `http://<public-ip>:3341`
+  relay) replaced a live transport with a dead one: measured 2026-09-01 from
+  fc-frankfurt, fc-sanjose and fc-sanjose-3, every Tencent host's `:3341` is
+  TCP-unreachable from every other Tencent host (and from itself via its
+  public IP — security group), while all four `*.relay.shadw.app:3343`
+  answer 200 from every vantage. Diagnose a sick pair from THREE vantages: the
+  leader logged 1014 cached-hint timeouts to fc-frankfurt in 24h while
+  fc-sanjose-3 logged 5 — the pair was sick, not the node.
 
 ## Deployment lifecycle: generations, previews, and the relocation reaper
 

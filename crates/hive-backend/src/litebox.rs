@@ -452,10 +452,15 @@ struct LiteboxFunctionProcess {
 
 /// One in-flight `exec_command` (Sandboxes): the runner was spawned as the
 /// LEADER of its own process group, so `pgid` names the whole guest process
-/// tree — the runner plus every child the guest forks (the AnEntrypoint base
-/// tracks guest `fork()` as real host forks, which inherit the group) — and
-/// `kill_exec` terminates all of it with one `killpg`. Removed by the waiter
-/// task the moment the runner is reaped, so a late kill is a no-op.
+/// tree — the runner plus whatever the guest forks — and `kill_exec` (and
+/// `terminate`) end all of it with one `killpg`. On the runner build the
+/// fleet runs today a guest `fork()` is NOT a host fork: gdb on a live hang
+/// showed the "child" as a second THREAD of the runner (`pgrep -P` empty), so
+/// the group is really one process, but the group kill is what stays correct
+/// if the emulation ever does become a host fork (the peer's vfork/shared-MM
+/// work), and it costs nothing now. Interactive shells are tracked here too,
+/// keyed by their session id. Removed by the waiter task the moment the
+/// runner is reaped, so a late kill is a no-op.
 #[derive(Clone)]
 struct LiteboxExec {
     cell: CellId,
@@ -2930,14 +2935,30 @@ async fn validate_archive_main_entry(archive: &File, guest_entry: &str) -> anyho
                 "could not inspect the immutable application archive: {error}"
             ))
         })?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{}",
-        launch_refusal(format!(
-            "main entry {guest_entry:?} is missing from the immutable application archive: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // GNU tar's member-miss is the DEPLOYMENT's fault (its start_cmd names
+        // a file the sealed tree never had — the build-time preflight in
+        // hive-cloud refuses this before sealing; reaching it here means an
+        // artifact sealed by an older binary), so it carries the app-fault
+        // marker, never `NODE_BACKEND_UNAVAILABLE`: fluid-compute records that
+        // marker as a NODE fault on the pool, blaming this node's backend for
+        // a missing tenant file. Any other tar failure (unreadable archive) is
+        // still this node's problem and keeps the launch-refusal class.
+        if stderr.contains("Not found in archive") {
+            anyhow::bail!(
+                "{}: main entry {guest_entry:?} does not exist in this deployment's sealed \
+                 application tree (the start_cmd names a file that was never committed or \
+                 built — fix the entry in fluid.json functions[].start_cmd / package.json \
+                 scripts.start, or make the build produce it); not a node fault",
+                hive_core::fault::DEPLOYMENT_START_FAILED
+            );
+        }
+        return Err(launch_refusal(format!(
+            "could not inspect the immutable application archive for main entry {guest_entry:?}: {}",
+            stderr.trim()
+        )));
+    }
     let entry_kind = output
         .stdout
         .iter()
@@ -3681,6 +3702,57 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
     "/usr/bin/env",
 ];
 
+/// Staged only where the host has them — an absent one is skipped with a
+/// debug line, never an exec failure (the fixed set above stays strict): the
+/// rest of the POSIX tool set a shell one-liner reaches for. Still a closed,
+/// audited list, never "whatever is on `$PATH`". This is hang-avoidance as
+/// much as convenience: under the litebox fork emulation a command the guest
+/// cannot find is the WORST case, not a harmless "not found" — the forked
+/// child that would print the error touches glibc state the fork copied
+/// wrongly and can spin forever (`litebox-fork-child-corruption`; measured:
+/// `sh -c 'uname -a; id'` with neither staged = a runner at 100% CPU until
+/// killed). Every entry is a real file or a symlink the staging `openat2`
+/// dereferences (Rocky's alternatives-managed `awk`), staged under its
+/// `/usr/bin` path.
+const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
+    "/usr/bin/uname",
+    "/usr/bin/id",
+    "/usr/bin/whoami",
+    "/usr/bin/hostname",
+    "/usr/bin/printf",
+    "/usr/bin/true",
+    "/usr/bin/false",
+    "/usr/bin/test",
+    "/usr/bin/[",
+    "/usr/bin/sleep",
+    "/usr/bin/date",
+    "/usr/bin/touch",
+    "/usr/bin/ln",
+    "/usr/bin/chmod",
+    "/usr/bin/sed",
+    "/usr/bin/awk",
+    "/usr/bin/sort",
+    "/usr/bin/uniq",
+    "/usr/bin/cut",
+    "/usr/bin/tr",
+    "/usr/bin/xargs",
+    "/usr/bin/tee",
+    "/usr/bin/basename",
+    "/usr/bin/dirname",
+    "/usr/bin/stat",
+    "/usr/bin/du",
+    "/usr/bin/df",
+    "/usr/bin/readlink",
+    "/usr/bin/realpath",
+    "/usr/bin/seq",
+    "/usr/bin/sha256sum",
+    "/usr/bin/md5sum",
+    "/usr/bin/base64",
+    "/usr/bin/which",
+    "/usr/bin/tar",
+    "/usr/bin/gzip",
+];
+
 /// Host directories a bare `exec_command` name (`node`, `ls`, `python3`) is
 /// resolved against — the guest `PATH` this backend hands the runner, plus
 /// `/usr/local/bin` for operator-installed runtimes. The resolved binary is
@@ -3805,6 +3877,24 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     let mut deps: Vec<PathBuf> = Vec::new();
     for program in &programs {
         deps.extend(ldd_closure(program).await?);
+    }
+    for program in SHELL_GUEST_OPTIONAL_PROGRAMS {
+        let path = PathBuf::from(program);
+        if !path.is_file() {
+            tracing::debug!(program, "litebox guest tar: optional tool absent on this host; skipped");
+            continue;
+        }
+        match ldd_closure(&path).await {
+            Ok(closure) => {
+                deps.extend(closure);
+                programs.push(path);
+            }
+            Err(error) => tracing::debug!(
+                program,
+                %error,
+                "litebox guest tar: optional tool has no resolvable closure; skipped"
+            ),
+        }
     }
     for program in extra {
         match ldd_closure(&program).await {
@@ -4518,6 +4608,7 @@ impl CellBackend for LiteboxBackend {
         let containers = self.containers.clone();
         let funcs = self.funcs.clone();
         let cell_nets = self.cell_nets.clone();
+        let execs = self.execs.clone();
         let cleanup = tokio::spawn(async move {
             let tunnel = tunnels.lock().await.remove(&id);
             if let Some(task) = tunnel {
@@ -4526,6 +4617,47 @@ impl CellBackend for LiteboxBackend {
             let container = containers.lock().await.remove(&id);
             if let Some(container) = container {
                 container.terminate().await;
+            }
+            // Every live sandbox exec in this cell — one-shot commands AND
+            // interactive shells, each its own process group — dies with the
+            // cell, before its TUN does. A guest that ignores its stdio (a
+            // spinning fork child, `sleep infinity`) otherwise outlives the
+            // sandbox that owned it: witnessed, a DELETE answered 200 while
+            // the runner held a core at 100% until an operator killed it.
+            let doomed: Vec<(String, i32)> = {
+                let mut execs = execs.lock().await;
+                let ids: Vec<String> = execs
+                    .iter()
+                    .filter(|(_, e)| e.cell == id)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|k| execs.remove(&k).map(|e| (k, e.pgid)))
+                    .collect()
+            };
+            for (exec_id, pgid) in doomed {
+                #[cfg(unix)]
+                {
+                    // SAFETY: killpg(2) with a pgid this process spawned and a
+                    // signal number; no pointer arguments.
+                    let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                    if rc != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            tracing::warn!(
+                                cell = %id,
+                                exec = %exec_id,
+                                pgid,
+                                %error,
+                                "litebox terminate: killpg on a live exec failed"
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (exec_id, pgid);
+                }
             }
             let process = funcs.lock().await.remove(&id);
             if let Some(mut process) = process {
@@ -4829,6 +4961,13 @@ impl CellBackend for LiteboxBackend {
             .stdout(Stdio::from(slave_fd.try_clone()?))
             .stderr(Stdio::from(slave_fd))
             .kill_on_drop(true);
+        // Own process group, tracked in `execs` under the session id exactly
+        // like a one-shot exec, so `terminate` can kill a shell (and whatever
+        // it forked) together with its cell. The runner already has no
+        // controlling terminal (no setsid/TIOCSCTTY), so job control is
+        // unchanged by the setpgid.
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut child = command.spawn().map_err(|error| {
             anyhow::anyhow!(
@@ -4839,6 +4978,18 @@ impl CellBackend for LiteboxBackend {
         let session_id = req.id.clone();
         let cell_id = cell.id.clone();
         let funcs = self.funcs.clone();
+        let execs = self.execs.clone();
+        if let Some(pid) = child.id() {
+            if let Ok(pgid) = i32::try_from(pid) {
+                execs.lock().await.insert(
+                    session_id.clone(),
+                    LiteboxExec {
+                        cell: cell_id.clone(),
+                        pgid,
+                    },
+                );
+            }
+        }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut master_read = tokio::fs::File::from_std(master_fd.try_clone()?.into());
@@ -4873,6 +5024,7 @@ impl CellBackend for LiteboxBackend {
         let id_waiter = session_id.clone();
         tokio::spawn(async move {
             let status = child.wait().await.ok();
+            execs.lock().await.remove(&id_waiter);
             let exit_code = status.and_then(|s| s.code());
             let _ = tx.send(hive_core::AgentEvent::PtyExited {
                 id: id_waiter,
