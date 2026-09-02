@@ -296,11 +296,25 @@ pub(crate) async fn init_schema() {
     reconcile_billing_checkouts_schema(&mut session).await;
     // Success used to be silent, so a node whose bring-up never ran was
     // indistinguishable in the journal from one whose bring-up succeeded.
-    tracing::info!(
-        keys = index_keys,
-        "relational: schema bring-up complete (every table verified present)"
-    );
+    let failed = SCHEMA_BRINGUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failed == 0 {
+        tracing::info!(
+            keys = index_keys,
+            "relational: schema bring-up complete (every table verified present in the catalog)"
+        );
+    } else {
+        tracing::error!(
+            keys = index_keys,
+            failed,
+            "relational: schema bring-up finished with tables that could not be verified"
+        );
+    }
 }
+
+/// Tables `ensure_table_exists` gave up on this process (for the bring-up
+/// summary; never reset — a later successful retry logs its own line).
+static SCHEMA_BRINGUP_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Attempts to bring up a single table before giving up and logging loudly —
 /// see `ensure_table_exists`'s doc comment for why a `CREATE TABLE IF NOT
@@ -358,11 +372,40 @@ async fn ensure_table_exists(
             tracing::warn!(table, attempt, error = %e, "relational: schema bring-up CREATE TABLE statement failed");
         }
         // Verify against a freshly reloaded catalog view (every autocommit
-        // statement reloads the catalog — see this fn's doc comment): a
-        // trivial SELECT only succeeds if the table is genuinely present,
-        // unlike trusting the CREATE TABLE call's own `Ok` result.
-        match exec(s, &format!("SELECT 1 FROM {table} LIMIT 1")).await {
-            Ok(_) => return,
+        // statement reloads the catalog — see this fn's doc comment). The
+        // check reads the CATALOG, never the table's rows: `SELECT 1 FROM t`
+        // scans every row, and on a cold index each row is a peer fetch, so
+        // that form timed out at 10 s for `teams` and `billing_ledger` and
+        // reported genuinely-created tables as missing (2026-09-02).
+        let verify = format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = '{table}'"
+        );
+        let present = exec(s, &verify).await.map(|results| {
+            results
+                .iter()
+                .any(|r| matches!(r, ExecResult::Rows { rows, .. } if !rows.is_empty()))
+        });
+        match present {
+            Ok(true) => return,
+            Ok(false) if attempt == SCHEMA_BRINGUP_MAX_ATTEMPTS => {
+                tracing::error!(
+                    table,
+                    attempts = SCHEMA_BRINGUP_MAX_ATTEMPTS,
+                    "relational: schema bring-up could not verify this table exists after \
+                     repeated CREATE TABLE + retry (absent from information_schema.tables)"
+                );
+                SCHEMA_BRINGUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    table,
+                    attempt,
+                    "relational: table absent from the catalog right after CREATE TABLE IF NOT \
+                     EXISTS reported success (a concurrent session's catalog read-modify-write \
+                     race — see ensure_table_exists's doc comment); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(150 * attempt as u64)).await;
+            }
             Err(e) if attempt == SCHEMA_BRINGUP_MAX_ATTEMPTS => {
                 tracing::error!(
                     table,
@@ -372,6 +415,7 @@ async fn ensure_table_exists(
                      repeated CREATE TABLE + retry — writes against it (e.g. upsert_billing's \
                      single atomic transaction) will keep silently failing until this is fixed"
                 );
+                SCHEMA_BRINGUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!(
@@ -675,6 +719,23 @@ fn spawn_index_refresher(db: SqlDb) {
                             "relational: index built -- sessions now read the real catalog"
                         );
                         index_ready_notify().notify_waiters();
+                        // Warm every row value once, AFTER readiness (nothing
+                        // waits on it): a cold row is a peer fetch on first
+                        // read, so a whole-table scan before this finishes can
+                        // still time out -- and succeed on the next attempt.
+                        let warm_started = std::time::Instant::now();
+                        match db.storage().warm_values().await {
+                            Ok(documents) => tracing::info!(
+                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                documents,
+                                "relational: row values warmed -- cold scans no longer pay a per-row fetch"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                "relational: row value warm-up failed; rows materialize lazily on read instead"
+                            ),
+                        }
                     } else {
                         tracing::debug!(elapsed_ms, keys, "relational: index re-walked");
                     }

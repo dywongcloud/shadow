@@ -26,9 +26,12 @@ use crate::guardian::error::{GuardianError, Result as GuardianResult};
 use crate::relational::error::Result as RelResult;
 use crate::relational::{RelError, RelationalStorage};
 use crate::sql::engine::Database;
-use crate::traits::{Document, DocumentStore};
+use crate::traits::{AsyncDocumentFilter, Document, DocumentStore};
 use async_trait::async_trait;
 use serde_json::{Map, Value as Json};
+use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Separator between a collection prefix and a row id in the GuardianDB key.
@@ -92,6 +95,27 @@ impl GuardianRelationalStorage {
     /// tells "empty database" from "index not built yet".
     pub fn index_len(&self) -> usize {
         self.store.index().len().unwrap_or(0)
+    }
+
+    /// Materialize every row value the index knows only by hash, in ONE
+    /// pass (the store's async `query` walks the key set and lazily fetches
+    /// each value, caching it). A cold index has every remotely-written row
+    /// as hash-only, and each such row costs a peer fetch on first read —
+    /// hundreds of milliseconds each — so a full-table scan on a cold index
+    /// (measured: even `teams`) exceeds a 10 s statement budget. Run this
+    /// once after the walk, off every request path. Returns the number of
+    /// documents materialized.
+    pub async fn warm_values(&self) -> GuardianResult<usize> {
+        let all: AsyncDocumentFilter = Box::pin(|_document: &Document| {
+            Box::pin(async { Ok(true) })
+                as Pin<
+                    Box<
+                        dyn Future<Output = Result<bool, Box<dyn Error + Send + Sync>>>
+                            + Send,
+                    >,
+                >
+        });
+        Ok(self.store.query(all).await?.len())
     }
 
     fn gkey(collection: &str, row_id: &str) -> String {
