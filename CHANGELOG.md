@@ -42,6 +42,26 @@ project_teams`; an unrolled node stays at 0 / 10.00 s. If the walk cannot
 complete inside its bound on a node, the journal now says so once per
 attempt (`index walk exceeded its bound`) and nothing writes the catalog.
 
+The first canary of that fix found the second half. The index built in
+69 ms on fc-frankfurt and 40 ms on fc-virginia (3,783 keys — the walk was
+never slow; the per-session refreshes had been cancelling each other), the
+refresh timeouts went from 56,000 per boot to zero, and the mirror's schema
+reconcile still logged `relation "project_teams" does not exist` ten times
+in the same millisecond. `GuardianRelationalStorage::{get, scan}` read
+through `index().get_bytes`, a cache-only lookup that answers `None` for
+every key a cold-start walk registered by hash and nothing has read yet; the
+catalog is exactly such a key on every boot, so the engine loaded an empty
+catalog on a fully built index. Both now fall through to the store's async
+`get`, which fetches the value lazily and caches it. And `init_schema`, the
+only path that creates the catalog and tables, was a single boot-time
+attempt that returned silently when GuardianDB was not open yet and never
+ran again; it retries every 15 s within the index-build bound and logs
+`relational: schema bring-up complete` with the key count. Note for
+anyone probing a follower: `POST /v1/admin/sql/query` is a mutation-shaped
+request and the admin ingress forwards it to the control-plane leader, so a
+follower's own relational state is witnessed from its journal (the
+bring-up line, zero `does not exist`), not from its admin SQL answer.
+
 ## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
 
 Measured over 75 fleet stops: `hive-node` took 78.4 s (+78.3..78.6 s) to exit

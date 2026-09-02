@@ -118,6 +118,26 @@ impl GuardianRelationalStorage {
             serde_json::from_slice(bytes).map_err(|e| RelError::Storage(e.to_string()))?;
         Ok(wrapped.get("doc").cloned())
     }
+
+    /// One wrapped row document by its full key, through the store's ASYNC
+    /// `get` — which lazily fetches a value the index only knows by hash.
+    /// The synchronous `index().get_bytes` path answers `None` for every key
+    /// a cold-start walk registered but nothing has read yet, and the SQL
+    /// catalog is exactly such a key on every boot: reading it through the
+    /// index made the engine load an empty catalog on a fully built index
+    /// (every table "does not exist"), measured 2026-09-02 fleet-wide.
+    async fn fetch_wrapped(&self, gkey: &str) -> RelResult<Option<Json>> {
+        let documents = self.store.get(gkey, None).await.map_err(map_err)?;
+        for document in documents {
+            let Some(wrapped) = document.downcast_ref::<Json>() else {
+                continue;
+            };
+            if wrapped.get("_id").and_then(Json::as_str) == Some(gkey) {
+                return Ok(wrapped.get("doc").cloned());
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn map_err(e: GuardianError) -> RelError {
@@ -135,9 +155,13 @@ impl RelationalStorage for GuardianRelationalStorage {
             let Some(row_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
-            if let Some(bytes) = index.get_bytes(&key).map_err(map_err)?
-                && let Some(doc) = Self::unwrap_doc(&bytes)?
-            {
+            // Cached value first (free); otherwise the lazy async fetch —
+            // never skip a row the index knows only by hash.
+            let doc = match index.get_bytes(&key).map_err(map_err)? {
+                Some(bytes) => Self::unwrap_doc(&bytes)?,
+                None => self.fetch_wrapped(&key).await?,
+            };
+            if let Some(doc) = doc {
                 out.push((row_id.to_string(), doc));
             }
         }
@@ -148,7 +172,7 @@ impl RelationalStorage for GuardianRelationalStorage {
         let gkey = Self::gkey(collection, row_id);
         match self.store.index().get_bytes(&gkey).map_err(map_err)? {
             Some(bytes) => Self::unwrap_doc(&bytes),
-            None => Ok(None),
+            None => self.fetch_wrapped(&gkey).await,
         }
     }
 

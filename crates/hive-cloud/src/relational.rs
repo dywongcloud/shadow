@@ -47,9 +47,24 @@ use crate::guardian::SqlDb;
 /// failure here just means the fleet fallback is unavailable until the next
 /// successful call, never a boot failure.
 pub(crate) async fn init_schema() {
-    let Ok(db) = crate::guardian::sql_db().await else {
-        tracing::debug!("relational: GuardianDB not ready yet; schema bring-up deferred");
-        return;
+    // GuardianDB's own bring-up routinely outlasts the boot moment this is
+    // spawned at (minutes on a large store), and this is the ONLY path that
+    // creates the catalog and its tables: a single deferred attempt left a
+    // node with no schema for its whole process life. Retry until the handle
+    // opens, bounded like the index walk it then waits for.
+    let deadline = std::time::Instant::now() + index_build_timeout();
+    let db = loop {
+        match crate::guardian::sql_db().await {
+            Ok(db) => break db,
+            Err(e) if std::time::Instant::now() < deadline => {
+                tracing::debug!(error = %e, "relational: GuardianDB not ready yet; schema bring-up retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "relational: schema bring-up SKIPPED -- GuardianDB never opened within its bound");
+                return;
+            }
+        }
     };
     // The catalog is one whole-document read-modify-write. Against an unbuilt
     // (empty) index every CREATE TABLE below would "succeed" into a fresh
@@ -66,6 +81,7 @@ pub(crate) async fn init_schema() {
         );
         return;
     }
+    let index_keys = db.storage().index_len();
     let mut session = Session::new(db, "hive-init");
     for (table, ddl) in [
         (
@@ -278,6 +294,12 @@ pub(crate) async fn init_schema() {
     reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
+    // Success used to be silent, so a node whose bring-up never ran was
+    // indistinguishable in the journal from one whose bring-up succeeded.
+    tracing::info!(
+        keys = index_keys,
+        "relational: schema bring-up complete (every table verified present)"
+    );
 }
 
 /// Attempts to bring up a single table before giving up and logging loudly —
