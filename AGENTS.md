@@ -50,6 +50,14 @@ history).
   complete`. Probing a follower: `POST /v1/admin/sql/query` is
   leader-forwarded, so a follower's relational state is read from its
   journal (bring-up line, zero `does not exist`), never from its admin SQL.
+  Two more, from the canaries: `ensure_table_exists` verifies through
+  `information_schema.tables` (synthesized from the catalog), never `SELECT
+  1 FROM t` — a cold row is a PEER fetch of hundreds of milliseconds, so a
+  row scan of even `teams` blew the 10 s statement budget and reported a
+  created table missing; and after the walk the refresher warms every row
+  value once (`GuardianRelationalStorage::warm_values`, journal `row values
+  warmed`) so cold scans stop paying that per-row fetch — nothing waits on
+  the warm, so a scan racing it may time out once and succeed next time.
 
 ## Mesh networking & anti-entropy
 
