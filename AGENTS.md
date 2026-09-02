@@ -425,6 +425,26 @@ releases).
   the runner kept a core); shells are tracked in `execs` like execs; and
   `SHELL_GUEST_OPTIONAL_PROGRAMS` stages the ordinary tool set where the host
   has it so a routine command is not the worst case.
+- **A sandbox shell STARTS with stderr off the pty and moves it there
+  itself; never spawn it with stderr on the pty, never drop the pipe pump.**
+  Litebox has no job-control tty ioctls (`tcsetpgrp` is ENOSYS, -38): a
+  shell whose stderr IS the pty at startup runs job-control init against it
+  and the runner dies `exit_group(277)` (status 21) before a prompt byte —
+  measured for `sh`, `+m`, `--norc +m`, `-i +m` alike. So `exec_pty` gives
+  the runner a stderr PIPE plus `-i` (the interactive shell a non-tty stderr
+  would suppress), pumps that pipe into the terminal stream as RAW CHUNKS
+  (a prompt has no trailing newline; a line reader held it forever), and
+  stages `/root/.hive-shellrc` (`exec 2>&1`) named by `ENV` so the shell
+  moves its own stderr onto the pty once init is behind it — otherwise
+  prompt (pipe) and output (pty) are two channels read by two tasks and the
+  next prompt overtakes the last command's output on screen. The pump stays:
+  it carries the runner's own messages and the two pre-rc job-control
+  warnings it filters, and a dropped warning owns the newline AFTER it (the
+  first cut leaked that CRLF as a blank line above every first prompt).
+  Witness = `shell-witness.py`-style websocket client through BOTH the
+  leader's listener and the public round-robin host: 101, first frame is the
+  prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
+  "exit_code":0}` on `exit`.
 - **The guest tar and its descriptor-bound alias belong to the runner's
   WAITER task, never to the function that spawns the runner.** Both
   `allocate_temp_file` and `allocate_initial_files_alias` return Drop guards

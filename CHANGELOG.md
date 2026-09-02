@@ -41,6 +41,25 @@ round-tripped within 100 ms, and the four held prompts arrived as ONE frame
 the newline — the terminal was interactive but blank, which is the whole
 defect the chunked pump removes.
 
+With the chunked pump live (witnessed green on the leader's listener AND
+through `https://api.shadw.cloud`: 101, prompt, `TERM_OK_42`,
+`{"exit_code":0,"type":"exited"}`) two smaller defects showed in the frames
+and are fixed in the same file:
+
+- The first frame was a bare `\r\n`: the pump swallowed the CRLF BEFORE a
+  dropped job-control warning, so the newline after the LAST warning leaked
+  and every terminal opened with a blank line above its prompt. A dropped
+  line now owns the newline that follows it.
+- The next prompt overtook the previous command's output (`sh-5.2$ echo
+  …\r\nsh-5.2$ TERM_OK_42`): stderr (pipe) and stdout (pty) were two
+  channels read by two tasks. The shell tar now stages `/root/.hive-shellrc`
+  (`exec 2>&1`) and the runner is spawned with `ENV` naming it — the shell
+  still STARTS with stderr off the pty (the arrangement that keeps the
+  runner alive through job-control init) and then moves it onto the pty
+  itself, so prompt, output and command stderr are one ordered stream with
+  the pty's own CRLF translation. Linux-gated code, so `cargo check` ran on
+  fc-virginia, not only locally.
+
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
 Two production failures reported together, root-caused as two different
