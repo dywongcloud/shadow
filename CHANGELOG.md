@@ -50,7 +50,17 @@ What the same pass found and fixed alongside:
   incident per (port, pid). Detection only — the platform never kills a
   process it did not start. `GET /v1/host/listeners` (operator, node-local
   like `/v1/dns/stats`) serves the last report; `supported: false` on a
-  host without procfs means "not audited", never "clean".
+  host without procfs means "not audited", never "clean". Witnessed on the
+  leader after the roll (exe `f7b353c97be7`): an empty-directory
+  `python3 -m http.server 28999 --bind 0.0.0.0` in a root session scope was
+  reported 171 s later — WARN with port/pid/cmd/cgroup, `incidents opened
+  opened=1`, the report naming `own_in_range: 4` (the raw proxy) and the one
+  foreign entry, and a Major `Foreign public listener on fc-sanjose: :28999
+  pid 3509642 (python3 -m http.server 28999)` incident on `/v1/incidents`
+  (deleted after the test). A pass costs ~11.6 s of `spawn_blocking` on the
+  leader (the `/proc/*/fd` walk resolving the owner); the incident stays
+  open until an operator resolves it — auto-resolve on a clean pass is PRD
+  `listener-audit-auto-resolve-incidents`.
 - **`scripts/audit-public-listeners.sh` (new):** the fleet view — every
   wildcard TCP listener per node that is not a platform daemon, plus the
   lockdown branch and peer count each node actually enforces; exits 1 on
