@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-09-02 — Leader relay drops: iroh's relay actor read its stream only when it had nothing to send
+
+The control-plane leader logged `iroh::socket::transports::relay::actor:
+Dropping received relay packet: no available capacity` 458,427 times in 24 h
+(journald suppressed 6.0 M more), 227,635 in the worst hour and 6,932 in the
+worst second, while followers logged 227 (fr) and 0 (va). The line is NOT
+the embedded relay server (which has zero clients on every node): it is
+iroh's client-side `ActiveRelayActor` inside hive-cloud. Both of its loops
+are `select! { biased; … }` and polled the outbound queue before
+`client_stream.next()`, so the one node that SENDS on relay paths at volume
+— the leader, serving wholesale store_sync pulls, rosters and gossip to its
+relay-only peers — never read its relay stream while it had something to
+send. The relay server's 2 s write timeout then reset it (303 `Connection
+reset by peer` on the leader against 47 and 35 on followers), and the
+released backlog decoded in one burst (2,000–4,500 frames inside 100 ms,
+inter-drop gaps under 50 µs) into the per-endpoint 512-slot receive channel
+the QUIC driver drains a batch at a time. Vendored patch
+(`vendor/iroh/CHANGES.md`, "read before send"): the read arm precedes the send
+arm in both selects (`biased` kept: stop, priority inbox and timeouts stay
+first; a received message is a non-blocking `try_send`, so reads cannot
+starve sends), and the channel is 4096 deep. Unchanged upstream in 1.1.0.
+Rolled as a canary to fr and va with a `/v1/mesh` assertion before the fleet.
+Open beside it (PRD `leader-udp-11204-rebind-addrinuse`): the leader's pinned
+iroh UDP socket fails to rebind with `AddrInUse` a few times an hour and stays
+closed for minutes; a 12-minute holder watch ruled out a persistent foreign
+holder, the in-process candidate is still unidentified.
+
 ## 2026-09-01 — Sandbox terminals no longer disconnect instantly: the pty runner's guest tar outlived by its waiter
 
 Every dashboard sandbox terminal closed the moment it opened. Reproduced

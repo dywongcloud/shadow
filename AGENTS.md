@@ -51,6 +51,26 @@ history).
   and `Connection::send_datagram` does exist. Switching would mean giving up
   the single-stream framing (and its ordering guarantee, which the current
   consumers may rely on), so it needs a measurement first, not a rewrite.
+- **`Dropping received relay packet: no available capacity` is iroh's
+  CLIENT-side relay actor inside hive-cloud, never the embedded relay
+  server, and it is a leader-shaped symptom.** The vendored iroh
+  (`vendor/iroh`, patch "read before send" in its `CHANGES.md`) polls the
+  relay stream BEFORE the outbound queue in both `ActiveRelayActor` loops
+  and sizes the per-endpoint receive channel 4096 deep; upstream (1.1.0
+  included) polls sends first under `biased`, so the one node with sustained
+  OUTBOUND relay traffic — the control-plane leader, serving wholesale
+  store_sync pulls, rosters and gossip to its relay-only peers — never read
+  its stream while it had something to send: 458k drops/24h on the leader,
+  hundreds on followers, plus 6–9× the followers' server-side resets. Keep
+  the patch across pin bumps until upstream changes the arm order, and treat
+  any recurrence on a NON-leader as a new finding. Diagnose from the journal
+  per second, not per hour: the signature is clumps of thousands of drops
+  inside 100 ms (a released backlog), not a steady rate. The line carries no
+  peer id or relay URL, so "who is being dropped" is answered from
+  `trunk opened … path="relay"` counts and cached-hint dial timeouts, never
+  from the drop line itself. `vendor/` IS synced by the fanout role, so a
+  vendored edit made while a roll is between its sync and its build ships
+  in that roll — edit vendored crates only between rolls.
 
 ## Address lookup: a node can only re-learn an address from a peer it can reach
 
