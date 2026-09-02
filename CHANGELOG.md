@@ -30,6 +30,10 @@ input and exits cleanly, warning once "cannot set terminal process group
 the pty, gives the runner a stderr pipe pumped into the same terminal stream
 (those two one-line warnings filtered), and passes `-i`. Job control inside
 a sandbox shell stays a litebox gap (PRD `litebox-guest-exec-pty-support`).
+The pump forwards raw chunks with LF normalized to CRLF, never whole lines:
+an interactive shell writes its prompt to stderr with no trailing newline,
+and a line reader held it forever (the roll-5 cut: 101 upgrade, runner
+alive, zero frames).
 
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
