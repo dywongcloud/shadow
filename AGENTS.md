@@ -20,6 +20,27 @@ history).
 - Admin SQL/tables view (`GET/POST /v1/admin/sql/*`) must stay read-only;
   extend `relational::known_tables()` for any new relational table. Detail:
   `recall("sql-readonly-guard")`.
+- **The relational index is built by ONE background walker, never on a
+  request path, and nothing writes the catalog before it has completed
+  once.** guardian-db's SQL catalog is a single document in the document-
+  store index; an EMPTY index (not a stale one) makes every `Session` load
+  `Catalog::new()` — every table "does not exist", `pg_class` = 0 — and a
+  `CREATE TABLE IF NOT EXISTS` then persists a fresh catalog over the real
+  one. `session()` used to run the full namespace walk under
+  `SQL_OP_TIMEOUT` before every operation; on 7.6–57 GB guardian stores the
+  walk never finished inside 10 s, so no node in the fleet ever built its
+  index and the mirror was dead everywhere (2026-09-02). Now
+  `spawn_index_refresher` walks once with `HIVE_RELATIONAL_INDEX_BUILD_SECS`
+  (900) and re-walks every `HIVE_RELATIONAL_REFRESH_SECS` (120) behind the
+  live sync; `index_ready()` gates `init_schema`, `ensure_table_exists` and
+  `backfill_billing_normalize`, `run_readonly_query` answers an explicit
+  not-ready error, and the vendored refresh swaps the key set in atomically.
+  Diagnose with `SELECT count(*) FROM pg_catalog.pg_class` through
+  `POST /v1/admin/sql/query` (a platform-admin bearer: `POST /v1/token` with
+  `{"email": <HIVE_ADMIN_EMAILS member>}`): 0 means the index is unbuilt,
+  and the journal's `relational: index built` / `index walk exceeded its
+  bound` lines say which. A walk that cannot complete inside its bound is a
+  guardian/iroh-docs problem to diagnose, never a reason to shorten the gate.
 
 ## Mesh networking & anti-entropy
 

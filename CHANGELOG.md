@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-09-02 — The relational mirror was dead fleet-wide: the index walk ran on every request path and never once completed
+
+On every node — the leader, nine followers, nodes 71 s after boot — every
+admin SQL query took exactly 10.00 s and answered `relation "X" does not
+exist` for EVERY table, `pg_catalog.pg_class` counted 0 and
+`information_schema.tables` was empty, while `GET /v1/admin/sql/tables` kept
+listing all 16 (`known_tables()` is a hardcoded list). The mirror loop failed
+the same way (`sync_teams upsert failed … relation "teams" does not exist`,
+`ALTER TABLE project_teams add deleted_ms failed`), and zero relational
+writes had succeeded since boot on the leader or on fc-virginia. Not a
+missing DDL statement, not a schema-qualification mismatch: guardian-db's SQL
+catalog is one document in the document-store index, and that index was
+EMPTY. `relational::session()` ran the full namespace walk
+(`storage().refresh()` → `get_many` over the whole `hive` namespace, on
+guardian stores of 7.6 GB on sj and 57 GB on va) under `SQL_OP_TIMEOUT` =
+10 s before EVERY operation, so the walk was cancelled every time, never
+completed even once per process, the catalog document was never known, and
+every `Session` loaded `Catalog::new()`. Worse, `CREATE TABLE IF NOT EXISTS`
+against that empty catalog "succeeds" and persists a fresh catalog over the
+real one — the whole-document read-modify-write `ensure_table_exists`'s doc
+already warns about.
+
+Fix (`crates/hive-cloud/src/relational.rs`, `vendor/guardian-db`): the walk
+runs in ONE background task (`spawn_index_refresher`) with a bound sized to
+the store (`HIVE_RELATIONAL_INDEX_BUILD_SECS`, 900 s) and re-walks on a timer
+(`HIVE_RELATIONAL_REFRESH_SECS`, 120 s) behind the document store's live
+sync; completing once flips `INDEX_READY` and logs `relational: index built`
+with the elapsed time and key count. `session()` waits up to 10 s for
+readiness and never walks. `init_schema`, `ensure_table_exists` and
+`backfill_billing_normalize` refuse DDL until the index is real;
+`run_readonly_query` answers an explicit not-ready error instead of "does not
+exist"; `team_for_project` requires a walk completed within two intervals.
+Vendored: `refresh_doc_index` builds the replacement key set off the lock and
+swaps it in atomically (`DocumentStoreIndex::replace_hash_only`, keeping
+fetched values whose hash is unchanged), so a completed refresh is never
+observable half-built and a cancelled one leaves the previous index in
+service; `GuardianRelationalStorage::index_len` exposes the key count. Verify
+on a rolled node: `pg_class` ≥ 16 and a sub-second `SELECT count(*) FROM
+project_teams`; an unrolled node stays at 0 / 10.00 s. If the walk cannot
+complete inside its bound on a node, the journal now says so once per
+attempt (`index walk exceeded its bound`) and nothing writes the catalog.
+
 ## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
 
 Measured over 75 fleet stops: `hive-node` took 78.4 s (+78.3..78.6 s) to exit
