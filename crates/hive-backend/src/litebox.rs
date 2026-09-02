@@ -5013,24 +5013,51 @@ impl CellBackend for LiteboxBackend {
         // tenant's shell, and are documented on `shell_args` above). Anything
         // else the runner or the shell writes to stderr — a real error — is
         // shown verbatim.
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(mut stderr) = child.stderr.take() {
             let tx_err = tx.clone();
             let id_err = session_id.clone();
             tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.contains("cannot set terminal process group")
-                        || line.contains("no job control in this shell")
-                    {
+                use tokio::io::AsyncReadExt;
+                // Raw chunks, never lines: an interactive shell writes its
+                // PROMPT to stderr without a trailing newline, so a line
+                // reader would hold it forever and the terminal would open
+                // blank (witnessed on the first cut of this pump: 101
+                // upgrade, runner alive, zero frames). The pipe bypasses the
+                // pty's output translation, so `\n` becomes `\r\n` here or
+                // xterm renders a staircase. The two litebox job-control
+                // warnings are whole lines and are dropped where they occur.
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let n = match stderr.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let chunk = &buffer[..n];
+                    let mut out = Vec::with_capacity(n + 16);
+                    for (i, segment) in chunk.split(|b| *b == b'\n').enumerate() {
+                        if i > 0 {
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        let text = String::from_utf8_lossy(segment);
+                        if text.contains("cannot set terminal process group")
+                            || text.contains("no job control in this shell")
+                        {
+                            // Drop the line AND the newline that follows it,
+                            // which `split` attributes to the next segment.
+                            if out.ends_with(b"\r\n") {
+                                out.truncate(out.len() - 2);
+                            }
+                            continue;
+                        }
+                        out.extend_from_slice(segment);
+                    }
+                    if out.is_empty() {
                         continue;
                     }
-                    let mut bytes = line.into_bytes();
-                    bytes.extend_from_slice(b"\r\n");
                     if tx_err
                         .send(hive_core::AgentEvent::PtyOutput {
                             id: id_err.clone(),
-                            bytes,
+                            bytes: out,
                         })
                         .is_err()
                     {
