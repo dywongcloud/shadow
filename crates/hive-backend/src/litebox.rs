@@ -3714,6 +3714,22 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// killed). Every entry is a real file or a symlink the staging `openat2`
 /// dereferences (Rocky's alternatives-managed `awk`), staged under its
 /// `/usr/bin` path.
+/// The interactive shell's rc file, staged into every shell tar and named by
+/// `ENV` (read by bash-as-sh, dash and ksh for an interactive shell AFTER
+/// job-control setup). Its one line moves the shell's stderr onto the pty:
+/// the runner is spawned with stderr as a PIPE because a stderr that IS the
+/// pty kills it at job-control init (`exec_pty`), but a pipe and a pty are
+/// two channels read by two tasks, so the next prompt (stderr) routinely
+/// overtook the previous command's output (stdout) and the terminal showed
+/// `sh-5.2$ TERM_OK_42` — measured through the public host 2026-09-02. Once
+/// the shell is past init the redirect is harmless (job control is already
+/// off) and prompt, output and command stderr share ONE ordered channel with
+/// the pty's own CRLF translation; the pipe keeps carrying the runner's own
+/// messages and the two pre-rc warnings the pump filters.
+const SHELL_RC_GUEST_PATH: &str = "/root/.hive-shellrc";
+#[cfg(target_os = "linux")]
+const SHELL_RC_BYTES: &[u8] = b"exec 2>&1\n";
+
 const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",
     "/usr/bin/id",
@@ -3995,6 +4011,14 @@ fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<
             path.display()
         );
     }
+
+    // The shell's rc file (`ENV`), synthesized here rather than read from the
+    // host: the guest tree is exactly what this tar carries, nothing else.
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new(SHELL_RC_GUEST_PATH.trim_start_matches('/')),
+        SHELL_RC_BYTES,
+    )?;
 
     builder
         .finish()
@@ -4937,7 +4961,11 @@ impl CellBackend for LiteboxBackend {
         // real), stderr is a PIPE pumped into the same terminal stream below,
         // and `-i` asks for the interactive shell that stderr-not-a-tty would
         // otherwise suppress. Every shell this platform offers (sh, bash,
-        // dash, zsh, fish) accepts `-i`.
+        // dash, zsh, fish) accepts `-i`. The pipe is only the STARTUP
+        // arrangement: `ENV` names the staged rc file whose `exec 2>&1`
+        // moves stderr onto the pty once job-control init is behind the
+        // shell, so prompts and output stop racing each other across two
+        // channels (`SHELL_RC_GUEST_PATH`).
         let shell_args: Vec<&str> = vec!["-i"];
         let cwd = if req.cwd.is_empty() {
             "/".to_string()
@@ -4966,6 +4994,7 @@ impl CellBackend for LiteboxBackend {
             .env("HOME", "/root")
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
+            .env("ENV", SHELL_RC_GUEST_PATH)
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
             .current_dir(&cwd)
@@ -5034,19 +5063,27 @@ impl CellBackend for LiteboxBackend {
                     };
                     let chunk = &buffer[..n];
                     let mut out = Vec::with_capacity(n + 16);
+                    // A dropped warning owns the newline that FOLLOWS it:
+                    // `split` hands that newline to the next segment's
+                    // boundary, so it is swallowed there. Truncating the
+                    // CRLF BEFORE the dropped line instead left the final
+                    // warning's newline as a bare CRLF and every terminal
+                    // opened with a blank line above its first prompt
+                    // (witnessed on the roll that introduced this pump).
+                    let mut swallow_newline = false;
                     for (i, segment) in chunk.split(|b| *b == b'\n').enumerate() {
                         if i > 0 {
-                            out.extend_from_slice(b"\r\n");
+                            if swallow_newline {
+                                swallow_newline = false;
+                            } else {
+                                out.extend_from_slice(b"\r\n");
+                            }
                         }
                         let text = String::from_utf8_lossy(segment);
                         if text.contains("cannot set terminal process group")
                             || text.contains("no job control in this shell")
                         {
-                            // Drop the line AND the newline that follows it,
-                            // which `split` attributes to the next segment.
-                            if out.ends_with(b"\r\n") {
-                                out.truncate(out.len() - 2);
-                            }
+                            swallow_newline = true;
                             continue;
                         }
                         out.extend_from_slice(segment);
