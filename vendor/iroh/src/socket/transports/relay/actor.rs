@@ -608,6 +608,29 @@ impl ActiveRelayActor {
                         }
                     }
                 }
+                // fluid-hive patch (see CHANGES.md, "read before send"): the
+                // relay stream is polled BEFORE the outbound datagram queue.
+                // This select is `biased`, so with the send arm first a node
+                // with sustained outbound relay traffic never read its stream
+                // while it had something to send; the backlog then decoded in
+                // one burst into the bounded recv channel (`Dropping received
+                // relay packet: no available capacity`) or the relay server's
+                // write timeout reset the connection. Handling a received
+                // message is a non-blocking `try_send`, so reads cannot starve
+                // sends the way sends starved reads.
+                msg = client_stream.next() => {
+                    let Some(msg) = msg else {
+                        break Err(e!(RunError::StreamClosedServer));
+                    };
+                    match msg {
+                        Ok(msg) => {
+                            self.handle_relay_msg(msg, &mut state);
+                            // reset the ping timer, we have just received a message
+                            ping_interval.reset();
+                        },
+                        Err(err) => break Err(e!(RunError::ClientStreamRead, err)),
+                    }
+                }
                 count = self.relay_datagrams_send.recv_many(
                     &mut send_datagrams_buf,
                     SEND_DATAGRAM_BATCH_SIZE,
@@ -629,19 +652,6 @@ impl ActiveRelayActor {
                     let mut packet_stream = n0_future::stream::iter(packet_iter);
                     let fut = client_sink.send_all(&mut packet_stream);
                     self.run_sending(fut, &mut state, &mut client_stream).await?;
-                }
-                msg = client_stream.next() => {
-                    let Some(msg) = msg else {
-                        break Err(e!(RunError::StreamClosedServer));
-                    };
-                    match msg {
-                        Ok(msg) => {
-                            self.handle_relay_msg(msg, &mut state);
-                            // reset the ping timer, we have just received a message
-                            ping_interval.reset();
-                        },
-                        Err(err) => break Err(e!(RunError::ClientStreamRead, err)),
-                    }
                 }
                 _ = &mut self.inactive_timeout, if !self.is_home_relay => {
                     debug!("Inactive for {RELAY_INACTIVE_CLEANUP_TIME:?}, exiting (running).");
@@ -764,16 +774,11 @@ impl ActiveRelayActor {
                         }
                     }
                 }
-                res = &mut sending_fut => {
-                    match res {
-                        Ok(_) => break Ok(()),
-                        Err(err) => break Err(err),
-                    }
-                }
-                _ = state.ping_tracker.timeout() => {
-                    break Err(e!(RunError::PingTimeout));
-                }
-                // No need to read the inbox or datagrams to send.
+                // fluid-hive patch (see CHANGES.md, "read before send"): keep
+                // draining the relay stream while a send is in flight, ahead
+                // of polling the send itself — same reasoning as in
+                // `run_connected`. No need to read the inbox or datagrams to
+                // send here.
                 msg = client_stream.next() => {
                     let Some(msg) = msg else {
                         break Err(e!(RunError::StreamClosedServer));
@@ -782,6 +787,15 @@ impl ActiveRelayActor {
                         Ok(msg) => self.handle_relay_msg(msg, state),
                         Err(err) => break Err(e!(RunError::ClientStreamRead, err)),
                     }
+                }
+                res = &mut sending_fut => {
+                    match res {
+                        Ok(_) => break Ok(()),
+                        Err(err) => break Err(err),
+                    }
+                }
+                _ = state.ping_tracker.timeout() => {
+                    break Err(e!(RunError::PingTimeout));
                 }
                 _ = &mut self.inactive_timeout, if !self.is_home_relay => {
                     debug!("Inactive for {RELAY_INACTIVE_CLEANUP_TIME:?}, exiting (sending).");

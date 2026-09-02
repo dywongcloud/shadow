@@ -45,7 +45,12 @@ impl RelayTransport {
     pub(crate) fn new(config: RelayActorConfig, cancel_token: CancellationToken) -> Self {
         let (relay_datagram_send_tx, relay_datagram_send_rx) = mpsc::channel(256);
 
-        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(512);
+        // fluid-hive patch (see CHANGES.md, "read before send"): 512 -> 4096.
+        // One channel per endpoint, fed by every ActiveRelayActor and drained
+        // in BATCH_SIZE steps by the QUIC driver; a relay backlog released
+        // after a stall arrived in measured clumps of 2,000-4,500 frames
+        // within 100 ms, and every frame past the cap is a dropped QUIC packet.
+        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(4096);
 
         let (actor_sender, actor_receiver) = mpsc::channel(256);
 

@@ -42,3 +42,40 @@ change which peers are reachable, so it's the version kept.
 (#4398, #4414) were closed unmerged by their own authors — a caution about
 this exact fix's shape, not just maintainer bandwidth. Carry this patch
 deliberately; re-diff against each iroh version bump before updating the pin.
+
+## Patch: read before send in `ActiveRelayActor` (no upstream issue yet; present unchanged in 1.1.0)
+
+**Files:** `src/socket/transports/relay/actor.rs` (`run_connected`,
+`run_sending`), `src/socket/transports/relay.rs` (`RelayTransport::new`).
+
+**Problem.** Both actor loops are `tokio::select! { biased; ... }` and polled
+the outbound side (`relay_datagrams_send.recv_many`, respectively the
+in-flight `sending_fut`) BEFORE `client_stream.next()`. A node with sustained
+outbound relay traffic therefore never read its relay TCP stream while it had
+something to send. Two things follow: the relay server's 2 s write timeout
+(`SERVER_WRITE_TIMEOUT`, iroh-relay `defaults.rs`) resets the connection, and
+when the stream is finally read the kernel backlog decodes in one burst into
+`relay_datagram_recv_tx` — a `mpsc::channel(512)` shared by every relay actor
+of the endpoint and drained `BATCH_SIZE` frames per QUIC-driver poll — so
+`handle_relay_msg`'s `try_send` fails and logs `Dropping received relay
+packet: no available capacity`, one dropped QUIC packet per line.
+
+**Measured, 2026-09-01, production (control-plane leader fc-sanjose):**
+458,427 such lines in 24 h (journald additionally suppressed 6.0 M lines),
+227,635 in the worst hour, 6,932 in the worst second; bursts of 2,000–4,500
+drops inside 100 ms with inter-drop gaps under 50 µs (a released backlog, not
+a stream); 303 server-side `Connection reset by peer` on the leader against
+47 and 35 on two followers; fr 227 drops, va 0. The leader is the one node
+that SENDS on relay paths at volume (wholesale store_sync pulls, rosters and
+gossip to its relay-only peers), which is why followers never show it.
+
+**Fix.** In both selects the `client_stream.next()` arm now precedes the send
+arm (`biased` is kept: stop token, priority inbox and timeouts stay first).
+Handling a received message is a non-blocking `try_send`, so reads cannot
+starve sends the way sends starved reads. `relay_datagram_recv` is sized
+512 → 4096 to absorb a backlog of the measured shape (worst case ≈5 MB per
+endpoint) instead of dropping it.
+
+**Rollout rule.** This changes mesh-transport scheduling: canary on one or
+two nodes with a `/v1/mesh` assertion before any fleet-wide roll (AGENTS.md,
+"Bringing a node into the mesh").
