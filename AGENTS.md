@@ -41,6 +41,15 @@ history).
   and the journal's `relational: index built` / `index walk exceeded its
   bound` lines say which. A walk that cannot complete inside its bound is a
   guardian/iroh-docs problem to diagnose, never a reason to shorten the gate.
+  Two companion rules: the relational storage's `get`/`scan` (vendored
+  `guardian_storage.rs`) must fall through to the store's ASYNC `get` when
+  the index has no cached value — `index().get_bytes` is cache-only and
+  answers `None` for every hash-only key, which made a fully built index
+  serve an empty catalog; and `init_schema` retries until GuardianDB opens
+  (it is the only creator of the catalog) and logs `schema bring-up
+  complete`. Probing a follower: `POST /v1/admin/sql/query` is
+  leader-forwarded, so a follower's relational state is read from its
+  journal (bring-up line, zero `does not exist`), never from its admin SQL.
 
 ## Mesh networking & anti-entropy
 
