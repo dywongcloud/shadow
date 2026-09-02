@@ -236,6 +236,13 @@ and are fixed in the same file:
   lives at `/usr/share/hive/shellrc`, nothing under `$HOME`, and `HISTFILE`
   is cleared so the shell never writes history. The panic itself is a
   litebox defect (PRD `litebox-layered-fs-nowriteperms-panic`).
+- Final witness on the control-plane leader after the fleet roll
+  (2026-09-02, exe `6c64268dd375`), on its own listener and through
+  `https://api.shadw.cloud`: 101, first frame `sh-5.2$ `, `TERM_OK_42`
+  echoed, `exit` → `{"exit_code":0,"type":"exited"}`, VERDICT PASS both
+  ways; the probe's frames read prompt, output, prompt in order, and `id`
+  answers `uid=1000`. What stays open is litebox's own job control (no
+  `tcsetpgrp`), which the shell reports once at startup and the pump drops.
 
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
