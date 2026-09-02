@@ -33,12 +33,31 @@ deterministically on the leader with a websocket driver (`shell-run.py`).
   tar stages each resolvable one, warning about any it cannot resolve
   instead of refusing the shell.
 
-Still open, recorded: `npm`/`npx` are scripts under the host's
-`node_modules_22` tree and are not staged (`sandbox-shell-stage-npm`);
-Python sandboxes get a bare 3.12 binary without its stdlib
-(`sandbox-shell-python-stdlib`); a genuinely missing command still kills the
-forked child and wedges the shell — upstream litebox fork emulation
-(`litebox-notfound-wedges-shell`).
+Witnessed on the leader after the roll (exe `7bd1e9e057fc`): `node -v` in
+the shell answers `v22.22.2`; a `POST …/commands node -v` while that shell
+is open exits 0 with the same output (was exit 101, the EBUSY panic); two
+shells opened together both prompt and run `id`; the per-runner `lbt` links
+are gone once the runners exit (1 before, 0 after) and no runner survives
+the deletes.
+
+Still open, recorded: **a litebox interactive shell runs exactly ONE
+external command per session** — measured `id; id; uname -a`: the first
+`id` answers, the second prints nothing, and `uname`/`exit` never return
+(builtins are unaffected). That is litebox's fork emulation on the parent
+side (the child of the second `fork()` never reaches `exec`), the same
+family as the fork-child faults already documented, and it is what wedged
+the shell after the pre-fix `node -v` too. Upstream (the AnEntrypoint fork's
+Task #51), tracked as `litebox-notfound-wedges-shell`. Also unstaged:
+`npm`/`npx` (scripts over the host's `node_modules_22` tree,
+`sandbox-shell-stage-npm`) and Python's stdlib
+(`sandbox-shell-python-stdlib`).
+
+The roll itself reached 10 hosts: between the previous roll and this one the
+operator terminated nine more instances (sp, sj3, sj4, sj5, va4, va5,
+cvmsj1, cvmsj2, fr; Tencent CloudAudit 22:08–22:27 UTC), so the live fleet
+is bkk, hk, phx, seoul, sj, sj2, tokyo, va, va2, va3. Inventory, lockdown
+roster and docs still describe 22 — PRD
+`gpu-hosts-terminated-inventory-cleanup` (rescoped to the full set).
 
 ## 2026-09-02 — The dashboard terminal never connected in production: the session cookie was host-only behind the reverse proxy, so the api-host WebSocket arrived anonymous
 
