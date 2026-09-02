@@ -1571,6 +1571,48 @@ just host firewalls) must open literal published ports (20000-29999 raw range
 is pre-opened); a migrated port is quarantined, never re-granted. Full detail:
 `recall("compose-published-ports-contract")`.
 
+## Host firewall & public listeners
+
+- **The published-port range (TCP+UDP 20000-29999) is open to the whole
+  internet in the Tencent security group by design, on every platform host,
+  so ANY wildcard-bound listener in that range is world-reachable the moment
+  it binds.** Never start an ad-hoc file server on a fleet node
+  (`python3 -m http.server --bind 0.0.0.0`, `npx serve`, a debug `nc -l`);
+  move binaries with `scp`/`rsync`, or bind `127.0.0.1` behind an ssh tunnel.
+  Witnessed 2026-08-26→09-02: two week-old hand-off servers on
+  fc-virginia:28126/:28127 served a directory listing of a hive-cloud build to
+  the world until Tencent's scanner filed a ticket against the account. The
+  platform noticed nothing because nothing looked.
+- **`scripts/audit-public-listeners.sh` is the check, and it exits 1 on a
+  finding.** It reports every wildcard TCP listener per node that is not a
+  platform daemon (hive-cloud, sshd, iroh-relay, rpc-server, llama-server,
+  cockpit's systemd socket) plus the lockdown roster each node actually
+  enforces. Run it after any hand-provisioning session and before a roll;
+  probe exposure from a FLEET vantage (a Tencent edge drops SYNs to closed
+  SG-open ports from non-Tencent sources, so an outside timeout proves
+  nothing).
+- **`scripts/hive-lockdown.sh` is the fleet's only host firewall and its
+  PEERS roster is generated, never typed.** 21 of 22 nodes run its iptables
+  branch (phx is nft-only); it drops 8787/9090/3000/7799-7804/50052/
+  50100-50999 from every source outside the roster. The roster sat at 13 of
+  22 hosts for weeks (nine later nodes were strangers to every other node's
+  admin/inference ports, silently pushing their HTTP admin dispatch onto the
+  iroh path). Refresh = `scripts/gen-hive-lockdown.sh` then
+  `ansible-playbook playbooks/site.yml --tags lockdown` (the tag exists so a
+  roster change rolls without the rest of the prerequisites role). A stale
+  second copy (va carried a 5-peer nft table beside its iptables chain) is
+  stricter than the live one and must be deleted, not left "harmless".
+- **Do not gate the published range on the listener's cgroup.**
+  `nft ... socket cgroupv2 level 2 "system.slice/hive-node.service"` was
+  measured on fc-virginia (6.12.33-pvm+, nft 1.1.1): it accepted 2 of 37 SYNs
+  to hive-cloud's own `:20008` and dropped the rest — a listener SYN has no
+  socket attached when the match runs. Any future experiment of this class
+  goes in a throwaway table on a spare port, never on a live one.
+- The ALL-ports 0.0.0.0/0 security groups on bkk, hk, tokyo, seoul and sp are
+  an operator decision recorded as PRD row `sec-sg-all-ports-open-groups`;
+  until they match the platform SG shape, the host lockdown is the only
+  guard on those five nodes.
+
 ## Mesh watchdogs & dial discipline (post-2026-08-17-incident shape)
 
 - meshwatch has TWO triggers: continuous total isolation (600s) and

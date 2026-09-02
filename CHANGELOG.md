@@ -1,5 +1,82 @@
 # Changelog
 
+## 2026-09-02 — Tencent exposure ticket: two forgotten `http.server` hand-offs served a directory listing to the internet for a week; the fleet firewall's peer roster was 13 of 22
+
+Tencent's scanner reported "Index directory traversal" on
+`43.166.206.175:28126` and `:28127` (fc-virginia, ins-7d6a22bf) on
+2026-08-27. Both were `python3 -m http.server 2812x --bind 0.0.0.0`
+processes started on 2026-08-26 (11:12 and 12:43) by two-second
+non-interactive root SSH sessions — an automated hand-off of freshly built
+hive-cloud binaries between nodes (`/root/xfer4/v2/hc`, `/root/xfer5/lb/hc`,
+plus a listener-less `/root/xfer3/s9/hc`; ELF builds, no key material) —
+and left running. They sat inside TCP 20000-29999, which the platform
+security group (`sg-gshd147x` in na-ashburn, `sg-2jhu3loa` in
+na-siliconvalley) opens to `0.0.0.0/0` for published container ports, so the
+listing was world-readable for a week and nothing on the node noticed.
+Resolution: both processes killed and all three trees removed; closure
+witnessed from a Tencent vantage (fc-frankfurt: connection refused) and a
+non-Tencent one (fc-phoenix: timeout — Tencent's edge drops SYNs to closed
+SG-open ports from outside sources, so an outside timeout never proves a
+filter; probe from inside the provider). A 22-node sweep found no other
+ad-hoc server.
+
+What the same pass found and fixed alongside:
+
+- **`scripts/hive-lockdown.sh` was enforcing a 13-host peer roster on every
+  node** (21 via its iptables chain, fc-phoenix via nft). The nine hosts
+  added since the last full prerequisites run (fr, phx, tokyo, seoul, va4,
+  va5, sj3-5) were strangers to every other node's 8787/50052/50100-50999,
+  which silently dropped their HTTP admin dispatch onto the iroh path.
+  `gen-hive-lockdown.sh` regenerated the line to 22, the three lockdown
+  tasks in `roles/prerequisites` now carry a `lockdown` tag so a roster
+  change rolls alone (`ansible-playbook playbooks/site.yml --tags lockdown`,
+  22/22 ok), and fc-virginia's stale second copy (a 5-peer nft table beside
+  its 13-peer iptables chain, stricter than the live one) was deleted.
+  Witness: fc-frankfurt and fc-phoenix now connect to va/sj/bkk:8787 where
+  they timed out before.
+- **An nft `socket cgroupv2` gate on the published range was tried and
+  rejected by measurement**: on fc-virginia (6.12.33-pvm+, nft 1.1.1) it
+  accepted 2 of 37 SYNs to hive-cloud's own `:20008` and dropped the rest —
+  a listener SYN has no socket attached when the match runs. It ran in a
+  throwaway table on a spare port and was removed; the record is in
+  AGENTS.md so nobody re-tries it on a live port.
+- **`crates/hive-cloud/src/listener_audit.rs` (new, every node, every
+  `HIVE_LISTENER_AUDIT_SECS` = 300 s):** reads `/proc/net/tcp{,6}`, keeps
+  wildcard LISTEN sockets inside the audited range
+  (`HIVE_LISTENER_AUDIT_PORTS`, default 20000-29999), drops the ones this
+  process owns (socket inode against `/proc/self/fd`, never a port list),
+  resolves the rest to pid/cmdline/cgroup, WARNs every pass while they
+  exist, and on the control-plane leader opens ONE deduplicated Major
+  incident per (port, pid). Detection only — the platform never kills a
+  process it did not start. `GET /v1/host/listeners` (operator, node-local
+  like `/v1/dns/stats`) serves the last report; `supported: false` on a
+  host without procfs means "not audited", never "clean".
+- **`scripts/audit-public-listeners.sh` (new):** the fleet view — every
+  wildcard TCP listener per node that is not a platform daemon, plus the
+  lockdown branch and peer count each node actually enforces; exits 1 on
+  any finding so it can gate a roll. Its first run flagged 34 `next-server`
+  processes on fc-sanjose-cvm-2 and 10 on fc-sanjose bound to `*:3xxxx-4xxxx`:
+  every one an orphaned host-spawned mock cell from before a hive-node
+  restart (`KillMode=process` keeps them alive, nothing adopts or reaps
+  them), cwd on a deleted checkout, zero connections, 5.4 GB RSS on cvm-2.
+  Reaped by hand (34 on cvm-2, the older-than-hive-cloud ones on sj);
+  the structural fix (a host-cell pid ledger reaped at boot, loopback bind
+  for host spawns) is PRD `mock-cells-orphaned-on-restart` /
+  `sec-host-spawned-functions-wildcard-bind`.
+- **Security-group audit (read-only, `DescribeSecurityGroupPolicies` across
+  eight regions):** bkk, hk, tokyo, seoul and sp each carry an ALL-ports
+  `0.0.0.0/0` group beside the platform group, so the host lockdown is the
+  only guard on those five; the platform group itself opens 8786/8787,
+  5432/6379, 9000-9001 and 53 world-wide. Recorded as PRD
+  `sec-sg-all-ports-open-groups` for an operator decision — an SG mistake
+  locks out SSH, so it is not automated here.
+
+Rules that fall out (AGENTS.md "Host firewall & public listeners"): never
+bind an ad-hoc server to `0.0.0.0` on a fleet host (`scp`/`rsync`, or
+`127.0.0.1` behind an ssh tunnel); run the audit script after any
+hand-provisioning session and before a roll; the lockdown roster is
+generated, never typed.
+
 ## 2026-09-02 — The relational mirror was dead fleet-wide: the index walk ran on every request path and never once completed
 
 On every node — the leader, nine followers, nodes 71 s after boot — every

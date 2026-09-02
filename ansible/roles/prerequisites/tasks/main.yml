@@ -74,11 +74,22 @@
 # scripts/hive-lockdown.sh's (6 of 12 current nodes). Regenerate the PEERS
 # list via scripts/gen-hive-lockdown.sh before running this role; never
 # hand-edit a second copy.
+#
+# The three lockdown tasks carry their own `lockdown` tag so a roster refresh
+# rolls ALONE: `ansible-playbook playbooks/site.yml --tags lockdown`. Without
+# it the only way to push a regenerated PEERS line was the whole prerequisites
+# role (dnf installs, a force-redownloaded runsc, toolchain checks), which is
+# why the live roster sat at 13 of 22 hosts for weeks -- every node added
+# after the last full prerequisites run (fr, phx, tokyo, seoul, va4, va5,
+# sj3-5) was a stranger to every other node's 8787/50052/5010x, so their
+# HTTP admin dispatch and inference reach were silently dropped. Witnessed
+# 2026-09-02 while resolving a Tencent exposure ticket.
 - name: Install hive-lockdown.sh
   ansible.builtin.copy:
     src: "{{ role_path }}/../../../scripts/hive-lockdown.sh"
     dest: /usr/local/sbin/hive-lockdown.sh
     mode: "0755"
+  tags: [lockdown]
 
 - name: Install hive-lockdown.service
   ansible.builtin.copy:
@@ -95,6 +106,7 @@
       RemainAfterExit=yes
       [Install]
       WantedBy=multi-user.target
+  tags: [lockdown]
 
 - name: Enable + run hive-lockdown now
   ansible.builtin.systemd:
@@ -102,6 +114,7 @@
     state: restarted
     enabled: true
     daemon_reload: true
+  tags: [lockdown]
 
 - name: Create hive data + run directories
   ansible.builtin.file:

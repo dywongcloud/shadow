@@ -57,6 +57,7 @@ mod incidents;
 mod inference;
 mod integrations;
 mod lease;
+mod listener_audit;
 mod memwatch;
 mod mesh_raw;
 mod mesh_shell;
@@ -1834,6 +1835,14 @@ async fn async_main() -> anyhow::Result<()> {
     // from the local registry and comes out empty. See `meshwatch`.
     meshwatch::spawn(cloud.clone(), controlled_restart.clone());
     tenancy_reconcile::spawn(cloud.clone());
+    // Host listener audit. Every node (listeners are per-host). Anything not
+    // this process bound to a wildcard address inside the internet-open
+    // published-port range is world-reachable through the security group and
+    // otherwise invisible: two week-old `python3 -m http.server` hand-offs on
+    // fc-virginia:28126/:28127 were found by the cloud provider's scanner, not
+    // by the platform (2026-08-27 ticket). Detects and reports only; never
+    // kills. See `listener_audit`.
+    listener_audit::spawn(cloud.clone(), |c| c.is_control_plane_leader());
     spawn_deletion_reconcile_loop(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies

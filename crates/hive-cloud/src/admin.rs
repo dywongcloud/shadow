@@ -53,6 +53,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
+        .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
@@ -8561,6 +8562,26 @@ async fn heap_profile(
         StatusCode::NOT_IMPLEMENTED,
         "heap profiling is Linux-only".to_string(),
     ))
+}
+
+/// Host listener audit (operator). NODE-LOCAL, exactly like `/v1/dns/stats`:
+/// the report describes the node that answers, so through the dashboard's
+/// `/ops/*` proxy you are reading the LEADER's host, not the page-serving
+/// node's — the fleet view is `scripts/audit-public-listeners.sh`. `last` is
+/// `null` until the first pass (~30 s after boot); `supported: false` means
+/// the host has no `/proc/net/tcp` (macOS), which is "not audited", never
+/// "clean". See `listener_audit`.
+async fn host_listeners(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let range = crate::listener_audit::audited_range();
+    Ok(Json(json!({
+        "node": c.node_name,
+        "range": [range.0, range.1],
+        "last": crate::listener_audit::last(),
+    })))
 }
 
 /// Geo-DNS observability (operator): live Seer query counters, the
