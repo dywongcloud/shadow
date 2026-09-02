@@ -1382,7 +1382,28 @@ async fn open_shell(
     Path((project, sandbox_id)): Path<(String, String)>,
     Query(q): Query<ShellQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let t = require(&c, &headers, &claims, &project)?;
+    // A refused upgrade is invisible from the browser (a `WebSocket` reports
+    // "connection failed" with no status), and until 2026-09-02 it was
+    // invisible here too: both refusals below return BEFORE the audit line,
+    // so a tenant whose session cookie never reached this host (anonymous
+    // handshake -> 403) left zero evidence on any node. Log every refusal
+    // with what decided it.
+    let anon = claims.is_none();
+    let t = match require(&c, &headers, &claims, &project) {
+        Ok(t) => t,
+        Err((status, body)) => {
+            tracing::info!(
+                project = %project,
+                sandbox = %sandbox_id,
+                status = status.as_u16(),
+                anonymous = anon,
+                claimed_tenant = %claims.as_ref().map(|e| e.0.tenant.as_str()).unwrap_or(""),
+                reason = %body,
+                "sandbox shell upgrade refused before the handshake"
+            );
+            return Err((status, body));
+        }
+    };
 
     // Fail BEFORE the upgrade for a genuine not-found/unauthorized sandbox —
     // an HTTP error response here is far more useful to the caller than a
@@ -1399,9 +1420,23 @@ async fn open_shell(
                     found = serde_json::from_value::<SandboxRecord>(v).ok();
                 }
             }
-            found.ok_or_else(|| sandbox_err(e))?
+            match found {
+                Some(rec) => rec,
+                None => {
+                    tracing::info!(
+                        project = %project,
+                        sandbox = %sandbox_id,
+                        tenant = %t,
+                        "sandbox shell upgrade refused: no such sandbox on this node, its owner, or the leader"
+                    );
+                    return Err(sandbox_err(e));
+                }
+            }
         }
-        Err(e) => return Err(sandbox_err(e)),
+        Err(e) => {
+            tracing::info!(project = %project, sandbox = %sandbox_id, tenant = %t, error = ?e, "sandbox shell upgrade refused: record lookup failed");
+            return Err(sandbox_err(e));
+        }
     };
 
     // Owner resolution: the record's `owner_node` first; an empty field is a

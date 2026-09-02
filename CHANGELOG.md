@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-09-02 — The dashboard terminal never connected in production: the session cookie was host-only behind the reverse proxy, so the api-host WebSocket arrived anonymous
+
+Reported as `WebSocket connection to 'wss://api.shadw.cloud/v1/projects/
+servermcserver/sandboxes/sbx_86001c0447a14171/shell?cols=138&rows=26'
+failed:` — the browser's only diagnostic. The server side was healthy the
+whole time: the sandbox was created at 19:06:33 UTC on fc-sanjose (litebox),
+and a dashboard-shaped create under the same project, opened with the same
+`hive_jwt` cookie a browser would send, upgraded 101 on the owner AND on the
+round-robin non-owner (fc-sanjose-2, forwarded over the mesh). What differed
+in the browser was that the cookie was never sent. `ui/app/api/token/route.ts`
+derives the cookie's `Domain` (`.shadw.cloud`, so it also reaches
+`api.shadw.cloud`) from the request's `Host` header — but hive-node's
+`dashboard_proxy` forwards to the Next server on loopback with
+`Host: 127.0.0.1:3002` and carries the real host ONLY as `x-forwarded-host`
+(which `ui/proxy.ts` already reads for exactly this reason). `cookieDomain()`
+therefore returned `undefined` in production on every node, every session
+cookie was host-only for `shadw.cloud`, the `wss://api.` handshake went out
+without it, `open_shell` saw an anonymous caller and refused 403 `project
+belongs to a different team`, and nothing logged it: both refusals in
+`open_shell` return before its audit line, so the leader's journal and audit
+had a `create` and a `delete` for the sandbox and nothing in between.
+
+Fixes:
+
+- `cookieDomain()` reads `x-forwarded-host` first (then `host` for local
+  `next dev`); the mint also expires the stale host-only cookie in the same
+  response so an existing session does not keep authenticating the dashboard
+  origin with the old (possibly other-tenant) cookie for its remaining hour.
+- `terminal-panel.tsx`: a close before open now runs a diagnosis through the
+  same-origin `/cloud` read of the sandbox (same tenant + record gate, minus
+  the upgrade, WITH a status): 200 there means only the api-host hop refused,
+  so the session is re-minted and the connect retried once; 404/401/403 or a
+  transport failure is written into the pane and the badge instead of a
+  silent "disconnected".
+- `open_shell` logs every refusal at INFO with project, sandbox, status,
+  anonymous flag, claimed tenant and the reason, before returning it.
+- The dashboard fanout's two `ui/` rsyncs exclude `.gm` (gm-tooling state a
+  watcher rewrites at will): the first deploy of this fix aborted on the
+  leader with rsync rc 24, "file has vanished", when that directory churned
+  mid-transfer, and the play stopped before any dashboard was built.
+
+Not a browser-witnessed fix: no Clerk session is available to this
+environment, so the proof is the server-side cookie-path upgrade (101 on both
+API nodes), the proxy code that strips `Host`, and the token route's
+derivation — deterministic, but the first real-browser confirmation is the
+user's next terminal open after the dashboard deploy (a page load re-mints
+the cookie with the parent domain).
+
 ## 2026-09-02 — Tencent exposure ticket: two forgotten `http.server` hand-offs served a directory listing to the internet for a week; the fleet firewall's peer roster was 13 of 22
 
 Tencent's scanner reported "Index directory traversal" on

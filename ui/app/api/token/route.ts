@@ -52,7 +52,20 @@ function jwtPlatformAdmin(token: string): boolean | null {
  * attribute on those anyway) so local dev is unaffected.
  */
 function cookieDomain(req: NextRequest): string | undefined {
-  const host = (req.headers.get("host") || "").split(":")[0];
+  // Behind hive-node's reverse proxy the Next server's `host` is the loopback
+  // upstream (`127.0.0.1:3002`) and the browser-facing host arrives ONLY as
+  // `x-forwarded-host` (the same convention `ui/proxy.ts` reads for Clerk's
+  // redirect URLs). Reading `host` alone returned `undefined` in production,
+  // so every session cookie was host-only for `shadw.cloud`, the browser never
+  // sent it on the `wss://api.shadw.cloud` handshake, the shell upgrade
+  // arrived anonymous and was refused 403 — "WebSocket connection failed"
+  // with no diagnosis (2026-09-02, sbx_86001c0447a14171). Forwarded host
+  // first, then the direct host for local `next dev`.
+  const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "")
+    .split(",")[0]
+    .trim()
+    .split(":")[0]
+    .toLowerCase();
   if (!host || host === "localhost" || host === "127.0.0.1") return undefined;
   const parts = host.split(".");
   if (parts.length < 2) return undefined;
@@ -249,11 +262,22 @@ export async function POST(req: NextRequest) {
   // treats an absent field as UNKNOWN and leaves those surfaces untouched.
   const platformAdmin = jwtPlatformAdmin(token);
   const res = NextResponse.json({ ok: true, tenant, role, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
+  const domain = cookieDomain(req);
+  if (domain) {
+    // Sessions minted before the forwarded-host fix hold a HOST-ONLY
+    // `hive_jwt` (no Domain attribute). A browser keeps that cookie beside the
+    // parent-domain one and sends BOTH to the dashboard origin, oldest first,
+    // so the backend would keep reading the stale (possibly other-tenant)
+    // cookie for up to its remaining hour. Expire the host-only variant in the
+    // same response, BEFORE setting the real one: two Set-Cookie headers for
+    // the same name differ by Domain and are distinct cookies to the browser.
+    res.cookies.set("hive_jwt", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
+  }
   res.cookies.set("hive_jwt", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
-    domain: cookieDomain(req),
+    domain,
     path: "/",
     maxAge: Math.max(60, expiresIn - 30),
   });
