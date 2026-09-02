@@ -48,6 +48,19 @@ derivation — deterministic, but the first real-browser confirmation is the
 user's next terminal open after the dashboard deploy (a page load re-mints
 the cookie with the parent domain).
 
+Shipped: dashboard build `E6BjeBsrFeA65wb5dU7QY` verified on 22/22 hosts
+(the compiled token-route chunk carries the forwarded-host read and the
+`maxAge: 0` expiry); backend roll to 19 hosts (leader exe `de2b67dd05e4`),
+after which an anonymous upgrade probe on the leader leaves `sandbox shell
+upgrade refused before the handshake project=servermcserver
+sandbox=sbx_86001c0447a14171 status=403 anonymous=true claimed_tenant=
+reason=project belongs to a different team` in the journal, and the
+post-roll terminal witnesses pass locally and through the public host. The
+three hosts the backend roll could not reach (fc-sanjose-gpu-1/2/3) had been
+terminated by the operator at 19:43 UTC that day (Tencent CloudAudit
+`TerminateInstances`); their inventory/lockdown/docs cleanup is PRD
+`gpu-hosts-terminated-inventory-cleanup`.
+
 ## 2026-09-02 — Tencent exposure ticket: two forgotten `http.server` hand-offs served a directory listing to the internet for a week; the fleet firewall's peer roster was 13 of 22
 
 Tencent's scanner reported "Index directory traversal" on
