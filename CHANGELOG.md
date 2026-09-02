@@ -75,7 +75,13 @@ value in one pass through the store's lazy `query`
 (`GuardianRelationalStorage::warm_values`, logged with count and
 duration), and nothing waits on it; the bring-up summary counts the tables
 it gave up on and logs at ERROR when that count is non-zero instead of
-claiming every table verified.
+claiming every table verified. Measured on the fourth canary
+(fc-virginia): index built in 14 ms, bring-up complete with every table
+verified in the catalog and zero errors within a second of start, and the
+warm pass materialized 3,759 documents in 416.9 s — about 111 ms per row,
+the peer-fetch cost the old per-row verification was paying inside a 10 s
+budget — so a cold node's mirror is fully warm seven minutes after boot and
+its catalog and schema are correct from the first second.
 
 ## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
 
