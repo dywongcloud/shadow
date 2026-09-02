@@ -79,13 +79,24 @@ and are fixed in the same file:
   line now owns the newline that follows it.
 - The next prompt overtook the previous command's output (`sh-5.2$ echo
   …\r\nsh-5.2$ TERM_OK_42`): stderr (pipe) and stdout (pty) were two
-  channels read by two tasks. The shell tar now stages `/root/.hive-shellrc`
+  channels read by two tasks. The shell tar now stages `/usr/share/hive/shellrc`
   (`exec 2>&1`) and the runner is spawned with `ENV` naming it — the shell
   still STARTS with stderr off the pty (the arrangement that keeps the
   runner alive through job-control init) and then moves it onto the pty
   itself, so prompt, output and command stderr are one ordered stream with
   the pty's own CRLF translation. Linux-gated code, so `cargo check` ran on
   fc-virginia, not only locally.
+- Rolled, that cut fixed both (first frame `sh-5.2$ `, then `TERM_OK_42`,
+  then the next prompt, on one channel) and failed at `exit` with runner
+  exit 101: `thread 'main' panicked at litebox/src/fs/layered.rs:683:67:
+  called Result::unwrap() on an Err value: NoWritePerms`. The rc file's tar
+  entry had implicitly created `/root` in the guest, not writable by the
+  guest uid, and the interactive shell's history write at exit hit a
+  permission check litebox unwraps instead of answering EACCES — where a
+  MISSING `/root` (every earlier cut) failed that write silently. The rc now
+  lives at `/usr/share/hive/shellrc`, nothing under `$HOME`, and `HISTFILE`
+  is cleared so the shell never writes history. The panic itself is a
+  litebox defect (PRD `litebox-layered-fs-nowriteperms-panic`).
 
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 

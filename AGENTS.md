@@ -454,7 +454,7 @@ releases).
   the runner a stderr PIPE plus `-i` (the interactive shell a non-tty stderr
   would suppress), pumps that pipe into the terminal stream as RAW CHUNKS
   (a prompt has no trailing newline; a line reader held it forever), and
-  stages `/root/.hive-shellrc` (`exec 2>&1`) named by `ENV` so the shell
+  stages `/usr/share/hive/shellrc` (`exec 2>&1`) named by `ENV` so the shell
   moves its own stderr onto the pty once init is behind it — otherwise
   prompt (pipe) and output (pty) are two channels read by two tasks and the
   next prompt overtakes the last command's output on screen. The pump stays:

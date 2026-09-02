@@ -3726,7 +3726,14 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// off) and prompt, output and command stderr share ONE ordered channel with
 /// the pty's own CRLF translation; the pipe keeps carrying the runner's own
 /// messages and the two pre-rc warnings the pump filters.
-const SHELL_RC_GUEST_PATH: &str = "/root/.hive-shellrc";
+///
+/// The path is deliberately NOT under `$HOME`: a tar entry implicitly creates
+/// its parent directory, and a `/root` that exists but is not writable by the
+/// guest uid is worse than none — the shell's history write at `exit` then
+/// hits a permission check litebox UNWRAPS (`layered.rs:683 NoWritePerms`,
+/// runner exit 101, measured 2026-09-02) instead of the silent ENOENT a
+/// missing directory gives. `HISTFILE` is cleared for the same reason.
+const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
 #[cfg(target_os = "linux")]
 const SHELL_RC_BYTES: &[u8] = b"exec 2>&1\n";
 
@@ -4995,6 +5002,10 @@ impl CellBackend for LiteboxBackend {
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
             .env("ENV", SHELL_RC_GUEST_PATH)
+            // No history file: the guest tree has no writable `$HOME`, and a
+            // failed create there is a litebox panic, not an EACCES (see
+            // `SHELL_RC_GUEST_PATH`).
+            .env("HISTFILE", "")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
             .current_dir(&cwd)
