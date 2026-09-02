@@ -81,7 +81,15 @@ verified in the catalog and zero errors within a second of start, and the
 warm pass materialized 3,759 documents in 416.9 s — about 111 ms per row,
 the peer-fetch cost the old per-row verification was paying inside a 10 s
 budget — so a cold node's mirror is fully warm seven minutes after boot and
-its catalog and schema are correct from the first second.
+its catalog and schema are correct from the first second. The control-plane
+leader after the fleet roll: index built in 4 ms, bring-up complete with
+every table verified, `pg_class` = 28 and real row counts in milliseconds
+where it answered 0 and "does not exist" after 10 s an hour earlier; its
+warm pass took 1,607 s for 1,935 documents (about 830 ms per row on the
+busiest node) and once it landed the statement timeouts stopped entirely.
+Expect the `ALTER TABLE project_teams` reconcile to retry with a 10 s
+timeout on every mirror tick until the warm pass ends; it converges on its
+own and is not the pre-fix "namespace wedged" class its message still names.
 
 ## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
 
