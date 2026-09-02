@@ -87,6 +87,13 @@ impl GuardianRelationalStorage {
         self.store.load(0).await
     }
 
+    /// Number of keys the local document index currently knows — `0` until
+    /// the first full walk completes (see `refresh`), which is how a caller
+    /// tells "empty database" from "index not built yet".
+    pub fn index_len(&self) -> usize {
+        self.store.index().len().unwrap_or(0)
+    }
+
     fn gkey(collection: &str, row_id: &str) -> String {
         format!("{collection}{SEP}{row_id}")
     }

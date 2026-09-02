@@ -221,6 +221,24 @@ history).
   reason. The db-reconcile loop is the belt-and-braces half: it restarts
   exited backing containers and rebuilds vanished Redis/Supabase members
   from their records every 60s.
+- **The graceful stop must finish under systemd's timeout, and five
+  invariants keep it there.** (1) A `persist::persist()` arriving after
+  `flush_blocking` has closed admission is REFUSED, never blocked:
+  `admit_generation` returns `None` (`persist` a no-op, `persist_durable`
+  `false`, one WARN per process) — a condvar wait there parks a tokio
+  worker, and when that worker owns the IO/timer driver every timer on the
+  runtime dies with it, the shutdown deadline included (measured: 34 of 56
+  stops SIGKILLed at 90 s with every thread in futex). (2) The hard deadline
+  (`HIVE_SHUTDOWN_DEADLINE_SECS`, 75 s) lives on a std thread, never a tokio
+  timer, and stays below `TimeoutStopSec`. (3) `TimeoutStopSec=90s` is
+  explicit in `hive-node.service.j2` because TencentOS's `system.conf`
+  defaults it to 5 s — inside the listener drain, before the flush. (4) The
+  guardian shutdown wait (`HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS`) is 10 s per
+  step: the writer commits one generation per 40–75 s, so a 60 s wait never
+  succeeds and only leaves a drained node dark. (5)
+  `restart_audit::mark_clean_exit` latches a flag the heartbeat checks, so
+  the clean-exit marker is never overwritten with `clean_exit=false` by a
+  later tick.
 - podman allocates one lock from a **fixed pool** (`num_locks`, default 2048)
   per CONTAINER **and per VOLUME**. The pool is per-host and shared by every
   tenant, so leaking locks starves the whole node: witnessed 2032 leaked

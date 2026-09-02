@@ -1205,27 +1205,58 @@ async fn async_main() -> anyhow::Result<()> {
             // fleet treated the dark leader as current. The watchdog turns any
             // wedged step into the bounded restart the caller asked for; the exit
             // code matches what the normal tail would have used.
+            //
+            // It runs on a plain OS thread, NOT a tokio timer: a wedge that
+            // parks the worker owning tokio's IO/timer driver stops every timer
+            // on the runtime, this one included (measured: 34 of 56 stops on
+            // 90 s nodes ended in SIGKILL with every timer dead), and a std
+            // thread sleeping on the OS clock exits regardless of the runtime's
+            // state. The 75 s default must stay below systemd's TimeoutStopSec
+            // (90 s in hive-node.service) so the exit is ours, never SIGKILL's.
             {
-                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 90));
+                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 75));
                 let code = if requested_reason.is_some() { 17 } else { 0 };
-                tokio::spawn(async move {
-                    tokio::time::sleep(deadline).await;
+                let spawned = std::thread::Builder::new()
+                    .name("hive-shutdown-deadline".into())
+                    .spawn(move || {
+                        std::thread::sleep(deadline);
+                        tracing::error!(
+                            ?deadline,
+                            exit_code = code,
+                            "graceful shutdown exceeded its hard deadline — forcing exit now"
+                        );
+                        std::process::exit(code);
+                    });
+                if let Err(error) = spawned {
                     tracing::error!(
-                        ?deadline,
-                        exit_code = code,
-                        "graceful shutdown exceeded its hard deadline — forcing exit now"
+                        %error,
+                        "could not spawn the shutdown hard-deadline thread; systemd's TimeoutStopSec is the only backstop"
                     );
-                    std::process::exit(code);
-                });
+                }
             }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
                 tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
                 handle.graceful_shutdown(Some(grace));
                 // graceful_shutdown stops new connections and gives existing ones
-                // the grace window; wait for it here since exit() below would
-                // otherwise kill them the instant this task returns regardless.
-                tokio::time::sleep(grace).await;
+                // the grace window; wait for them here since exit() below would
+                // otherwise kill them the instant this task returns — but only
+                // while any remain. An unconditional sleep charged every stop the
+                // full 15 s on an idle listener (measured: the 78 s graceful
+                // path spent 15 s here with zero connections open).
+                let drain_started = std::time::Instant::now();
+                loop {
+                    let open = handle.connection_count();
+                    if open == 0 || drain_started.elapsed() >= grace {
+                        tracing::info!(
+                            open_connections = open,
+                            elapsed_ms = drain_started.elapsed().as_millis() as u64,
+                            "public listener drained"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
             tracing::info!("shutdown requested → draining runtime artifact transfers");
             if let Err(error) = flush_cloud.runtime_artifact_transfer.shutdown().await {

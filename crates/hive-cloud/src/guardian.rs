@@ -4575,13 +4575,21 @@ async fn await_final_generation(
     }
 }
 
+/// Budget for EACH of `shutdown`'s three sequential waits (final generation,
+/// writer join, backend shutdown). The GuardianDB writer commits one
+/// generation per 40–75 s on this fleet, so the final-generation wait needs a
+/// full commit cadence to succeed and a 60 s budget never did (measured over
+/// 75 stops: it timed out on every one) — it only kept a node whose listener
+/// was already closed and whose state was already flushed alive as a mesh
+/// black hole for a further minute. 10 s bounds that cost to what the graceful
+/// tail can afford under the 75 s hard deadline.
 fn guardian_shutdown_timeout() -> std::time::Duration {
     std::env::var("HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(60))
+        .unwrap_or(std::time::Duration::from_secs(10))
 }
 
 /// Drain the terminal replication generation, stop and join its sole writer,

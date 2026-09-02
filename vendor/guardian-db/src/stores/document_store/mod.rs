@@ -144,6 +144,33 @@ impl DocumentStoreIndex {
         guard.clear();
     }
 
+    /// Replaces the WHOLE key set with `entries` (key, content hash) in one
+    /// write-lock critical section, keeping an already-fetched value for
+    /// every key whose hash did not change. This is what a full refresh
+    /// (`refresh_doc_index`) installs: readers never observe the empty or
+    /// half-built map that `clear_all()` + per-key inserts exposed, and a
+    /// refresh that is cancelled before it reaches this call leaves the
+    /// previous index untouched — the "serve the previous index" promise
+    /// the callers make is only true because the swap is atomic.
+    pub fn replace_hash_only(&self, entries: Vec<(String, String)>) {
+        let mut next: HashMap<String, IndexSlot> = HashMap::with_capacity(entries.len());
+        let mut guard = self.index.write();
+        for (key, hash) in entries {
+            let value = guard
+                .get(&key)
+                .filter(|slot| slot.hash.as_deref() == Some(hash.as_str()))
+                .and_then(|slot| slot.value.clone());
+            next.insert(
+                key,
+                IndexSlot {
+                    hash: Some(hash),
+                    value,
+                },
+            );
+        }
+        *guard = next;
+    }
+
     pub fn len(&self) -> usize {
         let guard = self.index.read();
         guard.len()
@@ -193,19 +220,20 @@ async fn refresh_doc_index(
         .get_many(doc, Query::single_latest_per_key().build())
         .await?;
 
-    index.clear_all();
-    let mut count = 0;
-
+    // Build the replacement key set OFF the lock, then swap it in whole
+    // (`replace_hash_only`): a cancelled walk leaves the previous index in
+    // service, and a completed one is never observable half-built.
+    let mut next: Vec<(String, String)> = Vec::with_capacity(entries.len());
     for entry in &entries {
         if entry.content_len() == 0 {
             continue;
         }
-
         let key = String::from_utf8_lossy(entry.key()).to_string();
         let hash_str = entry.content_hash().to_hex();
-        index.insert_hash_only(key, hash_str);
-        count += 1;
+        next.push((key, hash_str));
     }
+    let count = next.len();
+    index.replace_hash_only(next);
 
     debug!(
         "DocumentStore index key set synchronized from iroh-docs: {} entries (values load lazily on read)",

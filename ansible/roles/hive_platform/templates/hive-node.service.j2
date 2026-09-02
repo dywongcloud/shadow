@@ -135,6 +135,12 @@ LimitNOFILE=1048576
 # the dockerd/containerd precedent for exactly this shape — so databases and
 # cells outlive a control-plane restart, as they must.
 KillMode=process
+# Explicit because TencentOS's /etc/systemd/system.conf sets
+# DefaultTimeoutStopSec=5s, which SIGKILLs the node 5 s into its drain — before
+# the platform-state flush runs. The graceful path is ~30 s and the in-process
+# hard deadline (HIVE_SHUTDOWN_DEADLINE_SECS) is 75 s, so 90 s means the process
+# always exits on its own terms.
+TimeoutStopSec=90s
 
 [Install]
 WantedBy=multi-user.target

@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
+
+Measured over 75 fleet stops: `hive-node` took 78.4 s (+78.3..78.6 s) to exit
+on its happy path, was SIGKILLed on 34 of the 56 stops on 90 s nodes, and on
+the TencentOS hosts (bkk, hk, cvmsj1/2, gpusj1-3) was SIGKILLed at +5 s, before
+the listener drain ended and before the platform-state flush ran. The graceful
+sequence in `main.rs` (SIGTERM → 15 s listener drain → runtime-artifact drain
+→ `persist::flush_blocking` → `mark_clean_exit` → `guardian::shutdown` →
+`ep.close()` → exit) spent 15 s in an unconditional drain sleep with zero
+connections open and 60 s in `guardian::shutdown`'s first wait, which never
+succeeded: the GuardianDB writer commits one generation per 40–75 s. The
+SIGKILLs had one cause. After `flush_blocking` closed persistence admission,
+any later `persist()` (185 call sites; usually `main.rs`'s follower-sync
+adopt right after "store follower-sync: adopted the leader's snapshot", the
+metrics loop, or a mirrored gossip write) reached `admit_generation`'s
+condvar wait — a std wait on a tokio worker thread, by design "until process
+exit". When that worker was the one holding tokio's IO/timer driver no other
+worker re-took it, every timer and socket on the runtime stopped (thread
+snapshots: 0 in epoll, all 131 in futex, 0 CPU, one worker on a foreign
+futex, journal silent for 74 s), the 60 s guardian timeout and the 90 s
+in-runtime hard deadline stopped with them, and systemd SIGKILLed at 90 s.
+Two smaller defects rode along: `restart_audit::spawn`'s 20 s heartbeat
+rewrote the marker with `clean_exit=false` after `mark_clean_exit` had
+stamped it at +15 s, so every self-exiting restart was reported UNCLEAN; and
+the TencentOS hosts inherit `DefaultTimeoutStopSec=5s` from
+`/etc/systemd/system.conf` because the unit template set no `TimeoutStopSec`.
+
+Five fixes. `persist::admit_generation` returns `None` once admission is
+closed and never waits — `persist()` is a no-op and `persist_durable()`
+returns `false` (fail closed), with one WARN per process. The hard deadline
+is a `std::thread` sleeping on the OS clock (`hive-shutdown-deadline`),
+default `HIVE_SHUTDOWN_DEADLINE_SECS` 90 → 75 so it stays under systemd's
+stop timeout. The listener drain polls `Handle::connection_count()` every
+250 ms and ends as soon as it reads zero instead of sleeping the whole 15 s
+grace. `HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS` defaults to 10 s for each of the
+three sequential waits. `mark_clean_exit` latches an `AtomicBool` the
+heartbeat checks before every marker write. `hive-node.service.j2` sets
+`TimeoutStopSec=90s` explicitly. Expected graceful path after the roll:
+~30 s, exiting on its own before either deadline.
+
 ## 2026-09-02 — Leader relay drops: iroh's relay actor read its stream only when it had nothing to send
 
 The control-plane leader logged `iroh::socket::transports::relay::actor:

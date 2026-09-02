@@ -57,8 +57,15 @@
 use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+
+/// Set by `mark_clean_exit`; read by the heartbeat before every marker write.
+/// The graceful tail runs tens of seconds past the clean-exit stamp, so a
+/// 20 s heartbeat tick lands after it and — without this latch — rewrites the
+/// marker with `clean_exit=false`, reporting every self-exiting restart as
+/// UNCLEAN on the next boot (measured on every graceful stop of 75).
+static CLEAN_EXIT_MARKED: AtomicBool = AtomicBool::new(false);
 
 /// Bounded — this is a diagnostic tail, not a log.
 const HISTORY_MAX: usize = 64;
@@ -615,6 +622,9 @@ pub fn started_ms() -> u64 {
 /// path next to `persist::flush_blocking` — without it every deploy restart
 /// would be classified `unclean_exit` and the signal would be worthless.
 pub fn mark_clean_exit(node: &str) {
+    // Latched BEFORE the write so a heartbeat tick racing this call observes
+    // the stamp as final and skips its own write.
+    CLEAN_EXIT_MARKED.store(true, Ordering::SeqCst);
     let mut m = current_marker(node, true);
     m.heartbeat_ms = now_ms();
     save_marker(&m);
@@ -638,6 +648,11 @@ pub fn spawn(node: String) {
         let mut last_remind = 0u64;
         loop {
             tokio::time::sleep(interval).await;
+            if CLEAN_EXIT_MARKED.load(Ordering::SeqCst) {
+                // The clean-exit stamp is the marker's final word; a heartbeat
+                // after it would overwrite it with clean_exit=false.
+                return;
+            }
             save_marker(&current_marker(&node, false));
             let (restarts, oom, min_uptime) = window_stats(&history().read());
             let now = now_ms();

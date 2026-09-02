@@ -622,7 +622,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
 //     so persistence is never silently dropped.
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 struct Persister {
@@ -685,25 +685,49 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
         .expect("spawn persister thread");
 }
 
-fn admit_generation(p: &Persister) -> u64 {
-    let mut admission_open = p.lock.lock().unwrap();
-    while !*admission_open {
-        admission_open = p.cv.wait(admission_open).unwrap();
+/// Logged-once latch for post-barrier refusals: the first late producer warns,
+/// the rest (the follower-sync adopt, the metrics tick, mirrored gossip
+/// writes keep arriving for the whole graceful tail) stay silent.
+static PERSIST_REFUSED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Admit one generation, or `None` once `flush_blocking` has closed admission.
+///
+/// This NEVER waits. A post-barrier producer is a tokio worker thread, and a
+/// condvar wait there parks that worker for the rest of the process's life;
+/// when that worker is the one driving tokio's IO/timer driver no other worker
+/// re-takes it, so every timer and socket on the runtime stops — the guardian
+/// shutdown timeout and the shutdown hard deadline included — and systemd
+/// SIGKILLs the node at its stop timeout (measured on 34 of 56 stops: 0 threads
+/// in epoll, all 131 in futex, journal silent for 74 s). The terminal snapshot
+/// is already durable when admission closes, so the refusal costs the caller
+/// nothing it could still have saved.
+fn admit_generation(p: &Persister) -> Option<u64> {
+    let admission_open = p.lock.lock().unwrap();
+    if !*admission_open {
+        drop(admission_open);
+        if !PERSIST_REFUSED_WARNED.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                "persist refused after the shutdown barrier; the terminal snapshot is already durable"
+            );
+        }
+        return None;
     }
-    p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1)
+    Some(p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1))
 }
 
 /// Persist the current state to disk (call after any mutation). Non-blocking when
 /// the background writer is running (just marks dirty + wakes it); synchronous
-/// fallback otherwise so a mutation is never silently un-persisted.
+/// fallback otherwise so a mutation is never silently un-persisted. A no-op once
+/// the shutdown barrier has closed admission (see `admit_generation`).
 pub fn persist(cloud: &Arc<CloudState>) {
     if let Some(p) = PERSISTER.get() {
         // Admission and the generation bump are one transaction with the
-        // shutdown flush's final dirty==saved check. Once that check closes
-        // admission, a late mutation producer cannot return and race process
-        // exit; before it closes, every admitted generation is drained.
-        let _target = admit_generation(p);
-        p.cv.notify_one();
+        // shutdown flush's final dirty==saved check: before it closes, every
+        // admitted generation is drained; after it, admission is refused
+        // without waiting and there is nothing to wake.
+        if admit_generation(p).is_some() {
+            p.cv.notify_one();
+        }
         return;
     }
     // Writer not started (early boot / tests) → write synchronously.
@@ -719,7 +743,12 @@ pub fn persist(cloud: &Arc<CloudState>) {
 /// fact exists only in memory.
 pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
     if let Some(p) = PERSISTER.get() {
-        let _admitted = admit_generation(p);
+        // Refused after the shutdown barrier: nothing can be made durable
+        // ahead of process exit any more, and `false` is exactly the
+        // fail-closed answer this function's callers act on.
+        if admit_generation(p).is_none() {
+            return false;
+        }
         let _writer = p.writer.lock().unwrap();
         let target = p.dirty.load(Ordering::SeqCst);
         let snap = capture(&p.cloud);
@@ -745,8 +774,9 @@ pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
 
 /// Synchronously drain every admitted generation, then atomically close
 /// persistence admission before returning the exact final Guardian generation.
-/// A producer whose mutation reaches `persist()` after that boundary waits until
-/// process exit instead of acknowledging state absent from the terminal snapshot.
+/// A producer whose mutation reaches `persist()` after that boundary is refused
+/// without waiting (`admit_generation`): the terminal snapshot is already on
+/// disk, and blocking the producer stalls the runtime instead of protecting it.
 pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
     let Some(p) = PERSISTER.get() else {
         return crate::guardian::close_replication_admission(None);
@@ -771,7 +801,7 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
 
         // persist() registers under this same lock. It therefore either bumped
         // dirty before this stable check (and forces another pass), or observes
-        // closed admission and cannot return before process exit.
+        // closed admission and is refused.
         let mut admission_open = p.lock.lock().unwrap();
         if let Ok(guardian_generation) = write_result {
             if p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
