@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-09-02 — Litebox sandbox shell: one TUN per cell made every second runner panic with EBUSY, and the shell tar had no `node`
+
+The first thing typed into the newly-working dashboard terminal showed two
+faults. `node -v` in a `node22` sandbox answered `Fatal error: glibc detected
+an invalid stdio handle` plus `sh: tcsetattr: Inappropriate ioctl for
+device`, and the shell was wedged afterwards (`id`, `exit` produced
+nothing). And a runner panicked at `litebox_platform_linux_userland/src/
+lib.rs:245 failed to set TUN interface flags: EBUSY`. Both reproduced
+deterministically on the leader with a websocket driver (`shell-run.py`).
+
+- **One TUN device per cell, one owner per TUN.** `setup_cell_net` created
+  `lbt<i>` at provision and every runner of that cell — the function
+  process, each `exec_command`, each `exec_pty` — was started with
+  `--tun-device-name=lbt<i>`. litebox attaches with `TUNSETIFF`, which a
+  second process cannot do on an attached device: the interactive shell held
+  it, so a one-shot exec against the same sandbox (`POST …/commands`, the
+  dashboard's Run panel) died at startup with exit 101, and a second shell
+  did the same. Now `allocate_link()` hands every exec and shell runner its
+  own device and `/30`; the armed `LiteboxLinkRollback` moves into the
+  runner's waiter task and deletes the device when the runner exits (the
+  guest-tar guard rule). The cell's provision-time link serves only the
+  function process; `terminate` still kills every exec and shell group
+  first, so their links go with them.
+- **The shell tar staged sh + coreutils only.** The one-shot exec path
+  stages the resolved program with its `ldd` closure, the pty path never
+  did, so the sandbox's own runtime was absent from its shell — and under
+  litebox's fork emulation a not-found is the worst case, not an error
+  message. `ExecPtyRequest.programs` (additive, defaulted; Firecracker
+  ignores it) carries the interpreter (`node` for `node*`, `python3` for
+  `python*`) from `sandboxes_platform::open_shell`, and the litebox shell
+  tar stages each resolvable one, warning about any it cannot resolve
+  instead of refusing the shell.
+
+Still open, recorded: `npm`/`npx` are scripts under the host's
+`node_modules_22` tree and are not staged (`sandbox-shell-stage-npm`);
+Python sandboxes get a bare 3.12 binary without its stdlib
+(`sandbox-shell-python-stdlib`); a genuinely missing command still kills the
+forked child and wedges the shell — upstream litebox fork emulation
+(`litebox-notfound-wedges-shell`).
+
 ## 2026-09-02 — The dashboard terminal never connected in production: the session cookie was host-only behind the reverse proxy, so the api-host WebSocket arrived anonymous
 
 Reported as `WebSocket connection to 'wss://api.shadw.cloud/v1/projects/

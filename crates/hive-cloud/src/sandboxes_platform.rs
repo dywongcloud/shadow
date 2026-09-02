@@ -91,6 +91,20 @@ pub fn mint_sandbox_id() -> String {
     format!("sbx_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
 }
 
+/// Host programs a sandbox shell needs beyond the fixed tool set, by runtime
+/// family — the interpreter itself. `npm`/`npx` are JS scripts that need the
+/// whole `node_modules` tree and are a separate staging concern (PRD
+/// `sandbox-shell-stage-npm`); Python needs its stdlib tree likewise.
+fn shell_runtime_programs(runtime: &str) -> Vec<String> {
+    if runtime.starts_with("node") {
+        vec!["node".to_string()]
+    } else if runtime.starts_with("python") {
+        vec!["python3".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn runtime_image(runtime: &str) -> &'static str {
     match runtime {
         "node26" => "sandbox-node26",
@@ -759,6 +773,12 @@ impl SandboxProvider for PlatformSandboxProvider {
             .map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc)))
             .collect::<std::collections::BTreeMap<_, _>>();
 
+        // The sandbox's own runtime must be reachable from its shell: the
+        // litebox guest tar holds only sh + coreutils unless told otherwise,
+        // and `node -v` in a node22 sandbox was a not-found that litebox's
+        // fork emulation turns into "glibc detected an invalid stdio handle"
+        // (2026-09-02). Firecracker ignores this (its rootfs has the runtime).
+        let programs = shell_runtime_programs(&sandbox.runtime);
         let req = hive_core::ExecPtyRequest {
             id: session_id,
             shell: String::new(),
@@ -766,6 +786,7 @@ impl SandboxProvider for PlatformSandboxProvider {
             env,
             cols,
             rows,
+            programs,
         };
         backend
             .exec_pty(&handle, req)

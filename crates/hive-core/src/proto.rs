@@ -904,6 +904,18 @@ pub struct ExecPtyRequest {
     pub cols: u16,
     #[serde(default = "default_pty_rows")]
     pub rows: u16,
+    /// Programs the shell must be able to run besides the fixed tool set —
+    /// the sandbox's own runtime (`node` for a `node22` sandbox). Backends
+    /// with a full guest filesystem (Firecracker's rootfs) ignore it; the
+    /// litebox backend stages each one (resolved on the host, with its
+    /// dynamic closure) into the shell's guest tar, which otherwise holds
+    /// only sh + coreutils: `node -v` inside a node22 sandbox shell was a
+    /// not-found, and under litebox's fork emulation a not-found is the
+    /// worst case (the child that prints the error dies "glibc detected an
+    /// invalid stdio handle"), witnessed 2026-09-02. Additive and
+    /// defaulted, so the vsock agent wire shape is unchanged.
+    #[serde(default)]
+    pub programs: Vec<String>,
 }
 
 fn default_pty_cols() -> u16 {

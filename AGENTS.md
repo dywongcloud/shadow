@@ -529,6 +529,26 @@ releases).
   leader's listener and the public round-robin host: 101, first frame is the
   prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
   "exit_code":0}` on `exit`.
+- **A TUN device has ONE owner, so every exec and shell runner gets its
+  own link; the cell's provision-time link serves only the function
+  process.** litebox attaches with `TUNSETIFF`, and a second runner on the
+  same `lbt<i>` panics at startup (`lib.rs:245 failed to set TUN interface
+  flags: EBUSY`, exit 101 — witnessed 2026-09-02 from the dashboard: a shell
+  held the cell's device and the Run panel's one-shot exec died). `exec_
+  command` and `exec_pty` call `allocate_link()` and move the ARMED
+  `LiteboxLinkRollback` into the waiter task, which deletes the device when
+  the runner exits — the same rule as the guest tar below. A runner started
+  against `cell_nets[cell]` is the bug.
+- **The interactive shell stages the sandbox's runtime.**
+  `ExecPtyRequest.programs` (additive, defaulted) names the interpreter
+  (`node` for `node*`, `python3` for `python*`, from
+  `sandboxes_platform::shell_runtime_programs`) and the litebox shell tar
+  stages each resolvable one with its `ldd` closure; the one-shot exec path
+  already staged its resolved program. Without it `node -v` in a node22
+  sandbox was a not-found, which under litebox's fork emulation is fatal
+  (`glibc detected an invalid stdio handle`) and wedges the shell. `npm`
+  (a script over the `node_modules_22` tree) and Python's stdlib are still
+  unstaged — PRD `sandbox-shell-stage-npm` / `sandbox-shell-python-stdlib`.
 - **The guest tar and its descriptor-bound alias belong to the runner's
   WAITER task, never to the function that spawns the runner.** Both
   `allocate_temp_file` and `allocate_initial_files_alias` return Drop guards

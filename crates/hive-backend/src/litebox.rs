@@ -1534,6 +1534,28 @@ impl LiteboxBackend {
     /// (`provision`) is what turns that into a hard error for non-container
     /// cells, since a networkless litebox cell cannot serve anything.
     async fn setup_cell_net(&self, id: &CellId) -> Option<LiteboxNet> {
+        let (net, mut rollback) = self.allocate_link().await?;
+        self.cell_nets.lock().await.insert(id.clone(), net.clone());
+        rollback.commit();
+        Some(net)
+    }
+
+    /// Allocate a fresh TUN device + `/30` that belongs to ONE runner, not to
+    /// the cell. A TUN device has a single owner: litebox's userland stack
+    /// attaches with `TUNSETIFF`, and a second runner attaching to the same
+    /// device gets `EBUSY` and panics at startup (`litebox_platform_linux_
+    /// userland/src/lib.rs:245 failed to set TUN interface flags: EBUSY`,
+    /// witnessed 2026-09-02 in a dashboard terminal: the interactive shell
+    /// held the cell's device, and a one-shot exec against the same cell — or
+    /// a second shell — died on the spot). So the cell's provision-time
+    /// device (`setup_cell_net`) serves ONLY the function process; every
+    /// `exec_command` and `exec_pty` runner gets its own link from here and
+    /// tears it down when it exits: the returned rollback stays ARMED and is
+    /// moved into the runner's waiter task, whose drop deletes the link —
+    /// the same "the guard belongs to the waiter" rule the guest tar follows.
+    /// `None` on any setup failure (no `ip`, no CAP_NET_ADMIN, no
+    /// `/dev/net/tun`), never a panic.
+    async fn allocate_link(&self) -> Option<(LiteboxNet, LiteboxLinkRollback)> {
         use std::sync::atomic::Ordering;
         let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % 16384;
         let third = ((i >> 6) & 0xff) as u8;
@@ -1541,7 +1563,7 @@ impl LiteboxBackend {
         let host_ip = format!("10.88.{third}.{}", base + 1);
         let guest_ip = format!("10.88.{third}.{}", base + 2);
         let tun_dev = format!("lbt{i}");
-        let mut rollback = LiteboxLinkRollback::new(tun_dev.clone());
+        let rollback = LiteboxLinkRollback::new(tun_dev.clone());
 
         // Recreate fresh every time (delete any stale device from a prior
         // cell at this index) — same idempotency shape as
@@ -1585,9 +1607,7 @@ impl LiteboxBackend {
             host_ip,
             guest_ip,
         };
-        self.cell_nets.lock().await.insert(id.clone(), net.clone());
-        rollback.commit();
-        Some(net)
+        Some((net, rollback))
     }
 
     /// Tear down a cell's TUN device (best-effort; no netns/veth/iptables
@@ -3958,10 +3978,6 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
         .context("litebox shell guest tar construction task failed")?
 }
 
-/// The interactive-shell tar: the fixed set only.
-async fn build_shell_tar(archive: File) -> anyhow::Result<()> {
-    build_guest_tar(archive, Vec::new()).await
-}
 
 #[cfg(target_os = "linux")]
 fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<()> {
@@ -4745,18 +4761,21 @@ impl CellBackend for LiteboxBackend {
         if self.execs.lock().await.contains_key(&req.id) {
             anyhow::bail!("exec id {} is already running on this node", req.id);
         }
-        let net = self
-            .cell_nets
-            .lock()
-            .await
-            .get(&cell.id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
-                    cell.id
-                )
-            })?;
+        // The cell must exist (its provision-time link proves it), but this
+        // runner gets its OWN link: a TUN device has one owner, and sharing
+        // the cell's with a live shell or function was `EBUSY` at startup
+        // (see `allocate_link`).
+        anyhow::ensure!(
+            self.cell_nets.lock().await.contains_key(&cell.id),
+            "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+            cell.id
+        );
+        let (net, link) = self.allocate_link().await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "litebox: could not allocate a TUN device for sandbox exec {} (needs `ip`, CAP_NET_ADMIN, /dev/net/tun)",
+                req.id
+            )
+        })?;
 
         let (program, args) = if req.shell {
             let mut line = req.cmd.clone();
@@ -4861,8 +4880,11 @@ impl CellBackend for LiteboxBackend {
             });
             // The runner has exited, so the guest tar and its private alias
             // are provably no longer being read; their Drop guards unlink.
+            // The runner's own TUN link goes the same way: the armed rollback
+            // deletes the device (see `allocate_link`).
             drop(initial_files_alias);
             drop(exec_tar);
+            drop(link);
         });
         Ok(rx)
     }
@@ -4928,23 +4950,41 @@ impl CellBackend for LiteboxBackend {
         // kernel pty exactly as it would over SSH, the same technique
         // `hive-cell-agent`'s Firecracker-guest PTY support uses on the
         // OTHER side of the vsock boundary).
-        let net = self
-            .cell_nets
-            .lock()
-            .await
-            .get(&cell.id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
-                    cell.id
-                )
-            })?;
+        // The cell must exist, but the shell runner gets its OWN TUN link
+        // (one owner per device; sharing the cell's with a function or a
+        // one-shot exec was `EBUSY` — see `allocate_link`).
+        anyhow::ensure!(
+            self.cell_nets.lock().await.contains_key(&cell.id),
+            "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
+            cell.id
+        );
+        let (net, link) = self.allocate_link().await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "litebox: could not allocate a TUN device for the sandbox shell {} (needs `ip`, CAP_NET_ADMIN, /dev/net/tun)",
+                req.id
+            )
+        })?;
 
         let directories = self.prepare_artifact_dirs()?;
         directories.verify_bindings()?;
         let shell_tar = self.allocate_temp_file(&directories.temporary, "shell", ".tar")?;
-        build_shell_tar(shell_tar.file.try_clone()?).await?;
+        // The fixed tool set plus whatever the caller says this shell must be
+        // able to run (the sandbox's runtime — `node` for node22). A program
+        // the host cannot resolve is skipped with a warning rather than
+        // failing the shell: a shell without `node` is still a shell, and the
+        // warning names what the tenant will find missing.
+        let mut extra: Vec<PathBuf> = Vec::new();
+        for program in &req.programs {
+            match resolve_guest_program(program) {
+                Ok(path) => extra.push(path),
+                Err(error) => tracing::warn!(
+                    program,
+                    %error,
+                    "litebox shell: requested runtime program is not resolvable on this host; the shell opens without it"
+                ),
+            }
+        }
+        build_guest_tar(shell_tar.file.try_clone()?, extra).await?;
         let initial_files_alias =
             self.allocate_initial_files_alias(&directories.temporary, &shell_tar.file)?;
 
@@ -5157,6 +5197,9 @@ impl CellBackend for LiteboxBackend {
             // shell was never registered there to begin with, this just
             // guards a hypothetical future caller that keys off cell_id.
             let _ = funcs.lock().await.remove(&cell_id);
+            // The shell runner's own TUN link goes with it: the armed rollback
+            // deletes the device now that no process holds it (`allocate_link`).
+            drop(link);
             // The guest tar and its descriptor-bound alias MUST outlive the
             // runner: their Drop guards unlink the alias name and its scratch
             // directory. Dropping them at the end of `exec_pty` (as this
