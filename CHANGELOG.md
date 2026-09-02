@@ -33,7 +33,13 @@ a sandbox shell stays a litebox gap (PRD `litebox-guest-exec-pty-support`).
 The pump forwards raw chunks with LF normalized to CRLF, never whole lines:
 an interactive shell writes its prompt to stderr with no trailing newline,
 and a line reader held it forever (the roll-5 cut: 101 upgrade, runner
-alive, zero frames).
+alive, zero frames). Measured on that cut before the chunked pump rolled,
+with a websocket client that typed without waiting for a prompt: `echo`,
+`id` (`uid=1000`) and `exit` (`{"exit_code":0,"type":"exited"}`) all
+round-tripped within 100 ms, and the four held prompts arrived as ONE frame
+(`sh-5.2$ sh-5.2$ sh-5.2$ sh-5.2$ exit`) only when `exit` finally supplied
+the newline — the terminal was interactive but blank, which is the whole
+defect the chunked pump removes.
 
 ## 2026-09-01 — Deploy dispatch falls back past an unreachable node; peers keep their real home relay; a missing main entry fails the BUILD, not the node
 
