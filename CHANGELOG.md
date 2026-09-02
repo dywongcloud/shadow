@@ -62,6 +62,21 @@ request and the admin ingress forwards it to the control-plane leader, so a
 follower's own relational state is witnessed from its journal (the
 bring-up line, zero `does not exist`), not from its admin SQL answer.
 
+The third canary found the last piece. Bring-up now ran on both nodes
+(index built in 14–23 ms, zero refresh timeouts, zero `does not exist`) and
+two tables per node — `teams`, `billing_ledger` — still reported unverified:
+`ensure_table_exists` verified with `SELECT 1 FROM t LIMIT 1`, which scans
+every row, and on a cold index each remotely written row is a peer fetch
+of hundreds of milliseconds, so the scan blew the 10 s statement budget
+while the CREATE itself had succeeded. Verification now reads
+`information_schema.tables`, synthesized from the catalog document with no
+row access; after the walk flips readiness the refresher warms every row
+value in one pass through the store's lazy `query`
+(`GuardianRelationalStorage::warm_values`, logged with count and
+duration), and nothing waits on it; the bring-up summary counts the tables
+it gave up on and logs at ERROR when that count is non-zero instead of
+claiming every table verified.
+
 ## 2026-09-02 — hive-node never exited inside systemd's stop timeout: a post-barrier persist() parked the tokio driver
 
 Measured over 75 fleet stops: `hive-node` took 78.4 s (+78.3..78.6 s) to exit
