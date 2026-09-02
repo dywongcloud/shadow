@@ -141,6 +141,18 @@ KillMode=process
 # hard deadline (HIVE_SHUTDOWN_DEADLINE_SECS) is 75 s, so 90 s means the process
 # always exits on its own terms.
 TimeoutStopSec=90s
+# The unit's cgroup holds every child hive-cloud spawns — tenant build
+# processes, conmon, litebox runners, firecracker — under the node's memguard
+# MemoryMax. With systemd's default OOMPolicy=stop, ONE OOM-killed child stops
+# the whole node (SIGTERM, then SIGKILL on the next event a second later):
+# witnessed on fc-virginia 2026-09-02, 12 such stops in 24 h — the SIGTERM
+# hive-cloud logged after the OOM line proves the victim was a child. (The
+# cgroup's lifetime kernel OOM kills were hive-cloud itself at 26.8 GB anon
+# on 2026-08-28, the KV balloon; this directive does not change that case.)
+# `continue` keeps the node up and lets the child's own failure path report
+# it; hive-cloud itself being the victim still exits and Restart=always
+# brings it back, exactly as before.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

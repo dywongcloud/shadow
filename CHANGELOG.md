@@ -82,6 +82,22 @@ heartbeat checks before every marker write. `hive-node.service.j2` sets
 `TimeoutStopSec=90s` explicitly. Expected graceful path after the roll:
 ~30 s, exiting on its own before either deadline.
 
+A sixth, found while canarying the five: on fc-virginia the old binary was
+SIGKILLed 1.2 s after SIGTERM, not at 90 s, and the journal explained it —
+`hive-node.service: A process of this unit has been killed by the OOM
+killer`, twice a second apart. The unit's cgroup holds every child hive-cloud
+spawns (tenant builds, conmon, litebox runners, firecracker) under the
+node's memguard `MemoryMax` (31.5 GiB on va), and systemd's default
+`OOMPolicy=stop` turns ONE OOM-killed child into a stop of the whole node —
+the SIGTERM hive-cloud logged right after the OOM line proves today's victim
+was a child, not hive-cloud (12 such OOM-stop events in 24 h on va). The
+cgroup's 35 lifetime kernel OOM kills are a different case: every one was
+hive-cloud itself at 26.8 GB anon-rss on 2026-08-28, the KV balloon fixed
+since. `hive-node.service.j2` now sets `OOMPolicy=continue` — a child's own
+failure path reports it and the control plane stays up; hive-cloud itself
+being the victim still exits and restarts under `Restart=always` exactly as
+before.
+
 ## 2026-09-02 — Leader relay drops: iroh's relay actor read its stream only when it had nothing to send
 
 The control-plane leader logged `iroh::socket::transports::relay::actor:

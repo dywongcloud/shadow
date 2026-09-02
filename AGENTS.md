@@ -259,7 +259,15 @@ history).
   succeeds and only leaves a drained node dark. (5)
   `restart_audit::mark_clean_exit` latches a flag the heartbeat checks, so
   the clean-exit marker is never overwritten with `clean_exit=false` by a
-  later tick.
+  later tick. (6) `OOMPolicy=continue`: the unit's cgroup holds every child
+  hive-cloud spawns (tenant builds, conmon, litebox runners, firecracker)
+  under memguard's `MemoryMax`, and systemd's default `stop` turned one
+  OOM-killed child into a stop of the whole node (fc-virginia, 12 in 24 h);
+  hive-cloud itself as the victim still exits and restarts as before.
+  Witnessed on the first canary of these fixes: `public listener drained
+  open_connections=0 elapsed_ms=0`, the guardian wait giving up at 10 s,
+  then `persist refused after the shutdown barrier` — the exact call that
+  used to park the runtime.
 - podman allocates one lock from a **fixed pool** (`num_locks`, default 2048)
   per CONTAINER **and per VOLUME**. The pool is per-host and shared by every
   tenant, so leaking locks starves the whole node: witnessed 2032 leaked
