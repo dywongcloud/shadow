@@ -21,7 +21,16 @@ cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null; rm -rf "$DATA" "
 trap cleanup EXIT
 
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
-bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+# A FAIL prints the node's own log tail right there: CI keeps only stdout, so
+# without this a failed step ("alpha self-delete failed", 2026-09-02) has no
+# diagnosis at all and has to be re-run blind.
+bad()  {
+  echo "  FAIL: $1"; FAIL=$((FAIL+1))
+  if [ -f "$DATA/node.log" ]; then
+    echo "  --- node.log tail ---"
+    tail -n 20 "$DATA/node.log" | cut -c1-220 | sed 's/^/  | /'
+  fi
+}
 # assert <description> <command...>  → command must exit 0
 assert() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi; }
 # assert_out <description> <expected-substr> <command...>  → stdout must contain substr
@@ -102,7 +111,13 @@ DBID="$(curl -s -m5 -X POST "$API/v1/databases" -H "authorization: Bearer $KEY_A
 [ "$(hcode "$API/v1/databases/$DBID/credentials" -H "authorization: Bearer $KEY_B")" = "404" ] && ok "beta BLOCKED from alpha's DB credentials (404)" || bad "beta read alpha's credentials (LEAK)"
 [ "$(hcode -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_B")" = "404" ] && ok "beta BLOCKED from deleting alpha's database (404)" || bad "beta deleted alpha's db"
 [ "$(hcode "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha's database SURVIVED beta's delete attempt" || bad "db lost to cross-tenant delete"
-[ "$(hcode -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha deletes its OWN database (200)" || bad "alpha self-delete failed"
+# The owner's delete tears the backing container down INLINE (`podman rm -f
+# -v`, up to podman's 10 s stop grace) and, on a host with podman, contends
+# with the provision's still-running image pull for the storage lock -- a
+# by-design wait, not a fault. 2.3-2.5 s on the CI runner when the pull is
+# done, >5 s when it is not (2026-09-02, the run at 04:12 UTC): budget it
+# like the teardown it is, not like the 5 s reads around it.
+[ "$(curl -s -m25 -o /dev/null -w '%{http_code}' -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha deletes its OWN database (200)" || bad "alpha self-delete failed"
 
 # --- Webhooks: tenant-scoped list + delete (validates the new Webhook.team field). ---
 WHID="$(curl -s -m5 -X POST "$API/v1/webhooks" -H "authorization: Bearer $KEY_A" -H 'content-type: application/json' -d '{"url":"https://alpha.example/hook"}' | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d[0] if isinstance(d,list) else d).get("id",""))')"
