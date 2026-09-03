@@ -21,8 +21,26 @@
 # re-diff against the module doc's security-posture claims in
 # crates/hive-backend/src/litebox.rs, and re-verify with --litebox-probe
 # before rolling.
+#
+# 2026-09-04: upstream AnEntrypoint/litebox's ENTIRE git history was wiped
+# and replaced with one squashed "Initial commit" (repo `created_at` ==
+# commit date == 2026-09-03T14:11:38Z; the previously-pinned
+# 19532929bbe59769ce9653fdde3c69852d85b9b3 no longer exists anywhere on
+# GitHub, confirmed via `gh api repos/.../commits/<sha>` returning 422).
+# Investigated before re-pinning (not taken on faith): the repo's
+# `created_at` timestamp exactly matches the commit, the sole commit author
+# `lanmower` is a genuine long-standing GitHub account (created 2011, real
+# org member of AnEntrypoint, bio references this same platform's own `gm`
+# tooling), and the new checkout's README/file layout/crate structure is
+# unambiguously the same real LiteBox project (not a name-squat). THIS
+# repo's own `networking.patch` applies CLEANLY (`git apply --check` exit 0)
+# against the new tree with zero changes needed, which is strong structural
+# corroboration. The "500+ commits, real weeks-long history" provenance
+# claim above is now STALE (that history no longer exists to check) —
+# re-verify provenance again, not just re-apply this note, if the repo is
+# ever bumped again.
 litebox_repo_url: "https://github.com/AnEntrypoint/litebox"
-litebox_commit: "19532929bbe59769ce9653fdde3c69852d85b9b3"
+litebox_commit: "c325d5d9d446948b2b9030a3589bbee482b58c88"
 litebox_src_dir: "/root/litebox-src"
 
 # Whether this host's HIVE_LITEBOX_VERIFIED=1 systemd drop-in should be

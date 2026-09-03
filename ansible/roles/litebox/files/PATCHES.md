@@ -74,6 +74,43 @@ an interactive session, once the CellBackend `exec_pty` implementation for
 `LiteboxBackend` lands) needs to prove before `HIVE_LITEBOX_VERIFIED=1` is
 set on any node relying on this.
 
+## 2026-09-04: upstream history wiped — the above provenance evidence is now historical, not re-derivable
+
+`AnEntrypoint/litebox`'s ENTIRE git history was replaced with a single
+squashed "Initial commit" (repo `created_at` == commit date ==
+2026-09-03T14:11:38Z, confirmed via the GitHub API; the previously-pinned
+`19532929bbe59769ce9653fdde3c69852d85b9b3` returns 422 "No commit found" —
+it no longer exists anywhere on GitHub). The "500+ commits, real dated
+history" and "85 real, individually dated commits for fork_process" claims
+above describe history that genuinely existed and was genuinely checked at
+the time — they are not fabricated — but that history is now GONE and
+cannot be re-checked by a future session; do not cite those specific commit
+counts as still-verifiable.
+
+Re-verified legitimacy a different way before re-pinning to the new tip
+(`c325d5d9d446948b2b9030a3589bbee482b58c88`), not taken on faith: (1) the
+repo's `created_at` timestamp exactly matches the sole commit's timestamp,
+consistent with a genuine delete-and-recreate rather than a hidden partial
+history; (2) the commit author `lanmower` is a real, long-standing GitHub
+account (created 2011, 34 followers, 201 public repos) and a genuine
+current member of the `AnEntrypoint` org (`GET orgs/AnEntrypoint/members`),
+whose own bio references this same platform's `gm`/`plugkit` tooling; (3)
+the new checkout's README, file layout, and full crate structure
+(`litebox_shim_linux`, `litebox_platform_linux_userland`,
+`litebox_runner_linux_userland`, etc.) are unambiguously the same real
+LiteBox project, not a name-squat with unrelated content; (4) this
+directory's own `networking.patch` applies CLEANLY (`git apply --check`,
+exit 0, zero changes needed) against the new tree — real structural
+corroboration that the surrounding code this patch targets is materially
+unchanged, not a rewrite that happens to share a name. What this does NOT
+establish: whether the specific fork()/wait4()/pty fixes documented above
+are still present in the new squashed commit's code — re-run this
+document's own "spot-read `litebox_shim_linux/src/syscalls/process.rs`,
+confirm `required_clone_flags` no longer exists" check against the new pin
+before trusting those specific claims again, and re-run
+`hive-cloud --litebox-probe` on a drained canary before extending
+`HIVE_LITEBOX_VERIFIED=1` to any additional node on this new pin.
+
 # litebox networking.patch
 
 Applied by `ansible/roles/litebox/tasks/main.yml` via `git apply` right after
