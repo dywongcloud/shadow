@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-09-03 — Staging npm/Python into sandbox shells exposed a second, un-fixed GNU-tar-header bug — fleet-wide shell panic, found and fixed same day
+
+`node -v` inside a `node22` sandbox shell was a not-found (the shell tar
+carried only `sh` + coreutils, never the sandbox's own runtime), fatal under
+litebox's fork emulation. Fix: `ExecPtyRequest.programs` now names the
+runtime interpreter, and litebox's `support_tree_for` stages `node`'s npm
+tree (`/usr/lib/node_modules_22`, 15 MB / 1.7k files) or Python's stdlib
+(`/usr/lib64/python3.12`, 63 MB / 2.8k files) alongside it — bounded, docs/
+`__pycache__`/symlinks skipped.
+
+That staging immediately broke every litebox shell fleet-wide once rolled:
+`litebox/src/fs/tar_ro.rs:522` panicked (`ParseInt`, exit 101) the instant a
+shell opened. Root cause was a REGRESSION only in the sense that nothing had
+ever crossed its threshold before: `litebox_tar_header` built GNU-format tar
+headers, and `runtime_artifact.rs`'s own 2026-08-26 fix for this exact bug
+class ("never GNU headers", see `litebox-guest-tar-and-shim-gaps` memory)
+had never been applied to this second, separate header constructor in the
+same crate. The `tar` crate only takes the ustar prefix/name path-split
+branch litebox's reader is written to expect when the header is genuinely
+ustar; a GNU header over the 100-byte `name` field falls to the GNU longname
+extension entry instead, which litebox misparses as a real file. npm's
+deepest staged path (120 bytes) was the first thing in this crate's history
+to cross that line. Fixed by switching `litebox_tar_header` to
+`Header::new_ustar()`. Canary-verified with a direct binary swap on the
+leader before the fleet roll: `node -v` works, a concurrent exec still works
+(no regression to the same-day TUN-per-runner fix), the shell no longer
+panics.
+
+Not fixed, and unrelated to either change above: a litebox interactive shell
+still runs at most one external command per session before going silent —
+an upstream fork-emulation limitation, write-up drafted for the maintainer,
+not filed pending the user's go-ahead (opening an issue on a third-party
+repo is an outbound action).
+
 ## 2026-09-02 — Litebox sandbox shell: one TUN per cell made every second runner panic with EBUSY, and the shell tar had no `node`
 
 The first thing typed into the newly-working dashboard terminal showed two
