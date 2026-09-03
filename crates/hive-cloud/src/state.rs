@@ -692,6 +692,10 @@ impl CloudState {
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();
         let node_name_for_sandboxes = node_name.clone();
+        // One shared client for general platform HTTP + the geo lookup cache
+        // (reqwest::Client is Arc-backed internally, so cloning it is cheap
+        // and shares one connection pool instead of opening two).
+        let http = reqwest::Client::new();
         let state = Arc::new(CloudState {
             region,
             node_name,
@@ -726,8 +730,8 @@ impl CloudState {
             gw,
             fluid,
             hive,
-            http: reqwest::Client::new(),
-            dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
+            http: http.clone(),
+            dns_geo: crate::dns_geo::GeoCache::spawn(http),
             dns_probes: Arc::new(crate::dns_probe::NsProbes::new()),
             acme_challenges: crate::acme::AcmeChallengeStore::new(),
             acme_http01: crate::acme::Http01Store::new(),

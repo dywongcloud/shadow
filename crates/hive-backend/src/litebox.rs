@@ -3445,7 +3445,23 @@ async fn append_litebox_runtime_augmentation(
 
 #[cfg(target_os = "linux")]
 fn litebox_tar_header(length: u64, mode: u32) -> anyhow::Result<tar::Header> {
-    let mut header = tar::Header::new_gnu();
+    // ustar, NOT GNU: litebox's own reader (`litebox/src/fs/tar_ro.rs`) reads
+    // the POSIX ustar `prefix`+`name` split for a long path — its own source
+    // comment names `usr/lib/node_modules/npm/node_modules/...` as exactly
+    // the case that split exists for — but has no arm for the GNU-specific
+    // long-name extension entry (`typeflag='L'`). The `tar` crate only takes
+    // the ustar prefix/name split path when the header itself is ustar
+    // (`Header::as_ustar_mut()` returns `None` for a GNU header, a different
+    // byte layout at the same offset); a GNU header whose path exceeds the
+    // 100-byte `name` field falls straight to the `L`-entry extension
+    // instead, which the reader misparses as a real file and panics on
+    // (`tar_ro.rs:522`, `ParseInt`, reading the extension payload as if it
+    // were a mode field). Every previously-staged program had a short path,
+    // so this was latent until the npm/Python support trees (2026-09-03,
+    // `support_tree_for`) staged paths past 100 bytes for the first time.
+    // ustar's own limit is 100+155 bytes (prefix/name combined) — real
+    // enough for every path either tree contains.
+    let mut header = tar::Header::new_ustar();
     header.set_uid(0);
     header.set_gid(0);
     header.set_mtime(0);
@@ -3908,13 +3924,101 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Support trees a resolved `extra` program needs beyond its own `ldd`
+/// closure — the closure only covers a real ELF's shared-library deps, but
+/// `node`/`python3` are interpreters whose OWN standard library is a tree of
+/// plain files (JS modules, `.py`/`.pyc`, no `ldd` output at all). Keyed by
+/// the resolved program path's file NAME, not by the requested string,
+/// because `resolve_guest_program` already turned e.g. `"node"` into
+/// `/usr/bin/node`. Skipped harmlessly if the host doesn't have the tree
+/// (an older base image, a stripped-down build) — see `stage_tree`'s doc.
+fn support_tree_for(resolved: &Path) -> Option<&'static Path> {
+    match resolved.file_name().and_then(|n| n.to_str())? {
+        // npm/npx are scripts under this tree (`bin/npm-cli.js`), not
+        // separate binaries — staging `node` alone leaves `npm install`
+        // a not-found. The tree also carries npm's own vendored
+        // dependencies (its `node_modules/`), so one walk covers both.
+        "node" | "node-22" | "node-24" | "node-26" => {
+            Some(Path::new("/usr/lib/node_modules_22"))
+        }
+        "python3" | "python3.12" | "python3.13" => Some(Path::new("/usr/lib64/python3.12")),
+        _ => None,
+    }
+}
+
+/// Bound on any one support-tree walk — real trees here are ~15-60 MiB /
+/// 1.7-2.8k files (npm, Python's stdlib); a limit an order of magnitude
+/// above that catches a misconfigured path pointing at something huge
+/// instead of silently staging tens of thousands of files into every shell.
+const SUPPORT_TREE_MAX_FILES: usize = 20_000;
+
+/// Recursively list every REGULAR file under `dir` (relative to `dir`'s own
+/// root, i.e. absolute paths, since the caller stages absolute guest paths
+/// throughout this module). Symlinks are skipped, not followed — matching
+/// `build_shell_tar_blocking`'s own `follow_symlinks(false)`, and the only
+/// symlinks these two known trees contain (`npm/man`, `npm/docs`) are
+/// documentation, never on an execution path. `.pyc`/`__pycache__` bytecode
+/// caches are skipped: Python compiles pycache lazily and per-invocation
+/// anyway, so shipping the host's stale cache buys nothing and only adds
+/// file count. Best-effort: a read error on one entry (permission, a file
+/// that vanished mid-walk) is logged and skipped, never fails the whole
+/// shell — an incomplete support tree is a "some stdlib modules missing"
+/// gap, not a "no shell at all" one.
+fn walk_support_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(error) => {
+                tracing::debug!(dir = %d.display(), %error, "litebox support tree: read_dir failed; skipping this subtree");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            if out.len() >= SUPPORT_TREE_MAX_FILES {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    limit = SUPPORT_TREE_MAX_FILES,
+                    "litebox support tree: hit the file-count bound; the rest of this tree is NOT staged"
+                );
+                return out;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "__pycache__" || n == "man" || n == "docs")
+                {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|e| e.to_str()) != Some("pyc")
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 /// Async half of guest-tar construction for interactive shells AND one-shot
 /// execs: the fixed shell/coreutils set plus `extra` programs (the resolved
-/// `exec_command` binary), each with its `ldd` closure (a real subprocess
-/// spawn — cannot run inside the blocking tar-writer below), merged/deduped
-/// and handed to the blocking writer. A closure failure on an EXTRA program
-/// (a static binary or a script has none) stages the program alone; the
-/// fixed set's closure stays strict, as it always was.
+/// `exec_command` binary, or the sandbox runtime for an interactive shell —
+/// see `ExecPtyRequest.programs`), each with its `ldd` closure (a real
+/// subprocess spawn — cannot run inside the blocking tar-writer below) and,
+/// for an interpreter like `node`/`python3`, its support tree
+/// (`support_tree_for`), merged/deduped and handed to the blocking writer.
+/// A closure failure on an EXTRA program (a static binary or a script has
+/// none) stages the program alone; the fixed set's closure stays strict, as
+/// it always was.
 async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
     let mut deps: Vec<PathBuf> = Vec::new();
@@ -3947,6 +4051,28 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
                 %error,
                 "litebox exec: no dynamic closure for program; staging it alone"
             ),
+        }
+        if let Some(tree) = support_tree_for(&program) {
+            if tree.is_dir() {
+                let tree_buf = tree.to_path_buf();
+                let walk_target = tree_buf.clone();
+                let files = tokio::task::spawn_blocking(move || walk_support_tree(&walk_target))
+                    .await
+                    .unwrap_or_default();
+                tracing::debug!(
+                    program = %program.display(),
+                    tree = %tree_buf.display(),
+                    files = files.len(),
+                    "litebox: staging interpreter support tree"
+                );
+                programs.extend(files);
+            } else {
+                tracing::debug!(
+                    program = %program.display(),
+                    tree = %tree.display(),
+                    "litebox: support tree absent on this host; interpreter stages alone"
+                );
+            }
         }
         programs.push(program);
     }
