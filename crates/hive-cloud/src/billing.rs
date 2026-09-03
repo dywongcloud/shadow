@@ -8,6 +8,7 @@
 use hive_core::now_ms;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -265,12 +266,40 @@ pub struct Invoice {
     /// "paid" | "due" | "draft"
     pub status: String,
     pub created_ms: u64,
+    /// Tamper-evident commitment over this SAME period's raw ledger entries.
+    /// `Some` only once `account()`'s rollover computed one — never on a
+    /// "draft" invoice from `current_invoice`. `#[serde(default)]` so
+    /// pre-existing persisted invoices load with `None`.
+    #[serde(default)]
+    pub ledger_checkpoint: Option<LedgerCheckpoint>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InvoiceLine {
     pub description: String,
     pub amount_cents: i64,
+}
+
+/// Tamper-evident commitment over one tenant-period's raw `LedgerEntry` rows.
+/// NOT a zk-SNARK/STARK: there is no external, untrusted verifier for this
+/// platform's own billing process to convince, so this is a plain SHA-256
+/// hash chain giving tamper-evidence and fast replay verification, not real
+/// zero-knowledge trust-minimization. See `BillingStore::compute_ledger_checkpoint`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LedgerCheckpoint {
+    pub tenant: String,
+    pub period_start_ms: u64,
+    pub period_end_ms: u64,
+    /// Number of raw `LedgerEntry` rows folded into `commitment` — a fast
+    /// "does this still look complete" check without re-hashing.
+    pub entry_count: u64,
+    /// hex(SHA-256) chain root over every entry in
+    /// `[period_start_ms, period_end_ms)`, ordered `(ts_ms, id)` ASC.
+    pub commitment: String,
+    /// True once the raw entries this commitment covers have actually been
+    /// pruned from both the in-memory ledger and `billing_ledger`.
+    pub pruned: bool,
+    pub created_ms: u64,
 }
 
 /// Max function runtime (seconds) allowed on a plan. Enterprise unlocks 1 hour.
@@ -533,11 +562,17 @@ impl BillingStore {
             // control-plane leader once account() started being called more
             // frequently (relational mirror loop, one call per tenant per
             // tick) raised the odds of landing on a tenant mid-rollover.
-            let closing = build_invoice(
+            let mut closing = build_invoice(
                 acc,
                 self.usage_cost_cents_since(tenant, acc.period_start_ms),
                 "paid",
             );
+            // Compute the checkpoint from the OLD period_start_ms, before it's
+            // overwritten below. compute_ledger_checkpoint touches only
+            // `self.ledger` (never `self.accounts`), same locking-safety rule
+            // as `usage_cost_cents_since` above — `m` is still held here.
+            closing.ledger_checkpoint =
+                Some(self.compute_ledger_checkpoint(tenant, acc.period_start_ms, now));
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
@@ -607,6 +642,112 @@ impl BillingStore {
             .filter(|e| e.tenant == tenant && e.kind == "usage" && e.ts_ms >= period_start_ms)
             .map(|e| -e.amount_cents) // usage entries are negative amounts
             .sum()
+    }
+
+    /// Compute (never mutates) a tamper-evident SHA-256 hash-chain commitment
+    /// over a tenant's raw ledger entries in `[period_start_ms, period_end_ms)`.
+    /// Touches only `self.ledger` — safe to call while the caller holds
+    /// `self.accounts`'s write lock, same rule as `usage_cost_cents_since`.
+    ///
+    /// Entries are sorted `(ts_ms, id)` ASC before chaining: `self.ledger` is
+    /// push-appended across all tenants concurrently, not itself ordered per
+    /// tenant, so the chain must be computed over a deterministic order or two
+    /// computations of the "same" period would disagree. `0x1F` (ASCII unit
+    /// separator) delimits fields to avoid ambiguous concatenation without a
+    /// canonicalized encoding. The genesis hash is domain-separated by a
+    /// version string + tenant + period start so two tenants'/periods' empty
+    /// chains never collide, and leaves a `v2` escape hatch if this leaf
+    /// encoding ever changes.
+    pub(crate) fn compute_ledger_checkpoint(
+        &self,
+        tenant: &str,
+        period_start_ms: u64,
+        period_end_ms: u64,
+    ) -> LedgerCheckpoint {
+        const SEP: u8 = 0x1F;
+        let mut entries: Vec<LedgerEntry> = self
+            .ledger
+            .read()
+            .iter()
+            .filter(|e| e.tenant == tenant && e.ts_ms >= period_start_ms && e.ts_ms < period_end_ms)
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.id.cmp(&b.id)));
+
+        let mut chain = Sha256::new();
+        chain.update(b"hive-billing-ledger-checkpoint-v1");
+        chain.update([SEP]);
+        chain.update(tenant.as_bytes());
+        chain.update([SEP]);
+        chain.update(period_start_ms.to_string().as_bytes());
+        let mut chain = chain.finalize();
+
+        for e in &entries {
+            let mut leaf = Sha256::new();
+            leaf.update(e.id.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.tenant.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.ts_ms.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.kind.as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.amount_cents.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.balance_after_cents.to_string().as_bytes());
+            leaf.update([SEP]);
+            leaf.update(e.note.as_bytes());
+            let leaf = leaf.finalize();
+
+            let mut next = Sha256::new();
+            next.update(chain);
+            next.update([SEP]);
+            next.update(leaf);
+            chain = next.finalize();
+        }
+
+        LedgerCheckpoint {
+            tenant: tenant.to_string(),
+            period_start_ms,
+            period_end_ms,
+            entry_count: entries.len() as u64,
+            commitment: hex::encode(chain),
+            pruned: false,
+            created_ms: now_ms(),
+        }
+    }
+
+    /// Remove raw entries for tenant/period from the IN-MEMORY ledger only —
+    /// the relational side is pruned separately via
+    /// `relational::prune_billing_ledger`. Returns the count removed.
+    pub(crate) fn prune_ledger_range(
+        &self,
+        tenant: &str,
+        period_start_ms: u64,
+        period_end_ms: u64,
+    ) -> usize {
+        let mut g = self.ledger.write();
+        let before = g.len();
+        g.retain(|e| {
+            !(e.tenant == tenant && e.ts_ms >= period_start_ms && e.ts_ms < period_end_ms)
+        });
+        before - g.len()
+    }
+
+    /// Mark the in-memory `Invoice` whose checkpoint covers
+    /// `[period_start_ms, period_end_ms)` as pruned, so a restart's
+    /// `invoices_load` correctly remembers pruned-state without re-attempting
+    /// an already-completed relational delete on every tick.
+    pub(crate) fn mark_checkpoint_pruned(&self, tenant: &str, period_start_ms: u64) {
+        if let Some(invs) = self.invoices.write().get_mut(tenant) {
+            for inv in invs.iter_mut() {
+                if let Some(cp) = inv.ledger_checkpoint.as_mut() {
+                    if cp.period_start_ms == period_start_ms {
+                        cp.pruned = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Record metered compute usage (a fact — always accrues, never rejected). Uses
@@ -1283,6 +1424,10 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
         total_cents: subtotal,
         status: status.to_string(),
         created_ms: now_ms(),
+        // Never set here — drafts (`current_invoice`) must never carry a
+        // checkpoint; the rollover call site in `account()` overwrites this
+        // with a real one for a finalized period.
+        ledger_checkpoint: None,
     }
 }
 

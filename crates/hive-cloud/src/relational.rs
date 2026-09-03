@@ -294,6 +294,7 @@ pub(crate) async fn init_schema() {
     reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
+    reconcile_billing_invoices_schema(&mut session).await;
     // Success used to be silent, so a node whose bring-up never ran was
     // indistinguishable in the journal from one whose bring-up succeeded.
     let failed = SCHEMA_BRINGUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
@@ -1092,6 +1093,7 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
     let mut s = session(db).await;
     reconcile_billing_accounts_schema(&mut s).await;
     reconcile_billing_checkouts_schema(&mut s).await;
+    reconcile_billing_invoices_schema(&mut s).await;
 
     for (account, ledger, invoices, checkouts) in batch {
         let mut sql = String::from("BEGIN;");
@@ -1168,6 +1170,69 @@ fn build_ledger_sql(ledger: &[crate::billing::LedgerEntry]) -> String {
     sql
 }
 
+/// Row count of `billing_ledger` for `tenant` in `[period_start_ms,
+/// period_end_ms)` — the durability-gate read: pruning must never proceed
+/// until the relational mirror has actually caught up to a checkpoint's
+/// `entry_count`.
+pub(crate) async fn count_billing_ledger_rows(
+    tenant: &str,
+    period_start_ms: u64,
+    period_end_ms: u64,
+) -> Result<u64, String> {
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("guardian sql unavailable: {e}"))?;
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT COUNT(*) FROM billing_ledger WHERE tenant = {} AND ts_ms >= {} AND ts_ms < {}",
+        q(tenant),
+        period_start_ms,
+        period_end_ms,
+    );
+    let res = exec(&mut s, &query).await?;
+    for r in &res {
+        if let ExecResult::Rows { rows, .. } = r {
+            if let Some(row) = rows.first() {
+                let n = match row.first() {
+                    Some(SqlValue::Int8(n)) => *n as u64,
+                    Some(SqlValue::Int4(n)) => *n as u64,
+                    _ => 0,
+                };
+                return Ok(n);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// DELETE every `billing_ledger` row for `tenant` in `[period_start_ms,
+/// period_end_ms)` — called ONLY after the corresponding `LedgerCheckpoint`
+/// is durable (see `main.rs`'s billing-meter-loop prune step). Runs as its
+/// OWN single-statement autocommit DELETE, deliberately NOT folded into
+/// `upsert_billing_many`'s `BEGIN;...COMMIT;` write transaction: that
+/// transaction's own INSERT half has nothing left in `ledger` for this range
+/// by the time pruning runs, so mixing in a DELETE would let a prune failure
+/// roll back an unrelated account/invoice write. Idempotent: a DELETE on an
+/// already-empty range is a no-op, so a retried call after a crash is safe.
+pub(crate) async fn prune_billing_ledger(
+    tenant: &str,
+    period_start_ms: u64,
+    period_end_ms: u64,
+) -> Result<(), String> {
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("guardian sql unavailable: {e}"))?;
+    let mut s = session(db).await;
+    let sql = format!(
+        "DELETE FROM billing_ledger WHERE tenant = {} AND ts_ms >= {} AND ts_ms < {}",
+        q(tenant),
+        period_start_ms,
+        period_end_ms,
+    );
+    exec(&mut s, &sql).await?;
+    Ok(())
+}
+
 /// SQL for every FINALIZED invoice (+ its line items) — a draft
 /// (`status != "paid"`) is always skipped, never persisted as a row (see
 /// `upsert_billing`'s original doc comment on why: a draft is transient,
@@ -1179,14 +1244,22 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
         if inv.status != "paid" {
             continue;
         }
+        let (commitment, entry_count, pruned) = match inv.ledger_checkpoint.as_ref() {
+            Some(cp) => (cp.commitment.clone(), cp.entry_count, cp.pruned),
+            None => (String::new(), 0u64, false),
+        };
         sql.push_str(&format!(
             "INSERT INTO billing_invoices (id, tenant, number, plan, period_start_ms, period_end_ms, \
-             subtotal_cents, total_cents, status, created_ms) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             subtotal_cents, total_cents, status, created_ms, \
+             ledger_commitment, ledger_entry_count, ledger_pruned) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, number = excluded.number, \
              plan = excluded.plan, period_start_ms = excluded.period_start_ms, \
              period_end_ms = excluded.period_end_ms, subtotal_cents = excluded.subtotal_cents, \
-             total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms;",
+             total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms, \
+             ledger_commitment = excluded.ledger_commitment, \
+             ledger_entry_count = excluded.ledger_entry_count, \
+             ledger_pruned = excluded.ledger_pruned;",
             q(&inv.id),
             q(&inv.tenant),
             q(&inv.number),
@@ -1197,6 +1270,9 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
             inv.total_cents,
             q(&inv.status),
             inv.created_ms,
+            q(&commitment),
+            entry_count,
+            if pruned { 1 } else { 0 },
         ));
         // Stable per-line id: parent invoice id + its zero-padded index in
         // `lines` (e.g. "in_abc123-000", "in_abc123-001") — deterministic
@@ -1417,6 +1493,43 @@ async fn reconcile_billing_checkouts_schema(
     }
     if all_ok {
         BILLING_CHECKOUTS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `billing_invoices`' ledger-checkpoint columns (the ephemeral tamper-evident
+/// ledger work) — `billing_invoices` already exists on every real node, so
+/// (as with `billing_checkouts` above) these need ALTER-based reconciliation
+/// rather than a `CREATE TABLE IF NOT EXISTS` edit, which is a no-op there.
+const BILLING_INVOICES_NEW_COLUMNS: &[(&str, &str, &str)] = &[
+    ("ledger_commitment", "TEXT", "''"),
+    ("ledger_entry_count", "BIGINT", "0"),
+    ("ledger_pruned", "BIGINT", "0"),
+];
+
+/// See `BILLING_ACCOUNTS_SCHEMA_RECONCILED` — same memoization discipline.
+static BILLING_INVOICES_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See `reconcile_billing_checkouts_schema` — identical shape, called from
+/// the same sites (`init_schema()`, unconditionally from `upsert_billing_many`).
+async fn reconcile_billing_invoices_schema(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+) {
+    if BILLING_INVOICES_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut all_ok = true;
+    for (col, ty, default) in BILLING_INVOICES_NEW_COLUMNS {
+        let ddl = format!(
+            "ALTER TABLE billing_invoices ADD COLUMN IF NOT EXISTS {col} {ty} NOT NULL DEFAULT {default}"
+        );
+        if let Err(e) = exec(s, &ddl).await {
+            all_ok = false;
+            tracing::warn!(column = col, error = %e, "relational: ALTER TABLE billing_invoices add column failed");
+        }
+    }
+    if all_ok {
+        BILLING_INVOICES_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2851,7 +2964,8 @@ pub(crate) async fn billing_snapshot(
     let ledger = Some(serde_json::Value::Array(ledger_rows).to_string());
 
     let inv_q = format!(
-        "SELECT id, number, plan, period_start_ms, period_end_ms, subtotal_cents, total_cents, status, created_ms \
+        "SELECT id, number, plan, period_start_ms, period_end_ms, subtotal_cents, total_cents, status, created_ms, \
+         ledger_commitment, ledger_entry_count, ledger_pruned \
          FROM billing_invoices WHERE tenant = {} ORDER BY period_start_ms DESC",
         q(tenant)
     );

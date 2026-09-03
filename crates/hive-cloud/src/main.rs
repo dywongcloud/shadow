@@ -5085,6 +5085,141 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             if !acting {
                 continue;
             }
+            // Ephemeral ledger checkpoint pruning — SAME leader-elected `acting`
+            // gate above, no separate election mechanism. Runs every tick
+            // regardless of fleet-wide usage activity: a tenant with a
+            // finalized, durable, grace-period-elapsed checkpoint is prune-
+            // eligible even in a tick with zero function stats (this must
+            // NOT be gated behind the `stats.is_empty()` early-return below,
+            // which only concerns metering — a tenant that stops generating
+            // usage must still get pruned). A checkpoint is a tamper-evident
+            // SHA-256 hash chain (NOT a zk-SNARK/STARK: the verifier is this
+            // platform's own process, never an external party, so there is
+            // nothing for real ZK cryptography to buy here — see
+            // billing::LedgerCheckpoint's doc comment), computed once at
+            // period-close in `BillingStore::account()`'s rollover branch.
+            // Once a checkpoint is durable and its grace period has elapsed,
+            // the raw entries it covers become eligible for pruning from
+            // both the relational mirror and the in-memory ledger — never
+            // the account itself (billing.rs's `remove_account` stays
+            // untouched; pruning and account deletion are orthogonal by
+            // construction).
+            // Tenants that had at least one checkpoint pruned this tick — the
+            // in-memory `pruned=true` flag they now carry must be mirrored
+            // even on a quiet tick (zero fleet-wide usage), since the normal
+            // per-tenant mirror write below only runs for tenants present in
+            // `stats`/`metered`, and this whole block deliberately runs
+            // BEFORE that early-return so a usage-quiet tenant still prunes.
+            let mut pruned_tenants: Vec<String> = Vec::new();
+            for acc in cloud.billing.all_accounts() {
+                let tenant = acc.tenant.as_str();
+                let invs = cloud.billing.finalized_invoices(tenant);
+                for inv in &invs {
+                    let Some(cp) = inv.ledger_checkpoint.as_ref() else {
+                        continue;
+                    };
+                    if cp.pruned {
+                        continue;
+                    }
+                    let grace = env_u64("HIVE_LEDGER_PRUNE_GRACE_MS", 7 * 24 * 60 * 60 * 1000);
+                    if now_ms().saturating_sub(inv.created_ms) < grace {
+                        continue;
+                    }
+                    // Durability gate: never prune the in-memory copy ahead of
+                    // the relational mirror having actually caught up — skip
+                    // and retry next tick if it hasn't.
+                    let mirrored = match relational::count_billing_ledger_rows(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational count failed, retrying next tick");
+                            continue;
+                        }
+                    };
+                    if mirrored != cp.entry_count {
+                        tracing::debug!(
+                            tenant,
+                            mirrored,
+                            expected = cp.entry_count,
+                            "ledger checkpoint prune: relational mirror not yet caught up, retrying next tick"
+                        );
+                        continue;
+                    }
+                    // Blast-radius guard: recompute the commitment fresh from
+                    // the CURRENT in-memory rows for this exact range; refuse
+                    // loudly rather than deleting data that no longer matches
+                    // what was proven.
+                    let fresh = cloud.billing.compute_ledger_checkpoint(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    );
+                    if fresh.commitment != cp.commitment || fresh.entry_count != cp.entry_count {
+                        tracing::warn!(
+                            tenant,
+                            expected_commitment = %cp.commitment,
+                            fresh_commitment = %fresh.commitment,
+                            expected_entry_count = cp.entry_count,
+                            fresh_entry_count = fresh.entry_count,
+                            "ledger checkpoint prune REFUSED: commitment mismatch (data changed since checkpoint was proven)"
+                        );
+                        continue;
+                    }
+                    // Relational prune before in-memory prune, always — a
+                    // crash between the two just retries cleanly next tick
+                    // (both DELETE and retain are idempotent on an
+                    // already-empty range).
+                    if let Err(e) = relational::prune_billing_ledger(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    )
+                    .await
+                    {
+                        tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
+                        continue;
+                    }
+                    let removed =
+                        cloud
+                            .billing
+                            .prune_ledger_range(tenant, cp.period_start_ms, cp.period_end_ms);
+                    cloud.billing.mark_checkpoint_pruned(tenant, cp.period_start_ms);
+                    tracing::info!(
+                        tenant,
+                        removed,
+                        period_start_ms = cp.period_start_ms,
+                        period_end_ms = cp.period_end_ms,
+                        commitment = %cp.commitment,
+                        "ledger checkpoint: raw entries pruned, commitment + invoice retained"
+                    );
+                    if !pruned_tenants.iter().any(|t| t == tenant) {
+                        pruned_tenants.push(tenant.to_string());
+                    }
+                }
+            }
+            if !pruned_tenants.is_empty() {
+                let owned: Vec<_> = pruned_tenants
+                    .iter()
+                    .map(|tenant| {
+                        (
+                            cloud.billing.account(tenant),
+                            cloud.billing.ledger(tenant),
+                            cloud.billing.finalized_invoices(tenant),
+                            cloud.billing.checkouts_for_tenant(tenant),
+                        )
+                    })
+                    .collect();
+                let batch: Vec<relational::BillingRows<'_>> = owned
+                    .iter()
+                    .map(|(a, l, i, c)| (a, l.as_slice(), i.as_slice(), c.as_slice()))
+                    .collect();
+                relational::upsert_billing_many(&batch).await;
+            }
             let stats = admin::fleet_function_stats(&cloud).await;
             if stats.is_empty() {
                 continue;
