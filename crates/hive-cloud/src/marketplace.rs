@@ -40,7 +40,13 @@ const INTENT_TTL_MS: u64 = 15 * 60_000;
 const CLOCK_SKEW_MS: u64 = 5 * 60_000;
 const NONCE_TTL_MS: u64 = 10 * 60_000;
 const SETTLEMENT_SIGNATURE: &str =
+    "Settlement(bytes32,bytes32,address,address,address,uint256,uint256,address,uint256,uint256)";
+const HISTORICAL_SETTLEMENT_SIGNATURE: &str =
     "Settlement(bytes32,address,address,uint256,address,uint256,address,uint256,uint256)";
+const SETTLEMENT_V2: u8 = 2;
+const SETTLEMENT_V1: u8 = 1;
+const SETTLEMENT_ACTIVE: &str = "active";
+const SETTLEMENT_HISTORICAL: &str = "historical";
 
 #[derive(Serialize)]
 struct ApiError {
@@ -70,6 +76,10 @@ pub struct MarketplaceSecuritySnapshot {
     payment_intents: BTreeMap<String, PaymentIntent>,
     #[serde(default)]
     payment_idempotency: BTreeMap<String, String>,
+    /// Settlement-key ownership is independent of business order reference.
+    /// It prevents the same V2 on-chain settlement from verifying two intents.
+    #[serde(default)]
+    verified_settlement_keys: BTreeMap<String, String>,
     #[serde(default)]
     allocation_idempotency: BTreeMap<String, String>,
 }
@@ -135,6 +145,18 @@ impl MarketplaceSecurityStore {
             .write()
             .payment_intents
             .insert(intent.payment_intent_id.clone(), intent);
+    }
+    fn bind_verified_settlement_key(&self, intent_id: &str, settlement_key: &str) -> bool {
+        let mut state = self.0.write();
+        match state.verified_settlement_keys.get(settlement_key) {
+            Some(owner) => owner == intent_id,
+            None => {
+                state
+                    .verified_settlement_keys
+                    .insert(settlement_key.to_owned(), intent_id.to_owned());
+                true
+            }
+        }
     }
     fn allocation_for_key(&self, key: &str) -> Option<String> {
         self.0.read().allocation_idempotency.get(key).cloned()
@@ -258,6 +280,14 @@ struct SettlementConfig {
     settlement_event_signature: String,
     confirmation_policy: ConfirmationPolicy,
     configuration_reference: String,
+    #[serde(default)]
+    settlement_contract_version: u8,
+    #[serde(default)]
+    settlement_contract_status: String,
+    #[serde(default)]
+    audited_approved: bool,
+    #[serde(default)]
+    eligible_for_new_intents: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct ConfirmationPolicy {
@@ -277,6 +307,12 @@ struct PaymentIntent {
     settlement: SettlementConfig,
     verification_status: String,
     transaction_hash: Option<String>,
+    /// The cryptographic replay identity for V2. `order_reference` is a
+    /// business identifier only and must never be used as the on-chain key.
+    #[serde(default)]
+    settlement_key: Option<String>,
+    #[serde(default)]
+    settlement_event_log_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -309,6 +345,10 @@ pub struct Allocation {
     pub routed_build_id: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub settlement_key: Option<String>,
+    #[serde(default)]
+    pub configuration_reference: Option<String>,
 }
 #[derive(Default)]
 pub struct AllocationStore(RwLock<BTreeMap<String, Allocation>>);
@@ -480,6 +520,10 @@ fn settlement_config_static() -> Result<SettlementConfig, MarketplaceError> {
                     minimum_confirmations: CONFIRMATIONS,
                 },
                 configuration_reference: reference,
+                settlement_contract_version: SETTLEMENT_V2,
+                settlement_contract_status: SETTLEMENT_ACTIVE.into(),
+                audited_approved: true,
+                eligible_for_new_intents: true,
             })
         }
         None => {
@@ -539,11 +583,18 @@ fn settlement_config_static() -> Result<SettlementConfig, MarketplaceError> {
                 fee_recipient,
                 fee_bps: FEE_BPS,
                 settlement_contract,
-                settlement_event_signature: SETTLEMENT_SIGNATURE.into(),
+                settlement_event_signature: HISTORICAL_SETTLEMENT_SIGNATURE.into(),
                 confirmation_policy: ConfirmationPolicy {
                     minimum_confirmations: CONFIRMATIONS,
                 },
                 configuration_reference: reference,
+                // Base's currently configured deployment predates the V2
+                // contract. It remains verifiable only for snapshots already
+                // issued; it cannot be selected for new intents.
+                settlement_contract_version: SETTLEMENT_V1,
+                settlement_contract_status: SETTLEMENT_HISTORICAL.into(),
+                audited_approved: true,
+                eligible_for_new_intents: false,
             })
         }
         Some(_) => Err(error(
@@ -817,6 +868,34 @@ async fn create_payment_intent(
     let fee = decimal_divide_small(&gross, 20);
     let provider_amount = decimal_subtract(&gross, &fee)
         .expect("fee is floor(gross / 20) and can never exceed gross");
+    let settlement = settlement_config(&cloud).await?;
+    if !settlement.audited_approved
+        || !settlement.eligible_for_new_intents
+        || settlement.settlement_contract_version != SETTLEMENT_V2
+        || settlement.settlement_contract_status != SETTLEMENT_ACTIVE
+        || settlement.configuration_reference.trim().is_empty()
+    {
+        return Err(error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "settlement_unavailable",
+        ));
+    }
+    let settlement_key = derive_settlement_key(
+        &request.order_reference,
+        &settlement.token_contract,
+        &buyer_address,
+        &deployment.provider_recipient,
+        &settlement.fee_recipient,
+        &gross,
+        settlement.chain_id,
+        &settlement.settlement_contract,
+    )
+    .ok_or_else(|| {
+        error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "settlement_unavailable",
+        )
+    })?;
     let intent = PaymentIntent {
         payment_intent_id: format!("pi_{}", Uuid::new_v4().simple()),
         expires_at_ms: hive_core::now_ms() + INTENT_TTL_MS,
@@ -826,9 +905,11 @@ async fn create_payment_intent(
         deployment,
         provider_amount_atomic: provider_amount,
         fee_amount_atomic: fee,
-        settlement: settlement_config(&cloud).await?,
+        settlement,
         verification_status: "pending".into(),
         transaction_hash: None,
+        settlement_key: Some(settlement_key),
+        settlement_event_log_index: None,
     };
     let intent = cloud.marketplace_security.put_intent(key, intent);
     crate::persist::persist(&cloud);
@@ -839,6 +920,12 @@ fn payment_intent_response(intent: &PaymentIntent) -> Value {
     json!({"payment_intent_id": intent.payment_intent_id,
         "expires_at": iso_timestamp(intent.expires_at_ms),
         "amount_atomic": intent.gross_amount_atomic, "order_reference": intent.order_reference,
+        "settlement_key": intent.settlement_key,
+        "settlement_contract": intent.settlement.settlement_contract,
+        "settlement_version": intent.settlement.settlement_contract_version,
+        "configuration_reference": intent.settlement.configuration_reference,
+        "verification_status": intent.verification_status,
+        "required_confirmations": intent.settlement.confirmation_policy.minimum_confirmations,
         "settlement": intent.settlement})
 }
 
@@ -865,9 +952,18 @@ async fn verify_payment(
                 "payment_intent_not_found",
             )
         })?;
+    let transaction_hash = request.transaction_hash.to_ascii_lowercase();
+    if !valid_transaction_hash(&transaction_hash) {
+        return Err(error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_transaction_hash",
+        ));
+    }
     // Do not let a process changed to another profile settle an existing
     // intent. Receipt validation below uses the complete immutable snapshot.
-    if settlement_config(&cloud).await?.profile != intent.settlement.profile {
+    if intent.settlement.settlement_contract_status != SETTLEMENT_HISTORICAL
+        && settlement_config(&cloud).await?.profile != intent.settlement.profile
+    {
         return Err(error(
             axum::http::StatusCode::CONFLICT,
             "settlement_profile_changed",
@@ -876,7 +972,7 @@ async fn verify_payment(
     if intent
         .transaction_hash
         .as_deref()
-        .is_some_and(|old| old != request.transaction_hash)
+        .is_some_and(|old| old != transaction_hash)
     {
         return Err(error(
             axum::http::StatusCode::CONFLICT,
@@ -884,30 +980,68 @@ async fn verify_payment(
         ));
     }
     if intent.verification_status != "verified" {
-        intent.transaction_hash = Some(request.transaction_hash);
-        intent.verification_status = verify_payment_chain(&cloud, &intent).await;
+        intent.transaction_hash = Some(transaction_hash);
+        let (status, log_index) = verify_payment_chain(&cloud, &intent).await;
+        if status == "verified"
+            && intent.settlement.settlement_contract_version == SETTLEMENT_V2
+            && !cloud.marketplace_security.bind_verified_settlement_key(
+                &intent.payment_intent_id,
+                intent
+                    .settlement_key
+                    .as_deref()
+                    .expect("verified V2 settlement always has a key"),
+            )
+        {
+            return Err(error(
+                axum::http::StatusCode::CONFLICT,
+                "settlement_key_already_verified",
+            ));
+        }
+        intent.verification_status = status;
+        intent.settlement_event_log_index = log_index;
         cloud.marketplace_security.update_intent(intent.clone());
         crate::persist::persist(&cloud);
     }
     Ok(Json(
-        json!({"payment_intent_id": intent.payment_intent_id, "status": intent.verification_status}),
+        json!({"payment_intent_id": intent.payment_intent_id, "status": intent.verification_status,
+            "settlement_key": intent.settlement_key, "settlement_contract": intent.settlement.settlement_contract,
+            "settlement_version": intent.settlement.settlement_contract_version,
+            "configuration_reference": intent.settlement.configuration_reference,
+            "event_log_index": intent.settlement_event_log_index,
+            "required_confirmations": intent.settlement.confirmation_policy.minimum_confirmations}),
     ))
 }
 
-async fn verify_payment_chain(cloud: &CloudState, intent: &PaymentIntent) -> String {
+async fn verify_payment_chain(cloud: &CloudState, intent: &PaymentIntent) -> (String, Option<u64>) {
     if intent.expires_at_ms <= hive_core::now_ms()
         || !valid_transaction_hash(intent.transaction_hash.as_deref().unwrap_or_default())
     {
-        return "failed".into();
+        return ("failed".into(), None);
     }
     if !valid_settlement_snapshot(&intent.settlement) {
-        return "failed".into();
+        return ("failed".into(), None);
+    }
+    if intent.settlement.settlement_contract_version == SETTLEMENT_V2
+        && intent.settlement_key.as_deref()
+            != derive_settlement_key(
+                &intent.order_reference,
+                &intent.settlement.token_contract,
+                &intent.buyer_address,
+                &intent.deployment.provider_recipient,
+                &intent.settlement.fee_recipient,
+                &intent.gross_amount_atomic,
+                intent.settlement.chain_id,
+                &intent.settlement.settlement_contract,
+            )
+            .as_deref()
+    {
+        return ("failed".into(), None);
     }
     let chain = marketplace_rpc(cloud, &intent.settlement.rpc_url, "eth_chainId", json!([]))
         .await
         .and_then(|value| hex_u64(&value));
     if chain != Some(intent.settlement.chain_id) {
-        return "failed".into();
+        return ("failed".into(), None);
     }
     let Some(receipt) = marketplace_rpc(
         cloud,
@@ -917,20 +1051,20 @@ async fn verify_payment_chain(cloud: &CloudState, intent: &PaymentIntent) -> Str
     )
     .await
     else {
-        return "pending".into();
+        return ("pending".into(), None);
     };
     if receipt.is_null() {
-        return "pending".into();
+        return ("pending".into(), None);
     }
     if receipt.get("status").and_then(Value::as_str) != Some("0x1") {
-        return "failed".into();
+        return ("failed".into(), None);
     }
     let Some(block) = receipt
         .get("blockNumber")
         .and_then(Value::as_str)
         .and_then(hex_u64_str)
     else {
-        return "failed".into();
+        return ("failed".into(), None);
     };
     let Some(tip) = marketplace_rpc(
         cloud,
@@ -940,21 +1074,26 @@ async fn verify_payment_chain(cloud: &CloudState, intent: &PaymentIntent) -> Str
     )
     .await
     .and_then(|value| value.as_str().and_then(hex_u64_str)) else {
-        return "pending".into();
+        return ("pending".into(), None);
     };
     if tip.saturating_sub(block).saturating_add(1)
         < intent.settlement.confirmation_policy.minimum_confirmations
     {
-        return "awaiting_confirmations".into();
+        return ("awaiting_confirmations".into(), None);
     }
-    if receipt
+    let matching = receipt
         .get("logs")
         .and_then(Value::as_array)
-        .is_some_and(|logs| logs.iter().any(|log| valid_settlement_log(log, intent)))
-    {
-        "verified".into()
+        .map(|logs| {
+            logs.iter()
+                .filter_map(|log| valid_settlement_log(log, intent))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if matching.len() == 1 {
+        ("verified".into(), matching.into_iter().next())
     } else {
-        "failed".into()
+        ("failed".into(), None)
     }
 }
 async fn marketplace_rpc(
@@ -1015,7 +1154,6 @@ fn valid_settlement_snapshot(config: &SettlementConfig) -> bool {
     let common = config.currency == "THEO"
         && config.token_decimals == 18
         && config.fee_bps == FEE_BPS
-        && config.settlement_event_signature == SETTLEMENT_SIGNATURE
         && config.confirmation_policy.minimum_confirmations == CONFIRMATIONS
         && normalized_address(&config.token_contract).as_deref()
             == Some(config.token_contract.as_str())
@@ -1024,7 +1162,8 @@ fn valid_settlement_snapshot(config: &SettlementConfig) -> bool {
         && normalized_address(&config.fee_recipient).as_deref()
             == Some(config.fee_recipient.as_str())
         && config.rpc_url.starts_with("https://")
-        && config.explorer_url.starts_with("https://");
+        && config.explorer_url.starts_with("https://")
+        && !config.configuration_reference.trim().is_empty();
     common
         && match config.profile.as_str() {
             BASE_PROFILE => {
@@ -1033,6 +1172,10 @@ fn valid_settlement_snapshot(config: &SettlementConfig) -> bool {
                     && config.chain_id_hex == "0x2105"
                     && config.token_contract == THEO_TOKEN
                     && config.configuration_reference == "base-theo-atomic-split-v1"
+                    && config.settlement_event_signature == HISTORICAL_SETTLEMENT_SIGNATURE
+                    && (config.settlement_contract_version == 0
+                        || (config.settlement_contract_version == SETTLEMENT_V1
+                            && config.settlement_contract_status == SETTLEMENT_HISTORICAL))
             }
             AUTHEO_TESTNET_PROFILE => {
                 config.network == "Autheo Testnet"
@@ -1040,13 +1183,23 @@ fn valid_settlement_snapshot(config: &SettlementConfig) -> bool {
                     && config.chain_id_hex == "0x311"
                     && config.rpc_url == AUTHEO_TESTNET_RPC
                     && config.explorer_url == AUTHEO_TESTNET_EXPLORER
-                    && !config.configuration_reference.trim().is_empty()
+                    && ((config.settlement_contract_version == SETTLEMENT_V2
+                        && config.settlement_contract_status == SETTLEMENT_ACTIVE
+                        && config.audited_approved
+                        && config.eligible_for_new_intents
+                        && config.settlement_event_signature == SETTLEMENT_SIGNATURE)
+                        || ((config.settlement_contract_version == 0
+                            || config.settlement_contract_version == SETTLEMENT_V1)
+                            && (config.settlement_contract_status.is_empty()
+                                || config.settlement_contract_status == SETTLEMENT_HISTORICAL)
+                            && config.settlement_event_signature
+                                == HISTORICAL_SETTLEMENT_SIGNATURE))
             }
             _ => false,
         }
 }
 
-fn valid_settlement_log(log: &Value, intent: &PaymentIntent) -> bool {
+fn valid_settlement_log(log: &Value, intent: &PaymentIntent) -> Option<u64> {
     if log
         .get("address")
         .and_then(Value::as_str)
@@ -1054,7 +1207,7 @@ fn valid_settlement_log(log: &Value, intent: &PaymentIntent) -> bool {
         .as_deref()
         != Some(intent.settlement.settlement_contract.as_str())
     {
-        return false;
+        return None;
     }
     let expected_topic = format!(
         "0x{}",
@@ -1069,23 +1222,57 @@ fn valid_settlement_log(log: &Value, intent: &PaymentIntent) -> bool {
         .and_then(Value::as_str)
         .is_none_or(|topic| !topic.eq_ignore_ascii_case(&expected_topic))
     {
-        return false;
+        return None;
     }
     let Some(bytes) = log.get("data").and_then(Value::as_str).and_then(decode_hex) else {
-        return false;
+        return None;
     };
-    if bytes.len() != 32 * 9 {
-        return false;
-    }
-    word(&bytes, 0).as_deref() == Some(intent.order_reference.as_str())
-        && address_word(&bytes, 1).as_deref() == Some(intent.buyer_address.as_str())
-        && address_word(&bytes, 2).as_deref() == Some(intent.settlement.token_contract.as_str())
-        && uint_word(&bytes, 3).as_deref() == Some(intent.gross_amount_atomic.as_str())
-        && address_word(&bytes, 4).as_deref() == Some(intent.deployment.provider_recipient.as_str())
-        && uint_word(&bytes, 5).as_deref() == Some(intent.provider_amount_atomic.as_str())
-        && address_word(&bytes, 6).as_deref() == Some(intent.settlement.fee_recipient.as_str())
-        && uint_word(&bytes, 7).as_deref() == Some(intent.fee_amount_atomic.as_str())
-        && uint_word(&bytes, 8).as_deref() == Some(intent.settlement.fee_bps.to_string().as_str())
+    let fields_match = if intent.settlement.settlement_contract_version == SETTLEMENT_V2 {
+        if bytes.len() != 32 * 10 {
+            return None;
+        }
+        let expected_key = intent.settlement_key.as_deref()?;
+        word(&bytes, 0).as_deref() == Some(expected_key)
+            && word(&bytes, 1).as_deref() == Some(intent.order_reference.as_str())
+            && address_word(&bytes, 2).as_deref() == Some(intent.buyer_address.as_str())
+            && address_word(&bytes, 3).as_deref() == Some(intent.settlement.token_contract.as_str())
+            && address_word(&bytes, 4).as_deref()
+                == Some(intent.deployment.provider_recipient.as_str())
+            && uint_word(&bytes, 5).as_deref() == Some(intent.gross_amount_atomic.as_str())
+            && uint_word(&bytes, 6).as_deref() == Some(intent.provider_amount_atomic.as_str())
+            && address_word(&bytes, 7).as_deref() == Some(intent.settlement.fee_recipient.as_str())
+            && uint_word(&bytes, 8).as_deref() == Some(intent.fee_amount_atomic.as_str())
+            && uint_word(&bytes, 9).as_deref()
+                == Some(intent.settlement.fee_bps.to_string().as_str())
+            && fee_amount_for(&intent.gross_amount_atomic) == Some(intent.fee_amount_atomic.clone())
+            && decimal_subtract(&intent.gross_amount_atomic, &intent.fee_amount_atomic).as_deref()
+                == Some(intent.provider_amount_atomic.as_str())
+    } else {
+        // Historical V1 snapshots use their captured ABI and do not gain a
+        // synthetic V2 settlement key retroactively.
+        bytes.len() == 32 * 9
+            && word(&bytes, 0).as_deref() == Some(intent.order_reference.as_str())
+            && address_word(&bytes, 1).as_deref() == Some(intent.buyer_address.as_str())
+            && address_word(&bytes, 2).as_deref() == Some(intent.settlement.token_contract.as_str())
+            && uint_word(&bytes, 3).as_deref() == Some(intent.gross_amount_atomic.as_str())
+            && address_word(&bytes, 4).as_deref()
+                == Some(intent.deployment.provider_recipient.as_str())
+            && uint_word(&bytes, 5).as_deref() == Some(intent.provider_amount_atomic.as_str())
+            && address_word(&bytes, 6).as_deref() == Some(intent.settlement.fee_recipient.as_str())
+            && uint_word(&bytes, 7).as_deref() == Some(intent.fee_amount_atomic.as_str())
+            && uint_word(&bytes, 8).as_deref()
+                == Some(intent.settlement.fee_bps.to_string().as_str())
+            && fee_amount_for(&intent.gross_amount_atomic) == Some(intent.fee_amount_atomic.clone())
+            && decimal_subtract(&intent.gross_amount_atomic, &intent.fee_amount_atomic).as_deref()
+                == Some(intent.provider_amount_atomic.as_str())
+    };
+    fields_match
+        .then(|| {
+            log.get("logIndex")
+                .and_then(Value::as_str)
+                .and_then(hex_u64_str)
+        })
+        .flatten()
 }
 
 async fn submit_allocation(
@@ -1123,7 +1310,9 @@ async fn submit_allocation(
                 "payment_intent_not_found",
             )
         })?;
-    if settlement_config(&cloud).await?.profile != intent.settlement.profile {
+    if intent.settlement.settlement_contract_status != SETTLEMENT_HISTORICAL
+        && settlement_config(&cloud).await?.profile != intent.settlement.profile
+    {
         return Err(error(
             axum::http::StatusCode::CONFLICT,
             "settlement_profile_changed",
@@ -1183,6 +1372,8 @@ async fn submit_allocation(
         routed_build_id: None,
         created_at_ms: now,
         updated_at_ms: now,
+        settlement_key: intent.settlement_key.clone(),
+        configuration_reference: Some(intent.settlement.configuration_reference.clone()),
     };
     let allocation = match cloud.marketplace_allocations.put_if_absent(allocation) {
         Ok(row) => row,
@@ -1207,7 +1398,10 @@ async fn submit_allocation(
         buyer_tenant_id: allocation.tenant_id.clone(),
         retrieved_at_ms: now,
         approved_node_ids: allocation.approved_node_ids.clone(),
-        policy: json!({"source":"marketplace-verified-settlement","payment_intent_id": intent.payment_intent_id}),
+        policy: json!({"source":"marketplace-verified-settlement",
+            "payment_intent_id": intent.payment_intent_id,
+            "settlement_key": intent.settlement_key,
+            "configuration_reference": intent.settlement.configuration_reference}),
     });
     match crate::admin::start_named_deploy(&cloud, &allocation.tenant_id, deployment, None).await {
         Ok(result) => {
@@ -1278,6 +1472,53 @@ fn word(bytes: &[u8], index: usize) -> Option<String> {
         .get(index * 32..(index + 1) * 32)
         .map(|word| format!("0x{}", hex::encode(word)))
 }
+/// Solidity-compatible `keccak256(abi.encode(...))` for the V2 settlement
+/// replay identity. Every parameter here is static, so ABI encoding is ten
+/// left-padded 32-byte words; it is deliberately not `abi.encodePacked`.
+fn derive_settlement_key(
+    order_reference: &str,
+    token: &str,
+    payer: &str,
+    provider_recipient: &str,
+    fee_recipient: &str,
+    gross_amount: &str,
+    chain_id: u64,
+    settlement_contract: &str,
+) -> Option<String> {
+    let mut encoded = Vec::with_capacity(32 * 8);
+    encoded.extend(decode_hex(order_reference).filter(|value| value.len() == 32)?);
+    encoded.extend(address_abi_word(token)?);
+    encoded.extend(address_abi_word(payer)?);
+    encoded.extend(address_abi_word(provider_recipient)?);
+    encoded.extend(address_abi_word(fee_recipient)?);
+    encoded.extend(uint256_abi_word(gross_amount)?);
+    encoded.extend(uint256_abi_word(&chain_id.to_string())?);
+    encoded.extend(address_abi_word(settlement_contract)?);
+    Some(format!("0x{}", hex::encode(Keccak256::digest(encoded))))
+}
+fn address_abi_word(address: &str) -> Option<[u8; 32]> {
+    let address = normalized_address(address)?;
+    let raw = decode_hex(&address)?;
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(&raw);
+    Some(word)
+}
+fn uint256_abi_word(value: &str) -> Option<[u8; 32]> {
+    let value = canonical_atomic(value)?;
+    let mut word = [0u8; 32];
+    for digit in value.bytes() {
+        let mut carry = (digit - b'0') as u16;
+        for byte in word.iter_mut().rev() {
+            let product = (*byte as u16) * 10 + carry;
+            *byte = product as u8;
+            carry = product >> 8;
+        }
+        if carry != 0 {
+            return None;
+        }
+    }
+    Some(word)
+}
 fn address_word(bytes: &[u8], index: usize) -> Option<String> {
     bytes
         .get(index * 32 + 12..(index + 1) * 32)
@@ -1333,6 +1574,11 @@ fn decimal_divide_small(value: &str, divisor: u8) -> String {
     } else {
         output
     }
+}
+fn fee_amount_for(gross: &str) -> Option<String> {
+    // Kept in terms of the policy constant so a future policy cannot silently
+    // leave arithmetic tied to this currently exact 1/20 reduction.
+    (FEE_BPS == 500).then(|| decimal_divide_small(gross, 20))
 }
 fn decimal_subtract(value: &str, subtrahend: &str) -> Option<String> {
     let mut result = Vec::with_capacity(value.len());
