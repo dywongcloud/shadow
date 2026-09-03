@@ -4672,6 +4672,33 @@ async fn run_build(
                 runtime_artifact: runtime_artifact_identity.clone(),
                 readiness,
             })?;
+        // Mac-node-only: provision this deployment's Secure-Enclave-resident
+        // signing key now, at first build acceptance, so its public half is
+        // committed into the integrity chain's very first entry — a
+        // verifier never sees Mac-authored entries with no key to check
+        // them against. Best-effort and non-fatal: a SEP failure (unsigned
+        // binary, no SEP hardware, etc — see sep_signer.rs's module doc for
+        // the confirmed code-signing requirement) must never fail an
+        // otherwise-successful deployment; it only means that deployment's
+        // chain has no SEP-backed entries, falling back to this node's
+        // ordinary software signing key for everything else.
+        #[cfg(target_os = "macos")]
+        match hive_backend::sep_signer::generate_for_deployment(&deployment_id) {
+            Ok(sep_key) => {
+                if let Err(error) = cloud.deployment_ledger.append_integrity_entry(
+                    &deployment_id,
+                    hive_core::IntegrityEntryKind::SepKeyProvisioned {
+                        public_key_der_hex: sep_key.public_key_der_hex,
+                        key_tag: sep_key.key_tag,
+                    },
+                ) {
+                    tracing::warn!(deployment_id, %error, "integrity chain: failed to record SepKeyProvisioned");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(deployment_id, %error, "no Secure Enclave signing key provisioned for this deployment (non-fatal)");
+            }
+        }
         let (mut info, _readiness) = staged.publish_ready()?;
         if !crate::persist::persist_durable(cloud) {
             cloud.gw.remove(&deployment_id).await;

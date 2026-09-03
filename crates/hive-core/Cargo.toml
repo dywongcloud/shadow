@@ -9,6 +9,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+# Tamper-evidence hash-chain (integrity.rs) — pure hashing, no async/runtime
+# dependency, consistent with this crate's no-runtime rule above.
+sha2 = { workspace = true }
+hex = "0.4"
 # OPTIONAL and off by default: `logcap`'s async reader is generic over the
 # `tokio::io::AsyncBufRead` TRAIT only — no runtime, no executor, nothing that
 # contradicts this crate's "no async/runtime dependencies" rule for the

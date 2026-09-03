@@ -203,6 +203,10 @@ pub struct CloudState {
     /// Node-local write-ahead evidence for accepted deployments, production
     /// alias revisions, and retryable lifecycle delivery.
     pub deployment_ledger: Arc<crate::deployment_ledger::DeploymentLedger>,
+    /// This node's own signing identity for the deployment integrity chain
+    /// (`hive_core::integrity`) — per-node, never fleet-shared. See
+    /// `integrity_signer.rs`'s module doc.
+    pub integrity_signer: Arc<crate::integrity_signer::IntegritySigner>,
     /// Bounded, durable receiver for exact runtime-artifact packages. Every
     /// mutation is serialized by its owned worker and bound to the current
     /// project incarnation before it enters the queue.
@@ -612,6 +616,11 @@ impl CloudState {
             &node_name,
         )
         .unwrap_or_else(|error| panic!("deployment ledger failed closed: {error:#}"));
+        let integrity_signer = Arc::new(
+            crate::integrity_signer::IntegritySigner::open_or_create(&node_name).unwrap_or_else(
+                |error| panic!("integrity signing key failed closed: {error:#}"),
+            ),
+        );
         let runtime_artifact_transfer = crate::runtime_artifact_transfer::TransferService::open(
             crate::persist::data_dir().join("runtime-artifacts-v1"),
             node_name.clone(),
@@ -740,6 +749,7 @@ impl CloudState {
             builds: crate::git::BuildStore::new(),
             build_cancels: crate::git::BuildCancelRegistry::new(),
             deployment_ledger,
+            integrity_signer,
             runtime_artifact_transfer,
             cluster,
             teams,

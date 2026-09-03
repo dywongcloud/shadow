@@ -50,6 +50,12 @@ pub struct DeploymentAcceptance {
     pub accepting_boot_nonce: String,
     pub accepted_ms: u64,
     pub published_ms: Option<u64>,
+    /// Tamper-evidence chain for this deployment (build/publish/execution
+    /// facts) — see `hive_core::integrity`'s module doc for exact scope.
+    /// `#[serde(default)]` so ledger files persisted before this field
+    /// existed load with an empty chain rather than failing to deserialize.
+    #[serde(default)]
+    pub integrity_chain: Vec<hive_core::IntegrityEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,12 +241,32 @@ impl DeploymentLedger {
     pub fn accept(&self, input: DeploymentAcceptanceInput) -> anyhow::Result<()> {
         validate_acceptance_input(&input)?;
         self.mutate(|payload| {
+            let ts_ms = hive_core::now_ms();
+            let build_entry = hive_core::IntegrityEntry {
+                deployment_id: input.deployment_id.clone(),
+                seq: 0,
+                ts_ms,
+                node: payload.node.clone(),
+                kind: hive_core::IntegrityEntryKind::BuildAccepted {
+                    source_revision_sha256: input.source.revision.clone(),
+                    runtime_artifact_content_sha256: input
+                        .runtime_artifact
+                        .as_ref()
+                        .map(|a| a.content_sha256.clone())
+                        .unwrap_or_default(),
+                    repository_build_sha256: input
+                        .repository_build
+                        .as_ref()
+                        .map(|b| b.digest().to_string()),
+                },
+            };
             let accepted = DeploymentAcceptance {
                 input,
                 accepting_node: payload.node.clone(),
                 accepting_boot_nonce: payload.boot_nonce.clone(),
-                accepted_ms: hive_core::now_ms(),
+                accepted_ms: ts_ms,
                 published_ms: None,
+                integrity_chain: vec![build_entry],
             };
             if let Some(existing) = payload.accepted.get(&accepted.input.deployment_id) {
                 anyhow::ensure!(
@@ -253,6 +279,36 @@ impl DeploymentLedger {
             payload
                 .accepted
                 .insert(accepted.input.deployment_id.clone(), accepted);
+            Ok(())
+        })
+    }
+
+    /// Append one entry to `deployment_id`'s integrity chain, assigning it
+    /// the next strictly-increasing `seq`. No-op (returns `Ok`) if the
+    /// deployment has no acceptance record yet — callers on the execution
+    /// path (`ExecutionStarted`/`ExecutionEnded`) can race a not-yet-accepted
+    /// deployment in principle and must not fail loudly for a benign race.
+    pub fn append_integrity_entry(
+        &self,
+        deployment_id: &str,
+        kind: hive_core::IntegrityEntryKind,
+    ) -> anyhow::Result<()> {
+        self.mutate(|payload| {
+            let Some(accepted) = payload.accepted.get_mut(deployment_id) else {
+                return Ok(());
+            };
+            let next_seq = accepted
+                .integrity_chain
+                .last()
+                .map(|e| e.seq + 1)
+                .unwrap_or(0);
+            accepted.integrity_chain.push(hive_core::IntegrityEntry {
+                deployment_id: deployment_id.to_string(),
+                seq: next_seq,
+                ts_ms: hive_core::now_ms(),
+                node: payload.node.clone(),
+                kind,
+            });
             Ok(())
         })
     }
@@ -272,6 +328,21 @@ impl DeploymentLedger {
                 None => {
                     let published_ms = hive_core::now_ms();
                     accepted.published_ms = Some(published_ms);
+                    let next_seq = accepted
+                        .integrity_chain
+                        .last()
+                        .map(|e| e.seq + 1)
+                        .unwrap_or(0);
+                    let node = payload.node.clone();
+                    accepted.integrity_chain.push(hive_core::IntegrityEntry {
+                        deployment_id: deployment_id.to_string(),
+                        seq: next_seq,
+                        ts_ms: published_ms,
+                        node,
+                        kind: hive_core::IntegrityEntryKind::Published {
+                            alias: accepted.input.target.clone(),
+                        },
+                    });
                     published_ms
                 }
             };
@@ -758,4 +829,47 @@ fn write_payload(path: &Path, payload: &LedgerPayload) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     write_result
+}
+
+/// The real `hive_core::ExecutionObserver` — records
+/// `ExecutionStarted`/`ExecutionEnded` facts from `fluid-compute`'s cold-
+/// start/termination paths into this node's `DeploymentLedger`. Late-bound
+/// (`fluid_compute::Fluid::set_execution_observer`) once `CloudState`, and
+/// therefore this ledger, exists — see the call site in `main.rs` for why
+/// it can't be a `Fluid::start` constructor argument.
+pub struct LedgerExecutionObserver {
+    ledger: Arc<DeploymentLedger>,
+}
+
+impl LedgerExecutionObserver {
+    pub fn new(ledger: Arc<DeploymentLedger>) -> Arc<Self> {
+        Arc::new(Self { ledger })
+    }
+}
+
+impl hive_core::ExecutionObserver for LedgerExecutionObserver {
+    fn on_started(&self, deployment_id: &str, cell_id: &str, backend: &str) {
+        if let Err(error) = self.ledger.append_integrity_entry(
+            deployment_id,
+            hive_core::IntegrityEntryKind::ExecutionStarted {
+                cell_id: cell_id.to_string(),
+                backend: backend.to_string(),
+            },
+        ) {
+            tracing::warn!(deployment_id, cell_id, %error, "integrity chain: failed to record ExecutionStarted");
+        }
+    }
+
+    fn on_ended(&self, deployment_id: &str, cell_id: &str, requests_served: u64, outcome: &str) {
+        if let Err(error) = self.ledger.append_integrity_entry(
+            deployment_id,
+            hive_core::IntegrityEntryKind::ExecutionEnded {
+                cell_id: cell_id.to_string(),
+                requests_served,
+                outcome: outcome.to_string(),
+            },
+        ) {
+            tracing::warn!(deployment_id, cell_id, %error, "integrity chain: failed to record ExecutionEnded");
+        }
+    }
 }

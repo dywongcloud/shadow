@@ -350,12 +350,48 @@ type TerminationResult = Result<(), String>;
 
 struct PendingTermination {
     handle: CellHandle,
+    /// Integrity-chain identity for this cell, when the caller had it —
+    /// `None` on paths that only hold a bare `CellHandle` (e.g. the final
+    /// shutdown-drain retry loop, which re-collects `terminating`'s own
+    /// handles after everything else has already unregistered). A `None`
+    /// here just means no `ExecutionEnded` entry is recorded for that one
+    /// termination, never a hard failure.
+    execution: Option<ExecutionEndContext>,
     in_progress: bool,
     waiters: Vec<tokio::sync::oneshot::Sender<TerminationResult>>,
 }
 
+/// What `ExecutionObserver::on_ended` needs, carried alongside a
+/// `CellHandle` from whichever call site actually knows it (the registry
+/// entry being removed) through to the one owned termination worker that
+/// calls `backend.terminate`.
+#[derive(Clone)]
+struct ExecutionEndContext {
+    deployment_id: String,
+    requests_served: u64,
+    /// "drained" | "crashed" | "killed" — the caller's own classification of
+    /// why this cell is being terminated, decided at the scheduling call
+    /// site (which knows WHY: a health-check nack, a normal scale-down, a
+    /// shutdown drain), never re-derived from the termination outcome
+    /// itself (a clean `backend.terminate()` doesn't distinguish those).
+    outcome: String,
+}
+
 pub struct Fluid {
     backend: Arc<dyn CellBackend>,
+    /// Records deployment-lifecycle facts (cell started/ended) into the
+    /// tamper-evidence chain (`hive_core::integrity`). Unset when the
+    /// caller doesn't want integrity tracking (e.g. a bare dev invocation).
+    /// Injected rather than called directly because `fluid-compute` must
+    /// never depend on `hive-cloud` (the crate DAG is one-directional:
+    /// `hive-cloud` depends on `fluid-compute`) — same "coordinator injects,
+    /// backend implements" shape `backend` above already uses. A
+    /// `OnceLock`, not a constructor parameter: `hive-cloud`'s boot order
+    /// constructs `Fluid` BEFORE `deployment_ledger` (the real observer's
+    /// backing store, itself inside `CloudState::new`, which takes `Fluid`
+    /// as an input) — late-binding via `set_execution_observer` breaks that
+    /// chicken-and-egg without reordering boot.
+    execution_observer: std::sync::OnceLock<Arc<dyn hive_core::ExecutionObserver>>,
     cfg: FluidConfig,
     registry: Mutex<HashMap<String, FunctionPool>>,
     /// Bounds how many cold starts run concurrently across ALL pools. A burst of
@@ -632,6 +668,7 @@ impl Fluid {
         let cold_start_capacity = max_concurrent_cold_starts();
         let fluid = Arc::new(Fluid {
             backend,
+            execution_observer: std::sync::OnceLock::new(),
             cfg,
             registry: Mutex::new(HashMap::new()),
             cold_start_sem: Arc::new(tokio::sync::Semaphore::new(cold_start_capacity)),
@@ -661,9 +698,20 @@ impl Fluid {
         self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_RUNNING
     }
 
+    /// Late-bind the integrity-chain observer once `hive-cloud`'s
+    /// `deployment_ledger` exists (see `execution_observer`'s doc for why
+    /// this can't be a constructor parameter). Idempotent: a second call is
+    /// a silent no-op rather than a panic, so a defensive double-call from
+    /// two boot paths can never crash the node over an ordering detail this
+    /// unimportant.
+    pub fn set_execution_observer(&self, observer: Arc<dyn hive_core::ExecutionObserver>) {
+        let _ = self.execution_observer.set(observer);
+    }
+
     fn enqueue_termination(
         &self,
         handle: CellHandle,
+        execution: Option<ExecutionEndContext>,
         wait: bool,
     ) -> Option<tokio::sync::oneshot::Receiver<TerminationResult>> {
         let id = handle.id.clone();
@@ -679,10 +727,14 @@ impl Fluid {
                 if let Some(waiter) = waiter {
                     entry.get_mut().waiters.push(waiter);
                 }
+                if entry.get().execution.is_none() {
+                    entry.get_mut().execution = execution;
+                }
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(PendingTermination {
                     handle,
+                    execution,
                     in_progress: false,
                     waiters: waiter.into_iter().collect(),
                 });
@@ -694,7 +746,7 @@ impl Fluid {
     }
 
     fn schedule_termination(&self, handle: CellHandle) {
-        self.enqueue_termination(handle, false);
+        self.enqueue_termination(handle, None, false);
     }
 
     async fn termination_loop(self: Arc<Self>) {
@@ -726,7 +778,7 @@ impl Fluid {
                     .terminate(&handle)
                     .await
                     .map_err(|error| format!("{error:#}"));
-                let waiters = {
+                let (waiters, execution) = {
                     let mut pending = self.terminating.lock();
                     let waiters = pending
                         .get_mut(&id)
@@ -735,13 +787,25 @@ impl Fluid {
                             std::mem::take(&mut entry.waiters)
                         })
                         .unwrap_or_default();
-                    if outcome.is_ok() {
-                        pending.remove(&id);
-                    }
-                    waiters
+                    let execution = if outcome.is_ok() {
+                        pending.remove(&id).and_then(|entry| entry.execution)
+                    } else {
+                        None
+                    };
+                    (waiters, execution)
                 };
                 for waiter in waiters {
                     let _ = waiter.send(outcome.clone());
+                }
+                // Record ExecutionEnded only on a successful teardown — a
+                // FAILED terminate means the cell may still be live and this
+                // same loop retries it, so recording "ended" now would be a
+                // false integrity-chain entry; the eventual successful retry
+                // records it once, correctly.
+                if let (true, Some(observer), Some(ctx)) =
+                    (outcome.is_ok(), self.execution_observer.get(), &execution)
+                {
+                    observer.on_ended(&ctx.deployment_id, id.as_str(), ctx.requests_served, &ctx.outcome);
                 }
                 if let Err(error) = outcome {
                     warn!(cell = %id, %error, "backend cell termination failed; shutdown retains it for retry");
@@ -754,9 +818,13 @@ impl Fluid {
         }
     }
 
-    async fn terminate_tracked(self: &Arc<Self>, handle: CellHandle) -> anyhow::Result<()> {
+    async fn terminate_tracked(
+        self: &Arc<Self>,
+        handle: CellHandle,
+        execution: Option<ExecutionEndContext>,
+    ) -> anyhow::Result<()> {
         let receiver = self
-            .enqueue_termination(handle, true)
+            .enqueue_termination(handle, execution, true)
             .expect("tracked termination creates one waiter");
         match receiver.await {
             Ok(Ok(())) => Ok(()),
@@ -832,6 +900,13 @@ impl Fluid {
                     .entry(handle.id.clone())
                     .or_insert_with(|| PendingTermination {
                         handle,
+                        // Node-shutdown drain collapses the WHOLE registry at
+                        // once (`std::mem::take`) — recovering each
+                        // instance's deployment/requests_served here isn't
+                        // worth the complexity for a once-per-process-exit
+                        // path; those entries just get no ExecutionEnded
+                        // record (see PendingTermination.execution's doc).
+                        execution: None,
                         in_progress: false,
                         waiters: Vec::new(),
                     });
@@ -1810,6 +1885,10 @@ impl Fluid {
             anyhow::bail!("function '{key}' unregistered during cold start");
         }
         unpublished.publish();
+        if let Some(observer) = self.execution_observer.get() {
+            let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key);
+            observer.on_started(deployment_id, cell_id.as_str(), self.backend.name());
+        }
         Ok((cell_id, endpoint))
     }
 
@@ -1843,7 +1922,7 @@ impl Fluid {
     /// it, and account its time. Keep-warm/cold-start will replace it. This is
     /// our analogue of an instance `nack` → router drops it.
     pub async fn mark_dead(self: &Arc<Self>, key: &str, cell_id: &CellId) {
-        let handle = {
+        let (handle, requests_served) = {
             let mut reg = self.registry.lock();
             let Some(pool) = reg.get_mut(key) else { return };
             let Some(pos) = pool.instances.iter().position(|i| &i.cell_id == cell_id) else {
@@ -1852,9 +1931,15 @@ impl Fluid {
             let inst = pool.instances.remove(pos);
             pool.dead_reaped += 1;
             pool.instance_ms_retired += now_ms().saturating_sub(inst.started_at_ms);
-            inst.handle
+            (inst.handle, inst.requests_served)
         };
-        let _ = self.terminate_tracked(handle).await;
+        let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+        let execution = Some(ExecutionEndContext {
+            deployment_id,
+            requests_served,
+            outcome: "crashed".to_string(),
+        });
+        let _ = self.terminate_tracked(handle, execution).await;
     }
 
     /// Remove a function pool entirely and terminate all its instances.
@@ -1869,20 +1954,31 @@ impl Fluid {
         let mut unique: Vec<&str> = keys.iter().map(String::as_str).collect();
         unique.sort_unstable();
         unique.dedup();
-        let (removed, handles): (usize, Vec<hive_backend::CellHandle>) = {
+        let (removed, handles): (usize, Vec<(hive_backend::CellHandle, ExecutionEndContext)>) = {
             let mut reg = self.registry.lock();
             let mut removed = 0usize;
             let mut handles = Vec::new();
             for key in unique {
                 if let Some(pool) = reg.remove(key) {
                     removed += 1;
-                    handles.extend(pool.instances.into_iter().map(|instance| instance.handle));
+                    let deployment_id =
+                        key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+                    handles.extend(pool.instances.into_iter().map(|instance| {
+                        (
+                            instance.handle,
+                            ExecutionEndContext {
+                                deployment_id: deployment_id.clone(),
+                                requests_served: instance.requests_served,
+                                outcome: "killed".to_string(),
+                            },
+                        )
+                    }));
                 }
             }
             (removed, handles)
         };
-        for handle in handles {
-            let _ = self.terminate_tracked(handle).await;
+        for (handle, execution) in handles {
+            let _ = self.terminate_tracked(handle, Some(execution)).await;
         }
         removed
     }
@@ -1926,7 +2022,7 @@ impl Fluid {
     async fn reconcile(self: Arc<Self>) {
         // Decide scale-up (keep-warm) and scale-down (idle) under the lock.
         let mut to_warm: Vec<String> = Vec::new();
-        let mut to_drain: Vec<(String, CellId, hive_backend::CellHandle)> = Vec::new();
+        let mut to_drain: Vec<(String, CellId, hive_backend::CellHandle, u64)> = Vec::new();
         let now = now_ms();
         {
             let mut reg = self.registry.lock();
@@ -1985,7 +2081,7 @@ impl Fluid {
                         // Already draining (e.g. recycled while busy) — terminate once
                         // its in-flight requests have all completed.
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                         }
                         continue;
                     }
@@ -1995,7 +2091,7 @@ impl Fluid {
                         recycled_add += 1;
                         retired_add += age_ms;
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                         }
                         continue;
                     }
@@ -2005,7 +2101,7 @@ impl Fluid {
                         inst.draining = true;
                         live_after -= 1;
                         retired_add += age_ms;
-                        to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                        to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                     }
                 }
                 pool.instance_ms_retired += retired_add;
@@ -2055,17 +2151,25 @@ impl Fluid {
                 }
             }
         }));
-        let drain =
-            futures::future::join_all(to_drain.into_iter().map(|(key, cell_id, handle)| {
+        let drain = futures::future::join_all(to_drain.into_iter().map(
+            |(key, cell_id, handle, requests_served)| {
                 let f = self.clone();
                 async move {
-                    let _ = f.terminate_tracked(handle).await;
+                    let deployment_id =
+                        key.split_once('/').map(|(d, _)| d).unwrap_or(&key).to_string();
+                    let execution = ExecutionEndContext {
+                        deployment_id,
+                        requests_served,
+                        outcome: "drained".to_string(),
+                    };
+                    let _ = f.terminate_tracked(handle, Some(execution)).await;
                     if let Some(pool) = f.registry.lock().get_mut(&key) {
                         pool.instances.retain(|i| i.cell_id != cell_id);
                     }
                     debug!(func = %key, cell = %cell_id, "instance scaled to zero");
                 }
-            }));
+            },
+        ));
         tokio::join!(warm, drain);
 
         // ---- #2 adaptive concurrency (CPU-driven AIMD) --------------------

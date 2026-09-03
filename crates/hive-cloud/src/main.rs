@@ -56,6 +56,7 @@ mod identity;
 mod incidents;
 mod inference;
 mod integrations;
+mod integrity_signer;
 mod lease;
 mod listener_audit;
 mod memwatch;
@@ -1096,6 +1097,13 @@ async fn async_main() -> anyhow::Result<()> {
     // `Weak` deliberately: the AccessControl impl must never be the thing
     // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
+    // Same deferred-fill shape: Fluid was constructed before CloudState (and
+    // therefore before deployment_ledger, the integrity chain's backing
+    // store) existed, so the observer is wired in here instead of at
+    // `Fluid::start`.
+    cloud.fluid.set_execution_observer(
+        crate::deployment_ledger::LedgerExecutionObserver::new(cloud.deployment_ledger.clone()),
+    );
     // Advertise the sealed-artifact transfer receiver only after CloudState
     // construction PROVED it initialized (durable store opened, worker
     // spawned, interrupted transactions recovered). A receiver that failed

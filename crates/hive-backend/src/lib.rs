@@ -19,6 +19,8 @@ pub mod litebox;
 pub mod litebox_macos;
 pub mod mock;
 pub mod runtime_artifact;
+#[cfg(target_os = "macos")]
+pub mod sep_signer;
 pub mod snapshot;
 
 use async_trait::async_trait;

@@ -113,6 +113,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/deployments/:id", delete(dep_delete))
         .route("/v1/deployments/:id/resources", get(deployment_resources))
         .route("/v1/deployments/:id/build", get(deployment_build))
+        .route("/v1/deployments/:id/integrity", get(deployment_integrity))
         .route(
             "/v1/deployments/:id/service-graph",
             get(deployment_service_graph),
@@ -3446,6 +3447,54 @@ pub(crate) async fn deployment_build(
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) =
             fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/build"), &t).await
+        {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+/// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`) — build
+/// acceptance, publish, and execution facts, each entry's fold hashed into
+/// `chain_head_sha256`, the whole chain signed by this node's per-node key
+/// (`integrity_signer.rs`). A caller re-derives `chain_head_sha256` from
+/// `chain` with `hive_core::fold_integrity_chain` and checks the signature
+/// against `public_key_hex` — no trust in this response beyond the raw
+/// bytes returned. See `hive_core::integrity`'s module doc for exactly what
+/// this does and does not prove (tamper-evidence, never tamper-prevention).
+pub(crate) async fn deployment_integrity(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(acceptance) = c.deployment_ledger.acceptance(&id) {
+        let team_ok = norm(&c.projects.team_of(&acceptance.input.project)) == norm(&t)
+            || norm(&record_tenant(&acceptance.input.project)) == norm(&t);
+        if !team_ok {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let chain_head_sha256 =
+            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
+        let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
+            .integrity_chain
+            .iter()
+            .map(|e| &e.kind)
+            .filter(|k| matches!(k, hive_core::IntegrityEntryKind::SepKeyProvisioned { .. }))
+            .collect();
+        return Ok(Json(json!({
+            "deployment_id": id,
+            "chain": acceptance.integrity_chain,
+            "chain_head_sha256": chain_head_sha256,
+            "signatures": [signature],
+            "sep_public_keys": sep_public_keys,
+        })));
+    }
+    if let Some(node) = host_node_for_deployment(&c, &id) {
+        if let Some(v) =
+            fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/integrity"), &t).await
         {
             return Ok(Json(v));
         }
