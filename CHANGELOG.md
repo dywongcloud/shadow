@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-09-03 — npm's `$PATH` entry points were never staged into the guest; fixed, but litebox has no guest-side shebang execution at all
+
+Follow-up to the same-day GNU-tar-header fix below: with `node -v` working
+and the panic gone, `npm -v` as the first command in a fresh shell still
+failed with the identical `Fatal error: glibc detected an invalid stdio
+handle` a not-found command produces. Root cause was staging-completeness,
+not the tar header: `walk_support_tree` staged every file UNDER
+`/usr/lib/node_modules_22`, but `/usr/bin/npm` and `/usr/bin/npx` — the
+`$PATH`-visible symlinks a typed `npm`/`npx` actually resolves through
+(`PATH=/usr/bin:/bin` in the guest) — point INTO that tree and were never
+staged themselves, so `PATH` lookup found nothing.
+
+Fixed: `SupportTree::entry_points` names each `$PATH` symlink and its
+expected real target; before staging, the host symlink is resolved with
+`canonicalize` and compared against that expected target (never trusted
+blindly — a base-image change that moved npm's real file would otherwise
+stage a symlink to nothing), then emitted as a real symlink tar entry
+(`tar::EntryType::Symlink`, litebox's reader already handles `SYMTYPE`).
+Verified directly by copying a live shell's built tar to disk and reading
+it back with Python's `tarfile`: `usr/bin/npm` is a symlink entry pointing
+at the real staged file.
+
+That still wasn't sufficient — `npm -v` continued to fail identically.
+Isolated by comparing `node <path-to-npm-cli.js> -v` (works, prints the
+real npm version, exit 0) against bare `npm -v` (still exit 134): **litebox
+has no guest-side `execve` shebang-following logic at all** — confirmed by
+code search across the entire litebox repo, zero hits for shebang/
+interpreter handling. `npm-cli.js` begins `#!/usr/bin/node-22`; a real
+Linux kernel re-execs the named interpreter on that line automatically,
+and litebox's guest emulation simply doesn't implement that step. This is
+a genuine, separate upstream gap (`litebox-guest-execve-no-shebang`) that
+affects any shebang script a shell tries to run by name — `npm`, `npx`,
+`pip`/`pip3` (also a shebang script on this host), and any user-authored
+`#!/bin/sh`/`#!/usr/bin/env` script — not something more file-staging can
+fix. The symlink fix ships anyway: it is correct, harmless, and is exactly
+what makes `node <script>` and any future shebang-execution fix actually
+reachable by name.
+
 ## 2026-09-03 — Staging npm/Python into sandbox shells exposed a second, un-fixed GNU-tar-header bug — fleet-wide shell panic, found and fixed same day
 
 `node -v` inside a `node22` sandbox shell was a not-found (the shell tar

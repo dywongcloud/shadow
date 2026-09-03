@@ -3924,6 +3924,24 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// A support tree, plus the `$PATH`-visible entry points that make its
+/// commands reachable by name. Staging the tree's files alone is not
+/// enough: the guest shell resolves a typed command (`npm`) through
+/// `PATH=/usr/bin:/bin` (see `exec_pty`'s `.env("PATH", ...)`), and on the
+/// host `/usr/bin/npm` is a SYMLINK into the tree
+/// (`-> ../lib/node_modules_22/npm/bin/npm-cli.js`) — without a matching
+/// symlink entry in the guest tar, `PATH` search finds nothing at
+/// `/usr/bin/npm` even though the real file is staged elsewhere in the
+/// tree, and a not-found command is fatal under litebox's fork emulation
+/// rather than a clean error (see the module's fork-corruption notes).
+/// `(guest_path, real_target)`: `real_target` is host-absolute and must
+/// already be one of the paths this walk stages (it's just the symlink's
+/// own on-host target — the tar entry mirrors the real filesystem exactly).
+struct SupportTree {
+    tree: &'static Path,
+    entry_points: &'static [(&'static str, &'static str)],
+}
+
 /// Support trees a resolved `extra` program needs beyond its own `ldd`
 /// closure — the closure only covers a real ELF's shared-library deps, but
 /// `node`/`python3` are interpreters whose OWN standard library is a tree of
@@ -3931,17 +3949,30 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
 /// the resolved program path's file NAME, not by the requested string,
 /// because `resolve_guest_program` already turned e.g. `"node"` into
 /// `/usr/bin/node`. Skipped harmlessly if the host doesn't have the tree
-/// (an older base image, a stripped-down build) — see `stage_tree`'s doc.
-fn support_tree_for(resolved: &Path) -> Option<&'static Path> {
+/// (an older base image, a stripped-down build) — see `walk_support_tree`'s
+/// doc.
+fn support_tree_for(resolved: &Path) -> Option<SupportTree> {
     match resolved.file_name().and_then(|n| n.to_str())? {
         // npm/npx are scripts under this tree (`bin/npm-cli.js`), not
         // separate binaries — staging `node` alone leaves `npm install`
         // a not-found. The tree also carries npm's own vendored
-        // dependencies (its `node_modules/`), so one walk covers both.
-        "node" | "node-22" | "node-24" | "node-26" => {
-            Some(Path::new("/usr/lib/node_modules_22"))
-        }
-        "python3" | "python3.12" | "python3.13" => Some(Path::new("/usr/lib64/python3.12")),
+        // dependencies (its `node_modules/`), so one walk covers both;
+        // `/usr/bin/npm`+`/usr/bin/npx` are the `$PATH` entry points a
+        // typed `npm ...`/`npx ...` actually resolves through — real
+        // symlinks on the host, mirrored as real symlinks in the guest.
+        "node" | "node-22" | "node-24" | "node-26" => Some(SupportTree {
+            tree: Path::new("/usr/lib/node_modules_22"),
+            entry_points: &[
+                ("/usr/bin/npm", "/usr/lib/node_modules_22/npm/bin/npm-cli.js"),
+                ("/usr/bin/npx", "/usr/lib/node_modules_22/npm/bin/npx-cli.js"),
+            ],
+        }),
+        // python3 itself is already the staged `extra` program (it's a real
+        // ELF, not a tree entry point), so no additional entry points here.
+        "python3" | "python3.12" | "python3.13" => Some(SupportTree {
+            tree: Path::new("/usr/lib64/python3.12"),
+            entry_points: &[],
+        }),
         _ => None,
     }
 }
@@ -4022,6 +4053,7 @@ fn walk_support_tree(dir: &Path) -> Vec<PathBuf> {
 async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
     let mut deps: Vec<PathBuf> = Vec::new();
+    let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     for program in &programs {
         deps.extend(ldd_closure(program).await?);
     }
@@ -4053,8 +4085,8 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
             ),
         }
         if let Some(tree) = support_tree_for(&program) {
-            if tree.is_dir() {
-                let tree_buf = tree.to_path_buf();
+            if tree.tree.is_dir() {
+                let tree_buf = tree.tree.to_path_buf();
                 let walk_target = tree_buf.clone();
                 let files = tokio::task::spawn_blocking(move || walk_support_tree(&walk_target))
                     .await
@@ -4066,10 +4098,47 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
                     "litebox: staging interpreter support tree"
                 );
                 programs.extend(files);
+                for (guest_path, target) in tree.entry_points {
+                    let guest_path = Path::new(guest_path);
+                    let target = Path::new(target);
+                    // Verify the entry point genuinely RESOLVES (via
+                    // whatever chain of symlinks the host actually stores —
+                    // `readlink` alone is often relative, e.g.
+                    // `../lib/node_modules_22/npm/bin/npm-cli.js`, so
+                    // comparing its raw text against our absolute expected
+                    // target would never match) to the EXACT file this list
+                    // expects, before trusting it — a base-image change that
+                    // moves npm's real file would otherwise stage a symlink
+                    // to nothing, silently.
+                    match std::fs::symlink_metadata(guest_path) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            match (std::fs::canonicalize(guest_path), std::fs::canonicalize(target)) {
+                                (Ok(actual), Ok(expected)) if actual == expected => {
+                                    symlinks.push((guest_path.to_path_buf(), target.to_path_buf()));
+                                }
+                                (Ok(actual), _) => tracing::debug!(
+                                    guest_path = %guest_path.display(),
+                                    expected = %target.display(),
+                                    actual = %actual.display(),
+                                    "litebox: $PATH entry point resolves somewhere unexpected; not staged"
+                                ),
+                                (Err(error), _) => tracing::debug!(
+                                    guest_path = %guest_path.display(),
+                                    %error,
+                                    "litebox: $PATH entry point symlink unresolvable; not staged"
+                                ),
+                            }
+                        }
+                        _ => tracing::debug!(
+                            guest_path = %guest_path.display(),
+                            "litebox: $PATH entry point absent or not a symlink on this host; not staged"
+                        ),
+                    }
+                }
             } else {
                 tracing::debug!(
                     program = %program.display(),
-                    tree = %tree.display(),
+                    tree = %tree.tree.display(),
                     "litebox: support tree absent on this host; interpreter stages alone"
                 );
             }
@@ -4099,14 +4168,18 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     programs.append(&mut deps);
     programs.sort();
     programs.dedup();
-    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs))
+    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs, &symlinks))
         .await
         .context("litebox shell guest tar construction task failed")?
 }
 
 
 #[cfg(target_os = "linux")]
-fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<()> {
+fn build_shell_tar_blocking(
+    archive: File,
+    paths: &[PathBuf],
+    symlinks: &[(PathBuf, PathBuf)],
+) -> anyhow::Result<()> {
     let root = File::open("/").context("open root filesystem")?;
     let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut builder = tar::Builder::new(archive);
@@ -4161,6 +4234,39 @@ fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<
         );
     }
 
+    // `$PATH`-visible entry points into an already-staged support tree
+    // (e.g. `/usr/bin/npm` -> the npm tree's real `bin/npm-cli.js`) — real
+    // symlink entries, mirroring the host filesystem exactly, so the
+    // guest's own `PATH` search finds them the same way it would on a real
+    // system. See `SupportTree::entry_points`'s doc for why the tree's
+    // files alone aren't enough.
+    for (guest_path, target) in symlinks {
+        let relative = guest_path.strip_prefix("/").map_err(|_| {
+            anyhow::anyhow!(
+                "shell guest symlink path {} is not absolute",
+                guest_path.display()
+            )
+        })?;
+        let mut header = tar::Header::new_ustar();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_username("")?;
+        header.set_groupname("")?;
+        builder
+            .append_link(&mut header, relative, target)
+            .with_context(|| {
+                format!(
+                    "append shell guest symlink {} -> {}",
+                    guest_path.display(),
+                    target.display()
+                )
+            })?;
+    }
+
     // The shell's rc file (`ENV`), synthesized here rather than read from the
     // host: the guest tree is exactly what this tar carries, nothing else.
     append_platform_tar_entry(
@@ -4180,7 +4286,11 @@ fn build_shell_tar_blocking(archive: File, paths: &[PathBuf]) -> anyhow::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_shell_tar_blocking(_archive: File, _paths: &[PathBuf]) -> anyhow::Result<()> {
+fn build_shell_tar_blocking(
+    _archive: File,
+    _paths: &[PathBuf],
+    _symlinks: &[(PathBuf, PathBuf)],
+) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar construction requires Linux openat2")
 }
 
