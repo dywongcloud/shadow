@@ -8,7 +8,7 @@ import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { VercelMark } from "@/components/logo";
+import { LightningMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { RunNodeControl } from "@/components/run-node-control";
 import { WithIdentity, type Identity } from "@/components/identity";
@@ -86,7 +86,6 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
   return null;
 }
 
-/** The Vercel triangle mark — inverts with the theme (black on light, white on dark). */
 /** Thin breadcrumb separator matching the brand slash. */
 function Slash() {
   return <span className="px-1 text-2xl font-thin text-border-strong">/</span>;
@@ -131,7 +130,7 @@ export function TopNav() {
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">
-          <Link href="/" className="flex items-center"><VercelMark className="h-5 w-auto" /></Link>
+          <Link href="/" className="flex items-center"><LightningMark className="h-5 w-auto" /></Link>
           <Slash />
           <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
           {projectSeg && (

@@ -15,7 +15,7 @@ export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
 // it inverts with the theme with no image swap or hydration flash. Kept as a
 // vector path rather than a text glyph so it renders identically across
 // platform fonts and sizes cleanly with a height utility (e.g. `h-5`).
-export function VercelMark({ className = "h-5 w-auto" }: { className?: string }) {
+export function LightningMark({ className = "h-5 w-auto" }: { className?: string }) {
   return (
     <svg viewBox="0 0 32 32" className={`${className} text-green`} fill="none" aria-label="Autheo DevHub" role="img">
       <path
@@ -29,6 +29,9 @@ export function VercelMark({ className = "h-5 w-auto" }: { className?: string })
     </svg>
   );
 }
+
+/** @deprecated Use LightningMark, the Autheo DevHub brand mark. */
+export const VercelMark = LightningMark;
 
 // Forced-color variants for surfaces that are always one theme (e.g. the
 // always-dark landing page uses <LogoWhite/>).
