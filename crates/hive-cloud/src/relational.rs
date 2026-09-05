@@ -159,6 +159,7 @@ pub(crate) async fn init_schema() {
             sku TEXT NOT NULL DEFAULT '', \
             target TEXT NOT NULL DEFAULT '', \
             stripe_session_id TEXT NOT NULL DEFAULT '', \
+            theo_transaction_hash TEXT NOT NULL DEFAULT '', \
             created_ms BIGINT NOT NULL\
         )",
         ),
@@ -1307,11 +1308,12 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
     for co in checkouts {
         sql.push_str(&format!(
             "INSERT INTO billing_checkouts (id, tenant, kind, plan, amount_cents, sku, target, \
-             stripe_session_id, created_ms) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             stripe_session_id, theo_transaction_hash, created_ms) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, kind = excluded.kind, \
              plan = excluded.plan, amount_cents = excluded.amount_cents, sku = excluded.sku, \
              target = excluded.target, stripe_session_id = excluded.stripe_session_id, \
+             theo_transaction_hash = excluded.theo_transaction_hash, \
              created_ms = excluded.created_ms;",
             q(&co.id),
             q(&co.tenant),
@@ -1321,6 +1323,7 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
             q(&co.sku),
             q(&co.target),
             q(&co.stripe_session_id),
+            q(&co.theo_transaction_hash),
             co.created_ms,
         ));
     }
@@ -1464,7 +1467,11 @@ async fn reconcile_billing_accounts_schema(
 /// now already EXISTS on every real node, so a later `CREATE TABLE IF NOT
 /// EXISTS` adding columns to that same DDL string is a no-op there — these
 /// two columns need their own reconciliation to actually land.
-const BILLING_CHECKOUTS_NEW_COLUMNS: &[(&str, &str)] = &[("sku", "TEXT"), ("target", "TEXT")];
+const BILLING_CHECKOUTS_NEW_COLUMNS: &[(&str, &str)] = &[
+    ("sku", "TEXT"),
+    ("target", "TEXT"),
+    ("theo_transaction_hash", "TEXT"),
+];
 
 /// See `BILLING_ACCOUNTS_SCHEMA_RECONCILED` — same memoization discipline,
 /// separate flag because these are two independent tables that can finish
@@ -2656,6 +2663,7 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("sku", "text"),
                 col("target", "text"),
                 col("stripe_session_id", "text"),
+                col("theo_transaction_hash", "text"),
                 col("created_ms", "bigint"),
             ],
         },

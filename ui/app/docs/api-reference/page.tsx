@@ -4,23 +4,23 @@ import { CodeBlock } from "@/components/code-block";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
 export const metadata: Metadata = {
-  title: "REST API Reference — shadw Docs",
+  title: "REST API Reference — autheo Docs",
   description:
-    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+    "Reference for the autheo REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
   alternates: { canonical: "/docs/api-reference" },
   openGraph: {
-    title: "REST API Reference — shadw Docs",
+    title: "REST API Reference — autheo Docs",
     description:
-      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+      "Reference for the autheo REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
     url: "/docs/api-reference",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "REST API Reference — shadw Docs",
+    title: "REST API Reference — autheo Docs",
     description:
-      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse every endpoint for deploys, projects, domains, and nodes.",
+      "Reference for the autheo REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse every endpoint for deploys, projects, domains, and nodes.",
   },
 };
 
@@ -57,12 +57,12 @@ export default function ApiReferencePage() {
         <div className="mb-6 flex items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
           <span className="text-muted">/</span>
-          <span className="font-medium text-fg">shadw REST API</span>
+          <span className="font-medium text-fg">autheo REST API</span>
         </div>
 
         <h1 className="text-4xl font-bold tracking-tight">Using the REST API</h1>
         <p className="mt-6 text-[15px] leading-relaxed text-secondary">
-          Interact programmatically with your shadw cloud using direct HTTP requests. You can create
+          Interact programmatically with your autheo cloud using direct HTTP requests. You can create
           deployments, manage custom domains and DNS, configure projects, and wire up webhooks — all
           over the mesh.
         </p>

@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "The optional build-cache and runtime-warmup paths remain compiled for capability validation, but are not enabled by the current deployment flow."
+)]
+
 //! Deploy from a git repository with a live, Vercel-style **build log**.
 //!
 //! `start_build` creates a build record (state = building) and returns its id
@@ -691,11 +696,7 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     let out = out
         .trim_matches(|c| c == '-' || c == '.' || c == '_')
         .to_string();
-    if out.is_empty() {
-        "app".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "app".into() } else { out }
 }
 
 pub(crate) fn project_volume_name(
@@ -1888,6 +1889,53 @@ fn resolve_build_trust(
     })
 }
 
+/// Extract the only Marketplace policy input Hive is allowed to consume:
+/// authoritative node registry identifiers. Policy retrieval, Clerk
+/// authentication, tenant derivation, and schema validation happen in DevHub's
+/// server-only route; Hive must neither accept identity material nor refetch.
+///
+/// This defensive re-check protects CLI/internal paths from treating an
+/// incomplete Marketplace marker as an ordinary deployment. It intentionally
+/// does not relax to a local-node fallback: an absent eligible approved node is
+/// a placement refusal.
+fn marketplace_approved_nodes(
+    req: &GitDeployRequest,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let Some(snapshot) = req.marketplace_placement.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        snapshot.contract_version == 1 && snapshot.policy_version > 0,
+        "MARKETPLACE_POLICY_INVALID: unsupported Marketplace policy version"
+    );
+    anyhow::ensure!(
+        !snapshot.marketplace_order_id.trim().is_empty()
+            && !snapshot.buyer_tenant_id.trim().is_empty(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace order and buyer tenant are required"
+    );
+    anyhow::ensure!(
+        snapshot.policy.is_object(),
+        "MARKETPLACE_POLICY_INVALID: Marketplace policy snapshot is malformed"
+    );
+    let approved: std::collections::HashSet<String> = snapshot
+        .approved_node_ids
+        .iter()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        !approved.is_empty() && approved.len() == snapshot.approved_node_ids.len(),
+        "MARKETPLACE_POLICY_INVALID: approved_node_ids must be a non-empty unique list of node ids"
+    );
+    Ok(Some(approved))
+}
+
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -1897,6 +1945,11 @@ async fn run_build(
     first_deploy: bool,
 ) -> anyhow::Result<()> {
     cloud.projects.get_exact(&project, incarnation)?;
+    // A Marketplace policy is a deployment-scoped, immutable authorization
+    // snapshot. Do not refetch it here: the Clerk JWT belongs exclusively to
+    // DevHub's server-side consumer. This process uses only the validated,
+    // safe node-id allowlist copied into the request before the build began.
+    let marketplace_approved_nodes = marketplace_approved_nodes(&req)?;
     let region = &cloud.region;
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
@@ -2053,6 +2106,7 @@ async fn run_build(
             },
             !known_container,
             needs_build_isolation,
+            marketplace_approved_nodes.as_ref(),
         );
         // Nodes that can run repository build commands: the isolated executor
         // (Firecracker) OR a host-exec backend (mock/litebox) that builds on
@@ -2113,6 +2167,12 @@ async fn run_build(
             );
             log(msg.clone());
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
+            return Err(anyhow::anyhow!(msg));
+        }
+        if req.marketplace_placement.is_some() && targets.is_empty() {
+            let msg = "MARKETPLACE_PLACEMENT_UNAVAILABLE: no approved Marketplace node is currently healthy, reachable, and capable. The deployment was not placed outside buyer-authorized nodes.".to_string();
+            log(msg.clone());
+            tracing::warn!(project = %project, "deploy refused: no eligible Marketplace-approved node");
             return Err(anyhow::anyhow!(msg));
         }
         // Same refusal for the wasm runtime, and for the identical reason the GPU
@@ -3241,9 +3301,10 @@ async fn run_build(
             selection.relative.to_string_lossy().replace('\\', "/")
         };
         log(format!(
-            "Auto-detected workspace app: {relative} ({}; evidence: {}).",
+            "Auto-detected workspace app: {relative} ({}; evidence: {}; decision: {}).",
             selection.workspace_source,
-            selection.evidence.join(", ")
+            selection.evidence.join(", "),
+            selection.decision_digest,
         ));
         let selected = if selection.relative.as_os_str().is_empty() {
             checkout_dir.clone()
@@ -4158,8 +4219,7 @@ async fn run_build(
             })
             .collect();
         if !dropped.is_empty() {
-            let msg =
-                format!(
+            let msg = format!(
                 "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
                  `functions[].browser` for {}, but this project builds through the {} path, which \
                  constructs its own function list and cannot carry a per-function browser opt-in. \
@@ -4180,7 +4240,11 @@ async fn run_build(
                     })
                     .collect::<Vec<_>>()
                     .join(", "),
-                if is_container { "container" } else { "framework-detected" },
+                if is_container {
+                    "container"
+                } else {
+                    "framework-detected"
+                },
                 manifest
                     .functions
                     .iter()
@@ -4468,7 +4532,11 @@ async fn run_build(
         Ok(ports) if !ports.is_empty() => {
             log(format!(
                 "Allocated public raw port(s): {} (stable across redeploys).",
-                ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             // A compose publish request asked for a LITERAL host port. Name the
             // outcome for every such spec — grant == request is confirmation,
@@ -4600,184 +4668,23 @@ async fn run_build(
             .projects
             .claim_volumes_exact(&project, incarnation, volume_names)?;
     }
-    let previous_production = cloud
-        .gw
-        .list()
-        .into_iter()
-        .find(|deployment| {
-            deployment.project == project
-                && deployment.project_incarnation == Some(incarnation)
-                && deployment.production
-                && deployment.state == DeployState::Ready
-        })
-        .map(|deployment| deployment.id.to_string());
-    let source = crate::deployment_ledger::SourceIdentity {
-        kind: if req.image_ref.is_some() {
-            crate::deployment_ledger::SourceKind::PrebuiltImage
-        } else if req.repo_url.starts_with("upload://") {
-            crate::deployment_ledger::SourceKind::Upload
+    let info = cloud.gw.deploy_full_with_runtime_exact_marketplace(
+        host_static_root,
+        Some(runtime_workdir),
+        manifest,
+        req.creator.clone().unwrap_or_else(|| "you".into()),
+        Some(git),
+        flip_production,
+        if build_failed {
+            DeployState::Error
         } else {
             crate::deployment_ledger::SourceKind::Git
         },
-        repository: req.repo_url.clone(),
-        branch: actual_branch.clone(),
-        revision: if let Some(image) = req.image_ref.as_ref() {
-            image.clone()
-        } else if full_sha.is_empty() {
-            commit.clone()
-        } else {
-            full_sha.clone()
-        },
-    };
-    let info = if build_failed {
-        let info = cloud.gw.deploy_full_with_runtime_exact(
-            host_static_root,
-            Some(runtime_workdir),
-            manifest,
-            req.creator.clone().unwrap_or_else(|| "you".into()),
-            Some(git),
-            is_production,
-            DeployState::Error,
-            tenant.clone(),
-            incarnation,
-        );
-        crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
-        info
-    } else {
-        let mut staged = cloud.gw.stage_full_with_runtime_exact(
-            host_static_root,
-            Some(runtime_workdir),
-            manifest,
-            req.creator.clone().unwrap_or_else(|| "you".into()),
-            Some(git),
-            is_production,
-            tenant.clone(),
-            incarnation,
-        )?;
-        let deployment_id = staged.info().id.to_string();
-        crate::admin::causal_stamp_new_deployment(cloud, &project, &deployment_id);
-        let readiness = staged.prove_ready().await?.clone();
-        cloud
-            .deployment_ledger
-            .accept(crate::deployment_ledger::DeploymentAcceptanceInput {
-                deployment_id: deployment_id.clone(),
-                project: project.clone(),
-                target: if is_production {
-                    "production".to_string()
-                } else {
-                    "preview".to_string()
-                },
-                source,
-                repository_build: repository_build.clone(),
-                runtime_artifact: runtime_artifact_identity.clone(),
-                readiness,
-            })?;
-        // Mac-node-only: provision this deployment's Secure-Enclave-resident
-        // signing key now, at first build acceptance, so its public half is
-        // committed into the integrity chain's very first entry — a
-        // verifier never sees Mac-authored entries with no key to check
-        // them against. Best-effort and non-fatal: a SEP failure (unsigned
-        // binary, no SEP hardware, etc — see sep_signer.rs's module doc for
-        // the confirmed code-signing requirement) must never fail an
-        // otherwise-successful deployment; it only means that deployment's
-        // chain has no SEP-backed entries, falling back to this node's
-        // ordinary software signing key for everything else.
-        #[cfg(target_os = "macos")]
-        match hive_backend::sep_signer::generate_for_deployment(&deployment_id) {
-            Ok(sep_key) => {
-                if let Err(error) = cloud.deployment_ledger.append_integrity_entry(
-                    &deployment_id,
-                    hive_core::IntegrityEntryKind::SepKeyProvisioned {
-                        public_key_der_hex: sep_key.public_key_der_hex,
-                        key_tag: sep_key.key_tag,
-                    },
-                ) {
-                    tracing::warn!(deployment_id, %error, "integrity chain: failed to record SepKeyProvisioned");
-                }
-            }
-            Err(error) => {
-                tracing::debug!(deployment_id, %error, "no Secure Enclave signing key provisioned for this deployment (non-fatal)");
-            }
-        }
-        let (mut info, _readiness) = staged.publish_ready()?;
-        if !crate::persist::persist_durable(cloud) {
-            cloud.gw.remove(&deployment_id).await;
-            anyhow::bail!(
-                "deployment {deployment_id} passed readiness but its Ready record could not be persisted"
-            );
-        }
-        let ready_alias = if !info.commit_alias.is_empty() {
-            info.commit_alias.clone()
-        } else {
-            info.id_alias.clone()
-        };
-        if let Err(error) = cloud.deployment_ledger.mark_published(
-            &deployment_id,
-            serde_json::json!({
-                "id": deployment_id,
-                "project": info.project,
-                "url": cloud.deploy_url(&ready_alias),
-                "state": "ready",
-                "production": false,
-                "target": info.target,
-                "commit": commit,
-            }),
-        ) {
-            cloud.gw.remove(&info.id.to_string()).await;
-            let _ = crate::persist::persist_durable(cloud);
-            return Err(error.context("durably publish deployment readiness"));
-        }
-        if is_production {
-            let alias_revision = cloud.deployment_ledger.prepare_alias(
-                &project,
-                previous_production.clone(),
-                &info.id.to_string(),
-            )?;
-            let Some(promoted) = cloud.gw.promote_exact(&info.id.to_string(), incarnation) else {
-                cloud
-                    .deployment_ledger
-                    .abort_alias(alias_revision, "gateway refused accepted deployment")?;
-                anyhow::bail!(
-                    "accepted deployment {} could not acquire its production alias",
-                    info.id
-                );
-            };
-            if !crate::persist::persist_durable(cloud) {
-                cloud
-                    .deployment_ledger
-                    .abort_alias(alias_revision, "platform-state alias persistence failed")?;
-                if let Some(previous) = previous_production.as_deref() {
-                    let _ = cloud.gw.promote_exact(previous, incarnation);
-                } else {
-                    cloud.gw.remove(&promoted.id.to_string()).await;
-                }
-                let _ = crate::persist::persist_durable(cloud);
-                anyhow::bail!("production alias revision {alias_revision} could not be persisted");
-            }
-            info = promoted;
-            if let Err(error) = cloud.deployment_ledger.mark_alias_applied(
-                alias_revision,
-                serde_json::json!({
-                    "id": info.id.to_string(),
-                    "project": info.project,
-                    "url": cloud.deploy_url(&info.alias),
-                    "state": "ready",
-                    "production": true,
-                    "target": "production",
-                    "commit": commit,
-                    "aliasRevision": alias_revision,
-                }),
-            ) {
-                tracing::error!(
-                    deployment = %info.id,
-                    alias_revision,
-                    %error,
-                    "production alias is durably applied; ledger finalization remains pending"
-                );
-            }
-        }
-        info
-    };
+        tenant.clone(),
+        incarnation,
+        req.marketplace_placement.clone(),
+    );
+    crate::admin::causal_stamp_new_deployment(cloud, &project, &info.id.0);
 
     // Record deployment ownership of each browser artifact now that the
     // deployment id exists (`deploy_full` mints it). The bytes are already
@@ -4997,6 +4904,7 @@ async fn run_build(
             },
             true,
             true,
+            marketplace_approved_nodes.as_ref(),
         );
         if targets
             .iter()
@@ -5830,42 +5738,23 @@ async fn mirror_remote_build(
 ) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
-    // INACTIVITY deadline, not an absolute cap. The old fixed 10-minute cap
-    // declared "remote build timed out" for any legitimately long build (a
-    // large monorepo's install + build alone routinely exceeds it on a 4-core
-    // builder) even while every poll was succeeding and log lines were
-    // streaming. Only a window with ZERO successful state reads now counts
-    // toward giving up; every successful read pushes the deadline out. A much
-    // larger absolute ceiling still bounds the whole mirror so a target wedged
-    // in `Building` forever cannot pin this coordinator task indefinitely.
-    let idle_window_ms = std::env::var("HIVE_BUILD_MIRROR_IDLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(10 * 60 * 1000);
-    let ceiling_ms = std::env::var("HIVE_BUILD_MIRROR_MAX_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(120 * 60 * 1000);
-    let started = now_ms();
-    let mut deadline = started + idle_window_ms;
+    let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
     // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-                                              // anonymous tenant, `build_owned_by` never matched the build's real
-                                              // team, and every poll 404'd — INCLUDING every poll against a target
-                                              // build that had already finished. Verified live: 400/400 polls failed
-                                              // for a target build that reached `ready` in under 3 seconds, on a
-                                              // reachable node, every single time. This is not a mesh-health symptom;
-                                              // it silently broke remote-build status mirroring for every
-                                              // fanout-placed deployment on the whole fleet, always burning the full
-                                              // 10-minute deadline regardless of how fast the actual remote build was.
-                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
-                                              // every other mesh-internal proxied read (`fetch_from_host` and
-                                              // friends) — the coordinator knows the real owning team from its own
-                                              // local build record, so it can assert it the same way.
+    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+    // anonymous tenant, `build_owned_by` never matched the build's real
+    // team, and every poll 404'd — INCLUDING every poll against a target
+    // build that had already finished. Verified live: 400/400 polls failed
+    // for a target build that reached `ready` in under 3 seconds, on a
+    // reachable node, every single time. This is not a mesh-health symptom;
+    // it silently broke remote-build status mirroring for every
+    // fanout-placed deployment on the whole fleet, always burning the full
+    // 10-minute deadline regardless of how fast the actual remote build was.
+    // `mesh_team_qs` is the SAME delegation-token minting already used for
+    // every other mesh-internal proxied read (`fetch_from_host` and
+    // friends) — the coordinator knows the real owning team from its own
+    // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -5969,7 +5858,12 @@ async fn mirror_remote_build(
                 );
             }
             if now_ms() > deadline {
-                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
+                cloud.builds.log(
+                    bid,
+                    format!(
+                        "✗ {node}: lost contact with remote build after {polls_failed} failed polls"
+                    ),
+                );
                 // NOT a build failure: this node never told us its app failed —
                 // we simply could not read it. Treated as unreachable so it
                 // degrades capacity instead of vetoing healthy regions.
@@ -6870,7 +6764,9 @@ impl<'a> PackageManagerLauncher<'a> {
 
     fn add_svelte_adapter(&self) -> String {
         let arguments = match self.detection.manager {
-            "npm" => "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\"",
+            "npm" => {
+                "install -D --no-save --package-lock=false --no-audit --no-fund --legacy-peer-deps \"$spec\""
+            }
             "pnpm" => "add -D --lockfile=false --config.strict-peer-dependencies=false \"$spec\"",
             "yarn" => "add -D \"$spec\"",
             "bun" => "add -d \"$spec\"",
@@ -7745,7 +7641,9 @@ done' hive-delink {} +
                     let prm = fluid_build::per_route::discover(&next_dir);
                     log(format!(
                         "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
-                        prm.routes.len(), prm.eligible_count(), prm.fallback_count()
+                        prm.routes.len(),
+                        prm.eligible_count(),
+                        prm.fallback_count()
                     ));
                     // Map build-time classification -> runtime policy (#16), persisted
                     // into the manifest so the serve path can apply route-type-aware
@@ -9022,7 +8920,9 @@ async fn warmup_bun_bytecode(
                 .to_string_lossy()
                 .into_owned();
             let ver = bun_version(&bun_bin).await.unwrap_or_else(|| "?".into());
-            log(format!("Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."));
+            log(format!(
+                "Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."
+            ));
             vec!["bun".to_string(), "run".to_string(), rel]
         }
         Ok(o) => {
@@ -9031,11 +8931,15 @@ async fn warmup_bun_bytecode(
                 .chars()
                 .take(300)
                 .collect();
-            log(format!("Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."));
+            log(format!(
+                "Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."
+            ));
             original
         }
         Err(e) => {
-            log(format!("Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."));
+            log(format!(
+                "Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."
+            ));
             original
         }
     }
@@ -9662,11 +9566,7 @@ async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
         Ok(Ok(output)) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stdout.is_empty() {
-                stderr
-            } else {
-                stdout
-            }
+            if stdout.is_empty() { stderr } else { stdout }
         }
         _ => "unavailable".to_string(),
     }
@@ -10121,8 +10021,8 @@ async fn parse_expose(path: &Path) -> Option<u16> {
 /// trailingSlash, images, crons, and per-function overrides (matched by glob).
 fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
     use fluid_core::{
-        redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
-        Redirect, RemotePattern, Rewrite, RuleCondition,
+        CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern, Redirect,
+        RemotePattern, Rewrite, RuleCondition, redirect_status,
     };
 
     let conv_conds = |cs: &[fluid_build::VercelCondition]| -> Vec<RuleCondition> {
@@ -11459,6 +11359,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_pids: None,
         image_ports: None,
         git_token: token,
+        marketplace_placement: None,
     };
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
@@ -11709,9 +11610,11 @@ mod tests {
         assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
         // No server function yet → None even for opennext.
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(adapter_manifest("p", "opennext", &dir, None)
-            .await
-            .is_none());
+        assert!(
+            adapter_manifest("p", "opennext", &dir, None)
+                .await
+                .is_none()
+        );
         // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
         std::fs::write(
@@ -12267,13 +12170,15 @@ mod tests {
         assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
         assert_eq!(sanitize_tag(""), "app");
         // Only [a-z0-9._-] survive.
-        assert!(sanitize_tag("Foo/Bar:Baz")
-            .chars()
-            .all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || c == '.'
-                || c == '_'
-                || c == '-'));
+        assert!(
+            sanitize_tag("Foo/Bar:Baz")
+                .chars()
+                .all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == '.'
+                    || c == '_'
+                    || c == '-')
+        );
     }
 
     #[test]

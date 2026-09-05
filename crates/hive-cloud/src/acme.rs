@@ -193,14 +193,6 @@ pub fn raw_server_config_for(hosts: Vec<String>) -> Arc<rustls::ServerConfig> {
     Arc::new(cfg)
 }
 
-pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(SniResolver));
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(cfg)
-}
-
 pub fn server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -686,7 +678,9 @@ async fn account(
                 // reachable. Best-effort: the credential is already in hand.
                 if let Some(env) = seal_account(&c) {
                     if !write_account_sealed(&env) {
-                        tracing::warn!("adopted the replicated ACME account but could not write the local sealed cache");
+                        tracing::warn!(
+                            "adopted the replicated ACME account but could not write the local sealed cache"
+                        );
                     }
                 }
                 found = Some(("replicated store", c));
@@ -865,7 +859,7 @@ async fn issue(
             if authz.status == AuthorizationStatus::Valid {
                 continue;
             }
-            let mut challenge = authz
+            let challenge = authz
                 .challenge(ChallengeType::Dns01)
                 .ok_or_else(|| anyhow::anyhow!("no dns-01 challenge offered"))?;
             let host = challenge.identifier().to_string();
@@ -1592,7 +1586,7 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
     }
     tokio::spawn(async move {
         let mut installed: HashMap<String, u64> = HashMap::new(); // bundle -> issued_ms
-                                                                  // bundle -> consecutive unwanted ticks (prune flap damping)
+        // bundle -> consecutive unwanted ticks (prune flap damping)
         let mut unwanted: HashMap<String, u8> = HashMap::new();
         // boot: local cache first (guardian may take a while to come online)
         for (bundle, ..) in bundles(&cloud)

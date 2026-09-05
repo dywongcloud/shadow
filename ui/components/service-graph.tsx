@@ -81,7 +81,7 @@ function IngressNode({ data }: { data: any }) {
         <span className="flex h-5 w-5 items-center justify-center rounded bg-fg text-bg">
           <svg width="9" height="8" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
         </span>
-        OpenEdge Ingress
+        DevHub Ingress
       </div>
       <StatRow icon={<Shield className="h-3.5 w-3.5" />} label="DDoS protection" on={data.ddos} />
       <StatRow icon={<Globe className="h-3.5 w-3.5" />} label="CDN" on={data.cdn} />
@@ -148,9 +148,9 @@ function ResourceNode({ data }: { data: any }) {
 }
 
 const ADDER_OPTIONS: { kind: AddKind; label: string; provider: string; suffix: string; icon: React.ReactNode }[] = [
-  { kind: "postgres", label: "Database", provider: "OpenEdge Postgres", suffix: "db", icon: <DbIcon className="h-4 w-4" /> },
-  { kind: "redis", label: "Cache", provider: "OpenEdge KV", suffix: "cache", icon: <Server className="h-4 w-4" /> },
-  { kind: "blob", label: "Blob store", provider: "OpenEdge Blob", suffix: "blob", icon: <HardDrive className="h-4 w-4" /> },
+  { kind: "postgres", label: "Database", provider: "DevHub Postgres", suffix: "db", icon: <DbIcon className="h-4 w-4" /> },
+  { kind: "redis", label: "Cache", provider: "DevHub KV", suffix: "cache", icon: <Server className="h-4 w-4" /> },
+  { kind: "blob", label: "Blob store", provider: "DevHub Blob", suffix: "blob", icon: <HardDrive className="h-4 w-4" /> },
 ];
 
 type AdderOption = (typeof ADDER_OPTIONS)[number];

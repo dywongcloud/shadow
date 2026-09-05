@@ -57,7 +57,7 @@ export async function GET(req: NextRequest) {
     fetch(target.toString(), {
       // Some CDNs 403 an empty UA / wrong referer.
       headers: {
-        "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)",
+        "user-agent": "Mozilla/5.0 (compatible; autheo-tv/1.0)",
         ...(range ? { range } : {}),
       },
       cache: "no-store",

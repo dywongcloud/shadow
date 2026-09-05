@@ -79,6 +79,7 @@ pub fn place_for_project(
     needs_interpreter: impl Into<InterpreterNeeds>,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
+    approved_node_ids: Option<&std::collections::HashSet<String>>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
     if let Some(holder) = cloud.leases.owner_of(project) {
@@ -101,6 +102,8 @@ pub fn place_for_project(
             let bun_ok = bun_capable(n, needs_interpreter.bun);
             let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
             let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
+            let disk_ok = n.disk_free_gb == 0 || n.disk_free_gb >= disk_floor_gb();
+            let marketplace_ok = approved_node_ids.is_none_or(|approved| approved.contains(&n.id));
             if n.healthy
                 && region_ok
                 && reachable
@@ -109,6 +112,8 @@ pub fn place_for_project(
                 && bun_ok
                 && runtime_artifact_ok
                 && build_isolation_ok
+                && disk_ok
+                && marketplace_ok
             {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 // Carry BOTH transports whenever both are known. They are
@@ -150,6 +155,7 @@ pub fn place_for_project(
         needs_interpreter,
         needs_runtime_artifact,
         needs_build_isolation,
+        approved_node_ids,
     )
 }
 
@@ -522,6 +528,10 @@ pub fn place(
     // Any repository-controlled command requires the live-probed outer
     // BuildExecutor contract. Old peers and failed probes are ineligible.
     needs_build_isolation: bool,
+    // Immutable Marketplace policy allowlist. A node may be selected only when
+    // its authoritative registry id is listed; live health, reachability, and
+    // capacity still must independently pass.
+    approved_node_ids: Option<&std::collections::HashSet<String>>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
     let nodes = cloud.registry.nodes(); // self first
@@ -534,14 +544,73 @@ pub fn place(
     let target_of = |n: &NodeInfo| -> Target { target_of(cloud, n) };
     let reachable = |n: &NodeInfo| -> bool { reachable(cloud, n) };
     let capable = |n: &NodeInfo| -> bool {
-        capable(
-            n,
-            is_container,
-            needs_gpu,
-            needs_interpreter,
-            needs_runtime_artifact,
-            needs_build_isolation,
-        )
+        if approved_node_ids.is_some_and(|approved| !approved.contains(&n.id)) {
+            return false;
+        }
+        if needs_gpu && n.gpu_count == 0 {
+            return false;
+        }
+        // Wasmer capability, same hard-filter shape as the GPU gate above.
+        // See `wasm_capable` for why `None` excludes rather than admits.
+        if !wasm_capable(n, needs_interpreter.wasm) {
+            return false;
+        }
+        // Bun capability, identical shape and identical reasoning — see
+        // `bun_capable`.
+        if !bun_capable(n, needs_interpreter.bun) {
+            return false;
+        }
+        if !runtime_artifact_capable(n, needs_runtime_artifact) {
+            return false;
+        }
+        if !build_isolation_capable(n, needs_build_isolation) {
+            return false;
+        }
+        // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
+        // filtered on health/region/GPU and then sorted by deployment COUNT, a
+        // metric that says nothing about space. So the node with the most free
+        // capacity and the node with none scored identically, and a full node
+        // kept winning. Witnessed 2026-07-31 — fc-sanjose hit 0 bytes free and
+        // took 9 customer deployments down ("host disk critically low ... after
+        // GC") while fc-frankfurt and both CVM nodes sat under 10% used with
+        // ~920 GiB free each.
+        //
+        // A HARD filter, not another term in the score, because disk is not like
+        // CPU or memory: it does not drain on its own once a deployment lands,
+        // so a node that is out of space is out until something is deleted. A
+        // weighted score would still let it win when peers look busy.
+        //
+        // The floor is deliberately larger than the per-cold-start requirement
+        // (`FLOOR_BYTES`, 3 GiB in hive-backend): placement must leave room for
+        // the deployment it is about to create PLUS the next one, or it just
+        // hands the node to the very check that will reject it.
+        //
+        // `disk_free_gb == 0` means UNKNOWN, not full — a pre-upgrade peer does
+        // not report it. Excluding those would empty the candidate set during a
+        // rollout, so unknown is admitted and only a positive, genuinely-low
+        // reading rejects.
+        let floor_gb = disk_floor_gb();
+        if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
+            return false;
+        }
+        if is_container {
+            // A container deployment is served on this node's own public host —
+            // never through the microVM guest network — so a node with NO public
+            // address can win placement (it's `reachable()` for build DISPATCH via
+            // admin/iroh) but the resulting deployment is then unreachable by any
+            // real client: only 127.0.0.1. Witnessed as a live risk when the local
+            // Mac dev nodes moved region to san-jose — the mock-backend widening
+            // below exists so containers can run on them at all, but a
+            // region-pinned container could land there and silently never serve.
+            // Require a public address for EITHER family, on every backend
+            // (firecracker included — a NAT'd FC node has the identical problem,
+            // this is not mock-specific), so an unreachable node simply isn't a
+            // candidate rather than winning and quietly failing to serve.
+            let has_public = n.public_ip.is_some() || n.public_ip6.is_some();
+            has_public && (eligible(n) || (n.healthy && n.backend == "mock"))
+        } else {
+            eligible(n)
+        }
     };
 
     let regions: Vec<String> = regions
@@ -578,7 +647,12 @@ pub fn place(
         for region in regions {
             let cands: Vec<&NodeInfo> = nodes
                 .iter()
-                .filter(|n| n.healthy && n.region.eq_ignore_ascii_case(region) && reachable(n))
+                .filter(|n| {
+                    n.healthy
+                        && n.region.eq_ignore_ascii_case(region)
+                        && reachable(n)
+                        && approved_node_ids.is_none_or(|approved| approved.contains(&n.id))
+                })
                 .collect();
             if cands.is_empty() {
                 continue; // no reachable node in that region
@@ -594,6 +668,17 @@ pub fn place(
             // region entirely is correct: `targets` staying empty is the signal the
             // caller turns into an explicit failure.
             let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| capable(n)).collect();
+            // A Marketplace allowlist is an authorization boundary, not a
+            // preference. Unlike ordinary explicit-region placement, it may
+            // never widen from an approved-but-unhealthy/unavailable/capacity-
+            // constrained candidate to another node.
+            if approved_node_ids.is_some() && eligibles.is_empty() {
+                tracing::warn!(
+                    region = %region,
+                    "placement: no Marketplace-approved node in this region passes current health/capacity/capability checks"
+                );
+                continue;
+            }
             if needs_gpu && eligibles.is_empty() {
                 tracing::warn!(region = %region, "placement: no GPU-capable node in this region — not widening (gpu request)");
                 continue;
