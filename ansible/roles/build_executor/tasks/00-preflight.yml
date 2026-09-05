@@ -62,7 +62,7 @@
         build_executor_runsc_sidecar_sha256 ==
         (build_executor_gvisor_members | selectattr('path', 'equalto', 'containerd-shim-runsc-v1') | first).sha256
       - build_executor_runsc_sidecar_path == (build_executor_gvisor_current_link ~ "/containerd-shim-runsc-v1")
-      - build_executor_runsc_runtime_flags == ["platform=systrap", "network=sandbox", "gvisor-marker-file=true", "directfs=false", "host-uds=none", "host-fifo=none", "net-raw=false", "allow-flag-override=false"]
+      - build_executor_runsc_runtime_flags == ["platform=systrap", "network=sandbox", "gvisor-marker-file=true", "host-uds=none", "host-fifo=none", "net-raw=false", "allow-flag-override=false"]
       - build_executor_podman_path == (build_executor_libexec_dir ~ "/podman")
       - build_executor_containers_conf_dir == "/etc/hive/build-executor"
       - build_executor_containers_conf_path == (build_executor_containers_conf_dir ~ "/containers.conf")

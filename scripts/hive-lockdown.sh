@@ -25,7 +25,7 @@ PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
 # scripts/deploy-ui-fleet.sh already uses for its own host list), whenever a
 # node joins/leaves/changes IP. A hand-typed roster is exactly how this list
 # went stale the first time (6 of 12 current nodes, missing every GPU/CVM node).
-PEERS="43.152.247.70 43.128.46.225 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 43.173.78.95 43.166.76.159 43.153.106.173 170.106.155.130 162.62.83.91 43.166.223.197 43.166.233.114"
+PEERS="43.152.247.70 43.128.46.225 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 43.173.78.95 43.153.114.15 43.172.117.92 43.135.132.93 43.166.76.159 162.62.83.144 43.166.223.197 43.166.233.114 93.188.162.67 43.133.30.68 150.109.247.150 170.106.162.175 43.130.153.237 43.153.106.173 170.106.155.130 162.62.83.91"
 # 50052 = llama.cpp rpc-server on the GPU nodes (ggml RPC backend, NO
 # authentication of its own -- must never be internet-reachable; peers only).
 # 50100:50999 = managed-inference llama-server endpoints (inference.rs) --

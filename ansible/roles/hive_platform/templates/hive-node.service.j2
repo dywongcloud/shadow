@@ -102,6 +102,23 @@ Environment=GITHUB_WEBHOOK_SECRET={{ vault_github_webhook_secret }}
 {% if vault_hive_secret_key %}
 Environment=HIVE_SECRET_KEY={{ vault_hive_secret_key }}
 {% endif %}
+{# Dedicated public IPv4 addon (tencent_eip.rs): all three of these must be
+   present together or the node's own preflight() check correctly reports the
+   feature unavailable rather than half-configuring it. Credentials are
+   shared fleet-wide (one Tencent account); region + instance id are THIS
+   node's own real Tencent Cloud identity and must never be templated from a
+   shared/default value -- see hosts.ini's per-host hive_tencent_region /
+   hive_tencent_instance_id comment for how they were derived (live
+   DescribeInstances matched by this node's own public IP, not guessed). A
+   host with neither var set (e.g. a non-Tencent-hosted node) gets none of
+   this block, which is the correct "not available on this fleet yet" state
+   for that host specifically. #}
+{% if vault_tencentcloud_secret_id and hive_tencent_region is defined and hive_tencent_instance_id is defined %}
+Environment=TENCENTCLOUD_SECRET_ID={{ vault_tencentcloud_secret_id }}
+Environment=TENCENTCLOUD_SECRET_KEY={{ vault_tencentcloud_secret_key }}
+Environment=HIVE_TENCENT_EIP_REGION={{ hive_tencent_region }}
+Environment=HIVE_TENCENT_CVM_INSTANCE_ID={{ hive_tencent_instance_id }}
+{% endif %}
 ExecStart={{ hive_binary_path }} --region {{ hive_region }} --name {{ hive_name }} --listen {{ hive_listen }} --admin {{ hive_admin }}{% for p in (hive_extra_peers | default([])) %} --peer {{ p }}{% endfor %}
 
 WorkingDirectory={{ hive_src_dir }}
@@ -118,6 +135,24 @@ LimitNOFILE=1048576
 # the dockerd/containerd precedent for exactly this shape — so databases and
 # cells outlive a control-plane restart, as they must.
 KillMode=process
+# Explicit because TencentOS's /etc/systemd/system.conf sets
+# DefaultTimeoutStopSec=5s, which SIGKILLs the node 5 s into its drain — before
+# the platform-state flush runs. The graceful path is ~30 s and the in-process
+# hard deadline (HIVE_SHUTDOWN_DEADLINE_SECS) is 75 s, so 90 s means the process
+# always exits on its own terms.
+TimeoutStopSec=90s
+# The unit's cgroup holds every child hive-cloud spawns — tenant build
+# processes, conmon, litebox runners, firecracker — under the node's memguard
+# MemoryMax. With systemd's default OOMPolicy=stop, ONE OOM-killed child stops
+# the whole node (SIGTERM, then SIGKILL on the next event a second later):
+# witnessed on fc-virginia 2026-09-02, 12 such stops in 24 h — the SIGTERM
+# hive-cloud logged after the OOM line proves the victim was a child. (The
+# cgroup's lifetime kernel OOM kills were hive-cloud itself at 26.8 GB anon
+# on 2026-08-28, the KV balloon; this directive does not change that case.)
+# `continue` keeps the node up and lets the child's own failure path report
+# it; hive-cloud itself being the victim still exits and Restart=always
+# brings it back, exactly as before.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

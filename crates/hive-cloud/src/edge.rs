@@ -501,8 +501,48 @@ async fn edge_pipeline_inner(
     let local_state = serve_local
         .then(|| cloud.gw.host_deploy_state(&host))
         .flatten();
-    let prefer_peer =
-        serve_local && !matches!(local_state, Some(fluid_core::DeployState::Ready)) && {
+    // A local record that is Ready is not automatically the RIGHT answer: this
+    // node's `select()` only reflects deployments THIS node has itself
+    // registered (a build/publish that ran here), never a production promotion
+    // that happened on a different node. A stale preview left over from an
+    // earlier deploy stays Ready forever and wins the alias by default — this
+    // node has no signal that a newer production deployment exists elsewhere.
+    // Witnessed live (2026-08-26, `express.shadw.app`): fc-sanjose kept
+    // serving its own leftover preview build (Ready, `production: false`)
+    // while fc-frankfurt held the actual promoted production deployment for
+    // the same alias — sanjose never even checked `peer_deployments` because
+    // its local answer was Ready. Detect that gap from the gossiped fleet
+    // deployment list (`peer_deployments`, populated by the SAME
+    // `/v1/fleet-deployments` poll `raw_proxy.rs` already relies on): a peer
+    // deployment for this exact alias is "newer" only if it out-ranks the
+    // local candidate by the same `(production, created_at_ms)` ordering
+    // `set_alias_if_newer` uses locally, so a preview can never pre-empt a
+    // production deploy this node DOES hold correctly.
+    let local_is_stale = serve_local
+        && matches!(local_state, Some(fluid_core::DeployState::Ready))
+        && {
+            let local_rank = cloud
+                .gw
+                .deployment_for_host(&host)
+                .map(|d| (d.production, d.created_at_ms));
+            local_rank.is_some_and(|local_rank| {
+                cloud
+                    .peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .filter(|d| d.state == fluid_core::DeployState::Ready)
+                    .filter(|d| {
+                        [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&host) || a.split('.').next() == Some(sub.as_str()))
+                    })
+                    .any(|d| (d.production, d.created_at_ms) > local_rank)
+            })
+        };
+    let prefer_peer = serve_local
+        && (!matches!(local_state, Some(fluid_core::DeployState::Ready)) || local_is_stale)
+        && {
             // Full-host key first, same as the route lookup below (custom
             // tenant domains are keyed by full hostname in served_hosts).
             let routes = cloud.peer_routes.read();
@@ -1227,13 +1267,20 @@ async fn edge_pipeline_inner(
                 return cached_response(c, &region, CacheState::Hit);
             }
             Lookup::Stale(c) => {
-                // stale-while-revalidate: serve stale now, refresh in background.
-                spawn_revalidate(
-                    cloud.clone(),
-                    host.clone(),
-                    path_q.clone(),
-                    cache_key.clone(),
-                );
+                // stale-while-revalidate: serve stale now, refresh in background —
+                // unless a prior revalidation attempt failed and hasn't cleared
+                // its 30s backoff yet (Vercel's documented ISR failed-revalidation
+                // retry window): every request against a hot stale key would
+                // otherwise fire its own background refresh and hammer a
+                // possibly-still-failing origin.
+                if !c.revalidation_backoff_active() {
+                    spawn_revalidate(
+                        cloud.clone(),
+                        host.clone(),
+                        path_q.clone(),
+                        cache_key.clone(),
+                    );
+                }
                 let ev = cloud.event(
                     &region,
                     &method,
@@ -1644,11 +1691,17 @@ fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: Cache
 
 /// Background stale-while-revalidate refresh: re-fetch through our own gateway
 /// and update the cache entry (next lookup becomes a fresh HIT / REVALIDATED).
+/// Every early-return path below is a FAILED revalidation in Vercel's documented
+/// ISR sense (network error/timeout, or a status outside the success allowlist —
+/// `maybe_store` itself classifies the latter) and must call
+/// `note_revalidation_failed` so the existing stale entry is preserved and the
+/// 30s retry backoff engages, instead of silently doing nothing and letting the
+/// very next request re-fire another background refresh immediately.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
         // Subdomain host -> gateway. Use the internal gateway via public_base.
         let url = format!("{}{}", cloud.public_base, path_q);
-        if let Ok(resp) = cloud
+        let resp = match cloud
             .http
             .get(url)
             .header("host", &host)
@@ -1656,31 +1709,47 @@ fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: S
             .send()
             .await
         {
-            let status = resp.status().as_u16();
-            let hdrs: Vec<(String, String)> = resp
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|s| (k.as_str().to_string(), s.to_string()))
-                })
-                .collect();
-            if let Ok(body) = resp.bytes().await {
-                if cloud.cdn.maybe_store(&key, status, &hdrs, &body) {
-                    cloud.cdn.note_revalidated();
-                    let ev = cloud.event(
-                        &cloud.region,
-                        "GET",
-                        &host,
-                        &path_q,
-                        status,
-                        "cache-revalidate",
-                        "",
-                    );
-                    cloud.record(ev);
-                }
+            Ok(resp) => resp,
+            Err(_) => {
+                // Connection refused/timeout/DNS failure reaching the origin —
+                // no status code at all, so this can't route through
+                // maybe_store's own allowlist check.
+                cloud.cdn.note_revalidation_failed(&key);
+                return;
             }
+        };
+        let status = resp.status().as_u16();
+        let hdrs: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
+            .collect();
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(_) => {
+                // Status line arrived but the body stream broke mid-read
+                // (origin died mid-response) — same failure class as a
+                // connection error.
+                cloud.cdn.note_revalidation_failed(&key);
+                return;
+            }
+        };
+        if cloud.cdn.maybe_store(&key, status, &hdrs, &body) {
+            cloud.cdn.note_revalidated();
+            let ev = cloud.event(
+                &cloud.region,
+                "GET",
+                &host,
+                &path_q,
+                status,
+                "cache-revalidate",
+                "",
+            );
+            cloud.record(ev);
         }
     });
 }

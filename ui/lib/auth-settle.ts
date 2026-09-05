@@ -84,6 +84,10 @@ const FLAP_STORE_KEY = "hive_auth_flips";
 /** Bounded wait for Clerk to resolve at all; then degrade to the signed-out
  *  view (which carries a working sign-in affordance) instead of spinning. */
 const RESOLVE_TIMEOUT_MS = 8_000;
+/** Set by the sign-in/sign-up pages right before Clerk takes over, so the
+ *  guard can tell a DELIBERATE login completing apart from an ambient auth
+ *  flap (see `markPendingSignIn` below for the bug this exists to fix). */
+const PENDING_SIGNIN_KEY = "hive_pending_signin";
 
 // ---- client-only module state (never touched during SSR) ----
 let committed: Decision | null = null;
@@ -141,6 +145,18 @@ function enterDegraded(): void {
   notify();
 }
 
+/** Read + clear the pending-sign-in marker in one shot. try/caught like every
+ *  other storage access here — a private/blocked storage mode must not throw. */
+function consumePendingSignIn(): boolean {
+  try {
+    const pending = sessionStorage.getItem(PENDING_SIGNIN_KEY) === "1";
+    if (pending) sessionStorage.removeItem(PENDING_SIGNIN_KEY);
+    return pending;
+  } catch {
+    return false;
+  }
+}
+
 /** A debounced transition survived its hold window — apply it, bounded. */
 function commitFlip(next: Decision): void {
   if (degraded || committed === next) return;
@@ -176,6 +192,28 @@ function feed(isLoaded: boolean, isSignedIn: boolean): void {
     clearPending();
     return;
   }
+  // THE FIRST-LOGIN-DOESN'T-STICK BUG: Clerk's App Router integration
+  // redirects post-sign-in via `next/navigation`'s router.push/replace (a
+  // CLIENT-SIDE transition — confirmed in @clerk/nextjs's ClerkProvider,
+  // which wires `routerPush`/`routerReplace` through `useRouter()`), not a
+  // full page reload. `/sign-in` and `/` share this app's root layout, so
+  // that transition never remounts this module — `committed` is still
+  // whatever it was BEFORE the user signed in (normally "out", set the
+  // moment they first loaded the signed-out home page). The genuine
+  // false→true flip that sign-in produces therefore fell into the debounced
+  // path below like any other sample, sitting on the stale "out" (Landing)
+  // view for a full FLIP_DEBOUNCE_MS — long enough that a user reloads or
+  // retries, and the SECOND attempt then hits a truly fresh module load
+  // (committed === null), which commits instantly and "just works". The
+  // marker below is set by the sign-in/sign-up pages the moment Clerk's
+  // hosted flow takes over, so THIS transition — and only this one — can be
+  // told apart from an ambient flap (iOS/ITP oscillation, the reason the
+  // debounce exists) and commit immediately instead of waiting.
+  if (sample === "in" && consumePendingSignIn()) {
+    clearPending();
+    commitFlip(sample);
+    return;
+  }
   if (pendingValue === sample) return; // countdown for this target already running
   clearPending();
   pendingValue = sample;
@@ -184,6 +222,22 @@ function feed(isLoaded: boolean, isSignedIn: boolean): void {
     pendingValue = null;
     commitFlip(sample);
   }, FLIP_DEBOUNCE_MS);
+}
+
+/** Call right before handing off to Clerk's hosted sign-in/sign-up flow (see
+ *  the sign-in/sign-up pages) — marks the NEXT observed "signed in" sample as
+ *  a deliberate login rather than an ambient flap, so it commits instantly
+ *  instead of waiting out the anti-flicker debounce. Self-clears on
+ *  consumption; a stale/abandoned marker (never followed by a completed
+ *  sign-in) simply never gets read and cannot fast-path an unrelated later
+ *  session. */
+export function markPendingSignIn(): void {
+  if (typeof window === "undefined") return;
+  try {
+    sessionStorage.setItem(PENDING_SIGNIN_KEY, "1");
+  } catch {
+    /* storage unavailable — falls back to the ordinary debounced path */
+  }
 }
 
 /** One-time client init: honor cross-load flap history (a reload loop arrives
@@ -237,6 +291,12 @@ export function useSettledAuth(): SettledAuthView {
     const l = () => setView(viewFor(null));
     listeners.add(l);
     initClient();
+    // NOT redundant with the useState lazy initializer above: initClient()
+    // can synchronously mutate module-level `degraded`/`committed` (cross-load
+    // flap history), and this re-read picks that up in the same tick — a
+    // legitimate "subscribe + sync from external system" effect, not a
+    // duplicate of the initial render value.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setView(viewFor(isLoaded ? (isSignedIn ? "in" : "out") : null));
     return () => {
       listeners.delete(l);
@@ -260,6 +320,7 @@ export function resetAuthSettle(): void {
   if (typeof window === "undefined") return;
   try {
     sessionStorage.removeItem(FLAP_STORE_KEY);
+    sessionStorage.removeItem(PENDING_SIGNIN_KEY);
   } catch {
     /* storage unavailable — reload still restarts the per-load state */
   }

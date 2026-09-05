@@ -20,6 +20,44 @@ history).
 - Admin SQL/tables view (`GET/POST /v1/admin/sql/*`) must stay read-only;
   extend `relational::known_tables()` for any new relational table. Detail:
   `recall("sql-readonly-guard")`.
+- **The relational index is built by ONE background walker, never on a
+  request path, and nothing writes the catalog before it has completed
+  once.** guardian-db's SQL catalog is a single document in the document-
+  store index; an EMPTY index (not a stale one) makes every `Session` load
+  `Catalog::new()` — every table "does not exist", `pg_class` = 0 — and a
+  `CREATE TABLE IF NOT EXISTS` then persists a fresh catalog over the real
+  one. `session()` used to run the full namespace walk under
+  `SQL_OP_TIMEOUT` before every operation; on 7.6–57 GB guardian stores the
+  walk never finished inside 10 s, so no node in the fleet ever built its
+  index and the mirror was dead everywhere (2026-09-02). Now
+  `spawn_index_refresher` walks once with `HIVE_RELATIONAL_INDEX_BUILD_SECS`
+  (900) and re-walks every `HIVE_RELATIONAL_REFRESH_SECS` (120) behind the
+  live sync; `index_ready()` gates `init_schema`, `ensure_table_exists` and
+  `backfill_billing_normalize`, `run_readonly_query` answers an explicit
+  not-ready error, and the vendored refresh swaps the key set in atomically.
+  Diagnose with `SELECT count(*) FROM pg_catalog.pg_class` through
+  `POST /v1/admin/sql/query` (a platform-admin bearer: `POST /v1/token` with
+  `{"email": <HIVE_ADMIN_EMAILS member>}`): 0 means the index is unbuilt,
+  and the journal's `relational: index built` / `index walk exceeded its
+  bound` lines say which. A walk that cannot complete inside its bound is a
+  guardian/iroh-docs problem to diagnose, never a reason to shorten the gate.
+  Two companion rules: the relational storage's `get`/`scan` (vendored
+  `guardian_storage.rs`) must fall through to the store's ASYNC `get` when
+  the index has no cached value — `index().get_bytes` is cache-only and
+  answers `None` for every hash-only key, which made a fully built index
+  serve an empty catalog; and `init_schema` retries until GuardianDB opens
+  (it is the only creator of the catalog) and logs `schema bring-up
+  complete`. Probing a follower: `POST /v1/admin/sql/query` is
+  leader-forwarded, so a follower's relational state is read from its
+  journal (bring-up line, zero `does not exist`), never from its admin SQL.
+  Two more, from the canaries: `ensure_table_exists` verifies through
+  `information_schema.tables` (synthesized from the catalog), never `SELECT
+  1 FROM t` — a cold row is a PEER fetch of hundreds of milliseconds, so a
+  row scan of even `teams` blew the 10 s statement budget and reported a
+  created table missing; and after the walk the refresher warms every row
+  value once (`GuardianRelationalStorage::warm_values`, journal `row values
+  warmed`) so cold scans stop paying that per-row fetch — nothing waits on
+  the warm, so a scan racing it may time out once and succeed next time.
 
 ## Mesh networking & anti-entropy
 
@@ -51,6 +89,26 @@ history).
   and `Connection::send_datagram` does exist. Switching would mean giving up
   the single-stream framing (and its ordering guarantee, which the current
   consumers may rely on), so it needs a measurement first, not a rewrite.
+- **`Dropping received relay packet: no available capacity` is iroh's
+  CLIENT-side relay actor inside hive-cloud, never the embedded relay
+  server, and it is a leader-shaped symptom.** The vendored iroh
+  (`vendor/iroh`, patch "read before send" in its `CHANGES.md`) polls the
+  relay stream BEFORE the outbound queue in both `ActiveRelayActor` loops
+  and sizes the per-endpoint receive channel 4096 deep; upstream (1.1.0
+  included) polls sends first under `biased`, so the one node with sustained
+  OUTBOUND relay traffic — the control-plane leader, serving wholesale
+  store_sync pulls, rosters and gossip to its relay-only peers — never read
+  its stream while it had something to send: 458k drops/24h on the leader,
+  hundreds on followers, plus 6–9× the followers' server-side resets. Keep
+  the patch across pin bumps until upstream changes the arm order, and treat
+  any recurrence on a NON-leader as a new finding. Diagnose from the journal
+  per second, not per hour: the signature is clumps of thousands of drops
+  inside 100 ms (a released backlog), not a steady rate. The line carries no
+  peer id or relay URL, so "who is being dropped" is answered from
+  `trunk opened … path="relay"` counts and cached-hint dial timeouts, never
+  from the drop line itself. `vendor/` IS synced by the fanout role, so a
+  vendored edit made while a roll is between its sync and its build ships
+  in that roll — edit vendored crates only between rolls.
 
 ## Address lookup: a node can only re-learn an address from a peer it can reach
 
@@ -133,6 +191,24 @@ history).
 - Verify the fix by writing through the public round-robin host and reading it
   back several times, AND directly against a node still running the previous
   binary — the old node must still fail. That contrast is the proof.
+- **The stale-epoch 503 is a retryable refusal class, and the fence discloses
+  its epoch.** The `admin_ingress` epoch fence answers a behind-epoch forwarded
+  mutation with 503 `stale control-plane epoch (ownership changed); retry`
+  PLUS an `x-hive-cp-epoch-current` header carrying the receiver's own epoch.
+  `admin_forward_to_leader` treats it as a third provably-not-applied outcome
+  (the fence fires before the receiver's router, same retry-safety argument as
+  `not control-plane leader`): max-merge the disclosed epoch via `adopt_epoch`,
+  re-stamp, retry same-candidate up to `MAX_STALE_EPOCH_RETRIES` (3), then walk
+  candidates and only then return the refusal. The invariant is unchanged — a
+  sender that never converges (genuine ownership divergence) is still refused;
+  the bound, not the fence, is what moved. Why it matters: the epoch is an
+  OBSERVER-LOCAL fencing token that max-merges fleet-wide, so one sick node
+  inflates it for everyone — witnessed 2026-08-24, fc-virginia-2's cgroup-OOM
+  crash loop (restart counter 2652, ~5s process life, 151 stale firecracker
+  processes pinning 13.3 GB of its 16.5 GB cgroup) transiently self-elected on
+  every boot, bumping the fleet epoch ~5/min and fencing ~17% of in-flight
+  forwards (leader log: 442 rejections/h, always exactly one epoch behind,
+  leader itself stable with zero transitions).
 - **Store-sync adoption is WHOLESALE-REPLACE under a per-observer owner
   election, so an owner flap can churn a fresh leader write away fleet-wide.**
   `store_sync::REGISTRY`'s leader-pull entries (teams, billing, projects, …)
@@ -183,6 +259,32 @@ history).
   reason. The db-reconcile loop is the belt-and-braces half: it restarts
   exited backing containers and rebuilds vanished Redis/Supabase members
   from their records every 60s.
+- **The graceful stop must finish under systemd's timeout, and five
+  invariants keep it there.** (1) A `persist::persist()` arriving after
+  `flush_blocking` has closed admission is REFUSED, never blocked:
+  `admit_generation` returns `None` (`persist` a no-op, `persist_durable`
+  `false`, one WARN per process) — a condvar wait there parks a tokio
+  worker, and when that worker owns the IO/timer driver every timer on the
+  runtime dies with it, the shutdown deadline included (measured: 34 of 56
+  stops SIGKILLed at 90 s with every thread in futex). (2) The hard deadline
+  (`HIVE_SHUTDOWN_DEADLINE_SECS`, 75 s) lives on a std thread, never a tokio
+  timer, and stays below `TimeoutStopSec`. (3) `TimeoutStopSec=90s` is
+  explicit in `hive-node.service.j2` because TencentOS's `system.conf`
+  defaults it to 5 s — inside the listener drain, before the flush. (4) The
+  guardian shutdown wait (`HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS`) is 10 s per
+  step: the writer commits one generation per 40–75 s, so a 60 s wait never
+  succeeds and only leaves a drained node dark. (5)
+  `restart_audit::mark_clean_exit` latches a flag the heartbeat checks, so
+  the clean-exit marker is never overwritten with `clean_exit=false` by a
+  later tick. (6) `OOMPolicy=continue`: the unit's cgroup holds every child
+  hive-cloud spawns (tenant builds, conmon, litebox runners, firecracker)
+  under memguard's `MemoryMax`, and systemd's default `stop` turned one
+  OOM-killed child into a stop of the whole node (fc-virginia, 12 in 24 h);
+  hive-cloud itself as the victim still exits and restarts as before.
+  Witnessed on the first canary of these fixes: `public listener drained
+  open_connections=0 elapsed_ms=0`, the guardian wait giving up at 10 s,
+  then `persist refused after the shutdown barrier` — the exact call that
+  used to park the runtime.
 - podman allocates one lock from a **fixed pool** (`num_locks`, default 2048)
   per CONTAINER **and per VOLUME**. The pool is per-host and shared by every
   tenant, so leaking locks starves the whole node: witnessed 2032 leaked
@@ -341,78 +443,35 @@ releases).
   open shared object file" for that one library while others load fine —
   easy to misdiagnose as a partial/flaky failure when it is fully
   deterministic per file.
-- **Networking needed a real fix, and the root cause was smaller than it first
-  looked — a small forked litebox patch beats building an isolation layer
-  around litebox's bugs.** Three compounding constraints, all confirmed
-  directly from litebox's own source (`crates/hive-backend/src/litebox.rs`'s
-  module doc, "Networking" section, has the full narrative): (1) TUN cannot
-  bridge host<->guest loopback, architecturally, ever — not a litebox defect.
-  (2) The wildcard-bind failure WAS a litebox bug, not a smoltcp limitation:
-  `litebox/src/net/mod.rs`'s `bind()`/`listen()` never used smoltcp's own
-  `None` ("any address") sentinel, always building `Some(addr)` even for an
-  unspecified address — smoltcp 0.12.0 (litebox's exact pinned version)
-  already fully supports wildcard listening. (3) The guest's IP AND gateway
-  were HARDCODED AT COMPILE TIME (`INTERFACE_IP_ADDR = 10.0.0.2`,
-  `GATEWAY_IP_ADDR = 10.0.0.1`), both already marked `// TODO: Make this
-  configurable` by litebox's own authors — every concurrent litebox process
-  claimed the identical guest address. **The fix:**
-  `ansible/roles/litebox/files/networking.patch` (rationale in that
-  directory's `PATCHES.md`) fixes constraints 2 and 3 directly in litebox —
-  three wildcard-bind call sites now map an unspecified address to smoltcp's
-  `None`, and `Network::new`/`LinuxShimBuilder::build` gained an additive
-  `_with_addrs`/`_with_net_config` sibling reading `LITEBOX_GUEST_IP`/
-  `LITEBOX_GATEWAY_IP` from the environment (unset = byte-identical to
-  upstream, so litebox's own test suite needs no changes). With constraint 3
-  fixed, constraint 1's real solution falls out for free: every cell just
-  gets its own real, directly-routable TUN `/30`
-  (`setup_cell_net`/`teardown_cell_net` in `litebox.rs`) — the exact same
-  `net_idx`-allocated pattern `FirecrackerBackend::setup_cell_net` already
-  uses for microVMs (`mode=tun` instead of `mode=tap`, no kernel `ip=`
-  cmdline since litebox reads the two env vars directly) — with NO network
-  namespace, veth pair, or DNAT/iptables rule needed at all, since a TUN
-  device is a real point-to-point link the kernel routes to automatically.
-  Loopback (constraint 1) still needs a narrow residual fix — apps that
-  explicitly hardcode `127.0.0.1` — via a preload shim
-  (`litebox-bind-shim.js`, embedded via `include_str!`) patching Node's
-  `net.Server.prototype._listen2` (the internal, POST-overload-
-  normalization method every `.listen()` shape funnels into — a
-  deliberately preserved monkeypatch seam per Node's own source comment,
-  stable v10-v24, the same technique New Relic's Node agent has run since
-  ~2012), verified against every real `.listen()` shape through Node's
-  actual overload-resolution code (not a hand-rolled reimplementation of
-  it). **Node/Bun only — Python is not covered** (its ecosystem doesn't
-  converge on one bind mechanism the way Node does; most real Python
-  servers run behind a WSGI/ASGI server like gunicorn/uvicorn). **Do not
-  switch to litebox's own in-flight rewrite instead** — an unstable,
-  undocumented branch (`ulitebox`) replaces smoltcp/TUN with a real-socket
-  broker, genuinely fixing loopback, but its own access-control policy
-  hard-DENIES wildcard binds by design (its own unit test confirms it) — the
-  patch above is a permanent requirement regardless of which litebox
-  architecture is eventually used. **Proven live on fc-frankfurt
-  (2026-08-08):** `--litebox-probe` PASSES both checks for real, and a full
-  `provision`/`deliver_build`/`start_function` deployment of a real app
-  (local `require()` included) answered a real `curl` correctly. Getting
-  there took three real bugs live testing found, not design review —
-  `setup_cell_net`'s `set -e` aborting on a harmless `ip link del`, litebox's
-  own `SIGINT`/`SIGALRM` disposition assertion tripping under a parent with
-  no controlling terminal, and `wait_tcp_ready`'s per-loop (not per-attempt)
-  deadline check letting one slow `connect()` blow the whole budget — see
-  `crates/hive-backend/src/litebox.rs`'s module doc and git history for the
-  fixes; two of these are general hazards for any process this crate spawns
-  over a real network path, not litebox-specific. **`HIVE_LITEBOX_VERIFIED=1`
-  IS now set on fc-frankfurt, which serves the `frankfurt` region on
-  `backend=litebox` with real tenant traffic** (live registry, 2026-08-09).
-  That was the deliberate decision this paragraph used to say was still
-  pending, and three consequences follow from it that are easy to miss.
-  (1) The flag exists only as an out-of-band systemd drop-in:
-  `ansible/roles/litebox/defaults/main.yml` still declares
-  `litebox_verified: false`, so re-running that role SILENTLY DOWNGRADES the
-  node to `MockBackend` — a backend swap no one asked for, on a node carrying
-  traffic. (2) Nothing a tenant or operator reads discloses the isolation
-  tier, while placement's region widening is what puts work there. (3)
-  `LiteboxBackend` emits no `hive_core::fault` markers, so every node fault
-  on that node publishes `CAPACITY_EXHAUSTED` — the misattribution the
-  fault-marker contract exists to prevent. Treat all three as open.
+- **Networking, the fleet patch, and where each node actually stands.** The
+  full narrative of the three networking constraints (loopback, wildcard bind,
+  compile-time guest IP), the three live-testing bugs, and the bind-shim's
+  Node-only scope is code of record in `crates/hive-backend/src/litebox.rs`'s
+  module doc ("Networking") and `ansible/roles/litebox/files/PATCHES.md`;
+  `recall("litebox networking")` / `recall("litebox fleet conversion")` hold
+  the drained history. What must stay true now:
+  - The role tracks the `AnEntrypoint/litebox` pin (real `fork()`/pty, needed
+    for sandbox shells) and `networking.patch` carries a THIRD hunk on top of
+    the two networking ones: root `CAP_DAC_OVERRIDE` semantics in the guest
+    in-mem FS. Without it the pinned runner panics on every RHEL-family host
+    (`lib.rs:293 NoWritePerms` — `/usr/bin` is 0555 and the fork honoured mode
+    bits even for root). Witnessed 2026-09-01 on fc-tokyo; drop the hunk only
+    when the pin moves past the fork's own `dac_allows` fix.
+  - A node is Litebox only after `hive-cloud --litebox-probe` PASSES on that
+    host with the exact staged runner, then `litebox_verified=true` on its
+    (gitignored) `hosts.ini` line, then the role again. Converted this way
+    2026-09-01: fc-tokyo, fc-seoul, fc-virginia-4/5 (Rocky 10.2, runner
+    `f970bfe70ac86d4e…`, byte-identical), fc-sanjose-cvm-1/2 (glibc 2.38,
+    `cb20b4e9f3cf03f5…`); fc-sanjose (the leader) has its drop-in staged for
+    its next restart. fr/phx/sj3/4/5 still run the older microsoft
+    `e7984422` runner. Every macOS node stays mock until the separate
+    `litebox_macos` release gate passes — never set `HIVE_LITEBOX_VERIFIED`
+    on Darwin (it selects the Linux backend).
+  - Still open: nothing tenant-visible discloses the isolation tier while
+    region widening places work on Litebox; `LiteboxBackend` emits no
+    `hive_core::fault` markers, so a node fault there still reads as
+    `CAPACITY_EXHAUSTED`; a role re-run on a host whose inventory line lacks
+    `litebox_verified=true` silently downgrades it to mock.
 - **Security posture is honest, not oversold, and must stay that way.**
   Litebox measurably beats `MockBackend` (seccomp-bpf denies non-allowlisted
   syscalls at the real kernel boundary; mock has none) but is NOT
@@ -424,6 +483,85 @@ releases).
   unclosed gap — directly relevant since Node.js is built on V8, a JIT. Full
   reasoning in the module doc's "Security posture" section; never let this
   backend be silently substituted for Firecracker capability anywhere.
+- **A litebox guest child must `execve` immediately or it is unsound — and
+  the platform never waits on a guest without a deadline.** litebox's
+  `fork()` emulation hands the child a copy whose glibc heap/stdio/stack-list
+  pointers still reference the PARENT's mapping. Measured 2026-09-01 on
+  fc-sanjose with the exact staged tar (`/root/lb-exec-repro.tar`): a pipeline
+  or `$(...)` child dies `malloc(): unaligned tcache chunk detected`, a child
+  that touches stdio (`2>/dev/null`, a not-found command's error message) dies
+  `glibc detected an invalid stdio handle`, and two consecutive not-found
+  commands (`uname -a; id`) leave the second child SPINNING at 100% CPU
+  forever — gdb shows a fork-child `reclaim_stacks`-shaped list walk that
+  never reaches its head; fork + immediate `exec` works. The defect lives in
+  the litebox fork tree (the peer session's Task #51, acceptance = those four
+  commands), so never "fix" the hang by staging more tools alone: any pipeline
+  or subshell still dies until fork is sound. What this side guarantees:
+  `sandboxes_platform::supervise_exec` runs EVERY exec drain in its own task
+  (a dropped request future — curl's timeout, a closed tab, the leader
+  forward's budget — must not orphan a runner; the `ColdStartGuard` rule
+  applied to a guest process) under a deadline (`HIVE_SANDBOX_RUN_MS` minus
+  10 s for blocking runs; the sandbox's own `timeout_ms` capped by
+  `HIVE_SANDBOX_EXEC_MAX_MS` for detached), on expiry kills the guest's
+  process group and closes the record `killed` with the reason on its stderr;
+  `LiteboxBackend::terminate` kills every live exec AND interactive-shell
+  group of the cell before its TUN goes (a `DELETE` used to answer 200 while
+  the runner kept a core); shells are tracked in `execs` like execs; and
+  `SHELL_GUEST_OPTIONAL_PROGRAMS` stages the ordinary tool set where the host
+  has it so a routine command is not the worst case.
+- **A sandbox shell STARTS with stderr off the pty and moves it there
+  itself; never spawn it with stderr on the pty, never drop the pipe pump.**
+  Litebox has no job-control tty ioctls (`tcsetpgrp` is ENOSYS, -38): a
+  shell whose stderr IS the pty at startup runs job-control init against it
+  and the runner dies `exit_group(277)` (status 21) before a prompt byte —
+  measured for `sh`, `+m`, `--norc +m`, `-i +m` alike. So `exec_pty` gives
+  the runner a stderr PIPE plus `-i` (the interactive shell a non-tty stderr
+  would suppress), pumps that pipe into the terminal stream as RAW CHUNKS
+  (a prompt has no trailing newline; a line reader held it forever), and
+  stages `/usr/share/hive/shellrc` (`exec 2>&1`) named by `ENV` so the shell
+  moves its own stderr onto the pty once init is behind it — otherwise
+  prompt (pipe) and output (pty) are two channels read by two tasks and the
+  next prompt overtakes the last command's output on screen. The pump stays:
+  it carries the runner's own messages and the two pre-rc job-control
+  warnings it filters, and a dropped warning owns the newline AFTER it (the
+  first cut leaked that CRLF as a blank line above every first prompt).
+  Witness = `shell-witness.py`-style websocket client through BOTH the
+  leader's listener and the public round-robin host: 101, first frame is the
+  prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
+  "exit_code":0}` on `exit`.
+- **A TUN device has ONE owner, so every exec and shell runner gets its
+  own link; the cell's provision-time link serves only the function
+  process.** litebox attaches with `TUNSETIFF`, and a second runner on the
+  same `lbt<i>` panics at startup (`lib.rs:245 failed to set TUN interface
+  flags: EBUSY`, exit 101 — witnessed 2026-09-02 from the dashboard: a shell
+  held the cell's device and the Run panel's one-shot exec died). `exec_
+  command` and `exec_pty` call `allocate_link()` and move the ARMED
+  `LiteboxLinkRollback` into the waiter task, which deletes the device when
+  the runner exits — the same rule as the guest tar below. A runner started
+  against `cell_nets[cell]` is the bug.
+- **The interactive shell stages the sandbox's runtime.**
+  `ExecPtyRequest.programs` (additive, defaulted) names the interpreter
+  (`node` for `node*`, `python3` for `python*`, from
+  `sandboxes_platform::shell_runtime_programs`) and the litebox shell tar
+  stages each resolvable one with its `ldd` closure; the one-shot exec path
+  already staged its resolved program. Without it `node -v` in a node22
+  sandbox was a not-found, which under litebox's fork emulation is fatal
+  (`glibc detected an invalid stdio handle`) and wedges the shell. `npm`
+  (a script over the `node_modules_22` tree) and Python's stdlib are still
+  unstaged — PRD `sandbox-shell-stage-npm` / `sandbox-shell-python-stdlib`.
+- **The guest tar and its descriptor-bound alias belong to the runner's
+  WAITER task, never to the function that spawns the runner.** Both
+  `allocate_temp_file` and `allocate_initial_files_alias` return Drop guards
+  that unlink their names; the runner opens
+  `--initial-files=/proc/self/fd/N/initial-files.tar` only after it has
+  started, milliseconds after `spawn()` returns. `exec_command` moves both
+  guards into the task that awaits `child.wait()`; `exec_pty` once dropped
+  them at function end, and every dashboard terminal died at birth with a
+  bare `Error: No such file or directory (os error 2)` on the pty (witnessed
+  2026-09-01: 101 upgrade, that frame, `{"type":"exited","exit_code":1}`,
+  while the same runner and tar ran an interactive shell fine standalone). A
+  new runner spawn site copies the waiter shape; a guard that is not moved
+  into the waiter is the bug.
 
 ## Bringing a node into the mesh
 
@@ -1083,53 +1221,11 @@ releases).
 
 ## Managed Supabase Studio (`DbKind::Supabase`)
 
-- **A self-contained mini-stack per database, not a shared Supabase.**
-  `provision_supabase` (databases.rs) runs three containers on the owning
-  project's DNS-less podman net with deterministic static IPs in bands clear
-  of the managed-DB `.200+` band: `supabase/postgres:15.8.1.085` (named
-  volume `hive-vol-supa-<id8>` — data survives container replacement),
-  `supabase/postgres-meta:v0.95.2` (internal only), and
-  `supabase/studio:2026.02.16-sha-26c615c` (loopback-published, recorded as
-  `studio_port`). This is Studio's REQUIRED dependency set per the upstream
-  compose: its only declared dep is analytics-as-startup-barrier, and its
-  functional env deps are db + pg-meta + a router. GoTrue/PostgREST/
-  Realtime/Storage are deliberately NOT run — Studio's Authentication and
-  Data-API pages degrade; table/SQL editors are full. Do not "complete" the
-  stack silently; adding services is a resource + routing decision.
-- **Kong's two jobs are served by the platform, so no Kong container runs.**
-  Path routing is unnecessary (Studio's server side calls pg-meta directly
-  over the project net via `--add-host`), and the
-  `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` gate Kong applies to its `/`
-  catch-all is enforced by `db_rest::supabase_studio_proxy` — HTTP Basic
-  against the generated `STUDIO_USERNAME`/`STUDIO_PASSWORD`, constant-time,
-  with Kong's `hide_credentials` semantics (the Authorization header is
-  checked, then stripped, never proxied). The proxy streams the studio
-  container over loopback and rewrites `Location` headers that point at
-  internal origins.
-- **The Postgres wire rides the existing db_gateway SNI splice** — the
-  record's `local_port` is the stack's published 5432, so
-  `postgres://postgres:<pw>@<slug>.{db_domain}:5432/postgres?sslmode=require`
-  works exactly like a managed Postgres DSN. `with_external_endpoint` has the
-  Supabase arm that rewrites `DATABASE_URL`/`STUDIO_URL`/`SUPABASE_URL` to
-  the public host; when `HIVE_DB_DOMAIN` is unset the Studio URL stays
-  loopback-honest (reach "internal").
-- **JWT keys are static HS256 over `{role, iss:"supabase", exp:+10y}`** signed
-  with the stack's generated JWT_SECRET (the upstream/supahost derivation,
-  `supabase_api_jwt`) — they identify roles, not sessions; no rotation path
-  in v1.
-- **The record's `container` field is comma-joined (db,meta,studio)** —
-  every teardown site (`database_delete`, `purge_project_resources`) splits
-  on `,`, removes with `-v` (podman lock-pool rule), and removes the named
-  volume explicitly (delete = data destroyed, same semantics as any managed
-  engine delete). Replicas are dropped at provision (a second stack is a
-  divergent database, the SQLite-lane rule). The reconcile loop owns fault
-  tolerance for this lane: it restarts exited members and REBUILDS vanished
-  ones from the record via the same shared builder (`supabase_stack_args`)
-  provision uses — ports/secrets/JWTs ride the connection map
-  (`JWT_SECRET`/`PG_META_CRYPTO_KEY` included for exactly this), and the
-  named volume means a rebuilt db container returns WITH its data. The
-  builder takes the full db id for the deterministic sibling IPs — never
-  reconstruct one from the short container-name suffix.
+A self-contained per-database mini-stack (postgres + postgres-meta + studio
+containers, no Kong — the platform's own edge/db_rest proxy serves Kong's two
+jobs), named volume so data survives container replacement, static HS256 JWTs,
+reconcile-loop self-healing from the stored record. Full detail:
+`recall("managed-supabase-studio-dbkind")`.
 
 ## Browser-replicated databases (the `browser_db` contract)
 
@@ -1397,6 +1493,55 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   add a deploy path that bypasses that SHA check. A public repo needs no
   credential; a private repo reuses `git_webhook`'s token resolution
   (`github_app_auth` install token, else node `GITHUB_TOKEN`).
+- **A single unreachable node never fails a deploy.** The pure-remote
+  placement branch of `run_build` dispatches to the scheduler's target(s) and,
+  when `FanoutOutcome::nothing_ran()` (every target `DispatchFailed` — the
+  request arrived NOWHERE, so no node holds a half-run build), walks
+  `schedule::dispatch_fallbacks` one candidate at a time: same `capable` +
+  `reachable` predicates as `place` (never the region widening), configured
+  region(s) first, then proximity/load/disk/name, minus the targets already
+  tried and this node, bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3) with
+  `fanout_remote`'s own per-target budget (15s HTTP, 2×20s iroh). The loop
+  stops the moment any node RAN the deploy (Ready/BuildFailed/Declined are
+  verdicts about the app, never a reason to try elsewhere), and it is skipped
+  when an unreachable target holds the project's live container lease (its
+  state volume is there; landing elsewhere would fork it). Every candidate's
+  failure is named in the build log, and only an exhausted list says "Could
+  not reach any target". Witnessed 2026-09-01: eight consecutive `express`
+  deploys failed in 75 min with sole target fc-frankfurt while the leader's
+  trunk to it was cold (cached-hint dials timing out ~10/min) yet fc-frankfurt
+  stayed HEALTHY (still gossiping via other peers — by design); ten other
+  capable nodes sat idle. The `"iroh: no reply"` text now carries the measured
+  elapsed ms: those failures took 5–15s (the DIAL failed), not "20s".
+- **A relay hint must name the relay the peer is ATTACHED to, never merely
+  one it serves.** `gossip::relay_hinted_addr` keeps the relay carried in the
+  peer's own gossiped `iroh_addr` (its home relay, from signed gossip) and
+  steers via `hive_edge::select_relay_hint` ONLY when the addr has no relay at
+  all. Preferring `NodeInfo::relay_url` (the embedded `http://<public-ip>:3341`
+  relay) replaced a live transport with a dead one: measured 2026-09-01 from
+  fc-frankfurt, fc-sanjose and fc-sanjose-3, every Tencent host's `:3341` is
+  TCP-unreachable from every other Tencent host (and from itself via its
+  public IP — security group), while all four `*.relay.shadw.app:3343`
+  answer 200 from every vantage. Diagnose a sick pair from THREE vantages: the
+  leader logged 1014 cached-hint timeouts to fc-frankfurt in 24h while
+  fc-sanjose-3 logged 5 — the pair was sick, not the node.
+- **A direct-entry function whose entry does not exist fails the BUILD, never
+  the launch, and never as a node fault.** `git::preflight_direct_entries`
+  runs before `seal_host_runtime_artifact` for every Node/Bun function whose
+  argv is a plain `node <entry>` / `bun <entry>`: the entry (or its
+  `.js/.mjs/.cjs`, or a directory) must exist under
+  `checkout_root/app_rel/cwd_relative`, and the refusal names the entry, the
+  path examined, the sealed root's listing, package.json
+  `scripts.start`/`scripts.build`/`main`, and the deciding field
+  (`fluid.json functions[N].start_cmd` vs build-derived). The `fluid.json`
+  lane ships the checkout AS-IS — `produce_manifest` runs no install/build —
+  so `start_cmd: ["node","server.js"]` for a Next.js repo can never work
+  (witnessed: shoomoo2 / serverless-clawdbot@xstate, surfaced as
+  `NodeBackendUnavailable` at the readiness launch and charged to the NODE).
+  `litebox::validate_archive_main_entry` keeps a second net for artifacts
+  sealed by older binaries: a tar member miss is `DEPLOYMENT_START_FAILED`,
+  never `NODE_BACKEND_UNAVAILABLE`. Honoring install/build commands inside
+  the fluid.json lane is PRD `fluid-json-lane-honor-build-commands`.
 
 ## Deployment lifecycle: generations, previews, and the relocation reaper
 
@@ -1439,27 +1584,54 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
 
 ## Compose published ports (`ports: ["9000:9000"]`)
 
-- The HOST side of a compose `ports:` entry is a PUBLISH REQUEST
-  (`PortSpec.preferred_public_port`): the allocator prefers the literal number
-  (reserved set + fleet-uniqueness + bind probe permitting) and the build log
-  names grant-vs-request loudly. A bare `"PORT"` entry stays internal-only.
-- Published Http ports get **TLS termination at the raw proxy** (same SNI
-  resolver/certs as the 443 gateway, ALPN pinned http/1.1) with first-byte
-  sniffing — `https://` and `http://` both work on the same number; raw
-  Tcp/Grpc/Udp bindings stay pure passthrough.
-- The data plane requires per-port loopback publishes on EVERY backend:
-  `FunctionLaunch::tcp_ports` must be emitted as `-p` flags by mock,
-  firecracker AND litebox (the mock-only first cut was connection-refused on
-  the whole FC fleet), resolved via `Lease::tcp_host_port` in `mesh_raw`.
-- **The Tencent security group is part of the path.** Host firewalls admit
-  these ports (HIVE_LOCKDOWN only drops its explicit list), but the VPC edge
-  drops inbound on anything the SG doesn't open — the raw range 20000-29999
-  is open; literal published ports (9000/9001, …) need an SG rule or they
-  time out from EVERYWHERE, node-to-node included. Verify with node→node
-  curls on public IPs, never only from a laptop.
-- A migrated-away public port is QUARANTINED, never re-granted (stale
-  entry-node caches would misroute it cross-tenant); a port swap therefore
-  cannot converge, documented in `claim_local`.
+Host-side port is a publish REQUEST (allocator prefers it, bare `"PORT"` stays
+internal); TLS terminates at the raw proxy on Http ports; every backend (mock/
+firecracker/litebox) must emit `-p` loopback publishes; the Tencent SG (not
+just host firewalls) must open literal published ports (20000-29999 raw range
+is pre-opened); a migrated port is quarantined, never re-granted. Full detail:
+`recall("compose-published-ports-contract")`.
+
+## Host firewall & public listeners
+
+- **The published-port range (TCP+UDP 20000-29999) is open to the whole
+  internet in the Tencent security group by design, on every platform host,
+  so ANY wildcard-bound listener in that range is world-reachable the moment
+  it binds.** Never start an ad-hoc file server on a fleet node
+  (`python3 -m http.server --bind 0.0.0.0`, `npx serve`, a debug `nc -l`);
+  move binaries with `scp`/`rsync`, or bind `127.0.0.1` behind an ssh tunnel.
+  Witnessed 2026-08-26→09-02: two week-old hand-off servers on
+  fc-virginia:28126/:28127 served a directory listing of a hive-cloud build to
+  the world until Tencent's scanner filed a ticket against the account. The
+  platform noticed nothing because nothing looked.
+- **`scripts/audit-public-listeners.sh` is the check, and it exits 1 on a
+  finding.** It reports every wildcard TCP listener per node that is not a
+  platform daemon (hive-cloud, sshd, iroh-relay, rpc-server, llama-server,
+  cockpit's systemd socket) plus the lockdown roster each node actually
+  enforces. Run it after any hand-provisioning session and before a roll;
+  probe exposure from a FLEET vantage (a Tencent edge drops SYNs to closed
+  SG-open ports from non-Tencent sources, so an outside timeout proves
+  nothing).
+- **`scripts/hive-lockdown.sh` is the fleet's only host firewall and its
+  PEERS roster is generated, never typed.** 21 of 22 nodes run its iptables
+  branch (phx is nft-only); it drops 8787/9090/3000/7799-7804/50052/
+  50100-50999 from every source outside the roster. The roster sat at 13 of
+  22 hosts for weeks (nine later nodes were strangers to every other node's
+  admin/inference ports, silently pushing their HTTP admin dispatch onto the
+  iroh path). Refresh = `scripts/gen-hive-lockdown.sh` then
+  `ansible-playbook playbooks/site.yml --tags lockdown` (the tag exists so a
+  roster change rolls without the rest of the prerequisites role). A stale
+  second copy (va carried a 5-peer nft table beside its iptables chain) is
+  stricter than the live one and must be deleted, not left "harmless".
+- **Do not gate the published range on the listener's cgroup.**
+  `nft ... socket cgroupv2 level 2 "system.slice/hive-node.service"` was
+  measured on fc-virginia (6.12.33-pvm+, nft 1.1.1): it accepted 2 of 37 SYNs
+  to hive-cloud's own `:20008` and dropped the rest — a listener SYN has no
+  socket attached when the match runs. Any future experiment of this class
+  goes in a throwaway table on a spare port, never on a live one.
+- The ALL-ports 0.0.0.0/0 security groups on bkk, hk, tokyo, seoul and sp are
+  an operator decision recorded as PRD row `sec-sg-all-ports-open-groups`;
+  until they match the platform SG shape, the host lockdown is the only
+  guard on those five nodes.
 
 ## Mesh watchdogs & dial discipline (post-2026-08-17-incident shape)
 

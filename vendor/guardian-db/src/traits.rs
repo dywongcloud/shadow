@@ -742,7 +742,23 @@ pub struct SyncOutcomeSummary {
 pub trait KeyValueStore: Store {
     /// Returns all of the store's key-value pairs in a map.
     /// This operation reads the current state of the local index.
+    ///
+    /// For the iroh-docs implementation this returns only what is currently
+    /// CACHED (see `GuardianDBKeyValue::get_impl`'s lazy-fetch doc): a value
+    /// never read since the last index rebuild reads back as absent from
+    /// this map even though the key itself is live. Callers that only need
+    /// the key set (the common case — counting entries, listing keys) should
+    /// use [`KeyValueStore::keys`] instead, which is always complete and
+    /// never triggers a fetch.
     fn all(&self) -> std::collections::HashMap<String, Vec<u8>>;
+
+    /// Returns every live key, with no value materialization at all — cheap
+    /// regardless of store size or how many values have been lazily fetched.
+    /// The default forwards to `all()` for stores with no cheaper path; the
+    /// iroh-docs implementation overrides this to read key metadata only.
+    fn keys(&self) -> Vec<String> {
+        self.all().into_keys().collect()
+    }
 
     /// Sets a value for a specific key.
     /// Creates a new PUT operation in the distributed log that will be replicated.

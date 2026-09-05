@@ -76,6 +76,10 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
   // at once because we only compared the path. Synced on hashchange + scrollspy.
   const [hash, setHash] = useState("");
   useEffect(() => {
+    // window.location.hash is client-only, and this effect re-runs on every
+    // route change (deps: [pathname]) to re-sync for the new page's anchors --
+    // not eligible for a lazy initializer, which would only run once at mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setHash(window.location.hash);
     const onHash = () => setHash(window.location.hash);
     window.addEventListener("hashchange", onHash);

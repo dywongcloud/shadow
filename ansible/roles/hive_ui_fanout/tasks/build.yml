@@ -21,6 +21,11 @@
       - "--exclude=node_modules"
       - "--exclude=.next"
       - "--exclude=.git"
+      # ui/.gm is gm-tooling state (spool, config cache) that a running
+      # watcher rewrites at any moment; rsync aborted the whole leader sync
+      # (rc 24, "file has vanished") on 2026-09-02 when its staging dir
+      # churned mid-transfer. It is never part of the dashboard.
+      - "--exclude=.gm"
 
 - name: Template ui/.env.local
   ansible.builtin.template:

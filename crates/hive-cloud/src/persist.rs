@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluid_core::DeployRecord;
-use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef};
+use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef, WorkflowRun};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -75,6 +75,13 @@ pub struct PlatformSnapshot {
     /// restore omitting a database record cannot erase them.
     #[serde(default)]
     pub database_studio_replay: crate::databases::StudioReplaySnapshot,
+    /// Cloudflare Queues metadata (queue/consumer records + their tombstones)
+    /// — durable on disk exactly like the `databases` fields above, separate
+    /// from store_sync's cross-node replication path. Message BODIES are
+    /// deliberately excluded (node-local + GuardianDB-mirrored, see
+    /// `crate::queues` module doc) — this snapshot only ever holds metadata.
+    #[serde(default)]
+    pub queues: crate::queues::SyncedQueues,
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
@@ -148,6 +155,14 @@ pub struct PlatformSnapshot {
     /// ingested during a live deploy, so without this they vanished on reboot.
     #[serde(default)]
     pub workflow_defs: Vec<WorkflowDef>,
+    /// Engine-defined-workflow run history (`hive_edge::WorkflowEngine::runs`).
+    /// Previously pure in-memory and lost on every restart — an in-flight run
+    /// has no way to resume (its driving background task died with the
+    /// process), so `WorkflowEngine::runs_load` reconciles any restored
+    /// Pending/Running row to Failed, the same orphan-reconciliation shape
+    /// `persist::restore` already applies to in-flight deployments below.
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRun>,
     /// Enterprise feature suite state (secrets AEAD-encrypted in-struct). See
     /// [`crate::enterprise::EnterpriseSnapshot`].
     #[serde(default)]
@@ -554,6 +569,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         database_data: cloud.databases.data_snapshot(),
         database_tombstones: cloud.databases.tombstones_snapshot(),
         database_studio_replay: cloud.databases.studio_replay_snapshot(),
+        queues: cloud.queues.snapshot_synced(),
         project_tombstones,
         project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
@@ -578,6 +594,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
         workflow_defs: cloud.workflows.defs(),
+        workflow_runs: cloud.workflows.runs_snapshot(),
         enterprise: cloud.enterprise.snapshot(),
         sandboxes: {
             let (sandboxes, commands, snapshots, mounts) = cloud.sandboxes.snapshot();
@@ -613,7 +630,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
 //     so persistence is never silently dropped.
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 struct Persister {
@@ -676,25 +693,49 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
         .expect("spawn persister thread");
 }
 
-fn admit_generation(p: &Persister) -> u64 {
-    let mut admission_open = p.lock.lock().unwrap();
-    while !*admission_open {
-        admission_open = p.cv.wait(admission_open).unwrap();
+/// Logged-once latch for post-barrier refusals: the first late producer warns,
+/// the rest (the follower-sync adopt, the metrics tick, mirrored gossip
+/// writes keep arriving for the whole graceful tail) stay silent.
+static PERSIST_REFUSED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Admit one generation, or `None` once `flush_blocking` has closed admission.
+///
+/// This NEVER waits. A post-barrier producer is a tokio worker thread, and a
+/// condvar wait there parks that worker for the rest of the process's life;
+/// when that worker is the one driving tokio's IO/timer driver no other worker
+/// re-takes it, so every timer and socket on the runtime stops — the guardian
+/// shutdown timeout and the shutdown hard deadline included — and systemd
+/// SIGKILLs the node at its stop timeout (measured on 34 of 56 stops: 0 threads
+/// in epoll, all 131 in futex, journal silent for 74 s). The terminal snapshot
+/// is already durable when admission closes, so the refusal costs the caller
+/// nothing it could still have saved.
+fn admit_generation(p: &Persister) -> Option<u64> {
+    let admission_open = p.lock.lock().unwrap();
+    if !*admission_open {
+        drop(admission_open);
+        if !PERSIST_REFUSED_WARNED.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                "persist refused after the shutdown barrier; the terminal snapshot is already durable"
+            );
+        }
+        return None;
     }
-    p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1)
+    Some(p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1))
 }
 
 /// Persist the current state to disk (call after any mutation). Non-blocking when
 /// the background writer is running (just marks dirty + wakes it); synchronous
-/// fallback otherwise so a mutation is never silently un-persisted.
+/// fallback otherwise so a mutation is never silently un-persisted. A no-op once
+/// the shutdown barrier has closed admission (see `admit_generation`).
 pub fn persist(cloud: &Arc<CloudState>) {
     if let Some(p) = PERSISTER.get() {
         // Admission and the generation bump are one transaction with the
-        // shutdown flush's final dirty==saved check. Once that check closes
-        // admission, a late mutation producer cannot return and race process
-        // exit; before it closes, every admitted generation is drained.
-        let _target = admit_generation(p);
-        p.cv.notify_one();
+        // shutdown flush's final dirty==saved check: before it closes, every
+        // admitted generation is drained; after it, admission is refused
+        // without waiting and there is nothing to wake.
+        if admit_generation(p).is_some() {
+            p.cv.notify_one();
+        }
         return;
     }
     // Writer not started (early boot / tests) → write synchronously.
@@ -710,7 +751,12 @@ pub fn persist(cloud: &Arc<CloudState>) {
 /// fact exists only in memory.
 pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
     if let Some(p) = PERSISTER.get() {
-        let _admitted = admit_generation(p);
+        // Refused after the shutdown barrier: nothing can be made durable
+        // ahead of process exit any more, and `false` is exactly the
+        // fail-closed answer this function's callers act on.
+        if admit_generation(p).is_none() {
+            return false;
+        }
         let _writer = p.writer.lock().unwrap();
         let target = p.dirty.load(Ordering::SeqCst);
         let snap = capture(&p.cloud);
@@ -736,8 +782,9 @@ pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
 
 /// Synchronously drain every admitted generation, then atomically close
 /// persistence admission before returning the exact final Guardian generation.
-/// A producer whose mutation reaches `persist()` after that boundary waits until
-/// process exit instead of acknowledging state absent from the terminal snapshot.
+/// A producer whose mutation reaches `persist()` after that boundary is refused
+/// without waiting (`admit_generation`): the terminal snapshot is already on
+/// disk, and blocking the producer stalls the runtime instead of protecting it.
 pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
     let Some(p) = PERSISTER.get() else {
         return crate::guardian::close_replication_admission(None);
@@ -762,7 +809,7 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
 
         // persist() registers under this same lock. It therefore either bumped
         // dirty before this stable check (and forces another pass), or observes
-        // closed admission and cannot return before process exit.
+        // closed admission and is refused.
         let mut admission_open = p.lock.lock().unwrap();
         if let Ok(guardian_generation) = write_result {
             if p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
@@ -826,6 +873,49 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         tracing::warn!(
             count = authority_rejected,
             "persist::restore: skipped deployment records that lack active project-incarnation authority"
+        );
+    }
+    let ready_for_authority = deployments
+        .iter()
+        .filter(|record| record.state == fluid_core::DeployState::Ready)
+        .map(|record| {
+            (
+                record.id.clone(),
+                record.project.clone(),
+                record.created_at_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    let restore_authority = cloud
+        .deployment_ledger
+        .authorize_restore_batch(&ready_for_authority)
+        .unwrap_or_else(|error| panic!("deployment restore authority failed closed: {error:#}"));
+    let mut legacy_ready = 0usize;
+    let before_readiness_filter = deployments.len();
+    deployments.retain(|record| {
+        if record.state != fluid_core::DeployState::Ready {
+            return true;
+        }
+        match restore_authority.get(&record.id) {
+            Some(crate::deployment_ledger::RestoreAuthority::Proven) => true,
+            Some(crate::deployment_ledger::RestoreAuthority::LegacyMigration) => {
+                legacy_ready += 1;
+                true
+            }
+            Some(crate::deployment_ledger::RestoreAuthority::Refused) | None => false,
+        }
+    });
+    let readiness_rejected = before_readiness_filter - deployments.len();
+    if legacy_ready > 0 {
+        tracing::warn!(
+            count = legacy_ready,
+            "persist::restore: preserved pre-ledger Ready deployment(s) as explicit legacy predecessors; they are not readiness proof and cannot authorize promotion"
+        );
+    }
+    if readiness_rejected > 0 {
+        tracing::error!(
+            count = readiness_rejected,
+            "persist::restore: refused Ready deployment(s) without published acceptance evidence"
         );
     }
     let n = deployments.len();
@@ -993,6 +1083,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.databases.tombstones_load(snap.database_tombstones);
+    cloud.queues.load(snap.queues);
     cloud.metrics.rollup_load(snap.metrics_rollup);
     // BuildStore::load() already reconciles Queued/Building -> Error for its
     // own per-build log records internally (git.rs) -- no duplicate needed
@@ -1024,6 +1115,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }
+    cloud.workflows.runs_load(snap.workflow_runs);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

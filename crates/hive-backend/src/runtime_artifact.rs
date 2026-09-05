@@ -12,26 +12,31 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::{File, OpenOptions};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::Stdio;
 
-pub use hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION;
+pub use hive_core::{
+    RuntimeArtifactPackageDescriptor, RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION,
+    RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+};
 
 const MAX_ENTRIES: u64 = 100_000;
 const MAX_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MATERIALIZED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PACKAGE_BYTES: u64 = MAX_MATERIALIZED_BYTES + MAX_ENTRIES * 2048 + 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_DEPTH: usize = 128;
 const DEFAULT_STAGE_GC_GRACE_SECS: u64 = 60 * 60;
 const DEFAULT_STAGE_GC_MAX_REAP_FRACTION: f64 = 0.5;
 const STAGE_NONCE_BYTES: usize = 16;
+const HOST_CONTENT_MARKER: &str = ".hive-runtime-content-v1";
+const PACKAGE_DIRECTORY: &str = "packages-v1";
+const PACKAGE_TEMP_PREFIX: &str = ".runtime-artifact-package-v1-";
 
 /// One workspace link that the dependency planner proved is development-only.
 /// Staging may omit it only when a canonical `node_modules/<link_name>` symlink
@@ -114,6 +119,37 @@ pub struct RuntimeArtifactPaths {
     pub delivery_required: bool,
 }
 
+/// One content-addressed, read-only host copy of a validated runtime closure.
+/// Paths are derived only after reopening the store without following links and
+/// revalidating both semantic and transport identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRuntimeArtifact {
+    content_sha256: String,
+    store_root: PathBuf,
+    package_descriptor: RuntimeArtifactPackageDescriptor,
+}
+
+/// One read-only descriptor for the exact deterministic package bound to a
+/// [`SealedRuntimeArtifact`]. The content-addressed store path stays private;
+/// transports receive only this held descriptor and its already-validated wire
+/// descriptor.
+pub struct VerifiedRuntimeArtifactPackage {
+    file: std::fs::File,
+    descriptor: RuntimeArtifactPackageDescriptor,
+}
+
+impl VerifiedRuntimeArtifactPackage {
+    pub fn descriptor(&self) -> &RuntimeArtifactPackageDescriptor {
+        &self.descriptor
+    }
+
+    /// Transfer the read-only package descriptor and its inseparable wire
+    /// descriptor to a bounded transport or receiver.
+    pub fn into_parts(self) -> (std::fs::File, RuntimeArtifactPackageDescriptor) {
+        (self.file, self.descriptor)
+    }
+}
+
 impl RuntimeArtifactSpec {
     pub fn new(checkout_root: impl Into<PathBuf>, app_rel: impl Into<PathBuf>) -> Self {
         let app_rel = app_rel.into();
@@ -177,6 +213,136 @@ impl RuntimeArtifactSpec {
     }
 }
 
+impl SealedRuntimeArtifact {
+    fn validate_binding(&self) -> anyhow::Result<()> {
+        validate_runtime_artifact_package_descriptor(&self.package_descriptor)?;
+        validate_sha256(&self.content_sha256, "runtime artifact semantic digest")?;
+        anyhow::ensure!(
+            self.package_descriptor.semantic_tree_sha256 == self.content_sha256,
+            "sealed runtime artifact transport and semantic identities disagree"
+        );
+        Ok(())
+    }
+
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    pub fn package_descriptor(&self) -> &RuntimeArtifactPackageDescriptor {
+        &self.package_descriptor
+    }
+
+    pub fn identity(&self, image: &str) -> anyhow::Result<hive_core::RuntimeArtifactIdentity> {
+        anyhow::ensure!(
+            !image.is_empty()
+                && image.len() <= 256
+                && image
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "runtime artifact identity contains an invalid id"
+        );
+        self.validate_binding()?;
+        Ok(hive_core::RuntimeArtifactIdentity {
+            protocol: RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+            id: image.to_string(),
+            content_sha256: self.content_sha256.clone(),
+        })
+    }
+
+    pub fn guest_workdir(&self, guest_root: &str) -> anyhow::Result<String> {
+        let app_rel = parse_wire_relative(&self.package_descriptor.app_rel, "application path")?;
+        let rel = app_rel.to_string_lossy();
+        if rel.is_empty() {
+            Ok(guest_root.to_string())
+        } else {
+            Ok(format!("{}/{}", guest_root.trim_end_matches('/'), rel))
+        }
+    }
+
+    pub fn host_app_root(&self) -> anyhow::Result<PathBuf> {
+        self.validate_binding()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root = self.open_verified_host_tree()?;
+            let app_rel =
+                parse_wire_relative(&self.package_descriptor.app_rel, "application path")?;
+            let app = open_existing_directory(&root, &app_rel)
+                .context("open selected application in sealed host runtime artifact")?;
+            anyhow::ensure!(
+                source_state(&app)?.identity.is_directory(),
+                "sealed runtime artifact application root is not a directory"
+            );
+            return Ok(self.store_root.join(&self.content_sha256).join(app_rel));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            bail!("sealed runtime artifact access requires descriptor-relative filesystem support")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_verified_host_tree(&self) -> anyhow::Result<File> {
+        self.validate_binding()?;
+        let store =
+            open_existing_absolute_directory(&self.store_root, "sealed runtime artifact store")?;
+        let name = OsStr::new(&self.content_sha256);
+        let before = lstat_at(&store, name).context("locate sealed host runtime artifact")?;
+        anyhow::ensure!(
+            before.identity.is_directory(),
+            "sealed host runtime artifact address is not a directory"
+        );
+        let root = open_destination_directory(&store, name)
+            .context("open sealed host runtime artifact without following links")?;
+        ensure_same_state(before, source_state(&root)?, Path::new(name))?;
+        ensure_same_state(before, lstat_at(&store, name)?, Path::new(name))?;
+        validate_host_content_marker(&root, &self.content_sha256)?;
+        Ok(root)
+    }
+
+    /// Open the deterministic transport package through a read-only held
+    /// descriptor. No mutable store path crosses the crate boundary, and both
+    /// package bytes and the semantic host tree are reverified before return.
+    pub fn verified_package(&self) -> anyhow::Result<VerifiedRuntimeArtifactPackage> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let file = self.open_verified_package()?;
+            return Ok(VerifiedRuntimeArtifactPackage {
+                file,
+                descriptor: self.package_descriptor.clone(),
+            });
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            bail!(
+                "sealed runtime artifact package access requires descriptor-relative filesystem support"
+            )
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_verified_package(&self) -> anyhow::Result<File> {
+        self.validate_binding()?;
+        let store =
+            open_existing_absolute_directory(&self.store_root, "sealed runtime artifact store")?;
+        let packages = open_destination_directory(&store, OsStr::new(PACKAGE_DIRECTORY))
+            .context("open sealed runtime artifact package store")?;
+        let name = OsString::from(format!("{}.tar", self.package_descriptor.package_sha256));
+        let before =
+            lstat_at(&packages, &name).context("locate sealed runtime artifact package")?;
+        anyhow::ensure!(
+            before.identity.is_regular(),
+            "sealed runtime artifact package address is not a regular file"
+        );
+        let mut package = open_staged_regular(&packages, Path::new(&name))
+            .context("open sealed runtime artifact package without following links")?;
+        ensure_same_state(before, source_state(&package)?, Path::new(&name))?;
+        ensure_same_state(before, lstat_at(&packages, &name)?, Path::new(&name))?;
+        verify_open_package(&mut package, &self.package_descriptor)?;
+        self.open_verified_host_tree()?;
+        Ok(package)
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ActiveStageKey {
@@ -189,6 +355,12 @@ struct ActiveStageKey {
 fn active_stages() -> &'static Mutex<HashSet<ActiveStageKey>> {
     static ACTIVE: OnceLock<Mutex<HashSet<ActiveStageKey>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn host_publication_lock() -> &'static Mutex<()> {
+    static PUBLICATION: OnceLock<Mutex<()>> = OnceLock::new();
+    PUBLICATION.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -225,7 +397,9 @@ impl Drop for ActiveStage {
 pub(crate) struct StagedRuntimeArtifact {
     root_name: OsString,
     content_sha256: String,
+    logical_bytes: u64,
     materialized_bytes: u64,
+    entries: u64,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     root_parent: File,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -237,6 +411,18 @@ pub(crate) struct StagedRuntimeArtifact {
 impl StagedRuntimeArtifact {
     pub(crate) fn content_sha256(&self) -> &str {
         &self.content_sha256
+    }
+
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    pub(crate) fn materialized_bytes(&self) -> u64 {
+        self.materialized_bytes
+    }
+
+    pub(crate) fn entries(&self) -> u64 {
+        self.entries
     }
 
     /// Validated staged regular-file bytes, rounded up to MiB. Callers that
@@ -314,40 +500,20 @@ impl StagedRuntimeArtifact {
         }
     }
 
-    /// Pack the held stage descriptor, never its mutable pathname. The child
-    /// inherits only this descriptor for the duration of tar's exec; the
-    /// destination is an already-created platform file wired to stdout.
+    /// Pack the held stage descriptor, never its mutable pathname. Archive
+    /// metadata and entry order are canonical; repository links and special
+    /// files cannot appear because staging already materialized or rejected them.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) async fn package_workspace(&self, destination: &File) -> anyhow::Result<()> {
-        let mut command = tokio::process::Command::new("tar");
-        let source = inherit_file_path(&mut command, &self.root_descriptor)?;
-        command
-            .arg("-C")
-            .arg(source)
-            .arg("--sort=name")
-            .arg("--mtime=@0")
-            .arg("--owner=0")
-            .arg("--group=0")
-            .arg("--numeric-owner")
-            .arg("--transform=s,^\\./,workspace/,")
-            .arg("-cf")
-            .arg("-")
-            .arg(".")
-            .stdout(Stdio::from(destination.try_clone()?))
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let result = command
-            .spawn()
-            .map_err(|error| anyhow::anyhow!("failed to spawn tar: {error}"))?
-            .wait_with_output()
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to wait for tar: {error}"))?;
-        anyhow::ensure!(
-            result.status.success(),
-            "tar failed packing descriptor-bound runtime artifact: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-        Ok(())
+        let source = self.root_descriptor.try_clone()?;
+        let destination = destination.try_clone()?;
+        let expected_entries = self.entries;
+        let expected_bytes = self.materialized_bytes;
+        tokio::task::spawn_blocking(move || {
+            package_workspace_blocking(source, destination, expected_entries, expected_bytes)
+        })
+        .await
+        .context("runtime artifact package task failed")?
     }
 
     /// Add the platform-owned identity marker after all repository bytes have
@@ -394,6 +560,73 @@ impl StagedRuntimeArtifact {
             .context("sync runtime artifact stage after identity marker")?;
         Ok(())
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn publish_host(
+        self,
+        store_root: PathBuf,
+        app_rel: PathBuf,
+        package_descriptor: RuntimeArtifactPackageDescriptor,
+    ) -> anyhow::Result<SealedRuntimeArtifact> {
+        let digest = self.content_sha256.clone();
+        let mut marker = create_destination_file(
+            &self.root_descriptor,
+            OsStr::new(HOST_CONTENT_MARKER),
+            0o444,
+        )
+        .context("create host runtime artifact content marker")?;
+        marker
+            .write_all(digest.as_bytes())
+            .context("write host runtime artifact content marker")?;
+        marker
+            .sync_all()
+            .context("sync host runtime artifact content marker")?;
+        #[cfg(target_os = "linux")]
+        freeze_tree(&self.root_descriptor, Path::new(""), 0, true)?;
+        #[cfg(target_os = "macos")]
+        freeze_tree(&self.root_descriptor, Path::new(""), 0, false)?;
+
+        let _publication = host_publication_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let destination = OsString::from(&digest);
+        let published = publish_stage_noreplace(
+            &self.root_parent,
+            &self.root_name,
+            &destination,
+            &store_root,
+        )?;
+        #[cfg(target_os = "macos")]
+        if published {
+            freeze_directory_descriptor(&self.root_descriptor, Path::new(""))?;
+        }
+        let root_descriptor = open_destination_directory(&self.root_parent, &destination)
+            .context("open published host runtime artifact")?;
+        validate_host_content_marker(&root_descriptor, &digest)?;
+        if !published {
+            compare_runtime_artifact_trees(&self.root_descriptor, &root_descriptor)?;
+        }
+        let app_descriptor = if app_rel.as_os_str().is_empty() {
+            root_descriptor.try_clone()?
+        } else {
+            open_source_beneath(&root_descriptor, &app_rel)
+                .context("open selected application in published host runtime artifact")?
+        };
+        anyhow::ensure!(
+            source_state(&app_descriptor)?.identity.is_directory(),
+            "published runtime artifact application root is not a directory"
+        );
+        if published {
+            self.root_parent
+                .sync_all()
+                .context("sync host runtime artifact store after publication")?;
+        }
+        Ok(SealedRuntimeArtifact {
+            content_sha256: digest,
+            store_root,
+            package_descriptor,
+        })
+    }
 }
 
 impl Drop for StagedRuntimeArtifact {
@@ -402,6 +635,995 @@ impl Drop for StagedRuntimeArtifact {
         {
             let _ = remove_exact_stage(&self.root_parent, &self.root_name, &self.root_descriptor);
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn package_header(state: SourceState, directory: bool) -> anyhow::Result<tar::Header> {
+    // USTAR, not GNU, deliberately: paths longer than 100 bytes encode via the
+    // ustar name+prefix split (up to 255 bytes), which every consumer of this
+    // package parses — including litebox's `tar_no_std` guest filesystem. A
+    // GNU header makes tar-rs emit a GNU longname EXTENSION entry for such
+    // paths instead, which `tar_no_std` cannot parse: the guest silently lost
+    // every archive entry from the first long path onward (witnessed live —
+    // a Next.js 16 build's 100+-byte chunk paths left the litebox guest
+    // without its libraries or interpreter, failing every launch with a bare
+    // "failed to open the ELF file"). `set_ustar_path` is the matching loud
+    // refusal for paths no ustar split can encode.
+    let mut header = tar::Header::new_ustar();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_mode((state.mode & 0o777) as u32);
+    header.set_size(if directory { 0 } else { state.identity.length });
+    header.set_entry_type(if directory {
+        tar::EntryType::Directory
+    } else {
+        tar::EntryType::Regular
+    });
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_cksum();
+    Ok(header)
+}
+
+/// Prove `path` encodes in this ustar header WITHOUT a GNU longname fallback —
+/// `tar::Builder::append_data` silently emits that fallback when `set_path`
+/// fails, and the weakest package consumer (litebox's `tar_no_std`) drops
+/// every entry from the first longname extension onward. Refusing here turns a
+/// silent guest-filesystem truncation into one loud package-time error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_ustar_path(header: &mut tar::Header, path: &Path) -> anyhow::Result<()> {
+    header.set_path(path).with_context(|| {
+        format!(
+            "runtime artifact package path {:?} cannot be encoded in a ustar header \
+             (name/prefix split limit is 255 bytes with a component boundary within \
+             the last 100); shorten the path — a longname fallback would be silently \
+             invisible to the litebox guest filesystem",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn append_package_tree(
+    builder: &mut tar::Builder<File>,
+    directory: &File,
+    archive_path: &Path,
+    logical: &Path,
+    depth: usize,
+    entries: &mut u64,
+    bytes: &mut u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_DEPTH,
+        "runtime artifact package exceeds depth {MAX_DEPTH}"
+    );
+    for child in read_cleanup_children(directory)? {
+        let child_logical = logical.join(&child.name);
+        validate_output_path(&child_logical, depth + 1)?;
+        let child_archive = archive_path.join(&child.name);
+        *entries = entries.saturating_add(1);
+        anyhow::ensure!(
+            *entries <= MAX_ENTRIES + 1,
+            "runtime artifact package exceeds its entry bound"
+        );
+        if child.state.identity.is_directory() {
+            let child_directory = open_destination_directory(directory, &child.name)?;
+            ensure_same_state(child.state, source_state(&child_directory)?, &child_logical)?;
+            let mut header = package_header(child.state, true)?;
+            set_ustar_path(&mut header, &child_archive)?;
+            builder
+                .append_data(&mut header, &child_archive, std::io::empty())
+                .with_context(|| {
+                    format!(
+                        "append runtime artifact package directory {}",
+                        child_logical.display()
+                    )
+                })?;
+            append_package_tree(
+                builder,
+                &child_directory,
+                &child_archive,
+                &child_logical,
+                depth + 1,
+                entries,
+                bytes,
+            )?;
+            ensure_same_state(child.state, source_state(&child_directory)?, &child_logical)?;
+            continue;
+        }
+        anyhow::ensure!(
+            child.state.identity.is_regular(),
+            "runtime artifact package rejects link or special entry: {}",
+            child_logical.display()
+        );
+        *bytes = bytes.saturating_add(child.state.identity.length);
+        anyhow::ensure!(
+            *bytes <= MAX_MATERIALIZED_BYTES,
+            "runtime artifact package exceeds its materialized byte bound"
+        );
+        let mut file = open_staged_regular(directory, Path::new(&child.name))?;
+        ensure_same_state(child.state, source_state(&file)?, &child_logical)?;
+        let mut header = package_header(child.state, false)?;
+        set_ustar_path(&mut header, &child_archive)?;
+        builder
+            .append_data(&mut header, &child_archive, &mut file)
+            .with_context(|| {
+                format!(
+                    "append runtime artifact package file {}",
+                    child_logical.display()
+                )
+            })?;
+        ensure_same_state(child.state, source_state(&file)?, &child_logical)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn package_workspace_blocking(
+    source: File,
+    destination: File,
+    expected_entries: u64,
+    expected_bytes: u64,
+) -> anyhow::Result<()> {
+    let root_state = source_state(&source)?;
+    anyhow::ensure!(
+        root_state.identity.is_directory(),
+        "runtime artifact package source is not a directory"
+    );
+    let mut builder = tar::Builder::new(destination);
+    builder.mode(tar::HeaderMode::Deterministic);
+    builder.follow_symlinks(false);
+    let mut root_header = package_header(root_state, true)?;
+    builder
+        .append_data(&mut root_header, Path::new("workspace"), std::io::empty())
+        .context("append runtime artifact package root")?;
+    let mut entries = 1_u64;
+    let mut bytes = 0_u64;
+    append_package_tree(
+        &mut builder,
+        &source,
+        Path::new("workspace"),
+        Path::new(""),
+        0,
+        &mut entries,
+        &mut bytes,
+    )?;
+    anyhow::ensure!(
+        entries == expected_entries && bytes == expected_bytes,
+        "runtime artifact package accounting changed during serialization"
+    );
+    builder
+        .finish()
+        .context("finish runtime artifact package")?;
+    let destination = builder
+        .into_inner()
+        .context("close runtime artifact package writer")?;
+    destination
+        .sync_all()
+        .context("sync deterministic runtime artifact package")?;
+    ensure_same_state(root_state, source_state(&source)?, Path::new(""))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PendingPackageFile {
+    parent: File,
+    name: OsString,
+    file: File,
+    armed: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PendingPackageFile {
+    fn publish(mut self, package_sha256: &str, packages_root: &Path) -> anyhow::Result<PathBuf> {
+        let destination = OsString::from(format!("{package_sha256}.tar"));
+        let _publication = host_publication_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published =
+            publish_stage_noreplace(&self.parent, &self.name, &destination, packages_root)?;
+        verify_package_at(&self.parent, &destination, package_sha256)?;
+        if published {
+            self.armed = false;
+            self.parent
+                .sync_all()
+                .context("sync runtime artifact package store after publication")?;
+        } else {
+            remove_regular_if_same(&self.parent, &self.name, &self.file)?;
+            self.armed = false;
+        }
+        Ok(packages_root.join(destination))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for PendingPackageFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_regular_if_same(&self.parent, &self.name, &self.file);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn allocate_package_file(packages_root: &Path) -> anyhow::Result<PendingPackageFile> {
+    let parent = open_or_create_scratch_root(packages_root)?;
+    for _ in 0..256 {
+        let mut nonce = [0_u8; STAGE_NONCE_BYTES];
+        fill_stage_random(&mut nonce)?;
+        let name = OsString::from(format!(
+            "{PACKAGE_TEMP_PREFIX}{}-{}.tar",
+            hive_core::now_ms(),
+            hex_digest(&nonce)
+        ));
+        let file = match create_destination_file(&parent, &name, 0o600) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(error) => return Err(error).context("allocate runtime artifact package"),
+        };
+        let state = source_state(&file)?;
+        ensure_same_state(state, lstat_at(&parent, &name)?, Path::new(&name))?;
+        return Ok(PendingPackageFile {
+            parent,
+            name,
+            file,
+            armed: true,
+        });
+    }
+    bail!("could not allocate a unique runtime artifact package")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_regular_if_same(parent: &File, name: &OsStr, file: &File) -> anyhow::Result<()> {
+    let held = source_state(file)?;
+    let named = lstat_at(parent, name)?;
+    anyhow::ensure!(
+        held == named && held.identity.is_regular(),
+        "runtime artifact package identity changed before cleanup: {}",
+        name.to_string_lossy()
+    );
+    let name = cstring_component(name)?;
+    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("remove pending runtime artifact package");
+    }
+    parent
+        .sync_all()
+        .context("sync runtime artifact package parent after cleanup")?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hash_package_at(parent: &File, name: &OsStr) -> anyhow::Result<(String, u64)> {
+    let mut file = open_staged_regular(parent, Path::new(name))
+        .context("open deterministic runtime artifact package")?;
+    let before = source_state(&file)?;
+    anyhow::ensure!(
+        before.identity.is_regular()
+            && before.identity.length > 0
+            && before.identity.length <= MAX_PACKAGE_BYTES,
+        "runtime artifact package must be a nonempty regular file of at most {MAX_PACKAGE_BYTES} bytes"
+    );
+    let mut hash = Sha256::new();
+    let mut remaining = before.identity.length;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..take])?;
+        hash.update(&buffer[..take]);
+        remaining -= take as u64;
+    }
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut extra)? == 0,
+        "runtime artifact package grew while hashing"
+    );
+    ensure_same_state(before, source_state(&file)?, Path::new(name))?;
+    Ok((hex_digest(&hash.finalize()), before.identity.length))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_package_at(parent: &File, name: &OsStr, expected_sha256: &str) -> anyhow::Result<u64> {
+    validate_sha256(expected_sha256, "runtime artifact package digest")?;
+    let (actual, bytes) = hash_package_at(parent, name)?;
+    anyhow::ensure!(
+        actual == expected_sha256,
+        "runtime artifact package bytes do not match their content address"
+    );
+    Ok(bytes)
+}
+
+fn wire_relative(path: &Path, label: &str) -> anyhow::Result<String> {
+    let normalized = normalized_relative(path, label)?;
+    let value = if normalized.as_os_str().is_empty() {
+        "."
+    } else {
+        normalized
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("runtime artifact {label} is not UTF-8"))?
+    };
+    anyhow::ensure!(
+        value.len() <= MAX_PATH_BYTES
+            && !value.contains('\\')
+            && !value.chars().any(char::is_control),
+        "runtime artifact {label} is not a bounded canonical wire path"
+    );
+    Ok(value.to_string())
+}
+
+fn parse_wire_relative(value: &str, label: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= MAX_PATH_BYTES
+            && !value.contains('\\')
+            && !value.chars().any(char::is_control),
+        "runtime artifact {label} is not a bounded canonical wire path"
+    );
+    let parsed = normalized_relative(Path::new(value), label)?;
+    anyhow::ensure!(
+        wire_relative(&parsed, label)? == value,
+        "runtime artifact {label} is not canonically encoded"
+    );
+    Ok(parsed)
+}
+
+fn validate_sha256(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} must be 64 lowercase hexadecimal characters"
+    );
+    Ok(())
+}
+
+pub fn validate_runtime_artifact_package_descriptor(
+    descriptor: &RuntimeArtifactPackageDescriptor,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        descriptor.protocol == RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION,
+        "runtime artifact package uses unsupported protocol {}",
+        descriptor.protocol
+    );
+    validate_sha256(
+        &descriptor.package_sha256,
+        "runtime artifact package digest",
+    )?;
+    validate_sha256(
+        &descriptor.semantic_tree_sha256,
+        "runtime artifact semantic tree digest",
+    )?;
+    anyhow::ensure!(
+        descriptor.package_bytes > 0 && descriptor.package_bytes <= MAX_PACKAGE_BYTES,
+        "runtime artifact package byte count is outside the supported bound"
+    );
+    anyhow::ensure!(
+        descriptor.logical_bytes <= MAX_LOGICAL_BYTES
+            && descriptor.materialized_bytes <= MAX_MATERIALIZED_BYTES
+            && descriptor.logical_bytes <= descriptor.materialized_bytes,
+        "runtime artifact package tree byte counts are inconsistent or out of bounds"
+    );
+    anyhow::ensure!(
+        descriptor.entries > 0 && descriptor.entries <= MAX_ENTRIES + 1,
+        "runtime artifact package entry count is outside the supported bound"
+    );
+    let app_rel = parse_wire_relative(&descriptor.app_rel, "application path")?;
+    anyhow::ensure!(
+        !descriptor.include_rel.is_empty() && descriptor.include_rel.len() < MAX_ENTRIES as usize,
+        "runtime artifact package include closure is empty or too large"
+    );
+    let mut previous: Option<&str> = None;
+    let mut app_covered = false;
+    for include in &descriptor.include_rel {
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < include.as_str(),
+                "runtime artifact package include closure is not strictly lexically ordered"
+            );
+        }
+        let include_path = parse_wire_relative(include, "include path")?;
+        app_covered |= app_rel.starts_with(&include_path);
+        previous = Some(include);
+    }
+    anyhow::ensure!(
+        app_covered,
+        "runtime artifact package include closure does not cover the selected application"
+    );
+    Ok(())
+}
+
+fn canonical_package_coordinates(
+    spec: &RuntimeArtifactSpec,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let app_rel = normalized_relative(&spec.app_rel, "application path")?;
+    let mut includes = selected_roots(spec, &app_rel)?;
+    includes.sort();
+    let app_rel = wire_relative(&app_rel, "application path")?;
+    let include_rel = includes
+        .iter()
+        .map(|path| wire_relative(path, "include path"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((app_rel, include_rel))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn package_staged_runtime_artifact(
+    staged: &StagedRuntimeArtifact,
+    spec: &RuntimeArtifactSpec,
+    store_root: &Path,
+) -> anyhow::Result<(RuntimeArtifactPackageDescriptor, PathBuf)> {
+    let (app_rel, include_rel) = canonical_package_coordinates(spec)?;
+    let packages_root = store_root.join(PACKAGE_DIRECTORY);
+    let pending = allocate_package_file(&packages_root)?;
+    staged.package_workspace(&pending.file).await?;
+    pending
+        .file
+        .set_permissions(std::fs::Permissions::from_mode(0o444))?;
+    pending.file.sync_all()?;
+    let parent = pending.parent.try_clone()?;
+    let name = pending.name.clone();
+    let (package_sha256, package_bytes) =
+        tokio::task::spawn_blocking(move || hash_package_at(&parent, &name))
+            .await
+            .context("runtime artifact package hashing task failed")??;
+    let descriptor = RuntimeArtifactPackageDescriptor {
+        protocol: RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION,
+        package_sha256: package_sha256.clone(),
+        semantic_tree_sha256: staged.content_sha256().to_string(),
+        package_bytes,
+        logical_bytes: staged.logical_bytes(),
+        materialized_bytes: staged.materialized_bytes(),
+        entries: staged.entries(),
+        app_rel,
+        include_rel,
+    };
+    validate_runtime_artifact_package_descriptor(&descriptor)?;
+    let path =
+        tokio::task::spawn_blocking(move || pending.publish(&package_sha256, &packages_root))
+            .await
+            .context("runtime artifact package publication task failed")??;
+    Ok((descriptor, path))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn package_staged_runtime_artifact(
+    _staged: &StagedRuntimeArtifact,
+    _spec: &RuntimeArtifactSpec,
+    _store_root: &Path,
+) -> anyhow::Result<(RuntimeArtifactPackageDescriptor, PathBuf)> {
+    bail!("runtime artifact packaging requires descriptor-relative filesystem support")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_open_package(
+    package: &mut File,
+    descriptor: &RuntimeArtifactPackageDescriptor,
+) -> anyhow::Result<()> {
+    let metadata = package.metadata()?;
+    anyhow::ensure!(
+        metadata.file_type().is_file() && metadata.len() == descriptor.package_bytes,
+        "runtime artifact package is not a regular file with the declared byte length"
+    );
+    package.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut remaining = descriptor.package_bytes;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        package.read_exact(&mut buffer[..take])?;
+        hash.update(&buffer[..take]);
+        remaining -= take as u64;
+    }
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        package.read(&mut extra)? == 0,
+        "runtime artifact package exceeds its declared byte length"
+    );
+    anyhow::ensure!(
+        hex_digest(&hash.finalize()) == descriptor.package_sha256,
+        "runtime artifact package digest does not match its descriptor"
+    );
+    package.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_existing_directory(root: &File, relative: &Path) -> anyhow::Result<File> {
+    let mut current = root.try_clone()?;
+    for component in normal_components(relative)? {
+        current = open_destination_directory(&current, &component).with_context(|| {
+            format!(
+                "open extracted runtime artifact directory {}",
+                relative.display()
+            )
+        })?;
+    }
+    Ok(current)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_extracted_directory(root: &File, relative: &Path, mode: u32) -> anyhow::Result<()> {
+    let parent_rel = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent = open_existing_directory(root, parent_rel)?;
+    let name = relative.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "runtime artifact package directory has no name: {}",
+            relative.display()
+        )
+    })?;
+    let name_c = cstring_component(name)?;
+    let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "create extracted runtime artifact directory {}",
+                relative.display()
+            )
+        });
+    }
+    let directory = open_destination_directory(&parent, name)?;
+    directory.set_permissions(std::fs::Permissions::from_mode(mode | 0o700))?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_extracted_file<R: Read>(
+    root: &File,
+    relative: &Path,
+    mode: u32,
+    bytes: u64,
+    input: &mut R,
+) -> anyhow::Result<()> {
+    let parent_rel = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent = open_existing_directory(root, parent_rel)?;
+    let name = relative.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "runtime artifact package file has no name: {}",
+            relative.display()
+        )
+    })?;
+    let mut output = create_destination_file(&parent, name, 0o600).with_context(|| {
+        format!(
+            "create extracted runtime artifact file {}",
+            relative.display()
+        )
+    })?;
+    let mut remaining = bytes;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..take])?;
+        output.write_all(&buffer[..take])?;
+        remaining -= take as u64;
+    }
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        input.read(&mut extra)? == 0,
+        "runtime artifact package file exceeds its declared entry length: {}",
+        relative.display()
+    );
+    output.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    output.sync_all()?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn package_entry_relative(path: &Path) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !path.is_absolute() && path.as_os_str().as_bytes().len() <= MAX_PATH_BYTES + 10,
+        "runtime artifact package entry path is absolute or too long"
+    );
+    let components = normal_components(path)?;
+    anyhow::ensure!(
+        components.first().map(OsString::as_os_str) == Some(OsStr::new("workspace")),
+        "runtime artifact package entry is outside the workspace root: {}",
+        path.display()
+    );
+    let mut relative = PathBuf::new();
+    for component in components.iter().skip(1) {
+        relative.push(component);
+    }
+    let canonical = if relative.as_os_str().is_empty() {
+        PathBuf::from("workspace")
+    } else {
+        PathBuf::from("workspace").join(&relative)
+    };
+    anyhow::ensure!(
+        canonical == path,
+        "runtime artifact package entry is not canonically encoded: {}",
+        path.display()
+    );
+    validate_output_path(&relative, relative.components().count())?;
+    Ok(relative)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_in_package_closure(relative: &Path, directory: bool, includes: &[PathBuf]) -> bool {
+    includes.iter().any(|include| {
+        relative.starts_with(include) || (directory && include.starts_with(relative))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn extract_runtime_artifact_package(
+    package: &mut File,
+    descriptor: &RuntimeArtifactPackageDescriptor,
+    destination: &File,
+) -> anyhow::Result<()> {
+    package.seek(SeekFrom::Start(0))?;
+    let includes = descriptor
+        .include_rel
+        .iter()
+        .map(|value| parse_wire_relative(value, "include path"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut archive = tar::Archive::new(package);
+    let mut entries = 0_u64;
+    let mut materialized_bytes = 0_u64;
+    let mut previous: Option<PathBuf> = None;
+    let mut directories = Vec::new();
+    for item in archive
+        .entries()
+        .context("read runtime artifact package entries")?
+    {
+        let mut entry = item.context("read runtime artifact package entry")?;
+        let path = entry
+            .path()
+            .context("decode runtime artifact package entry path")?
+            .into_owned();
+        let relative = package_entry_relative(&path)?;
+        if let Some(previous) = previous.as_ref() {
+            anyhow::ensure!(
+                previous < &relative,
+                "runtime artifact package entries are not strictly lexically ordered"
+            );
+        }
+        previous = Some(relative.clone());
+        entries = entries.saturating_add(1);
+        anyhow::ensure!(
+            entries <= descriptor.entries && entries <= MAX_ENTRIES + 1,
+            "runtime artifact package exceeds its declared entry count"
+        );
+        let kind = entry.header().entry_type();
+        let mode = entry
+            .header()
+            .mode()
+            .context("read runtime artifact package mode")?
+            & 0o777;
+        if relative.as_os_str().is_empty() {
+            anyhow::ensure!(
+                entries == 1 && kind.is_dir(),
+                "runtime artifact package must begin with one workspace directory"
+            );
+            directories.push((relative, mode));
+            continue;
+        }
+        if kind.is_dir() {
+            anyhow::ensure!(
+                path_in_package_closure(&relative, true, &includes),
+                "runtime artifact package directory is outside its declared closure: {}",
+                relative.display()
+            );
+            create_extracted_directory(destination, &relative, mode)?;
+            directories.push((relative, mode));
+            continue;
+        }
+        anyhow::ensure!(
+            kind.is_file(),
+            "runtime artifact package rejects links and special entries: {}",
+            relative.display()
+        );
+        anyhow::ensure!(
+            path_in_package_closure(&relative, false, &includes),
+            "runtime artifact package file is outside its declared closure: {}",
+            relative.display()
+        );
+        let size = entry.size();
+        materialized_bytes = materialized_bytes.saturating_add(size);
+        anyhow::ensure!(
+            materialized_bytes <= descriptor.materialized_bytes
+                && materialized_bytes <= MAX_MATERIALIZED_BYTES,
+            "runtime artifact package exceeds its declared materialized byte count"
+        );
+        create_extracted_file(destination, &relative, mode, size, &mut entry)?;
+    }
+    anyhow::ensure!(
+        entries == descriptor.entries,
+        "runtime artifact package entry count differs from its descriptor"
+    );
+    anyhow::ensure!(
+        materialized_bytes == descriptor.materialized_bytes,
+        "runtime artifact package materialized byte count differs from its descriptor"
+    );
+    directories.sort_by(|left, right| {
+        right
+            .0
+            .components()
+            .count()
+            .cmp(&left.0.components().count())
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    for (relative, mode) in directories {
+        let directory = open_existing_directory(destination, &relative)?;
+        directory.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        directory.sync_all()?;
+    }
+    destination.sync_all()?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn persist_verified_package(
+    package: &mut File,
+    descriptor: &RuntimeArtifactPackageDescriptor,
+    store_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    package.seek(SeekFrom::Start(0))?;
+    let packages_root = store_root.join(PACKAGE_DIRECTORY);
+    let pending = allocate_package_file(&packages_root)?;
+    let mut output = pending.file.try_clone()?;
+    let mut remaining = descriptor.package_bytes;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        package.read_exact(&mut buffer[..take])?;
+        output.write_all(&buffer[..take])?;
+        remaining -= take as u64;
+    }
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        package.read(&mut extra)? == 0,
+        "runtime artifact package changed after semantic verification"
+    );
+    output.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+    output.sync_all()?;
+    let (actual, bytes) = hash_package_at(&pending.parent, &pending.name)?;
+    anyhow::ensure!(
+        actual == descriptor.package_sha256 && bytes == descriptor.package_bytes,
+        "runtime artifact package changed while entering the content-addressed store"
+    );
+    pending.publish(&descriptor.package_sha256, &packages_root)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn materialize_runtime_artifact_package_blocking(
+    mut package: File,
+    descriptor: RuntimeArtifactPackageDescriptor,
+    store_root: PathBuf,
+) -> anyhow::Result<SealedRuntimeArtifact> {
+    validate_runtime_artifact_package_descriptor(&descriptor)?;
+    verify_open_package(&mut package, &descriptor)?;
+    let incoming_root = store_root.join("incoming-v1");
+    let incoming_parent = open_or_create_scratch_root(&incoming_root)?;
+    let extracted = create_stage_in(&incoming_parent)?;
+    extract_runtime_artifact_package(&mut package, &descriptor, &extracted.root_descriptor)?;
+
+    let app_rel = parse_wire_relative(&descriptor.app_rel, "application path")?;
+    let include_rel = descriptor
+        .include_rel
+        .iter()
+        .map(|value| parse_wire_relative(value, "include path"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let checkout_state = source_state(&extracted.root_descriptor)?;
+    ensure_same_state(
+        checkout_state,
+        lstat_at(&extracted.root_parent, &extracted.root_name)?,
+        Path::new(&extracted.root_name),
+    )?;
+    let spec = RuntimeArtifactSpec {
+        checkout_root: incoming_root.join(&extracted.root_name),
+        app_rel: app_rel.clone(),
+        include_rel,
+        omitted_workspace_links: Vec::new(),
+    };
+    let staged = stage_blocking(&spec, &store_root)?;
+    ensure_same_state(
+        checkout_state,
+        source_state(&extracted.root_descriptor)?,
+        Path::new(&extracted.root_name),
+    )?;
+    // The package materializes every dereferenced symlink into a real file, so
+    // re-staging the extracted tree measures logical == materialized by
+    // construction; the SOURCE tree's logical_bytes (descriptor.logical_bytes,
+    // smaller whenever the checkout held symlinks) is not an invariant the
+    // extracted tree can reproduce. The restaged logical total must instead
+    // equal the declared MATERIALIZED total — the exact byte cost the
+    // descriptor promised this package expands to.
+    anyhow::ensure!(
+        staged.content_sha256() == descriptor.semantic_tree_sha256
+            && staged.logical_bytes() == descriptor.materialized_bytes
+            && staged.materialized_bytes() == descriptor.materialized_bytes
+            && staged.entries() == descriptor.entries,
+        "runtime artifact package materializes to a different semantic tree or declared accounting \
+         (semantic sha declared {} restaged {}; materialized bytes declared {} restaged logical {} restaged materialized {}; entries declared {} restaged {})",
+        descriptor.semantic_tree_sha256,
+        staged.content_sha256(),
+        descriptor.materialized_bytes,
+        staged.logical_bytes(),
+        staged.materialized_bytes(),
+        descriptor.entries,
+        staged.entries()
+    );
+    verify_open_package(&mut package, &descriptor)?;
+    persist_verified_package(&mut package, &descriptor, &store_root)?;
+    staged.publish_host(store_root, app_rel, descriptor)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stage_verified_runtime_artifact_package_blocking(
+    mut package: File,
+    descriptor: RuntimeArtifactPackageDescriptor,
+    scratch_parent: File,
+) -> anyhow::Result<StagedRuntimeArtifact> {
+    validate_runtime_artifact_package_descriptor(&descriptor)?;
+    verify_open_package(&mut package, &descriptor)?;
+    let extracted = create_stage_in(&scratch_parent)?;
+    extract_runtime_artifact_package(&mut package, &descriptor, &extracted.root_descriptor)?;
+
+    let app_rel = parse_wire_relative(&descriptor.app_rel, "application path")?;
+    let include_rel = descriptor
+        .include_rel
+        .iter()
+        .map(|value| parse_wire_relative(value, "include path"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let checkout_state = source_state(&extracted.root_descriptor)?;
+    ensure_same_state(
+        checkout_state,
+        lstat_at(&extracted.root_parent, &extracted.root_name)?,
+        Path::new(&extracted.root_name),
+    )?;
+    let spec = RuntimeArtifactSpec {
+        checkout_root: PathBuf::new(),
+        app_rel,
+        include_rel,
+        omitted_workspace_links: Vec::new(),
+    };
+    let staged = stage_blocking_from_checkout(
+        &spec,
+        extracted.root_descriptor.try_clone()?,
+        scratch_parent,
+    )?;
+    ensure_same_state(
+        checkout_state,
+        source_state(&extracted.root_descriptor)?,
+        Path::new(&extracted.root_name),
+    )?;
+    // Same symlink-materialization reasoning as `materialize_runtime_artifact_
+    // package_blocking` above: the extracted tree is the descriptor's
+    // MATERIALIZED form, so its logical total must equal the declared
+    // materialized total, never the source tree's smaller logical total.
+    anyhow::ensure!(
+        staged.content_sha256() == descriptor.semantic_tree_sha256
+            && staged.logical_bytes() == descriptor.materialized_bytes
+            && staged.materialized_bytes() == descriptor.materialized_bytes
+            && staged.entries() == descriptor.entries,
+        "sealed runtime artifact package materializes to a different semantic tree or declared accounting \
+         (semantic sha declared {} restaged {}; materialized bytes declared {} restaged logical {} restaged materialized {}; entries declared {} restaged {})",
+        descriptor.semantic_tree_sha256,
+        staged.content_sha256(),
+        descriptor.materialized_bytes,
+        staged.logical_bytes(),
+        staged.materialized_bytes(),
+        descriptor.entries,
+        staged.entries()
+    );
+    verify_open_package(&mut package, &descriptor)?;
+    Ok(staged)
+}
+
+/// Derive a backend-private stage only from the exact sealed transport bytes.
+/// The post-publication host tree is never re-traversed, so its platform marker
+/// cannot become application content.
+pub(crate) async fn stage_sealed_runtime_artifact(
+    artifact: &SealedRuntimeArtifact,
+    scratch_parent: &Path,
+) -> anyhow::Result<StagedRuntimeArtifact> {
+    let artifact = artifact.clone();
+    let scratch_parent = scratch_parent.to_path_buf();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        return tokio::task::spawn_blocking(move || {
+            let package = artifact.open_verified_package()?;
+            let scratch_parent = open_or_create_scratch_root(&scratch_parent)?;
+            stage_verified_runtime_artifact_package_blocking(
+                package,
+                artifact.package_descriptor.clone(),
+                scratch_parent,
+            )
+        })
+        .await
+        .context("sealed runtime artifact staging task failed")?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (artifact, scratch_parent);
+        bail!("sealed runtime artifact staging requires descriptor-relative filesystem support")
+    }
+}
+
+/// Stage sealed bytes while transferring an external serialization permit into
+/// the blocking task. Cancellation cannot release the permit while a hidden
+/// filesystem mutation is still running.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn stage_sealed_runtime_artifact_serialized<G>(
+    artifact: &SealedRuntimeArtifact,
+    scratch_parent: File,
+    serialization: G,
+) -> anyhow::Result<(StagedRuntimeArtifact, G)>
+where
+    G: Send + 'static,
+{
+    let artifact = artifact.clone();
+    tokio::task::spawn_blocking(move || {
+        let package = artifact.open_verified_package()?;
+        let staged = stage_verified_runtime_artifact_package_blocking(
+            package,
+            artifact.package_descriptor.clone(),
+            scratch_parent,
+        )?;
+        Ok::<_, anyhow::Error>((staged, serialization))
+    })
+    .await
+    .context("serialized sealed runtime artifact staging task failed")?
+}
+
+/// Verify and materialize one transferred package into the same content-addressed
+/// host store used by local builds. The package file is owned by the caller, but
+/// only exact package bytes and a recomputed semantic tree can become executable.
+/// Reopen sealed authority over an ALREADY-materialized content-addressed
+/// artifact. The descriptor must be a validated wire descriptor whose semantic
+/// identity names an existing store entry; the host tree is reopened without
+/// following links and its content marker re-verified before any authority is
+/// returned, so a caller can never mint a `SealedRuntimeArtifact` for bytes
+/// this store does not actually hold. This is the receiver-side bridge from a
+/// durable `Materialized` transfer record back to live artifact authority
+/// after a process restart.
+pub fn reopen_sealed_runtime_artifact(
+    store_root: &Path,
+    descriptor: &RuntimeArtifactPackageDescriptor,
+) -> anyhow::Result<SealedRuntimeArtifact> {
+    validate_runtime_artifact_package_descriptor(descriptor)?;
+    let sealed = SealedRuntimeArtifact {
+        content_sha256: descriptor.semantic_tree_sha256.clone(),
+        store_root: store_root.to_path_buf(),
+        package_descriptor: descriptor.clone(),
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        sealed
+            .open_verified_host_tree()
+            .context("reopen sealed runtime artifact host tree")?;
+        Ok(sealed)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("sealed runtime artifact access requires descriptor-relative filesystem support")
+    }
+}
+
+pub async fn materialize_runtime_artifact_package(
+    package: std::fs::File,
+    descriptor: RuntimeArtifactPackageDescriptor,
+    store_root: &Path,
+) -> anyhow::Result<SealedRuntimeArtifact> {
+    let store_root = store_root.to_path_buf();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        return tokio::task::spawn_blocking(move || {
+            materialize_runtime_artifact_package_blocking(package, descriptor, store_root)
+        })
+        .await
+        .context("runtime artifact package materialization task failed")?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (package, descriptor, store_root);
+        bail!("runtime artifact package materialization requires descriptor-relative filesystem support")
     }
 }
 
@@ -419,25 +1641,23 @@ pub(crate) async fn stage_runtime_artifact(
         .context("runtime artifact staging task failed")?
 }
 
-/// Stage while transferring an external serialization permit into the blocking
-/// task. If the async caller is cancelled, the task retains the permit until it
-/// has stopped mutating the stage and its unobserved result has been dropped.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) async fn stage_runtime_artifact_serialized<G>(
+/// Materialize and atomically publish one backend-neutral host artifact.
+/// The final directory name is the canonical semantic digest, so every build
+/// lane consumes one immutable byte identity rather than a mutable checkout.
+pub async fn seal_host_runtime_artifact(
     spec: &RuntimeArtifactSpec,
-    scratch_parent: File,
-    serialization: G,
-) -> anyhow::Result<(StagedRuntimeArtifact, G)>
-where
-    G: Send + 'static,
-{
-    let spec = spec.clone();
+    store_root: &Path,
+) -> anyhow::Result<SealedRuntimeArtifact> {
+    let app_rel = normalized_relative(&spec.app_rel, "application path")?;
+    let store_root = store_root.to_path_buf();
+    let staged = stage_runtime_artifact(spec, &store_root).await?;
+    let (package_descriptor, _package_path) =
+        package_staged_runtime_artifact(&staged, spec, &store_root).await?;
     tokio::task::spawn_blocking(move || {
-        let staged = stage_blocking_in(&spec, scratch_parent)?;
-        Ok::<_, anyhow::Error>((staged, serialization))
+        staged.publish_host(store_root, app_rel, package_descriptor)
     })
     .await
-    .context("runtime artifact staging task failed")?
+    .context("runtime artifact publication task failed")?
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -630,6 +1850,59 @@ fn open_directory_component(parent: &File, name: &OsStr) -> std::io::Result<File
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_existing_absolute_directory(path: &Path, label: &str) -> anyhow::Result<File> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "runtime artifact {label} must be absolute: {}",
+        path.display()
+    );
+    let mut current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .with_context(|| format!("open filesystem root for runtime artifact {label}"))?;
+    let mut components = 0_usize;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            anyhow::ensure!(
+                matches!(component, Component::RootDir),
+                "runtime artifact {label} is not normalized: {}",
+                path.display()
+            );
+            continue;
+        };
+        components += 1;
+        current = open_directory_component(&current, name).with_context(|| {
+            format!(
+                "open no-follow runtime artifact {label} component {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            source_state(&current)?.identity.is_directory(),
+            "runtime artifact {label} component is not a directory: {}",
+            path.display()
+        );
+    }
+    anyhow::ensure!(
+        components > 0,
+        "runtime artifact {label} cannot be the filesystem root"
+    );
+    let metadata = current.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "runtime artifact {label} is not owned by the current process user: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "runtime artifact {label} is group/world writable: {}",
+        path.display()
+    );
+    Ok(current)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_or_create_scratch_root(path: &Path) -> anyhow::Result<File> {
     anyhow::ensure!(
         path.is_absolute(),
@@ -733,13 +2006,26 @@ fn stage_blocking_in(
     spec: &RuntimeArtifactSpec,
     scratch_parent: File,
 ) -> anyhow::Result<StagedRuntimeArtifact> {
+    let checkout = open_checkout_root(&spec.checkout_root)?;
+    stage_blocking_from_checkout(spec, checkout, scratch_parent)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stage_blocking_from_checkout(
+    spec: &RuntimeArtifactSpec,
+    checkout: File,
+    scratch_parent: File,
+) -> anyhow::Result<StagedRuntimeArtifact> {
     anyhow::ensure!(
         source_state(&scratch_parent)?.identity.is_directory(),
         "runtime artifact scratch descriptor is not a directory"
     );
+    anyhow::ensure!(
+        source_state(&checkout)?.identity.is_directory(),
+        "runtime artifact checkout descriptor is not a directory"
+    );
     let app_rel = normalized_relative(&spec.app_rel, "application path")?;
     let roots = selected_roots(spec, &app_rel)?;
-    let checkout = open_checkout_root(&spec.checkout_root)?;
 
     let mut totals = Totals::default();
     let mut approved = Vec::with_capacity(roots.len());
@@ -819,14 +2105,17 @@ fn stage_blocking_in(
         );
     }
     let digest = context.content.clone().finalize();
+    let logical_bytes = context.totals.logical_bytes;
     let materialized_bytes = context.totals.materialized_bytes;
+    let entries = context.totals.materialized_entries.saturating_add(1);
     drop(context);
     staged.content_sha256 = hex_digest(&digest);
+    staged.logical_bytes = logical_bytes;
     staged.materialized_bytes = materialized_bytes;
+    staged.entries = entries;
     Ok(staged)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn selected_roots(spec: &RuntimeArtifactSpec, app_rel: &Path) -> anyhow::Result<Vec<PathBuf>> {
     anyhow::ensure!(
         spec.include_rel.len() < MAX_ENTRIES as usize,
@@ -1777,7 +3066,9 @@ fn create_stage_in(parent: &File) -> anyhow::Result<StagedRuntimeArtifact> {
         return Ok(StagedRuntimeArtifact {
             root_name: name,
             content_sha256: String::new(),
+            logical_bytes: 0,
             materialized_bytes: 0,
+            entries: 0,
             root_parent,
             root_descriptor,
             _active: active,
@@ -1894,6 +3185,292 @@ fn create_destination_file(
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn freeze_directory_descriptor(directory: &File, logical: &Path) -> anyhow::Result<()> {
+    let state = source_state(directory)?;
+    directory.set_permissions(std::fs::Permissions::from_mode(state.mode & !0o222))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("sync host artifact directory {}", logical.display()))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn freeze_tree(
+    directory: &File,
+    logical: &Path,
+    depth: usize,
+    freeze_current: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_DEPTH,
+        "host runtime artifact exceeds {MAX_DEPTH} directory levels"
+    );
+    for child in read_cleanup_children(directory)? {
+        let child_logical = logical.join(&child.name);
+        if child.state.identity.is_directory() {
+            let child_directory =
+                open_destination_directory(directory, &child.name).with_context(|| {
+                    format!("open host artifact directory {}", child_logical.display())
+                })?;
+            ensure_same_state(child.state, source_state(&child_directory)?, &child_logical)?;
+            freeze_tree(&child_directory, &child_logical, depth + 1, true)?;
+            continue;
+        }
+        anyhow::ensure!(
+            child.state.identity.is_regular(),
+            "host runtime artifact contains a special entry: {}",
+            child_logical.display()
+        );
+        let file = open_staged_regular(directory, Path::new(&child.name))
+            .with_context(|| format!("open host artifact file {}", child_logical.display()))?;
+        ensure_same_state(child.state, source_state(&file)?, &child_logical)?;
+        file.set_permissions(std::fs::Permissions::from_mode(child.state.mode & !0o222))?;
+        file.sync_all()
+            .with_context(|| format!("sync host artifact file {}", child_logical.display()))?;
+    }
+    if freeze_current {
+        freeze_directory_descriptor(directory, logical)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn compare_regular_files(
+    expected_parent: &File,
+    actual_parent: &File,
+    name: &OsStr,
+    expected_state: SourceState,
+    actual_state: SourceState,
+    logical: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected_state.identity.is_regular()
+            && actual_state.identity.is_regular()
+            && expected_state.identity.length == actual_state.identity.length
+            && expected_state.mode & 0o777 == actual_state.mode & 0o777,
+        "content-addressed runtime artifact collision has a different file shape: {}",
+        logical.display()
+    );
+    let mut expected = open_staged_regular(expected_parent, Path::new(name))?;
+    let mut actual = open_staged_regular(actual_parent, Path::new(name))?;
+    ensure_same_state(expected_state, source_state(&expected)?, logical)?;
+    ensure_same_state(actual_state, source_state(&actual)?, logical)?;
+    let mut remaining = expected_state.identity.length;
+    let mut expected_buffer = [0_u8; 64 * 1024];
+    let mut actual_buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(expected_buffer.len() as u64) as usize;
+        expected.read_exact(&mut expected_buffer[..take])?;
+        actual.read_exact(&mut actual_buffer[..take])?;
+        anyhow::ensure!(
+            expected_buffer[..take] == actual_buffer[..take],
+            "content-addressed runtime artifact collision has different bytes: {}",
+            logical.display()
+        );
+        remaining -= take as u64;
+    }
+    let mut expected_extra = [0_u8; 1];
+    let mut actual_extra = [0_u8; 1];
+    anyhow::ensure!(
+        expected.read(&mut expected_extra)? == 0 && actual.read(&mut actual_extra)? == 0,
+        "content-addressed runtime artifact collision changed while comparing: {}",
+        logical.display()
+    );
+    ensure_same_state(expected_state, source_state(&expected)?, logical)?;
+    ensure_same_state(actual_state, source_state(&actual)?, logical)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn compare_runtime_artifact_tree_at(
+    expected: &File,
+    actual: &File,
+    logical: &Path,
+    depth: usize,
+    entries: &mut u64,
+    bytes: &mut u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_DEPTH,
+        "content-addressed runtime artifact collision exceeds depth {MAX_DEPTH}"
+    );
+    let expected_children = read_cleanup_children(expected)?;
+    let actual_children = read_cleanup_children(actual)?;
+    anyhow::ensure!(
+        expected_children.len() == actual_children.len(),
+        "content-addressed runtime artifact collision has a different directory inventory: {}",
+        logical.display()
+    );
+    for (expected_child, actual_child) in expected_children.iter().zip(&actual_children) {
+        anyhow::ensure!(
+            expected_child.name == actual_child.name,
+            "content-addressed runtime artifact collision has a different lexical inventory: {}",
+            logical.display()
+        );
+        *entries = entries.saturating_add(1);
+        anyhow::ensure!(
+            *entries <= MAX_ENTRIES + 2,
+            "content-addressed runtime artifact collision comparison exceeds its entry bound"
+        );
+        let child_logical = logical.join(&expected_child.name);
+        if expected_child.state.identity.is_directory()
+            && actual_child.state.identity.is_directory()
+        {
+            anyhow::ensure!(
+                expected_child.state.mode & 0o777 == actual_child.state.mode & 0o777,
+                "content-addressed runtime artifact collision has a different directory mode: {}",
+                child_logical.display()
+            );
+            let expected_directory = open_destination_directory(expected, &expected_child.name)?;
+            let actual_directory = open_destination_directory(actual, &actual_child.name)?;
+            ensure_same_state(
+                expected_child.state,
+                source_state(&expected_directory)?,
+                &child_logical,
+            )?;
+            ensure_same_state(
+                actual_child.state,
+                source_state(&actual_directory)?,
+                &child_logical,
+            )?;
+            compare_runtime_artifact_tree_at(
+                &expected_directory,
+                &actual_directory,
+                &child_logical,
+                depth + 1,
+                entries,
+                bytes,
+            )?;
+            continue;
+        }
+        anyhow::ensure!(
+            expected_child.state.identity.is_regular() && actual_child.state.identity.is_regular(),
+            "content-addressed runtime artifact collision contains a link or special entry: {}",
+            child_logical.display()
+        );
+        *bytes = bytes.saturating_add(expected_child.state.identity.length);
+        anyhow::ensure!(
+            *bytes <= MAX_MATERIALIZED_BYTES + 64,
+            "content-addressed runtime artifact collision comparison exceeds its byte bound"
+        );
+        compare_regular_files(
+            expected,
+            actual,
+            &expected_child.name,
+            expected_child.state,
+            actual_child.state,
+            &child_logical,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn compare_runtime_artifact_trees(expected: &File, actual: &File) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source_state(expected)?.identity.is_directory()
+            && source_state(actual)?.identity.is_directory(),
+        "content-addressed runtime artifact collision is not two directories"
+    );
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
+    compare_runtime_artifact_tree_at(expected, actual, Path::new(""), 0, &mut entries, &mut bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_host_content_marker(root: &File, expected: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.len() == 64
+            && expected
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "host runtime artifact has an invalid semantic digest"
+    );
+    let mut marker = open_staged_regular(root, Path::new(HOST_CONTENT_MARKER))
+        .context("open host runtime artifact content marker")?;
+    let state = source_state(&marker)?;
+    anyhow::ensure!(
+        state.identity.is_regular() && state.identity.length == 64,
+        "host runtime artifact content marker has an invalid shape"
+    );
+    let mut bytes = [0_u8; 64];
+    marker
+        .read_exact(&mut bytes)
+        .context("read host runtime artifact content marker")?;
+    let mut extra = [0_u8; 1];
+    anyhow::ensure!(
+        marker.read(&mut extra)? == 0 && bytes == expected.as_bytes(),
+        "host runtime artifact content marker does not match its address"
+    );
+    ensure_same_state(
+        state,
+        source_state(&marker)?,
+        Path::new(HOST_CONTENT_MARKER),
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_stage_noreplace(
+    parent: &File,
+    source: &OsStr,
+    destination: &OsStr,
+    _store_root: &Path,
+) -> anyhow::Result<bool> {
+    let source = cstring_component(source)?;
+    let destination = cstring_component(destination)?;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            1_u32,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(false);
+    }
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        bail!("Linux renameat2 is unavailable; host artifact publication refuses an overwrite-capable fallback");
+    }
+    Err(error).context("atomically publish host runtime artifact")
+}
+
+#[cfg(target_os = "macos")]
+fn publish_stage_noreplace(
+    parent: &File,
+    source: &OsStr,
+    destination: &OsStr,
+    _store_root: &Path,
+) -> anyhow::Result<bool> {
+    let source = cstring_component(source)?;
+    let destination = cstring_component(destination)?;
+    let rc = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(false);
+    }
+    Err(error).context("atomically publish host runtime artifact")
 }
 
 #[cfg(target_os = "linux")]
@@ -2178,6 +3755,10 @@ fn remove_directory_contents(
         depth <= MAX_DEPTH,
         "runtime artifact cleanup refuses a stage deeper than {MAX_DEPTH} components"
     );
+    let directory_state = source_state(directory)?;
+    directory.set_permissions(std::fs::Permissions::from_mode(
+        (directory_state.mode & 0o777) | 0o700,
+    ))?;
     let children = read_cleanup_children(directory)?;
     for child in children {
         anyhow::ensure!(

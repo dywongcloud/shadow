@@ -41,7 +41,31 @@ pub struct CachedResponse {
     fresh_until_ms: u64,
     /// Past this, the entry is unusable even as stale (max-age + SWR).
     usable_until_ms: u64,
+    /// Set by `note_revalidation_failed` on a FAILED revalidation (any status
+    /// outside 200/301/302/307/308/404/410, or a network error/timeout) —
+    /// mirrors Vercel's documented ISR contract: on failure the stale entry
+    /// is preserved untouched and retried no sooner than this. 0 = no
+    /// pending backoff.
+    retry_not_before_ms: u64,
 }
+
+impl CachedResponse {
+    /// True while a prior revalidation attempt failed and the 30s backoff
+    /// (Vercel's documented ISR failed-revalidation retry window) hasn't
+    /// elapsed yet — the caller should skip firing another background
+    /// refresh for this entry.
+    pub fn revalidation_backoff_active(&self) -> bool {
+        now_ms() < self.retry_not_before_ms
+    }
+}
+
+/// Status codes Vercel's ISR treats as a SUCCESSFUL revalidation outcome
+/// (<https://vercel.com/docs/incremental-static-regeneration>): the cache is
+/// updated to match. Every other status, plus any network error/timeout
+/// reaching the origin, is a FAILED revalidation — the existing stale entry
+/// is preserved and retried no sooner than `REVALIDATION_FAILURE_BACKOFF_MS`.
+const REVALIDATION_SUCCESS_STATUSES: [u16; 7] = [200, 301, 302, 307, 308, 404, 410];
+const REVALIDATION_FAILURE_BACKOFF_MS: u64 = 30_000;
 
 /// Result of a cache lookup.
 pub enum Lookup {
@@ -102,8 +126,15 @@ impl CdnCache {
         // Accounting handled via store(); this is a hook for symmetry/tests.
     }
 
-    /// Cache a 200 GET response if its (precedence-resolved) directives allow.
-    /// Returns true if stored.
+    /// Cache a GET response if its status is one of Vercel's documented
+    /// ISR revalidation-success codes (200/301/302/307/308/404/410) and its
+    /// (precedence-resolved) directives allow. Any other status is a FAILED
+    /// revalidation: an existing entry for `key` is left completely
+    /// untouched (body/headers/TTL) and only gated behind
+    /// `REVALIDATION_FAILURE_BACKOFF_MS` before the next retry — see
+    /// `note_revalidation_failed`, which callers on a hard network
+    /// error/timeout (no status at all) should call directly instead of this
+    /// method. Returns true if stored.
     pub fn maybe_store(
         &self,
         key: &str,
@@ -111,8 +142,50 @@ impl CdnCache {
         headers: &[(String, String)],
         body: &[u8],
     ) -> bool {
-        if status != 200 {
+        if !REVALIDATION_SUCCESS_STATUSES.contains(&status) {
+            self.note_revalidation_failed(key);
             return false;
+        }
+        // Integrity gates: a captured body that is provably not the response
+        // the origin declared must NEVER enter the cache — an origin instance
+        // dying mid-stream once otherwise poisons an immutable entry that
+        // every later client replays. Witnessed live (nodes-wtf 2026-08-26):
+        // a 59-byte truncated prefix of a 6142-byte gzip chunk was cached as
+        // a complete `Content-Encoding: gzip` 200 and served to every browser
+        // as ERR_CONTENT_DECODING_FAILED until the next process restart.
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        if let Some(declared) = header("content-length").and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            if declared != body.len() as u64 {
+                // A truncated/corrupt body is treated the same as a failed
+                // revalidation, not a "legitimately uncacheable" decision —
+                // back off before the next attempt against a possibly still-
+                // misbehaving origin, same as a bad status code would.
+                self.note_revalidation_failed(key);
+                return false;
+            }
+        }
+        if header("content-encoding").is_some_and(|v| v.eq_ignore_ascii_case("gzip")) {
+            // Full decode, bounded by the body we already hold in memory: the
+            // only proof a gzip stream is complete is decoding it to its end.
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(body);
+            let mut sink = [0_u8; 16 * 1024];
+            loop {
+                match decoder.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => {
+                        self.note_revalidation_failed(key);
+                        return false;
+                    }
+                }
+            }
         }
         let Some((ttl, swr)) = cache_policy(headers) else {
             return false;
@@ -134,10 +207,26 @@ impl CdnCache {
                 body: body.to_vec(),
                 fresh_until_ms: now + ttl * 1000,
                 usable_until_ms: now + (ttl + swr) * 1000,
+                retry_not_before_ms: 0,
             },
         );
         self.stores.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// Record a FAILED revalidation for an existing entry (per Vercel's
+    /// documented ISR contract: any status outside the 7-code success
+    /// allowlist, a network error/timeout reaching the origin, or a
+    /// corrupt/truncated body). The entry's existing body/headers/TTL are
+    /// left completely untouched — only the retry backoff advances. A no-op
+    /// if there is no existing entry for `key` (nothing to preserve, and a
+    /// cold MISS should just be retried on the next request, not backed
+    /// off).
+    pub fn note_revalidation_failed(&self, key: &str) {
+        let mut map = self.map.lock();
+        if let Some(entry) = map.get_mut(key) {
+            entry.retry_not_before_ms = now_ms() + REVALIDATION_FAILURE_BACKOFF_MS;
+        }
     }
 
     pub fn purge(&self) {

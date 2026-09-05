@@ -47,10 +47,41 @@ use crate::guardian::SqlDb;
 /// failure here just means the fleet fallback is unavailable until the next
 /// successful call, never a boot failure.
 pub(crate) async fn init_schema() {
-    let Ok(db) = crate::guardian::sql_db().await else {
-        tracing::debug!("relational: GuardianDB not ready yet; schema bring-up deferred");
-        return;
+    // GuardianDB's own bring-up routinely outlasts the boot moment this is
+    // spawned at (minutes on a large store), and this is the ONLY path that
+    // creates the catalog and its tables: a single deferred attempt left a
+    // node with no schema for its whole process life. Retry until the handle
+    // opens, bounded like the index walk it then waits for.
+    let deadline = std::time::Instant::now() + index_build_timeout();
+    let db = loop {
+        match crate::guardian::sql_db().await {
+            Ok(db) => break db,
+            Err(e) if std::time::Instant::now() < deadline => {
+                tracing::debug!(error = %e, "relational: GuardianDB not ready yet; schema bring-up retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "relational: schema bring-up SKIPPED -- GuardianDB never opened within its bound");
+                return;
+            }
+        }
     };
+    // The catalog is one whole-document read-modify-write. Against an unbuilt
+    // (empty) index every CREATE TABLE below would "succeed" into a fresh
+    // catalog and persist it over the real one, so DDL waits for the first
+    // full walk (bounded like the walk itself) and is skipped, loudly, if
+    // that never comes.
+    spawn_index_refresher(db.clone());
+    let bound = index_build_timeout();
+    if !wait_index_ready(bound).await {
+        tracing::error!(
+            bound_secs = bound.as_secs(),
+            "relational: schema bring-up SKIPPED -- the index never built within its bound, \
+             and CREATE TABLE against an unbuilt catalog would overwrite the real catalog"
+        );
+        return;
+    }
+    let index_keys = db.storage().index_len();
     let mut session = Session::new(db, "hive-init");
     for (table, ddl) in [
         (
@@ -264,7 +295,28 @@ pub(crate) async fn init_schema() {
     reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
+    reconcile_billing_invoices_schema(&mut session).await;
+    // Success used to be silent, so a node whose bring-up never ran was
+    // indistinguishable in the journal from one whose bring-up succeeded.
+    let failed = SCHEMA_BRINGUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failed == 0 {
+        tracing::info!(
+            keys = index_keys,
+            "relational: schema bring-up complete (every table verified present in the catalog)"
+        );
+    } else {
+        tracing::error!(
+            keys = index_keys,
+            failed,
+            "relational: schema bring-up finished with tables that could not be verified"
+        );
+    }
 }
+
+/// Tables `ensure_table_exists` gave up on this process (for the bring-up
+/// summary; never reset — a later successful retry logs its own line).
+static SCHEMA_BRINGUP_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Attempts to bring up a single table before giving up and logging loudly —
 /// see `ensure_table_exists`'s doc comment for why a `CREATE TABLE IF NOT
@@ -310,16 +362,52 @@ async fn ensure_table_exists(
     table: &str,
     ddl: &str,
 ) {
+    // Never CREATE against an unbuilt catalog (see `session`'s doc): the
+    // "missing" table is an artifact of the empty index, and persisting a
+    // fresh catalog here would erase the real one.
+    if !index_ready() {
+        warn_index_not_ready(table);
+        return;
+    }
     for attempt in 1..=SCHEMA_BRINGUP_MAX_ATTEMPTS {
         if let Err(e) = exec(s, ddl).await {
             tracing::warn!(table, attempt, error = %e, "relational: schema bring-up CREATE TABLE statement failed");
         }
         // Verify against a freshly reloaded catalog view (every autocommit
-        // statement reloads the catalog — see this fn's doc comment): a
-        // trivial SELECT only succeeds if the table is genuinely present,
-        // unlike trusting the CREATE TABLE call's own `Ok` result.
-        match exec(s, &format!("SELECT 1 FROM {table} LIMIT 1")).await {
-            Ok(_) => return,
+        // statement reloads the catalog — see this fn's doc comment). The
+        // check reads the CATALOG, never the table's rows: `SELECT 1 FROM t`
+        // scans every row, and on a cold index each row is a peer fetch, so
+        // that form timed out at 10 s for `teams` and `billing_ledger` and
+        // reported genuinely-created tables as missing (2026-09-02).
+        let verify = format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = '{table}'"
+        );
+        let present = exec(s, &verify).await.map(|results| {
+            results
+                .iter()
+                .any(|r| matches!(r, ExecResult::Rows { rows, .. } if !rows.is_empty()))
+        });
+        match present {
+            Ok(true) => return,
+            Ok(false) if attempt == SCHEMA_BRINGUP_MAX_ATTEMPTS => {
+                tracing::error!(
+                    table,
+                    attempts = SCHEMA_BRINGUP_MAX_ATTEMPTS,
+                    "relational: schema bring-up could not verify this table exists after \
+                     repeated CREATE TABLE + retry (absent from information_schema.tables)"
+                );
+                SCHEMA_BRINGUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    table,
+                    attempt,
+                    "relational: table absent from the catalog right after CREATE TABLE IF NOT \
+                     EXISTS reported success (a concurrent session's catalog read-modify-write \
+                     race — see ensure_table_exists's doc comment); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(150 * attempt as u64)).await;
+            }
             Err(e) if attempt == SCHEMA_BRINGUP_MAX_ATTEMPTS => {
                 tracing::error!(
                     table,
@@ -329,6 +417,7 @@ async fn ensure_table_exists(
                      repeated CREATE TABLE + retry — writes against it (e.g. upsert_billing's \
                      single atomic transaction) will keep silently failing until this is fixed"
                 );
+                SCHEMA_BRINGUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!(
@@ -507,32 +596,191 @@ fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
     out
 }
 
-/// A `Session` over a freshly re-synced local index. CRITICAL: guardian-db's
-/// own `GuardianRelationalStorage::refresh` doc comment states plainly that
-/// "the relational engine reads the DocumentStore's synchronous local index;
-/// that index updates on local writes and on `load`/`sync`, but NOT
-/// automatically when documents arrive from peers in the background" — so
-/// without this call, a node whose `Database` handle was opened before a
-/// remote peer's write replicated in would serve a permanently-stale read
-/// (live-witnessed: fc-virginia's `/v1/gitops/projects` stayed empty for
-/// drugs-wtf even after every other node's backfill had long since written
-/// it, while fc-hongkong/fc-lax happened to read correctly). Cheap: this
-/// re-scans the LOCAL already-replicated doc index, not a network round-trip
-/// (the actual iroh-docs replication runs continuously in the background
-/// regardless of this call).
-async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStorage> {
-    match tokio::time::timeout(SQL_OP_TIMEOUT, db.storage().refresh()).await {
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, "relational: index refresh failed (serving from the previous local index)")
+/// The relational index is READY only once one full walk of the `hive`
+/// namespace has COMPLETED in this process. Before that the guardian document
+/// index is empty — not "stale", EMPTY: the SQL catalog document
+/// (`__gdb_sql_catalog/catalog`, a single JSON value) is not in it, every
+/// `Session` loads `Catalog::new()` and every table reads as
+/// `relation "X" does not exist`, `pg_catalog.pg_class` counts 0, and a
+/// `CREATE TABLE IF NOT EXISTS` would persist a fresh catalog OVER the real
+/// one. That was the live state of every node in the fleet on 2026-09-02:
+/// the walk (`GuardianRelationalStorage::refresh` → `get_many` over the whole
+/// namespace, 7.6–57 GB guardian stores) takes longer than `SQL_OP_TIMEOUT`,
+/// and `session()` used to run it — bounded and cancelled — before EVERY
+/// operation, so no walk ever finished, every admin query took exactly 10 s
+/// and answered "does not exist", and zero mirror writes had succeeded since
+/// boot on any node.
+///
+/// Now the walk runs in ONE background task (`spawn_index_refresher`) with a
+/// bound sized to the store, not to a request; completing it once flips
+/// `INDEX_READY`, after which the document store's live sync (remote inserts
+/// via Willow) and local puts keep the index current and the same task
+/// re-walks on a timer as the belt-and-braces resync. Sessions never walk:
+/// they wait briefly for readiness and otherwise proceed, and every path
+/// that would WRITE the catalog (`init_schema`, `ensure_table_exists`,
+/// `backfill_billing_normalize`) refuses until the index is real.
+static INDEX_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INDEX_REFRESHER_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Wall-clock ms of the last COMPLETED walk (0 = never).
+static INDEX_LAST_OK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INDEX_NOT_READY_WARNED_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INDEX_READY_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+fn index_ready_notify() -> &'static tokio::sync::Notify {
+    INDEX_READY_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// `true` once one full index walk has completed in this process.
+pub(crate) fn index_ready() -> bool {
+    INDEX_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn env_secs(name: &str, default: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default),
+    )
+}
+
+/// Bound on ONE full walk. Sized to the store (a multi-GB guardian namespace
+/// walked once), never to a request: the walk is off every request path.
+fn index_build_timeout() -> std::time::Duration {
+    env_secs("HIVE_RELATIONAL_INDEX_BUILD_SECS", 900)
+}
+
+/// Cadence of the background re-walk once the index is ready. Bounds the
+/// staleness of a REMOTE write the live sync somehow missed; local writes and
+/// live-synced remote inserts land in the index immediately regardless.
+fn index_refresh_interval() -> std::time::Duration {
+    env_secs("HIVE_RELATIONAL_REFRESH_SECS", 120)
+}
+
+/// Rate-limited (30 s) WARN for a caller that found the index unbuilt.
+fn warn_index_not_ready(what: &str) {
+    use std::sync::atomic::Ordering;
+    let now = wall_ms();
+    let last = INDEX_NOT_READY_WARNED_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30_000
+        && INDEX_NOT_READY_WARNED_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            what,
+            "relational: index not built yet -- this session sees an EMPTY catalog (every \
+             table reads as missing) until the first full walk completes; see \
+             spawn_index_refresher"
+        );
+    }
+}
+
+/// Wait up to `bound` for the first walk to complete; `true` if it did.
+async fn wait_index_ready(bound: std::time::Duration) -> bool {
+    if index_ready() {
+        return true;
+    }
+    let _ = tokio::time::timeout(bound, index_ready_notify().notified()).await;
+    index_ready()
+}
+
+/// The one background walker for this process. Idempotent: the first caller
+/// starts it, later calls return at once.
+fn spawn_index_refresher(db: SqlDb) {
+    use std::sync::atomic::Ordering;
+    if INDEX_REFRESHER_SPAWNED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let bound = index_build_timeout();
+        let interval = index_refresh_interval();
+        let mut failures: u32 = 0;
+        loop {
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(bound, db.storage().refresh()).await {
+                Ok(Ok(())) => {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let keys = db.storage().index_len();
+                    INDEX_LAST_OK_MS.store(wall_ms(), Ordering::Release);
+                    failures = 0;
+                    if !INDEX_READY.swap(true, Ordering::AcqRel) {
+                        tracing::info!(
+                            elapsed_ms,
+                            keys,
+                            "relational: index built -- sessions now read the real catalog"
+                        );
+                        index_ready_notify().notify_waiters();
+                        // Warm every row value once, AFTER readiness (nothing
+                        // waits on it): a cold row is a peer fetch on first
+                        // read, so a whole-table scan before this finishes can
+                        // still time out -- and succeed on the next attempt.
+                        let warm_started = std::time::Instant::now();
+                        match db.storage().warm_values().await {
+                            Ok(documents) => tracing::info!(
+                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                documents,
+                                "relational: row values warmed -- cold scans no longer pay a per-row fetch"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                "relational: row value warm-up failed; rows materialize lazily on read instead"
+                            ),
+                        }
+                    } else {
+                        tracing::debug!(elapsed_ms, keys, "relational: index re-walked");
+                    }
+                }
+                Ok(Err(e)) => {
+                    failures += 1;
+                    tracing::warn!(
+                        error = %e,
+                        failures,
+                        ready = index_ready(),
+                        "relational: index walk failed; the previous index stays in service"
+                    );
+                }
+                Err(_) => {
+                    failures += 1;
+                    tracing::warn!(
+                        bound_secs = bound.as_secs(),
+                        failures,
+                        ready = index_ready(),
+                        "relational: index walk exceeded its bound (HIVE_RELATIONAL_INDEX_BUILD_SECS); \
+                         the previous index -- or, before the first build, NONE -- stays in service"
+                    );
+                }
+            }
+            let nap = if index_ready() {
+                interval
+            } else {
+                std::time::Duration::from_secs(5)
+            };
+            tokio::time::sleep(nap).await;
         }
-        Err(_) => tracing::warn!(
-            timeout_secs = SQL_OP_TIMEOUT.as_secs(),
-            "relational: index refresh timed out (serving from the previous local index) -- \
-             a fresh node's first refresh on a corrupted/interrupted namespace can hang \
-             indefinitely with no error at all; see run_readonly_query's own timeout for the \
-             matching guard on the query side"
-        ),
-        Ok(Ok(())) => {}
+    });
+}
+
+/// A `Session` over the local index. Starts the background walker if nothing
+/// has yet, waits up to `SQL_OP_TIMEOUT` for the FIRST walk to complete, and
+/// then proceeds either way: a not-yet-ready session reads an empty catalog
+/// (logged, rate-limited) and the catalog-writing callers gate on
+/// `index_ready()` themselves. Never walks the namespace on a request path.
+async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStorage> {
+    spawn_index_refresher(db.clone());
+    if !wait_index_ready(SQL_OP_TIMEOUT).await {
+        warn_index_not_ready("session");
     }
     Session::new(db, "hive")
 }
@@ -692,14 +940,19 @@ pub(crate) async fn team_for_project(project: &str) -> Result<Option<String>, St
     let db = crate::guardian::sql_db()
         .await
         .map_err(|e| format!("guardian relational database unavailable: {e}"))?;
-    match tokio::time::timeout(SQL_OP_TIMEOUT, db.storage().refresh()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(format!("relational index refresh failed: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "relational index refresh timed out after {SQL_OP_TIMEOUT:?}"
-            ))
-        }
+    // Freshness = a completed walk within two refresh intervals. The walk
+    // itself never runs here (see `spawn_index_refresher`); a caller that
+    // cannot get a fresh answer falls back to its lower-authority source.
+    spawn_index_refresher(db.clone());
+    if !wait_index_ready(SQL_OP_TIMEOUT).await {
+        return Err("relational index not built yet".to_string());
+    }
+    let age_ms = wall_ms().saturating_sub(INDEX_LAST_OK_MS.load(std::sync::atomic::Ordering::Acquire));
+    let max_age_ms = index_refresh_interval().as_millis() as u64 * 2;
+    if age_ms > max_age_ms {
+        return Err(format!(
+            "relational index is stale: last completed walk {age_ms} ms ago (limit {max_age_ms} ms)"
+        ));
     }
     let mut s = Session::new(db, "hive");
     reconcile_project_teams_schema(&mut s).await;
@@ -812,8 +1065,9 @@ pub(crate) type BillingRows<'a> = (
 /// refresh and ONE schema reconciliation for the whole batch.
 ///
 /// This exists because both billing loops used to call `upsert_billing` once
-/// per tenant inside a `for`, and `session()` (see its doc) runs
-/// `storage().refresh()`, which re-reads the ENTIRE local relational index —
+/// per tenant inside a `for`, and `session()` at the time ran
+/// `storage().refresh()` (today the walk lives in `spawn_index_refresher`,
+/// off every request path), which re-reads the ENTIRE local relational index —
 /// every row of `billing_ledger` (one row per ledger entry, unbounded and
 /// append-only), `billing_invoices`, `billing_invoice_lines`, `teams`,
 /// `deployments`, and the rest — sequentially, one blob read per row. Doing
@@ -840,6 +1094,7 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
     let mut s = session(db).await;
     reconcile_billing_accounts_schema(&mut s).await;
     reconcile_billing_checkouts_schema(&mut s).await;
+    reconcile_billing_invoices_schema(&mut s).await;
 
     for (account, ledger, invoices, checkouts) in batch {
         let mut sql = String::from("BEGIN;");
@@ -916,6 +1171,69 @@ fn build_ledger_sql(ledger: &[crate::billing::LedgerEntry]) -> String {
     sql
 }
 
+/// Row count of `billing_ledger` for `tenant` in `[period_start_ms,
+/// period_end_ms)` — the durability-gate read: pruning must never proceed
+/// until the relational mirror has actually caught up to a checkpoint's
+/// `entry_count`.
+pub(crate) async fn count_billing_ledger_rows(
+    tenant: &str,
+    period_start_ms: u64,
+    period_end_ms: u64,
+) -> Result<u64, String> {
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("guardian sql unavailable: {e}"))?;
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT COUNT(*) FROM billing_ledger WHERE tenant = {} AND ts_ms >= {} AND ts_ms < {}",
+        q(tenant),
+        period_start_ms,
+        period_end_ms,
+    );
+    let res = exec(&mut s, &query).await?;
+    for r in &res {
+        if let ExecResult::Rows { rows, .. } = r {
+            if let Some(row) = rows.first() {
+                let n = match row.first() {
+                    Some(SqlValue::Int8(n)) => *n as u64,
+                    Some(SqlValue::Int4(n)) => *n as u64,
+                    _ => 0,
+                };
+                return Ok(n);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// DELETE every `billing_ledger` row for `tenant` in `[period_start_ms,
+/// period_end_ms)` — called ONLY after the corresponding `LedgerCheckpoint`
+/// is durable (see `main.rs`'s billing-meter-loop prune step). Runs as its
+/// OWN single-statement autocommit DELETE, deliberately NOT folded into
+/// `upsert_billing_many`'s `BEGIN;...COMMIT;` write transaction: that
+/// transaction's own INSERT half has nothing left in `ledger` for this range
+/// by the time pruning runs, so mixing in a DELETE would let a prune failure
+/// roll back an unrelated account/invoice write. Idempotent: a DELETE on an
+/// already-empty range is a no-op, so a retried call after a crash is safe.
+pub(crate) async fn prune_billing_ledger(
+    tenant: &str,
+    period_start_ms: u64,
+    period_end_ms: u64,
+) -> Result<(), String> {
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("guardian sql unavailable: {e}"))?;
+    let mut s = session(db).await;
+    let sql = format!(
+        "DELETE FROM billing_ledger WHERE tenant = {} AND ts_ms >= {} AND ts_ms < {}",
+        q(tenant),
+        period_start_ms,
+        period_end_ms,
+    );
+    exec(&mut s, &sql).await?;
+    Ok(())
+}
+
 /// SQL for every FINALIZED invoice (+ its line items) — a draft
 /// (`status != "paid"`) is always skipped, never persisted as a row (see
 /// `upsert_billing`'s original doc comment on why: a draft is transient,
@@ -927,14 +1245,22 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
         if inv.status != "paid" {
             continue;
         }
+        let (commitment, entry_count, pruned) = match inv.ledger_checkpoint.as_ref() {
+            Some(cp) => (cp.commitment.clone(), cp.entry_count, cp.pruned),
+            None => (String::new(), 0u64, false),
+        };
         sql.push_str(&format!(
             "INSERT INTO billing_invoices (id, tenant, number, plan, period_start_ms, period_end_ms, \
-             subtotal_cents, total_cents, status, created_ms) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             subtotal_cents, total_cents, status, created_ms, \
+             ledger_commitment, ledger_entry_count, ledger_pruned) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, number = excluded.number, \
              plan = excluded.plan, period_start_ms = excluded.period_start_ms, \
              period_end_ms = excluded.period_end_ms, subtotal_cents = excluded.subtotal_cents, \
-             total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms;",
+             total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms, \
+             ledger_commitment = excluded.ledger_commitment, \
+             ledger_entry_count = excluded.ledger_entry_count, \
+             ledger_pruned = excluded.ledger_pruned;",
             q(&inv.id),
             q(&inv.tenant),
             q(&inv.number),
@@ -945,6 +1271,9 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
             inv.total_cents,
             q(&inv.status),
             inv.created_ms,
+            q(&commitment),
+            entry_count,
+            if pruned { 1 } else { 0 },
         ));
         // Stable per-line id: parent invoice id + its zero-padded index in
         // `lines` (e.g. "in_abc123-000", "in_abc123-001") — deterministic
@@ -1174,6 +1503,43 @@ async fn reconcile_billing_checkouts_schema(
     }
 }
 
+/// `billing_invoices`' ledger-checkpoint columns (the ephemeral tamper-evident
+/// ledger work) — `billing_invoices` already exists on every real node, so
+/// (as with `billing_checkouts` above) these need ALTER-based reconciliation
+/// rather than a `CREATE TABLE IF NOT EXISTS` edit, which is a no-op there.
+const BILLING_INVOICES_NEW_COLUMNS: &[(&str, &str, &str)] = &[
+    ("ledger_commitment", "TEXT", "''"),
+    ("ledger_entry_count", "BIGINT", "0"),
+    ("ledger_pruned", "BIGINT", "0"),
+];
+
+/// See `BILLING_ACCOUNTS_SCHEMA_RECONCILED` — same memoization discipline.
+static BILLING_INVOICES_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See `reconcile_billing_checkouts_schema` — identical shape, called from
+/// the same sites (`init_schema()`, unconditionally from `upsert_billing_many`).
+async fn reconcile_billing_invoices_schema(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+) {
+    if BILLING_INVOICES_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut all_ok = true;
+    for (col, ty, default) in BILLING_INVOICES_NEW_COLUMNS {
+        let ddl = format!(
+            "ALTER TABLE billing_invoices ADD COLUMN IF NOT EXISTS {col} {ty} NOT NULL DEFAULT {default}"
+        );
+        if let Err(e) = exec(s, &ddl).await {
+            all_ok = false;
+            tracing::warn!(column = col, error = %e, "relational: ALTER TABLE billing_invoices add column failed");
+        }
+    }
+    if all_ok {
+        BILLING_INVOICES_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// One-time backfill entry point. Reads every existing row from the OLD
 /// JSON-blob tables (`billing_accounts.account_json`,
 /// `billing_ledger_snapshot.ledger_json`, `billing_invoices_snapshot.invoices_json`),
@@ -1218,6 +1584,12 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         .await
         .map_err(|e| format!("relational store unavailable: {e}"))?;
     let mut s = session(db).await;
+    if !index_ready() {
+        return Err(
+            "relational index not built yet; refusing to run DDL against an empty catalog"
+                .to_string(),
+        );
+    }
 
     if let Err(e) = exec(
         &mut s,
@@ -2492,6 +2864,13 @@ pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, S
         .await
         .map_err(|e| format!("relational store unavailable: {e}"))?;
     let mut s = session(db).await;
+    if !index_ready() {
+        return Err(
+            "relational index not built yet (the first full walk of the namespace has not \
+             completed in this process); every table would read as missing -- retry shortly"
+                .to_string(),
+        );
+    }
     let results = exec(&mut s, sql).await?;
     for r in &results {
         if let ExecResult::Rows { fields, rows } = r {
@@ -2593,7 +2972,8 @@ pub(crate) async fn billing_snapshot(
     let ledger = Some(serde_json::Value::Array(ledger_rows).to_string());
 
     let inv_q = format!(
-        "SELECT id, number, plan, period_start_ms, period_end_ms, subtotal_cents, total_cents, status, created_ms \
+        "SELECT id, number, plan, period_start_ms, period_end_ms, subtotal_cents, total_cents, status, created_ms, \
+         ledger_commitment, ledger_entry_count, ledger_pruned \
          FROM billing_invoices WHERE tenant = {} ORDER BY period_start_ms DESC",
         q(tenant)
     );

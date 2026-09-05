@@ -27,11 +27,12 @@
 use fluid_core::FunctionConfig;
 use hive_backend::{
     connect_endpoint, CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch,
-    RuntimeArtifactPaths, RuntimeArtifactSpec,
+    RuntimeArtifactPaths, SealedRuntimeArtifact,
 };
 use hive_core::{now_ms, CellId, ResourceSpec};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -71,6 +72,18 @@ fn instance_recyclable(
 ) -> bool {
     (max_requests > 0 && requests_served >= max_requests)
         || (max_age_ms > 0 && requests_served > 0 && age_ms >= max_age_ms)
+}
+
+/// Complete launch authority for one function pool. A deployment builds every
+/// member before [`Fluid::register_many`] takes the registry lock, so duplicate
+/// keys or malformed batches cannot leave a partially registered deployment.
+#[derive(Clone, Debug)]
+pub struct PoolSpec {
+    pub key: String,
+    pub cfg: FunctionConfig,
+    pub image: String,
+    pub workdir: String,
+    pub tenant: String,
 }
 
 /// Everything needed to (re)launch instances of one function.
@@ -185,6 +198,40 @@ struct FunctionPool {
 }
 
 impl FunctionPool {
+    fn from_spec(spec: PoolSpec) -> Self {
+        let recommended = recommended_safe_concurrency(&spec.cfg.runtime, spec.cfg.max_concurrency);
+        let safe_concurrency = (recommended < spec.cfg.max_concurrency).then_some(recommended);
+        Self {
+            cfg: spec.cfg,
+            tenant: norm_tenant(spec.tenant),
+            image: spec.image,
+            workdir: spec.workdir,
+            instances: Vec::new(),
+            provisioning: 0,
+            requests: 0,
+            served_ms_sum: 0,
+            instance_ms_retired: 0,
+            dead_reaped: 0,
+            browser_requests: 0,
+            browser_served_ms: 0,
+            warm_backoff_until_ms: 0,
+            warm_fail_streak: 0,
+            last_warm_ok_ms: 0,
+            crash_streak: 0,
+            circuit_probe_after_ms: 0,
+            last_node_fault: None,
+            safe_concurrency,
+            nack_concurrency: 0,
+            nack_quota: 0,
+            scale_out_total: 0,
+            coldstart_deduped: 0,
+            recycled: 0,
+            last_provision_ms: 0,
+            last_runtime_init_ms: 0,
+            last_cpu_pct: 0.0,
+        }
+    }
+
     fn live_count(&self) -> u32 {
         self.instances.iter().filter(|i| !i.draining).count() as u32 + self.provisioning
     }
@@ -294,8 +341,57 @@ impl Default for FluidConfig {
     }
 }
 
+const SHUTDOWN_RUNNING: u8 = 0;
+const SHUTDOWN_CLOSING: u8 = 1;
+const SHUTDOWN_COMPLETE: u8 = 2;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+type TerminationResult = Result<(), String>;
+
+struct PendingTermination {
+    handle: CellHandle,
+    /// Integrity-chain identity for this cell, when the caller had it —
+    /// `None` on paths that only hold a bare `CellHandle` (e.g. the final
+    /// shutdown-drain retry loop, which re-collects `terminating`'s own
+    /// handles after everything else has already unregistered). A `None`
+    /// here just means no `ExecutionEnded` entry is recorded for that one
+    /// termination, never a hard failure.
+    execution: Option<ExecutionEndContext>,
+    in_progress: bool,
+    waiters: Vec<tokio::sync::oneshot::Sender<TerminationResult>>,
+}
+
+/// What `ExecutionObserver::on_ended` needs, carried alongside a
+/// `CellHandle` from whichever call site actually knows it (the registry
+/// entry being removed) through to the one owned termination worker that
+/// calls `backend.terminate`.
+#[derive(Clone)]
+struct ExecutionEndContext {
+    deployment_id: String,
+    requests_served: u64,
+    /// "drained" | "crashed" | "killed" — the caller's own classification of
+    /// why this cell is being terminated, decided at the scheduling call
+    /// site (which knows WHY: a health-check nack, a normal scale-down, a
+    /// shutdown drain), never re-derived from the termination outcome
+    /// itself (a clean `backend.terminate()` doesn't distinguish those).
+    outcome: String,
+}
+
 pub struct Fluid {
     backend: Arc<dyn CellBackend>,
+    /// Records deployment-lifecycle facts (cell started/ended) into the
+    /// tamper-evidence chain (`hive_core::integrity`). Unset when the
+    /// caller doesn't want integrity tracking (e.g. a bare dev invocation).
+    /// Injected rather than called directly because `fluid-compute` must
+    /// never depend on `hive-cloud` (the crate DAG is one-directional:
+    /// `hive-cloud` depends on `fluid-compute`) — same "coordinator injects,
+    /// backend implements" shape `backend` above already uses. A
+    /// `OnceLock`, not a constructor parameter: `hive-cloud`'s boot order
+    /// constructs `Fluid` BEFORE `deployment_ledger` (the real observer's
+    /// backing store, itself inside `CloudState::new`, which takes `Fluid`
+    /// as an input) — late-binding via `set_execution_observer` breaks that
+    /// chicken-and-egg without reordering boot.
+    execution_observer: std::sync::OnceLock<Arc<dyn hive_core::ExecutionObserver>>,
     cfg: FluidConfig,
     registry: Mutex<HashMap<String, FunctionPool>>,
     /// Bounds how many cold starts run concurrently across ALL pools. A burst of
@@ -303,6 +399,19 @@ pub struct Fluid {
     /// traffic spike would otherwise spawn unbounded backend containers in
     /// parallel and saturate the host's process table / container lock pool.
     cold_start_sem: Arc<tokio::sync::Semaphore>,
+    cold_start_capacity: u32,
+    shutdown_state: AtomicU8,
+    shutdown_result: Mutex<Option<Result<usize, String>>>,
+    shutdown_notify: tokio::sync::Notify,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// A cell removed from the registry stays here until the one owned
+    /// termination worker has completed backend teardown. Cancellation can drop
+    /// an async caller at any await; this map remains the authoritative owner
+    /// that shutdown drains after joining that worker.
+    terminating: Mutex<HashMap<CellId, PendingTermination>>,
+    termination_notify: tokio::sync::Notify,
+    termination_closing: AtomicBool,
+    termination_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Max cold starts in flight at once across the whole node (ALL pools share this
@@ -361,14 +470,14 @@ pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
 }
 
 struct UnpublishedCell {
-    backend: Arc<dyn CellBackend>,
+    fluid: Arc<Fluid>,
     handle: Option<CellHandle>,
 }
 
 impl UnpublishedCell {
-    fn new(backend: Arc<dyn CellBackend>, handle: CellHandle) -> Self {
+    fn new(fluid: Arc<Fluid>, handle: CellHandle) -> Self {
         Self {
-            backend,
+            fluid,
             handle: Some(handle),
         }
     }
@@ -383,12 +492,7 @@ impl Drop for UnpublishedCell {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        let backend = self.backend.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = backend.terminate(&handle).await;
-            });
-        }
+        self.fluid.schedule_termination(handle);
     }
 }
 
@@ -561,22 +665,367 @@ fn norm_tenant(t: String) -> String {
 
 impl Fluid {
     pub fn start(backend: Arc<dyn CellBackend>, cfg: FluidConfig) -> Arc<Fluid> {
+        let cold_start_capacity = max_concurrent_cold_starts();
         let fluid = Arc::new(Fluid {
             backend,
+            execution_observer: std::sync::OnceLock::new(),
             cfg,
             registry: Mutex::new(HashMap::new()),
-            cold_start_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_cold_starts())),
+            cold_start_sem: Arc::new(tokio::sync::Semaphore::new(cold_start_capacity)),
+            cold_start_capacity: cold_start_capacity as u32,
+            shutdown_state: AtomicU8::new(SHUTDOWN_RUNNING),
+            shutdown_result: Mutex::new(None),
+            shutdown_notify: tokio::sync::Notify::new(),
+            background_tasks: Mutex::new(Vec::with_capacity(2)),
+            terminating: Mutex::new(HashMap::new()),
+            termination_notify: tokio::sync::Notify::new(),
+            termination_closing: AtomicBool::new(false),
+            termination_task: Mutex::new(None),
         });
         let f = fluid.clone();
-        tokio::spawn(async move { f.autoscaler_loop().await });
+        let autoscaler = tokio::spawn(async move { f.autoscaler_loop().await });
         let h = fluid.clone();
-        tokio::spawn(async move { h.health_loop().await });
+        let health = tokio::spawn(async move { h.health_loop().await });
+        fluid.background_tasks.lock().extend([autoscaler, health]);
+        let t = fluid.clone();
+        *fluid.termination_task.lock() = Some(tokio::spawn(async move {
+            t.termination_loop().await;
+        }));
         fluid
     }
 
-    /// Register (or replace) a function pool owned by `tenant` (empty =>
-    /// "personal"). Does not provision yet; the autoscaler will bring up
-    /// `min_instances`.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_RUNNING
+    }
+
+    /// Late-bind the integrity-chain observer once `hive-cloud`'s
+    /// `deployment_ledger` exists (see `execution_observer`'s doc for why
+    /// this can't be a constructor parameter). Idempotent: a second call is
+    /// a silent no-op rather than a panic, so a defensive double-call from
+    /// two boot paths can never crash the node over an ordering detail this
+    /// unimportant.
+    pub fn set_execution_observer(&self, observer: Arc<dyn hive_core::ExecutionObserver>) {
+        let _ = self.execution_observer.set(observer);
+    }
+
+    fn enqueue_termination(
+        &self,
+        handle: CellHandle,
+        execution: Option<ExecutionEndContext>,
+        wait: bool,
+    ) -> Option<tokio::sync::oneshot::Receiver<TerminationResult>> {
+        let id = handle.id.clone();
+        let (waiter, receiver) = if wait {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let mut pending = self.terminating.lock();
+        match pending.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if let Some(waiter) = waiter {
+                    entry.get_mut().waiters.push(waiter);
+                }
+                if entry.get().execution.is_none() {
+                    entry.get_mut().execution = execution;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PendingTermination {
+                    handle,
+                    execution,
+                    in_progress: false,
+                    waiters: waiter.into_iter().collect(),
+                });
+            }
+        }
+        drop(pending);
+        self.termination_notify.notify_one();
+        receiver
+    }
+
+    fn schedule_termination(&self, handle: CellHandle) {
+        self.enqueue_termination(handle, None, false);
+    }
+
+    async fn termination_loop(self: Arc<Self>) {
+        loop {
+            self.termination_notify.notified().await;
+            if self.termination_closing.load(Ordering::Acquire) {
+                return;
+            }
+            loop {
+                let next = {
+                    let mut pending = self.terminating.lock();
+                    let id = pending
+                        .iter()
+                        .filter(|(_, entry)| !entry.in_progress)
+                        .min_by_key(|(id, _)| id.to_string())
+                        .map(|(id, _)| id.clone());
+                    id.and_then(|id| {
+                        let entry = pending.get_mut(&id)?;
+                        entry.in_progress = true;
+                        Some((id, entry.handle.clone()))
+                    })
+                };
+                let Some((id, handle)) = next else {
+                    break;
+                };
+
+                let outcome = self
+                    .backend
+                    .terminate(&handle)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let (waiters, execution) = {
+                    let mut pending = self.terminating.lock();
+                    let waiters = pending
+                        .get_mut(&id)
+                        .map(|entry| {
+                            entry.in_progress = false;
+                            std::mem::take(&mut entry.waiters)
+                        })
+                        .unwrap_or_default();
+                    let execution = if outcome.is_ok() {
+                        pending.remove(&id).and_then(|entry| entry.execution)
+                    } else {
+                        None
+                    };
+                    (waiters, execution)
+                };
+                for waiter in waiters {
+                    let _ = waiter.send(outcome.clone());
+                }
+                // Record ExecutionEnded only on a successful teardown — a
+                // FAILED terminate means the cell may still be live and this
+                // same loop retries it, so recording "ended" now would be a
+                // false integrity-chain entry; the eventual successful retry
+                // records it once, correctly.
+                if let (true, Some(observer), Some(ctx)) =
+                    (outcome.is_ok(), self.execution_observer.get(), &execution)
+                {
+                    observer.on_ended(&ctx.deployment_id, id.as_str(), ctx.requests_served, &ctx.outcome);
+                }
+                if let Err(error) = outcome {
+                    warn!(cell = %id, %error, "backend cell termination failed; shutdown retains it for retry");
+                    break;
+                }
+                if self.termination_closing.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn terminate_tracked(
+        self: &Arc<Self>,
+        handle: CellHandle,
+        execution: Option<ExecutionEndContext>,
+    ) -> anyhow::Result<()> {
+        let receiver = self
+            .enqueue_termination(handle, execution, true)
+            .expect("tracked termination creates one waiter");
+        match receiver.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+            Err(_) => {
+                anyhow::bail!("Fluid termination worker stopped before acknowledging an owned cell")
+            }
+        }
+    }
+
+    async fn stop_termination_worker(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
+        self.termination_closing.store(true, Ordering::Release);
+        self.termination_notify.notify_waiters();
+        let Some(mut task) = self.termination_task.lock().take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow::anyhow!(
+                "Fluid termination worker failed before shutdown drain: {error}"
+            )),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                anyhow::bail!("Fluid termination worker did not stop before shutdown deadline")
+            }
+        }
+    }
+
+    async fn shutdown_inner(self: &Arc<Self>) -> anyhow::Result<usize> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+
+        let tasks = std::mem::take(&mut *self.background_tasks.lock());
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+
+        let cold_start_barrier = tokio::time::timeout_at(
+            deadline,
+            self.cold_start_sem
+                .clone()
+                .acquire_many_owned(self.cold_start_capacity),
+        )
+        .await;
+        let _cold_start_barrier = match cold_start_barrier {
+            Ok(Ok(barrier)) => barrier,
+            Ok(Err(_)) => {
+                let _ = self.stop_termination_worker(deadline).await;
+                anyhow::bail!("Fluid cold-start barrier closed during shutdown");
+            }
+            Err(_) => {
+                let _ = self.stop_termination_worker(deadline).await;
+                anyhow::bail!("Fluid shutdown timed out waiting for in-flight cold starts");
+            }
+        };
+
+        let detached: Vec<CellHandle> = {
+            let mut registry = self.registry.lock();
+            std::mem::take(&mut *registry)
+                .into_values()
+                .flat_map(|pool| pool.instances.into_iter().map(|instance| instance.handle))
+                .collect()
+        };
+        let owned = {
+            let mut terminating = self.terminating.lock();
+            let mut ids: HashSet<CellId> = terminating.keys().cloned().collect();
+            for handle in detached {
+                ids.insert(handle.id.clone());
+                terminating
+                    .entry(handle.id.clone())
+                    .or_insert_with(|| PendingTermination {
+                        handle,
+                        // Node-shutdown drain collapses the WHOLE registry at
+                        // once (`std::mem::take`) — recovering each
+                        // instance's deployment/requests_served here isn't
+                        // worth the complexity for a once-per-process-exit
+                        // path; those entries just get no ExecutionEnded
+                        // record (see PendingTermination.execution's doc).
+                        execution: None,
+                        in_progress: false,
+                        waiters: Vec::new(),
+                    });
+            }
+            ids.len()
+        };
+
+        // All internal producers are now stopped and every cold-start guard has
+        // run. Join the sole running termination writer before shutdown becomes
+        // the sole writer for the final retry/drain.
+        self.stop_termination_worker(deadline).await?;
+
+        let mut last_errors = Vec::new();
+        for attempt in 0..2 {
+            let handles: Vec<CellHandle> = self
+                .terminating
+                .lock()
+                .values()
+                .map(|entry| entry.handle.clone())
+                .collect();
+            if handles.is_empty() {
+                return Ok(owned);
+            }
+            last_errors.clear();
+            for handle in handles {
+                let id = handle.id.clone();
+                let outcome = tokio::time::timeout_at(deadline, self.backend.terminate(&handle))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Fluid shutdown timed out terminating {} owned cell(s)",
+                            self.terminating.lock().len()
+                        )
+                    })?
+                    .map_err(|error| format!("{error:#}"));
+                let waiters = {
+                    let mut terminating = self.terminating.lock();
+                    let waiters = terminating
+                        .get_mut(&id)
+                        .map(|entry| std::mem::take(&mut entry.waiters))
+                        .unwrap_or_default();
+                    if outcome.is_ok() {
+                        terminating.remove(&id);
+                    }
+                    waiters
+                };
+                for waiter in waiters {
+                    let _ = waiter.send(outcome.clone());
+                }
+                if let Err(error) = outcome {
+                    last_errors.push(format!("{id}: {error}"));
+                }
+            }
+            if self.terminating.lock().is_empty() {
+                return Ok(owned);
+            }
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        anyhow::bail!(
+            "Fluid shutdown could not terminate {} owned cell(s): {}",
+            self.terminating.lock().len(),
+            last_errors.join("; ")
+        )
+    }
+
+    /// Stop admission and background work, wait for every cold start to leave
+    /// the provisioning boundary, then terminate every backend handle. The first
+    /// caller starts one bounded teardown task; concurrent and repeated callers
+    /// observe the same terminal result.
+    pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<usize> {
+        if self
+            .shutdown_state
+            .compare_exchange(
+                SHUTDOWN_RUNNING,
+                SHUTDOWN_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let fluid = self.clone();
+            tokio::spawn(async move {
+                let result = fluid
+                    .shutdown_inner()
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                *fluid.shutdown_result.lock() = Some(result);
+                fluid
+                    .shutdown_state
+                    .store(SHUTDOWN_COMPLETE, Ordering::Release);
+                fluid.shutdown_notify.notify_waiters();
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT + Duration::from_secs(5);
+        loop {
+            let notified = self.shutdown_notify.notified();
+            if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_COMPLETE {
+                break;
+            }
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| anyhow::anyhow!("Fluid shutdown did not reach a terminal result"))?;
+        }
+        match self
+            .shutdown_result
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Fluid shutdown completed without a result"))?
+        {
+            Ok(terminated) => Ok(terminated),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
+    }
+
+    /// Register (or replace) one function pool. This compatibility wrapper uses
+    /// the same atomic batch path as deployment registration.
     pub fn register(
         &self,
         key: String,
@@ -585,73 +1034,71 @@ impl Fluid {
         workdir: String,
         tenant: String,
     ) {
-        let tenant = norm_tenant(tenant);
-        // Runtime-aware initial safe-concurrency baseline (#5). `None` when it equals
-        // the configured max (i.e. no reduction) so the common case is unchanged.
-        let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
-        let safe_concurrency = if rec < cfg.max_concurrency {
-            Some(rec)
-        } else {
-            None
-        };
-        let mut reg = self.registry.lock();
-        // Re-registering a key (a redeploy, or a boot restore over a live pool)
-        // installs a fresh pool whose `instances` is empty. Anything the OLD pool
-        // was running would then be orphaned: still alive on the host, still
-        // holding a lock/process slot/memory/published port, but unknown to the
-        // pool — so never reused, never drained, never terminated. Mark them
-        // draining instead and let the reconcile loop terminate them properly.
-        let orphans: Vec<Instance> = reg
-            .get_mut(&key)
-            .map(|old| {
-                old.instances
-                    .drain(..)
-                    .map(|mut i| {
-                        i.draining = true;
-                        i
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !orphans.is_empty() {
-            warn!(
-                func = %key,
-                count = orphans.len(),
-                "re-registering a pool with live instances — draining them instead of orphaning"
+        self.register_many(vec![PoolSpec {
+            key,
+            cfg,
+            image,
+            workdir,
+            tenant,
+        }])
+        .expect("one function pool always has a unique non-empty key");
+    }
+
+    /// Validate and install a deployment's complete function-pool set under one
+    /// registry lock. No pool becomes leasable until every key is known valid.
+    pub fn register_many(&self, specs: Vec<PoolSpec>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid is shutting down; function-pool registration is closed"
+        );
+        let mut keys = HashSet::with_capacity(specs.len());
+        for spec in &specs {
+            anyhow::ensure!(!spec.key.is_empty(), "function pool key is empty");
+            anyhow::ensure!(
+                keys.insert(spec.key.clone()),
+                "duplicate function pool key {:?}",
+                spec.key
             );
         }
-        reg.insert(
-            key,
-            FunctionPool {
-                cfg,
-                tenant,
-                image,
-                workdir,
-                instances: orphans,
-                provisioning: 0,
-                requests: 0,
-                served_ms_sum: 0,
-                instance_ms_retired: 0,
-                dead_reaped: 0,
-                browser_requests: 0,
-                browser_served_ms: 0,
-                warm_backoff_until_ms: 0,
-                warm_fail_streak: 0,
-                last_warm_ok_ms: 0,
-                crash_streak: 0,
-                circuit_probe_after_ms: 0,
-                last_node_fault: None,
-                safe_concurrency,
-                nack_concurrency: 0,
-                nack_quota: 0,
-                scale_out_total: 0,
-                coldstart_deduped: 0,
-                recycled: 0,
-                last_provision_ms: 0,
-                last_runtime_init_ms: 0,
-                last_cpu_pct: 0.0,
-            },
+        let mut pools: Vec<(String, FunctionPool)> = specs
+            .into_iter()
+            .map(|spec| {
+                let key = spec.key.clone();
+                (key, FunctionPool::from_spec(spec))
+            })
+            .collect();
+
+        let mut reg = self.registry.lock();
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid shutdown began before function-pool registration committed"
         );
+        for (key, pool) in &mut pools {
+            let orphans: Vec<Instance> = reg
+                .get_mut(key)
+                .map(|old| {
+                    old.instances
+                        .drain(..)
+                        .map(|mut instance| {
+                            instance.draining = true;
+                            instance
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !orphans.is_empty() {
+                warn!(
+                    func = %key,
+                    count = orphans.len(),
+                    "re-registering a pool with live instances — draining them instead of orphaning"
+                );
+            }
+            pool.instances = orphans;
+        }
+        for (key, pool) in pools {
+            reg.insert(key, pool);
+        }
+        Ok(())
     }
 
     /// Set a pool's dynamic safe-concurrency ceiling (the CPU/IO-pressure hook). A
@@ -707,51 +1154,49 @@ impl Fluid {
         self.backend.name()
     }
 
-    /// Where the active backend expects a DELIVERED build to appear inside a
-    /// cell, or `None` when its cells read the host build dir directly.
-    ///
-    /// This is the honest test for "does this backend need `deliver_build` to
-    /// run", and callers should branch on it rather than on `backend_name()`.
-    /// A name comparison silently excludes any backend added later: gating
-    /// delivery on `== "firecracker"` made the whole delivery step dead for
-    /// LiteboxBackend, whose `start_function` hard-requires the artifact.
-    /// Derive both serving locations from one server-built descriptor. Static
-    /// files must always retain `host_static_root`; only function launch consumes
-    /// `guest_workdir`. `delivery_required` is the backend capability gate.
+    /// Derive both serving locations from one sealed descriptor. Static files
+    /// use the verified host application root; function launch uses the
+    /// backend-specific cwd. Every backend must explicitly consume the seal.
     pub fn runtime_artifact_paths(
         &self,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<RuntimeArtifactPaths> {
-        let host_static_root = artifact.host_static_root()?;
-        let delivered = self.backend.delivered_workdir(artifact)?;
-        let delivery_required = delivered.is_some();
-        let guest_workdir = delivered
+        let host_static_root = artifact.host_app_root()?;
+        let guest_workdir = self
+            .backend
+            .delivered_workdir(artifact)?
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| host_static_root.clone());
         Ok(RuntimeArtifactPaths {
             host_static_root,
             guest_workdir,
-            delivery_required,
+            delivery_required: true,
         })
     }
 
-    /// Legacy backend-level guest-path query. New deployment registration must
-    /// use `runtime_artifact_paths` so it cannot replace the host static root.
     pub fn delivered_workdir(
         &self,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<Option<String>> {
         self.backend.delivered_workdir(artifact)
     }
 
-    /// Make a built deployment available to the cells that will serve it (see
-    /// [`hive_backend::CellBackend::deliver_build`]). No-op for same-host backends.
+    /// Make the exact sealed artifact available to serving cells.
     pub async fn deliver_build(
         &self,
         image: &str,
-        artifact: &RuntimeArtifactSpec,
+        artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
         self.backend.deliver_build(image, artifact).await
+    }
+
+    /// Re-read the backend's committed artifact receipt. Delivery callers use
+    /// this to bind the launch record to the exact bytes the backend accepted.
+    pub async fn runtime_artifact_identity(
+        &self,
+        image: &str,
+    ) -> anyhow::Result<Option<hive_core::RuntimeArtifactIdentity>> {
+        self.backend.runtime_artifact_identity(image).await
     }
 
     /// Total live instances (running + provisioning) a tenant currently holds
@@ -850,6 +1295,10 @@ impl Fluid {
     /// Acquire a slot on an instance for one request. Reuses a running instance
     /// (least-loaded with a free slot) or cold-starts when saturated.
     pub async fn lease(self: &Arc<Self>, key: &str) -> anyhow::Result<Lease> {
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid is shutting down; new function leases are closed"
+        );
         // Open circuit: this deployment's instances keep dying seconds after they
         // start, so cold-starting another one just dies the same way while the
         // caller waits out the whole lease timeout (the observed symptom was a
@@ -1015,6 +1464,10 @@ impl Fluid {
     }
 
     fn decide_lease(&self, key: &str, coalesce: bool) -> anyhow::Result<LeaseDecision> {
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid is shutting down; cold-start admission is closed"
+        );
         let mut reg = self.registry.lock();
         // Existence + per-function knobs. The EFFECTIVE reuse ceiling is the lower of
         // the static `max_concurrency` and the dynamic `safe_concurrency` (lowered by
@@ -1131,7 +1584,20 @@ impl Fluid {
     ) -> anyhow::Result<(CellId, CellEndpoint)> {
         // Bound concurrent provisioning so a burst can't saturate the host. Held
         // for the whole provision+start; dropped when this fn returns.
-        let _permit = self.cold_start_sem.clone().acquire_owned().await;
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid shutdown began before cold-start admission"
+        );
+        let _permit = self
+            .cold_start_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("Fluid cold-start admission is closed"))?;
+        anyhow::ensure!(
+            !self.is_shutting_down(),
+            "Fluid shutdown began while the cold start waited for host capacity"
+        );
         let (image, mut launch, mem, vcpus, tenant) = {
             let reg = self.registry.lock();
             let pool = reg
@@ -1385,7 +1851,7 @@ impl Fluid {
             .backend
             .provision_runtime(&spec, launch.runtime_artifact.as_ref())
             .await?;
-        let mut unpublished = UnpublishedCell::new(self.backend.clone(), handle.clone());
+        let mut unpublished = UnpublishedCell::new(self.clone(), handle.clone());
         let provision_ms = now_ms().saturating_sub(t_prov);
         let t_run = now_ms();
         let endpoint = self.backend.start_function(&handle, &launch).await?;
@@ -1419,6 +1885,10 @@ impl Fluid {
             anyhow::bail!("function '{key}' unregistered during cold start");
         }
         unpublished.publish();
+        if let Some(observer) = self.execution_observer.get() {
+            let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key);
+            observer.on_started(deployment_id, cell_id.as_str(), self.backend.name());
+        }
         Ok((cell_id, endpoint))
     }
 
@@ -1452,7 +1922,7 @@ impl Fluid {
     /// it, and account its time. Keep-warm/cold-start will replace it. This is
     /// our analogue of an instance `nack` → router drops it.
     pub async fn mark_dead(self: &Arc<Self>, key: &str, cell_id: &CellId) {
-        let handle = {
+        let (handle, requests_served) = {
             let mut reg = self.registry.lock();
             let Some(pool) = reg.get_mut(key) else { return };
             let Some(pos) = pool.instances.iter().position(|i| &i.cell_id == cell_id) else {
@@ -1461,24 +1931,56 @@ impl Fluid {
             let inst = pool.instances.remove(pos);
             pool.dead_reaped += 1;
             pool.instance_ms_retired += now_ms().saturating_sub(inst.started_at_ms);
-            inst.handle
+            (inst.handle, inst.requests_served)
         };
-        let _ = self.backend.terminate(&handle).await;
+        let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+        let execution = Some(ExecutionEndContext {
+            deployment_id,
+            requests_served,
+            outcome: "crashed".to_string(),
+        });
+        let _ = self.terminate_tracked(handle, execution).await;
     }
 
-    /// Remove a function pool entirely and terminate all its instances. Used
-    /// when a deployment is deleted.
+    /// Remove a function pool entirely and terminate all its instances.
     pub async fn unregister(self: &Arc<Self>, key: &str) {
-        let handles: Vec<hive_backend::CellHandle> = {
+        self.unregister_many(&[key.to_string()]).await;
+    }
+
+    /// Remove a deployment's complete pool set under one lock, then terminate
+    /// every detached cell outside the lock. An in-flight cold start cannot
+    /// publish into only part of the removed set.
+    pub async fn unregister_many(self: &Arc<Self>, keys: &[String]) -> usize {
+        let mut unique: Vec<&str> = keys.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let (removed, handles): (usize, Vec<(hive_backend::CellHandle, ExecutionEndContext)>) = {
             let mut reg = self.registry.lock();
-            match reg.remove(key) {
-                Some(pool) => pool.instances.into_iter().map(|i| i.handle).collect(),
-                None => return,
+            let mut removed = 0usize;
+            let mut handles = Vec::new();
+            for key in unique {
+                if let Some(pool) = reg.remove(key) {
+                    removed += 1;
+                    let deployment_id =
+                        key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+                    handles.extend(pool.instances.into_iter().map(|instance| {
+                        (
+                            instance.handle,
+                            ExecutionEndContext {
+                                deployment_id: deployment_id.clone(),
+                                requests_served: instance.requests_served,
+                                outcome: "killed".to_string(),
+                            },
+                        )
+                    }));
+                }
             }
+            (removed, handles)
         };
-        for h in handles {
-            let _ = self.backend.terminate(&h).await;
+        for (handle, execution) in handles {
+            let _ = self.terminate_tracked(handle, Some(execution)).await;
         }
+        removed
     }
 
     // ---- health checks ------------------------------------------------
@@ -1520,7 +2022,7 @@ impl Fluid {
     async fn reconcile(self: Arc<Self>) {
         // Decide scale-up (keep-warm) and scale-down (idle) under the lock.
         let mut to_warm: Vec<String> = Vec::new();
-        let mut to_drain: Vec<(String, CellId, hive_backend::CellHandle)> = Vec::new();
+        let mut to_drain: Vec<(String, CellId, hive_backend::CellHandle, u64)> = Vec::new();
         let now = now_ms();
         {
             let mut reg = self.registry.lock();
@@ -1579,7 +2081,7 @@ impl Fluid {
                         // Already draining (e.g. recycled while busy) — terminate once
                         // its in-flight requests have all completed.
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                         }
                         continue;
                     }
@@ -1589,7 +2091,7 @@ impl Fluid {
                         recycled_add += 1;
                         retired_add += age_ms;
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                         }
                         continue;
                     }
@@ -1599,7 +2101,7 @@ impl Fluid {
                         inst.draining = true;
                         live_after -= 1;
                         retired_add += age_ms;
-                        to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone()));
+                        to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
                     }
                 }
                 pool.instance_ms_retired += retired_add;
@@ -1607,10 +2109,12 @@ impl Fluid {
             }
         }
 
-        // Execute outside the lock.
-        for key in to_warm {
+        // Execute outside the lock, but keep every operation owned by this
+        // autoscaler task. Shutdown aborts and joins that one owner; no detached
+        // cold start or termination can outlive the Fluid lifecycle.
+        let warm = futures::future::join_all(to_warm.into_iter().map(|key| {
             let f = self.clone();
-            tokio::spawn(async move {
+            async move {
                 match f.cold_start(&key).await {
                     Ok((cell_id, _)) => {
                         // Warm instance: it was created with inflight=1; reset to 0.
@@ -1645,18 +2149,28 @@ impl Fluid {
                         debug!(func = %key, error = %e, "keep-warm cold start failed");
                     }
                 }
-            });
-        }
-        for (key, cell_id, handle) in to_drain {
-            let f = self.clone();
-            tokio::spawn(async move {
-                let _ = f.backend.terminate(&handle).await;
-                if let Some(pool) = f.registry.lock().get_mut(&key) {
-                    pool.instances.retain(|i| i.cell_id != cell_id);
+            }
+        }));
+        let drain = futures::future::join_all(to_drain.into_iter().map(
+            |(key, cell_id, handle, requests_served)| {
+                let f = self.clone();
+                async move {
+                    let deployment_id =
+                        key.split_once('/').map(|(d, _)| d).unwrap_or(&key).to_string();
+                    let execution = ExecutionEndContext {
+                        deployment_id,
+                        requests_served,
+                        outcome: "drained".to_string(),
+                    };
+                    let _ = f.terminate_tracked(handle, Some(execution)).await;
+                    if let Some(pool) = f.registry.lock().get_mut(&key) {
+                        pool.instances.retain(|i| i.cell_id != cell_id);
+                    }
+                    debug!(func = %key, cell = %cell_id, "instance scaled to zero");
                 }
-                debug!(func = %key, cell = %cell_id, "instance scaled to zero");
-            });
-        }
+            },
+        ));
+        tokio::join!(warm, drain);
 
         // ---- #2 adaptive concurrency (CPU-driven AIMD) --------------------
         // Sample the REAL CPU of each pool's live instances and AIMD-adjust the

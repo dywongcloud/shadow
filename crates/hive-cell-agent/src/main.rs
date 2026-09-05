@@ -68,7 +68,8 @@ mod linux {
         validate_legacy_agent_start_function_request_frame, AgentBootProof, AgentEvent,
         AgentFunctionFault, AgentFunctionFaultCode, AgentHandshake, AgentHandshakeReady,
         AgentProtocolFault, AgentProtocolFaultCode, AgentRequest, AgentRequestFrameKind, BuildJob,
-        BuildResult, ExecRequest, FunctionLaunch, LogLine, LogStream, RuntimeArtifactIdentity,
+        BuildResult, ExecPtyRequest, ExecRequest, FunctionLaunch, LogLine, LogStream,
+        RuntimeArtifactIdentity,
         RuntimeArtifactRootfsMarker, AGENT_HANDSHAKE_NONCE_BYTES, AGENT_WIRE_CAPABILITIES,
         AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
         RUNTIME_ARTIFACT_MARKER_FILE, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
@@ -600,6 +601,21 @@ mod linux {
                 let _ = stream.flush();
                 Ok(false)
             }
+            AgentRequest::ExecPty(req) => {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    run_exec_pty(&mut stream, req);
+                });
+                Ok(false)
+            }
+            // Only valid as follow-up frames on an already-open ExecPty
+            // connection (consumed inside run_exec_pty's own read loop, never
+            // seen here as a fresh connection's first frame).
+            AgentRequest::PtyInput { .. } | AgentRequest::PtyResize { .. } => refuse_protocol(
+                &mut stream,
+                AgentProtocolFaultCode::OutOfOrder,
+                "PtyInput/PtyResize must follow ExecPty on the same connection",
+            ),
         }
     }
 
@@ -737,6 +753,254 @@ mod linux {
         }
         let status = child.wait()?;
         Ok(status.code())
+    }
+
+    /// Run one interactive `ExecPtyRequest` for its whole life on its own
+    /// dedicated connection: allocate a real pty (`openpty`), fork a child
+    /// attached to the slave as its controlling terminal running the caller's
+    /// shell, pump the master fd's raw bytes to `PtyOutput` on a reader
+    /// thread while THIS thread keeps reading the connection for
+    /// `PtyInput`/`PtyResize` frames and applying them, until the shell exits
+    /// or the connection closes.
+    fn run_exec_pty(stream: &mut UnixStream, req: ExecPtyRequest) {
+        let id = req.id.clone();
+        let exit_code = match spawn_pty(stream, &req) {
+            Ok(code) => code,
+            Err(e) => {
+                let _ = send(
+                    stream,
+                    &AgentEvent::PtyOutput {
+                        id: id.clone(),
+                        bytes: format!("exec pty failed: {e}\r\n").into_bytes(),
+                    },
+                );
+                None
+            }
+        };
+        exec_registry().lock().unwrap().remove(&id);
+        let _ = send(stream, &AgentEvent::PtyExited { id, exit_code });
+        let _ = stream.flush();
+    }
+
+    fn spawn_pty(stream: &mut UnixStream, req: &ExecPtyRequest) -> std::io::Result<Option<i32>> {
+        use std::ffi::CString;
+
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let winsize = libc::winsize {
+            ws_row: req.rows,
+            ws_col: req.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty is given valid out-params and a stack winsize; on
+        // success both fds are open and owned by this process.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &winsize,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let shell = if req.shell.is_empty() {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        } else {
+            req.shell.clone()
+        };
+        let cwd = if req.cwd.is_empty() {
+            "/root".to_string()
+        } else {
+            req.cwd.clone()
+        };
+        let _ = std::fs::create_dir_all(&cwd);
+        let shell_c = CString::new(shell.as_str())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in shell path"))?;
+        let cwd_c = CString::new(cwd.as_str())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in cwd"))?;
+        // `-<name>` argv[0] tells most shells to behave as a login shell,
+        // which is what a real terminal session expects (profile sourcing).
+        let argv0 = format!(
+            "-{}",
+            std::path::Path::new(&shell)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("sh")
+        );
+        let argv0_c = CString::new(argv0)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in argv0"))?;
+
+        // SAFETY: fork() is async-signal-safe to call; the child path below
+        // only calls async-signal-safe syscalls before execv, per the usual
+        // fork+exec discipline (no allocation, no locking, no libstd I/O).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return Err(err);
+        }
+        if pid == 0 {
+            // Child: become session leader, attach the pty slave as our
+            // controlling terminal, wire it to fd 0/1/2, drop the now-unused
+            // fds, chdir, then execve. Any failure here calls _exit directly
+            // — never unwind back into the parent's Rust runtime state.
+            unsafe {
+                libc::close(master);
+                if libc::setsid() < 0 {
+                    libc::_exit(126);
+                }
+                if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
+                    libc::_exit(126);
+                }
+                libc::dup2(slave, 0);
+                libc::dup2(slave, 1);
+                libc::dup2(slave, 2);
+                if slave > 2 {
+                    libc::close(slave);
+                }
+                let _ = libc::chdir(cwd_c.as_ptr());
+                libc::setenv(
+                    CString::new("HOME").unwrap().as_ptr(),
+                    CString::new("/root").unwrap().as_ptr(),
+                    1,
+                );
+                libc::setenv(
+                    CString::new("TERM").unwrap().as_ptr(),
+                    CString::new("xterm-256color").unwrap().as_ptr(),
+                    1,
+                );
+                libc::setenv(
+                    CString::new("PATH").unwrap().as_ptr(),
+                    CString::new("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                        .unwrap()
+                        .as_ptr(),
+                    1,
+                );
+                for (k, v) in req.env.iter() {
+                    if let (Ok(kc), Ok(vc)) = (CString::new(k.as_str()), CString::new(v.as_str())) {
+                        libc::setenv(kc.as_ptr(), vc.as_ptr(), 1);
+                    }
+                }
+                let argv: [*const libc::c_char; 2] = [argv0_c.as_ptr(), std::ptr::null()];
+                libc::execv(shell_c.as_ptr(), argv.as_ptr());
+                libc::_exit(127); // execv only returns on failure
+            }
+        }
+
+        // Parent: close the slave (the child owns its own copy across the
+        // fork), keep the master as our pty end.
+        unsafe {
+            libc::close(slave);
+        }
+        exec_registry()
+            .lock()
+            .unwrap()
+            .insert(req.id.clone(), pid as u32);
+
+        // SAFETY: master is a valid, open fd owned by this process from here on.
+        let mut master_read = unsafe { std::fs::File::from_raw_fd(master) };
+        let master_write_fd = master;
+
+        let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let reader = {
+            let mut out_stream = stream.try_clone()?;
+            let id = req.id.clone();
+            let write_lock = write_lock.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0_u8; 8192];
+                loop {
+                    let n = match master_read.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        // EIO on a pty master is the normal "slave closed"
+                        // signal once the shell (and every child holding the
+                        // slave open) has exited — not a real error.
+                        Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                        Err(_) => break,
+                    };
+                    let _guard = write_lock.lock().unwrap();
+                    if send(
+                        &mut out_stream,
+                        &AgentEvent::PtyOutput {
+                            id: id.clone(),
+                            bytes: buf[..n].to_vec(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // This thread: keep reading frames off the SAME connection for
+        // PtyInput/PtyResize until the connection closes or the child exits.
+        // The write side of the connection is shared with `reader` above via
+        // `write_lock` (PtyOutput never interleaves with anything this loop
+        // sends, though this loop currently sends nothing back).
+        loop {
+            let frame = match read_frame(stream) {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            let req: AgentRequest = match serde_json::from_slice(&frame) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            match req {
+                AgentRequest::PtyInput { bytes } => unsafe {
+                    let mut off = 0;
+                    while off < bytes.len() {
+                        let n = libc::write(
+                            master_write_fd,
+                            bytes[off..].as_ptr() as *const libc::c_void,
+                            bytes.len() - off,
+                        );
+                        if n <= 0 {
+                            break;
+                        }
+                        off += n as usize;
+                    }
+                },
+                AgentRequest::PtyResize { cols, rows } => unsafe {
+                    let ws = libc::winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    libc::ioctl(master_write_fd, libc::TIOCSWINSZ as _, &ws);
+                },
+                // A fresh ExecPty/anything else on this connection is a
+                // protocol violation once a session is already open — just
+                // stop reading; the reader thread and child-wait below still
+                // finish this session's teardown cleanly.
+                _ => break,
+            }
+        }
+
+        let _ = reader.join();
+        let mut status: libc::c_int = 0;
+        // SAFETY: pid was returned by our own fork() above and has not been
+        // reaped elsewhere (this is the only waiter for it).
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        let code = if libc::WIFEXITED(status) {
+            Some(libc::WEXITSTATUS(status))
+        } else {
+            None
+        };
+        Ok(code)
     }
 
     fn spawn_reader(

@@ -1,3 +1,0 @@
-module.exports=[63588,a=>{"use strict";var b=a.i(7997),c=a.i(42630);a.s(["default",0,function(){return(0,b.jsxs)("div",{className:"flex flex-col gap-4 pb-24",children:[(0,b.jsx)(c.Skeleton,{className:"h-7 w-56"}),(0,b.jsx)(c.Skeleton,{className:"h-4 w-80 max-w-full"}),(0,b.jsx)(c.Skeleton,{className:"mt-2 h-40 w-full"})]})}])},45538,a=>{a.n(a.i(63588))}];
-
-//# sourceMappingURL=app_loading_tsx_0a1flg9._.js.map

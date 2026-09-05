@@ -8,9 +8,6 @@ import { auth, clerkClient } from "@clerk/nextjs/server";
 // node can't verify Clerk itself, so the node's zkauth endpoints are kept off the
 // public proxy (next.config) — only this server reaches them. Returns JSON so the
 // page can stage the proof visualization and then redirect to `url`.
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 const PERSONAL = new Set(["personal", "__personal__", ""]);

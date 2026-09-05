@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { composioConfigured, connectToolkit, resolveEntity } from "@/lib/composio";
 import { publicOrigin } from "@/lib/origin";
 
-export const dynamic = "force-dynamic";
-
 export async function POST(req: NextRequest) {
   if (!composioConfigured()) {
     return NextResponse.json(

@@ -1,3 +1,0 @@
-module.exports=[48720,a=>{"use strict";var b=a.i(7997),c=a.i(42630);a.s(["default",0,function(){return(0,b.jsxs)("div",{children:[(0,b.jsx)(c.SkeletonPageHeader,{}),(0,b.jsx)("div",{className:"grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3",children:Array.from({length:6}).map((a,d)=>(0,b.jsx)(c.Skeleton,{className:"h-36 w-full"},d))})]})}])},29953,a=>{a.n(a.i(48720))}];
-
-//# sourceMappingURL=app_integrations_loading_tsx_1nkbrd1._.js.map

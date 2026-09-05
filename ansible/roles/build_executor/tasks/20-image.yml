@@ -111,7 +111,7 @@
 - name: Require image identity, non-root default, and protocol label
   ansible.builtin.assert:
     that:
-      - _build_executor_builder_inspect.Id == build_executor_builder_image_id
+      - (_build_executor_builder_inspect.Id | regex_replace('^sha256:', '')) == (build_executor_builder_image_id | regex_replace('^sha256:', ''))
       - _build_executor_builder_inspect.Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
       - (_build_executor_builder_inspect.Config.Volumes | default({}, true)) | length == 0
       - (_build_executor_builder_inspect.Config.Labels | default({})).get('org.hive.build-executor.protocol', '') == build_executor_protocol

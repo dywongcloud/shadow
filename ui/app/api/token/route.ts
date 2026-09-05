@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
 
-export const dynamic = "force-dynamic";
-
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
@@ -37,6 +35,41 @@ function jwtPlatformAdmin(token: string): boolean | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Parent-domain scope for the `hive_jwt` cookie (e.g. `.shadw.cloud` from a
+ * `shadw.cloud`/`dashboard.shadw.cloud` request host), so the SAME cookie the
+ * dashboard's same-origin `/cloud` proxy relies on is ALSO sent on the
+ * sandbox terminal's cross-subdomain websocket handshake to
+ * `wss://api.<domain>` (`ui/lib/api.ts`'s `wsBase()` derives that exact
+ * target from the identical two-label-suffix rule). Without an explicit
+ * `domain`, a cookie defaults to the exact host that set it and is invisible
+ * to any other subdomain — the websocket would silently 401/close, not fail
+ * loudly, since a browser WebSocket handshake can't attach a header to work
+ * around it (this cookie is httpOnly by design). `localhost`/`127.0.0.1`/a
+ * bare single-label host get `undefined` (browsers reject a `Domain`
+ * attribute on those anyway) so local dev is unaffected.
+ */
+function cookieDomain(req: NextRequest): string | undefined {
+  // Behind hive-node's reverse proxy the Next server's `host` is the loopback
+  // upstream (`127.0.0.1:3002`) and the browser-facing host arrives ONLY as
+  // `x-forwarded-host` (the same convention `ui/proxy.ts` reads for Clerk's
+  // redirect URLs). Reading `host` alone returned `undefined` in production,
+  // so every session cookie was host-only for `shadw.cloud`, the browser never
+  // sent it on the `wss://api.shadw.cloud` handshake, the shell upgrade
+  // arrived anonymous and was refused 403 — "WebSocket connection failed"
+  // with no diagnosis (2026-09-02, sbx_86001c0447a14171). Forwarded host
+  // first, then the direct host for local `next dev`.
+  const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "")
+    .split(",")[0]
+    .trim()
+    .split(":")[0]
+    .toLowerCase();
+  if (!host || host === "localhost" || host === "127.0.0.1") return undefined;
+  const parts = host.split(".");
+  if (parts.length < 2) return undefined;
+  return `.${parts.slice(-2).join(".")}`;
 }
 
 /**
@@ -97,6 +130,7 @@ export async function POST(req: NextRequest) {
         httpOnly: true,
         secure: false, // local-only branch (NODE_ENV !== "production" above)
         sameSite: "lax",
+        domain: cookieDomain(req),
         path: "/",
         maxAge: Math.max(60, expiresIn - 30),
       });
@@ -228,10 +262,22 @@ export async function POST(req: NextRequest) {
   // treats an absent field as UNKNOWN and leaves those surfaces untouched.
   const platformAdmin = jwtPlatformAdmin(token);
   const res = NextResponse.json({ ok: true, tenant, role, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
+  const domain = cookieDomain(req);
+  if (domain) {
+    // Sessions minted before the forwarded-host fix hold a HOST-ONLY
+    // `hive_jwt` (no Domain attribute). A browser keeps that cookie beside the
+    // parent-domain one and sends BOTH to the dashboard origin, oldest first,
+    // so the backend would keep reading the stale (possibly other-tenant)
+    // cookie for up to its remaining hour. Expire the host-only variant in the
+    // same response, BEFORE setting the real one: two Set-Cookie headers for
+    // the same name differ by Domain and are distinct cookies to the browser.
+    res.cookies.set("hive_jwt", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
+  }
   res.cookies.set("hive_jwt", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
+    domain,
     path: "/",
     maxAge: Math.max(60, expiresIn - 30),
   });

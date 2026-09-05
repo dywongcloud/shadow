@@ -4,10 +4,6 @@ import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/com
 import { Check } from "lucide-react";
 import { TheoMarketReference } from "@/components/theo-market-reference";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "Pricing — autheo",
   description:

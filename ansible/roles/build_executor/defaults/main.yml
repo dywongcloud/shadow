@@ -89,11 +89,21 @@ build_executor_gvisor_current_link: "{{ build_executor_libexec_dir }}/gvisor-cur
 build_executor_gvisor_retain_releases: 2
 build_executor_runsc_path: "{{ build_executor_gvisor_current_link }}/runsc"
 build_executor_runsc_sidecar_path: "{{ build_executor_gvisor_current_link }}/containerd-shim-runsc-v1"
+# directfs is deliberately left at runsc's own default (true), NOT pinned to
+# false: on the PVM-patched kernel (6.12.33-pvm+) this fleet's CVM/GPU hosts
+# run, forcing directfs=false makes gVisor fall back to the older gofer-only
+# filesystem path, and platform initialization then dies immediately with
+# "initialize systrap: unable to attach: operation not permitted" — surfaced
+# to the client only as the generic "cannot read client sync file: EOF".
+# Isolated live on sj2 (2026-08-28) via single-flag bisection against a bare
+# `podman run --runtime runsc`: directfs=false alone reproduces the failure
+# with zero other flags present; every other pinned flag here, individually
+# and combined, works fine. The platform's own hive-cell-agent sandboxes
+# never pass --directfs at all and boot correctly on the same kernel.
 build_executor_runsc_runtime_flags:
   - platform=systrap
   - network=sandbox
   - gvisor-marker-file=true
-  - directfs=false
   - host-uds=none
   - host-fifo=none
   - net-raw=false
@@ -162,7 +172,17 @@ build_executor_probe_listener_port: 18080
 build_executor_probe_peer_port: 18081
 build_executor_probe_hairpin_port: 18082
 build_executor_probe_memory: 256m
-build_executor_probe_pids_limit: 128
+# Matches the pids.max already measured live on this fleet's real, working
+# hive-cell-agent gVisor sandboxes (machine.slice/libpod-*.scope/pids.max ==
+# 1024) rather than an arbitrary lower number. 128 is not enough headroom for
+# gVisor's own sentry/gofer process and thread fan-out under
+# platform=systrap on a high-CPU-count host: isolated live on sj2
+# (2026-08-28) by holding every other probe setting fixed and varying only
+# --pids-limit through the real hardened wrapper — 128 reliably fails
+# `containerManager.StartRoot failed: EOF` (exit status 128, with a paired
+# `cgroup: fork rejected by pids controller` kernel log line), 1024
+# reliably succeeds.
+build_executor_probe_pids_limit: 1024
 # Workspace is a named Podman local volume backed by tmpfs: the kernel enforces
 # this byte ceiling synchronously, and the explicit volume identity lets every
 # cancellation/failure path prove that both container and volume were reaped.

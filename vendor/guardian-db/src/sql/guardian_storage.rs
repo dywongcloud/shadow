@@ -26,9 +26,12 @@ use crate::guardian::error::{GuardianError, Result as GuardianResult};
 use crate::relational::error::Result as RelResult;
 use crate::relational::{RelError, RelationalStorage};
 use crate::sql::engine::Database;
-use crate::traits::{Document, DocumentStore};
+use crate::traits::{AsyncDocumentFilter, Document, DocumentStore};
 use async_trait::async_trait;
 use serde_json::{Map, Value as Json};
+use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Separator between a collection prefix and a row id in the GuardianDB key.
@@ -87,6 +90,34 @@ impl GuardianRelationalStorage {
         self.store.load(0).await
     }
 
+    /// Number of keys the local document index currently knows — `0` until
+    /// the first full walk completes (see `refresh`), which is how a caller
+    /// tells "empty database" from "index not built yet".
+    pub fn index_len(&self) -> usize {
+        self.store.index().len().unwrap_or(0)
+    }
+
+    /// Materialize every row value the index knows only by hash, in ONE
+    /// pass (the store's async `query` walks the key set and lazily fetches
+    /// each value, caching it). A cold index has every remotely-written row
+    /// as hash-only, and each such row costs a peer fetch on first read —
+    /// hundreds of milliseconds each — so a full-table scan on a cold index
+    /// (measured: even `teams`) exceeds a 10 s statement budget. Run this
+    /// once after the walk, off every request path. Returns the number of
+    /// documents materialized.
+    pub async fn warm_values(&self) -> GuardianResult<usize> {
+        let all: AsyncDocumentFilter = Box::pin(|_document: &Document| {
+            Box::pin(async { Ok(true) })
+                as Pin<
+                    Box<
+                        dyn Future<Output = Result<bool, Box<dyn Error + Send + Sync>>>
+                            + Send,
+                    >,
+                >
+        });
+        Ok(self.store.query(all).await?.len())
+    }
+
     fn gkey(collection: &str, row_id: &str) -> String {
         format!("{collection}{SEP}{row_id}")
     }
@@ -111,6 +142,26 @@ impl GuardianRelationalStorage {
             serde_json::from_slice(bytes).map_err(|e| RelError::Storage(e.to_string()))?;
         Ok(wrapped.get("doc").cloned())
     }
+
+    /// One wrapped row document by its full key, through the store's ASYNC
+    /// `get` — which lazily fetches a value the index only knows by hash.
+    /// The synchronous `index().get_bytes` path answers `None` for every key
+    /// a cold-start walk registered but nothing has read yet, and the SQL
+    /// catalog is exactly such a key on every boot: reading it through the
+    /// index made the engine load an empty catalog on a fully built index
+    /// (every table "does not exist"), measured 2026-09-02 fleet-wide.
+    async fn fetch_wrapped(&self, gkey: &str) -> RelResult<Option<Json>> {
+        let documents = self.store.get(gkey, None).await.map_err(map_err)?;
+        for document in documents {
+            let Some(wrapped) = document.downcast_ref::<Json>() else {
+                continue;
+            };
+            if wrapped.get("_id").and_then(Json::as_str) == Some(gkey) {
+                return Ok(wrapped.get("doc").cloned());
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn map_err(e: GuardianError) -> RelError {
@@ -128,9 +179,13 @@ impl RelationalStorage for GuardianRelationalStorage {
             let Some(row_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
-            if let Some(bytes) = index.get_bytes(&key).map_err(map_err)?
-                && let Some(doc) = Self::unwrap_doc(&bytes)?
-            {
+            // Cached value first (free); otherwise the lazy async fetch —
+            // never skip a row the index knows only by hash.
+            let doc = match index.get_bytes(&key).map_err(map_err)? {
+                Some(bytes) => Self::unwrap_doc(&bytes)?,
+                None => self.fetch_wrapped(&key).await?,
+            };
+            if let Some(doc) = doc {
                 out.push((row_id.to_string(), doc));
             }
         }
@@ -141,7 +196,7 @@ impl RelationalStorage for GuardianRelationalStorage {
         let gkey = Self::gkey(collection, row_id);
         match self.store.index().get_bytes(&gkey).map_err(map_err)? {
             Some(bytes) => Self::unwrap_doc(&bytes),
-            None => Ok(None),
+            None => self.fetch_wrapped(&gkey).await,
         }
     }
 

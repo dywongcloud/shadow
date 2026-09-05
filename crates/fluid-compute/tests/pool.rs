@@ -25,6 +25,7 @@ fn python3() -> Option<String> {
 fn test_fluid(lease_timeout_ms: u64) -> Arc<Fluid> {
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("fluid-test-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("fluid-test-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("fluid-test-cache-{}", std::process::id())),
     }));
@@ -271,6 +272,7 @@ async fn per_tenant_instance_quota_is_isolated() {
     };
     let backend = Arc::new(MockBackend::new(MockConfig {
         root: std::env::temp_dir().join(format!("fluid-quota-{}", std::process::id())),
+        receipts_dir: std::env::temp_dir().join(format!("fluid-quota-{}", std::process::id())),
         provision_latency: Duration::from_millis(10),
         cache_root: std::env::temp_dir().join(format!("fluid-quota-cache-{}", std::process::id())),
     }));

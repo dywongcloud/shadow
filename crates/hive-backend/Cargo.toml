@@ -14,6 +14,13 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tar = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Secure-Enclave-resident per-deployment signing keys (sep_signer.rs). macOS
+# only — the SEP has no Linux equivalent this crate targets.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+hex = "0.4"

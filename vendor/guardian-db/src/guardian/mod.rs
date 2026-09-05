@@ -1435,7 +1435,31 @@ impl DocumentStore for DocumentStoreWrapper {
 
         let opts = opts.unwrap_or_default();
 
-        // Try the index first (more efficient).
+        // Prefer the concrete iroh-docs-backed store's own async `get`,
+        // which lazily fetches a value on a cache miss (see
+        // `document_store::DocumentStoreIndex`'s doc): going through the
+        // generic `Store::index()` -> `StoreIndex::get_bytes` path instead
+        // (as `search_documents_by_key` does below) is synchronous and can
+        // only serve already-cached values, silently under-reporting any key
+        // not yet lazily warmed right after a cold-start rebuild.
+        if let Some(doc_store) = self
+            .store
+            .as_any()
+            .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
+        {
+            let get_opts = crate::traits::DocumentStoreGetOptions {
+                case_insensitive: opts.case_insensitive,
+                partial_matches: opts.partial_matches,
+            };
+            let values = doc_store.get(key, Some(get_opts)).await?;
+            return Ok(values
+                .into_iter()
+                .map(|v| Box::new(v) as Document)
+                .collect());
+        }
+
+        // Fallback for a non-iroh-docs Store implementer: try the index first
+        // (more efficient), then the oplog.
         let documents_from_index = self.search_documents_by_key(key, &opts)?;
 
         if !documents_from_index.is_empty() {
@@ -1455,8 +1479,35 @@ impl DocumentStore for DocumentStoreWrapper {
     ) -> std::result::Result<Vec<Document>, Self::Error> {
         // Query with a customizable asynchronous filter.
 
-        // Get all available documents.
-        let all_documents = self.get_all_documents_from_index()?;
+        // Prefer the concrete store's own index reads via `get_value_lazy`
+        // semantics — same reasoning as `get` above. `GuardianDBDocumentStore`
+        // has no bulk async-filtered query of its own (its sync `query<F>` is
+        // cached-only and unrelated to this async `AsyncDocumentFilter`), so
+        // reuse its lazy single-key fetch across the full key set instead of
+        // the generic synchronous, cache-only `get_all_documents_from_index`.
+        let all_documents = if let Some(doc_store) = self
+            .store
+            .as_any()
+            .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
+        {
+            let mut docs = Vec::new();
+            for key in doc_store.index_key_set() {
+                if let Some(bytes) = doc_store.get_value_lazy(&key).await {
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(json_value) => docs.push(Box::new(json_value) as Document),
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to deserialize document for key '{}': {}",
+                                key, e
+                            );
+                        }
+                    }
+                }
+            }
+            docs
+        } else {
+            self.get_all_documents_from_index()?
+        };
 
         let mut filtered_documents = Vec::new();
 

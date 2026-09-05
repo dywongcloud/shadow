@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
             root: std::env::temp_dir().join("hive-cells"),
             provision_latency: Duration::from_millis(args.mock_provision_ms),
             cache_root: std::env::temp_dir().join("hive-cache"),
+            receipts_dir: std::env::temp_dir().join("hive-cells"),
         })),
         Backend::Firecracker => {
             let fc = FirecrackerBackend::new(FirecrackerConfig {

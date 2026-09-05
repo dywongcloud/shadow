@@ -1,19 +1,100 @@
+diff --git a/litebox/src/fs/in_mem.rs b/litebox/src/fs/in_mem.rs
+index 1961f5e..9adfab8 100644
+--- a/litebox/src/fs/in_mem.rs
++++ b/litebox/src/fs/in_mem.rs
+@@ -1370,6 +1370,15 @@ impl UserInfo {
+ 
+ impl Permissions {
+     fn can_read_by(&self, current: UserInfo) -> bool {
++        // Fleet patch (hive): CAP_DAC_OVERRIDE semantics -- uid 0 bypasses the
++        // discretionary read/write bits (and may execute when any x bit is set),
++        // exactly as Linux root does. Without this the runner cannot even stage
++        // its own program: RHEL-family hosts ship /usr/bin as 0555, the runner
++        // recreates that directory in the in-mem FS with the host mode, and the
++        // CREAT open under with_root_privileges then fails with NoWritePerms.
++        if current.user == 0 {
++            return true;
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::RUSR)
+         } else if self.userinfo.group == current.group {
+@@ -1379,6 +1388,9 @@ impl Permissions {
+         }
+     }
+     fn can_write_by(&self, current: UserInfo) -> bool {
++        if current.user == 0 {
++            return true;
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::WUSR)
+         } else if self.userinfo.group == current.group {
+@@ -1388,6 +1400,9 @@ impl Permissions {
+         }
+     }
+     fn can_execute_by(&self, current: UserInfo) -> bool {
++        if current.user == 0 {
++            return self.mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
++        }
+         if self.userinfo.user == current.user {
+             self.mode.contains(Mode::XUSR)
+         } else if self.userinfo.group == current.group {
+diff --git a/litebox/src/fs/resolver.rs b/litebox/src/fs/resolver.rs
+index d84d9b5..c523118 100644
+--- a/litebox/src/fs/resolver.rs
++++ b/litebox/src/fs/resolver.rs
+@@ -102,6 +102,10 @@ impl Context {
+     }
+ 
+     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
++        // Fleet patch (hive): CAP_DAC_OVERRIDE semantics for uid 0 -- see in_mem.rs.
++        if self.user_info.user == 0 {
++            return permissions.mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::XUSR)
+         } else if self.user_info.group == permissions.owner.group {
+@@ -112,6 +116,9 @@ impl Context {
+     }
+ 
+     fn can_read(&self, permissions: &PermissionInfo) -> bool {
++        if self.user_info.user == 0 {
++            return true;
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::RUSR)
+         } else if self.user_info.group == permissions.owner.group {
+@@ -122,6 +129,9 @@ impl Context {
+     }
+ 
+     fn can_write(&self, permissions: &PermissionInfo) -> bool {
++        if self.user_info.user == 0 {
++            return true;
++        }
+         if self.user_info.user == permissions.owner.user {
+             permissions.mode.contains(Mode::WUSR)
+         } else if self.user_info.group == permissions.owner.group {
 diff --git a/litebox/src/net/mod.rs b/litebox/src/net/mod.rs
-index de31c04e..73016b0e 100644
+index 6dd9bb7..1d79326 100644
 --- a/litebox/src/net/mod.rs
 +++ b/litebox/src/net/mod.rs
-@@ -93,23 +93,35 @@ where
+@@ -93,13 +93,34 @@ where
      /// and the created `Network` handle is expected to be shared across all usage over the
      /// system.
      pub fn new(litebox: &LiteBox<Platform>) -> Self {
 +        Self::new_with_addrs(litebox, None, None)
 +    }
 +
-+    /// Same as [`Self::new`], but lets the caller override the interface/gateway
-+    /// addresses instead of the fixed `INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR`
-+    /// defaults (`None` = use the default). Needed by any caller that runs more
-+    /// than one `Network` on the same host at once (each one needs a distinct
-+    /// address to be independently reachable).
++    /// Same as [`Network::new`], but lets the caller override the guest's
++    /// own interface IP and default-gateway IP (falling back to the
++    /// module's hardcoded defaults when either is `None`). Every concurrent
++    /// litebox instance on a multi-tenant host otherwise believes it has the
++    /// IDENTICAL address (`INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR` are plain
++    /// constants, both still marked `// TODO: Make this configurable` by
++    /// upstream) -- unusable for a platform running many concurrent
++    /// sandboxed instances that each need their own reachable identity.
++    /// `litebox_runner_linux_userland::run` wires `LITEBOX_GUEST_IP`/
++    /// `LITEBOX_GATEWAY_IP` from the environment into this; unset = both
++    /// `None` = byte-identical to `Network::new`.
 +    pub fn new_with_addrs(
 +        litebox: &LiteBox<Platform>,
 +        interface_ip: Option<Ipv4Addr>,
@@ -32,6 +113,7 @@ index de31c04e..73016b0e 100644
                  24,
              )) {
                  Ok(()) => {}
+@@ -122,10 +143,7 @@ where
                  Err(_) => unreachable!(),
              }
          });
@@ -43,63 +125,64 @@ index de31c04e..73016b0e 100644
              Ok(None) => {}
              _ => unreachable!(),
          }
-@@ -1175,7 +1187,8 @@ where
-                 }
-                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
-                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
--                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-+                        addr: (!addr.ip().is_unspecified())
-+                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-                         port: new_port,
-                     },
-                     backlog: None,
-@@ -1188,7 +1201,8 @@ where
-                     .allocate_local_port(addr.port())
-                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
-                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
--                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-+                    addr: (!addr.ip().is_unspecified())
-+                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-                     port: lp.port(),
-                 };
-                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-@@ -1261,7 +1275,7 @@ where
+@@ -1296,10 +1314,15 @@ where
+                         unimplemented!()
                      }
                      handle.server_socket = Some(TcpServerSpecific {
-                         ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+-                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
 -                            addr: Some(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)),
-+                            addr: None,
-                             port,
-                         },
+-                            port,
+-                        },
++                        // See the explicit-bind() TCP arm above and the UDP
++                        // arm's identical comment: an unspecified address
++                        // must map to smoltcp's true wildcard (`addr: None`),
++                        // not `Some(0.0.0.0)`, or inbound SYNs addressed to
++                        // the interface's real address are rejected. This is
++                        // the implicit-bind-on-listen() path (listen() called
++                        // with no prior explicit bind()), the one remaining
++                        // site using the wrong sentinel.
++                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint { addr: None, port },
                          backlog: None,
+                         socket_set_handles: vec![],
+                     });
 diff --git a/litebox_runner_linux_userland/src/lib.rs b/litebox_runner_linux_userland/src/lib.rs
-index 746469b5..890925e8 100644
+index dbbec41..7b110ea 100644
 --- a/litebox_runner_linux_userland/src/lib.rs
 +++ b/litebox_runner_linux_userland/src/lib.rs
-@@ -313,7 +313,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
- 
-     let initial_file_system = std::sync::Arc::new(initial_file_system);
+@@ -127,6 +127,14 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
+ /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
+ /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
+ /// message could be thrown instead.
++/// Reads and parses an IPv4 address from the named environment variable.
++/// Unset or unparsable = `None` (never a panic — an operator typo in an
++/// optional override must not crash the runner; it falls back to litebox's
++/// own hardcoded default the same as if the var were absent).
++fn parse_ipv4_env(name: &str) -> Option<std::net::Ipv4Addr> {
++    std::env::var(name).ok()?.trim().parse().ok()
++}
++
+ pub fn run(cli_args: CliArgs) -> Result<()> {
+     tracing_subscriber::fmt()
+         .with_timer(tracing_subscriber::fmt::time::uptime())
+@@ -350,7 +358,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
+             .unwrap_or_else(|e| panic!("failed to create {}: {e}", export_path.display()))
+     });
  
 -    let shim = shim_builder.build();
-+    // Per-invocation network identity override (fleet-hive patch): lets many
-+    // concurrent litebox processes on one host each own a distinct,
-+    // independently-reachable address instead of all defaulting to the same
-+    // hardcoded 10.0.0.2/10.0.0.1. Unset = identical to upstream behavior.
-+    let parse_ipv4_env = |name: &str| -> Option<core::net::Ipv4Addr> {
-+        std::env::var(name).ok()?.parse().ok()
-+    };
-+    let shim = shim_builder.build_with_net_config(
-+        parse_ipv4_env("LITEBOX_GUEST_IP"),
-+        parse_ipv4_env("LITEBOX_GATEWAY_IP"),
-+    );
++    // Per-invocation guest interface/gateway IP override, so many concurrent
++    // litebox instances on one multi-tenant host each get their own real,
++    // directly-routable address instead of all believing they are the
++    // hardcoded default (10.0.0.2/10.0.0.1). Unset = both None = byte-
++    // identical to `shim_builder.build()`.
++    let shim = shim_builder.build_with_net_config(parse_ipv4_env("LITEBOX_GUEST_IP"), parse_ipv4_env("LITEBOX_GATEWAY_IP"));
  
-     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-     let net_worker = if cli_args.tun_device_name.is_some() {
+     // `--gui`: open a real host window and wire the guest's DRM page-flips into it. Mirrors
+     // `litebox_runner_linux_on_windows_userland`'s identical wiring -- see `presentation.rs`'s
 diff --git a/litebox_shim_linux/src/lib.rs b/litebox_shim_linux/src/lib.rs
-index a3bcb921..62fc0910 100644
+index f6fbf70..e495a94 100644
 --- a/litebox_shim_linux/src/lib.rs
 +++ b/litebox_shim_linux/src/lib.rs
-@@ -228,7 +228,19 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
+@@ -275,7 +275,21 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
  
      /// Build the shim.
      pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
@@ -107,10 +190,12 @@ index a3bcb921..62fc0910 100644
 +        self.build_with_net_config(None, None)
 +    }
 +
-+    /// Same as [`Self::build`], but lets the caller override this instance's
-+    /// interface/gateway addresses (`None` = use `Network::new`'s default of
-+    /// `10.0.0.2`/`10.0.0.1`). Needed to run more than one shim on the same
-+    /// host at once, each independently reachable.
++    /// Same as [`Self::build`], but lets the caller override the guest's
++    /// interface IP and default-gateway IP (see
++    /// [`litebox::net::Network::new_with_addrs`]) — every concurrent litebox
++    /// instance on a multi-tenant host otherwise believes it has the
++    /// IDENTICAL guest address. `unset = None, None` is byte-identical to
++    /// `build()`.
 +    pub fn build_with_net_config<FS: ShimFS>(
 +        self,
 +        interface_ip: Option<core::net::Ipv4Addr>,

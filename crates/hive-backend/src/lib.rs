@@ -19,17 +19,24 @@ pub mod litebox;
 pub mod litebox_macos;
 pub mod mock;
 pub mod runtime_artifact;
+#[cfg(target_os = "macos")]
+pub mod sep_signer;
 pub mod snapshot;
 
 use async_trait::async_trait;
 use hive_core::{BuildJob, BuildResult, CellId, LogLine, ResourceSpec};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 pub use hive_core::FunctionLaunch;
 pub use runtime_artifact::{
-    RuntimeArtifactPaths, RuntimeArtifactSpec, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+    materialize_runtime_artifact_package, reopen_sealed_runtime_artifact,
+    seal_host_runtime_artifact, validate_runtime_artifact_package_descriptor,
+    RuntimeArtifactPackageDescriptor, RuntimeArtifactPaths, RuntimeArtifactSpec,
+    SealedRuntimeArtifact, VerifiedRuntimeArtifactPackage,
+    RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
 };
 
 /// Sink the backend writes build output to. The box daemon fans this out to
@@ -1753,21 +1760,18 @@ pub trait CellBackend: Send + Sync {
         sink: LogSink,
     ) -> anyhow::Result<BuildResult>;
 
-    /// Make a built deployment available to the cells that will serve it.
-    ///
-    /// The control plane builds on its own host filesystem (`build_dir`), then
-    /// serves via `provision` + `start_function`. For a same-host backend (mock,
-    /// child process) the serving cell already sees `build_dir`, so this is a
-    /// no-op. For an isolated backend (Firecracker microVM) the guest cannot see
-    /// the host's `build_dir`, so this packs it into a per-`image` artifact that
-    /// `provision` later attaches to the cell. Called once per deployment, keyed
-    /// by the same `image` the function pool will provision with.
+    /// Make one exact sealed runtime artifact available to serving cells. A
+    /// backend never receives checkout coordinates and therefore cannot rebuild
+    /// or re-detect independently of the coordinator's immutable authority.
     async fn deliver_build(
         &self,
         _image: &str,
-        _artifact: &RuntimeArtifactSpec,
+        _artifact: &SealedRuntimeArtifact,
     ) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!(
+            "backend {} did not consume the caller-authorized sealed runtime artifact",
+            self.name()
+        )
     }
 
     /// Whether this backend attaches an isolated runtime artifact when serving a
@@ -1792,9 +1796,11 @@ pub trait CellBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Guest cwd for the application selected by `artifact`. Same-host backends
-    /// return `None` and retain the host build cwd.
-    fn delivered_workdir(&self, _artifact: &RuntimeArtifactSpec) -> anyhow::Result<Option<String>> {
+    /// Backend cwd for the application selected by the sealed descriptor.
+    fn delivered_workdir(
+        &self,
+        _artifact: &SealedRuntimeArtifact,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
@@ -1823,6 +1829,73 @@ pub trait CellBackend: Send + Sync {
     /// guessing from latency (which would wrongly penalize I/O-bound work).
     async fn cpu_percent(&self, _cell: &CellHandle) -> Option<f32> {
         None
+    }
+
+    /// Run one argv command inside an already-provisioned, long-lived cell
+    /// (Sandboxes). Unlike `run_build`'s one-shot self-destructing cell, the
+    /// cell accepts many commands over its life. Returns as soon as the
+    /// command has started; the caller drains the channel for
+    /// `AgentEvent::ExecOutput`* then one `AgentEvent::ExecDone`. Default:
+    /// unsupported (mock/container backends have no such exec channel yet).
+    async fn exec_command(
+        &self,
+        _cell: &CellHandle,
+        _req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>> {
+        anyhow::bail!("backend {} does not support exec_command", self.name())
+    }
+
+    /// Signal a still-running `exec_command` (by the id it was started with)
+    /// to stop. Default: unsupported, matching `exec_command`.
+    async fn kill_exec(&self, _cell: &CellHandle, _exec_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("backend {} does not support kill_exec", self.name())
+    }
+
+    /// Open one interactive pty session inside `cell` (Sandboxes terminal —
+    /// real `vim`/`less`/`^C`/tab-completion support, unlike `exec_command`'s
+    /// line-buffered batch output). Returns an `AgentEvent` receiver
+    /// (`PtyOutput`* then one `PtyExited`) plus a sender the caller uses to
+    /// push typed bytes / resize events back on the same session. Default:
+    /// unsupported.
+    async fn exec_pty(
+        &self,
+        _cell: &CellHandle,
+        _req: hive_core::ExecPtyRequest,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+        PtyIo,
+    )> {
+        anyhow::bail!("backend {} does not support exec_pty", self.name())
+    }
+}
+
+/// Backend-agnostic write side of an `exec_pty` session — a thin
+/// `Fn`-closure wrapper so each backend can plug in its own transport
+/// (`FirecrackerBackend::PtySender`'s channel, litebox's own guest-shim
+/// call) without `CellBackend` depending on any one backend's concrete type.
+#[derive(Clone)]
+pub struct PtyIo {
+    input: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    resize: Arc<dyn Fn(u16, u16) + Send + Sync>,
+}
+
+impl PtyIo {
+    pub fn new(
+        input: impl Fn(Vec<u8>) + Send + Sync + 'static,
+        resize: impl Fn(u16, u16) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            input: Arc::new(input),
+            resize: Arc::new(resize),
+        }
+    }
+
+    pub fn input(&self, bytes: Vec<u8>) {
+        (self.input)(bytes)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        (self.resize)(cols, rows)
     }
 }
 

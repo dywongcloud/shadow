@@ -144,6 +144,12 @@ export const SETTLED_GRACE_MS = 90_000;
 export function usePendingBuilds(opts?: { project?: string }): PendingBuild[] {
   const [list, setList] = useState<PendingBuild[]>([]);
   const [team, setTeam] = useState<string>("");
+  // "Now" for the settled-grace-window filter below must come from state, never
+  // a bare `Date.now()` call in the render path (impure — flagged by
+  // react-hooks/purity, and correctly so: the same render could otherwise see
+  // two different answers). Refreshed on the same cadence as `sync()` below
+  // (every event + the 2s poll), which is plenty for a 90s grace window.
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     // Change detection on the RAW serialized store + the team string: `read()`
     // allocates a fresh array every call and React's useState bailout is
@@ -162,6 +168,7 @@ export function usePendingBuilds(opts?: { project?: string }): PendingBuild[] {
         lastTeam = t;
         setTeam(t);
       }
+      setNow(Date.now());
     };
     sync();
     window.addEventListener(EVT, sync);
@@ -200,7 +207,6 @@ export function usePendingBuilds(opts?: { project?: string }): PendingBuild[] {
       window.removeEventListener("hive-team-changed", sync);
     };
   }, []);
-  const now = Date.now();
   return list.filter(
     (b) =>
       // Tenant filter applies only when BOTH sides are known.

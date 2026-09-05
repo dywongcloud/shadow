@@ -131,8 +131,7 @@ Every Podman operation uses `/usr/local/libexec/hive-build-executor/podman`,
 which starts with an empty environment and globally fixes:
 
 - the absolute runsc binary;
-- `platform=systrap`, `network=sandbox`, `gvisor-marker-file=true`, and
-  `directfs=false`;
+- `platform=systrap`, `network=sandbox`, `gvisor-marker-file=true`;
 - `host-uds=none`, `host-fifo=none`, `net-raw=false`;
 - `allow-flag-override=false`;
 - dedicated primary and empty override `containers.conf` files;
@@ -141,6 +140,19 @@ which starts with an empty environment and globally fixes:
 
 The role asserts the host is already rootful Netavark. It never migrates or
 changes a live host's selected backend.
+
+`directfs` is deliberately left unpinned (runsc's own default, `true`), not
+forced to `false`. On this fleet's PVM-patched kernels (`6.12.33-pvm+`,
+the CVM/GPU hosts), `directfs=false` makes the sandbox fall back to the
+gofer-only filesystem path, and platform initialization dies immediately —
+`initialize systrap: unable to attach: operation not permitted` in the
+sandbox's own oci-log, surfaced to the client only as the generic
+`cannot read client sync file: waiting for sandbox to start: EOF`. Isolated
+live via single-flag bisection: `directfs=false` alone, with every other
+flag absent, reproduces the failure against a bare `podman run --runtime
+runsc`; every other flag here, individually and combined, boots fine. The
+platform's own `hive-cell-agent` sandboxes never pass `--directfs` and boot
+correctly on the same kernel.
 
 ## Network enforcement and restore ordering
 

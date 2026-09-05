@@ -13,13 +13,20 @@
 //!    from the native output directory.
 
 pub mod build_output;
+pub mod deployment_snapshot;
 pub mod framework;
 pub mod nextjs;
 pub mod parser;
 pub mod per_route;
+pub mod repository_snapshot;
 pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
+pub use deployment_snapshot::{
+    BuildAuthoritySnapshot, BuildOutputInventorySeals, ComposeServiceIdentity, ContentSeal,
+    DeploymentBuildContract, DeploymentBuildSnapshot, ResolvedOciIdentity, SourceSnapshot,
+    DEPLOYMENT_BUILD_SNAPSHOT_SCHEMA,
+};
 pub use framework::{
     detect, detect_checked, detect_package_manager, detect_package_manager_checked,
     package_manager, plan_build, plan_build_checked_with_package_manager,
@@ -29,13 +36,19 @@ pub use framework::{
 };
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
+pub use repository_snapshot::{
+    ApplicationSnapshot, BuildSteps, ExactShellCommand, FixedArgv, FrameworkSnapshot,
+    GeneratedStep, MetadataInputSeal, PackageManagerSnapshot, ParentPath, RepositoryBuildContract,
+    RepositoryBuildSnapshot, RepositoryCoordinates, RepositoryPath, StepAuthority,
+    WorkspaceSnapshot,
+};
 pub use vercel_config::{
     load_vercel_config, load_vercel_config_checked, ConditionValue, VercelCondition, VercelConfig,
     VercelCron, VercelFunction, VercelHeader, VercelHeaderRule, VercelImages, VercelRedirect,
     VercelRewrite,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
@@ -120,7 +133,7 @@ impl std::error::Error for BuildContractError {}
 
 /// A normalized output directory relative to the selected application. This is
 /// the only output-path form accepted by checked build planning.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OutputDirectory(String);
 

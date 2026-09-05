@@ -53,6 +53,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
+        .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
@@ -112,6 +113,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/deployments/:id", delete(dep_delete))
         .route("/v1/deployments/:id/resources", get(deployment_resources))
         .route("/v1/deployments/:id/build", get(deployment_build))
+        .route("/v1/deployments/:id/integrity", get(deployment_integrity))
         .route(
             "/v1/deployments/:id/service-graph",
             get(deployment_service_graph),
@@ -355,6 +357,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
+        .route(
+            "/v1/admin/projects/:project/team",
+            post(admin_set_project_team),
+        )
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -365,6 +371,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_admission::routes())
         // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
         .merge(crate::browser_artifacts::routes())
+        // ---- Immutable runtime artifact transfer (bounded, durable, mesh-internal) ----
+        .merge(crate::runtime_artifact_transfer::routes())
         // ---- Browser-replicated database exchange (fleet-initiated pull) ----
         .merge(crate::browser_db::routes())
         // ---- browser_db libsql/Hrana + Upstash REST surface (owner-proxied) ----
@@ -382,6 +390,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::sandboxes_api::routes())
         // ---- Storage broker: Firecracker cell data-image snapshots ----
         .merge(crate::storage_api::routes())
+        // ---- Cloudflare Queues parity (crate::queues) ----
+        .merge(crate::queues_api::routes())
         // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
         .merge(crate::db_rest::routes())
@@ -1958,7 +1968,7 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
 /// Body-carrying POST forward to a specific node's admin surface — the POST
 /// counterpart of `put_to_host` (PUT), same node_admins-then-iroh-mesh
 /// fallback shape.
-async fn post_to_host_json(
+pub(crate) async fn post_to_host_json(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,
@@ -1983,7 +1993,7 @@ async fn post_to_host_json(
             }
         }
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
                 request = request.bearer_auth(token);
             }
         }
@@ -3459,6 +3469,54 @@ pub(crate) async fn deployment_build(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`) — build
+/// acceptance, publish, and execution facts, each entry's fold hashed into
+/// `chain_head_sha256`, the whole chain signed by this node's per-node key
+/// (`integrity_signer.rs`). A caller re-derives `chain_head_sha256` from
+/// `chain` with `hive_core::fold_integrity_chain` and checks the signature
+/// against `public_key_hex` — no trust in this response beyond the raw
+/// bytes returned. See `hive_core::integrity`'s module doc for exactly what
+/// this does and does not prove (tamper-evidence, never tamper-prevention).
+pub(crate) async fn deployment_integrity(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(acceptance) = c.deployment_ledger.acceptance(&id) {
+        let team_ok = norm(&c.projects.team_of(&acceptance.input.project)) == norm(&t)
+            || norm(&record_tenant(&acceptance.input.project)) == norm(&t);
+        if !team_ok {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let chain_head_sha256 =
+            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
+        let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
+            .integrity_chain
+            .iter()
+            .map(|e| &e.kind)
+            .filter(|k| matches!(k, hive_core::IntegrityEntryKind::SepKeyProvisioned { .. }))
+            .collect();
+        return Ok(Json(json!({
+            "deployment_id": id,
+            "chain": acceptance.integrity_chain,
+            "chain_head_sha256": chain_head_sha256,
+            "signatures": [signature],
+            "sep_public_keys": sep_public_keys,
+        })));
+    }
+    if let Some(node) = host_node_for_deployment(&c, &id) {
+        if let Some(v) =
+            fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/integrity"), &t).await
+        {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
 /// Publish the host subdomains this node serves + its gateway URL, so peers can
 /// build their cross-node routing tables (the mesh routes requests to wherever a
 /// deployment actually lives).
@@ -3519,6 +3577,43 @@ async fn resources_get(
             "city": n.city, "country": n.country, "healthy": n.healthy,
         })).collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Deserialize)]
+struct SetProjectTeamReq {
+    team: String,
+}
+
+/// Operator-only repair for a project stuck at `__untagged__` (created before
+/// tenancy tagging existed, or a tag write that never landed) — real,
+/// witnessed failure mode: `mien-kamp` had zero deployments, zero relational
+/// rows, and settings.team == "__untagged__", so EVERY ownership check in the
+/// platform (the coordinator's own `authorized` gate in `project_delete`, and
+/// the peer-side gossip cascade's `owns_settings`/`owns_deploys`/
+/// `owns_relational` in `gossip.rs`) correctly refused every tenant,
+/// including the platform owner's own "personal" tenant — an untagged
+/// project the owner created is otherwise permanently undeletable, since
+/// `norm("__untagged__")` is NOT the empty-string case `norm()` maps to
+/// "personal". `spawn_tenancy_reconcile` only ever ADDS a tag when it can
+/// infer one from a deployment/relational record — a project with neither
+/// has nothing to infer from and stays untagged forever without a manual
+/// fix. Mirrors `ProjectStore::set_team`'s existing local-write +
+/// fleet-relational-mirror behavior exactly; this endpoint is just the
+/// missing operator-facing door to it.
+async fn admin_set_project_team(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(body): Json<SetProjectTeamReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let team = body.team.trim();
+    if team.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "team must not be empty".into()));
+    }
+    c.projects.set_team(&project, team);
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "project": project, "team": team })))
 }
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
@@ -3917,6 +4012,34 @@ pub(crate) fn require_auth_read(
     } else {
         Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
     }
+}
+
+/// Like [`require_auth_read`], but also honors the internal node-to-node
+/// forward trust (`x-hive-internal` == `HIVE_INTERNAL_TOKEN`, constant-time
+/// compare — the same trust `require_operator_or_internal` grants). Needed by
+/// handlers a peer node probes for its OWN infra facts (not tenant data) on a
+/// caller's behalf, e.g. `billing_addons`'s leader-preflight forward — that
+/// hop carries no bearer token and must not require one to answer a
+/// node-local capability check.
+pub(crate) fn require_auth_read_or_internal(
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+) -> Result<(), (StatusCode, String)> {
+    if require_auth_read(claims).is_ok() {
+        return Ok(());
+    }
+    if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+        if !t.trim().is_empty()
+            && headers
+                .get("x-hive-internal")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ct_eq(v, &t))
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
 }
 
 /// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
@@ -5537,13 +5660,26 @@ async fn project_delete(
             // 30s — an answer slower than that reads as failure even when the
             // cascade later succeeds. Peers the quick pass could not reach get the
             // full retry budget DETACHED below.
+            //
+            // 28s, not the old 20s: `dispatch_project_delete_with`'s own worst
+            // case chains HTTP-capabilities + HTTP-delete + mesh-capabilities +
+            // mesh-delete (the last kept intentionally generous for discovery
+            // fallback, see its own comment) — even after trimming the other
+            // three legs, that sum is ~31s, so a 20s outer cap could kill the
+            // future before it ever reached the mesh fallback it exists to
+            // provide. Witnessed live: a real project delete failed with
+            // "accepted == 0 across all 23 peers" on every attempt, because
+            // every peer with real-but-imperfect HTTP admin connectivity spent
+            // its entire budget stuck on the HTTP leg. 28s stays under the 30s
+            // proxy ceiling with 2s of margin for the response to actually
+            // return.
             let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
                 let c = c.clone();
                 let project = project.clone();
                 let t = t.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
+                        std::time::Duration::from_secs(28),
                         dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
@@ -5801,11 +5937,24 @@ pub(crate) async fn dispatch_project_delete_with(
         // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
+            // Budgeted, not the old flat 5s/15s/10s/20s: this whole function
+            // runs inside the caller's own 20s-per-peer timeout (team_delete's
+            // quick pass), and unlike a single-shot call this one chains FOUR
+            // network round trips in the worst case (HTTP capabilities, HTTP
+            // delete, mesh capabilities, mesh delete) when the HTTP path is
+            // slow-but-not-dead rather than cleanly absent. The old
+            // 5+15+10+20=50s sum could never fit the 20s budget, so a peer
+            // with imperfect-but-real HTTP admin connectivity burned its
+            // ENTIRE budget on the HTTP leg and never reached the mesh
+            // fallback the function is written to fall back to — exactly the
+            // "accepted == 0 across all peers" failure witnessed live deleting
+            // a real project. Shrunk so the four-hop worst case (3+5+3+6=17s)
+            // leaves headroom inside the 20s cap.
             if !http_generation_v1 {
                 http_generation_v1 = match c
                     .http
                     .get(format!("{admin}/v1/project-delete/capabilities"))
-                    .timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(3))
                     .send()
                     .await
                 {
@@ -5841,13 +5990,13 @@ pub(crate) async fn dispatch_project_delete_with(
                 }
                 if crate::auth::enforced() {
                     if let Ok(token) =
-                        crate::auth::issue("mesh-internal", team, "service", false, 60)
+                        crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)
                     {
                         request = request.bearer_auth(token);
                     }
                 }
                 match request
-                    .timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(5))
                     .send()
                     .await
                 {
@@ -5879,6 +6028,16 @@ pub(crate) async fn dispatch_project_delete_with(
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
             if !mesh_generation_v1 {
+                // 6s, not the 10s original NOR the over-corrected 3s: this is
+                // the ONLY transport ever exercised on a Firecracker fleet
+                // (`node_admins` is empty there, so the HTTP leg above never
+                // runs at all — its own timeouts cost nothing real here).
+                // Measured cross-continent mesh dial latency on this fleet
+                // reaches ~4.3s (lax) on a cold connection, so 3s risked
+                // failing the capabilities probe on real, healthy links
+                // rather than fixing anything — the actual bottleneck this
+                // whole change targets is the DELETE call below, which stays
+                // at its original, deliberately generous timeout.
                 mesh_generation_v1 = crate::gossip::request_to(
                     c,
                     &id,
@@ -5886,7 +6045,7 @@ pub(crate) async fn dispatch_project_delete_with(
                     hive_p2p::GOSSIP_GET,
                     "/v1/project-delete/capabilities",
                     &[],
-                    10,
+                    6,
                 )
                 .await
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
@@ -6644,7 +6803,7 @@ pub(crate) async fn fetch_bytes_from_host(
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(15));
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6666,7 +6825,7 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     // proxied here silently 403'd. Attach the same short-lived signed service
     // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6774,7 +6933,7 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
         return String::new();
     }
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
             return format!("team={team}&tok={tok}");
         }
     }
@@ -7027,7 +7186,7 @@ async fn project_redeploy(
             );
             let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
                 .await
-                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
             return Ok(Json(json!({ "build_id": build_id })));
         }
         if let Some(host) = host_node_for_source_ids(&c, &source_ids) {
@@ -7052,7 +7211,7 @@ async fn project_redeploy(
                         Some(incarnation),
                     )
                     .await
-                    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+                    .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
             }
@@ -7096,7 +7255,7 @@ async fn project_redeploy(
         req.image_ref = Some(image_ref);
         let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
             .await
-            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+            .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
@@ -7114,7 +7273,7 @@ async fn project_redeploy(
     );
     let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
     Ok(Json(json!({ "build_id": build_id })))
 }
 
@@ -8473,6 +8632,26 @@ async fn heap_profile(
         StatusCode::NOT_IMPLEMENTED,
         "heap profiling is Linux-only".to_string(),
     ))
+}
+
+/// Host listener audit (operator). NODE-LOCAL, exactly like `/v1/dns/stats`:
+/// the report describes the node that answers, so through the dashboard's
+/// `/ops/*` proxy you are reading the LEADER's host, not the page-serving
+/// node's — the fleet view is `scripts/audit-public-listeners.sh`. `last` is
+/// `null` until the first pass (~30 s after boot); `supported: false` means
+/// the host has no `/proc/net/tcp` (macOS), which is "not audited", never
+/// "clean". See `listener_audit`.
+async fn host_listeners(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let range = crate::listener_audit::audited_range();
+    Ok(Json(json!({
+        "node": c.node_name,
+        "range": [range.0, range.1],
+        "last": crate::listener_audit::last(),
+    })))
 }
 
 /// Geo-DNS observability (operator): live Seer query counters, the
@@ -13017,7 +13196,7 @@ fn ns(
 /// admin router is bound to the public API host (main.rs), so an arbitrary
 /// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok`
 /// carries a short-lived signed token (minted the same way as `mesh_team_qs`,
-/// `crate::auth::issue("mesh-internal", team, "service", false, 60)`) — only a
+/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`) — only a
 /// caller holding `HIVE_JWT_SECRET` can produce one, closing the cross-tenant
 /// write bypass. When JWT enforcement is off (dev/single-node), the raw header
 /// is trusted as before (nothing to forge against). Normal writes resolve the
@@ -15241,12 +15420,32 @@ async fn billing_wallet_config(
 /// cannot, WHY. The dashboard reads this to render a disabled control with the
 /// operator's remedy instead of a Buy button that answers with an HTTP error
 /// only after the user clicks it. Tenant-authed (same read bar as billing).
+///
+/// GETs are served node-local (see `main.rs`'s admin_ingress dispatch doc) —
+/// correct for gossip-replicated tenant state, wrong here: Tencent
+/// credentials are NODE-LOCAL infrastructure config, so different nodes give
+/// genuinely different (not just eventually-consistent) answers. A tenant
+/// landing on a non-Tencent or not-yet-configured node saw "not available"
+/// even on a fleet where the purchase path (leader-forwarded, always a
+/// credentialed node per `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a
+/// local preflight failure, ask the leader's own view before answering
+/// "unavailable" — the leader is always Tencent-credentialed by the same
+/// invariant `provision_from_checkout` already relies on. Fail OPEN toward
+/// the local answer if the leader can't be reached, never hang the endpoint.
 async fn billing_addons(
-    State(_c): State<Arc<CloudState>>,
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth_read(claims.as_ref().map(|e| &e.0)).map_err(|e| (e.0, e.1))?;
-    let (available, reason) = match crate::tencent_eip::preflight() {
+    require_auth_read_or_internal(&headers, claims.as_ref().map(|e| &e.0))
+        .map_err(|e| (e.0, e.1))?;
+    let mut result = crate::tencent_eip::preflight();
+    if result.is_err() && !c.is_control_plane_leader() {
+        if let Some(leader_result) = crate::tencent_eip::leader_preflight(&c).await {
+            result = leader_result;
+        }
+    }
+    let (available, reason) = match result {
         Ok(()) => (true, String::new()),
         Err(why) => (
             false,

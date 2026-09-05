@@ -70,6 +70,30 @@ const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: false,
 
+  // Pin the Turbopack workspace root to this app. The monorepo's outer
+  // package.json is an empty stub with its own near-empty lockfile — without
+  // this, Turbopack's root inference warns on every build and (more than
+  // cosmetic) could resolve module/cache boundaries against the wrong root,
+  // undermining 16.3's filesystem cache correctness.
+  turbopack: {
+    root: import.meta.dirname,
+  },
+
+  // Next.js 16.3 Instant Navigations: Cache Components (Partial Prerendering
+  // + the `use cache` model) and Partial Prefetching (one reusable shell per
+  // ROUTE instead of per link). Adopted INCREMENTALLY, per Vercel's own
+  // migration guide: every route started opted out of instant-navigation
+  // validation via `instant = false` (the cache-components-instant-false
+  // codemod), then converted one at a time, verified via `npm run build` +
+  // a live `next start` smoke test after each batch. 52 of 53 routes are now
+  // fully adopted (real PPR — see the build output's ◐ markers). The one
+  // holdout is app/layout.tsx: Clerk's own <SignIn>/<SignUp> call
+  // usePathname() internally with no Suspense boundary of their own, inside
+  // <ClerkProvider> which wraps this whole tree — see that file's own
+  // comment for the full trace. Not fixable from app code alone.
+  cacheComponents: true,
+  partialPrefetching: true,
+
   // The upstream @workflow/web console (mounted at /workflows via
   // app/wf-console/[[...slug]]/route.ts) loads its compiled Express app from
   // node_modules at runtime — keep it (and express) external so Next doesn't
@@ -193,7 +217,10 @@ const nextConfig = {
     // CSP is now ENFORCING (promoted from report-only). The policy allows the
     // app's real origins (verified from the codebase: client data goes
     // same-origin through /cloud + /api/* server proxies → `connect-src 'self'`;
-    // Clerk auth origins; GitHub avatar images via `img-src https:`). `script-src`
+    // the sandbox interactive-shell websocket is the one exception — Next.js
+    // rewrites proxy plain HTTP only, never a websocket Upgrade handshake, so
+    // it dials `wss://<admin-host>` directly, hence `wss://*.shadw.cloud`
+    // below; Clerk auth origins; GitHub avatar images via `img-src https:`). `script-src`
     // carries `'unsafe-inline'` because Next.js emits inline hydration/bootstrap
     // scripts and this build has no per-request nonce pipeline — the OTHER
     // directives still deliver the high-value protections (connect-src bounds
@@ -227,7 +254,7 @@ const nextConfig = {
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud wss://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
       `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",
@@ -246,7 +273,7 @@ const nextConfig = {
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud wss://*.shadw.cloud https://*.relay.shadw.app:3343 wss://*.relay.shadw.app:3343`,
       `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",

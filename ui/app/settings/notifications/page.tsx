@@ -55,8 +55,15 @@ export default function NotificationsPage() {
 
   useEffect(() => {
     const s = localStorage.getItem("hive_notif");
-    if (s) try { const v = JSON.parse(s); setChan(v.chan ?? chan); setGrid(v.grid ?? {}); } catch {}
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (s) try {
+      const v = JSON.parse(s);
+      // Functional updates read the latest chan/grid without needing them in
+      // the dep array -- this effect only runs once, on mount, to hydrate
+      // from localStorage (a browser-only API unavailable during SSR).
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setChan((c) => v.chan ?? c);
+      setGrid(v.grid ?? {});
+    } catch {}
   }, []);
   function persist(nextChan = chan, nextGrid = grid) {
     localStorage.setItem("hive_notif", JSON.stringify({ chan: nextChan, grid: nextGrid }));
@@ -301,6 +308,11 @@ function PushSmsDelivery({
     if (!data || smsSeeded.current) return;
     smsSeeded.current = true;
     if (data.sms) {
+      // One-time seed of locally-editable state (phone input, switch) from
+      // the first async poll response -- `data` isn't available at mount for
+      // a lazy initializer, and the ref guard deliberately prevents later
+      // poll ticks from clobbering in-progress user edits.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPhone(data.sms.phone);
       setSmsEnabled(data.sms.enabled);
       setSmsVerified(data.sms.verified);

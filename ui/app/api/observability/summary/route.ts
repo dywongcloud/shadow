@@ -44,8 +44,6 @@ import { resolveTeam, fetchMetricsSummary, BackendFetchError } from "@/lib/obser
 
 // Node runtime: `backend()` reads server-only config and talks to the local
 // admin socket, neither of which exists on the edge runtime.
-export const runtime = "nodejs";
-
 /** Seconds a shared cache may serve this summary without revalidating. */
 const S_MAXAGE = 30;
 /** Seconds past expiry a stale summary may still be served instantly. */

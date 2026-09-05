@@ -34,17 +34,19 @@ struct Candidate {
     score: u8,
 }
 
-pub(crate) async fn select(root: &Path) -> anyhow::Result<Option<Selection>> {
-    // Explicit root contracts are authoritative. A direct root application
-    // (prebuilt output, recognized framework, or start script) also wins before
-    // workspace inference; only a bare root index participates in member ranking.
+pub(crate) async fn select(
+    root: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
+) -> anyhow::Result<Option<Selection>> {
+    // Explicit root contracts are authoritative. Without one, discovery is
+    // intentionally cardinality-based: exactly one deployable application may be
+    // inferred, while any larger set requires an explicit Root Directory.
     if has_root_contract(root).await? {
         return Ok(None);
     }
-    let Some(workspace) = crate::workspace::load(root).await? else {
+    let Some(workspace) = workspace else {
         return Ok(None);
     };
-    workspace_package_names(root, &workspace).await?;
 
     let unsupported = unsupported_root_markers(root).await?;
     let mut candidates = Vec::new();
@@ -94,35 +96,23 @@ pub(crate) async fn select(root: &Path) -> anyhow::Result<Option<Selection>> {
             evidence: candidate.evidence.clone(),
         })
         .collect::<Vec<_>>();
-    let direct_root = candidates
-        .iter()
-        .position(|candidate| candidate.relative.as_os_str().is_empty() && candidate.score > 1);
-    let candidate = if let Some(index) = direct_root {
-        // A real root application contract (prebuilt output, recognized framework,
-        // or start script) wins before workspace inference. A bare root index.html
-        // remains weak evidence so it cannot hide a stronger nested application.
-        candidates.remove(index)
-    } else {
-        let winner_score = candidates[0].score;
-        candidates.retain(|candidate| candidate.score == winner_score);
-        if candidates.len() > 1 {
-            let choices = candidates
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{} [{}]",
-                        display_relative(&candidate.relative),
-                        candidate.evidence.join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::bail!(
-                "multiple deployable workspace applications were found: {choices}; set Root Directory explicitly"
-            );
-        }
-        candidates.remove(0)
-    };
+    if candidates.len() > 1 {
+        let choices = candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{} [{}]",
+                    display_relative(&candidate.relative),
+                    candidate.evidence.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "multiple deployable workspace applications were found: {choices}; set Root Directory explicitly"
+        );
+    }
+    let candidate = candidates.remove(0);
     let report = DiscoveryReportV1 {
         policy_version: DISCOVERY_POLICY_VERSION,
         declaration_source: workspace.source.to_string(),
@@ -147,8 +137,12 @@ pub(crate) async fn select(root: &Path) -> anyhow::Result<Option<Selection>> {
     }))
 }
 
-pub(crate) async fn is_member(root: &Path, candidate: &Path) -> anyhow::Result<bool> {
-    let Some(workspace) = crate::workspace::load(root).await? else {
+pub(crate) fn is_member(
+    root: &Path,
+    candidate: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
+) -> anyhow::Result<bool> {
+    let Some(workspace) = workspace else {
         return Ok(false);
     };
     let relative = candidate.strip_prefix(root).map_err(|_| {
@@ -165,6 +159,7 @@ pub(crate) async fn is_member(root: &Path, candidate: &Path) -> anyhow::Result<b
 pub(crate) async fn runtime_include_rel(
     root: &Path,
     selected: &Path,
+    workspace: Option<&crate::workspace::Workspace>,
 ) -> anyhow::Result<hive_backend::runtime_artifact::RuntimeArtifactClosure> {
     let selected_relative = selected.strip_prefix(root).map_err(|_| {
         anyhow::anyhow!(
@@ -173,7 +168,7 @@ pub(crate) async fn runtime_include_rel(
             root.display()
         )
     })?;
-    let Some(workspace) = crate::workspace::load(root).await? else {
+    let Some(workspace) = workspace else {
         return Ok(Default::default());
     };
     if selected_relative.as_os_str().is_empty()
@@ -269,10 +264,7 @@ pub(crate) enum WorkspaceOrchestrator {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BuildContract {
-    WorkspaceRoot {
-        orchestrator: WorkspaceOrchestrator,
-        package_name: String,
-    },
+    WorkspaceRoot { orchestrator: WorkspaceOrchestrator },
     SelectedApp,
     FrameworkDefault,
 }
@@ -305,26 +297,12 @@ pub(crate) async fn build_contract(
                     anyhow::anyhow!("repository root scripts.build must be a string")
                 })?;
                 if let Some(orchestrator) = workspace_orchestrator(build)? {
-                    let workspace = workspace.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "selected application {} was marked as a workspace member, but no checked workspace snapshot exists",
-                            display_relative(relative)
-                        )
-                    })?;
-                    let names = workspace_package_names(root, workspace).await?;
-                    let package_name = names
-                        .iter()
-                        .find_map(|(name, member)| (member == relative).then(|| name.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "selected workspace application {} must declare a unique package.json name for filtered builds",
-                                display_relative(relative)
-                            )
-                        })?;
-                    return Ok(BuildContract::WorkspaceRoot {
-                        orchestrator,
-                        package_name,
-                    });
+                    anyhow::ensure!(
+                        workspace.is_some(),
+                        "selected application {} was marked as a workspace member, but no checked workspace snapshot exists",
+                        display_relative(relative)
+                    );
+                    return Ok(BuildContract::WorkspaceRoot { orchestrator });
                 }
             }
         }

@@ -200,6 +200,9 @@ export default function IntegrationsPage() {
     // GitHub card (status/scopes/orgs), never credential-linked into deployments.
     // Just refresh the card so a completed OAuth reflects immediately.
     if (slug === "github") {
+      // One-time reaction to the OAuth-callback URL param on mount — not a
+      // subscription, a genuine external-system (browser URL) sync.
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time OAuth-callback URL handling on mount, not a subscription
       setLinkMsg({ tone: "ok", text: "GitHub connected." });
       refreshGh();
       return;
@@ -232,6 +235,9 @@ export default function IntegrationsPage() {
 
   useEffect(() => {
     // Enriched GitHub status + accessible orgs (short cache; reflects connection state).
+    // Fetch-on-mount: refreshGh sets state only after its internal awaits resolve,
+    // syncing external (server) GitHub connection state into React.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount; state is set only after an internal await, not synchronously
     refreshGh();
   }, [refreshGh]);
 
@@ -275,8 +281,14 @@ export default function IntegrationsPage() {
   const safePage = Math.min(page, pageCount - 1);
   const shown = filtered.slice(safePage * PER_PAGE, safePage * PER_PAGE + PER_PAGE);
 
-  // Reset to page 0 whenever the search changes.
-  useEffect(() => { setPage(0); }, [q]);
+  // Reset to page 0 whenever the search changes — adjusted during render
+  // (React's "adjusting state when a prop changes" pattern) instead of an
+  // effect, avoiding an extra render on every keystroke.
+  const [prevQ, setPrevQ] = useState(q);
+  if (q !== prevQ) {
+    setPrevQ(q);
+    if (page !== 0) setPage(0);
+  }
 
   async function connectToolkit(slug: string) {
     setConnecting(slug);

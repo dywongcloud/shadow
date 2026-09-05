@@ -23,6 +23,7 @@ export function DeploymentResources({ deploymentId }: { deploymentId?: string })
   const [assetLimit, setAssetLimit] = useState(10);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect reacting to a changing deploymentId prop, not an initial-mount-only value
     if (!deploymentId) { setLoading(false); return; }
     setLoading(true);
     apiGet<Resources>(`/v1/deployments/${encodeURIComponent(deploymentId)}/resources`)

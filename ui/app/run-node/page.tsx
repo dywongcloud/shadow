@@ -219,6 +219,7 @@ export default function RunNodePage() {
           // "none" restores as "auto" too (see TARGET_KEY's note) — the node it
           // named would contribute nothing, which is exactly what this build
           // stopped offering.
+          // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate post-mount hydration to avoid an SSR/CSR mismatch (#418, see comment above); a lazy initializer would read localStorage during the server render and diverge from the client's first paint
           setSelection(parsed.deployment ? { deployment: parsed.deployment, fn: parsed.fn } : "auto");
           if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
         }
@@ -343,6 +344,11 @@ export default function RunNodePage() {
     } else if (geoDecision !== "granted") {
       localStorage.removeItem(GEO_COORDS_KEY);
     }
+    // Deliberately depend on the primitive lat/lon, not the `coords` object
+    // reference: requestLocation() below can produce a new object with
+    // identical values, and depending on the object would re-run this
+    // (harmless but wasteful) localStorage write on every such tick.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally narrowed to primitives; see comment above
   }, [geoDecision, coords?.lat, coords?.lon]);
 
   function decideGeo(next: "granted" | "denied") {

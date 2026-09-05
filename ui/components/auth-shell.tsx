@@ -25,6 +25,7 @@ export function AuthShell({
 }) {
   const { resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- hydration-mismatch-avoidance mount flag: render neutral state until client mount, then reveal theme-dependent UI
   useEffect(() => setMounted(true), []);
   const dark = mounted && resolvedTheme === "dark";
 

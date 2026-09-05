@@ -11,9 +11,14 @@
 //! * [`logcap`] — bounded capture of tenant subprocess output (the one place
 //!   this crate touches I/O, and only through `std::io`/an optional
 //!   `tokio::io` trait — still no runtime, no executor).
+//! * [`integrity`] — the tamper-EVIDENCE hash-chain vocabulary (see its own
+//!   module doc for the honest scope limits) shared between `hive-cloud`
+//!   (the authoritative writer, via `deployment_ledger`) and `fluid-compute`
+//!   (which cannot depend on `hive-cloud` — see `ExecutionObserver`).
 
 pub mod error;
 pub mod ids;
+pub mod integrity;
 pub mod job;
 pub mod logcap;
 pub mod proto;
@@ -22,6 +27,7 @@ pub mod time;
 
 pub use error::{fault, HiveError, Result};
 pub use ids::{BoxId, CellId, HiveId, JobId};
+pub use integrity::{ExecutionObserver, IntegrityEntry, IntegrityEntryKind, fold_integrity_chain};
 pub use job::{BuildJob, ResourceSpec};
 pub use logcap::{CappedLine, LOG_CAP_STATS, MAX_LOG_LINE_BYTES};
 pub use proto::*;

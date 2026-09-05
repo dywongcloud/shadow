@@ -3,10 +3,6 @@ import type { Metadata } from "next";
 import { CodeBlock } from "@/components/code-block";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
-// Perf: prerender this public page (see root layout note).
-export const dynamic = "force-static";
-export const revalidate = 3600;
-
 export const metadata: Metadata = {
   title: "REST API Reference — autheo Docs",
   description:

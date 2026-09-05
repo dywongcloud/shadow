@@ -42,6 +42,10 @@ export default function StatusPage() {
   const { data } = usePoll<Incident[]>("/v1/incidents", 5000);
   const [now, setNow] = useState(0);
   useEffect(() => {
+    // Date.now() is client-only and time-varying -- cannot be computed during
+    // SSR/lazy-init without a hydration mismatch; the `now ? ... : ""` render
+    // guard covers the gap until this effect first fires.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(id);
