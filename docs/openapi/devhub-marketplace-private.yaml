@@ -1,0 +1,232 @@
+openapi: 3.1.0
+info:
+  title: DevHub Marketplace private API
+  version: 1.0.0
+  description: |
+    **PRIVATE_SERVICE_TO_SERVICE.** This is the Marketplace-to-DevHub integration
+    implemented by `hive-cloud`. It is not a browser API and is not an L0 mesh
+    API. Marketplace talks only to DevHub through the four routes below;
+    DevHub owns Hive scheduling.
+
+    Deployment expectation: expose this only to the Marketplace service over a
+    private, authenticated service path. Documentation does not authorize a
+    public route or bypass Hive Admin authentication.
+servers:
+  - url: http://127.0.0.1:8786
+    description: Example local/private DevHub upstream; not an Internet endpoint.
+security:
+  - marketplaceHmac: []
+paths:
+  /v1/marketplace/l0/deployments:
+    get:
+      operationId: listMarketplaceL0Deployments
+      summary: List currently eligible L0 deployment advertisements
+      x-autheo-security-classification: PRIVATE_SERVICE_TO_SERVICE
+      description: |
+        Returns only healthy, connected, eligible Firecracker nodes or
+        artifact-capable Litebox nodes with at least 1 GiB memory and either
+        unknown disk telemetry or 20+ GiB free. Provider recipients come solely
+        from operator configuration. Results expire after 60 seconds.
+      responses:
+        '200':
+          description: Sanitized capacity advertisements
+          content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentList'}}}
+        '401': {$ref: '#/components/responses/InvalidSignature'}
+        '409': {$ref: '#/components/responses/Replay'}
+  /v1/marketplace/payment-intents:
+    post:
+      operationId: createMarketplacePaymentIntent
+      summary: Create or return an immutable payment intent
+      x-autheo-security-classification: PRIVATE_SERVICE_TO_SERVICE
+      description: Requires `Idempotency-Key`. The selected advertisement must
+        still be cached and unexpired, with matching provider and canonical node.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/PaymentIntentRequest'}}}
+      responses:
+        '200':
+          description: Created or prior response for the idempotency key
+          content: {application/json: {schema: {$ref: '#/components/schemas/PaymentIntent'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/InvalidSignature'}
+        '409': {$ref: '#/components/responses/DeploymentUnavailable'}
+        '503': {$ref: '#/components/responses/SettlementUnavailable'}
+  /v1/marketplace/payments/verify:
+    post:
+      operationId: verifyMarketplacePayment
+      summary: Verify a payment receipt against its immutable intent snapshot
+      x-autheo-security-classification: PRIVATE_SERVICE_TO_SERVICE
+      description: Repeating the same transaction hash is idempotent. A different
+        hash after binding returns `payment_intent_already_bound`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SettlementVerificationRequest'}}}
+      responses:
+        '200':
+          description: Receipt status (`pending`, `awaiting_confirmations`, `verified`, or `failed`)
+          content: {application/json: {schema: {$ref: '#/components/schemas/SettlementVerification'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/InvalidSignature'}
+        '404': {$ref: '#/components/responses/IntentNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /v1/marketplace/l0/allocations:
+    post:
+      operationId: submitMarketplaceL0Allocation
+      summary: Submit a verified settlement for constrained Hive scheduling
+      x-autheo-security-classification: PRIVATE_SERVICE_TO_SERVICE
+      description: |
+        Requires `Idempotency-Key`. DevHub re-derives the advertisement from the
+        live registry and passes a one-node allowlist to Hive scheduling. It never
+        substitutes a different node. Duplicate keys return the existing status.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AllocationRequest'}}}
+      responses:
+        '200':
+          description: Allocation accepted or duplicate response
+          content: {application/json: {schema: {$ref: '#/components/schemas/AllocationResponse'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/InvalidSignature'}
+        '404': {$ref: '#/components/responses/IntentNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+components:
+  securitySchemes:
+    marketplaceHmac:
+      type: apiKey
+      in: header
+      name: X-Marketplace-Signature
+      description: |
+        All five headers are required: `X-Marketplace-Key-Id`,
+        `X-Marketplace-Timestamp`, `X-Marketplace-Nonce`,
+        `X-Marketplace-Content-SHA256`, and this hexadecimal HMAC-SHA256
+        signature. DevHub reads credentials from
+        `HIVE_MARKETPLACE_HMAC_KEYS=<key-id>:<secret>[,...]`; Marketplace must
+        map its `DEVHUB_MARKETPLACE_KEY_ID` and
+        `DEVHUB_MARKETPLACE_SIGNING_SECRET` to an entry there.
+
+        The complete Marketplace router verifies these headers against the
+        exact raw request body before any endpoint handler runs. Canonical UTF-8 input is
+        `METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY)`.
+        GET signs the SHA-256 of an empty body. The timestamp is Unix
+        milliseconds and must be within 300000 ms of DevHub's clock. The nonce
+        (1–128 characters) is durable, scoped by `key-id:nonce`, single-use for
+        600000 ms, and persisted only after all header, digest, timestamp, and
+        signature validation succeeds. Digest/signature failure,
+        missing/malformed headers, unknown keys, and clock expiry are rejected;
+        a reused nonce is HTTP 409.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+      example: allocation-6f4e9c
+  responses:
+    BadRequest: {description: '`invalid_request`, invalid address/amount/order/hash, or missing idempotency key', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    InvalidSignature: {description: '`invalid_marketplace_signature`, `invalid_marketplace_key`, `invalid_marketplace_digest`, or `marketplace_request_expired`', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    Replay: {description: '`marketplace_nonce_replayed`', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    DeploymentUnavailable: {description: '`deployment_unavailable`', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    SettlementUnavailable: {description: '`settlement_unavailable`', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    IntentNotFound: {description: '`payment_intent_not_found`', content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+    Conflict: {description: One of the documented allocation or verification conflict errors, content: {application/json: {schema: {$ref: '#/components/schemas/APIError'}}}}
+  schemas:
+    APIError:
+      type: object
+      required: [error]
+      properties: {error: {type: string}}
+    Capacity:
+      type: object
+      required: [vcpu, ram_mib, storage_gib]
+      properties: {vcpu: {type: integer}, ram_mib: {type: integer}, storage_gib: {type: integer}}
+    ResourceAdvertisement:
+      type: object
+      properties: {available: {type: boolean}, capacity_units: {type: integer, example: 1}}
+    Deployment:
+      type: object
+      required: [deployment_id, provider_id, canonical_node_id, provider_recipient, region, runtime, capabilities, availability, health, issued_at, expires_at, configuration_reference]
+      properties:
+        deployment_id: {type: string, example: dep_0123456789abcdef}
+        provider_id: {type: string}
+        canonical_node_id: {type: string}
+        provider_recipient: {type: string, pattern: '^0x[a-f0-9]{40}$'}
+        region: {type: string}
+        runtime: {type: string}
+        capabilities: {$ref: '#/components/schemas/Capacity'}
+        availability: {$ref: '#/components/schemas/ResourceAdvertisement'}
+        health: {type: string, const: healthy}
+        issued_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        revoked_at: {type: [string, 'null'], format: date-time}
+        configuration_reference: {type: string, const: l0-config-v1}
+    DeploymentList:
+      type: object
+      required: [data]
+      properties: {data: {type: array, items: {$ref: '#/components/schemas/Deployment'}}}
+    SettlementSnapshot:
+      type: object
+      required: [profile, network, currency, chain_id, token_contract, fee_recipient, fee_bps, settlement_contract, settlement_event_signature, confirmation_policy, configuration_reference, settlement_contract_version, settlement_contract_status, audited_approved, eligible_for_new_intents]
+      properties:
+        profile: {type: string, example: autheo-testnet-v1}
+        network: {type: string, example: Autheo Testnet}
+        currency: {type: string, const: THEO}
+        chain_id: {type: integer, example: 785}
+        chain_id_hex: {type: string, example: '0x311'}
+        token_contract: {type: string}
+        token_decimals: {type: integer, const: 18}
+        rpc_url: {type: string, format: uri}
+        explorer_url: {type: string, format: uri}
+        fee_recipient: {type: string}
+        fee_bps: {type: integer, const: 500}
+        settlement_contract: {type: string}
+        settlement_event_signature: {type: string}
+        confirmation_policy: {type: object, properties: {minimum_confirmations: {type: integer, const: 2}}}
+        configuration_reference: {type: string}
+        settlement_contract_version: {type: integer, enum: [1, 2]}
+        settlement_contract_status: {type: string, enum: [active, historical]}
+        audited_approved: {type: boolean}
+        eligible_for_new_intents: {type: boolean}
+    PaymentIntentRequest:
+      type: object
+      required: [deployment_id, provider_id, canonical_node_id, order_reference, gross_amount_atomic, buyer_address]
+      properties:
+        deployment_id: {type: string}
+        provider_id: {type: string}
+        canonical_node_id: {type: string}
+        order_reference: {type: string, pattern: '^0x[a-fA-F0-9]{64}$'}
+        gross_amount_atomic: {type: string, pattern: '^[0-9]+$'}
+        buyer_address: {type: string, pattern: '^0x[a-fA-F0-9]{40}$'}
+    PaymentIntent:
+      type: object
+      properties:
+        payment_intent_id: {type: string}
+        expires_at: {type: string, format: date-time}
+        amount_atomic: {type: string}
+        order_reference: {type: string}
+        settlement_key: {type: string}
+        settlement_contract: {type: string}
+        settlement_version: {type: integer}
+        configuration_reference: {type: string}
+        verification_status: {type: string, enum: [pending, awaiting_confirmations, verified, failed]}
+        required_confirmations: {type: integer}
+        settlement: {$ref: '#/components/schemas/SettlementSnapshot'}
+    SettlementVerificationRequest:
+      type: object
+      required: [payment_intent_id, transaction_hash]
+      properties: {payment_intent_id: {type: string}, transaction_hash: {type: string, pattern: '^0x[a-fA-F0-9]{64}$'}}
+    SettlementVerification:
+      type: object
+      properties: {payment_intent_id: {type: string}, status: {type: string}, settlement_key: {type: [string, 'null']}, settlement_contract: {type: string}, settlement_version: {type: integer}, configuration_reference: {type: string}, event_log_index: {type: [integer, 'null']}, required_confirmations: {type: integer}}
+    AllocationRequest:
+      type: object
+      required: [payment_intent_id, tenant_id, resources, deployment]
+      properties:
+        payment_intent_id: {type: string}
+        tenant_id: {type: string}
+        resources: {type: object, properties: {vcpu: {type: integer}, memory_mb: {type: integer}, disk_gb: {type: integer}, gpu: {type: boolean}, runtime: {type: [string, 'null']}, region: {type: [string, 'null']}}}
+        deployment: {type: object, description: 'The implemented `fluid_core::GitDeployRequest` wire shape; DevHub overwrites marketplace-sensitive placement fields.'}
+    AllocationResponse:
+      type: object
+      required: [allocation_id, status]
+      properties: {allocation_id: {type: string, description: 'The order reference'}, status: {type: string, enum: [submitted, scheduled, failed]}, build_id: {type: [string, 'null']}}

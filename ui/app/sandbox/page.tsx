@@ -13,7 +13,7 @@ interface SandboxResp {
 }
 
 export default function SandboxPage() {
-  const [code, setCode] = useState("echo 'hello from a OpenEdge sandbox'\nuname -a\npython3 -c 'print(2**16)'");
+  const [code, setCode] = useState("echo 'hello from a DevHub sandbox'\nuname -a\npython3 -c 'print(2**16)'");
   const [resp, setResp] = useState<SandboxResp | null>(null);
   const [running, setRunning] = useState(false);
 

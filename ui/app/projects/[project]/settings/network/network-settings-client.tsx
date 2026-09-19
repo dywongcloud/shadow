@@ -43,7 +43,7 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   // The purchase record (survives across redeploys) — separate from the
   // deployment-stamped `dedicated_ipv4` below, which only appears once a
   // deploy AFTER purchase actually attaches the address. Polled so a return
-  // from Stripe checkout (or the webhook completing) reflects here with no
+  // from a completed wallet-signed THEO checkout reflects here with no
   // manual refresh.
   const { data: pSettings, refresh: refreshSettings } = usePoll<ProjectSettings>(
     `/v1/projects/${encodeURIComponent(project)}/settings`,

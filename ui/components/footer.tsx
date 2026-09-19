@@ -1,11 +1,24 @@
 "use client";
 
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Logo } from "@/components/logo";
 
 export function Footer() {
+  return (
+    <Suspense fallback={null}>
+      <FooterContent />
+    </Suspense>
+  );
+}
+
+function FooterContent() {
   const pathname = usePathname();
+  const [year, setYear] = useState<number | null>(null);
+  useEffect(() => {
+    setYear(new Date().getFullYear());
+  }, []);
   // The ops console + auth + public status pages render their own chrome.
   if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status") || pathname.startsWith("/docs")) return null;
 
@@ -25,7 +38,7 @@ export function Footer() {
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <span>© {new Date().getFullYear()} OpenEdge</span>
+          <span>© {year ?? ""} Autheo DevHub</span>
           <Link href="/network" className="hover:text-fg">Status</Link>
           <Link href="/settings" className="hover:text-fg">Privacy</Link>
           <Link href="/settings" className="hover:text-fg">Terms</Link>

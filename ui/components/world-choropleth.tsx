@@ -218,7 +218,7 @@ export function WorldChoropleth({
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         className="block w-full bg-white dark:bg-black"
         role="img"
-        aria-label={`World map — ${nodesByCountry.size} countries with a live shadw node`}
+        aria-label={`World map — ${nodesByCountry.size} countries with a live autheo node`}
       >
         <g
           style={{

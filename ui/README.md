@@ -11,11 +11,49 @@ cargo run -p hive-cloud -- --region sfo1 --name node-a   # public :8787, admin :
 
 # 2) Start the dashboard (this dir)
 npm install
-npm run dev            # http://localhost:3000
+npm run dev            # http://localhost:3001
 ```
 
 The dashboard proxies `/cloud/*` → the node's admin API (`HIVE_ADMIN`, default
 `http://127.0.0.1:8786`) via a Next.js rewrite, so there's no CORS setup.
+
+## Marketplace
+
+Set `MARKETPLACE_URL=http://localhost:3000` when Marketplace runs locally
+(for example, Autheo.dev on port 3001). This server-only URL is required for
+Marketplace deployment-policy retrieval. Set
+`NEXT_PUBLIC_MARKETPLACE_URL=http://localhost:3000` too when browser navigation
+and project-resource links should point at that local Marketplace. In production
+the public navigation URL defaults to `https://marketplace.autheo.dev`; the
+server-side deployment origin remains explicit.
+
+The primary header opens Marketplace as an external link. Project pages include
+Compute and Storage browse links that carry the project ID, resource type, and
+return URL. After checkout, Marketplace redirects back with
+`marketplace_order=<order-id>` and Autheo.dev attaches the authenticated order
+through the documented server-side integration contract in
+[`docs/marketplace-project-resources.md`](../docs/marketplace-project-resources.md).
+
+For the Clerk-authenticated Marketplace deployment flow, including the
+`autheo-marketplace-v1` JWT template, the isolated JWKS-validating fixture, and
+all manual policy cases, see
+[`docs/devhub-marketplace-placement-policy.md`](../docs/devhub-marketplace-placement-policy.md).
+
+## THEO settlement and market reference
+
+Autheo.dev settles paid plans, credits, and add-ons in $THEO only. The checkout
+uses an EIP-1193-compatible browser wallet to submit an ERC-20 transfer to the
+configured treasury; no wallet secret or card data is collected by the app.
+
+Configure `THEO_CHAIN_ID`, `THEO_CHAIN_NAME`, `THEO_RPC_URL`,
+`THEO_EXPLORER_URL`, `THEO_TOKEN_ADDRESS`, `THEO_TREASURY_ADDRESS`,
+`THEO_TOKEN_DECIMALS`, and `THEO_REQUIRED_CONFIRMATIONS` on the hive-cloud
+node. The node's `/v1/billing/wallet-config` and checkout payment-intent
+responses are the UI's source of truth for the canonical token, recipient,
+chain and confirmation policy; browser configuration is not trusted.
+`THEO_MARKET_PAIR_ADDRESS` defaults to the Base/Hydrex pair
+`0x182be47742b81777055d69c50e5c9d2fe803e938`. The Dexscreener THEO/USD quote is
+informational only and is never used to calculate, convert, or settle a charge.
 
 ## Local full-page testing (JWT path)
 

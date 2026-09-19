@@ -1,5 +1,5 @@
 import { clerkClient, clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 // Public routes (no auth required): sign-in/up + the node API proxy + static.
 const isPublic = createRouteMatcher([
@@ -50,6 +50,9 @@ const isPublic = createRouteMatcher([
 // .env) can no longer disable auth for every account, since NODE_ENV is set by
 // the Next.js production build/start itself, not by an easily-copied env file.
 const bypass = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== "production";
+const clerkConfigured =
+  !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY &&
+  !!process.env.CLERK_SECRET_KEY;
 
 // Sensitive / highly-dynamic surfaces that must NEVER be client- or CDN-cached:
 // personal settings, team settings + org management, project settings, project
@@ -224,7 +227,7 @@ async function isPlatformOwner(userId: string): Promise<boolean> {
   }
 }
 
-const clerk = clerkMiddleware(async (auth, req) => {
+const clerk = clerkConfigured ? clerkMiddleware(async (auth, req) => {
   if (isAdminRoute(req)) {
     // Must be signed in AND on the owner allow-list. Deliberately does NOT
     // call bare `auth().protect()` here (see the self-connect-storm note
@@ -277,7 +280,7 @@ const clerk = clerkMiddleware(async (auth, req) => {
     await auth.protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(returnTo)}`, publicBase).toString() });
   }
   return withCache(req, NextResponse.next());
-});
+}) : null;
 
 // WORKAROUND (self-hosted `next start` infinite self-connect storm): every
 // clerkMiddleware() invocation that ends in NextResponse.next() gets rewritten
@@ -328,9 +331,22 @@ export const proxy = bypass
   ? corsWrapped((req: Request & { nextUrl: { pathname: string }; method: string }) =>
       withCache(req, NextResponse.next()),
     )
-  : corsWrapped(
-      async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
-        const res = await clerk(req, event);
+  : !clerkConfigured
+    ? corsWrapped((req: NextRequest) => {
+        if (isAdminRoute(req)) {
+          if (req.nextUrl.pathname.startsWith("/ops")) {
+            return withCache(req, NextResponse.json({ error: "forbidden" }, { status: 403 }));
+          }
+          return withCache(req, NextResponse.redirect(new URL("/", req.url)));
+        }
+        return withCache(req, NextResponse.next());
+      })
+    : corsWrapped(
+      async (
+        req: Parameters<NonNullable<typeof clerk>>[0],
+        event: Parameters<NonNullable<typeof clerk>>[1],
+      ) => {
+        const res = await clerk!(req, event);
         return neutralizeClerkSelfRewrite(req, res ?? NextResponse.next());
       },
     );

@@ -1,0 +1,401 @@
+openapi: 3.1.0
+info:
+  title: Hive Admin / control-plane API
+  version: 1.0.0
+  description: "**INTERNAL CONTROL PLANE \u2014 NOT A PUBLIC API.**\nDeployment expectation: Hive Admin is bound to loopback\
+    \ by default. A private management bind requires `HIVE_ADMIN_PRIVATE_NETWORK=1`\nplus `HIVE_JWT_SECRET`; public, wildcard,\
+    \ and link-local binds fail startup. Public host dispatch explicitly rejects Admin.\nMarketplace must not call\
+    \ this API; it calls the private DevHub Marketplace\nAPI instead. The source router is `crates/hive-cloud/src/admin.rs`,\
+    \ with\nmodule routes merged in `main.rs`.\n"
+servers:
+- url: http://127.0.0.1:8786
+  description: Default loopback binding. Do not publish through a public reverse proxy.
+security:
+- hiveJwt: []
+paths:
+  /healthz:
+    get:
+      summary: Process liveness
+      security: []
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: 'Unauthenticated minimal liveness only; loopback/private management networking only.'
+      responses:
+        '200':
+          description: Plain-text `ok`
+  /v1/mesh:
+    get:
+      summary: Local mesh membership health
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT/API-key identity required when `HIVE_JWT_SECRET` is configured.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+  /v1/nodes:
+    get:
+      summary: List registered nodes and facts
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT/API-key identity required when `HIVE_JWT_SECRET` is configured.
+      responses:
+        '200':
+          description: Node registry
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Node'
+  /v1/resources:
+    get: &id001
+      summary: Internal read operation
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT/API-key identity required when `HIVE_JWT_SECRET` is configured; handler authorization remains route-specific.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+  /v1/leases:
+    get: *id001
+  /v1/cluster:
+    get: *id001
+  /v1/overview:
+    get: *id001
+  /v1/fleet-deployments:
+    get: *id001
+  /deployments:
+    get:
+      summary: List tenant deployments
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT/API-key identity when enforcement is enabled; tenant-scoped handler authorization.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+    post:
+      summary: Create a deployment
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT or tenant API key required when `HIVE_JWT_SECRET` is set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Deployment'
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/deployments/{id}:
+    delete: &id002
+      summary: Internal mutation operation
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT/API-key required when `HIVE_JWT_SECRET` is configured; handler applies tenant/operator authorization.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/deployments/{id}/resources:
+    get: *id001
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/deployments/{id}/build:
+    get: *id001
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/deployments/{id}/promote:
+    post: *id002
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/nodes/announce:
+    post:
+      summary: Announce a mesh node
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: JWT required when enforcement is enabled; trust/identity validation is handler-specific.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/mesh/roster:
+    get: *id001
+  /v1/mesh/admit:
+    post: *id002
+  /v1/mesh/discovery:
+    get: *id001
+  /v1/mesh/health-guard:
+    get: *id001
+  /v1/gpu-pools:
+    get: *id001
+  /v1/inference:
+    get: *id001
+  /v1/functions:
+    get: *id001
+  /v1/builds/{id}:
+    get: *id001
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/builds/{id}/cancel:
+    post: *id002
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/deploy/zip:
+    post: *id002
+  /v1/deploy/image:
+    post: *id002
+  /v1/runtime-artifact/v1/git/deploy:
+    post: *id002
+  /v1/git/deploy:
+    post: *id002
+  /v1/projects/{project}/settings:
+    get: *id001
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/projects/{project}/build:
+    put: *id002
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/projects/{project}/functions:
+    put: *id002
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/projects/{project}/env:
+    post: *id002
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/projects/{project}/env/{key}:
+    delete: *id002
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: key
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/projects/{project}/redeploy:
+    post: *id002
+    parameters:
+    - name: project
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/ratelimit:
+    get: *id001
+    put: *id002
+  /v1/waf:
+    get: *id001
+  /v1/waf/rules:
+    post: *id002
+  /v1/cdn/purge:
+    post: *id002
+  /v1/cron:
+    get: *id001
+    post: *id002
+  /v1/workflows:
+    get: *id001
+    post: *id002
+  /v1/workflows/runs:
+    get: *id001
+  /v1/databases:
+    get: *id001
+    post: *id002
+  /v1/databases/{id}:
+    get: *id001
+    delete: *id002
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/storage/blob/{bucket}/{key}:
+    get: *id001
+    put: *id002
+    parameters:
+    - name: bucket
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: key
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/storage/queue/{queue}:
+    get: *id001
+    post: *id002
+    parameters:
+    - name: queue
+      in: path
+      required: true
+      schema:
+        type: string
+  /v1/teams:
+    get: *id001
+    post: *id002
+  /v1/billing:
+    get: *id001
+  /v1/billing/checkout:
+    post: *id002
+  /v1/incidents:
+    get: *id001
+    post: *id002
+  /v1/admin/overview:
+    get: &id003
+      summary: Platform operator read operation
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: Platform operator authorization (`platform_admin`) in handler.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/admin/audit:
+    get: *id003
+  /v1/admin/marketplace:
+    get: *id003
+  /v1/admin/sql/query:
+    post:
+      summary: Run an admin SQL query
+      x-autheo-security-classification: INTERNAL_CONTROL_PLANE
+      x-autheo-auth: Platform operator authorization in handler.
+      responses:
+        '200':
+          $ref: '#/components/responses/Json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/debug/heap:
+    get: *id001
+  /v1/debug/memory:
+    get: *id001
+components:
+  securitySchemes:
+    hiveJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 JWT (`HIVE_JWT_SECRET`) or a `hive_` tenant API key. Every Admin route except minimal `/healthz`
+        rejects an absent or invalid credential when `HIVE_JWT_SECRET` is configured. Routes using their own mandatory
+        credential scheme (webhooks, Marketplace HMAC, database bearers, and WebDAV) remain separate. This API is
+        loopback/private-management-only.
+  responses:
+    Json:
+      description: Handler-specific JSON response
+    Unauthorized:
+      description: Missing or invalid bearer token
+    Forbidden:
+      description: Valid identity lacks tenant or platform-operator authorization
+  schemas:
+    Node:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        region:
+          type: string
+        healthy:
+          type: boolean
+        backend:
+          type: string
+    NodeFacts:
+      type: object
+      properties:
+        cpu_cores:
+          type: integer
+        mem_total_mb:
+          type: integer
+        disk_free_gb:
+          type: integer
+        gpu_count:
+          type: integer
+    Capacity:
+      type: object
+      properties:
+        vcpu:
+          type: integer
+        memory_mb:
+          type: integer
+        disk_gb:
+          type: integer
+    ResourceAdvertisement:
+      type: object
+      properties:
+        provider_id:
+          type: string
+        canonical_node_id:
+          type: string
+    Deployment:
+      type: object
+      description: Deployment requests/responses are handler-specific; consult `fluid_core::GitDeployRequest` for the precise
+        accepted input.
+    PaymentIntent:
+      type: object
+    SettlementSnapshot:
+      type: object
+    SettlementVerification:
+      type: object
+    AllocationRequest:
+      type: object
+    AllocationResponse:
+      type: object
+    UsageRecord:
+      type: object
+    APIError:
+      type: object
+      properties:
+        error:
+          type: string

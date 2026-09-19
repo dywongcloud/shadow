@@ -299,20 +299,9 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
     }
 }
 
-/// The CONTAINER-side port + transport protocol from a `ports:` sequence
-/// ("HOST:CONTAINER", "PORT", "IP:HOST:CONTAINER", "…/udp", or the long-syntax
-/// `{ target: N, protocol: "udp" }`). We want what the app listens on, plus whether
-/// the mapping declared a real transport change — see [`ParsedService::protocol`].
-fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
-    container_ports(ports)
-        .first()
-        .map(|p| (p.container, p.protocol))
-}
-
 /// EVERY container-side port in a `ports:` sequence, in declaration order, deduped
-/// on (port, protocol). Same per-entry grammar as [`container_port`], which is now
-/// just "the first of these" — see [`ParsedService::all_ports`] for why the rest
-/// must not be dropped on the floor.
+/// on (port, protocol) — see [`ParsedService::all_ports`] for why the rest must
+/// not be dropped on the floor.
 fn container_ports(ports: &[serde_yaml::Value]) -> Vec<ComposePort> {
     let mut out: Vec<ComposePort> = Vec::new();
     for p in ports {

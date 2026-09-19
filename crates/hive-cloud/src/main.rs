@@ -59,6 +59,7 @@ mod integrations;
 mod integrity_signer;
 mod lease;
 mod listener_audit;
+mod marketplace;
 mod memwatch;
 mod mesh_raw;
 mod mesh_shell;
@@ -418,6 +419,11 @@ async fn async_main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The default hook still prints exactly as before, while this additionally
+    // leaves the first panic on disk for restart_audit. That is essential for
+    // a double-panic abort: Rust's final "panic in a destructor" line hides
+    // the original failure that actually needs fixing.
+    restart_audit::install_panic_hook();
     // Install the process-level rustls CryptoProvider FIRST (later installs
     // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
     // rustls features, so any rustls user that runs before one of the lazy
@@ -536,6 +542,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
     }
+    validate_admin_bind(args.admin)?;
 
     // Restart audit — FIRST thing after the diagnostics, before any subsystem
     // can wedge or overwrite state. A node killed by the cgroup OOM killer is
@@ -723,7 +730,7 @@ async fn async_main() -> anyhow::Result<()> {
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
     // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
-    let build_isolation_protocol = match build_executor::init_installed().await {
+    let _build_isolation_protocol = match build_executor::init_installed().await {
         Ok(protocol) => {
             tracing::info!(protocol, "BuildExecutor live probe passed");
             Some(protocol)
@@ -1915,6 +1922,9 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        // Marketplace is authenticated with its own service credential inside
+        // the module; it must never consume a DevHub hive_jwt.
+        .merge(crate::marketplace::routes(cloud.clone()))
         // guardian-growth-and-gc-observability: guardian.rs owns this route's
         // handler/state end-to-end (single-writer scope), so it merges here
         // rather than adding a line inside admin::router() itself. Same
@@ -1930,59 +1940,45 @@ async fn async_main() -> anyhow::Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             admin_max_body,
         ))
-        .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            admin_req_timeout,
+        ));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
 
-    // Host-based dispatch (real-DNS ingress): on the shared public listener,
-    // `Host: api.{platform_domain}` routes to the ADMIN router (the platform
-    // API), everything else — `*.{apps_domain}` etc. — to the deployment edge
-    // pipeline. Only active when `HIVE_INGRESS != ngrok`; in ngrok mode the
-    // public listener is byte-identical to today. Exposing the admin API on a
-    // public host REQUIRES JWT enforcement — refuse to split otherwise.
+    // Host-based dispatch for real-DNS ingress. The shared public listener
+    // never publishes the Admin router: `api.`, `admin.`, `webhook.`, and
+    // region-pinned `api-*.` names deliberately return 404. User traffic is
+    // served only by the deployment edge and dashboard proxy below. Admin,
+    // Marketplace, and webhooks stay on the loopback/private Admin listener.
     let public = if cloud.ingress != "ngrok" {
-        if !auth::enforced() {
-            tracing::error!(
-                "HIVE_INGRESS={} requires HIVE_JWT_SECRET (the admin API becomes publicly addressable at api.{}); keeping single-router listener",
-                cloud.ingress, cloud.platform_domain
-            );
-            public
-        } else {
-            let api_host = format!("api.{}", cloud.platform_domain);
-            // Ops/admin console host — the operator surface, distinct from the
-            // developer/API-key `api.` host (both currently reach the admin router).
-            let admin_host = format!("admin.{}", cloud.platform_domain);
-            // Incoming GitOps/OpenEdge build-notification receiver
-            // (OPENEDGE_WEBHOOK_URL, /v1/git/webhook) — same admin router, its own
-            // host so webhook traffic is distinguishable from the api./admin.
-            // developer/operator surfaces.
-            let webhook_host = format!("webhook.{}", cloud.platform_domain);
-            // Dashboard hosts (apex + www): reverse-proxied to `HIVE_DASHBOARD_UPSTREAM`
-            // — each node's own self-hosted dashboard on loopback
-            // (http://127.0.0.1:3002), never an external tunnel. Empty upstream =
-            // no dashboard hosts.
-            let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
-                .ok()
-                .map(|v| v.trim().trim_end_matches('/').to_string())
-                .filter(|v| !v.is_empty());
-            let dash_hosts = vec![
-                cloud.platform_domain.clone(),
-                format!("www.{}", cloud.platform_domain),
-            ];
-            tracing::info!(%api_host, %admin_host, %webhook_host, dashboard = ?dash_upstream, "host-based dispatch active (api/admin/webhook hosts → admin router; apex/www → dashboard proxy)");
-            host_switch_router(
-                cloud.clone(),
-                api_host,
-                admin_host,
-                webhook_host,
-                dash_hosts,
-                dash_upstream,
-                cloud.http.clone(),
-                admin_router.clone(),
-                public,
-            )
-        }
+        let api_host = format!("api.{}", cloud.platform_domain);
+        let admin_host = format!("admin.{}", cloud.platform_domain);
+        let webhook_host = format!("webhook.{}", cloud.platform_domain);
+        // Dashboard hosts (apex + www): reverse-proxied to `HIVE_DASHBOARD_UPSTREAM`
+        // — each node's own self-hosted dashboard on loopback
+        // (http://127.0.0.1:3002), never an external tunnel. Empty upstream =
+        // no dashboard hosts.
+        let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+        let dash_hosts = vec![
+            cloud.platform_domain.clone(),
+            format!("www.{}", cloud.platform_domain),
+        ];
+        tracing::info!(%api_host, %admin_host, %webhook_host, dashboard = ?dash_upstream, "host-based dispatch active (reserved Admin hosts reject public requests; apex/www → dashboard proxy)");
+        host_switch_router(
+            api_host,
+            admin_host,
+            webhook_host,
+            dash_hosts,
+            dash_upstream,
+            cloud.http.clone(),
+            public,
+        )
     } else {
         public
     };
@@ -2299,32 +2295,22 @@ async fn admin_loopback_forward(
 }
 
 /// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the
-/// PLATFORM API + API-key surface), `admin.{platform_domain}` (the ops/admin
-/// console surface) AND `webhook.{platform_domain}` (incoming GitOps/OpenEdge
-/// build-notification receiver, `OPENEDGE_WEBHOOK_URL`) → the admin router; the
-/// dashboard hosts → the dashboard proxy; anything else → the deployment edge
-/// pipeline. Implemented as a fallback handler that oneshots into the matching
-/// inner router, so the x-hive-proxied loop guard, WS upgrade path and
-/// everything else inside each router are untouched. Host matching is
-/// case-insensitive and strips `:port`. api/admin/webhook share one router
-/// today (same auth); the split is by HOSTNAME so each reads as its own
-/// surface, and they can diverge (separate auth/route sets) without touching
-/// this dispatch.
+/// Reserved Admin names (`api.`, `admin.`, `webhook.`, and `api-<region>.`)
+/// reject all public requests. The dashboard hosts proxy only to the local UI;
+/// all other hosts reach the tenant deployment edge. This explicit deny route
+/// prevents a future public-host change from accidentally publishing the broad
+/// private Admin router.
 fn host_switch_router(
-    cloud: Arc<CloudState>,
     api_host: String,
     admin_host: String,
     webhook_host: String,
     dash_hosts: Vec<String>,
     dash_upstream: Option<String>,
     http: reqwest::Client,
-    admin: axum::Router,
     public: axum::Router,
 ) -> axum::Router {
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, response::IntoResponse};
     let handler = move |req: Request<Body>| {
-        let cloud = cloud.clone();
-        let admin = admin.clone();
         let public = public.clone();
         let api_host = api_host.clone();
         let admin_host = admin_host.clone();
@@ -2367,10 +2353,7 @@ fn host_switch_router(
                 })
                 .unwrap_or(false);
             if host == api_host || host == admin_host || host == webhook_host || region_api {
-                // Pass the MATCHED host so a leader-forward pins to the right SNI
-                // (the platform cert covers api./admin./webhook. and, once the
-                // SAN-coverage reissue lands, every api-<region>.).
-                return admin_ingress(cloud, admin, host, req).await;
+                return axum::http::StatusCode::NOT_FOUND.into_response();
             }
             // Dashboard hosts: reverse-proxy to the configured origin — each
             // node's own self-hosted dashboard on loopback, never an external
@@ -2388,6 +2371,34 @@ fn host_switch_router(
         }
     };
     axum::Router::new().fallback(handler)
+}
+
+/// Admin is a private control-plane listener, never a public ingress
+/// implementation detail. Loopback is always safe. A private management
+/// address requires both enforced JWT authentication and an explicit operator
+/// acknowledgement; unspecified, link-local, and globally-routable binds fail
+/// before the node opens any listeners.
+fn validate_admin_bind(addr: SocketAddr) -> anyhow::Result<()> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    let private_management_address = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private(),
+        std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+    };
+    let private_management_enabled =
+        std::env::var("HIVE_ADMIN_PRIVATE_NETWORK").ok().as_deref() == Some("1");
+    if private_management_address && private_management_enabled && auth::enforced() {
+        tracing::warn!(
+            %addr,
+            "Admin bound on explicitly enabled private management network; public ingress remains disabled"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing unsafe Admin bind {addr}: use loopback, or set HIVE_ADMIN_PRIVATE_NETWORK=1 \
+         with HIVE_JWT_SECRET on an RFC1918/IPv6-ULA management address"
+    )
 }
 
 /// Regional AdminAPI ingress for `api.{platform_domain}`. Runs on EVERY healthy
@@ -2530,6 +2541,9 @@ async fn admin_ingress(
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
+            // Separate Marketplace service authentication is checked by its
+            // handlers, never by the DevHub hive_jwt gate.
+            || path.starts_with("/v1/marketplace/")
             // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
             // Per-project browser_db REST bearer, not a platform JWT — see

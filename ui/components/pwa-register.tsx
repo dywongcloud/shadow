@@ -2,7 +2,7 @@
 
 import { useEffect } from "react";
 
-// Registers the service worker so shadw is installable + works offline.
+// Registers the service worker so autheo is installable + works offline.
 // No-op in browsers without service-worker support.
 export function PwaRegister() {
   useEffect(() => {
@@ -25,12 +25,12 @@ export function PwaRegister() {
       if (refreshing || !hadController) return;
       refreshing = true;
       try {
-        const raw = sessionStorage.getItem("shadw-sw-reloads");
+        const raw = sessionStorage.getItem("autheo-sw-reloads");
         const now = Date.now();
         const hits = (raw ? (JSON.parse(raw) as number[]) : []).filter((t) => now - t < 60_000);
         if (hits.length >= 2) return; // latched: ride the current build
         hits.push(now);
-        sessionStorage.setItem("shadw-sw-reloads", JSON.stringify(hits));
+        sessionStorage.setItem("autheo-sw-reloads", JSON.stringify(hits));
       } catch {
         /* storage unavailable (private mode) — reload unlatched, worst case matches old behavior */
       }

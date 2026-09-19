@@ -17,7 +17,7 @@
   ansible.posix.synchronize:
     src: "{{ playbook_dir }}/../../ui/"
     dest: "{{ hive_src_dir }}/ui/"
-    delete: false
+    delete: true
     rsync_opts:
       - "--exclude=node_modules"
       - "--exclude=.next"
@@ -28,6 +28,21 @@
     src: env.local.j2
     dest: "{{ hive_src_dir }}/ui/.env.local"
     mode: "0640"
+
+- name: Install hive-ui runtime environment file
+  ansible.builtin.template:
+    src: env.local.j2
+    dest: /etc/hive-ui.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart hive-ui
+
+- name: Restore SELinux context on hive-ui runtime environment
+  ansible.builtin.command:
+    cmd: restorecon -v /etc/hive-ui.env
+  changed_when: false
 
 # Discover node's DIRECTORY so the systemd unit's PATH can include it.
 #
@@ -88,6 +103,28 @@
   async: 900
   poll: 15
   notify: restart hive-ui
+
+- name: Ensure hive-ui runtime directory exists
+  ansible.builtin.file:
+    path: /opt/hive-ui
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Publish hive-ui runtime from built source
+  ansible.builtin.command:
+    cmd: >
+      rsync -a --delete
+      --exclude='.env.local'
+      {{ hive_src_dir }}/ui/
+      /opt/hive-ui/
+  notify: restart hive-ui
+
+- name: Restore SELinux context on hive-ui runtime tree
+  ansible.builtin.command:
+    cmd: restorecon -RFv /opt/hive-ui
+  changed_when: false
 
 - name: Template the hive-ui systemd unit
   ansible.builtin.template:

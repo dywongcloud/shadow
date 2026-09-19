@@ -1746,7 +1746,6 @@ export interface BillingAccount {
   included_cents: number;
   used_cents: number;
   balance_cents: number;
-  stripe_customer: string;
   period_start_ms: number;
   period_end_ms: number;
   updated_ms: number;
@@ -1754,7 +1753,6 @@ export interface BillingAccount {
 export interface BillingInfo {
   account: BillingAccount;
   plans: PlanSpec[];
-  stripe: boolean;
   rate_card?: RateCard;
   limits?: PlanLimits;
   current_invoice?: Invoice;

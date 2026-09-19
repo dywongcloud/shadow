@@ -4,11 +4,23 @@ import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
+
+/** Development minting may only reach a local Admin listener. This keeps a
+ * developer's bypass flags from becoming credentials for a remote/private
+ * environment through a copied `HIVE_ADMIN` value. */
+function localAdminUpstream(): boolean {
+  try {
+    const host = new URL(ADMIN).hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    return false;
+  }
+}
 // Platform owner(s) — the accounts that keep the legacy "personal" tenant (all
 // other accounts are isolated under `u_<uid>`). Mirrors the backend's
 // HIVE_OWNER_EMAIL authoritative check. Determined HERE from the verified Clerk
 // email rather than from `/v1/identity/sync`, because that endpoint is an
-// auth-gated mutation and 401s at the enforced api.shadw.cloud ingress BEFORE we
+// auth-gated mutation and 401s at the enforced api.autheo.dev ingress BEFORE we
 // hold a token (the mint is the token bootstrap). The tenant we compute is only
 // trusted by the backend because the mint (`/v1/token`) is `x-hive-internal`-
 // gated — a non-owner can neither reach the mint nor be assigned "personal" here.
@@ -96,7 +108,10 @@ export async function POST(req: NextRequest) {
     // testing exercises the REAL production mint→cookie→JWT-tenant path
     // (401-remint included) instead of reading the anonymous/empty tenant.
     // Never production-reachable by construction.
-    const devMint = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== "production";
+    const devMint =
+      process.env.HIVE_AUTH_BYPASS === "1" &&
+      process.env.NODE_ENV !== "production" &&
+      localAdminUpstream();
     if (!devMint) {
       return NextResponse.json({ ok: false, reason: "clerk-disabled" });
     }

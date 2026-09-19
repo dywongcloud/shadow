@@ -5,7 +5,7 @@ import { useMemo } from "react";
 /**
  * Inline equirectangular dotted world map for the Function Regions setting.
  *
- * The land dots are sampled from the OpenEdge region art into a fixed GW×GH
+ * The land dots are sampled from the DevHub region art into a fixed GW×GH
  * grid, and the selected-region markers are projected into that SAME grid via
  * lon/lat, so a marker always lands on the correct part of the map. Colors are
  * driven by Tailwind theme tokens (`text-*` / `dark:`), so the map background

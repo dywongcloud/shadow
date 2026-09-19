@@ -916,7 +916,7 @@ const US_SMS_GATEWAYS: &[&str] = &[
 /// Deliver ONE plaintext message to one carrier-gateway recipient over SMTP.
 /// Returns Ok on a 2xx to the final `.`; Err with the SMTP reason otherwise.
 async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let domain = to
         .split('@')
         .nth(1)
