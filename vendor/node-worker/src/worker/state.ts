@@ -22,6 +22,10 @@ export function setNet(net: {
 	relayToken?: string;
 	peerToken?: string;
 }) {
+	// The URL arrives already resolved: the host picked it (caller, platform
+	// relay, or an opted-in public fallback proven reachable) before the worker
+	// started — see ../../wire/wisp.ts. Undefined here means "this worker has no
+	// network", and epoxy turns that into a named error at the first socket.
 	WISP_URL = net.wispUrl || undefined;
 	RELAY_TOKEN = net.relayToken || undefined;
 	PEER_TOKEN = net.peerToken || undefined;

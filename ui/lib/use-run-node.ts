@@ -121,6 +121,141 @@ function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[
   return { host, end };
 }
 
+/** The page half of node-worker's synchronous-`fs` bridge
+ *  (bn-node-worker-service-worker-sync-fs).
+ *
+ *  `navigator.serviceWorker` is `[Exposed=Window]` — it exists in NEITHER
+ *  worker context this file drives — so the run-node worker cannot register
+ *  node-worker's sw.js itself, and without that registration there is no
+ *  synchronous `fs` and therefore no working `require` inside a guest app.
+ *  It brokers the registration through a connected page exactly like the mesh
+ *  agent above:
+ *
+ *    worker -> page : { type: "syncFsRegisterRequest", requestId,
+ *                       swUrl, workerUrl, agentUrl }
+ *    page  -> worker: { type: "syncFsRegisterResult", requestId, ok, ... | error }
+ *
+ *  The page is trusted with nothing here either: it registers, reports what it
+ *  registered (scope / scriptURL / prefix) and stops. It never sees a mount, a
+ *  capability or a byte — all of that stays in the worker. THE REGISTRATION
+ *  LOGIC ITSELF lives in the published module, not here, for the same reason
+ *  peer-mesh-agent.js does: one contract, one build, loaded from the deployed
+ *  origin at runtime. */
+type SyncFsAgentModule = {
+  registerNodeWorkerSyncFs: (options: {
+    swUrl: string;
+    workerUrl: string;
+    scope?: string;
+  }) => Promise<{ scope: string; scriptURL: string; prefix: string; workerCovered: boolean }>;
+};
+
+function createSyncFsBroker(post: (message: unknown) => void) {
+  // Monotonic: an in-flight import whose request was superseded (or whose page
+  // is unmounting) never reports a stale registration.
+  let generation = 0;
+
+  const host = (requestId: number, swUrl: string, workerUrl: string, agentUrl?: string) => {
+    const mine = ++generation;
+    // The worker is the authority on where these assets live (it resolves them
+    // against its own import.meta.url); the origin fallback keeps an older
+    // worker's request working.
+    const url = agentUrl || `${window.location.origin}/browser-node/sync-fs-agent.js`;
+    void (import(/* webpackIgnore: true */ /* turbopackIgnore: true */ url) as Promise<SyncFsAgentModule>)
+      .then((module) =>
+        mine === generation ? module.registerNodeWorkerSyncFs({ swUrl, workerUrl }) : null,
+      )
+      .then((result) => {
+        if (mine !== generation || !result) return;
+        post({
+          type: "syncFsRegisterResult",
+          requestId,
+          ok: true,
+          scope: result.scope,
+          scriptURL: result.scriptURL,
+          prefix: result.prefix,
+        });
+      })
+      .catch((error: unknown) => {
+        if (mine !== generation) return;
+        // The reason is already a named `sync_fs_<reason>: <fix>` string from
+        // the agent; passing it through verbatim is what makes the failure
+        // actionable in the worker's status instead of a bare DOMException.
+        post({
+          type: "syncFsRegisterResult",
+          requestId,
+          ok: false,
+          error: String((error as { message?: string })?.message ?? error).slice(0, 300),
+        });
+      });
+  };
+
+  return { host };
+}
+
+/** The page half of the node-worker EXECUTION lane
+ *  (bn-node-worker-substrate / execution-path-swap-off-quickjs).
+ *
+ *  Browser artifacts run in a vendored node-worker Worker — not in QuickJS, and
+ *  not in the run-node worker: node-worker's module resolver is synchronous end
+ *  to end, so its synchronous `fs` is a blocking XHR that only a service worker
+ *  can answer, and `navigator.serviceWorker` is `[Exposed=Window]`. A
+ *  SharedWorker global scope additionally has no `Worker` constructor, so the
+ *  run-node worker cannot even start the guest — it asks a connected page to
+ *  HOST it and bridge a MessageChannel to it:
+ *
+ *    worker -> page : { type: "nodeWorkerRequest", requestId }
+ *    page  -> worker: { type: "nodeWorkerPort", requestId } + transfer [port]
+ *    worker -> page : { type: "nodeWorkerDone", requestId }
+ *
+ *  The agent module (browser-node/node-worker-agent.js) is the thinnest
+ *  possible thing, exactly like peer-mesh-agent.js: it boots the substrate and
+ *  translates the runner protocol. It learns the artifact's source bytes —
+ *  they have to be written into the guest filesystem — and nothing else: which
+ *  artifact runs and which host ops its `allowed_ops` permit stay in the
+ *  worker. */
+type NodeWorkerAgentModule = {
+  startNodeWorkerAgent: (port: MessagePort) => { stop: () => void };
+};
+
+function createNodeWorkerBroker(post: (message: unknown, transfer?: Transferable[]) => void) {
+  // Monotonic, so an in-flight import whose request was superseded (or whose
+  // page is unmounting) never installs a stale agent — an orphaned agent holds
+  // a real node-worker Worker alive.
+  let generation = 0;
+  let agent: { stop: () => void; requestId: number } | null = null;
+
+  const end = (requestId?: number) => {
+    generation += 1;
+    if (!agent) return;
+    if (requestId !== undefined && agent.requestId !== requestId) return;
+    try {
+      agent.stop();
+    } catch {
+      /* already stopped */
+    }
+    agent = null;
+  };
+
+  const host = (requestId: number) => {
+    end();
+    const mine = generation;
+    const url = `${window.location.origin}/browser-node/node-worker-agent.js`;
+    void (import(/* webpackIgnore: true */ /* turbopackIgnore: true */ url) as Promise<NodeWorkerAgentModule>)
+      .then(module => {
+        if (mine !== generation) return;
+        const channel = new MessageChannel();
+        const started = module.startNodeWorkerAgent(channel.port1);
+        agent = { stop: () => started.stop(), requestId };
+        post({ type: "nodeWorkerPort", requestId }, [channel.port2]);
+      })
+      .catch(() => {
+        /* unpublished or blocked: the worker's broker timeout reports it */
+      });
+  };
+
+  return { host, end };
+}
+
 // Web-Locks-fallback owner handoff (bn-ui-sharedworker-owner): unlike a real
 // SharedWorker (which outlives any single tab), a Web Locks re-election spawns
 // a BRAND NEW dedicated Worker with no memory of what was running before —
@@ -435,17 +570,36 @@ export function useRunNode() {
       // constructor). Re-created per wired port so a reconnect never posts a
       // transferred port into a dead channel.
       let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
+      // synchronous-fs registration broker — same shape as the two above and
+      // for the same structural reason (a worker global scope has no
+      // navigator.serviceWorker). Re-created per wired port so a reconnect
+      // never answers into a dead channel.
+      let syncFsBroker: ReturnType<typeof createSyncFsBroker> | null = null;
+      // node-worker host broker (bn-node-worker-substrate): the same shape and
+      // the same structural reason — the substrate needs a page. Re-created per
+      // wired port so a reconnect never answers into a dead channel.
+      let nodeWorkerBroker: ReturnType<typeof createNodeWorkerBroker> | null = null;
 
       const wire = (p: MessagePort) => {
         sendRef.current = (msg) => p.postMessage(msg);
         meshBroker?.end();
         meshBroker = createMeshAgentBroker((message, transfer) => p.postMessage(message, transfer ?? []));
+        syncFsBroker = createSyncFsBroker((message) => p.postMessage(message));
+        nodeWorkerBroker = createNodeWorkerBroker((message, transfer) => p.postMessage(message, transfer ?? []));
         p.onmessage = (e: MessageEvent) => {
           const msg = e.data;
           if (msg && msg.type === "status") applyIncomingStatus(msg.status);
           else if (msg && msg.type === "meshPeerRequest") meshBroker?.host(msg.requestId);
           else if (msg && msg.type === "meshPeerDone") meshBroker?.end(msg.requestId);
-          else if (msg && msg.type === "dbWorkerRequest") {
+          else if (msg && msg.type === "syncFsRegisterRequest") {
+            syncFsBroker?.host(msg.requestId, msg.swUrl, msg.workerUrl, msg.agentUrl);
+          } else if (msg && msg.type === "nodeWorkerRequest") {
+            // One host per request: a fresh request supersedes (an orphaned
+            // agent holds a real Worker alive).
+            nodeWorkerBroker?.host(msg.requestId);
+          } else if (msg && msg.type === "nodeWorkerDone") {
+            nodeWorkerBroker?.end(msg.requestId);
+          } else if (msg && msg.type === "dbWorkerRequest") {
             endDbBridge();
             try {
               const w = new Worker("/browser-node/sqlite/sqlite-worker.js", { type: "module" });
@@ -626,6 +780,11 @@ export function useRunNode() {
         // gone. The worker also sends `meshPeerDone` on its own teardown; this
         // covers the direction the worker cannot see.
         meshBroker?.end();
+        // An agent left running after its host page unmounts keeps a real
+        // node-worker Worker alive for a node that may already be gone — the
+        // worker sends `nodeWorkerDone` on its own teardown; this covers the
+        // direction it cannot see.
+        nodeWorkerBroker?.end();
         port.postMessage({ type: "visibility", visible: false, unloading: true });
         port.close();
         sendRef.current = () => {};
@@ -688,10 +847,24 @@ export function useRunNode() {
       // Only the OWNER tab wires this, because only it holds the real Worker
       // reference; a non-owner tab has no channel to receive the request on.
       let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
+      // The synchronous-fs registration broker is needed HERE TOO — unlike the
+      // db lane, which nests directly in a dedicated Worker, there is no
+      // nested fallback for a service worker registration: no worker global
+      // scope has `navigator.serviceWorker`, this one included. Only the OWNER
+      // tab wires it (only it holds the real Worker reference, so only it can
+      // receive the request).
+      let syncFsBroker: ReturnType<typeof createSyncFsBroker> | null = null;
+      // The node-worker HOST broker is needed here for exactly the reasons the
+      // two above are: the substrate needs a page (navigator.serviceWorker),
+      // and the run-node worker — SharedWorker or this dedicated Worker — is
+      // not one. Only the OWNER tab wires it.
+      let nodeWorkerBroker: ReturnType<typeof createNodeWorkerBroker> | null = null;
 
       const wireOwnerWorker = (worker: Worker) => {
         meshBroker?.end();
         meshBroker = createMeshAgentBroker((message, transfer) => worker.postMessage(message, transfer ?? []));
+        syncFsBroker = createSyncFsBroker((message) => worker.postMessage(message));
+        nodeWorkerBroker = createNodeWorkerBroker((message, transfer) => worker.postMessage(message, transfer ?? []));
         worker.onmessage = (e: MessageEvent) => {
           const msg = e.data;
           if (msg && msg.type === "status") {
@@ -701,6 +874,12 @@ export function useRunNode() {
             meshBroker?.host(msg.requestId);
           } else if (msg && msg.type === "meshPeerDone") {
             meshBroker?.end(msg.requestId);
+          } else if (msg && msg.type === "syncFsRegisterRequest") {
+            syncFsBroker?.host(msg.requestId, msg.swUrl, msg.workerUrl, msg.agentUrl);
+          } else if (msg && msg.type === "nodeWorkerRequest") {
+            nodeWorkerBroker?.host(msg.requestId);
+          } else if (msg && msg.type === "nodeWorkerDone") {
+            nodeWorkerBroker?.end(msg.requestId);
           }
         };
         // Worker crash recovery (bn-ui-sharedworker-owner, the row's 3rd
@@ -781,6 +960,11 @@ export function useRunNode() {
         sendRef.current({ type: "visibility", tabId: myTabId, visible: false, unloading: true });
         cancelled = true;
         meshBroker?.end();
+        // An agent left running after its host page unmounts keeps a real
+        // node-worker Worker (and its service-worker session) alive for a node
+        // that may already be gone. The worker also sends `nodeWorkerDone` on
+        // its own teardown; this covers the direction it cannot see.
+        nodeWorkerBroker?.end();
         statusChannel.close();
         controlChannel.close();
         reconnectRef.current = () => {};

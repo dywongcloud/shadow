@@ -81,10 +81,9 @@
         scratch.free();        // then release the wasm wrapper explicitly
         node = await BrowserNode.boot(relay, discovery || null, seedHex);
       }
-      const localDevelopment = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
+      // The substrate is hosted in this page (node-worker's filesystem host
+      // needs navigator.serviceWorker), so there is no frame to configure.
       const runtime = new BrowserFunctionRuntime({
-        development: localDevelopment && params.get('runtime-production') !== '1',
-        frameUrl: params.get('function-frame') || undefined,
         blake3: blake3Hex,
         ops: harness ? {
           1: {

@@ -1,38 +1,33 @@
-// Worker-native bounded QuickJS function runtime (browser-worker-quickjs-runtime).
+// Worker-native bounded function runtime on the node-worker substrate
+// (browser-worker-quickjs-runtime → bn-node-worker-substrate /
+// execution-path-swap-off-quickjs).
 // The DOM-only BrowserFunctionRuntime (function-runtime.js/function-runner.js)
 // needs `document`, an iframe and page message events, so it cannot run inside
 // the "Run a node" SharedWorker. This runtime is the worker-context lane:
 //
-//   * QUICKJS MODE ONLY. Native-mode artifacts evaluate tenant JS directly in
-//     the host context — inside the trusted worker that owns the iroh endpoint,
-//     the seed and the platform session that would be a privilege escape, so
-//     pin() rejects them. QuickJS executes IN THIS THREAD (quickjs-emscripten
-//     RELEASE_SYNC has no yield), bounded by the engine interrupt handler —
-//     the only substrate with hard memory/stack/CPU limits (see
-//     docs/browser-node-proposal.md §2.3).
-//   * The shipped pkg/function-worker.js bundle (quickjs-emscripten + the
-//     src-js runner protocol, embedded wasm) is evaluated with a shimmed
-//     `self`, giving each artifact an isolated in-thread "virtual worker" that
-//     speaks the EXACT same boot/invoke/opBatch/close protocol as the real
-//     dedicated Worker the iframe spawns — one tested code path, no rebundled
-//     variant to drift. The bundle's only global-scope dependency is `self.*`
-//     (verified against the built bundle: self.location/onmessage/postMessage/
-//     close; emscripten's window/document references are feature-tests that are
-//     false in any worker scope).
-//   * NODE API (browser-node-api-runtime). The QuickJS guest's global object is
-//     bare ECMAScript — measured: no console, no TextEncoder/TextDecoder, no
-//     URL, no timers, no atob/btoa, no crypto, no fetch. node-runtime.js is
-//     evaluated in the guest immediately before the artifact function and
-//     supplies `require`/`process`/`Buffer`/`console`/timers/`URL`/
-//     `TextEncoder` plus the Node builtin module set, so a handler written for
-//     Node (including an Express app or a `(req, res)` listener) runs as
-//     written. It is wrapped AROUND the verified source, never merged into it:
-//     pin()'s size/BLAKE3/policy-digest verification below is unchanged and
-//     still runs against the exact bytes the server described.
-//   * Execution budgets are capped by maxExecBlockMs BELOW the policy ceiling
-//     when necessary: one synchronous guest segment blocks this worker's whole
-//     event loop, including the iroh endpoint driving the relay connection, so
-//     the budget handed to QuickJS is min(policy.timeoutMs, maxExecBlockMs).
+//   * THE SUBSTRATE IS VENDORED node-worker (vendor/node-worker, Node's own lib
+//     transpiled for a Worker), no longer QuickJS. An artifact runs in a
+//     dedicated node-worker Worker realm of its own with the REAL Node module
+//     set, so nothing needs the hand-written node-runtime.js shim any more —
+//     the QuickJS guest's bare ECMAScript global (no console, no TextEncoder,
+//     no URL, no timers) is not what we execute against.
+//   * BOTH WIRE MODES RUN. `mode` is part of the canonical policy encoding the
+//     server signs (`fluid_core::browser_policy_digest`), so the descriptor's
+//     mode is still verified and still accepted — but under this substrate both
+//     `quickjs` and `native` execute the same way, in the artifact's own
+//     Worker, never in this trusted worker's context. (Under QuickJS `native`
+//     meant host-context `eval`, which is why it was rejected here.)
+//   * THE HOST IS A PAGE, BROKERED. node-worker's filesystem host needs
+//     `navigator.serviceWorker` (`[Exposed=Window]`) and a `Worker`
+//     constructor — a SharedWorker global scope has NEITHER — so this runtime
+//     never creates the substrate itself: the caller injects `acquireHost`,
+//     which brokers one from a connected page (node-worker-agent.js) and
+//     returns a MessagePort-shaped end. Absent, every boot rejects with a
+//     named `node_worker_*` reason rather than pretending to run.
+//   * Execution budgets are capped by maxExecBlockMs BELOW the policy ceiling:
+//     the deadline is the substrate's only bound (node-worker enforces no
+//     memory or stack quota), and a guest that outlives it is terminated by
+//     the host, so a shorter ceiling is a cheaper failure.
 //
 // Queue/cap model: one bounded FIFO per artifact (single active invocation —
 // the underlying runner rejects concurrent invokes), a global active cap
@@ -46,10 +41,11 @@ import {
   registryAbiFor,
   sourceDigestBytes,
 } from "./artifact-policy.js";
-import { wrapArtifactSource } from "./node-runtime.js";
 
-const QUICKJS_INTERRUPT_GRACE_MS = 50;
+// Grace on top of the guest's deadline for the host to notice and terminate.
+const SUBSTRATE_DEADLINE_GRACE_MS = 50;
 const ARTIFACT_SOURCE_MAX_BYTES = 512 * 1024; // build contract caps entries at 256 KiB + fixed envelope
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 20_000; // a page must fetch and boot a multi-MB worker
 
 function abortError(signal) {
   return signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
@@ -77,53 +73,37 @@ function validOperationId(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-// Evaluate the function-worker bundle with `self` bound to a shim and return
-// the host end of its message protocol. Worker→host messages are delivered
-// synchronously (the bundle posts op/result messages from inside a
-// synchronous guest segment; the host handlers only enqueue/async-dispatch,
-// never reenter the guest). Host→worker `invoke` runs the guest's first
-// segment SYNCHRONOUSLY inside postMessage — that is the intended in-thread,
-// interrupt-bounded execution.
-function createInlineWorker(bundleSource, sourceUrl, onFatal) {
-  let hostMessage = null;
-  let terminated = false;
-  const fakeSelf = {
-    location: { href: sourceUrl },
-    postMessage(message) {
-      if (terminated || hostMessage === null) return;
-      hostMessage({ data: message });
-    },
-    close() {
-      terminated = true;
-    },
-  };
-  const evaluate = new Function("self", `${bundleSource}\n//# sourceURL=${sourceUrl}#inline`);
-  evaluate(fakeSelf);
-  if (typeof fakeSelf.onmessage !== "function") {
-    throw new Error("function worker bundle did not install an onmessage handler");
-  }
-  return {
-    set onmessage(handler) {
-      hostMessage = handler;
-    },
-    postMessage(message) {
-      if (terminated) return;
-      try {
-        const delivered = fakeSelf.onmessage({ data: message });
-        // The bundle catches its own errors and reports them as `fatal`
-        // messages; a rejection here means that error path itself failed.
-        Promise.resolve(delivered).catch(error => onFatal(error));
-      } catch (error) {
-        onFatal(error);
-      }
-    },
-    terminate() {
-      terminated = true;
-    },
-  };
+/**
+ * The guest's Wisp relay config (bn-node-worker-wisp-net), read from the
+ * globals run-node-worker.js published out of the admission capability's `net`
+ * block: the platform relay first (`HIVE_BROWSER_WISP_URL` on the fleet), then
+ * the third-party public fallback, which travels as a PERMIT plus an address
+ * rather than as a URL — the substrate proves that relay answers before it
+ * routes anything at it, and says so when it does.
+ *
+ * `undefined` when there is nothing to send, which is the honest shape for a
+ * fleet that configured no relay: the guest's first socket then throws the
+ * substrate's named `WispRelayUnavailable` instead of resolving to nothing.
+ */
+function substrateNetConfig() {
+  const url = wispUrlOrNull(globalThis.HIVE_WISP_URL);
+  const fallbackUrl = wispUrlOrNull(globalThis.HIVE_WISP_PUBLIC_FALLBACK_URL);
+  const allowFallback = globalThis.HIVE_WISP_PUBLIC_FALLBACK === true;
+  if (!url && !fallbackUrl && !allowFallback) return undefined;
+  const net = {};
+  if (url) net.wispUrl = url;
+  if (fallbackUrl) net.publicFallbackUrl = fallbackUrl;
+  if (allowFallback) net.allowPublicFallback = true;
+  return net;
 }
 
-class InlineFunctionRunner {
+function wispUrlOrNull(value) {
+  return typeof value === "string" && /^wss?:\/\/[^\s]+$/.test(value.trim())
+    ? value.trim()
+    : null;
+}
+
+class SubstrateFunctionRunner {
   constructor(runtime, artifact) {
     this.runtime = runtime;
     this.artifact = artifact;
@@ -150,32 +130,54 @@ class InlineFunctionRunner {
       controller.abort(new Error("function runner boot timed out"));
     }, this.runtime.bootTimeoutMs);
     try {
-      const workerSource = await this.runtime.loadWorkerSource(controller.signal);
+      // The substrate host: a page-brokered node-worker Worker (see the file
+      // header). `acquireHost` is the caller's broker; without it there is no
+      // substrate at all, and the named error is the point of use.
+      const acquire = this.runtime.acquireHost;
+      if (typeof acquire !== "function") {
+        throw new Error(
+          "node_worker_no_host: the worker function runtime requires an `acquireHost` broker — " +
+            "the node-worker substrate must be hosted by a page (a SharedWorker has neither a Worker constructor nor navigator.serviceWorker)",
+        );
+      }
+      // A broker that never answers must not hold the boot open forever; the
+      // timer is cleared either way so a settled acquire leaves nothing behind.
+      let brokerTimer;
+      const port = await Promise.race([
+        Promise.resolve(acquire()),
+        new Promise((_, reject) => {
+          brokerTimer = setTimeout(
+            () => reject(new Error(`node_worker_broker_timeout: no page supplied a node-worker host within ${DEFAULT_ACQUIRE_TIMEOUT_MS}ms`)),
+            DEFAULT_ACQUIRE_TIMEOUT_MS,
+          );
+        }),
+      ]).finally(() => clearTimeout(brokerTimer));
       if (controller.signal.aborted) throw abortError(controller.signal);
-      this.port = createInlineWorker(workerSource, this.runtime.workerUrl, error => {
-        this.close(new Error(`function worker failed: ${error?.message || error}`));
-      });
+      this.port = port;
       this.port.onmessage = ({ data }) => this.onMessage(data);
       const booted = abortable(new Promise(resolve => {
         this.bootResolve = resolve;
       }), controller.signal);
+      // The artifact is handed over as the EXACT verified bytes: pin()
+      // size-checked, BLAKE3-matched and policy-digest-verified them, and the
+      // host wraps `module.exports = (…)` AROUND them rather than editing
+      // them. The runtime is substrate, exactly like `ops`: it grants no
+      // capability the artifact's `allowed_ops` did not already grant.
       this.port.postMessage({
         kind: "boot",
-        // The Node API surface (browser-node-api-runtime) is installed AROUND
-        // the verified artifact, never inside it: `wrapArtifactSource` returns
-        // an expression that installs `require`/`process`/`Buffer`/`console`/
-        // timers/`URL`/`TextEncoder` in the guest and then evaluates to the
-        // artifact function unchanged. The artifact BYTES are untouched — they
-        // were size-checked, BLAKE3-matched and policy-digest-verified by
-        // pin() before this line, and none of that is recomputed or relaxed
-        // here. The runtime is substrate, exactly like `ops`: it grants no
-        // capability the artifact's `allowed_ops` did not already grant.
-        source: wrapArtifactSource(this.artifact.source),
-        mode: "quickjs",
-        limits: {
-          memoryBytes: this.artifact.memoryBytes,
-          stackBytes: this.artifact.stackBytes,
-        },
+        source: this.artifact.source,
+        mode: this.artifact.mode,
+        timeoutMs: this.artifact.timeoutMs,
+        // bn-node-worker-wisp-net: the guest's `node:net` / `node:tls` config
+        // travels WITH the boot message rather than being re-read by the host,
+        // because the host runs in a PAGE realm that shares no global with this
+        // worker — the platform relay lives in `globalThis.HIVE_WISP_URL` here
+        // (published by run-node-worker.js from the admission capability's
+        // `net` block) and would be invisible over there. Undefined means
+        // "resolve it yourself", which for a page with no globals of its own
+        // ends in the substrate's named `WispRelayUnavailable` at the first
+        // socket — not in a silently network-less guest.
+        net: substrateNetConfig(),
       });
       await booted;
     } finally {
@@ -193,12 +195,13 @@ class InlineFunctionRunner {
     this.runtime.globalQueued -= 1;
     const id = this.runtime.nextId++;
     const controller = new AbortController();
-    // The budget actually handed to QuickJS: the policy timeout clamped to the
-    // relay-liveness ceiling. The guest's interrupt handler fires at this
-    // deadline; the host timer below is the backstop for an overrun (a guest
-    // stuck in an uninterruptible native op can only be abandoned, and the
-    // timer itself can only fire after the thread unblocks — the overshoot is
-    // what the witness profiles).
+    // The budget actually handed to the substrate: the policy timeout clamped
+    // to the exec ceiling. The guest now runs in its OWN worker, so this is
+    // not a relay-liveness bound any more — it is a cost bound, and the only
+    // one the substrate has (node-worker meters neither memory nor stack). The
+    // host terminates a guest that outlives it; the timer below is the
+    // backstop for an overrun, and an uninterruptible native call inside the
+    // guest can still overshoot it.
     const deadlineMs = Math.min(this.artifact.timeoutMs, this.runtime.maxExecBlockMs);
     const timer = setTimeout(() => {
       const current = this.pending.get(id);
@@ -208,7 +211,7 @@ class InlineFunctionRunner {
       current.reject(error);
       this.pending.delete(id);
       this.close(new Error("function runner terminated after timeout"));
-    }, deadlineMs + QUICKJS_INTERRUPT_GRACE_MS);
+    }, deadlineMs + SUBSTRATE_DEADLINE_GRACE_MS);
     this.pending.set(id, { ...item, timer, controller, calls: new Set() });
     this.port.postMessage({ kind: "invoke", id, request: item.request, deadlineMs });
   }
@@ -309,16 +312,22 @@ export class WorkerFunctionRuntime {
   constructor(options = {}) {
     if (typeof options.blake3 !== "function") throw new Error("worker function runtime requires a BLAKE3 implementation");
     this.blake3 = options.blake3;
-    this.workerUrl = new URL(options.workerUrl || "./pkg/function-worker.js", import.meta.url).href;
+    // `acquireHost` is the caller's broker for a page-hosted node-worker
+    // substrate (see the file header): a SharedWorker can neither construct a
+    // Worker nor register a service worker, so the substrate is always
+    // brokered. It is REQUIRED, and its absence is a named error at boot
+    // rather than a lane that silently serves nothing.
+    this.acquireHost = options.acquireHost;
     this.bootTimeoutMs = positiveInteger(options.bootTimeoutMs, 10000, "bootTimeoutMs");
     this.maxQueuePerArtifact = positiveInteger(options.maxQueuePerArtifact, 32, "maxQueuePerArtifact");
     this.maxQueuedGlobal = positiveInteger(options.maxQueuedGlobal, 64, "maxQueuedGlobal");
     this.maxActiveGlobal = positiveInteger(options.maxActiveGlobal, 4, "maxActiveGlobal");
     this.maxActiveOps = positiveInteger(options.maxActiveOps, 32, "maxActiveOps");
-    // Relay-liveness ceiling for ONE synchronous guest segment. Defaults to
-    // the platform's own default policy timeout; sized by the live interrupt
-    // profile (see the row's witness: relay echo survives a 1s block with
-    // margin, and the iroh event loop resumes within ms of the interrupt).
+    // Ceiling on ONE invocation's wall-clock budget. Defaults to the
+    // platform's own default policy timeout. The guest runs in its own worker
+    // now, so this is no longer a relay-liveness bound — it is a cost bound,
+    // and the substrate's only one (node-worker meters neither memory nor
+    // stack), so a guest past it is terminated.
     this.maxExecBlockMs = positiveInteger(options.maxExecBlockMs, 1000, "maxExecBlockMs");
     this.opHandlers = new Map();
     for (const [rawId, handler] of Object.entries(options.ops || {})) this.setOp(Number(rawId), handler);
@@ -340,35 +349,6 @@ export class WorkerFunctionRuntime {
     if (typeof handler !== "function") throw new Error("operation handler must be a function");
     registryAbiFor(id); // unknown platform op — refuse to register at all
     this.opHandlers.set(id, handler);
-  }
-
-  loadWorkerSource(signal) {
-    if (this.closed) return Promise.reject(new Error("worker function runtime is closed"));
-    if (!this.workerSource) {
-      const controller = new AbortController();
-      this.workerSourceController = controller;
-      const timer = setTimeout(() => {
-        controller.abort(new Error("function worker fetch timed out"));
-      }, this.bootTimeoutMs);
-      const source = fetch(this.workerUrl, { signal: controller.signal })
-        .then(async response => {
-          if (!response.ok) throw new Error(`function worker fetch failed: ${response.status}`);
-          return response.text();
-        })
-        .catch(error => {
-          if (controller.signal.aborted) throw abortError(controller.signal);
-          throw error;
-        })
-        .finally(() => {
-          clearTimeout(timer);
-          if (this.workerSourceController === controller) this.workerSourceController = undefined;
-        });
-      source.catch(() => {
-        if (this.workerSource === source) this.workerSource = undefined;
-      });
-      this.workerSource = source;
-    }
-    return abortable(this.workerSource, signal);
   }
 
   has(digest) {
@@ -396,8 +376,10 @@ export class WorkerFunctionRuntime {
   // admission capability block; `sourceBytes` the fetched (or cache-read)
   // artifact body. Verification chain, all local, all before anything runs:
   //   1. shape: digests are 64-hex, limits are positive, ops resolve in the
-  //      platform registry, mode is quickjs (native would run tenant JS
-  //      unsandboxed in this trusted worker — rejected, never executed);
+  //      platform registry, mode is one the wire contract defines (it is part
+  //      of the canonical policy encoding the server signed, so it is verified
+  //      here and never rewritten — under node-worker both modes execute in
+  //      the artifact's own Worker realm, never in this trusted worker's);
   //   2. byte length matches descriptor.source_bytes;
   //   3. BLAKE3(bytes) matches descriptor.source_digest;
   //   4. the canonical policy digest recomputed from (source_digest, mode,
@@ -410,8 +392,11 @@ export class WorkerFunctionRuntime {
     const { policyDigest: policyDigestValue, sourceDigest: sourceDigestValue } = descriptor;
     if (!DIGEST_RE.test(policyDigestValue || "")) throw new Error("policy digest must be 64 lowercase hexadecimal characters");
     if (!DIGEST_RE.test(sourceDigestValue || "")) throw new Error("source digest must be 64 lowercase hexadecimal characters");
-    if (descriptor.mode !== "quickjs") {
-      throw new Error(`artifact mode ${JSON.stringify(descriptor.mode)} is unsupported — only quickjs artifacts run in the worker runtime`);
+    // `mode` still has to be one of the two wire values: it is a field of the
+    // canonical policy encoding, so an unknown one is a descriptor the fleet
+    // could not have signed. Both accepted values now run the same way.
+    if (descriptor.mode !== "quickjs" && descriptor.mode !== "native") {
+      throw new Error(`artifact mode ${JSON.stringify(descriptor.mode)} is unsupported — the wire contract defines quickjs and native`);
     }
     const policy = normalizePolicy({
       mode: descriptor.mode,
@@ -448,6 +433,9 @@ export class WorkerFunctionRuntime {
       digest: policyDigestValue,
       sourceDigest: sourceDigestValue,
       sourceBytes: descriptor.sourceBytes,
+      // The descriptor's mode, carried verbatim: it is verified wire data, and
+      // the substrate no longer branches on it.
+      mode: policy.mode,
       timeoutMs: policy.timeoutMs,
       memoryBytes: policy.memoryBytes,
       stackBytes: policy.stackBytes,
@@ -508,7 +496,7 @@ export class WorkerFunctionRuntime {
 
   ensureRunner(artifact) {
     if (!artifact.runner) {
-      artifact.runner = new InlineFunctionRunner(this, artifact);
+      artifact.runner = new SubstrateFunctionRunner(this, artifact);
       artifact.ready = artifact.runner.boot();
     }
     artifact.ready.then(
@@ -593,7 +581,6 @@ export class WorkerFunctionRuntime {
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.workerSourceController?.abort(new Error("worker function runtime closed"));
     for (const artifact of this.artifacts.values()) {
       artifact.runner?.close();
       for (const item of artifact.queue) item.reject(new Error("worker function runtime closed"));

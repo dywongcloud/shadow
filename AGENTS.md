@@ -1350,13 +1350,33 @@ releases).
 - **A function is browser-eligible ONLY by opting in** via fluid.json
   `functions[].browser` (`fluid_core::BrowserPolicy`: `entry` + bounded
   `mode`/`timeout_ms`/`memory_bytes`/`stack_bytes`/`allowed_ops`) and
-  surviving `browser_artifacts::bundle` at build time. An opted-in function
-  that is ineligible — container/python/go/command runtime, TypeScript or
-  missing entry, any Node/Bun/Deno surface in the source (`require`,
-  `import`/`export`, `process.`, `Buffer`, `Bun.`, `fetch(` in quickjs mode),
-  an unknown host-op id — FAILS THE BUILD loudly; the deployment is never
-  registered. Never "warn and drop the opt-in": that leaves the fleet serving
-  code donors believe they serve.
+  surviving `browser_artifacts::bundle` at build time, OR by the build
+  AUTO-detecting a handler-shaped entry (`git::infer_browser_entry` /
+  `infer_package_server_entry`) — a synthesized policy that fails to bundle is
+  SKIPPED SILENTLY, so a normal fleet deploy is never broken by it; only an
+  EXPLICIT opt-in fails the build. An opted-in function that is ineligible —
+  container/python/go/command runtime, TypeScript or missing entry, an unknown
+  host-op id, no handler export, or machine code no browser Worker can run
+  (`process.dlopen`, a `*.node` addon, `node-gyp-build`, `process.binding`) —
+  FAILS THE BUILD loudly; the deployment is never registered. Never "warn and
+  drop the opt-in": that leaves the fleet serving code donors believe they
+  serve.
+- **Node/framework surfaces are NOT a rejection — the substrate is a real Node
+  runtime** (vendored node-worker: Node v25.9.0's own lib transpiled for a
+  Worker), which supplies `require`, `process`, `Buffer` and `fetch`.
+  `require`/`process.`/`Buffer`/`Bun.`/`fetch(`/`Deno.` reach the artifact
+  unchanged, and a module the substrate cannot provide is named at the point of
+  use, never guessed at build time. Static ES module syntax
+  (`import x from` / `export …`) is REWRITTEN to CommonJS by
+  `crates/hive-cloud/src/browser_esm.rs` rather than rejected — the artifact is
+  ONE `async function (request, ops)` EXPRESSION, where module syntax is a
+  SyntaxError, but rejecting it excluded every framework build output
+  (`dist/server/entry.mjs`, `.output/server/index.mjs`). Only a form with no
+  CommonJS equivalent (mixing `export default` with named exports, an
+  unreadable `export`) is refused. Every binding the envelope itself introduces
+  is `__hive_`-prefixed: the entry is embedded verbatim in that scope, so a
+  plain `const handler` collided with the `function handler(...)` an entry
+  declares and the artifact failed to PARSE.
 - **The canonical policy digest is ONE contract with TWO implementations.**
   `fluid_core::browser_policy_digest` must stay byte-for-byte identical to
   `policyDigest` in `crates/hive-browser/www/function-runtime.js`
@@ -1471,6 +1491,62 @@ releases).
   legitimate full drain (every browser deployment deleted) therefore refuses
   forever by design — that is a state-versus-caller-bug ambiguity no GC may
   resolve by deleting; drain the store dir by hand.
+
+## Cross-origin isolation for the browser-node lane (COOP/COEP)
+
+- **`SharedArrayBuffer` is gated on isolation, so node-worker's synchronous
+  bridge (`receiveMessageOnPort`) is gated on it too** —
+  `vendor/node-worker/src/worker/node/worker_threads.ts` says so outright
+  ("What is not here"): the runtime deliberately has no `SharedArrayBuffer`,
+  and that is what lets it run without isolation. Turning the bridge on starts
+  with response headers, never with JS.
+- **The default is `HIVE_COI=lane`, never global, and that is a measured
+  decision, not caution.** A global `Cross-Origin-Embedder-Policy:
+  require-corp` on the public listener breaks (a) the dashboard's Clerk embed
+  — `ui/app/layout.tsx` wraps the whole tree in `<ClerkProvider>` and Clerk's
+  bundle is a cross-origin `no-cors` `<script>`, which `require-corp` blocks
+  outright — and (b) every tenant deployment under `*.{apps_domain}` that
+  hotlinks an image, font or script with no CORP header. Lane mode stamps
+  COOP/COEP only on the dashboard hosts (apex + `www`) at `/run-node`,
+  `/run-node-worker.js` and `/browser-node/*`. `HIVE_COI=global` is opt-in and
+  requires re-running the cross-origin sweep first.
+- **`HIVE_COI_COEP` defaults to `credentialless`, not `require-corp`.**
+  `credentialless` keeps the document isolated while still allowing cross-origin
+  `no-cors` subresources (fetched without credentials), which is what keeps
+  Clerk and GitHub-avatar images (`img-src https:` in the enforcing CSP) alive
+  on `/run-node`. Honest limit: Safari implements neither value, so Safari never
+  isolates this lane — that is a browser property, not a header bug, and it is
+  why the lane has a degradation path.
+- **The public listener is the ONLY writer.** `coi::layer` is applied after host
+  dispatch and before every clone (`tls_public`, the dedicated-IPv4 listeners,
+  the plain-HTTP `serve`), so all four listeners agree; the dashboard's own
+  `next.config.mjs` deliberately does NOT set these headers, so there is one
+  place to change. Env: `HIVE_COI` (off|lane|global), `HIVE_COI_COEP`,
+  `HIVE_COI_LANE_HOSTS`, `HIVE_COI_LANE_PATHS`; every unrecognised value falls
+  back to the default with a WARN — an env typo must never silently flip
+  isolation off or on.
+- **Isolation is DETECTED, never assumed, and its absence is reported, not
+  waited out.** `public/run-node-worker.js` reads
+  `globalThis.crossOriginIsolated` and `typeof SharedArrayBuffer` in its own
+  global, publishes them as the additive `isolation` status key, and answers
+  the `syncBridge` port message with a typed refusal; `requireSyncBridge()` is
+  the single gate in front of anything that drains a port synchronously. A
+  synchronous drain on an unisolated global has NO failure mode to report — it
+  just never returns — so "async-only mode" is an error, never a hang.
+  `syncBridge: false` is an expected value (Safari, a page served without the
+  headers, a service worker that stripped them): mesh, relay identity,
+  presence, database replication and the function lane all still run.
+- **`ui/public` and `crates/hive-browser/www` are CORP-clean** — swept, and
+  every load is same-origin and relative to `import.meta.url` or
+  `location.href` (the wasm bundle, `sync-client.js`, `hcb1.js`,
+  `wa-sqlite/**`, `node-worker-{agent,host,vfs}.js`, `sync-fs-agent.js`, `offline.html`'s one `/shadw-logo-dark.png`). The only
+  absolute URLs in either tree are XML namespace strings
+  (`http://www.w3.org/2000/svg`, never fetched), comments/doc links, and
+  `index.html`'s dev-harness relay default. The lane's own file set moves, so
+  the durable artifact is the sweep — `grep -rn -oE "https?://[^[:space:]\"']+"
+  ui/public crates/hive-browser/www`, discarding namespaces and comments.
+  Re-run it before widening `HIVE_COI_LANE_PATHS` or switching to
+  `require-corp`.
 
 ## Managed SQLite over libsql/Hrana (`DbKind::Sqlite`)
 

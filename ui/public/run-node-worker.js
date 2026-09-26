@@ -37,6 +37,13 @@
 //   { type: "dbSyncNow", id }      runs a sync round now; replies
 //                                  { type: "dbSyncResult", id, ok, reports?|error? }
 //
+// bn-node-worker-substrate: the node-worker lane (the real Node.js runtime
+// that replaces QuickJS) boots `dist/worker.js` from the SAME published
+// directory as its service worker, and needs that service worker REGISTERED
+// first — see the "synchronous-fs lane" section below, and the header of
+// browser-node/sync-fs-agent.js for why the registration is page-brokered and
+// why its scope is `/browser-node/node-worker/`.
+//
 // bn-browser-peer-webrtc-mesh: this worker also owns the browser↔browser
 // DIRECT lane (the "mesh lane" section below). It is strictly ADDITIVE to the
 // iroh relay path — see browser-node/peer-mesh.js for why it structurally
@@ -118,6 +125,13 @@
 //    only where host/reflexive candidates suffice and falls back to the relay
 //    everywhere else. Absent block = no mesh, which is what every pre-upgrade
 //    node answers.
+//
+//    The `net` block rides the same snapshot for the same reason (bn-node-worker
+//    -wisp-net): { wisp_url, allow_public_fallback, public_fallback_url,
+//    disclosure } — the Wisp relay the browser substrate's node:net/node:tls
+//    dial. Server-derived (HIVE_BROWSER_WISP_URL); the public fallback is off
+//    unless the operator opted in, and is disclosed when it is on, because it
+//    puts a third party in front of donor outbound TCP.
 //
 // 3. A PUBLISHED MODULE PAIR. `ui/scripts/sync-browser-node.mjs` copies a
 //    hand-written allowlist into ui/public/browser-node/, and it now lists
@@ -230,6 +244,51 @@ let fnFailures = [];
 // value before each async gap; any continuation whose captured epoch no
 // longer matches the live counter is stale and must undo whatever it just
 // created (close a booted node, revoke an admission) instead of publishing
+/* ---- Cross-origin isolation (coop-coep-fleet-wide) ------------------------
+ *
+ * node-worker's synchronous bridge — `receiveMessageOnPort`, a SYNCHRONOUS
+ * drain of a MessagePort — cannot exist without SharedArrayBuffer, and
+ * SharedArrayBuffer exists only in a cross-origin-isolated global
+ * (`vendor/node-worker/src/worker/node/worker_threads.ts`, "What is not
+ * here": this runtime deliberately has none, which is what lets it run
+ * without isolation today). Isolation is granted by the BROWSER from a
+ * `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy`
+ * response pair — see `crates/hive-cloud/src/coi.rs`, which serves it for the
+ * lane paths only.
+ *
+ * Being a browser decision, it can be absent for reasons this file cannot
+ * repair: Safari implements neither `COEP: credentialless` nor the pair on
+ * this lane, an insecure origin never isolates, and a service worker that
+ * drops the header un-isolates the page. So it is DETECTED, never assumed,
+ * and published rather than silently paid for:
+ *
+ *   - `isolation` rides the status object additively (the dashboard renders
+ *     it, /run-node included);
+ *   - the `syncBridge` port message is the sanctioned PROBE for anything that
+ *     would otherwise block forever on a port that can never be drained
+ *     synchronously;
+ *   - `requireSyncBridge()` is the one gate in front of every such call, and
+ *     it THROWS — async-only mode is an error, never a wait.
+ */
+const ISOLATION = {
+  crossOriginIsolated: globalThis.crossOriginIsolated === true,
+  sharedArrayBuffer: typeof SharedArrayBuffer === "function",
+};
+// Both, not either: `crossOriginIsolated` without SharedArrayBuffer is a
+// browser that reports isolation but withholds the buffer; SharedArrayBuffer
+// without `crossOriginIsolated` is a legacy flag or enterprise override that
+// still cannot host the bridge, because the blocking `Atomics.wait` the drain
+// is built on is gated on isolation independently.
+const SYNC_BRIDGE_AVAILABLE = ISOLATION.crossOriginIsolated && ISOLATION.sharedArrayBuffer;
+
+function requireSyncBridge(what = "the synchronous bridge") {
+  if (SYNC_BRIDGE_AVAILABLE) return;
+  throw new Error(
+    `async-only mode: ${what} needs SharedArrayBuffer, which this browser has not granted ` +
+      `(crossOriginIsolated=${ISOLATION.crossOriginIsolated}, SharedArrayBuffer=${ISOLATION.sharedArrayBuffer})`,
+  );
+}
+
 // it.
 let epoch = 0;
 
@@ -274,6 +333,15 @@ let status = {
   // own identity/protocol) is stale — see isSessionStaleError. Self-clears on
   // the next successful renewal; never blocks retry (see that function's doc).
   sessionStale: false,
+  // coop-coep-fleet-wide (additive, same discipline as `db` below): whether
+  // this worker's global is cross-origin isolated and therefore whether the
+  // SYNCHRONOUS half of node-worker is available at all. Published, never
+  // assumed — see the block above `ISOLATION`. `syncBridge: false` is an
+  // honest, expected value (Safari; a served page without the headers; a
+  // service worker that stripped them) and means async-only, NOT broken:
+  // mesh, relay identity, presence, database replication and the function
+  // lane all run exactly as before.
+  isolation: { ...ISOLATION, syncBridge: SYNC_BRIDGE_AVAILABLE },
   // browser-worker-quickjs-runtime introspection (additive): the pinned
   // artifact digests, live invoker-grant count and served-invoke total of the
   // worker's QuickJS lane. null while no function runtime is running.
@@ -299,6 +367,13 @@ let status = {
   // project's capability carries a server-derived `db` block — the dashboard
   // renders nothing then.
   db: null,
+  // bn-node-worker-service-worker-sync-fs introspection (additive, same
+  // discipline as `db` above): { state, scope, scriptURL, prefix, error }.
+  // `state: "ready"` means a service worker is registered at a scope that
+  // covers dist/worker.js, which is what makes node-worker's BLOCKING
+  // synchronous-`fs` requests answerable. null until a registration has been
+  // attempted; `unavailable` carries the named `sync_fs_*` reason.
+  syncFs: null,
   // bn-browser-peer-webrtc-mesh introspection (additive, same discipline as
   // `db` above): PeerMesh.summary() — { state, known, connected, peers[],
   // direct, artifactHits, crrRounds, bytesIn/Out, error }. `connected` is a
@@ -569,6 +644,87 @@ async function admitOnce(addrJson, endpointId) {
     challenge_ms: challengeMs,
     signature,
   });
+}
+
+// ---------------------------------------------------------------------------
+// bn-node-worker-wisp-net: the `node:net` / `node:tls` relay.
+//
+// The browser substrate (vendored node-worker) gets its TCP — and its TLS, which
+// epoxy terminates inside the relay transport — from exactly one option,
+// `net: { wispUrl }`. There is no other way for donor-browser code to open a
+// socket and no relay compiled in, so the URL is operator configuration and it
+// rides the SAME atomic admission capability as `db` and `mesh`:
+//
+//   { wisp_url: "wss://relay.example/" | null,
+//     allow_public_fallback: false,
+//     public_fallback_url: "wss://anura.pro/",
+//     disclosure: "<what donor traffic crosses>" }
+//
+// Every field is server-derived (HIVE_BROWSER_WISP_URL and
+// HIVE_BROWSER_WISP_PUBLIC_FALLBACK on the fleet), and this side still re-
+// validates the URL shape before publishing it — the same two-independent-
+// filters rule `mesh.ice_servers` carries.
+//
+// The publication target is a pair of globals the substrate reads when it
+// resolves its options (vendor/node-worker/src/wire/wisp.ts):
+// platform relay first, then the third-party public fallback ONLY when this
+// fleet opted in and after the substrate has proven that relay answers. Nothing
+// here turns the fallback on by itself: routing a donor's outbound TCP through a
+// third party is a disclosure, not a default.
+//
+// An absent `net` block (a pre-upgrade leader) withdraws both globals, so a
+// browser never keeps dialing a relay the fleet has stopped publishing.
+// ---------------------------------------------------------------------------
+
+const WISP_URL_RE = /^wss?:\/\/[^\s?#]+$/;
+
+function normalizeNetCapability(capability) {
+  const raw = capability && capability.net;
+  if (!raw || typeof raw !== "object") return null;
+  const wispUrl =
+    typeof raw.wisp_url === "string" && WISP_URL_RE.test(raw.wisp_url.trim())
+      ? raw.wisp_url.trim()
+      : null;
+  const publicFallbackUrl =
+    typeof raw.public_fallback_url === "string" && WISP_URL_RE.test(raw.public_fallback_url.trim())
+      ? raw.public_fallback_url.trim()
+      : null;
+  return {
+    wispUrl,
+    // The fallback needs a URL to fall back TO; a permit with no address is
+    // treated as no permit, never as the substrate's hardcoded default.
+    allowPublicFallback: raw.allow_public_fallback === true && publicFallbackUrl !== null,
+    publicFallbackUrl,
+    disclosure: typeof raw.disclosure === "string" ? raw.disclosure.slice(0, 400) : "",
+  };
+}
+
+let wispDisclosureLogged = false;
+
+function reconcileNetConfig(capability) {
+  const net = normalizeNetCapability(capability);
+  if (!net) {
+    delete globalThis.HIVE_WISP_URL;
+    delete globalThis.HIVE_WISP_PUBLIC_FALLBACK;
+    delete globalThis.HIVE_WISP_PUBLIC_FALLBACK_URL;
+    wispDisclosureLogged = false;
+    return;
+  }
+  if (net.wispUrl) globalThis.HIVE_WISP_URL = net.wispUrl;
+  else delete globalThis.HIVE_WISP_URL;
+  if (net.publicFallbackUrl) globalThis.HIVE_WISP_PUBLIC_FALLBACK_URL = net.publicFallbackUrl;
+  else delete globalThis.HIVE_WISP_PUBLIC_FALLBACK_URL;
+  globalThis.HIVE_WISP_PUBLIC_FALLBACK = net.allowPublicFallback;
+  // Operator-facing, once per published block: a donor's browser is about to
+  // hand its outbound TCP to a third party. The substrate warns again per
+  // worker at the moment it actually picks the fallback.
+  if (net.allowPublicFallback && !wispDisclosureLogged) {
+    wispDisclosureLogged = true;
+    console.warn(
+      `[run-node-worker] ${net.disclosure || "browser node:net / node:tls may transit a third-party public wisp relay"}` +
+        ` (fallback: ${net.publicFallbackUrl}; configure HIVE_BROWSER_WISP_URL on the fleet to keep donor traffic on platform infrastructure)`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +1039,187 @@ async function reconcileCapability(capability, myEpoch) {
   updateFunctionsStatus();
 }
 
+// ---------------------------------------------------------------------------
+// bn-node-worker-substrate / execution-path-swap-off-quickjs: the node-worker
+// HOST broker.
+//
+// Browser artifacts no longer run in QuickJS: they run in a vendored
+// node-worker Worker, and that substrate's filesystem host must be a PAGE —
+// `navigator.serviceWorker` is `[Exposed=Window]`, and a SharedWorker global
+// scope has no `Worker` constructor either (measured live; the same reason the
+// sqlite worker and the peer-mesh agent are brokered). So this worker asks a
+// connected page to host one and bridge a MessageChannel to it:
+//
+//   worker -> page : { type: "nodeWorkerRequest", requestId }
+//   page  -> worker: { type: "nodeWorkerPort", requestId } + transfer [port]
+//   worker -> page : { type: "nodeWorkerDone", requestId }
+//
+// The page speaks the runner protocol to the host
+// (browser-node/node-worker-agent.js → node-worker-host.js) and relays host ops
+// back here. Every policy decision stays on this side — which artifact runs,
+// which ops its `allowed_ops` permit — exactly as it was when the guest ran
+// in-process, so the page is trusted with bytes and nothing else.
+//
+// NOT HOSTING IS A FULLY SUPPORTED STATE and every failure lands in it with a
+// name: no connected page, an unbuilt lane, a browser that will not register a
+// service worker. The runner's boot then rejects with that `node_worker_*`
+// reason, `status.functions` stays honest, and the node keeps relaying.
+// ---------------------------------------------------------------------------
+
+// A page has to fetch, install and activate a service worker AND fetch and boot
+// a multi-megabyte worker before it can answer: well above the sqlite/mesh
+// brokers' 6s, which only ever spawn an already-published script.
+const NODE_WORKER_BROKER_TIMEOUT_MS = 20_000;
+
+let nwBroker = null; // { requestSeq, pending, hosted: Map<requestId, pagePort> }
+
+function nwBrokerState() {
+  if (!nwBroker) nwBroker = { requestSeq: 0, pending: null, hosted: new Map() };
+  return nwBroker;
+}
+
+/**
+ * A brokered MessagePort, shaped the way WorkerFunctionRuntime drives its end:
+ * `onmessage` receives `{ data }`, and `terminate()` closes the port (the
+ * agent stops its own host when it sees the `close` message this produces).
+ */
+function asRunnerPort(port) {
+  if (typeof port.start === "function") {
+    try {
+      port.start();
+    } catch {
+      /* already started */
+    }
+  }
+  return {
+    set onmessage(handler) {
+      port.onmessage = event => handler(event?.data);
+    },
+    postMessage(message) {
+      port.postMessage(message);
+    },
+    terminate() {
+      nwForgetHost(port);
+      try {
+        port.close();
+      } catch {
+        /* already closed */
+      }
+    },
+  };
+}
+
+function nwForgetHost(endpoint) {
+  // Keyed by requestId → the PAGE that brokered it, so a host released by its
+  // runner is dropped by its ENDPOINT: the page is only the broker, and it is
+  // the endpoint's lifetime that decides whether a `nodeWorkerDone` is still
+  // worth sending.
+  const lane = nwBroker;
+  if (!lane) return;
+  for (const [requestId, entry] of lane.hosted) {
+    if (entry.endpoint === endpoint) lane.hosted.delete(requestId);
+  }
+}
+
+function requestNodeWorkerHost(lane, port) {
+  return new Promise((resolve, reject) => {
+    const requestId = ++lane.requestSeq;
+    const timer = setTimeout(() => {
+      if (lane.pending && lane.pending.requestId === requestId) lane.pending = null;
+      reject(
+        new Error(
+          `node_worker_broker_timeout: no page supplied a node-worker host within ${NODE_WORKER_BROKER_TIMEOUT_MS}ms`,
+        ),
+      );
+    }, NODE_WORKER_BROKER_TIMEOUT_MS);
+    lane.pending = {
+      requestId,
+      resolve: endpoint => {
+        clearTimeout(timer);
+        resolve(endpoint);
+      },
+      reject: error => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    };
+    try {
+      port.postMessage({ type: "nodeWorkerRequest", requestId });
+    } catch (error) {
+      clearTimeout(timer);
+      if (lane.pending && lane.pending.requestId === requestId) lane.pending = null;
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+async function acquireNodeWorkerHost() {
+  const lane = nwBrokerState();
+  // One page at a time, visible first — the sqlite-worker and peer-mesh-agent
+  // brokers' ordering, verbatim. Never a broadcast: every answering page would
+  // boot a real node worker.
+  let lastError = null;
+  const candidates = [...ports].sort(
+    (a, b) => Number(portVisibility.get(b) ?? true) - Number(portVisibility.get(a) ?? true),
+  );
+  for (const port of candidates) {
+    try {
+      return await requestNodeWorkerHost(lane, port);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw (
+    lastError ||
+    new Error(
+      "node_worker_no_page: no connected page could host the node-worker substrate (open the dashboard in a visible tab)",
+    )
+  );
+}
+
+function onNodeWorkerPort(port, msg, transferred) {
+  const lane = nwBrokerState();
+  const pending = lane.pending;
+  const endpoint = transferred && transferred[0];
+  if (!pending || msg.requestId !== pending.requestId) {
+    // Stale or unsolicited answer — close the end so neither side dangles.
+    try {
+      if (endpoint) endpoint.close();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  lane.pending = null;
+  if (!endpoint) {
+    pending.reject(new Error("node_worker_no_port: nodeWorkerPort arrived without a transferred port"));
+    return;
+  }
+  lane.hosted.set(msg.requestId, { pagePort: port, endpoint });
+  pending.resolve(asRunnerPort(endpoint));
+}
+
+// Every teardown path (stop, terminal admission failure, endpoint rotation).
+// The agent stops its own host on the runner's `close` message, so this is the
+// backstop for a host whose page is still connected but whose node is going
+// away — an orphaned host holds a real Worker alive.
+function releaseNodeWorkerHosts() {
+  const lane = nwBroker;
+  if (!lane) return;
+  if (lane.pending) {
+    lane.pending.reject(new Error("node_worker_closed: the function lane was torn down"));
+    lane.pending = null;
+  }
+  for (const [requestId, entry] of lane.hosted) {
+    try {
+      entry.pagePort.postMessage({ type: "nodeWorkerDone", requestId });
+    } catch {
+      /* page already gone */
+    }
+  }
+  lane.hosted.clear();
+}
+
 function updateFunctionsStatus() {
   if (!fnRuntime || fnRuntime.closed) {
     if (status.functions !== null || status.serving !== false) {
@@ -936,6 +1273,9 @@ function teardownFunctionLane(owner = node) {
   fnGrants = new Map();
   fnRoutes = new Map();
   fnFailures = [];
+  // Before the runners close: a brokered node-worker host is a real Worker in
+  // a page, and the agent only self-stops on the runner's `close`.
+  releaseNodeWorkerHosts();
   if (fnRuntime) {
     try {
       fnRuntime.close();
@@ -1910,6 +2250,246 @@ async function reconcileMeshLane(capability, myEpoch) {
   updateMeshStatus();
 }
 
+// ---------------------------------------------------------------------------
+// bn-node-worker-service-worker-sync-fs: the synchronous-`fs` lane.
+//
+// node-worker's module resolver is synchronous end to end, so a guest `require`
+// parks the worker thread on a BLOCKING XMLHttpRequest that ONLY a service
+// worker can answer: the SW relays the request to a page over a MessagePort
+// and turns the reply into the response body (dist/sw.js + sw-handler.js,
+// published to /browser-node/node-worker/). No service worker → no synchronous
+// `fs` → no working `require` → nothing runs. That is the entire reason this
+// lane exists.
+//
+// This worker CANNOT register one: `navigator.serviceWorker` is
+// `[Exposed=Window]`, absent from every worker global scope — including this
+// one and the Web Locks fallback's dedicated worker. So registration is
+// brokered through a connected page, the sqlite-worker and peer-mesh-agent
+// pattern verbatim:
+//
+//   worker -> page : { type: "syncFsRegisterRequest", requestId,
+//                      swUrl, workerUrl, agentUrl }
+//   page  -> worker: { type: "syncFsRegisterResult", requestId, ok,
+//                      scope?, scriptURL?, prefix? | error? }
+//
+// The page is trusted with nothing: it registers, reports what it registered
+// and stops. It never sees a mount, a capability or a byte — the same
+// deliberately-thin shape as the mesh agent broker.
+//
+// ## The scope, and why
+//
+// `/browser-node/node-worker/` — the directory BOTH dist/sw.js and
+// dist/worker.js are published into, i.e. sw.js's own default registration
+// scope. Measured upstream across Blink, Gecko and WebKit: what decides
+// interception of a worker's requests is whether that worker's own SCRIPT URL
+// is inside the scope, and whether the page is controlled does not matter — so
+// this is the narrowest scope that covers worker.js and therefore the blocking
+// XHRs it issues (<scope>__nwm/v<proto>/<sid>/<seq>-<op>). It is deliberately
+// NOT `/`, where the dashboard already registers an unrelated service worker
+// (public/sw.js, ui/components/pwa-register.tsx) that owns the app's offline
+// cache: a nested scope is legal, needs no `Service-Worker-Allowed` header
+// (static assets cannot set one), wins for in-scope clients by longest-prefix
+// match, and leaves that root worker — and `getRegistration()` with no
+// argument, ui/lib/push.ts — untouched.
+//
+// ## Failure is named, never silent
+//
+// The failure mode this lane exists to prevent is a silent one: without
+// interception a synchronous `fs` call parks the thread forever and the guest
+// app just stops. So every refusal carries a `sync_fs_<reason>` name and the
+// fix (see browser-node/sync-fs-agent.js: no-sw, insecure-context,
+// out-of-scope, scope-taken, register-failed, inactive, no-page,
+// broker-timeout), and lands in `status.syncFs`.
+//
+// ## Fatal or not
+//
+// A PREREQUISITE, not an optimisation — but only of the node-worker substrate.
+// While QuickJS is the execution lane it needs no synchronous `fs`, so a
+// registration failure is surfaced and this boot CONTINUES (a donor whose
+// browser cannot register a service worker still relays, replicates and
+// serves). When node-worker replaces QuickJS, `ensureSyncFs` is the first
+// thing that boot awaits and a failure there is fatal by design, because
+// everything downstream of it would hang instead of erroring.
+// ---------------------------------------------------------------------------
+
+const SYNC_FS_SW_URL = new URL("./browser-node/node-worker/sw.js", import.meta.url).href;
+const SYNC_FS_WORKER_URL = new URL("./browser-node/node-worker/worker.js", import.meta.url).href;
+const SYNC_FS_AGENT_URL = new URL("./browser-node/sync-fs-agent.js", import.meta.url).href;
+// A page may have to fetch, install and ACTIVATE a worker before it can reply,
+// and registration is a browser round trip: well above the mesh/db brokers'
+// 6s, which only ever spawn an already-published script.
+const SYNC_FS_BROKER_TIMEOUT_MS = 15_000;
+
+let syncFsLane = null;
+// shape: { state: "registering" | "ready" | "unavailable", scope, scriptURL,
+//          prefix, error, requestSeq, pendingBroker, attempt }
+//
+// Deliberately NOT cleared by stop(): the registration lives in the BROWSER,
+// not in this process, so a stop/start cycle has nothing to re-register and
+// re-asking a page would race the activation of a worker that is already
+// active.
+
+function updateSyncFsStatus() {
+  const summary = syncFsLane
+    ? {
+        state: syncFsLane.state,
+        scope: syncFsLane.scope,
+        scriptURL: syncFsLane.scriptURL,
+        prefix: syncFsLane.prefix,
+        error: syncFsLane.error,
+      }
+    : null;
+  if (JSON.stringify(status.syncFs ?? null) === JSON.stringify(summary)) return;
+  setStatus({ syncFs: summary });
+}
+
+// Same shape as noteMeshError: a failure with no lane yet is still surfaced,
+// never hidden — and never thrown at the caller that only wanted to know.
+//
+// NOT called for a superseded attempt: stop() running mid-registration is not
+// a statement about synchronous `fs`, and marking the lane `unavailable` for
+// it would report a failure this browser never had.
+function noteSyncFsError(error) {
+  const message = String((error && error.message) || error).slice(0, 300);
+  if (!syncFsLane) {
+    syncFsLane = {
+      state: "unavailable",
+      scope: null,
+      scriptURL: null,
+      prefix: null,
+      error: message,
+      requestSeq: 0,
+      pendingBroker: null,
+      attempt: null,
+    };
+  } else {
+    syncFsLane.state = "unavailable";
+    syncFsLane.error = message;
+  }
+  updateSyncFsStatus();
+}
+
+// Idempotent per worker process: one registration, shared by every lane that
+// needs it. A second caller awaits the SAME attempt rather than asking pages
+// twice — two concurrent register() calls for one scope race each other's
+// activation, and the loser's `active` worker can be the one it just replaced.
+function superseded() {
+  const error = new Error("sync-fs lane superseded during registration");
+  error.syncFsSuperseded = true;
+  return error;
+}
+
+function ensureSyncFs(myEpoch) {
+  if (syncFsLane && syncFsLane.state === "ready") return Promise.resolve(syncFsLane);
+  if (syncFsLane && syncFsLane.attempt) return syncFsLane.attempt;
+  const lane = syncFsLane || {
+    state: "registering",
+    scope: null,
+    scriptURL: null,
+    prefix: null,
+    error: null,
+    requestSeq: 0,
+    pendingBroker: null,
+    attempt: null,
+  };
+  lane.state = "registering";
+  lane.error = null;
+  syncFsLane = lane;
+  updateSyncFsStatus();
+  lane.attempt = (async () => {
+    try {
+      // One page at a time, visible first — the sqlite-worker and
+      // peer-mesh-agent brokers' ordering, verbatim. Never a broadcast: every
+      // answering page would register.
+      let lastError = null;
+      const candidates = [...ports].sort(
+        (a, b) => Number(portVisibility.get(b) ?? true) - Number(portVisibility.get(a) ?? true),
+      );
+      for (const port of candidates) {
+        if (myEpoch !== epoch) throw superseded();
+        try {
+          const result = await requestSyncFsRegistration(lane, port);
+          lane.scope = result.scope ?? null;
+          lane.scriptURL = result.scriptURL ?? null;
+          lane.prefix = result.prefix ?? null;
+          lane.state = "ready";
+          lane.error = null;
+          updateSyncFsStatus();
+          return lane;
+        } catch (error) {
+          if (myEpoch !== epoch) throw error;
+          lastError = error;
+        }
+      }
+      throw (
+        lastError ||
+        new Error(
+          "sync_fs_no_page: no connected page could register the service worker (open the dashboard in a visible tab)",
+        )
+      );
+    } catch (error) {
+      if (!(error && error.syncFsSuperseded)) noteSyncFsError(error);
+      throw error;
+    } finally {
+      lane.attempt = null;
+    }
+  })();
+  return lane.attempt;
+}
+
+function requestSyncFsRegistration(lane, port) {
+  return new Promise((resolve, reject) => {
+    const requestId = ++lane.requestSeq;
+    const timer = setTimeout(() => {
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(
+        new Error(
+          `sync_fs_broker_timeout: no page reported a service worker registration within ${SYNC_FS_BROKER_TIMEOUT_MS}ms`,
+        ),
+      );
+    }, SYNC_FS_BROKER_TIMEOUT_MS);
+    lane.pendingBroker = {
+      requestId,
+      resolve: (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    };
+    try {
+      port.postMessage({
+        type: "syncFsRegisterRequest",
+        requestId,
+        swUrl: SYNC_FS_SW_URL,
+        workerUrl: SYNC_FS_WORKER_URL,
+        agentUrl: SYNC_FS_AGENT_URL,
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(error);
+    }
+  });
+}
+
+// A late or duplicated reply is dropped, not merged: `requestId` is per lane
+// and monotonic, so a stale page's answer can never settle this attempt.
+function onSyncFsRegisterResult(msg) {
+  const pending = syncFsLane && syncFsLane.pendingBroker;
+  if (!pending || msg.requestId !== pending.requestId) return;
+  syncFsLane.pendingBroker = null;
+  if (msg.ok) {
+    pending.resolve({ scope: msg.scope, scriptURL: msg.scriptURL, prefix: msg.prefix });
+    return;
+  }
+  pending.reject(
+    new Error(msg.error || "sync_fs_unknown: the page reported a registration failure with no reason"),
+  );
+}
+
 // One renewal spine owns every admission write: periodic lease refresh,
 // browser-network restoration, and iroh home-relay/address migration. The
 // attempt reads currentAddrJson at execution time; boot's first address is
@@ -1973,6 +2553,12 @@ async function renewNow(myEpoch) {
       await discardStaleAttempt(null, endpointId, renewalTeam);
       return "stale";
     }
+    // bn-node-worker-wisp-net: publish the relay BEFORE the artifact pin, so
+    // the substrate's options can resolve even on a run whose function lane
+    // never starts. It cannot fail an admission — a missing or malformed block
+    // just leaves this browser with no relay, which is a named error at the
+    // first socket, never a refusal to run.
+    reconcileNetConfig(admitResult && admitResult.capability);
     // Capability reconcile rides the same renewal spine: pin/re-verify the
     // server-described artifact, then revoke stale callers/digests before
     // granting their replacements. A reconcile failure is treated exactly
@@ -2032,6 +2618,15 @@ async function renewNow(myEpoch) {
       // revocation (contract §5): wipe the replica, no final push — the grant
       // is already gone server-side.
       await stopDbLane({ wipe: true, finalPush: false, owner: doomed });
+      // bn-node-worker-vfs-opfs-fsa: the same event wipes the donor-held GUEST
+      // filesystem. The admission authorized this browser to hold a copy of the
+      // project's tree; a terminal denial means that grant is gone, and the
+      // tree has no other copy — so it goes with the replica. Deliberately NOT
+      // wiped anywhere else: an ordinary stop() only unmounts (a donor turning
+      // the node off and on again gets their filesystem back), and a refused
+      // sync round is not revocation. Best-effort, and loud about survivors —
+      // data outliving its grant silently is the failure this exists to prevent.
+      await wipeGuestFsOnRevocation();
       // Peer links are a grant too: a denied admission means the peer set is
       // no longer authorized, so every direct channel closes with it.
       await stopMeshLane();
@@ -2260,6 +2855,22 @@ async function start(msg) {
       return;
     }
     const endpointId = n.nodeId();
+    // bn-node-worker-service-worker-sync-fs: node-worker's one hard
+    // prerequisite, attempted BEFORE the execution lane exists. Not fatal
+    // while QuickJS is the substrate — it needs no synchronous `fs`, so a
+    // refusal is recorded in status.syncFs and this boot continues. When
+    // node-worker replaces QuickJS this becomes the first await of the boot
+    // and a failure here is fatal, because a guest `require` would otherwise
+    // park its thread forever instead of erroring.
+    try {
+      await ensureSyncFs(myEpoch);
+    } catch {
+      /* named + surfaced by ensureSyncFs (status.syncFs.error) */
+    }
+    if (myEpoch !== epoch) {
+      await discardStaleAttempt(booted, null, msg.team);
+      return;
+    }
     // browser-worker-quickjs-runtime: create the worker-native QuickJS lane
     // and install the invoke handler BEFORE this endpoint can become routable
     // — the first admission only happens after setAddressHandler -> kickRenew
@@ -2268,6 +2879,11 @@ async function start(msg) {
     // rejects, so installing early grants nobody anything.
     const runtime = new WorkerFunctionRuntime({
       blake3: blake3Hex,
+      // bn-node-worker-substrate: the substrate is a node-worker Worker hosted
+      // by a connected page — see the host-broker section above. Without a
+      // page (or with an unbuilt lane) every boot rejects with the named
+      // `node_worker_*` reason and nothing is executed.
+      acquireHost: acquireNodeWorkerHost,
       ops: {
         // The platform registry's read ops with worker-meaningful handlers
         // (hive-browser/identity-json-v1, hive-browser/utf8-array-buffer-v1);
@@ -2421,6 +3037,34 @@ function onPortVisibility(port, msg) {
   }
 }
 
+// bn-node-worker-vfs-opfs-fsa: delete every guest filesystem tree this browser
+// holds for the platform. Called from ONE place — the terminal-admission-denial
+// arm of renewOnce, i.e. revocation — and never from stop(): unlike the CRR
+// replica, whose system of record is the converged fleet set, the guest tree
+// exists only here, so a routine stop must not destroy it.
+//
+// Best-effort, because revocation must still complete if storage is gone or the
+// lane was never built; loud, because a wipe that silently leaves data behind is
+// the exact failure this function exists to prevent.
+async function wipeGuestFsOnRevocation() {
+  try {
+    const vfs = await import("./browser-node/node-worker-vfs.js");
+    const result = await vfs.wipeGuestFs({});
+    if (result.survivors.length > 0) {
+      console.error(
+        `[run-node] guest filesystem wipe incomplete: ${result.survivors.length} entries survived revocation`,
+        result.survivors,
+      );
+    }
+    return result;
+  } catch (error) {
+    // Named, not swallowed: a donor holding data whose grant is gone deserves a
+    // line in the console, and an operator needs the reason.
+    console.error(`[run-node] guest filesystem wipe failed: ${String(error?.message || error)}`);
+    return null;
+  }
+}
+
 async function stop() {
   epoch++; // fences every in-flight start()/renew continuation from this point on
   closing = true;
@@ -2468,6 +3112,9 @@ async function stop() {
   // had transport + a live grant for the final push.
   if (dbLane) await stopDbLane({ wipe: false, finalPush: false });
   if (meshLane) await stopMeshLane();
+  // The relay was a published grant like the two lanes above: withdraw it with
+  // the session so a stopped node keeps no dialable third party in its globals.
+  reconcileNetConfig(null);
   session = null;
   closing = false;
   setStatus({
@@ -2511,12 +3158,38 @@ function connectPort(port) {
     // The db lane's page-broker handshake + control ops
     // (bn-run-node-db-sync-wiring; see the file header for the contract).
     else if (msg.type === "dbWorkerPort") onDbWorkerPort(port, msg, e.ports);
+    else if (msg.type === "nodeWorkerPort") onNodeWorkerPort(port, msg, e.ports);
     // The peer-mesh lane's page-agent handshake (bn-browser-peer-webrtc-mesh;
     // RTCPeerConnection is Window-only, see the file header).
     else if (msg.type === "meshPeerPort") onMeshPeerPort(port, msg, e.ports);
+    // The synchronous-fs lane's page-broker handshake
+    // (bn-node-worker-service-worker-sync-fs; see that section's header).
+    else if (msg.type === "syncFsRegisterResult") onSyncFsRegisterResult(msg);
     else if (msg.type === "dbExec") handleDbExec(port, msg, true);
     else if (msg.type === "dbQuery") handleDbExec(port, msg, false);
     else if (msg.type === "dbSyncNow") handleDbSyncNow(port, msg);
+    // coop-coep-fleet-wide: the sanctioned probe for the SYNCHRONOUS half of
+    // node-worker (`receiveMessageOnPort`). Anything that means to drain a
+    // port synchronously asks FIRST, because a synchronous drain on a global
+    // with no SharedArrayBuffer has no failure mode to report — it just never
+    // returns, and the caller blocks forever with nothing in any log. This
+    // answers instead: `ok: false` carries the reason, and the caller is
+    // expected to take its async path.
+    else if (msg.type === "syncBridge") {
+      let ok = false;
+      let error = null;
+      try {
+        requireSyncBridge("receiveMessageOnPort");
+        ok = true;
+      } catch (e) {
+        error = String((e && e.message) || e);
+      }
+      try {
+        port.postMessage({ type: "syncBridge", ok, error, isolation: { ...ISOLATION, syncBridge: SYNC_BRIDGE_AVAILABLE } });
+      } catch {
+        /* ignore */
+      }
+    }
     else if (msg.type === "status") {
       try {
         port.postMessage({ type: "status", status });

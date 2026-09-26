@@ -7,6 +7,13 @@
 // complete by the time connectTls() resolves, so the negotiated protocol/cipher
 // and the peer certificate chain are available immediately.
 //
+// Which is why TLS has no relay configuration of its own: it rides whatever TCP
+// `net` got, and that comes from the one Wisp URL resolved in ../../wire/wisp.ts
+// (caller-supplied, then the platform's configured relay, then a public fallback
+// the host opted into). With none of those, `getClient()` throws a named
+// `WispRelayUnavailable` and this fails with it, rather than looking like a
+// certificate problem.
+//
 // Not supported (epoxy can only establish TLS at connect time, against the
 // bundled webpki roots): wrapping an existing socket via `new TLSSocket(sock)`,
 // TLS servers (`tls.createServer`), client certificates, custom CA / a custom

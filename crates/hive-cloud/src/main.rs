@@ -15,6 +15,7 @@ mod billing;
 mod bounded_round;
 mod browser_admission;
 mod browser_artifacts;
+mod browser_esm;
 mod browser_db;
 mod browser_db_rest;
 // bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
@@ -23,6 +24,7 @@ mod browser_presence;
 mod build_coordinates;
 mod build_executor;
 mod cluster;
+mod coi;
 mod compose;
 mod databases;
 mod db_gateway;
@@ -2095,6 +2097,14 @@ async fn async_main() -> anyhow::Result<()> {
     // pipeline. Only active when `HIVE_INGRESS != ngrok`; in ngrok mode the
     // public listener is byte-identical to today. Exposing the admin API on a
     // public host REQUIRES JWT enforcement — refuse to split otherwise.
+    // Dashboard hosts (apex + www). Hoisted because TWO consumers need them:
+    // the host dispatcher below, and the cross-origin-isolation policy, whose
+    // default (`lane`) isolates exactly these hosts at the browser-node lane
+    // paths — see `coi`.
+    let dash_hosts = vec![
+        cloud.platform_domain.clone(),
+        format!("www.{}", cloud.platform_domain),
+    ];
     let public = if cloud.ingress != "ngrok" {
         if !auth::enforced() {
             tracing::error!(
@@ -2120,17 +2130,13 @@ async fn async_main() -> anyhow::Result<()> {
                 .ok()
                 .map(|v| v.trim().trim_end_matches('/').to_string())
                 .filter(|v| !v.is_empty());
-            let dash_hosts = vec![
-                cloud.platform_domain.clone(),
-                format!("www.{}", cloud.platform_domain),
-            ];
             tracing::info!(%api_host, %admin_host, %webhook_host, dashboard = ?dash_upstream, "host-based dispatch active (api/admin/webhook hosts → admin router; apex/www → dashboard proxy)");
             host_switch_router(
                 cloud.clone(),
                 api_host,
                 admin_host,
                 webhook_host,
-                dash_hosts,
+                dash_hosts.clone(),
                 dash_upstream,
                 cloud.http.clone(),
                 admin_router.clone(),
@@ -2140,6 +2146,19 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         public
     };
+
+    // Cross-origin isolation (COOP + COEP) for the browser-node lane —
+    // SharedArrayBuffer, which node-worker's synchronous bridge needs, exists
+    // only in a cross-origin-isolated document. Layered HERE, after host
+    // dispatch and BEFORE every clone below (`tls_public`, the dedicated-IPv4
+    // listeners, the plain-HTTP `serve`), so all four public listeners agree
+    // on one policy: withhold it from one and the same URL is isolated on
+    // https:// and not on https://<addon-ip>, which is a worse failure than
+    // never having it (the lane degrades only on some requests). Default is
+    // `lane` (dashboard hosts at `/run-node`, `/run-node-worker.js`,
+    // `/browser-node/*`) because a global `require-corp` would take out the
+    // dashboard's Clerk embed and every tenant deployment. See `coi`.
+    let public = coi::layer(public, coi::Config::from_env(&dash_hosts));
 
     // Production TLS: terminate HTTPS on the gateway (same edge pipeline). Uses a
     // real cert from HIVE_TLS_CERT/HIVE_TLS_KEY (PEM paths) when set, else a

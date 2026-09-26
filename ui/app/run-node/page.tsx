@@ -6,8 +6,11 @@ import { useRunNode } from "@/lib/use-run-node";
 import {
   lifecycleLabel,
   dbLaneStateLabel,
+  syncFsStateLabel,
+  isolationLabel,
   type RunNodeStatus,
   type DbLaneStatus,
+  type SyncFsLaneStatus,
   type FunctionLaneStatus,
   type ServeMode,
 } from "@/lib/run-node-status";
@@ -61,6 +64,12 @@ function staleSuffix(locatedMs: number | null): string {
 export default function RunNodePage() {
   const { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError } = useRunNode();
   const dbStatus = (status as RunNodeStatus & { db?: DbLaneStatus | null }).db ?? null;
+  // bn-node-worker-service-worker-sync-fs (additive worker field): whether the
+  // node-worker substrate's one hard prerequisite is actually in place. A node
+  // that reports `unavailable` still relays, replicates and serves under the
+  // QuickJS lane, so this is surfaced as a fact with its own named reason
+  // rather than folded into the lifecycle.
+  const syncFsStatus = (status as RunNodeStatus & { syncFs?: SyncFsLaneStatus | null }).syncFs ?? null;
   // Additive worker field (browser-node-optional-serve-target): whether a
   // function artifact is actually PINNED right now, derived worker-side from
   // the runtime rather than from what was requested — so the page can state
@@ -695,6 +704,23 @@ export default function RunNodePage() {
               </dd>
             </>
           )}
+          {syncFsStatus && (
+            <>
+              <dt className="text-muted">Sync fs</dt>
+              {/* The named reason is rendered verbatim: it is the only thing
+                  that turns "the guest app just stopped" into a fix. Nothing
+                  here is fatal to the node under the QuickJS lane. */}
+              <dd className={syncFsStatus.state === "unavailable" ? "text-amber-600 dark:text-amber-400" : "text-secondary"}>
+                {syncFsStateLabel(syncFsStatus)}
+                {syncFsStatus.state === "ready" && syncFsStatus.prefix && (
+                  <span className="text-muted"> · {syncFsStatus.prefix}</span>
+                )}
+                {syncFsStatus.state === "unavailable" && syncFsStatus.error && (
+                  <span className="text-muted"> · {syncFsStatus.error}</span>
+                )}
+              </dd>
+            </>
+          )}
           {status.tabCount > 1 && (
             <>
               <dt className="text-muted">Tabs</dt>
@@ -769,6 +795,19 @@ export default function RunNodePage() {
             </div>
           )
         )}
+        {/* coop-coep-fleet-wide: async-only is its OWN banner, deliberately
+            outside the error chain above — it is not an error and must not
+            displace one (a node can be both isolated-less and failing), and
+            it must not be rendered as a red alert: nothing here is broken.
+            Only shown once the worker has actually reported (null = not
+            connected yet), and only while a node is running, so a stopped
+            page doesn't lead with a limitation the user hasn't hit. */}
+        {status.isolation && !status.isolation.syncBridge && status.lifecycle !== "stopped" ? (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-sky-500/10 p-2 text-xs text-sky-700 dark:text-sky-300" role="status">
+            <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{isolationLabel(status.isolation)}</span>
+          </div>
+        ) : null}
         <div className="mt-4 flex gap-2">
           {status.lifecycle === "stopped" ? (
             <button

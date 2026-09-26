@@ -42,23 +42,40 @@ for (const f of readdirSync(srcPkg)) {
 // ui/public/browser-node/, so the deployed worker imported a path that was never
 // published.
 //
-// node-runtime.js is a STATIC import of worker-function-runtime.js
-// (browser-node-api-runtime): omitting it does not 404 one lane, it fails the
-// SharedWorker's whole module graph on the fleet while every local check stays
-// green — the same publishing gap as peer-mesh*.js, one step louder.
+// node-runtime.js USED to be a static import of worker-function-runtime.js —
+// the hand-written Node API shim evaluated INSIDE the QuickJS guest. The
+// substrate is node-worker now (execution-path-swap-off-quickjs), which IS
+// Node, so the shim is deleted and the module graph has one fewer
+// load-bearing file.
+// sync-fs-agent.js is the page half of the SAME bridge (bn-node-worker-service-
+// worker-sync-fs): `navigator.serviceWorker` is `[Exposed=Window]`, so the
+// run-node SharedWorker cannot register sw.js itself and brokers it through a
+// connected page, which imports this module from the deployed origin at
+// runtime — exactly the peer-mesh-agent.js shape, so omitting it fails no
+// build and only 404s on the fleet at the moment the lane is needed.
+//
+// node-worker-host.js / node-worker-agent.js / node-worker-vfs.js are the
+// node-worker substrate's own trio (bn-node-worker-substrate +
+// bn-node-worker-vfs-opfs-fsa). The host is imported by the agent, and it
+// imports the vfs module with a RUNTIME dynamic import — so a missing
+// node-worker-vfs.js fails no build and only surfaces as a page-side
+// "no persistent guest filesystem" degradation inside a donor's browser.
 for (const f of [
   "identity.js",
   "artifact-policy.js",
-  "node-runtime.js",
   "worker-function-runtime.js",
   "peer-mesh.js",
   "peer-mesh-agent.js",
+  "sync-fs-agent.js",
+  "node-worker-host.js",
+  "node-worker-agent.js",
+  "node-worker-vfs.js",
 ]) {
   const src = join(srcRoot, f);
   if (existsSync(src)) {
     copyFileSync(src, join(destRoot, f));
   } else if (f !== "identity.js") {
-    console.warn(`[sync-browser-node] ${src} missing — the worker QuickJS lane will fail to load until it exists.`);
+    console.warn(`[sync-browser-node] ${src} missing — the browser-node lane it belongs to will fail to load until it exists.`);
   }
 }
 
@@ -74,9 +91,12 @@ for (const f of [
 // sw.js and sw-handler.js are the ServiceWorker half of the SYNCHRONOUS `fs`
 // bridge: node-worker's module resolver is synchronous end to end, so without
 // a service worker backing sync `fs` there is no working `require` and nothing
-// runs. They must be published at the scope the page registers them under,
-// which is why they ship as top-level browser-node assets rather than being
-// imported by the worker.
+// runs. They must be published at the scope the page registers them under —
+// that scope is this directory (`/browser-node/node-worker/`, sw.js's own
+// default), which is also where dist/worker.js lives, because what makes the
+// worker's blocking requests interceptable is its own script URL being inside
+// the scope. Registration itself is browser-node/sync-fs-agent.js (see its
+// header); NODE_WORKER_SET below is what puts the bytes there for it.
 const NODE_WORKER_SET = ["index.js", "worker.js", "sw.js", "sw-handler.js"];
 const nwSrcRoot = join(srcRoot, "node-worker");
 if (existsSync(nwSrcRoot)) {

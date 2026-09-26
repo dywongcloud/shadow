@@ -1,6 +1,7 @@
 import { connectToPeer } from "../peer";
 import { decode, fetchPuter } from "../puter";
-import { RELAY_TOKEN, WISP_URL } from "../state";
+import { PUTER_TOKEN, RELAY_TOKEN, WISP_URL } from "../state";
+import { noRelayError } from "../../wire/wisp";
 import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
 // epoxy-tls 43ed248. Bumped from 04e4930, which never requested the Wisp v2 subprotocol: the spec
@@ -171,12 +172,19 @@ async function createClient() {
 	if (WISP_URL) {
 		server = WISP_URL;
 		password = RELAY_TOKEN;
-	} else {
+	} else if (PUTER_TOKEN) {
 		let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {});
 		if (!ok) throw new Error("failed to get wisp credentials");
 		let creds = decode(u8array);
 		server = creds.server;
 		password = creds.token;
+	} else {
+		// Anonymous AND relay-less: there is no token to mint credentials with and
+		// no relay to dial, so this is the point of use for the one error that says
+		// so. Without it the failure was "failed to get wisp credentials" — a
+		// sentence about an api this worker deliberately never calls, out of a
+		// `fetchPuter` that only got here because `PUTER_TOKEN` was empty.
+		throw noRelayError();
 	}
 
 	// epoxy's WebSocketJsProvider dials the relay through its bundled

@@ -51,6 +51,34 @@ export interface NodeNetInit {
 	 * identity across reloads.
 	 */
 	peerToken?: string;
+	/**
+	 * Allow the THIRD-PARTY public fallback relay when nothing else resolves.
+	 *
+	 * Off unless asked for, on this option or on the host's own configuration:
+	 * that relay terminates and re-emits every connection this worker makes, so
+	 * routing someone's traffic through it is a decision, not a default. When it
+	 * is allowed its reachability is proven first (see `publicFallbackProbeMs`)
+	 * and its use is logged. Resolution order is spelled out in ../wire/wisp.ts.
+	 */
+	allowPublicFallback?: boolean;
+	/**
+	 * The fallback relay to dial, overriding the package default.
+	 *
+	 * Exists because the host may live in a realm that shares no global with the
+	 * one that read the operator's configuration (a page hosting the substrate
+	 * for a SharedWorker), so "which third-party relay" has to be able to travel
+	 * with the rest of `net` instead of being re-derived at the destination.
+	 */
+	publicFallbackUrl?: string;
+	/**
+	 * How long the fallback relay gets to answer a websocket handshake before it
+	 * counts as unreachable. `0` trusts it without probing.
+	 *
+	 * Default 5000ms. Only ever spent on the fallback: an operator's own relay
+	 * is configuration, not a guess, and probing it would put a third party's
+	 * round trip in front of a source that needs none.
+	 */
+	publicFallbackProbeMs?: number;
 }
 
 /** Terminal dimensions, as `process.stdout.columns`/`rows`. */

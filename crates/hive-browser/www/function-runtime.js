@@ -1,4 +1,4 @@
-import { FunctionRunner, post } from "./function-runner.js";
+import { FunctionRunner } from "./function-runner.js";
 import {
   DIGEST_RE,
   normalizePolicy as normalizePolicyShape,
@@ -6,36 +6,9 @@ import {
   positiveInteger,
   sourceDigest,
 } from "./artifact-policy.js";
-import { wrapArtifactSource } from "./node-runtime.js";
+import { assetUrls } from "./node-worker-host.js";
 
 const encoder = new TextEncoder();
-
-function site(hostname) {
-  if (hostname === "localhost" || /^\d+(?:\.\d+){3}$/.test(hostname)) return hostname;
-  return hostname.split(".").slice(-2).join(".");
-}
-
-function abortError(signal) {
-  return signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
-}
-
-function abortable(promise, signal) {
-  if (signal.aborted) return Promise.reject(abortError(signal));
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(abortError(signal));
-    signal.addEventListener("abort", onAbort, { once: true });
-    Promise.resolve(promise).then(
-      value => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      error => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
-}
 
 function readOperation(value) {
   const handler = typeof value === "function" ? value : value?.handler;
@@ -75,19 +48,12 @@ function normalizePolicy(options, operations) {
 
 export class BrowserFunctionRuntime {
   constructor(options = {}) {
-    this.development = options.development === true;
-    const configuredFrame = options.frameUrl;
-    if (!this.development && !configuredFrame) throw new Error("production function runtime requires frameUrl");
-    const frameUrl = new URL(configuredFrame || "./function-frame.html", location.href);
-    if (!this.development) {
-      if (frameUrl.protocol !== "https:") throw new Error("production function frame must use https");
-      if (frameUrl.origin === location.origin || site(frameUrl.hostname) === site(location.hostname)) {
-        throw new Error("production function frame must use a separate site");
-      }
-    }
-    this.frameUrl = frameUrl.href;
-    this.workerUrl = new URL(options.workerUrl || "./pkg/function-worker.js", location.href).href;
-    this.bootTimeoutMs = positiveInteger(options.bootTimeoutMs, 10000, "bootTimeoutMs");
+    // The substrate is hosted in THIS page (node-worker's filesystem host needs
+    // `navigator.serviceWorker`), so there is no sandboxed frame to configure
+    // any more — see function-runner.js for what replaced it and what that
+    // costs. `substrateBase` overrides where the vendored build was published.
+    this.hostUrls = assetUrls(options.substrateBase || "./node-worker/");
+    this.bootTimeoutMs = positiveInteger(options.bootTimeoutMs, 20000, "bootTimeoutMs");
     this.maxQueue = positiveInteger(options.maxQueue, 32, "maxQueue");
     this.maxActiveOps = positiveInteger(options.maxActiveOps, 32, "maxActiveOps");
     if (typeof options.blake3 !== "function") throw new Error("function runtime requires a BLAKE3 implementation");
@@ -99,41 +65,9 @@ export class BrowserFunctionRuntime {
       this.ops.set(id, readOperation(value));
     }
     this.artifacts = new Map();
-    this.opCompletions = [];
-    this.opFlushScheduled = false;
     this.activeOps = 0;
     this.closed = false;
     this.handleInvoke = this.handleInvoke.bind(this);
-  }
-
-  loadWorkerSource(signal) {
-    if (this.closed) return Promise.reject(new Error("function runtime is closed"));
-    if (!this.workerSource) {
-      const controller = new AbortController();
-      this.workerSourceController = controller;
-      const timer = setTimeout(() => {
-        controller.abort(new Error("function worker fetch timed out"));
-      }, this.bootTimeoutMs);
-      let source;
-      source = fetch(this.workerUrl, { signal: controller.signal })
-        .then(async response => {
-          if (!response.ok) throw new Error(`function worker fetch failed: ${response.status}`);
-          return response.text();
-        })
-        .catch(error => {
-          if (controller.signal.aborted) throw abortError(controller.signal);
-          throw error;
-        })
-        .finally(() => {
-          clearTimeout(timer);
-          if (this.workerSourceController === controller) this.workerSourceController = undefined;
-        });
-      source.catch(() => {
-        if (this.workerSource === source) this.workerSource = undefined;
-      });
-      this.workerSource = source;
-    }
-    return abortable(this.workerSource, signal);
   }
 
   beginOp() {
@@ -157,23 +91,18 @@ export class BrowserFunctionRuntime {
     const artifact = {
       digest,
       sourceDigest: sourceDigestValue,
+      // The verified source, handed to the substrate EXACTLY as pinned: the
+      // host wraps `module.exports = (…)` around it at boot
+      // (node-worker-host.js). Nothing is substituted into it, and nothing
+      // needs to be — node-worker IS Node, so there is no Node API shim to
+      // prepend any more.
+      source,
+      mode: policy.mode,
       timeoutMs: policy.timeoutMs,
       allowedOps: new Set(policy.ids),
       ops: policy.operations,
       runner: undefined,
       ready: undefined,
-      workerConfig: {
-        // Same Node API surface as the worker lane (browser-node-api-runtime),
-        // installed around the source AFTER its digest was verified above.
-        // Nothing is replaced in the native lane's real Worker globals — the
-        // runtime only fills in what the substrate is missing.
-        source: wrapArtifactSource(source),
-        mode: policy.mode,
-        limits: {
-          memoryBytes: policy.memoryBytes,
-          stackBytes: policy.stackBytes,
-        },
-      },
     };
     this.artifacts.get(digest)?.runner?.close(new Error("artifact replaced"));
     this.artifacts.set(digest, artifact);
@@ -224,27 +153,9 @@ export class BrowserFunctionRuntime {
     }
   }
 
-  scheduleOpFlush() {
-    if (this.opFlushScheduled) return;
-    this.opFlushScheduled = true;
-    queueMicrotask(() => {
-      this.opFlushScheduled = false;
-      const byRunner = new Map();
-      for (const item of this.opCompletions.splice(0)) {
-        if (!item.runner.closed) {
-          const batch = byRunner.get(item.runner) || [];
-          batch.push(item.result);
-          byRunner.set(item.runner, batch);
-        }
-      }
-      for (const [runner, items] of byRunner) post(runner.port, { kind: "opBatch", items });
-    });
-  }
-
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.workerSourceController?.abort(new Error("function runtime closed"));
     for (const artifact of this.artifacts.values()) artifact.runner?.close();
     this.artifacts.clear();
   }

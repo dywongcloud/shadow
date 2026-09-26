@@ -582,9 +582,10 @@ impl Default for FunctionConfig {
 // A function becomes browser-eligible ONLY by opting in through fluid.json
 // `functions[].browser` and surviving the build-time bundle pass. The build
 // emits ONE deterministic, self-contained source string — an
-// `async function (request, ops)` expression in exactly the shape
-// `crates/hive-browser/www/pkg/function-worker.js` evaluates
-// (`globalThis.__hive_handler = (<source>)`) — computes two BLAKE3 digests
+// `async function (request, ops)` expression in exactly the shape the browser
+// substrate evaluates (`module.exports = (<source>)`, run as CommonJS by the
+// vendored node-worker guest — see
+// `crates/hive-browser/www/node-worker-host.js`) — computes two BLAKE3 digests
 // (source bytes; canonical policy encoding), persists the bytes
 // content-addressed on the building node, and stamps only the descriptor onto
 // the manifest. The digest the wire protocol routes on

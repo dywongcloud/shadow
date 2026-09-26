@@ -1417,10 +1417,16 @@ fn retained_source_path_for_ids(project: &str, ids: &[String]) -> Option<PathBuf
 /// `module.exports` is served in browsers with zero config, not just one that
 /// ships a dedicated `.browser.js`. What makes probing a function's own entry
 /// safe (rather than "shipping the wrong code" from a long-running server) is
-/// `bundle()`'s BUILD-TIME gate: the forbidden-surface scan drops any entry
-/// that uses `require`/`import`/`process`/Node APIs, and `handler_export_present`
-/// drops any entry that never assigns `module.exports`/`exports.handler` — a
-/// server's entry hits both, so it is filtered, never bundled. A synthesized
+/// `bundle()`'s BUILD-TIME gate: `handler_export_present` drops any entry that
+/// never assigns a handler (`module.exports` / `exports.handler` /
+/// `exports.default`, or an ESM `export default` / `export const handler`,
+/// which `browser_esm::rewrite_esm` rewrites to CommonJS), and the
+/// unimplementable-surface scan drops machine code no browser Worker can run
+/// (`process.dlopen`, a `*.node` addon). Node/framework surfaces
+/// (`require`/`process`/`Buffer`/`fetch`/ESM `import`) are NOT rejected — the
+/// substrate is a real Node runtime (vendored node-worker), and a module it
+/// cannot provide is named at the point of use. A server's entry assigns no
+/// handler export, so it is filtered, never bundled. A synthesized
 /// candidate that fails to bundle is skipped SILENTLY (the function just serves
 /// the normal fleet path); only an explicit fluid.json opt-in fails the build.
 /// The `start_cmd` argv itself is still never parsed for an entry (it may be
@@ -1504,8 +1510,9 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
         candidates.push(format!("browser.{ext}"));
     }
     // The function's own plausible handler files, most-specific first. Each is
-    // still gated by bundle()'s forbidden-surface + handler-export checks, so a
-    // matched-but-ineligible file (a server entry) is skipped, not shipped.
+    // still gated by bundle()'s handler-export + unimplementable-surface
+    // checks, so a matched-but-ineligible file (a server entry) is skipped,
+    // not shipped.
     if safe_name {
         for ext in ["js", "mjs", "cjs"] {
             candidates.push(format!("{fn_name}.handler.{ext}"));
@@ -4165,8 +4172,8 @@ async fn run_build(
     // content-addressed on THIS node, and stamped onto the manifest as a
     // digest-only descriptor — the only thing the replicated deployment state
     // ever carries. An opted-in function that is NOT browser-eligible
-    // (container/python/go runtime, TypeScript entry, Node/Bun/Deno API use,
-    // unresolved host ops) FAILS THE BUILD loudly here: dropping the opt-in
+    // (container/python/go runtime, TypeScript entry, no handler export,
+    // machine code no browser Worker can run) FAILS THE BUILD loudly here: dropping the opt-in
     // silently would leave the function serving on the fleet path while
     // donors believe they are serving it — the exact pretend-every-function-
     // can-run-in-a-browser state this contract exists to remove. Deliberately
@@ -4181,8 +4188,12 @@ async fn run_build(
     // survives the build gate". The `start_cmd` argv is still never parsed for
     // an entry (it may be `next start`/`npm start` with no JS file), and a
     // long-running SERVER entry is not shipped by accident — bundle()'s
-    // forbidden-surface scan (require/import/process/Node APIs) and its new
-    // handler-export check filter it out. Container/python/go/command runtimes
+    // handler-export check filters it out (a server assigns no handler), and
+    // its unimplementable-surface scan refuses the machine code no browser
+    // Worker can run. Node/framework surfaces (require/process/Buffer/fetch and
+    // ES module syntax) are NOT rejected: the substrate is a real Node runtime
+    // (vendored node-worker) and ESM is rewritten to CommonJS
+    // (browser_esm::rewrite_esm). Container/python/go/command runtimes
     // are excluded by construction. Crucially, a SYNTHESIZED policy that then
     // fails to bundle is SKIPPED silently (the function just serves the normal
     // fleet path) — only an EXPLICIT fluid.json opt-in still fails the build

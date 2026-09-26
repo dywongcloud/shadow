@@ -21,6 +21,7 @@ import {
 	KIND_STDIO,
 } from "../wire/kinds";
 import type { ControlCall, ControlResult, NodeNetInit } from "../wire/control";
+import { resolveWispRelay } from "../wire/wisp";
 import type { PeerCall } from "../wire/peer";
 import type { EventsCall } from "../wire/events";
 import type { StdioCall } from "../wire/stdio";
@@ -70,6 +71,22 @@ export type { MountSnapshot, NodeFsCapabilities } from "../wire/fs";
 export { fsError, VfsError, type WireError } from "../vfs/errno";
 export { SyncFsUnavailable } from "./sw";
 export type { NodeNetInit } from "../wire/control";
+
+// How a worker's `node:net` / `node:tls` find a relay, and the error they throw
+// when there is none. Exported so a host can decide the URL the way it decides
+// everything else about the worker, and can tell a missing relay apart from a
+// broken one.
+export {
+	PUBLIC_WISP_FALLBACK_URL,
+	WispRelayUnavailable,
+	isWispUrl,
+	platformWispUrl,
+	publicFallbackAllowed,
+	publicFallbackUrl,
+	resolveWispRelay,
+	type ResolvedWisp,
+	type WispSource,
+} from "../wire/wisp";
 
 // Running programs, and the extension point for it.
 //
@@ -162,6 +179,15 @@ export interface NodeWorkerOptions {
 	 *   net: { wispUrl: server, relayToken: token, peerToken: crypto.randomUUID() }
 	 *
 	 * Ignored when a puter token is passed, which mints all of it for itself.
+	 *
+	 * With no `wispUrl` of its own, one is looked for before the worker starts, in
+	 * this order: the host's platform-configured relay (`globalThis.HIVE_WISP_URL`,
+	 * which the host writes from its own configuration), then — only if the host
+	 * opted in — a third-party PUBLIC fallback, proven reachable and named in a
+	 * console warning, because it terminates and re-emits every connection this
+	 * worker makes. When neither exists the worker still starts, and the first
+	 * socket throws a named `WispRelayUnavailable` instead of an opaque failure.
+	 * Full reasoning: ../wire/wisp.ts.
 	 */
 	net?: NodeNetInit;
 	/**
@@ -818,6 +844,30 @@ export class NodeWorker {
 			// may well have been called during it.
 			if (this.#terminated) throw new Error("terminated before start");
 
+			// The network, for an anonymous worker. A puter token mints relay
+			// credentials of its own and `net` is documented as ignored, so the
+			// resolution only runs for the start that actually needs it.
+			//
+			// Order: what the caller named, then the platform's configured relay,
+			// then — only if the host opted in — the third-party public fallback,
+			// proven reachable and logged. See src/wire/wisp.ts for the whole
+			// argument, including why "none of them" is a startup warning here and a
+			// named `WispRelayUnavailable` at the first socket instead.
+			let net = options?.net;
+			if (!puterToken) {
+				const resolved = await resolveWispRelay(options?.net);
+				if (resolved) {
+					net = { ...options?.net, wispUrl: resolved.url };
+				} else {
+					console.warn(
+						"[node-worker] no wisp relay configured — node:net / node:tls will throw " +
+							"WispRelayUnavailable on first use. Pass net: { wispUrl }, or have the " +
+							"platform publish one (HIVE_BROWSER_WISP_URL, written here as " +
+							"globalThis.HIVE_WISP_URL).",
+					);
+				}
+			}
+
 			this.worker = new Worker(workerURL, {
 				name: "node-worker-" + workers++,
 				type: "module",
@@ -833,7 +883,7 @@ export class NodeWorker {
 				{
 					op: "ctl.init",
 					puter: puterToken ?? "",
-					net: options?.net,
+					net,
 					epoxyBase: options?.epoxyBase,
 					cwd,
 					keepalive,

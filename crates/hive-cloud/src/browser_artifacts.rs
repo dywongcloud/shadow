@@ -6,28 +6,43 @@
 //! `functions[].browser` ([`fluid_core::BrowserPolicy`]) — or automatically,
 //! via `git::infer_browser_entry` — and surviving [`bundle`]'s rejection pass.
 //! The emitted artifact is ONE deterministic, self-contained source string —
-//! an `async function (request, ops)` expression in exactly the shape
-//! `crates/hive-browser/www/pkg/function-worker.js` evaluates — carrying no
+//! an `async function (request, ops)` expression in exactly the shape the
+//! browser substrate evaluates (`module.exports = (<source>)`, run as CommonJS
+//! by the vendored node-worker guest — see
+//! `crates/hive-browser/www/node-worker-host.js`) — carrying no
 //! env and no secrets.
 //!
 //! NODE SURFACE (browser-node-api-runtime): the build does NOT reject Node/Bun
 //! runtime TOKENS. `require(...)`, `process.*`, `Buffer`, `__dirname`,
 //! `__filename`, `import(...)`, `Deno.*`/`Bun.*` references all compile through
-//! to the artifact, because the browser substrate now SUPPLIES a Node API —
-//! `crates/hive-browser/www/node-runtime.js` installs a CommonJS `require`, a
-//! `process`, a real `Buffer`, `console`, timers, `URL`/`URLSearchParams`,
-//! `TextEncoder`/`TextDecoder` and the Node builtin module set inside the
-//! guest before the artifact function is evaluated. A module the substrate
-//! genuinely cannot provide (`net`, `dns`, outbound `http.request`, …) throws a
-//! NAMED error at the point of use rather than being silently no-op'd, which is
-//! the same "loud, at the honest boundary" discipline the removed scan had —
-//! moved from build time to the exact call that cannot work.
+//! to the artifact, because the browser substrate SUPPLIES a Node API — the
+//! substrate is vendored node-worker (`vendor/node-worker`: Node v25.9.0's own
+//! lib transpiled for a Worker), with Node's real CommonJS/ESM loader,
+//! `process`, `Buffer` and `fetch`. That replaced QuickJS, whose global object
+//! is bare ECMAScript and which could honestly run none of it. A module the
+//! substrate genuinely cannot provide (`net`, `dns`, outbound `http.request`,
+//! …) throws a NAMED error at the point of use rather than being silently
+//! no-op'd — the same "loud, at the honest boundary" discipline the removed
+//! token scan had, moved from build time to the exact call that cannot work.
 //!
-//! Static ES module syntax (`import x from` / `export …`) is STILL a build
-//! rejection, and that one is a correctness check, not a language-surface one:
-//! the artifact is evaluated as a FUNCTION EXPRESSION, where an `import`
-//! statement is a hard SyntaxError — it would fail identically in every donor's
-//! browser, at boot, for every request.
+//! ES MODULE SYNTAX is REWRITTEN, not rejected (browser-esm-rewrite,
+//! [`crate::browser_esm`]). The artifact is ONE `async function (request, ops)`
+//! EXPRESSION, so a static `import`/`export` STATEMENT is a hard SyntaxError in
+//! its body — but it was also what excluded every framework build output
+//! (`dist/server/entry.mjs`, `.output/server/index.mjs`, a SvelteKit
+//! `build/index.js`) from browser nodes. Since the substrate's loader loads
+//! FILES while the artifact is an EXPRESSION, the build rewrites the module
+//! syntax into the CommonJS the envelope and the guest's
+//! `require`/`module.exports` registry already supply, and refuses only the
+//! forms with no CommonJS equivalent (an entry mixing `export default` with
+//! named exports, an unreadable `export`, an unterminated statement). A
+//! CommonJS entry is returned byte-identical.
+//!
+//! STILL REFUSED LOUDLY is what NO browser substrate can provide: machine code
+//! (`process.dlopen`, a `*.node` addon, `node-gyp-build`) and Node's internal
+//! `process.binding`. Plus the standing checks: non-JS runtime, TypeScript
+//! entry, oversized source, and an entry that exports no request→response
+//! handler at all.
 //!
 //! Store layout under `persist::data_dir()/browser-artifacts/`:
 //!
@@ -88,38 +103,87 @@ pub struct BundledArtifact {
 }
 
 /// Whether a CommonJS entry assigns a handler the wrapper can resolve —
-/// `module.exports = ...`, `module.exports.handler = ...`, or `exports.handler
-/// = ...`. Mirrors the wrapper's runtime resolution (`typeof module.exports ===
-/// "function" ? module.exports : module.exports.handler`), scanned statically
-/// so a server/library/bare-script entry that never touches `module.exports`
-/// is filtered before it can ship. A plain substring is enough: any reference
-/// to `module.exports` (whole-object or `.handler`) means the file participates
-/// in the CommonJS export the wrapper reads; a bare `exports.handler` covers
-/// the aliased form the wrapper also accepts.
+/// `module.exports = ...`, `module.exports.handler = ...`, `exports.handler =
+/// ...`, or the `default` form a TypeScript-transpiled entry emits
+/// (`exports.default = ...`). Mirrors the wrapper's runtime resolution
+/// (a function `module.exports`, else `.handler`, else `.default`), scanned
+/// statically so a server/library/bare-script entry that never touches
+/// `module.exports` is filtered before it can ship. A plain substring is
+/// enough: any reference to `module.exports` (whole-object, `.handler` or
+/// `.default`) means the file participates in the CommonJS export the wrapper
+/// reads; a bare `exports.handler` / `exports.default` covers the aliased forms
+/// the wrapper also accepts.
 fn handler_export_present(src: &str) -> bool {
-    src.contains("module.exports") || src.contains("exports.handler")
+    src.contains("module.exports")
+        || src.contains("exports.handler")
+        || src.contains("exports.default")
 }
 
-/// Every static `import ...` / `export ...` module form. Matched line-wise so
-/// the denial message can name the exact line.
-fn module_syntax_lines(source: &str) -> Vec<usize> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(i, line)| {
-            let t = line.trim_start();
-            if t.starts_with("import ")
-                || t.starts_with("import{")
-                || t.starts_with("export ")
-                || t.starts_with("export{")
-                || t == "import"
-            {
-                Some(i + 1)
-            } else {
-                None
+/// Surfaces NO browser substrate can ever provide, matched line-wise so the
+/// rejection names the exact line: machine code and Node's internal bindings.
+/// Everything else — a module the substrate lacks, a relative specifier,
+/// outbound `http.request` — is left to the runtime to name at the point of
+/// use, never turned into a build-time guess here.
+const UNIMPLEMENTABLE: &[(&str, &str)] = &[
+    (
+        "process.dlopen(",
+        "loads a native addon (`process.dlopen`) — a browser Worker cannot execute machine code, \
+         so this entry cannot run in a donor's browser at all",
+    ),
+    (
+        "process.binding(",
+        "uses Node's internal `process.binding` — there is no such API in a browser Worker",
+    ),
+    (
+        "node-gyp-build",
+        "loads a native addon through `node-gyp-build` — compiled machine code cannot run in a \
+         browser Worker; use the package's pure-JS/WASM build",
+    ),
+    (
+        "require(\"bindings\")",
+        "loads a native addon through `bindings` — compiled machine code cannot run in a browser \
+         Worker",
+    ),
+    (
+        "require('bindings')",
+        "loads a native addon through `bindings` — compiled machine code cannot run in a browser \
+         Worker",
+    ),
+];
+
+fn unimplementable_lines(source: &str) -> Vec<(usize, &'static str)> {
+    let mut out = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        for (needle, why) in UNIMPLEMENTABLE {
+            if line.contains(needle) {
+                out.push((i + 1, *why));
             }
-        })
-        .collect()
+        }
+        // A `*.node` specifier is a compiled addon by extension.
+        if (line.contains(".node\"") || line.contains(".node'"))
+            && line.contains("require(")
+        {
+            out.push((
+                i + 1,
+                "requires a `*.node` native addon — compiled machine code cannot run in a browser \
+                 Worker",
+            ));
+        }
+    }
+    out
+}
+
+/// The `import.meta` shim the envelope defines when the rewritten entry uses
+/// it: the artifact is ONE in-memory file, so there is no real disk path — the
+/// entry path is reported as it is known to the deployment.
+fn import_meta_binding(entry: &str) -> String {
+    let rel = entry.trim().trim_start_matches("./");
+    let esc = rel.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "const {} = {{ url: \"file:///hive/{esc}\", filename: \"/hive/{esc}\", dirname: \"/hive\", \
+         env: {{}}, resolve: (s) => s }};",
+        crate::browser_esm::IMPORT_META_SHIM
+    )
 }
 
 /// Resolve the entry path safely inside the deployment build dir. The entry
@@ -165,9 +229,10 @@ fn resolve_entry(build_dir: &Path, entry: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Bundle one opted-in function into its deterministic QuickJS-compatible
-/// artifact. Every ineligibility is a loud `Err` naming the function and the
-/// reason — the caller (the build pipeline) fails the deployment on it.
+/// Bundle one opted-in (or auto-detected) function into its deterministic
+/// browser artifact. Every ineligibility is a loud `Err` naming the function
+/// and the reason — the caller (the build pipeline) fails an EXPLICIT opt-in on
+/// it and skips an auto-detected one silently.
 pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, String> {
     let name = || format!("function {:?}", f.name);
     let Some(policy) = f.browser.as_ref() else {
@@ -249,35 +314,46 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     // before wrapping (and before hashing).
     let user = raw.replace("\r\n", "\n").replace('\r', "\n");
 
-    // The ONLY source-shape rejection left. Node/Bun runtime tokens are no
-    // longer scanned for at all (browser-node-api-runtime: the substrate
-    // supplies `require`/`process`/`Buffer`/… and names what it cannot do at
-    // the call site), but a static `import`/`export` STATEMENT is a hard
-    // SyntaxError inside the function-expression envelope below — it cannot be
-    // "permitted", only deferred into a boot failure in every donor's browser.
+    // ES module syntax -> CommonJS (browser-esm-rewrite). A static
+    // `import`/`export` STATEMENT is a SyntaxError inside the function
+    // expression below, so instead of rejecting the entry — which excluded
+    // every framework build output from browser nodes — the module syntax is
+    // rewritten into the `require`/`module.exports` the envelope (and the
+    // guest's Node module registry) already evaluates. A CommonJS entry comes
+    // back byte-identical. Only a form with NO CommonJS equivalent is an Err
+    // here, and that is a loud build rejection (explicit opt-in) or a silent
+    // skip (auto-detected entry), decided by the caller.
+    let rewritten = match crate::browser_esm::rewrite_esm(&user) {
+        Ok(esm) => esm,
+        Err(reason) => {
+            return Err(format!(
+                "{} is browser-eligible in principle, but its entry {:?} cannot be evaluated as a \
+                 browser artifact:\n  - {reason}",
+                name(),
+                policy.entry
+            ));
+        }
+    };
+    let user = rewritten.source;
     let mut rejections: Vec<String> = Vec::new();
-    for line in module_syntax_lines(&user) {
-        rejections.push(format!(
-            "line {line}: ES module syntax — the artifact is evaluated as ONE function \
-             expression, where `import`/`export` statements are a SyntaxError; use CommonJS \
-             (`const x = require(\"…\")`, `module.exports = handler`), which the browser Node \
-             runtime supports"
-        ));
+    for (line, why) in unimplementable_lines(&user) {
+        rejections.push(format!("line {line}: {why}"));
     }
     // A browser artifact MUST resolve to a request→response handler at runtime:
-    // the wrapper below assigns `module.exports`/`exports.handler` and THROWS if
-    // it is not a function. Verify that export exists STATICALLY here so a
-    // non-handler entry (a long-running server, a library, a bare script) is
-    // caught at build — an AUTO-detected candidate is then skipped silently and
-    // an EXPLICIT opt-in fails the build loudly, instead of shipping bytes that
+    // the wrapper below resolves `module.exports` and THROWS if it is not a
+    // function. Verify that export exists STATICALLY here so a non-handler
+    // entry (a long-running server, a library, a bare script) is caught at
+    // build — an AUTO-detected candidate is then skipped silently and an
+    // EXPLICIT opt-in fails the build loudly, instead of shipping bytes that
     // throw in every donor's browser. This is what makes probing a function's
     // own entry (not just a `.browser.js` convention file) safe: a server's
     // entry never assigns module.exports, so it is filtered here.
     if !handler_export_present(&user) {
         rejections.push(
             "defines no handler export — assign the request→response handler to `module.exports` \
-             (or `exports.handler`); an entry that exports none is a server/library, not a browser \
-             handler"
+             (or `exports.handler`); an ES module entry exports it as `export default handler` or \
+             `export const handler = ...`, which the build rewrites to CommonJS. An entry that \
+             exports none is a server/library, not a browser handler"
                 .to_string(),
         );
     }
@@ -291,17 +367,18 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
         ));
     }
 
-    // The deterministic single-function source: the user's CommonJS-style
-    // file verbatim inside a fixed envelope that (a) resolves the handler,
-    // (b) normalizes the request (a JSON string on the QuickJS path, an
-    // object on the native path), and (c) normalizes the response into the
-    // `{status, headers, body, bodyBase64}` envelope string the gateway's
-    // `browser_response` parses. The wrapper is a constant template, so the
-    // emitted bytes — and therefore both digests — depend only on the entry
-    // source and the policy.
+    // The deterministic single-function source: the user's file — CommonJS, or
+    // ESM rewritten to CommonJS — verbatim inside a fixed envelope that (a)
+    // resolves the handler, (b) normalizes the request (a JSON string on the
+    // guest path, an object on the native path), and (c) normalizes the
+    // response into the `{status, headers, body, bodyBase64}` envelope string
+    // the gateway's `browser_response` parses. The wrapper is a constant
+    // template, so the emitted bytes — and therefore both digests — depend only
+    // on the entry source and the policy.
     //
-    // `__hive_node_bridge` is the ONE hook the Node runtime installs
-    // (node-runtime.js, evaluated in the guest before this function). When it
+    // `__hive_node_bridge` is the ONE hook the Node runtime installs — the
+    // guest's Node API shim (node-runtime.js today, node-worker's runtime after
+    // the substrate swap), evaluated in the guest before this function. When it
     // is absent — a substrate with no Node runtime, e.g. the native-mode DOM
     // lane — every line below behaves exactly as it did before it existed:
     // `request`/`ops` are passed through unchanged and the handler's RETURN
@@ -314,37 +391,60 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     // always wins (the platform contract, unchanged), otherwise the response
     // written on `res` is used, including the `return res.json(...)` shape
     // that returns `res` rather than `undefined`.
+    // Every binding the wrapper itself introduces is `__hive_`-prefixed, and
+    // that is not cosmetics: the entry is embedded VERBATIM in the same scope,
+    // so a plain `const handler = …` / `const status = …` here collided with
+    // the overwhelmingly common `function handler(request, ops)` a deployment
+    // declares — the artifact failed to PARSE ("Identifier 'handler' has
+    // already been declared") in every donor's browser, for every request.
+    // `module` and `exports` keep their names because the entry references
+    // them; everything internal does not.
+    let prelude = if rewritten.uses_import_meta {
+        format!(
+            "\x20 const exports = module.exports;\n\x20 {}\n",
+            import_meta_binding(policy.entry.trim())
+        )
+    } else {
+        "\x20 const exports = module.exports;\n".to_string()
+    };
+    let esm_note = if rewritten.rewritten {
+        ", ES module syntax rewritten to CommonJS"
+    } else {
+        ""
+    };
     let source = format!(
         "async function (request, ops) {{\n\
          \x20 \"use strict\";\n\
          \x20 const module = {{ exports: {{}} }};\n\
-         \x20 const exports = module.exports;\n\
-         \x20 /* ---- begin deployment entry (verbatim, LF-normalized) ---- */\n\
+         {prelude}\
+         \x20 /* ---- begin deployment entry (verbatim, LF-normalized{esm_note}) ---- */\n\
          {user}\n\
          \x20 /* ---- end deployment entry ---- */\n\
-         \x20 ;const handler = typeof module.exports === \"function\" ? module.exports : module.exports.handler;\n\
-         \x20 if (typeof handler !== \"function\") {{\n\
-         \x20   throw new TypeError(\"browser entry must assign its handler to module.exports or exports.handler\");\n\
+         \x20 ;const __hive_handler = typeof module.exports === \"function\" ? module.exports : (module.exports && (module.exports.handler || module.exports.default));\n\
+         \x20 if (typeof __hive_handler !== \"function\") {{\n\
+         \x20   throw new TypeError(\"browser entry must assign its handler to module.exports, exports.handler or exports.default\");\n\
          \x20 }}\n\
-         \x20 const bridge = typeof globalThis.__hive_node_bridge === \"function\" ? globalThis.__hive_node_bridge(request, ops) : null;\n\
-         \x20 const req = bridge ? bridge.request : (typeof request === \"string\" ? JSON.parse(request) : request);\n\
-         \x20 const res = bridge ? bridge.response : ops;\n\
-         \x20 let out = await handler(req, res);\n\
-         \x20 if (bridge) out = await bridge.settle(out);\n\
-         \x20 if (typeof out === \"string\") return out;\n\
-         \x20 if (!out || typeof out !== \"object\") {{\n\
+         \x20 const __hive_bridge = typeof globalThis.__hive_node_bridge === \"function\" ? globalThis.__hive_node_bridge(request, ops) : null;\n\
+         \x20 const __hive_req = __hive_bridge ? __hive_bridge.request : (typeof request === \"string\" ? JSON.parse(request) : request);\n\
+         \x20 const __hive_res = __hive_bridge ? __hive_bridge.response : ops;\n\
+         \x20 let __hive_out = await __hive_handler(__hive_req, __hive_res);\n\
+         \x20 if (__hive_bridge) __hive_out = await __hive_bridge.settle(__hive_out);\n\
+         \x20 if (typeof __hive_out === \"string\") return __hive_out;\n\
+         \x20 if (!__hive_out || typeof __hive_out !== \"object\") {{\n\
          \x20   throw new TypeError(\"browser handler must return a response object or an envelope string\");\n\
          \x20 }}\n\
-         \x20 const status = out.status === undefined ? 200 : Number(out.status);\n\
-         \x20 if (!Number.isInteger(status) || status < 100 || status > 599) {{\n\
+         \x20 const __hive_status = __hive_out.status === undefined ? 200 : Number(__hive_out.status);\n\
+         \x20 if (!Number.isInteger(__hive_status) || __hive_status < 100 || __hive_status > 599) {{\n\
          \x20   throw new RangeError(\"browser response status must be an integer in 100..599\");\n\
          \x20 }}\n\
-         \x20 const headers = out.headers && typeof out.headers === \"object\" ? out.headers : {{}};\n\
-         \x20 const envelope = {{ status: status, headers: headers }};\n\
-         \x20 if (typeof out.bodyBase64 === \"string\") envelope.bodyBase64 = out.bodyBase64;\n\
-         \x20 envelope.body = typeof out.body === \"string\" ? out.body : JSON.stringify(out.body === undefined ? \"\" : out.body);\n\
-         \x20 return JSON.stringify(envelope);\n\
-         }}"
+         \x20 const __hive_headers = __hive_out.headers && typeof __hive_out.headers === \"object\" ? __hive_out.headers : {{}};\n\
+         \x20 const __hive_envelope = {{ status: __hive_status, headers: __hive_headers }};\n\
+         \x20 if (typeof __hive_out.bodyBase64 === \"string\") __hive_envelope.bodyBase64 = __hive_out.bodyBase64;\n\
+         \x20 __hive_envelope.body = typeof __hive_out.body === \"string\" ? __hive_out.body : JSON.stringify(__hive_out.body === undefined ? \"\" : __hive_out.body);\n\
+         \x20 return JSON.stringify(__hive_envelope);\n\
+         }}",
+        prelude = prelude,
+        esm_note = esm_note
     );
     let source_digest = fluid_core::browser_source_digest(&source);
     let policy_digest = fluid_core::browser_policy_digest(

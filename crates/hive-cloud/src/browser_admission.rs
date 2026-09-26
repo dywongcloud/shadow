@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 
 use crate::state::CloudState;
 
@@ -1602,7 +1602,181 @@ fn capability_json(
     if let Some(mesh) = mesh_capability_json(cloud, me, hive_core::now_ms()) {
         out["mesh"] = mesh;
     }
+    // The `node:net` / `node:tls` relay (bn-node-worker-wisp-net) rides the
+    // SAME atomic snapshot, for the same reason `db` and `mesh` do: which
+    // third party a donor's outbound TCP is allowed to transit is live
+    // operator configuration, and the donor re-reads it on every renewal
+    // rather than caching a URL from an earlier boot.
+    out["net"] = wisp_net_json();
     out
+}
+
+// ---------------------------------------------------------------------------
+// `node:net` / `node:tls` over a Wisp relay (bn-node-worker-wisp-net): the
+// server half.
+//
+// The browser substrate (vendored node-worker) gets its TCP — and therefore
+// its TLS, since epoxy terminates TLS inside the relay transport — from ONE
+// option: `net: { wispUrl }`. Nothing else can open a socket in a donor's
+// browser, and no relay URL is compiled in, so this is where the URL comes
+// from. Resolution order, mirrored on the donor by
+// `vendor/node-worker/src/wire/wisp.ts`:
+//
+//   1. the PLATFORM relay, `HIVE_BROWSER_WISP_URL` — an operator-run relay,
+//      and the only source that keeps donor traffic off third-party
+//      infrastructure;
+//   2. the PUBLIC fallback, enabled only by
+//      `HIVE_BROWSER_WISP_PUBLIC_FALLBACK=1` — the upstream README's example
+//      relay (`wss://anura.pro/`) then terminates and re-emits every donor
+//      connection, so it is OFF by default, proven reachable before it is
+//      used, and named out loud (once here, operator-facing, and once in the
+//      capability's `disclosure`, donor-facing);
+//   3. neither — `wisp_url: null`, and the substrate throws a NAMED error at
+//      the first socket: `net`/`tls` are UNAVAILABLE, never silently broken.
+//
+// OFF by default is the defensible default, not pedantry: this is the same
+// rule the DNS geo path and `HIVE_BROWSER_ICE_SERVERS` carry (AGENTS.md:
+// "never re-introduce a default endpoint"). A default relay would put a third
+// party on the outbound path of every browser node in the fleet whether or
+// not the operator wanted one — and unlike a STUN lookup, this one carries
+// the whole connection, so it sees every byte a donor's guest code sends.
+// ---------------------------------------------------------------------------
+
+/// The public fallback relay: upstream node-worker's own README example.
+///
+/// Never a default — reachable only through the opt-in below, and then only
+/// after the donor proves it answers a websocket handshake.
+const PUBLIC_WISP_FALLBACK_URL: &str = "wss://anura.pro/";
+
+/// The platform relay, or `None`.
+///
+/// `ws://` is accepted and WARNed: it is a real deployment (a relay inside the
+/// operator's own network, reached over a trusted link) but it puts donor
+/// traffic on the wire in the clear, so the operator has to hear about it.
+/// Anything that is not a `ws:`/`wss:` URL at all yields NO relay rather than a
+/// half-parsed one — same shape as `mesh_ice_servers`, and the donor
+/// re-validates it anyway.
+fn wisp_relay_url() -> Option<String> {
+    let raw = std::env::var("HIVE_BROWSER_WISP_URL").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if !is_wisp_url(raw) {
+        tracing::warn!(
+            "HIVE_BROWSER_WISP_URL is not a ws:// or wss:// URL — browser node:net / node:tls stay unconfigured"
+        );
+        return None;
+    }
+    if raw.starts_with("ws://") {
+        tracing::warn!(
+            "HIVE_BROWSER_WISP_URL is plaintext ws:// — donor-browser outbound TCP/TLS metadata travels unencrypted to the relay"
+        );
+    }
+    Some(raw.to_string())
+}
+
+/// Scheme + a host, and nothing that could smuggle a second origin in: the
+/// donor dials this string as given.
+fn is_wisp_url(raw: &str) -> bool {
+    if raw.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let rest = raw.strip_prefix("wss://").or_else(|| raw.strip_prefix("ws://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    let host = host.rsplit('@').next().unwrap_or_default(); // userinfo, if any
+    let host = match host.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        Some(_) => return false, // a trailing ':' with no port is malformed
+        None => host,
+    };
+    !host.is_empty() && !host.contains('?') && !host.contains('#')
+}
+
+/// Is the third-party public fallback permitted at all? OFF unless the
+/// operator turns it on — see the section header.
+fn wisp_public_fallback() -> bool {
+    matches!(
+        std::env::var("HIVE_BROWSER_WISP_PUBLIC_FALLBACK").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
+/// The capability's `net` block. Every field is operator configuration, so all
+/// of it is server-derived and none of it comes from the request.
+///
+/// Logged ONCE per process: this is derived per admission, and per-admission
+/// lines would bury the one thing an operator needs to read — that donor
+/// traffic is crossing a third party.
+fn wisp_net_json() -> Value {
+    static LOGGED: Once = Once::new();
+    let relay = wisp_relay_url();
+    let fallback = wisp_public_fallback();
+    LOGGED.call_once(|| match (&relay, fallback) {
+        (Some(url), false) => tracing::info!(
+            relay = %wisp_log_label(url),
+            "browser node:net / node:tls configured over the platform wisp relay"
+        ),
+        (Some(url), true) => tracing::info!(
+            relay = %wisp_log_label(url),
+            fallback = PUBLIC_WISP_FALLBACK_URL,
+            "browser node:net / node:tls configured over the platform wisp relay (public fallback armed)"
+        ),
+        (None, true) => tracing::warn!(
+            "browser wisp PUBLIC FALLBACK in use: donor-browser outbound TCP/TLS transits the \
+             third-party relay {} — every connection is terminated and re-emitted there, so that \
+             relay sees donor traffic this platform does not control. Set HIVE_BROWSER_WISP_URL \
+             to an operator-run relay and HIVE_BROWSER_WISP_PUBLIC_FALLBACK=0 to stop it.",
+            PUBLIC_WISP_FALLBACK_URL
+        ),
+        (None, false) => tracing::info!(
+            "no HIVE_BROWSER_WISP_URL and no public fallback — browser node:net / node:tls are \
+             unavailable in donors (they throw a named error at first use, they do not fail silently)"
+        ),
+    });
+    json!({
+        "wisp_url": relay,
+        "allow_public_fallback": fallback,
+        "public_fallback_url": PUBLIC_WISP_FALLBACK_URL,
+        "disclosure": match (&relay, fallback) {
+            (Some(url), false) => format!(
+                "outbound TCP/TLS from this browser transits the operator-configured wisp relay {}",
+                wisp_log_label(url)
+            ),
+            (Some(url), true) => format!(
+                "outbound TCP/TLS from this browser transits the operator-configured wisp relay \
+                 {}, or the third-party public relay {} when that one is unreachable",
+                wisp_log_label(url),
+                PUBLIC_WISP_FALLBACK_URL
+            ),
+            (None, true) => format!(
+                "outbound TCP/TLS from this browser transits the THIRD-PARTY public wisp relay \
+                 {} — that relay terminates and re-emits every connection",
+                PUBLIC_WISP_FALLBACK_URL
+            ),
+            (None, false) => "no wisp relay is configured — node:net and node:tls are unavailable \
+                              in this browser"
+                .to_string(),
+        },
+    })
+}
+
+/// Scheme + host only, never the whole URL: a wisp v1 relay carries its token
+/// in the PATH (`wss://host/<relay-token>/`), so logging a configured URL
+/// verbatim would put a relay credential in the journal.
+fn wisp_log_label(url: &str) -> String {
+    let scheme = url.split("://").next().unwrap_or("wss");
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    format!("{scheme}://{host}/")
 }
 
 /// The fleet EndpointIds currently allowed to originate BrowserPool invokes

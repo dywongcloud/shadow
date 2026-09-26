@@ -58,12 +58,17 @@ if command -v wasm-tools >/dev/null 2>&1; then
   fi
 fi
 
-# Build every browser artifact into a sibling directory. A failed Rust, bindgen,
-# npm, or esbuild stage leaves the last complete bundle intact; publishing is the
-# only point that touches www/pkg.
-command -v npm >/dev/null 2>&1 || { echo "FAIL: npm is required for the function runtime bundle" >&2; exit 1; }
-npm ci --ignore-scripts --no-audit --no-fund
-
+# Build every browser artifact into a sibling directory. A failed Rust or
+# bindgen stage leaves the last complete bundle intact; publishing is the only
+# point that touches www/pkg.
+#
+# There is no JS bundle step here any more. Browser artifacts used to execute
+# inside an embedded QuickJS wasm produced by esbuild from src-js/ (see git
+# history); the substrate is vendored node-worker now
+# (execution-path-swap-off-quickjs), which is built by
+# scripts/build-node-worker.sh — a pnpm + Node-core clone, deliberately NOT a
+# dependency of the wasm build. Its absence is a WARN below, never a failure of
+# this build: the wasm bundle is what this script owns.
 OUT=www/pkg
 TMP=www/pkg.next
 OLD=www/pkg.old
@@ -74,7 +79,6 @@ restore_bundle() {
 }
 trap restore_bundle ERR INT TERM
 "$WASM_BINDGEN" --weak-refs --target web --out-dir "$TMP" "$ART"
-npm run --silent build:runtime -- --outfile="$TMP/function-worker.js"
 
 # Optional size pass; skipped if wasm-opt is absent (correctness unaffected).
 if command -v wasm-opt >/dev/null 2>&1; then
@@ -82,12 +86,12 @@ if command -v wasm-opt >/dev/null 2>&1; then
     "$TMP/hive_browser_bg.wasm" -o "$TMP/hive_browser_bg.wasm"
 fi
 
-# The embedded release-sync interpreter is ~500 KiB before JS glue. Catch a
-# loader/config regression that silently turns it back into a network fetch.
-[ "$(wc -c < "$TMP/function-worker.js")" -gt 600000 ] || {
-  echo "FAIL: function worker is missing embedded QuickJS wasm" >&2
-  exit 1
-}
+# The execution substrate is a SEPARATE build (scripts/build-node-worker.sh),
+# staged into www/node-worker/. Say so loudly when it is missing instead of
+# letting the browser node discover it as a 404 in a donor's browser.
+if [ ! -f www/node-worker/worker.js ] || [ ! -f www/node-worker/index.js ] || [ ! -f www/node-worker/sw.js ]; then
+  echo "WARN: www/node-worker/ is unbuilt — browser execution will report node_worker_unbuilt until scripts/build-node-worker.sh runs." >&2
+fi
 
 if [ -d "$OUT" ]; then mv "$OUT" "$OLD"; fi
 mv "$TMP" "$OUT"

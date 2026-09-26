@@ -54,6 +54,23 @@ export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
  * name so a reloaded page attaches to a worker that pins the whole set. */
 export const HOST_ABI_VERSION = 4;
 
+/** coop-coep-fleet-wide: whether this worker's global is cross-origin
+ *  isolated, i.e. whether the SYNCHRONOUS half of node-worker
+ *  (`receiveMessageOnPort`) exists at all. Additive on the wire, like `db`
+ *  below — the SharedWorker publishes it, the page renders it.
+ *
+ *  `syncBridge: false` is an honest, EXPECTED value, not an error: Safari
+ *  implements neither `COEP: credentialless` nor the COOP/COEP pair this lane
+ *  serves, a page served without the headers is never isolated, and a service
+ *  worker that drops them un-isolates it. Async-only means mesh, relay
+ *  identity, presence, database replication and the function lane all still
+ *  run — only a synchronous port drain does not. */
+export type NodeIsolation = {
+  crossOriginIsolated: boolean;
+  sharedArrayBuffer: boolean;
+  syncBridge: boolean;
+};
+
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one
    *  already applied is stale (e.g. from a delayed duplicate) and must be
@@ -80,6 +97,9 @@ export interface RunNodeStatus {
    *  the very next retry succeed with no page reload needed, unlike
    *  protocolMismatch === "outdated". */
   sessionStale: boolean;
+  /** coop-coep-fleet-wide (additive wire key): null until the worker reports,
+   *  i.e. before the SharedWorker has connected — never assumed true. */
+  isolation: NodeIsolation | null;
   lastError: string | null;
   updatedMs: number;
   /** Multi-tab dedup UI (bn-ui-sharedworker-owner): distinct tabs currently
@@ -100,6 +120,7 @@ export function initialRunNodeStatus(): RunNodeStatus {
     protocolMismatch: "none",
     hostAbiStale: false,
     sessionStale: false,
+    isolation: null,
     lastError: null,
     updatedMs: 0,
     tabCount: 1,
@@ -156,6 +177,38 @@ export type FunctionLaneStatus = {
   failed: { digest: string; error: string }[];
 };
 
+/** bn-node-worker-service-worker-sync-fs: the worker's additive synchronous-
+ *  `fs` status field. Like `db` above this is an ADDITIVE wire key (consumers
+ *  widen `RunNodeStatus` with `{ syncFs?: SyncFsLaneStatus | null }`).
+ *
+ *  `state: "ready"` means node-worker's service worker is registered at a
+ *  scope that covers dist/worker.js — which is what makes the guest's
+ *  BLOCKING synchronous `fs` requests answerable at all. Without it there is
+ *  no working `require`, so this is a prerequisite of the node-worker
+ *  substrate, not an optimisation. `unavailable` carries a named
+ *  `sync_fs_<reason>` message that also states the fix. */
+export type SyncFsLaneStatus = {
+  state: "registering" | "ready" | "unavailable";
+  /** Registration scope, e.g. `https://host/browser-node/node-worker/`. */
+  scope: string | null;
+  /** The service worker script actually registered (`dist/sw.js`). */
+  scriptURL: string | null;
+  /** Scope-relative prefix the node worker POSTs its frames to. */
+  prefix: string | null;
+  error: string | null;
+};
+
+export function syncFsStateLabel(syncFs: SyncFsLaneStatus): string {
+  switch (syncFs.state) {
+    case "registering":
+      return "registering service worker…";
+    case "ready":
+      return "ready";
+    case "unavailable":
+      return "unavailable";
+  }
+}
+
 /** Which serve lane the running node ASKED for (the worker echoes its own
  *  session): the automatic eligible set, one deliberately pinned function, or
  *  capacity only. Distinct from `serving`, which is about what is pinned. */
@@ -185,4 +238,16 @@ export function lifecycleLabel(state: NodeLifecycle): string {
     case "suspended": return "Suspended";
     case "error": return "Error";
   }
+}
+
+/** coop-coep-fleet-wide: one sentence a user can act on (or dismiss). The two
+ *  false-ish shapes are named separately because their remedies differ — no
+ *  isolation at all is a server/header/browser question, isolation without
+ *  `SharedArrayBuffer` is a browser policy question. */
+export function isolationLabel(isolation: NodeIsolation): string {
+  if (isolation.syncBridge) return "Cross-origin isolated — synchronous bridge available";
+  if (!isolation.crossOriginIsolated) {
+    return "Async-only mode: this page is not cross-origin isolated, so the synchronous bridge is unavailable (this browser, or the headers on this page). Everything else — mesh, database sync and serving — runs normally.";
+  }
+  return "Async-only mode: this browser reports isolation but withholds SharedArrayBuffer, so the synchronous bridge is unavailable. Everything else runs normally.";
 }
