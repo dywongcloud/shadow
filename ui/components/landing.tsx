@@ -217,8 +217,14 @@ export function Landing() {
             >
               Start Now <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
+            {/* Opens the product walkthrough in a new tab rather than scrolling to
+                the on-page device showcase: the operator asked for the Demo button
+                to go straight to the video. `target="_blank"` + `rel` because it
+                leaves the origin, and the href is a plain external URL. */}
             <a
-              href="#demo"
+              href="https://youtu.be/qp_lbhPioZF4"
+              target="_blank"
+              rel="noopener noreferrer"
               className="inline-flex items-center gap-2 rounded-full bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-white/90"
             >
               Watch Demo

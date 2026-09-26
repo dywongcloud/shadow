@@ -77,7 +77,12 @@ const TEMPLATES: Template[] = [
   { name: "Node.js", desc: "A minimal Node.js server, deployed to Fluid compute.", repo: "https://github.com/vercel/vercel", root: "examples/node", tag: "No", color: "#539e43", icon: "/frameworks/node.png" },
   { name: "Bun", desc: "Incredibly fast all-in-one JavaScript runtime.", repo: "https://github.com/oven-sh/bun", root: "examples/bun-http", tag: "Bu", color: "#fbf0df", icon: "/frameworks/bun.png" },
   { name: "Deno", desc: "Secure runtime for JavaScript and TypeScript.", repo: "https://github.com/denoland/examples", root: "http-server", tag: "De", color: "#000", icon: "/frameworks/deno.png" },
-  { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-typescript-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
+  // `worker-typescript-template` no longer exists upstream (the repo renamed
+  // its examples to `<name>-template`); pointing at it failed every deploy
+  // with "root directory was not found in the repository". Verified against
+  // the live repo's contents: worker-publisher-template is a real Worker
+  // template (src/index.ts + wrangler.jsonc).
+  { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-publisher-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
   { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26", icon: "/frameworks/html5.png" },
   { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
   // Pre-built image, not a git clone — see `examples/minecraft-server/` in

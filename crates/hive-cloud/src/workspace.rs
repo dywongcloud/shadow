@@ -28,6 +28,12 @@ const PRUNED_DIRS: &[&str] = &[
 #[derive(Clone)]
 enum Segment {
     Literal(String),
+    /// A segment containing `*` and/or `?` alongside literal text (e.g.
+    /// `*-template`). Package managers allow these — pnpm's own
+    /// `cloudflare/templates` declares `./*-template` — and rejecting them
+    /// failed the whole build with BUILD_CONTRACT_INVALID_METADATA for a
+    /// repository that is otherwise perfectly deployable.
+    Glob(String),
     One,
     Many,
 }
@@ -321,9 +327,14 @@ fn parse_pattern(raw: &str) -> anyhow::Result<Pattern> {
         } else if value == "**" {
             segments.push(Segment::Many);
         } else {
+            // Bracket/brace expansions stay unsupported: they are a different
+            // grammar (character classes, alternation) and silently guessing at
+            // them would be worse than refusing. `*` and `?` WITHIN a segment
+            // are now supported (see `Segment::Glob`).
             anyhow::ensure!(
-                !value.contains(['*', '?', '[', ']', '{', '}']),
-                "workspace pattern {:?} uses unsupported glob syntax; supported wildcards are whole-segment '*' and '**'",
+                !value.contains(['[', ']', '{', '}']),
+                "workspace pattern {:?} uses bracket or brace expansion; supported wildcards \
+                 are whole-segment '*', '**', and '*'/'?' inside a segment",
                 raw
             );
             anyhow::ensure!(
@@ -331,7 +342,11 @@ fn parse_pattern(raw: &str) -> anyhow::Result<Pattern> {
                 "workspace pattern {:?} enters pruned directory {value:?}",
                 raw
             );
-            segments.push(Segment::Literal(value.to_string()));
+            segments.push(if value.contains(['*', '?']) {
+                Segment::Glob(value.to_string())
+            } else {
+                Segment::Literal(value.to_string())
+            });
         }
     }
     anyhow::ensure!(
@@ -378,6 +393,19 @@ async fn expand(
                 }
                 Segment::One => {
                     next.extend(child_dirs(root, &path, pattern, visited_entries).await?);
+                }
+                // A partial-segment glob enumerates this directory's children
+                // and keeps the ones the pattern matches -- the same expansion
+                // `Segment::One` does, narrowed by name.
+                Segment::Glob(glob) => {
+                    for candidate in child_dirs(root, &path, pattern, visited_entries).await? {
+                        let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if glob_segment_matches(glob, name) {
+                            next.push(candidate);
+                        }
+                    }
                 }
                 Segment::Many => {
                     next.extend(descendants(root, &path, pattern, visited_entries).await?);
@@ -527,6 +555,11 @@ fn pattern_matches(pattern: &Pattern, path: &Path) -> anyhow::Result<bool> {
                     component_index < components.len()
                         && matches[pattern_index + 1][component_index + 1]
                 }
+                Segment::Glob(glob) => {
+                    component_index < components.len()
+                        && glob_segment_matches(glob, &components[component_index])
+                        && matches[pattern_index + 1][component_index + 1]
+                }
                 Segment::Many => {
                     matches[pattern_index + 1][component_index]
                         || (component_index < components.len()
@@ -536,6 +569,51 @@ fn pattern_matches(pattern: &Pattern, path: &Path) -> anyhow::Result<bool> {
         }
     }
     Ok(matches[0][0])
+}
+
+/// Match ONE path segment against a pattern that mixes literal text with `*`
+/// and `?`. `*` matches any run of characters (including none) within the
+/// segment; `?` matches exactly one character. Nothing here crosses a `/`, so a
+/// pattern can never match more path depth than the caller gave it — that is
+/// what keeps this a safe widening rather than a directory-traversal risk.
+///
+/// Deliberately not a full glob: `[`, `]`, `{` and `}` are rejected at parse
+/// time (see `parse_pattern`), so no character-class or alternation grammar has
+/// to be interpreted here.
+fn glob_segment_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    // Classic two-pointer wildcard match: linear in the value, and the only
+    // backtracking is the single star position, so no pathological blowup on
+    // long directory names.
+    let (mut p, mut v, mut star, mut star_v) = (0usize, 0usize, None::<usize>, 0usize);
+    while v < value.len() {
+        match pattern.get(p) {
+            Some('?') => {
+                p += 1;
+                v += 1;
+            }
+            Some('*') => {
+                star = Some(p);
+                star_v = v;
+                p += 1;
+            }
+            Some(expected) if *expected == value[v] => {
+                p += 1;
+                v += 1;
+            }
+            _ => match star {
+                Some(star_p) => {
+                    star_v += 1;
+                    v = star_v;
+                    p = star_p + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    // Trailing stars consume nothing.
+    pattern[p..].iter().all(|c| *c == '*')
 }
 
 fn path_string(path: &Path) -> anyhow::Result<String> {
