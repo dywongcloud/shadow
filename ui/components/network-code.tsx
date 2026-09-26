@@ -15,7 +15,7 @@ const C = {
   id: "text-zinc-200", // identifiers
 };
 
-/** A small, hand-highlighted shadw deploy snippet. */
+/** A small, hand-highlighted autheo deploy snippet. */
 function CodeSample() {
   return (
     <pre className="no-scrollbar overflow-x-auto px-5 py-4 font-mono text-[10px] leading-[1.75] sm:text-[11px]">
@@ -23,7 +23,7 @@ function CodeSample() {
         <span className={C.kw}>const</span> <span className={C.id}>res</span> <span className={C.pl}>=</span>{" "}
         <span className={C.kw}>await</span> <span className={C.fn}>fetch</span>
         <span className={C.pl}>(</span>
-        <span className={C.str}>&apos;https://api.shadw.cloud/v1/git/deploy&apos;</span>
+        <span className={C.str}>&apos;https://api.autheo.dev/v1/git/deploy&apos;</span>
         <span className={C.pl}>, {"{"}</span>
         {"\n"}
         {"  "}<span className={C.id}>method</span>
@@ -54,7 +54,7 @@ function CodeSample() {
         <span className={C.fn}>json</span>
         <span className={C.pl}>();</span>
         {"\n"}
-        <span className={C.com}>{"// → shadw is deploying across the edge…"}</span>
+        <span className={C.com}>{"// → autheo is deploying across the edge…"}</span>
       </code>
     </pre>
   );

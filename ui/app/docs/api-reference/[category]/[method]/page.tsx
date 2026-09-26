@@ -59,7 +59,7 @@ export default async function MethodPage(props: { params: Promise<{ category: st
         <div className="mb-6 flex flex-wrap items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
           <span className="text-muted">/</span>
-          <Link href="/docs/api-reference" className="hover:text-fg">shadw REST API</Link>
+          <Link href="/docs/api-reference" className="hover:text-fg">autheo REST API</Link>
           <span className="text-muted">/</span>
           <span className="font-medium text-fg">{ep.name}</span>
         </div>

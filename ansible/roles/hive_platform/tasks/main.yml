@@ -3,6 +3,24 @@
 # node. Source is pushed from the Ansible control host's checkout; both binaries
 # are compiled in one Cargo invocation, so a later manual rootfs bake cannot
 # consume bootstrap-vintage guest code.
+- name: Ensure Hive configuration directory exists
+  ansible.builtin.file:
+    path: /etc/hive
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install root-only Hive secrets environment file
+  ansible.builtin.template:
+    src: hive-secrets.env.j2
+    dest: /etc/hive/hive-secrets.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart hive-node
+
 
 - name: Ensure the source directory exists on the target
   ansible.builtin.file:
@@ -56,9 +74,28 @@
 
 - name: Confirm the controller binary was produced
   ansible.builtin.stat:
-    path: "{{ hive_binary_path }}"
+    path: "{{ hive_cargo_target_dir }}/release/hive-cloud"
+    get_checksum: true
+    checksum_algorithm: sha256
   register: _bin
-  failed_when: not _bin.stat.exists
+  failed_when: >-
+    not (_bin.stat.exists | default(false)) or
+    not (_bin.stat.isreg | default(false))
+
+- name: Install hive-cloud production binary
+  ansible.builtin.copy:
+    src: "{{ hive_cargo_target_dir }}/release/hive-cloud"
+    dest: "{{ hive_binary_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart hive-node
+
+- name: Restore SELinux context on hive-cloud production binary
+  ansible.builtin.command:
+    cmd: restorecon -v "{{ hive_binary_path }}"
+  changed_when: false
 
 - name: Confirm and checksum the companion cell-agent binary
   ansible.builtin.stat:

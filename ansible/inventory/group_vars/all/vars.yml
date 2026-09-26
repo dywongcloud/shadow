@@ -10,11 +10,11 @@
 # the exhaustive list if you need something not templated here).
 
 # ---------- Repo / build ----------
-hive_repo_url: "https://github.com/your-org/hive.git"   # or a private mirror
+hive_repo_url: "https://github.com/ThothDivision/L0_devhub_deploy.git"   # or a private mirror
 hive_repo_ref: "main"
 hive_src_dir: "/root/hive"                                # flat (non-crates/-prefixed) layout mirrors fc-bangkok
 hive_cargo_target_dir: "/root/fc-target"                   # matches the fc_pvm hosts' convention; fc_kvm hosts can use hive_src_dir/target
-hive_binary_path: "{{ hive_cargo_target_dir }}/release/hive-cloud"
+hive_binary_path: "/usr/local/bin/hive-cloud"
 hive_data_dir: "/var/lib/hive/data"
 
 # ---------- Identity / mesh ----------

@@ -20,23 +20,23 @@ import {
 } from "lucide-react";
 
 export const metadata: Metadata = {
-  title: "Product — shadw",
+  title: "Product — autheo",
   description:
-    "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+    "autheo is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
   alternates: { canonical: "/product" },
   openGraph: {
-    title: "Product — shadw",
+    title: "Product — autheo",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+      "autheo is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
     url: "/product",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Product — shadw",
+    title: "Product — autheo",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data over an Iroh QUIC mesh, with Vercel-style Git deploys and instant rollbacks.",
+      "autheo is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data over an Iroh QUIC mesh, with Vercel-style Git deploys and instant rollbacks.",
   },
 };
 

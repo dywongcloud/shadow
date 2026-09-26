@@ -1,9 +1,11 @@
 # RUNBOOK — ngrok → real DNS (`shadw.cloud` + `*.shadw.app` via Vercel DNS)
 
-The platform serves everything on its own domains: `api.shadw.cloud` (control
-plane), `*.shadw.app` (every deployment alias, one label), with TLS terminated
-by the nodes themselves (ACME DNS-01 wildcard via the Vercel API) and DNS
-records reconciled from live node health by a leader-elected loop.
+The platform serves tenant deployments on `*.shadw.app` (every deployment
+alias, one label), with TLS terminated by the nodes themselves (ACME DNS-01
+wildcard via the Vercel API) and DNS records reconciled from live node health
+by a leader-elected loop. Hive Admin is private on `127.0.0.1:8786` by default;
+`api.shadw.cloud`, `admin.shadw.cloud`, and `webhook.shadw.cloud` are not
+supported public control-plane hosts and are explicitly rejected by ingress.
 
 Two registrable domains is deliberate (the vercel.com / vercel.app split): user
 content on `shadw.app` can never set cookies on, or shadow, `shadw.cloud`.
@@ -46,9 +48,11 @@ Never serve user apps from a `shadw.cloud` subdomain.
    (or `setcap 'cap_net_bind_service=+ep' /root/fc-target/release/hive-cloud`
    after every binary swap — the systemd capability survives swaps, setcap does
    not; prefer the drop-in.)
-7. **`HIVE_JWT_SECRET` must be set on every node** before any non-ngrok ingress
-   mode: `api.shadw.cloud` exposes the admin router publicly and the node
-   refuses to host-split without JWT enforcement.
+7. **`HIVE_JWT_SECRET` must be set on every production node**. It enforces
+   Admin identity on all reads and mutations other than minimal local
+   `/healthz`. Do not publish port 8786, Admin, Swagger, Marketplace, or
+   webhook routes. A private management bind additionally requires explicit
+   `HIVE_ADMIN_PRIVATE_NETWORK=1`; public/wildcard Admin binds fail startup.
 8. Relay/discovery names: set `HIVE_RELAY_IPS` / `HIVE_DISCOVERY_IPS`
    (comma-separated public IPs of the nodes running the self-hosted iroh relay
    / pkarr relay) on the LEADER-capable nodes so

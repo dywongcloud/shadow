@@ -33,21 +33,8 @@ use std::sync::Arc;
 /// gates on this exact string before ever creating a checkout with `kind == "addon"`.
 pub const SKU: &str = "dedicated_ipv4";
 
-/// Real Stripe recurring price id for the addon, operator-configured —
-/// deliberately NOT a hard-coded `price_...` literal (unlike `plan_spec`'s
-/// tier prices): this repo's own tooling must never be able to charge a real
-/// Stripe price by accident, and there is no real price id to hard-code
-/// until an operator actually creates one in the Stripe dashboard.
-pub fn price_id() -> Option<String> {
-    std::env::var("HIVE_DEDICATED_IPV4_PRICE_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
 /// Price (USD cents/mo) used for the checkout's own `amount_cents`
-/// bookkeeping and the invoice line — mirrors how `PlanSpec::price_cents` is
-/// the informational amount even though a real charge (once one exists)
-/// would be governed by the Stripe price object once `price_id()` is set.
+/// bookkeeping and the invoice line.
 ///
 /// Temporarily 0 for testing (operator decision, not a permanent price):
 /// `admin::billing_checkout`'s `amount == 0` branch applies ANY $0 purchase

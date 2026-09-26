@@ -3179,7 +3179,7 @@ fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
             .get("name")
             .and_then(|n| n.as_str())
             .unwrap_or("<unnamed>");
-        let mut check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
+        let check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
             if let Some(p) = v.as_str() {
                 p.parse::<ServiceProtocol>().map_err(|e| {
                     serde_json::Error::custom(format!("function {name:?}{ctx}: {e}"))
@@ -3580,6 +3580,12 @@ pub struct DeployRecord {
     /// deployment's function pools under the correct tenant.
     #[serde(default)]
     pub tenant: String,
+    /// Immutable, Marketplace-authorized placement input captured before this
+    /// deployment entered the Hive build pipeline. The raw policy is retained
+    /// for audit; tokens, Clerk claims, node addresses, and control-plane
+    /// metadata are intentionally not part of this type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace_placement: Option<MarketplacePlacementSnapshot>,
 }
 
 /// A registered deployment (manifest + where its files live).
@@ -3611,6 +3617,29 @@ pub struct Deployment {
     /// project's team; flows into each cell's `CellSpec` and the Fluid pool so
     /// compute is partitioned and quota'd per tenant.
     pub tenant: String,
+    /// Immutable Marketplace placement authorization, if this deployment was
+    /// created from a Marketplace order.
+    pub marketplace_placement: Option<MarketplacePlacementSnapshot>,
+}
+
+/// A Marketplace placement policy that DevHub validated on the server before
+/// passing a Marketplace-backed deployment to Hive.
+///
+/// This is deliberately a deployment record, not mutable project configuration:
+/// retries, fanout, and later build stages must consume this exact snapshot and
+/// must not re-fetch Marketplace or accept a browser replacement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarketplacePlacementSnapshot {
+    pub contract_version: u32,
+    pub policy_version: u64,
+    pub marketplace_order_id: String,
+    pub buyer_tenant_id: String,
+    pub retrieved_at_ms: u64,
+    pub approved_node_ids: Vec<String>,
+    /// Canonical, complete Marketplace response after DevHub's strict schema
+    /// validation. Marketplace policies never contain node addresses,
+    /// credentials, control-plane data, Clerk claims, or tokens.
+    pub policy: serde_json::Value,
 }
 
 /// Admin API: request to create a direct local deployment. `root` is source
@@ -3803,6 +3832,12 @@ pub struct GitDeployRequest {
     /// upload lineage and must fail closed rather than scan newest-any source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_deployment_ids: Vec<String>,
+    /// Set only by DevHub's server-side Marketplace consumer after it obtains a
+    /// Clerk template JWT, derives the buyer tenant, fetches, and validates the
+    /// policy. Presence makes this a Marketplace-backed deployment and drives
+    /// the approved-node hard filter in Hive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace_placement: Option<MarketplacePlacementSnapshot>,
 }
 fn default_prod() -> bool {
     true

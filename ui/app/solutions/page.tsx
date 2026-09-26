@@ -17,23 +17,23 @@ import {
 } from "lucide-react";
 
 export const metadata: Metadata = {
-  title: "Solutions — shadw",
+  title: "Solutions — autheo",
   description:
-    "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+    "See how startups, agencies, enterprises, and AI teams ship on autheo — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
   alternates: { canonical: "/solutions" },
   openGraph: {
-    title: "Solutions — shadw",
+    title: "Solutions — autheo",
     description:
-      "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+      "See how startups, agencies, enterprises, and AI teams ship on autheo — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
     url: "/solutions",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Solutions — shadw",
+    title: "Solutions — autheo",
     description:
-      "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
+      "See how startups, agencies, enterprises, and AI teams ship on autheo — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
   },
 };
 
@@ -111,7 +111,7 @@ export default function SolutionsPage() {
             </span>
           </>
         }
-        subtitle="shadw is a self-hosted, peer-to-peer cloud — serverless functions, containers, edge, and durable data over a P2P mesh, with Vercel-style Git deploys. One platform that adapts to your team and your workloads."
+        subtitle="autheo is a self-hosted, peer-to-peer cloud — serverless functions, containers, edge, and durable data over a P2P mesh, with Vercel-style Git deploys. One platform that adapts to your team and your workloads."
       >
         <Link
           href="/sign-up"
@@ -133,7 +133,7 @@ export default function SolutionsPage() {
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">Solutions for every team</h2>
           <p className="mt-3 text-zinc-400">
-            From your first deploy to a self-hosted global mesh, shadw meets you where you are.
+            From your first deploy to a self-hosted global mesh, autheo meets you where you are.
           </p>
         </div>
 

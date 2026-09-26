@@ -3,17 +3,19 @@
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useRef, useState } from "react";
-import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Workflow } from "lucide-react";
+import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Workflow, ExternalLink } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { VercelMark } from "@/components/logo";
+import { LightningMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { RunNodeControl } from "@/components/run-node-control";
 import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, switchTeam, mintSessionToken, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
+import { marketplaceUrl } from "@/lib/marketplace";
+import { WalletConnectionButton } from "@/components/wallet-connection";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
@@ -84,7 +86,6 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
   return null;
 }
 
-/** The Vercel triangle mark — inverts with the theme (black on light, white on dark). */
 /** Thin breadcrumb separator matching the brand slash. */
 function Slash() {
   return <span className="px-1 text-2xl font-thin text-border-strong">/</span>;
@@ -129,7 +130,7 @@ export function TopNav() {
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">
-          <Link href="/" className="flex items-center"><VercelMark className="h-5 w-auto" /></Link>
+          <Link href="/" className="flex items-center"><LightningMark className="h-5 w-auto" /></Link>
           <Slash />
           <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
           {projectSeg && (
@@ -172,6 +173,14 @@ export function TopNav() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <a
+            href={marketplaceUrl()}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border-strong px-2.5 py-1 text-xs font-medium text-secondary hover:bg-subtle hover:text-fg"
+          >
+            Marketplace <ExternalLink className="h-3.5 w-3.5" />
+          </a>
           {/* Ops entry — platform owner only (middleware enforces; this just hides the link). */}
           {isOwner && (
             <Link
@@ -182,6 +191,7 @@ export function TopNav() {
               <ShieldHalf className="h-3.5 w-3.5" /> Ops
             </Link>
           )}
+          <WalletConnectionButton />
           <RunNodeControl />
           <NotificationBell />
           <ThemeToggle />

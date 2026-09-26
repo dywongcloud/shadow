@@ -1,20 +1,20 @@
 import type { MetadataRoute } from "next";
 
-// PWA manifest — served at /manifest.webmanifest. Makes shadw installable as a
+// PWA manifest — served at /manifest.webmanifest. Makes Autheo DevHub installable as a
 // standalone app on desktop and mobile.
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "shadw — the peer-to-peer cloud",
-    short_name: "shadw",
+    name: "Autheo DevHub",
+    short_name: "DevHub",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: deploy serverless functions, containers and static sites to a mesh of your own machines over Iroh QUIC.",
+      "Autheo DevHub is a self-hosted peer-to-peer cloud: deploy serverless functions, containers, and static sites to your own electric mesh.",
     id: "/",
     start_url: "/",
     scope: "/",
     display: "standalone",
     orientation: "any",
-    background_color: "#000000",
-    theme_color: "#000000",
+    background_color: "#050b07",
+    theme_color: "#0f8a3b",
     categories: ["developer", "productivity", "utilities"],
     icons: [
       { src: "/web-app-manifest-192x192.png", sizes: "192x192", type: "image/png", purpose: "any" },

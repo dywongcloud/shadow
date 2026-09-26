@@ -4,23 +4,23 @@ import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/com
 import { ArrowRight } from "lucide-react";
 
 export const metadata: Metadata = {
-  title: "Case Studies — shadw",
+  title: "Case Studies — autheo",
   description:
-    "How real teams cut costs and ship faster on shadw's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
+    "How real teams cut costs and ship faster on autheo's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
   alternates: { canonical: "/case-studies" },
   openGraph: {
-    title: "Case Studies — shadw",
+    title: "Case Studies — autheo",
     description:
-      "How real teams cut costs and ship faster on shadw's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
+      "How real teams cut costs and ship faster on autheo's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
     url: "/case-studies",
     type: "website",
-    siteName: "shadw",
+    siteName: "autheo",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Case Studies — shadw",
+    title: "Case Studies — autheo",
     description:
-      "How real teams cut costs and ship faster on shadw's peer-to-peer cloud — cheaper AI inference, per-client preview deploys, data-residency compliance, and instant rollbacks.",
+      "How real teams cut costs and ship faster on autheo's peer-to-peer cloud — cheaper AI inference, per-client preview deploys, data-residency compliance, and instant rollbacks.",
   },
 };
 
@@ -40,7 +40,7 @@ const CASES = [
     metric: "55%",
     metricLabel: "cheaper inference",
     quote:
-      "We doubled throughput and still cut our bill in half. shadw let us own the hardware story without owning a datacenter.",
+      "We doubled throughput and still cut our bill in half. autheo let us own the hardware story without owning a datacenter.",
     person: "Priya Nadeem, VP Engineering",
   },
   {
@@ -62,7 +62,7 @@ const CASES = [
     metric: "100%",
     metricLabel: "data residency compliance",
     quote:
-      "Data residency used to block deals. With shadw the data never leaves where it should, and auditors love it.",
+      "Data residency used to block deals. With autheo the data never leaves where it should, and auditors love it.",
     person: "Sofia Ramos, Head of Compliance",
   },
   {
@@ -73,7 +73,7 @@ const CASES = [
     metric: "9s",
     metricLabel: "to roll back on Black Friday",
     quote:
-      "A bad deploy hit at our busiest minute. One click later we were back. shadw saved our Black Friday.",
+      "A bad deploy hit at our busiest minute. One click later we were back. autheo saved our Black Friday.",
     person: "Dev Okafor, Director of Platform",
   },
 ];

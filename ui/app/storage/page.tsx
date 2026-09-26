@@ -394,7 +394,7 @@ function BrowseStorage({
                 ? "Create databases and stores that you can connect to your projects."
                 : isSqlite
                 ? "SQLite (browser) · replicated to every admitted browser"
-                : `${sel?.provider} · backed by OpenEdge ${sel ? KIND_LABEL[sel.kind] : ""}`}
+                : `${sel?.provider} · backed by DevHub ${sel ? KIND_LABEL[sel.kind] : ""}`}
             </p>
           </div>
           <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-5 w-5" /></button>
@@ -412,7 +412,7 @@ function BrowseStorage({
 
               {!!native.length && (
                 <>
-                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">OpenEdge Native</div>
+                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">DevHub Native</div>
                   <div className="mb-6 flex flex-col gap-2">
                     {native.map((n) => (
                       <Row key={n.kind}
@@ -481,7 +481,7 @@ function BrowseStorage({
                 <span className="text-secondary">{sel && KIND_ICON[sel.kind]}</span>
                 <div>
                   <div className="text-sm font-medium">{sel?.provider}</div>
-                  <div className="text-xs text-secondary">Backed by OpenEdge {sel ? KIND_LABEL[sel.kind] : ""}</div>
+                  <div className="text-xs text-secondary">Backed by DevHub {sel ? KIND_LABEL[sel.kind] : ""}</div>
                 </div>
               </div>
               <div>

@@ -62,7 +62,7 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         {!attached && <Meta label="Registrar" value={<span className="flex items-center gap-1.5"><Triangle className="h-4 w-4" /> {d.registrar}</span>} />}
         {!attached && <Meta label="Auto Renewal" value={<AutoRenew domain={domain} on={d.auto_renew} onChange={refresh} />} />}
         <Meta label="Age" value={timeAgo(d.created_ms)} />
-        <Meta label="OpenEdge CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
+        <Meta label="DevHub CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
       </div>
 
       {/* Ownership verification (custom-domain attachment) */}
@@ -98,7 +98,7 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       {/* SSL Certificates — simulated placeholder data, only meaningful for
           legacy DNS-only records (no attach flow). */}
       {!attached && (
-      <Section title="SSL Certificates" desc="By default, OpenEdge issues and auto-renews a free SSL certificate for your domains.">
+      <Section title="SSL Certificates" desc="By default, DevHub issues and auto-renews a free SSL certificate for your domains.">
         <Card className="p-0">
           <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
             <span>ID</span><span>CNs</span><span>Renewal</span><span>Expiration</span><span>Age</span>
@@ -606,7 +606,7 @@ function Nameservers({ domain, nameservers, attached, onChange }: { domain: stri
   return (
     <Section
       title="Nameservers"
-      desc="By default, OpenEdge propagates its nameservers for your domains. You can view them or add custom ones here."
+      desc="By default, DevHub propagates its nameservers for your domains. You can view them or add custom ones here."
       action={editing ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><Button onClick={save}>Save</Button></div> : <div className="flex gap-2"><Button variant="outline" onClick={() => apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ["ns1.openedge-dns.com", "ns2.openedge-dns.com"] }).then(onChange)}>Restore Original</Button><Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }}>Edit</Button></div>}
     >
       <Card className="p-0">

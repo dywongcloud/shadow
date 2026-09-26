@@ -10,24 +10,9 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
 import { VitalsBeacon } from "@/components/vitals-beacon";
+import { WalletProvider } from "@/components/wallet-connection";
 
-// Still opted out, for a DIFFERENT reason than before (the app-chrome
-// usePathname() gap below is fixed — see the Suspense wrapping around
-// ChromeTop/ChromeBottom). The remaining blocker is Clerk's own <SignIn>/
-// <SignUp> components: they call usePathname() internally
-// (@clerk/nextjs's usePathnameWithoutCatchAll), with no Suspense boundary
-// of their own, on the /sign-in and /sign-up catch-all routes specifically.
-// That call happens INSIDE <ClerkProvider>, which wraps this entire tree —
-// there is no seam in this file to add a boundary around a third-party
-// component's own internals. Confirmed via `next dev`'s exact error
-// attribution (digest: CLIENT_HOOK_DYNAMIC, points at the ClerkProvider
-// line). Not fixable from app code; would need either an upstream Clerk fix
-// or moving ClerkProvider itself to wrap only the auth routes (a much larger
-// restructure of the whole app's auth boundary, out of scope for this pass).
-// See: https://nextjs.org/docs/app/guides/migrating-to-cache-components
-export const instant = false;
-
-// schema.org JSON-LD so AI search / LLMs (and rich results) can parse what shadw
+// schema.org JSON-LD so AI search / LLMs (and rich results) can parse what Autheo
 // is — structured, machine-readable content the AI-search era favors. Kept
 // accurate to the product; rendered once in the root so every page carries it.
 const STRUCTURED_DATA = {
@@ -35,22 +20,22 @@ const STRUCTURED_DATA = {
   "@graph": [
     {
       "@type": "Organization",
-      "@id": "https://shadw.cloud/#org",
-      name: "shadw",
-      url: "https://shadw.cloud",
+      "@id": "https://autheo.dev/#org",
+      name: "Autheo",
+      url: "https://autheo.dev",
       description:
-        "shadw is a peer-to-peer cloud for serverless functions, containers, edge routing and durable data over an Iroh QUIC mesh.",
+        "Autheo DevHub is an electric-green developer cloud for serverless functions, containers, edge routing and durable data over an Iroh QUIC mesh.",
     },
     {
       "@type": "WebSite",
-      "@id": "https://shadw.cloud/#site",
-      url: "https://shadw.cloud",
-      name: "shadw",
-      publisher: { "@id": "https://shadw.cloud/#org" },
+      "@id": "https://autheo.dev/#site",
+      url: "https://autheo.dev",
+      name: "Autheo DevHub",
+      publisher: { "@id": "https://autheo.dev/#org" },
     },
     {
       "@type": "SoftwareApplication",
-      name: "shadw",
+      name: "Autheo DevHub",
       applicationCategory: "DeveloperApplication",
       operatingSystem: "Web",
       offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
@@ -65,36 +50,36 @@ const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display", 
 // Electrolize — the marketing/landing surface's primary typeface (single 400 weight).
 const electrolize = Electrolize({ subsets: ["latin"], weight: "400", variable: "--font-electrolize", display: "swap" });
 
-const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://shadw.cloud").replace(/\/$/, "");
+const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://autheo.dev").replace(/\/$/, "");
 const DESCRIPTION =
-  "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers, edge & durable data over a P2P mesh (Iroh QUIC).";
+  "Autheo DevHub is an electric-green peer-to-peer cloud. Build serverless functions, containers, edge apps, and durable data over a P2P mesh (Iroh QUIC).";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "shadw — Beyond the Edge are Shadows",
+    default: "Autheo DevHub — Electric Cloud Platform",
     // Public pages set their own titles; this templates them for consistent SEO.
-    template: "%s · shadw",
+    template: "%s · Autheo DevHub",
   },
   description: DESCRIPTION,
-  applicationName: "shadw",
+  applicationName: "Autheo DevHub",
   manifest: "/manifest.webmanifest",
   alternates: { canonical: "/" },
   // Social + AI-search preview cards (title/description inherit unless a page
   // overrides). OG image is provided by app/opengraph-image.
   openGraph: {
     type: "website",
-    siteName: "shadw",
+    siteName: "Autheo DevHub",
     url: SITE_URL,
-    title: "shadw — Beyond the Edge are Shadows",
+    title: "Autheo DevHub — Electric Cloud Platform",
     description: DESCRIPTION,
   },
-  twitter: { card: "summary_large_image", title: "shadw", description: DESCRIPTION },
+  twitter: { card: "summary_large_image", title: "Autheo DevHub", description: DESCRIPTION },
   // Favicon + icons come from the file-based metadata in app/ (favicon.ico,
   // icon.png, apple-icon.png) so there's a single source of truth.
   appleWebApp: {
     capable: true,
-    title: "shadw",
+    title: "Autheo DevHub",
     statusBarStyle: "black-translucent",
   },
 };
@@ -108,8 +93,8 @@ export const viewport: Viewport = {
   initialScale: 1,
   viewportFit: "cover",
   themeColor: [
-    { media: "(prefers-color-scheme: dark)", color: "#000000" },
-    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#050b07" },
+    { media: "(prefers-color-scheme: light)", color: "#f4fff6" },
   ],
 };
 
@@ -128,14 +113,14 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 // Origins Clerk is allowed to redirect back to after sign-in / OAuth — i.e. the
 // app's callback URLs. This lets login work both locally and on the public
 // platform domain. Override/extend via NEXT_PUBLIC_ALLOWED_ORIGINS
-// (comma-separated); the defaults cover the common local ports + shadw.cloud.
-// `www.shadw.cloud` serves the SAME app (live-verified: it answers 200 with
+// (comma-separated); the defaults cover the common local ports + autheo.dev.
+// `www.autheo.dev` serves the SAME app (live-verified: it answers 200 with
 // the dashboard, no redirect to the apex), so it must be allow-listed too —
 // otherwise Clerk refuses every redirect_url on the www origin and a sign-in
 // there bounces back to where it started.
 const allowedRedirectOrigins = (
   process.env.NEXT_PUBLIC_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://localhost:3002,https://shadw.cloud,https://www.shadw.cloud"
+  "http://localhost:3000,http://localhost:3001,http://localhost:3002,https://autheo.dev,https://www.autheo.dev"
 )
   .split(",")
   .map((s) => s.trim())
@@ -154,6 +139,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <VitalsBeacon />
         <Toaster />
         <ThemeProvider>
+          <WalletProvider>
           {/* Dashboard chrome (top nav + footer + overlays) is auth-gated in a
               CLIENT component so it reacts to client-side login/logout — the
               signed-out landing renders its own full-bleed nav/footer. See
@@ -167,9 +153,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <ChromeTop />
           </Suspense>
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
-          <Suspense fallback={null}>
-            <ChromeBottom />
-          </Suspense>
+          <ChromeBottom />
+          </WalletProvider>
         </ThemeProvider>
       </body>
     </html>

@@ -48,7 +48,7 @@ export default function AccountPage() {
 
         <SettingCard
           title="Username"
-          desc="This is your URL namespace within OpenEdge."
+          desc="This is your URL namespace within DevHub."
           footer="Please use 48 characters at maximum."
           footerAction={<Button>Save</Button>}
         >
@@ -94,7 +94,7 @@ export default function AccountPage() {
           <Input placeholder="(201) 555-0123" className="max-w-sm" />
         </SettingCard>
 
-        <SettingCard title="User ID" desc="This is your user ID within OpenEdge." footer="Used when interacting with the OpenEdge API.">
+        <SettingCard title="User ID" desc="This is your user ID within DevHub." footer="Used when interacting with the DevHub API.">
           <button
             onClick={() => navigator.clipboard?.writeText(userId)}
             className="flex max-w-sm items-center gap-2 rounded-md border border-border bg-subtle px-3 py-2 font-mono text-sm hover:bg-card"

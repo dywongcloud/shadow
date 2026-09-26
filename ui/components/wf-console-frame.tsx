@@ -7,7 +7,7 @@ import { currentTeam, ensureSessionMinted, mintSessionToken } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // Seamless embed of the LITERAL upstream @workflow/web console (served at
-// /wfc by app/wf-console/[[...slug]]/route.ts) inside the shadw dashboard's
+// /wfc by app/wf-console/[[...slug]]/route.ts) inside the autheo dashboard's
 // own chrome. The iframe is the isolation boundary that keeps the console's
 // Tailwind v4 stylesheet from colliding with the dashboard's Tailwind v3 —
 // visually it is borderless, full-height, and URL-synced, so the console

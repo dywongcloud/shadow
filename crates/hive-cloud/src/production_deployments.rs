@@ -450,6 +450,9 @@ async fn relocate_one(
         image_pids: None,
         image_ports: None,
         git_token: None,
+        // This restores a known-good Git source after its host died; it does
+        // not reapply a Marketplace placement-policy snapshot.
+        marketplace_placement: None,
         source_deployment_ids: Vec::new(),
     };
 
