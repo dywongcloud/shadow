@@ -1428,6 +1428,67 @@ fn retained_source_path_for_ids(project: &str, ids: &[String]) -> Option<PathBuf
 /// probed on disk instead. The function name only builds a bare filename
 /// (rejected unless `[a-z0-9._-]`), and `bundle()`'s `resolve_entry` re-checks
 /// the final path stays inside the deployment root — no walk outside `build_dir`.
+/// Resolve a Node SERVER entry for a framework app that has no handler-shaped
+/// file: `package.json` (`main`/`module`/`exports`/`scripts.start` naming a JS
+/// file) and the built server outputs of the frameworks the platform detects.
+///
+/// Returns a deployment-root-relative path, the same shape
+/// `infer_browser_entry` returns. Only real, existing files are ever returned --
+/// a framework directory that was not built is not an entry.
+fn infer_package_server_entry(root: &Path) -> Option<String> {
+    let is_js = |p: &str| {
+        let lower = p.to_ascii_lowercase();
+        lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs")
+    };
+    let exists = |rel: &str| root.join(rel).is_file();
+    // Framework build outputs first: these are the REAL server entry of a built
+    // app, and package.json `main` often still points at unbuilt source.
+    for rel in [
+        ".next/standalone/server.js",
+        "build/index.js",
+        "build/server/index.js",
+        "dist/server/entry.mjs",
+        "dist/server/server.js",
+        ".output/server/index.mjs",
+        "server.js",
+        "app.js",
+    ] {
+        if exists(rel) {
+            return Some(rel.to_string());
+        }
+    }
+    let raw = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+    for key in ["main", "module"] {
+        if let Some(value) = parsed.get(key).and_then(|v| v.as_str()) {
+            if is_js(value) {
+                candidates.push(value.trim_start_matches("./").to_string());
+            }
+        }
+    }
+    if let Some(value) = parsed.get("exports").and_then(|v| v.as_str()) {
+        if is_js(value) {
+            candidates.push(value.trim_start_matches("./").to_string());
+        }
+    }
+    if let Some(start) = parsed
+        .get("scripts")
+        .and_then(|s| s.get("start"))
+        .and_then(|v| v.as_str())
+    {
+        // `next start` / `node build/index.js` -- take only the argv token that
+        // names a JS file, never the whole command line.
+        for token in start.split_whitespace() {
+            if is_js(token) {
+                candidates.push(token.trim_start_matches("./").to_string());
+                break;
+            }
+        }
+    }
+    candidates.into_iter().find(|rel| exists(rel))
+}
+
 fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     let safe_name = fn_name
@@ -4211,9 +4272,22 @@ async fn run_build(
                 ));
                 continue;
             }
-            if let Some(entry) = infer_browser_entry(&build_dir, &f.name) {
+            // Handler-shaped entry first, then a PACKAGE/FRAMEWORK server entry
+            // (bn-node-worker-substrate). The handler probe alone excluded every
+            // real framework: a Next.js or SvelteKit app has no `<fn>.js`,
+            // `handler.js` or `index.js` handler in the deployment root — its
+            // entry is `next start` / `node build`, and its server file lives in
+            // the build output. Now that the substrate is a real Node runtime
+            // (vendored node-worker: Node's own lib transpiled for a Worker)
+            // rather than QuickJS, a server entry is exactly what we want to
+            // host, so package.json and the framework build outputs are probed
+            // too. Still no `start_cmd` argv parsing: the ENTRY is a file, and
+            // the same bundle() gate decides whether the source can actually run.
+            let entry = infer_browser_entry(&build_dir, &f.name)
+                .or_else(|| infer_package_server_entry(&build_dir));
+            if let Some(entry) = entry {
                 log(format!(
-                    "Browser artifact ({}): auto-detected handler {entry:?} — serving in browsers \
+                    "Browser artifact ({}): auto-detected entry {entry:?} — serving in browsers \
                      automatically (no fluid.json browser opt-in needed).",
                     f.name
                 ));
@@ -4224,9 +4298,10 @@ async fn run_build(
                 auto_browser.insert(f.name.clone());
             } else {
                 f.browser_ineligible_reason = Some(format!(
-                    "no browser handler file found — looked for {}.browser.js, browser.js, {}.js, \
-                     handler.js, index.js and main.js (.mjs/.cjs too) in the deployment root; add \
-                     one that assigns its handler to module.exports",
+                    "no browser entry found — looked for {}.browser.js, browser.js, {}.js, \
+                     handler.js, index.js, main.js (.mjs/.cjs too), a package.json \
+                     main/module/exports/scripts.start JS file, and the Next.js/SvelteKit \
+                     build outputs in the deployment root",
                     f.name, f.name
                 ));
             }
