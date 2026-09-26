@@ -1,0 +1,20 @@
+diff --git a/lib/internal/fs/glob.js b/lib/internal/fs/glob.js
+index 526efd4c010..2e45db4d265 100644
+--- a/lib/internal/fs/glob.js
++++ b/lib/internal/fs/glob.js
+@@ -16,8 +16,13 @@ const {
+   StringPrototypeEndsWith,
+ } = primordials;
+ 
+-const { lstatSync, readdirSync } = require('fs');
+-const { lstat, readdir } = require('fs/promises');
++// node-worker: reach readdir/lstat through the impl modules rather than the `fs`
++// barrel. `lib/fs.js` is a forwarder whose top level reads properties off
++// node/fs/index.ts, and index.ts is what exposes glob — so requiring `fs` here
++// puts that forwarder in a cycle with it and it evaluates first, throwing
++// "Cannot access 'fs$N' before initialization". See
++// src/worker/node-core/lib/internal/fs/glob-impl.js.
++const { lstatSync, readdirSync, lstat, readdir } = require('internal/fs/glob-impl');
+ const { join, resolve, basename, isAbsolute, dirname } = require('path');
+ 
+ const {

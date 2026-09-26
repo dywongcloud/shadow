@@ -1,0 +1,37 @@
+diff --git a/lib/internal/http2/core.js b/lib/internal/http2/core.js
+index 273ddd15414..3f40bd8c2b9 100644
+--- a/lib/internal/http2/core.js
++++ b/lib/internal/http2/core.js
+@@ -1091,7 +1091,9 @@ function setupHandle(socket, type, options) {
+     return;
+   }
+ 
+-  assert(socket._handle !== undefined,
++  // node-worker: sockets here are plain stream.Duplex with no `_handle`
++  // StreamBase; the binding drives I/O via a JS byte pump in `consume(socket)`.
++  assert(socket,
+          'Internal HTTP/2 Failure. The socket is not connected. Please ' +
+          'report this as a bug in Node.js');
+ 
+@@ -1105,7 +1107,8 @@ function setupHandle(socket, type, options) {
+   const handle = new binding.Http2Session(type);
+   handle[kOwner] = this;
+ 
+-  handle.consume(socket._handle);
++  // node-worker: pass the JS socket itself; the binding installs the byte pump.
++  handle.consume(socket);
+   handle.ongracefulclosecomplete = this[kMaybeDestroy].bind(this, null);
+ 
+   this[kHandle] = handle;
+@@ -1294,9 +1297,8 @@ class Http2Session extends EventEmitter {
+ 
+     socket[kBoundSession] = this;
+ 
+-    if (!socket._handle || !socket._handle.isStreamBase) {
+-      socket = new JSStreamSocket(socket);
+-    }
++    // node-worker: our net.Socket/tls.TLSSocket has no StreamBase `_handle`;
++    // the http2 binding consumes the JS socket directly (no JSStreamSocket).
+     socket.on('error', socketOnError);
+     socket.on('close', socketOnClose);
+ 

@@ -1,0 +1,28 @@
+diff --git a/lib/internal/repl/utils.js b/lib/internal/repl/utils.js
+index 1e6c7127175..7f5e7db24e2 100644
+--- a/lib/internal/repl/utils.js
++++ b/lib/internal/repl/utils.js
+@@ -7,6 +7,7 @@ const {
+   Boolean,
+   FunctionPrototypeBind,
+   MathMin,
++  ObjectGetOwnPropertyNames,
+   RegExpPrototypeExec,
+   SafeSet,
+   SafeStringIterator,
+@@ -815,8 +816,14 @@ function getREPLResourceName() {
+   return `REPL${nextREPLResourceNumber++}`;
+ }
+ 
++// node-worker: read this realm's globals directly rather than minting a context
++// to read a pristine set from. There is no second realm in a Worker — `vm`'s
++// contextify half cannot be reproduced without V8 — and this runs at module load,
++// so throwing here would take the whole REPL down. The set is only consulted when
++// building a *separate* REPL context (`repl.js:1140`), which is the one thing this
++// runtime cannot do anyway; `node -i` passes `useGlobal: true` and never reads it.
+ const globalBuiltins =
+-  new SafeSet(vm.runInNewContext('Object.getOwnPropertyNames(globalThis)'));
++  new SafeSet(ObjectGetOwnPropertyNames(globalThis));
+ 
+ let _builtinLibs = ArrayPrototypeFilter(
+   CJSModule.builtinModules,

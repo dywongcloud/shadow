@@ -62,6 +62,42 @@ for (const f of [
   }
 }
 
+// The node-worker lane (bn-node-worker-substrate): the real Node.js runtime
+// (Node core transpiled for a Worker) that replaces the QuickJS lane for
+// browser execution, so a browser node can host arbitrary Node/Next/Svelte
+// apps with no per-repo opt-in. dist/ is produced by
+// scripts/build-node-worker.sh from vendor/node-worker; everything here is a
+// build artifact, never hand-edited. A missing artifact is a WARN, never a
+// build failure -- same discipline as pkg/ and the sqlite lane above, and the
+// runtime reports its own honest error if the lane is absent.
+//
+// sw.js and sw-handler.js are the ServiceWorker half of the SYNCHRONOUS `fs`
+// bridge: node-worker's module resolver is synchronous end to end, so without
+// a service worker backing sync `fs` there is no working `require` and nothing
+// runs. They must be published at the scope the page registers them under,
+// which is why they ship as top-level browser-node assets rather than being
+// imported by the worker.
+const NODE_WORKER_SET = ["index.js", "worker.js", "sw.js", "sw-handler.js"];
+const nwSrcRoot = join(srcRoot, "node-worker");
+if (existsSync(nwSrcRoot)) {
+  const nwDest = join(destRoot, "node-worker");
+  mkdirSync(nwDest, { recursive: true });
+  for (const f of NODE_WORKER_SET) {
+    const s = join(nwSrcRoot, f);
+    if (existsSync(s)) {
+      copyFileSync(s, join(nwDest, f));
+    } else {
+      console.warn(
+        `[sync-browser-node] ${s} missing — the node-worker lane will report itself unbuilt (run scripts/build-node-worker.sh).`,
+      );
+    }
+  }
+} else {
+  console.warn(
+    `[sync-browser-node] ${nwSrcRoot} not built yet — skipping node-worker assets (run scripts/build-node-worker.sh).`,
+  );
+}
+
 // The browser-replicated database lane (bn-run-node-db-sync-wiring): when the
 // admission capability carries a `db` block, run-node-worker.js spawns the
 // sqlite DedicatedWorker from these deployed assets. The set is the exact

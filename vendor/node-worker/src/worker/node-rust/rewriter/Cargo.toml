@@ -1,0 +1,13 @@
+[package]
+name = "rewriter"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+oxc = { workspace = true }
+transform = { version = "0.1.0", path = "../transform" }
+thiserror = "2.0.17"
+itoa = "1.0.15"

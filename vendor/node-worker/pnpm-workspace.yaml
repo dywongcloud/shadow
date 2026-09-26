@@ -1,0 +1,2 @@
+patchedDependencies:
+  buffer@6.0.3: patches/buffer@6.0.3.patch

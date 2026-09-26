@@ -1,0 +1,13 @@
+[package]
+name = "native"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+oxc = { workspace = true }
+rewriter = { version = "0.1.0", path = "../rewriter" }
+clap = { version = "4.5.51", features = ["cargo", "derive"] }
