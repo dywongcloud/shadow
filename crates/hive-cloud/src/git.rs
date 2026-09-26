@@ -7614,8 +7614,18 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("removing pnpm dependency materialization roots failed")?;
+        // `package-import-method=copy` is load-bearing, not an optimization:
+        // pnpm's default hardlinks every package file from a content-addressable
+        // STORE OUTSIDE the checkout, so each installed file reports nlink=2 with
+        // only one link inside the artifact. The runtime-artifact seal rejects
+        // exactly that ("checkout-external hardlink provenance: expected 2 links,
+        // approved 1") -- and it is right to: the artifact would not own its own
+        // bytes and could be mutated through the store link. Copying makes every
+        // file nlink=1 and the artifact genuinely self-contained. Cost is disk,
+        // not correctness, and it only applies to this runtime normalization.
         let runtime_install = launcher.invoke(
-            "install --prod --frozen-lockfile --config.node-linker=hoisted --offline --ignore-scripts",
+            "install --prod --frozen-lockfile --config.node-linker=hoisted \
+             --config.package-import-method=copy --offline --ignore-scripts",
         );
         run_streamed(
             require_build_session(&mut isolated)?,
