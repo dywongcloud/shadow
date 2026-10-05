@@ -4959,7 +4959,14 @@ impl CellBackend for LiteboxBackend {
         // are never run here: a narrow, validated package-script reducer emits
         // one direct Node process or a typed backend-capability refusal (Bun is
         // refused above, before this lock, before any of the machinery below).
-        let _publication = self.artifact_lock.clone().lock_owned().await;
+        //
+        // The guard is RELEASED as soon as the runner holds the archive (see the
+        // drop after `spawn`), not at the end of this function: it used to be
+        // held across `wait_litebox_ready` (up to 15 s) as well, so every other
+        // deployment's cold start on the node queued behind one guest's boot --
+        // a boot that starts a hundred deployments then spent minutes, and the
+        // last ones answered tens of seconds after the node was already up.
+        let publication = self.artifact_lock.clone().lock_owned().await;
         let directories = self.prepare_artifact_dirs()?;
         let mut reference = self
             .load_image_reference_locked(&directories, &cell.image)
@@ -4997,6 +5004,7 @@ impl CellBackend for LiteboxBackend {
                 func.runtime
             )));
         }
+        let t_stage = std::time::Instant::now();
         let app_archive = verified_app_archive(
             &self.verified_archives,
             &cell.image,
@@ -5004,6 +5012,7 @@ impl CellBackend for LiteboxBackend {
             &reference,
         )
         .await?;
+        let app_ms = t_stage.elapsed().as_millis();
         let DirectLaunch {
             runtime,
             bin,
@@ -5036,6 +5045,7 @@ impl CellBackend for LiteboxBackend {
             },
             bin.display()
         );
+        let t_stage = std::time::Instant::now();
         let initial_files = self
             .ensure_combined_tar_locked(
                 &directories,
@@ -5045,6 +5055,7 @@ impl CellBackend for LiteboxBackend {
                 &mut reference,
             )
             .await?;
+        let tar_ms = t_stage.elapsed().as_millis();
 
         let net = self
             .cell_nets
@@ -5127,12 +5138,18 @@ impl CellBackend for LiteboxBackend {
             command.env_remove("NODE_OPTIONS").env_remove("BUN_OPTIONS");
         }
 
+        let t_spawn = std::time::Instant::now();
         let mut child = command.spawn().map_err(|error| {
             anyhow::anyhow!(
                 "failed to spawn litebox runner at {}: {error}",
                 self.cfg.runner_bin.display()
             )
         })?;
+        // The runner inherited the archive's file descriptor (`--initial-files`
+        // is a /proc/self/fd path), so the bytes it will read are pinned for
+        // that process regardless of what publication/GC does to the directory
+        // entry afterwards. Nothing below needs the publication lock.
+        drop(publication);
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         if let Some(mut pipe) = child.stderr.take() {
             const STDERR_TAIL_CAP: usize = 8 * 1024;
@@ -5176,16 +5193,24 @@ impl CellBackend for LiteboxBackend {
             }
             return Err(anyhow::anyhow!("{error}; guest stderr tail: {tail}"));
         }
+        {
+            let spawn_ready_ms = t_spawn.elapsed().as_millis();
+            tracing::info!(
+                image = %cell.image,
+                app_ms,
+                tar_ms,
+                spawn_ready_ms,
+                total_ms = app_ms + tar_ms + spawn_ready_ms,
+                "litebox cold-start stages"
+            );
+        }
         reap_guard.disarm();
         // Guest readiness proves Litebox has materialized the initial tar. Drop
         // the descriptor-relative pathname now; cancellation before this point
         // takes the same Drop cleanup path automatically.
         drop(initial_files_alias);
-        // Keep publication/GC serialized until the runner has consumed the
-        // selected immutable archive. A concurrent redelivery can then retire
-        // the old reference without deleting the file from under this cold
-        // start; a ready guest has already materialized its in-memory fs.
-        drop(_publication);
+        // Publication/GC serialization was already released above (right after
+        // `spawn`, when the runner inherited the archive's descriptor).
 
         let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
