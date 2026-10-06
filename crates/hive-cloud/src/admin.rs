@@ -9839,6 +9839,14 @@ pub(crate) struct WfQuery {
     /// Scope a run-scoped read (e.g. `/v1/workflows/hooks`) to a single run.
     #[serde(default, rename = "runId")]
     pub(crate) run_id: Option<String>,
+    /// Internal: skip the per-project WORLD reads (`worlds=0`). Set by the
+    /// fleet-aggregation fan-out only. A world is read over the project's own
+    /// REST URL, which answers from ANY node — so the aggregating node reads
+    /// every tenant-owned project's world itself and each peer hop would
+    /// otherwise re-read the same worlds, once per peer, just to have its rows
+    /// thrown away as duplicates.
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    pub(crate) worlds: Option<bool>,
 }
 
 /// Does this workflow's project belong to the requesting team? Fleet-aware —
@@ -10650,6 +10658,11 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     /// One phase's budget: generous for a healthy fleet, and small enough that
     /// world-read + fan-out in sequence still complete under the client abort.
     const PHASE_BUDGET: Duration = Duration::from_secs(8);
+    /// One project's world read budget. The world store is an EXTERNAL REST
+    /// endpoint, so a hung one must not be allowed to eat the caller's whole
+    /// deadline — and (see the read loop) must never take the healthy
+    /// projects' rows down with it.
+    const WORLD_READ_BUDGET: Duration = Duration::from_millis(2_500);
     // Scoped request for a project with a locally-readable, tenant-owned WORLD
     // (env is gossiped, so this is true on EVERY node): never depend on the
     // mesh forward for the world rows — the forward path returned a false-[]
@@ -10734,6 +10747,10 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
                 s.into_iter().collect()
             }
         };
+        if q.worlds == Some(false) {
+            // Inner fleet hop: the aggregating node already read these worlds.
+            locals.clear();
+        }
         locals.retain(|p| crate::world::has_world(&c, p));
         // Per-project Upstash world reads run CONCURRENTLY — a tenant with many
         // projects previously paid one Upstash round-trip per project, one at a
@@ -10742,20 +10759,44 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
         // the slowest single project's read instead of the sum of every project.
         // Budgeted: a single slow/hung Upstash world must cost this POLL its
         // rows for that project, never the whole endpoint its deadline.
-        if let Ok(all) = tokio::time::timeout(
-            PHASE_BUDGET,
-            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100))),
-        )
-        .await
-        {
-            for wruns in all.into_iter().flatten() {
-                runs.extend(wruns);
+        // Budgeted PER PROJECT, never as one timeout over the whole join — the
+        // same lesson the peer fan-out below already learned. A single project
+        // with a dead/slow world previously burned the entire 8 s phase budget
+        // and the outer timeout then discarded EVERY OTHER project's rows too,
+        // so the dashboard's runs table came back empty after 8 s even though
+        // most worlds answered in single-digit milliseconds. Per-project, one
+        // bad world costs only its own rows.
+        let world_start = std::time::Instant::now();
+        let world_reads: Vec<Value> = futures::future::join_all(locals.iter().map(|p| {
+            let c = c.clone();
+            async move {
+                let started = std::time::Instant::now();
+                match tokio::time::timeout(WORLD_READ_BUDGET, crate::world::list_runs(&c, p, 100))
+                    .await
+                {
+                    Ok(rows) => rows.unwrap_or_default(),
+                    Err(_) => {
+                        tracing::warn!(
+                            project = %p,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "wf_runs: world read exceeded its budget — serving this poll without that project's runs"
+                        );
+                        Vec::new()
+                    }
+                }
             }
-        } else if !locals.is_empty() {
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        runs.extend(world_reads);
+        if world_start.elapsed() > Duration::from_secs(2) {
             tracing::warn!(
                 team,
                 projects = locals.len(),
-                "wf_runs: world reads exceeded the phase budget — serving without them this poll"
+                elapsed_ms = world_start.elapsed().as_millis() as u64,
+                "wf_runs: world reads were slow this poll"
             );
         }
     }
@@ -10780,7 +10821,7 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             async move {
                 tokio::time::timeout(
                     PHASE_BUDGET,
-                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true", &team),
+                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true&worlds=0", &team),
                 )
                 .await
                 .ok()

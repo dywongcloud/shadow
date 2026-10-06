@@ -1999,6 +1999,7 @@ fn wf_query(path: &str) -> axum::extract::Query<crate::admin::WfQuery> {
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
         summary: qparam(path, "summary").map(|v| v == "true" || v == "1"),
         run_id: qparam(path, "runId"),
+        worlds: qparam(path, "worlds").map(|v| v == "true" || v == "1"),
     })
 }
 
