@@ -662,6 +662,19 @@ fn index_build_timeout() -> std::time::Duration {
 /// Cadence of the background re-walk once the index is ready. Bounds the
 /// staleness of a REMOTE write the live sync somehow missed; local writes and
 /// live-synced remote inserts land in the index immediately regardless.
+/// Budget for the post-build row-value warm-up. It is an optimization only
+/// (rows materialize lazily on read without it) and it must never block the
+/// index refresher's next tick.
+fn warm_values_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("HIVE_RELATIONAL_WARM_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n: &u64| *n > 0)
+            .unwrap_or(600)
+    )
+}
+
 fn index_refresh_interval() -> std::time::Duration {
     env_secs("HIVE_RELATIONAL_REFRESH_SECS", 120)
 }
@@ -725,20 +738,40 @@ fn spawn_index_refresher(db: SqlDb) {
                         // Warm every row value once, AFTER readiness (nothing
                         // waits on it): a cold row is a peer fetch on first
                         // read, so a whole-table scan before this finishes can
-                        // still time out -- and succeed on the next attempt.
-                        let warm_started = std::time::Instant::now();
-                        match db.storage().warm_values().await {
-                            Ok(documents) => tracing::info!(
-                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
-                                documents,
-                                "relational: row values warmed -- cold scans no longer pay a per-row fetch"
-                            ),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                elapsed_ms = warm_started.elapsed().as_millis() as u64,
-                                "relational: row value warm-up failed; rows materialize lazily on read instead"
-                            ),
-                        }
+                        // still time out.
+                        //
+                        // DETACHED and BOUNDED, not awaited inline: the warm
+                        // walks every key of the namespace (measured 38,734 on
+                        // fc-sanjose) and materializes each hash-only row, and
+                        // awaiting it inside the loop meant the index never
+                        // re-walked — no "row values warmed" line was ever
+                        // logged, so refreshes silently stopped after the first
+                        // build. It reports its own outcome when it finishes.
+                        let db2 = db.clone();
+                        crate::bulkhead::spawn(async move {
+                            let warm_started = std::time::Instant::now();
+                            match tokio::time::timeout(
+                                warm_values_timeout(),
+                                db2.storage().warm_values(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(documents)) => tracing::info!(
+                                    elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                    documents,
+                                    "relational: row values warmed -- cold scans no longer pay a per-row fetch"
+                                ),
+                                Ok(Err(e)) => tracing::warn!(
+                                    error = %e,
+                                    elapsed_ms = warm_started.elapsed().as_millis() as u64,
+                                    "relational: row value warm-up failed; rows materialize lazily on read instead"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    bound_secs = warm_values_timeout().as_secs(),
+                                    "relational: row value warm-up exceeded its budget; rows materialize lazily on read instead"
+                                ),
+                            }
+                        });
                     } else {
                         tracing::debug!(elapsed_ms, keys, "relational: index re-walked");
                     }
