@@ -685,7 +685,22 @@ impl<S: RelationalStorage> Session<S> {
         {
             exec.materialize_with(with)?;
         }
+        let dispatch_started = std::time::Instant::now();
         let result = self.dispatch(&mut exec, stmt)?;
+        let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
+        let loaded_rows: usize = exec.tables.values().map(|t| t.rows.len()).sum();
+        if dispatch_ms >= 200 || loaded_rows >= 1000 {
+            // The executor half of a statement's cost. `load_table` (scan + build)
+            // was measured under 200 ms for a 21.5k-row table while the statement
+            // as a whole exceeded the 10 s budget, so the time is here: the
+            // per-row scan/filter/aggregate path, not the load.
+            tracing::info!(
+                tables = exec.tables.len(),
+                rows = loaded_rows,
+                dispatch_ms,
+                "sql: dispatch"
+            );
+        }
         // Persist variable writes made during execution (e.g. `set_limit`).
         self.vars = exec.vars.borrow().clone();
 
