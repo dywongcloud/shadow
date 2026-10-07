@@ -6,7 +6,7 @@
 //! refresh, mirroring GuardianDB's local-first "refresh then operate" model.
 
 use crate::relational::value::SqlValue;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 
 /// Separator between composite key components. `0x1f` (unit separator) cannot
@@ -51,7 +51,18 @@ pub fn ordered_key(values: &[SqlValue]) -> String {
 /// An ordered secondary index: composite key -> set of row ids.
 #[derive(Debug, Default, Clone)]
 pub struct SecondaryIndex {
-    map: BTreeMap<String, BTreeSet<String>>,
+    /// key -> row ids, kept ascending.
+    ///
+    /// Was `BTreeMap<String, BTreeSet<String>>`. Rebuilding that per statement
+    /// allocated a tree node per key AND per (key, row) pair, with a fresh
+    /// `String` key for every row of every index — measured ~0.47 ms per row on
+    /// a 21.5k-row table, most of it this. musql's row store indexes are exactly
+    /// this shape (`rsEqIndex{ rows map[int64][]uint64 }` in
+    /// engine/row_store_eqindex.go): a hash map to a flat row-id vector, with
+    /// order produced by sorting when it is needed rather than maintained on
+    /// every insert. Nothing in the production query path needs ordered
+    /// iteration — `range` below has no callers outside this file's tests.
+    map: HashMap<String, Vec<String>>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
 }
@@ -59,7 +70,7 @@ pub struct SecondaryIndex {
 impl SecondaryIndex {
     pub fn new(unique: bool) -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: HashMap::new(),
             unique,
         }
     }
@@ -69,15 +80,25 @@ impl SecondaryIndex {
     }
 
     pub fn insert(&mut self, key: String, row_id: String) {
-        self.map.entry(key).or_default().insert(row_id);
+        let v = self.map.entry(key).or_default();
+        // Sorted + deduped, preserving BTreeSet semantics; binary search keeps
+        // the per-row cost at O(log n) with one small memmove instead of an
+        // allocation per member.
+        if let Err(at) = v.binary_search(&row_id) {
+            v.insert(at, row_id);
+        }
     }
 
     pub fn remove(&mut self, key: &str, row_id: &str) {
-        if let Some(set) = self.map.get_mut(key) {
-            set.remove(row_id);
-            if set.is_empty() {
-                self.map.remove(key);
+        let mut drop_key = false;
+        if let Some(v) = self.map.get_mut(key) {
+            if let Ok(at) = v.binary_search(&row_id.to_string()) {
+                v.remove(at);
             }
+            drop_key = v.is_empty();
+        }
+        if drop_key {
+            self.map.remove(key);
         }
     }
 
@@ -86,24 +107,45 @@ impl SecondaryIndex {
     /// Returns a reference to the internal set (or a shared empty set) to avoid
     /// cloning on the hot path — callers that just iterate or check `.len()` pay
     /// no allocation cost.
-    pub fn get(&self, key: &str) -> &BTreeSet<String> {
-        static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    pub fn get(&self, key: &str) -> &[String] {
+        static EMPTY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         self.map
             .get(key)
-            .unwrap_or_else(|| EMPTY.get_or_init(BTreeSet::new))
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| EMPTY.get_or_init(Vec::new).as_slice())
     }
 
     /// Returns the row id currently occupying `key`, if any (for unique checks).
     pub fn unique_occupant(&self, key: &str) -> Option<String> {
-        self.map.get(key).and_then(|s| s.iter().next().cloned())
+        self.map.get(key).and_then(|v| v.first().cloned())
     }
 
     /// Row ids whose key falls within `[lo, hi]`.
+    /// Row ids whose key falls within `[lo, hi]`.
+    ///
+    /// Now a scan-and-filter, since the map is no longer ordered. That is the
+    /// same trade musql makes: its indexes serve equality (`rsEqIndex`) and
+    /// ordering is produced by sorting the flat row-id vector when a query
+    /// needs it. There are no production callers of this method — only this
+    /// file's tests — so no query path pays the difference.
     pub fn range(&self, lo: Bound<String>, hi: Bound<String>) -> BTreeSet<String> {
-        self.map
-            .range((lo, hi))
-            .flat_map(|(_, set)| set.iter().cloned())
-            .collect()
+        let mut out = BTreeSet::new();
+        for (key, rows) in &self.map {
+            let in_lo = match &lo {
+                Bound::Unbounded => true,
+                Bound::Included(a) => key >= a,
+                Bound::Excluded(a) => key > a,
+            };
+            let in_hi = match &hi {
+                Bound::Unbounded => true,
+                Bound::Included(b) => key <= b,
+                Bound::Excluded(b) => key < b,
+            };
+            if in_lo && in_hi {
+                out.extend(rows.iter().cloned());
+            }
+        }
+        out
     }
 
     pub fn is_empty(&self) -> bool {

@@ -12,7 +12,7 @@ use crate::relational::catalog::{Index, Table};
 use crate::relational::{SecondaryIndex, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
 use serde_json::{Map, Value as Json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const F_ID: &str = "_id";
 pub const F_SCHEMA: &str = "__schema";
@@ -30,7 +30,10 @@ pub struct LoadedTable {
     /// row id -> decoded column values
     pub rows: BTreeMap<String, RowValues>,
     /// monotonically increasing version per row id (for `__version`)
-    pub versions: BTreeMap<String, i64>,
+    /// row_id -> MVCC version. Only ever read by key (`version_of`), never
+    /// iterated in order, so a hash map is both correct and cheaper than the
+    /// B-tree it was — one tree insert with a cloned `String` key per row.
+    pub versions: HashMap<String, i64>,
     pub indexes: Vec<LoadedIndex>,
 }
 
@@ -46,7 +49,7 @@ impl LoadedTable {
     /// definitions for the table.
     pub fn build(meta: Table, docs: Vec<(String, Json)>, index_defs: Vec<Index>) -> Result<Self> {
         let mut rows = BTreeMap::new();
-        let mut versions = BTreeMap::new();
+        let mut versions = HashMap::new();
         for (_rid, doc) in docs {
             // `build` already owns the documents, so decode by move to skip a
             // per-column `Json` clone.
