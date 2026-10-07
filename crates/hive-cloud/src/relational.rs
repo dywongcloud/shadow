@@ -1154,12 +1154,15 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
     reconcile_billing_invoices_schema(&mut s).await;
 
     for (account, ledger, invoices, checkouts) in batch {
+        let started = std::time::Instant::now();
         let mut sql = String::from("BEGIN;");
         sql.push_str(&build_account_sql(account, now));
         sql.push_str(&build_ledger_sql(ledger));
         sql.push_str(&build_invoices_sql(invoices));
         sql.push_str(&build_checkouts_sql(checkouts));
         sql.push_str("COMMIT;");
+        let statements = sql.matches(';').count();
+        let ledger_rows = ledger.len();
 
         if let Err(e) = exec(&mut s, &sql).await {
             tracing::debug!(
@@ -1169,6 +1172,21 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
                  fallback — and since this ran as ONE transaction, the failure rolled back atomically: no \
                  partial account/ledger/invoice/checkout row state was left behind)"
             );
+        } else {
+            // The mirror's write path is one BEGIN..COMMIT per tenant whose
+            // statements each touch a DIFFERENT table, so cross-statement
+            // caching does not help it; the cost is the per-statement
+            // materialization of each table. This is the number to watch.
+            let ms = started.elapsed().as_millis() as u64;
+            if ms >= 500 {
+                tracing::info!(
+                    tenant = %account.tenant,
+                    ms,
+                    statements,
+                    ledger_rows,
+                    "relational: billing mirror write"
+                );
+            }
         }
     }
 }
