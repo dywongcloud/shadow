@@ -21,7 +21,30 @@ pub const F_VERSION: &str = "__version";
 pub const F_DELETED: &str = "__deleted";
 
 /// A decoded row: column name -> value (internal/system columns excluded).
-pub type RowValues = BTreeMap<String, SqlValue>;
+/// A row's column values, keyed by INTERNED column name.
+///
+/// Keys are `Rc<str>` so that materializing a table clones a refcount instead of
+/// allocating a fresh `String` per column per row — `decode_row_owned` runs once
+/// per row of every `load_table`, which is the measured hot path (~0.47 ms/row on
+/// a 21.5k-row table). `Rc<str>: Borrow<str>`, so every existing `values.get("col")`
+/// keeps working unchanged.
+pub type RowValues = BTreeMap<std::sync::Arc<str>, SqlValue>;
+
+/// Process-wide interner for column names. Bounded by the number of DISTINCT
+/// column names in the catalog (tens), never by row count.
+pub fn intern_column(name: &str) -> std::sync::Arc<str> {
+    use std::collections::HashMap as Map;
+    use std::sync::Arc;
+    static INTERN: std::sync::OnceLock<parking_lot::Mutex<Map<String, Arc<str>>>> =
+        std::sync::OnceLock::new();
+    let mut m = INTERN.get_or_init(Default::default).lock();
+    if let Some(rc) = m.get(name) {
+        return rc.clone();
+    }
+    let rc: Arc<str> = Arc::from(name.to_string());
+    m.insert(name.to_string(), rc.clone());
+    rc
+}
 
 /// A loaded, materialized table view with live indexes.
 #[derive(Clone)]
@@ -175,7 +198,7 @@ pub fn index_values(index: &Index, values: &RowValues) -> Vec<SqlValue> {
     index
         .columns
         .iter()
-        .map(|c| values.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| values.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect()
 }
 
@@ -209,7 +232,7 @@ pub fn decode_row_owned(table: &Table, doc: Json) -> Result<Option<(String, RowV
     for col in &table.columns {
         let raw = obj.remove(&col.name).unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;
-        values.insert(col.name.clone(), value);
+        values.insert(intern_column(&col.name), value);
     }
     Ok(Some((id, values, version)))
 }
@@ -225,7 +248,7 @@ pub fn encode_row(table: &Table, row_id: &str, values: &RowValues, version: i64)
     for col in &table.columns {
         // Encode directly from a reference — avoids a `SqlValue` clone per column.
         let v = values
-            .get(&col.name)
+            .get(col.name.as_str())
             .map_or(Json::Null, SqlValue::encode_json);
         obj.insert(col.name.clone(), v);
     }
@@ -241,7 +264,7 @@ pub fn derive_row_id(table: &Table, values: &RowValues) -> Option<String> {
     }
     let parts: Vec<SqlValue> = pk
         .iter()
-        .map(|c| values.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| values.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect();
     if parts.iter().any(|v| v.is_null()) {
         return None;

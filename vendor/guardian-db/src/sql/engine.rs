@@ -1346,7 +1346,10 @@ impl<S: RelationalStorage> Session<S> {
             return Ok(None);
         };
         let collection = table.storage_collection.clone();
+        let scan_started = std::time::Instant::now();
         let mut docs = self.db.storage.scan(&collection).await?;
+        let scan_ms = scan_started.elapsed().as_millis() as u64;
+        let scanned_rows = docs.len();
         if let Some(txn) = &self.txn {
             let truncated = txn.truncated.contains(&collection);
             let overlay = txn.overlay.get(&collection);
@@ -1376,7 +1379,19 @@ impl<S: RelationalStorage> Session<S> {
             .into_iter()
             .cloned()
             .collect();
-        Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
+        let build_started = std::time::Instant::now();
+        let loaded = LoadedTable::build(table.clone(), docs, index_defs)?;
+        let build_ms = build_started.elapsed().as_millis() as u64;
+        if scan_ms + build_ms >= 200 {
+            tracing::info!(
+                collection = %collection,
+                rows = scanned_rows,
+                scan_ms,
+                build_ms,
+                "sql: load_table"
+            );
+        }
+        Ok(Some(loaded))
     }
 
     /// Load `q` reflecting explicitly-given `overlay`/`truncated` writes —
@@ -1395,7 +1410,10 @@ impl<S: RelationalStorage> Session<S> {
             return Ok(None);
         };
         let collection = table.storage_collection.clone();
+        let scan_started = std::time::Instant::now();
         let mut docs = self.db.storage.scan(&collection).await?;
+        let scan_ms = scan_started.elapsed().as_millis() as u64;
+        let scanned_rows = docs.len();
         let is_truncated = truncated.contains(&collection);
         let collection_overlay = overlay.get(&collection);
         if is_truncated || collection_overlay.is_some() {
@@ -1423,7 +1441,19 @@ impl<S: RelationalStorage> Session<S> {
             .into_iter()
             .cloned()
             .collect();
-        Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
+        let build_started = std::time::Instant::now();
+        let loaded = LoadedTable::build(table.clone(), docs, index_defs)?;
+        let build_ms = build_started.elapsed().as_millis() as u64;
+        if scan_ms + build_ms >= 200 {
+            tracing::info!(
+                collection = %collection,
+                rows = scanned_rows,
+                scan_ms,
+                build_ms,
+                "sql: load_table"
+            );
+        }
+        Ok(Some(loaded))
     }
 
     /// Re-validate every check in `checks` ([`DeferredFkCheck`]) against the

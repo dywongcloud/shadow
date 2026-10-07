@@ -379,7 +379,7 @@ impl Exec {
                     .meta
                     .columns
                     .iter()
-                    .map(|c| values.get(&c.name).cloned().unwrap_or(SqlValue::Null))
+                    .map(|c| values.get(c.name.as_str()).cloned().unwrap_or(SqlValue::Null))
                     .collect()
             })
             .collect();
@@ -2374,7 +2374,7 @@ fn loaded_to_rowset(
                 .meta
                 .columns
                 .iter()
-                .map(|c| values.get(&c.name).cloned().unwrap_or(SqlValue::Null))
+                .map(|c| values.get(c.name.as_str()).cloned().unwrap_or(SqlValue::Null))
                 .collect()
         })
         .collect();

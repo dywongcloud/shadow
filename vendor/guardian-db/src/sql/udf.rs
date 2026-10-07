@@ -1205,7 +1205,7 @@ fn assign_row_field(env: &mut PlBindings, row: &str, column: &str, v: SqlValue) 
     let coerced = crate::sql::dml::coerce_to_col(v, table, column)?;
     match env.rows.get_mut("new") {
         Some(new_row) => {
-            new_row.insert(column.to_string(), coerced);
+            new_row.insert(crate::sql::store::intern_column(column), coerced);
             Ok(())
         }
         // DELETE / statement-level firings have no NEW record (PostgreSQL's
@@ -1340,7 +1340,7 @@ fn substitute_expr(expr: &Expr, env: &PlBindings) -> Expr {
         if parts.len() == 2 {
             let qualifier = ident_name(&parts[0]);
             if let Some(row) = env.rows.get(&qualifier)
-                && let Some(v) = row.get(&ident_name(&parts[1]))
+                && let Some(v) = row.get(ident_name(&parts[1]).as_str())
             {
                 return value_to_expr(v);
             }
