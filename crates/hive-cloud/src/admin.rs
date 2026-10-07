@@ -16843,7 +16843,16 @@ async fn sql_query(
     crate::relational::run_readonly_query(&sql)
         .await
         .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        .map_err(|e| {
+            // A slow mirror read is a retryable capacity/refusal condition, not
+            // a malformed request: the statement was accepted and validated, it
+            // just did not finish inside the mirror's budget.
+            if e.contains("timed out") {
+                (StatusCode::SERVICE_UNAVAILABLE, e)
+            } else {
+                (StatusCode::BAD_REQUEST, e)
+            }
+        })
 }
 
 // ============================ Deployment preview / thumbnail ============================

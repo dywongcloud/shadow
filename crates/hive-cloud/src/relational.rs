@@ -2916,6 +2916,28 @@ fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
 /// live mutation path).
 pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, String> {
     reject_unless_readonly(sql)?;
+    // A mirror read can take seconds on a large table — measured: `SELECT
+    // count(*) FROM billing_ledger` exceeded the 10 s exec ceiling on every
+    // node. Run the whole thing on the bulkhead runtime so a slow admin query
+    // occupies a bulkhead thread, never a serving tokio worker (the same rule
+    // `relational::exec` already follows for writes).
+    let sql = sql.to_string();
+    let started = std::time::Instant::now();
+    let out = crate::bulkhead::spawn(async move { run_readonly_query_inner(&sql).await })
+        .await
+        .map_err(|e| format!("relational query task failed: {e}"))?;
+    if out.is_err() {
+        tracing::warn!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "admin relational query failed"
+        );
+    }
+    out
+}
+
+/// The body of [`run_readonly_query`], run on the bulkhead runtime.
+async fn run_readonly_query_inner(sql: &str) -> Result<serde_json::Value, String> {
+    reject_unless_readonly(sql)?;
     let db = crate::guardian::sql_db()
         .await
         .map_err(|e| format!("relational store unavailable: {e}"))?;
