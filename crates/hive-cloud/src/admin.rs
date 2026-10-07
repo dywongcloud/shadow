@@ -10648,6 +10648,22 @@ pub(crate) async fn wf_runs(
 /// misses one poll's budget simply contributes to the next poll). Writes the
 /// LAST-KNOWN-GOOD belt (and consults it for empties) itself, so completion —
 /// not the HTTP caller's patience — is what populates it.
+/// Per-project world-read circuit breaker. A project whose world store does
+/// not answer (dead/expired Upstash endpoint, which is tenant configuration no
+/// node can repair) used to cost every poll its full read budget, forever —
+/// six of nine projects on the busiest tenant were in exactly that state, so
+/// the console paid ~2.5 s per poll for rows that never arrive. After a
+/// timeout the project's world is skipped for [`WORLD_COOLDOWN`] and retried
+/// when it lapses, so recovery is automatic and the steady state stays fast.
+const WORLD_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn world_cooldowns() -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static M: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
 async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value {
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
@@ -10752,6 +10768,30 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             locals.clear();
         }
         locals.retain(|p| crate::world::has_world(&c, p));
+        // Drop projects still inside their cooldown (see `world_cooldowns`).
+        {
+            let mut cd = world_cooldowns().lock();
+            let now = std::time::Instant::now();
+            let mut cooled: usize = 0;
+            locals.retain(|p| match cd.get(p) {
+                Some(until) if *until > now => {
+                    cooled += 1;
+                    false
+                }
+                Some(_) => {
+                    cd.remove(p);
+                    true
+                }
+                None => true,
+            });
+            if cooled > 0 {
+                tracing::debug!(
+                    team,
+                    cooled,
+                    "wf_runs: skipping world reads for projects still in cooldown"
+                );
+            }
+        }
         // Per-project Upstash world reads run CONCURRENTLY — a tenant with many
         // projects previously paid one Upstash round-trip per project, one at a
         // time (this function's own doc/comment history calls it "the most
@@ -10781,6 +10821,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "wf_runs: world read exceeded its budget — serving this poll without that project's runs"
                         );
+                        world_cooldowns()
+                            .lock()
+                            .insert(p.to_string(), std::time::Instant::now() + WORLD_COOLDOWN);
                         Vec::new()
                     }
                 }
