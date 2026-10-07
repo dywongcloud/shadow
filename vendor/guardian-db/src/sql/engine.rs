@@ -142,6 +142,18 @@ struct Transaction {
     /// transaction. Fired at `COMMIT` before writing to storage; discarded on
     /// `ROLLBACK`.
     deferred_triggers: Vec<DeferredTriggerFiring>,
+    /// Materialized tables carried ACROSS statements of this transaction.
+    ///
+    /// `load_table` otherwise re-scans the whole collection for every
+    /// statement, so an N-statement transaction paid N full materializations
+    /// (the billing mirror's 500-row INSERT batches being the extreme case).
+    /// The value handed to `Exec` IS the running state — `Exec` mutates
+    /// `exec.tables` in lockstep with every `Mutation` it enqueues — so it is
+    /// moved back here at end of statement, never cloned (a clone would be
+    /// O(rows x cols)). Dropped wholesale whenever the catalog changes
+    /// (DDL/identity advance), because a cached `LoadedTable` whose `Table`
+    /// meta went stale would silently serve dropped/added columns wrong.
+    table_cache: HashMap<QualifiedName, LoadedTable>,
 }
 
 /// A connection-scoped session.
@@ -629,7 +641,12 @@ impl<S: RelationalStorage> Session<S> {
                 collect_stmt(&body_stmt, &mut names);
             }
         }
-        let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
+        // Reuse this transaction's already-materialized tables: only a table
+        // this transaction has not touched yet pays `load_table`.
+        let mut tables: HashMap<QualifiedName, LoadedTable> = match &mut self.txn {
+            Some(t) => std::mem::take(&mut t.table_cache),
+            None => HashMap::new(),
+        };
         for (schema, name) in &names {
             if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
                 && !tables.contains_key(&q)
@@ -691,6 +708,17 @@ impl<S: RelationalStorage> Session<S> {
         // Commit or stage the produced mutations / catalog changes.
         let mutations = std::mem::take(&mut *exec.mutations.lock().unwrap());
         let catalog_dirty = exec.catalog_dirty;
+        // Carry the statement's post-execution table state into the
+        // transaction (or throw it away if the catalog changed — see
+        // `Transaction::table_cache`). Autocommit has no transaction, so its
+        // single statement's tables are simply dropped as before.
+        if let Some(t) = self.txn.as_mut() {
+            if catalog_dirty {
+                t.table_cache.clear();
+            } else {
+                t.table_cache = std::mem::take(&mut exec.tables);
+            }
+        }
         // Foreign-key checks this statement postponed (see `DeferredFkCheck`)
         // because their constraint is currently running `DEFERRED`.
         let new_deferred: Vec<_> = exec.deferred_checks.borrow_mut().drain(..).collect();
@@ -1204,6 +1232,7 @@ impl<S: RelationalStorage> Session<S> {
                 constraint_modes: ConstraintModes::default(),
                 pending_deferred: Vec::new(),
                 deferred_triggers: Vec::new(),
+                table_cache: HashMap::new(),
             });
         }
         Ok(ExecResult::empty_command("BEGIN"))

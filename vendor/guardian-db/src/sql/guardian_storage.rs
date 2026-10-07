@@ -133,9 +133,13 @@ impl GuardianRelationalStorage {
     }
 
     fn unwrap_doc(bytes: &[u8]) -> RelResult<Option<Json>> {
-        let wrapped: Json =
+        let mut wrapped: Json =
             serde_json::from_slice(bytes).map_err(|e| RelError::Storage(e.to_string()))?;
-        Ok(wrapped.get("doc").cloned())
+        // `remove`, not `get(...).cloned()`: the row payload is the bulk of the
+        // document, and every scan of a large table deep-cloned it once per
+        // row before returning it. Same semantics — `None` when the key is
+        // absent, `Some(Null)` when it is JSON null.
+        Ok(wrapped.as_object_mut().and_then(|m| m.remove("doc")))
     }
 
     /// One wrapped row document by its full key, through the store's ASYNC
