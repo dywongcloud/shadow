@@ -11797,6 +11797,25 @@ async fn apikeys_list(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // `apikeys` is NODE-LOCAL state (an in-process `RwLock<Vec<ApiKey>>`), and
+    // `admin_ingress` forwards MUTATIONS to the control-plane leader while
+    // serving GETs locally — so creating a key from the dashboard stored it on
+    // the leader and then read it back from whichever node round-robin DNS
+    // picked, which had never seen it: "generating an API key doesn't work"
+    // (reproduced: POST then GET on a follower returned 5 keys, the new one
+    // absent; on the leader, 6 and present).
+    //
+    // Same shape as `project_settings_get`: a non-leader reads the leader's
+    // authoritative copy, falling back to local only when the leader is
+    // unreachable, because a read local state can answer must never fail. The
+    // leader serves local (no self-loop).
+    if !c.is_control_plane_leader() {
+        if let Some(leader) = c.leader_forward_target() {
+            if let Some(v) = fetch_from_host(&c, &leader, "/v1/apikeys", &t).await {
+                return Json(v);
+            }
+        }
+    }
     Json(json!(c
         .apikeys
         .list(&t)
