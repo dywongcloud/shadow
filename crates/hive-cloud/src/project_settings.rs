@@ -1994,7 +1994,7 @@ fn upsert_env(row: &mut ProjectSettings, mut value: EnvVar) {
     // credentials through encrypted/masked storage by key, not token shape.
     let game_secret = matches!(
         value.key.trim().to_ascii_uppercase().as_str(),
-        "STEAM_USER" | "STEAM_PASSWORD" | "STEAM_BRANCH_PASSWORD" | "SERVER_PASS"
+        "PASSWORD" | "STEAM_LOGIN" | "BETA_ACCESSCODE" | "DISCORD_WEBHOOK_URL" | "STEAM_USER" | "STEAM_PASSWORD" | "STEAM_BRANCH_PASSWORD" | "SERVER_PASS"
             | "SERVER_PASSWORD" | "ADMIN_PASSWORD" | "RCON_PASSWORD" | "SUPERVISOR_HTTP_PASS"
     );
     if !value.sensitive && (game_secret || looks_like_secret(&value.value)) {

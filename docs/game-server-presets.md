@@ -1,9 +1,9 @@
 # Game server presets
 
 These are catalog/configuration presets, not a claim of playable, capacity-approved
-or paid deployments. Minecraft remains unchanged. Terraria and Factorio are the
-existing DevHub definitions, reused verbatim in Shadow. New presets are Palworld,
-Valheim and Arma 3. No upstream source code, game binaries or passwords are copied.
+or paid deployments. The Games menu unifies Minecraft, Terraria, Factorio, Palworld,
+Valheim, Arma 3 and ARK: Survival Evolved. Existing image, port, memory and
+environment defaults are preserved; Minecraft now explicitly names /data. No upstream source code, game binaries or passwords are copied.
 
 ## Audited upstream revisions (2026-10-08)
 
@@ -27,6 +27,72 @@ our source of truth; image tags below remain mutable and are NOT digest pins.
   README and image build definitions. MIT; game-server distribution remains
   subject to Wube's game terms, not the wrapper's MIT license.
 
+- Minecraft: [itzg / docker-minecraft-server](https://github.com/itzg/docker-minecraft-server/tree/70b3f73ebc6110aea1bfb6c918e0afc2c55055e7).
+  Dockerfile, scripts/start*, docs/versions/minecraft.md,
+  docs/types-and-platforms (Vanilla/Paper), docs/configuration/server-properties.md,
+  LICENSE (Apache-2.0). TYPE/VERSION/LEVEL/MAX_PLAYERS/MODE/DIFFICULTY are upstream controls.
+- ARK: [Hermsi1337 / docker-ark-server](https://github.com/Hermsi1337/docker-ark-server/tree/984d901311a0ec842203ef0d6c7a0905a3604b02).
+  README.md, Dockerfile, bin/docker-entrypoint.sh, bin/steam-entrypoint.sh,
+  conf.d/arkmanager-user.cfg, conf.d/arkmanager-sub.cfg.template and LICENSE.
+  MIT, copyright 2018 Dennis Hermsmeier. Only image references/derived metadata,
+  not upstream scripts. **Survival Evolved, not Survival Ascended.**
+
+## Audited configure controls and profiles
+
+The same metadata drives Games navigation, labeled forms, validation, summary and
+image payload in both repositories. Profiles are small supported env overlays,
+not claims of game edition compatibility or preinstalled mods.
+
+| Game | Supported controls / profiles | Version semantics |
+| --- | --- | --- |
+| Minecraft Java | Vanilla/Paper survival; EULA, world, players, mode, difficulty | VERSION runtime LATEST/vanilla SNAPSHOT/exact release syntax; OCI latest or user tag/digest |
+| Terraria vanilla | Existing medium/default, new small/large; world, seed, difficulty, players, optional password | terraria-latest OCI channel controls binary; no fake runtime selector |
+| Factorio | Load existing or generate save; SAVE_NAME, GENERATE_NEW_SAVE, LOAD_LATEST_SAVE | stable/latest OCI channels; exact custom OCI tag/digest syntax only |
+| Palworld | Private direct connect; name, players, join password | latest OCI; Steam runtime independent |
+| Valheim | Private Steam/crossplay; name, world, password, listing | latest OCI; downloaded runtime independent |
+| Arma 3 | Prepared config volume; profile/startup world, headless count, local Launcher HTML mod preset, dedicated Steam login | v2 OCI; refreshed Steam depots independent |
+| ARK ASE | Private TheIsland or custom map/mods; session/map/players, join/admin passwords, numeric Workshop IDs, update/validation/backup switches | latest OCI; ASE runtime download/update independent |
+
+Field ranges are conservative **form bounds**, not certified upstream capacity.
+Custom image tags/digests are limited to each audited repository and syntax
+validated. They are not fabricated supported releases or verified registry
+availability. Real releases/mods/maps must be checked by the operator; TheIsland
+is the only seeded ARK map. No Ascended image/variant is offered.
+
+Factorio player limits/passwords/mod portal authentication belong to prepared
+server-settings.json, not invented env controls. Arma mission/player/game/admin
+settings belong to prepared configs; MODS_PRESET is a Launcher HTML preset path,
+not fabricated Workshop ID support. Terraria remains vanilla, no tModLoader.
+Advanced env editing remains available for existing non-transport settings and
+additional upstream keys; public ports/admin exposure are fixed to safe metadata.
+Port changes require a separate audited custom-image flow; game-specific
+port/env coupling cannot drift through these screens.
+
+Configure → review → create is explicit, with back navigation and readiness
+checkboxes for image/platform/resources/volume/backup/backend policy; multiport
+profiles additionally require verified direct serving-node ingress. The entire
+summary hides env VALUES, even under unrecognized keys, to prevent cross-key
+credential leaks. Secrets are masked in inputs; errors name fields only, never
+reflect submitted credentials or raw backend error strings. No config export.
+
+**Local runtime limitation:** the running native backend has not received the
+last secret-policy changes. Do not submit real credentials there. Publication
+of this UI/backend source does not upgrade running binaries. The form warns
+and requires operator confirmation; this task never logs in to Steam, pulls
+images/game binaries or restarts mesh/DB/backend services.
+
+## ARK-specific operations
+
+ASE exposes 7777/UDP (game), 7778/UDP (game+1), 27015/UDP (query), persists /app.
+Upstream enables internal 27020/TCP RCON; it is deliberately NOT in public ports.
+ADMIN_PASSWORD and SERVER_PASSWORD default empty, overriding unsafe sample defaults.
+The image is linux/amd64 only; first start is a very large server download. 8g
+is only a requested memory budget, not an upstream minimum or verified capacity.
+Keep WSL volumes on Linux filesystem, not Windows-mounted storage. Backup/update
+switches follow Dockerfile/entrypoint support; VALIDATE_ON_START only matters
+with UPDATE_ON_START=true. UPDATE_CRON/RESTART_CRON are explicitly unsupported
+upstream and not offered. No arbitrary map/version list or default credential.
+
 ## Transport and persistence
 
 All use the prebuilt-image /v1/deploy/image engine, not Git builds or HTTP ingress.
@@ -34,7 +100,7 @@ A nonempty ports list REPLACES defaults, so the primary port is included alongsi
 all seeded extra ports. Container ports below are not promises of public ports.
 **Existing engine limitation:** fluid-core documents that mesh_raw only forwards
 the PRIMARY port (spec_idx != 0 is unsupported). Secondary raw ports receive
-allocations but are not cross-node forwardable. Valheim and Arma therefore need
+allocations but are not cross-node forwardable. Valheim, Arma and ARK therefore need
 verified serving-node raw ingress for all secondary ports; a mesh-only deployment
 is NOT a ready-to-play multiport server. This preset task does not change routing.
 
@@ -46,6 +112,7 @@ is NOT a ready-to-play multiport server. This preset task does not change routin
 | Palworld | thijsvanloef/palworld-server-docker:latest | 8211/UDP | /palworld |
 | Valheim | ghcr.io/community-valheim-tools/valheim-server:latest | 2456–2458/UDP | /config |
 | Arma 3 | ghcr.io/brettmayson/arma3server/arma3server:v2 | 2302–2306/UDP | /arma3/server |
+| ARK: Survival Evolved | hermsi/ark-server:latest | 7777,7778,27015/UDP; no public RCON | /app |
 
 Palworld upstream publishes amd64/arm64 images; Valheim's build and Arma's Compose
 specify linux/amd64. Terraria/Factorio retain existing image architecture behavior;
@@ -104,9 +171,10 @@ request/fanout/settings/mount plumbing needed to honor non-/data game paths.
 
 Run from ui: node scripts/check-game-presets.mjs (Node 24's TypeScript stripping).
 This is an offline catalog/schema regression validator, not a mock game server.
-It checks five presets, uniqueness, transport, persistence, seeded multiports,
-required-env boundary cases, empty secret defaults, masking/server-key policy and
-an unchanged metadata fingerprint for Minecraft and all non-game starters.
+It checks all seven identities, transport/persistence, multiports, typed fields,
+profiles, OCI/runtime version validation, missing/short credentials, masked
+summary values, backend policy and accessibility/navigation source guards.
+These source guards are NOT DOM/browser interaction proof.
 
 Also run the repository frontend type/build checks and applicable Rust compilation
 before deployment. Browser interaction and game-runtime verification are separate
