@@ -1831,6 +1831,16 @@ impl LiteboxBackend {
                   || iptables -t nat -I PREROUTING 1 -s 10.88.0.0/16 -d "$HAIRPIN_IP" -p tcp -m multiport --dports 80,443 -j REDIRECT
               fi
               iptables -C FORWARD -s 10.88.0.0/16 -d 10.88.0.0/16 -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 10.88.0.0/16 -d 10.88.0.0/16 -j DROP
+              # INTERNET-ONLY EGRESS. A bare `-s 10.88/16 ACCEPT` would forward
+              # guest packets to everything the host can route: this node's own
+              # admin listener (:8786), the rest of the VPC, and the cloud
+              # metadata endpoint 169.254.169.254 — whose response hands
+              # untrusted tenant code the node's own credentials. Guests get
+              # the internet and nothing else. These are appended BEFORE the
+              # ACCEPTs below, so they win.
+              for DST in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+                iptables -C FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP
+              done
               iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -j MASQUERADE
               iptables -C FORWARD -s 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -j ACCEPT
               iptables -C FORWARD -d 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.88.0.0/16 -j ACCEPT
@@ -1847,6 +1857,11 @@ impl LiteboxBackend {
               nft 'add chain ip hive_nat_litebox fwd { type filter hook forward priority 0 ; }' 2>/dev/null
               nft flush chain ip hive_nat_litebox fwd 2>/dev/null
               nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 ip daddr 10.88.0.0/16 drop 2>/dev/null
+              # INTERNET-ONLY EGRESS (same reasoning as the iptables branch):
+              # without these, the accept below forwards guest traffic to this
+              # node's admin listener, the VPC, and 169.254.169.254, whose reply
+              # gives untrusted tenant code the node's cloud credentials.
+              nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 ip daddr '{ 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }' drop 2>/dev/null
               nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 accept 2>/dev/null
               nft add rule ip hive_nat_litebox fwd ip daddr 10.88.0.0/16 accept 2>/dev/null
             fi"#;

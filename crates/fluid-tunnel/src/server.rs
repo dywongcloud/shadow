@@ -644,6 +644,10 @@ fn is_loopback_authority(authority: &str) -> bool {
         None => authority,
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    // A trailing dot is the fully-qualified spelling of the same host; every
+    // resolver treats `localhost.` as `localhost`. Without this the rewrite
+    // silently skips the FQDN form and the app keeps building localhost URLs.
+    let host = host.trim_end_matches('.');
     host == "localhost"
         || host == "::1"
         || host == "0.0.0.0"
