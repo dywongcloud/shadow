@@ -1771,8 +1771,101 @@ impl LiteboxBackend {
     /// the same "the guard belongs to the waiter" rule the guest tar follows.
     /// `None` on any setup failure (no `ip`, no CAP_NET_ADMIN, no
     /// `/dev/net/tun`), never a panic.
+    /// Idempotently enable IP forwarding + NAT so litebox guests (10.88/16) can
+    /// reach the internet.
+    ///
+    /// A litebox cell is a point-to-point TUN with no forwarding by design, so
+    /// without this a guest can talk to the host end of its link and nothing
+    /// else: outbound HTTPS from a tenant app — a hosted database, an external
+    /// API — never completes. Combined with the `resolv.conf` planted in the
+    /// guest tar, this is what makes `getaddrinfo` and `connect` work at all.
+    ///
+    /// Modelled on `FirecrackerBackend::ensure_host_nat`, including the two
+    /// properties that matter:
+    ///
+    /// TENANT ISOLATION: the cell↔cell DROP is installed BEFORE the ACCEPTs.
+    /// The host routes every per-cell /30, so a bare `-s 10.88/16 ACCEPT` would
+    /// also forward guest→guest and let one tenant reach another's guest.
+    /// Return traffic from the internet is unaffected (its source is external,
+    /// so the 10.88→10.88 pair never matches).
+    ///
+    /// HAIRPIN: a guest that calls its OWN deployment's public hostname
+    /// resolves the node's public IP, which sits on the cloud provider's 1:1
+    /// NAT and on no host interface — the packet would be masqueraded out and
+    /// dropped. Redirecting 80/443 to that address back into the host fixes it;
+    /// because REDIRECT lands on INPUT, the cell↔cell FORWARD drop is
+    /// untouched.
+    ///
+    /// Uses its own `hive_nat_litebox` table rather than sharing `hive_nat`,
+    /// which is keyed to the firecracker 172.16/16 range. `scripts/hive-
+    /// lockdown.sh` deletes only its own named tables and the generator
+    /// rewrites only the PEERS lines, so this table survives a lockdown
+    /// regeneration. Failures are non-fatal: cells simply get no egress.
+    #[cfg(target_os = "linux")]
+    async fn ensure_guest_nat() {
+        use std::sync::atomic::Ordering;
+        static NAT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if NAT_READY.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let hairpin = match std::env::var("HIVE_PUBLIC_IP")
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
+            // `auto` is a configured value meaning "detect at runtime", not an
+            // address; an unset/unparseable value means this host has no
+            // inbound-reachable address to hairpin to.
+            Some(ip) if ip.parse::<std::net::Ipv4Addr>().is_ok() => ip,
+            _ => String::new(),
+        };
+        // `HAIRPIN_IP` travels as an env var rather than being interpolated:
+        // the nft branch is full of `{ ... }` chain bodies, so a `format!`
+        // would need every brace escaped, and an env var leaves no
+        // shell-injection surface for a configured value.
+        let script = r#"
+            export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+            if command -v iptables >/dev/null 2>&1; then
+              if [ -n "$HAIRPIN_IP" ]; then
+                iptables -t nat -C PREROUTING -s 10.88.0.0/16 -d "$HAIRPIN_IP" -p tcp -m multiport --dports 80,443 -j REDIRECT 2>/dev/null \
+                  || iptables -t nat -I PREROUTING 1 -s 10.88.0.0/16 -d "$HAIRPIN_IP" -p tcp -m multiport --dports 80,443 -j REDIRECT
+              fi
+              iptables -C FORWARD -s 10.88.0.0/16 -d 10.88.0.0/16 -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 10.88.0.0/16 -d 10.88.0.0/16 -j DROP
+              iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -j MASQUERADE
+              iptables -C FORWARD -s 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -j ACCEPT
+              iptables -C FORWARD -d 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.88.0.0/16 -j ACCEPT
+            elif command -v nft >/dev/null 2>&1; then
+              nft add table ip hive_nat_litebox 2>/dev/null
+              if [ -n "$HAIRPIN_IP" ]; then
+                nft 'add chain ip hive_nat_litebox pre { type nat hook prerouting priority -100 ; }' 2>/dev/null
+                nft flush chain ip hive_nat_litebox pre 2>/dev/null
+                nft add rule ip hive_nat_litebox pre ip saddr 10.88.0.0/16 ip daddr "$HAIRPIN_IP" tcp dport '{80, 443}' redirect 2>/dev/null
+              fi
+              nft 'add chain ip hive_nat_litebox post { type nat hook postrouting priority 100 ; }' 2>/dev/null
+              nft flush chain ip hive_nat_litebox post 2>/dev/null
+              nft add rule ip hive_nat_litebox post ip saddr 10.88.0.0/16 masquerade 2>/dev/null
+              nft 'add chain ip hive_nat_litebox fwd { type filter hook forward priority 0 ; }' 2>/dev/null
+              nft flush chain ip hive_nat_litebox fwd 2>/dev/null
+              nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 ip daddr 10.88.0.0/16 drop 2>/dev/null
+              nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 accept 2>/dev/null
+              nft add rule ip hive_nat_litebox fwd ip daddr 10.88.0.0/16 accept 2>/dev/null
+            fi"#;
+        let _ = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("HAIRPIN_IP", &hairpin)
+            .kill_on_drop(true)
+            .output()
+            .await;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn ensure_guest_nat() {}
+
     async fn allocate_link(&self) -> Option<(LiteboxNet, LiteboxLinkRollback)> {
         use std::sync::atomic::Ordering;
+        // Egress once per process, before the first guest could try to use it.
+        Self::ensure_guest_nat().await;
         let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % 16384;
         let third = ((i >> 6) & 0xff) as u8;
         let base = ((i & 0x3f) as u8) * 4;
@@ -3998,6 +4091,27 @@ fn append_litebox_runtime_augmentation_blocking(
     for (path, bytes) in extra_entries {
         append_platform_tar_entry(&mut builder, path, bytes)?;
     }
+    // Guest DNS. The guest tar ships no resolv.conf at all, so glibc has
+    // nothing to resolve against and every outbound call a tenant app makes —
+    // a Turso/libSQL database, any external API — fails at `getaddrinfo
+    // EAI_AGAIN` before it ever opens a socket. Two public resolvers, ordered:
+    // the guest has no resolver of its own and the host does not run one on
+    // the 10.88/16 link, and these are reachable the moment `ensure_guest_nat`
+    // has installed the masquerade.
+    //
+    // `nsswitch.conf` is spelled out rather than left to glibc's built-in
+    // default so the lookup order is explicit and identical on every base
+    // image: `files` first (so /etc/hosts still wins), then `dns`.
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/resolv.conf"),
+        b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n",
+    )?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/nsswitch.conf"),
+        b"hosts: files dns\n",
+    )?;
     append_platform_tar_entry(
         &mut builder,
         Path::new(GUEST_BIND_SHIM_PATH.trim_start_matches('/')),
