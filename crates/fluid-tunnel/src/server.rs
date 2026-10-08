@@ -409,6 +409,23 @@ async fn proxy_local(
     // self-close right after a write: `conn`'s own `Drop` closes this end
     // once we've read a complete, correctly-framed response, which is an
     // ordinary client-initiated close the guest was never mid-write for.
+    // The `host` the app sees is what it builds absolute URLs from — Next.js and
+    // Clerk both do (an auth redirect's `redirect_url` among them). Cells are
+    // published on 127.0.0.1:<ephemeral>, so a caller that forwards the cell's
+    // own bind address makes the app hand the browser a URL that exists only on
+    // this machine. Prefer the public origin the edge already computed whenever
+    // the supplied host is loopback.
+    //
+    // Non-loopback hosts are left strictly alone: an origin that routes ON its
+    // Host (an ngrok tunnel) 421s "Misdirected Request" the moment it is
+    // overridden — live-reproduced in hive-cloud's `dashboard_proxy`.
+    let fwd_host = meta
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-host"))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
     let mut req = format!("{} {} HTTP/1.1\r\n", meta.method, meta.path);
     let mut has_host = false;
     for (k, v) in &meta.headers {
@@ -418,11 +435,21 @@ async fn proxy_local(
         }
         if kl == "host" {
             has_host = true;
+            match fwd_host.as_deref() {
+                Some(public) if is_loopback_authority(v.trim()) => {
+                    req.push_str(&format!("host: {public}\r\n"));
+                    continue;
+                }
+                _ => {}
+            }
         }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     if !has_host {
-        req.push_str("host: fluid.internal\r\n");
+        match fwd_host.as_deref() {
+            Some(public) => req.push_str(&format!("host: {public}\r\n")),
+            None => req.push_str("host: fluid.internal\r\n"),
+        }
     }
     req.push_str(&format!("content-length: {}\r\n", body.len()));
     req.push_str("connection: keep-alive\r\n\r\n");
@@ -598,6 +625,28 @@ fn is_hop_by_hop(h: &str) -> bool {
         h,
         "connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" | "trailers"
     )
+}
+
+/// Is `authority` the cell's own loopback bind address (host or host:port)?
+/// Anything else — a hostname, a tunnel origin — routes on its Host and must
+/// be forwarded untouched.
+fn is_loopback_authority(authority: &str) -> bool {
+    let authority = authority.trim();
+    let host = match authority.rfind(':') {
+        // Ignore an IPv6 literal's own colons ([::1]:443); only a bracketed
+        // literal followed by :port has a real port suffix.
+        Some(i) if !authority.starts_with('[') => &authority[..i],
+        Some(_) if authority.ends_with(']') => authority,
+        Some(i) => &authority[..i],
+        None => authority,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
