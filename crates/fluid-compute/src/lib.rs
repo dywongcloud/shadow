@@ -1085,19 +1085,43 @@ impl Fluid {
             "Fluid shutdown began before function-pool registration committed"
         );
         for (key, pool) in &mut pools {
-            let orphans: Vec<Instance> = reg
-                .get_mut(key)
-                .map(|old| {
+            // Draining is only correct when the deployment actually CHANGED.
+            // `register_many` is also how a node re-announces pools it already
+            // has (reconcile / re-registration paths), and draining there threw
+            // away warm cells, forcing every in-flight request onto a fresh cold
+            // start. Measured on fc-sanjose 2026-10-08: 41 cold starts in 20
+            // minutes, each paying the litebox tar extraction (tar_ms up to
+            // 24 s) plus ~2 s of spawn readiness. An identical spec means the
+            // same deployment — carry the instances over untouched.
+            let (orphans, kept_warm) = match reg.get_mut(key) {
+                Some(old)
+                    if old.cfg == pool.cfg
+                        && old.image == pool.image
+                        && old.workdir == pool.workdir
+                        && old.tenant == pool.tenant =>
+                {
+                    let n = old.instances.len();
+                    (old.instances.drain(..).collect::<Vec<_>>(), n)
+                }
+                Some(old) => (
                     old.instances
                         .drain(..)
                         .map(|mut instance| {
                             instance.draining = true;
                             instance
                         })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !orphans.is_empty() {
+                        .collect::<Vec<_>>(),
+                    0,
+                ),
+                None => (Vec::new(), 0),
+            };
+            if kept_warm > 0 {
+                tracing::debug!(
+                    func = %key,
+                    count = kept_warm,
+                    "identical pool re-registered — keeping warm instances"
+                );
+            } else if !orphans.is_empty() {
                 warn!(
                     func = %key,
                     count = orphans.len(),

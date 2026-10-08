@@ -346,7 +346,7 @@ pub struct DedicatedIpv4 {
 
 /// A serverless function within a deployment. The server process must listen on
 /// `$PORT` and speak HTTP/1.1.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FunctionConfig {
     pub name: String,
     /// Informational: "node", "python", "go", "command", ...
@@ -658,7 +658,7 @@ impl BrowserExecMode {
 
 /// The browser-execution opt-in entry from fluid.json `functions[].browser`.
 /// Its PRESENCE is the opt-in; every field has a platform default.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BrowserPolicy {
     /// Entry file, relative to the deployment root — a single self-contained
     /// `.js`/`.mjs`/`.cjs` file assigning its handler to `module.exports`
