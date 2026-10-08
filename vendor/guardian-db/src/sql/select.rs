@@ -283,7 +283,7 @@ impl Exec {
     /// disables the fast path rather than being approximated.
     fn try_count_star(&self, select: &Select, order_by: Option<&OrderBy>) -> Result<Option<RowSet>> {
         use sqlparser::ast::{
-            Expr, FunctionArg, FunctionArgExpr, GroupByExpr, SelectItem, SetExpr, TableFactor,
+            Expr, GroupByExpr, SelectItem, TableFactor,
         };
         if order_by.is_some()
             || select.selection.is_some()

@@ -28,6 +28,7 @@ use crate::relational::{RelError, RelationalStorage};
 use crate::sql::engine::Database;
 use crate::traits::{AsyncDocumentFilter, Document, DocumentStore};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{Map, Value as Json};
 use std::error::Error;
 use std::future::Future;
@@ -39,6 +40,11 @@ use std::sync::Arc;
 const SEP: char = '\u{1f}';
 /// Reserved collection used to persist the serialized catalog.
 const CATALOG_COLLECTION: &str = "__gdb_sql_catalog";
+/// How many lazily-fetched row blobs a single `scan` may have in flight at
+/// once. Bounded deliberately: a large table's misses are one blob read each,
+/// so this converts a serialized sum of fetch latencies into a bounded number
+/// of batches without opening 21k concurrent store reads.
+const SCAN_FETCH_CONCURRENCY: usize = 64;
 
 /// Consistency mode for the GuardianDB-backed SQL layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -180,34 +186,73 @@ impl RelationalStorage for GuardianRelationalStorage {
         // runs distinguishes them.
         let walk_started = std::time::Instant::now();
         tracing::info!(collection = %collection, keys = total_keys, "sql: scan start");
-        let mut out = Vec::new();
+        // Two phases, because the per-row miss path is an async blob fetch
+        // (`cat_bytes`) and awaiting it once per row serialized ~21.5k round
+        // trips at 2.5 ms each, which is the whole 10 s exec budget on its own.
+        // Phase 1 resolves every already-cached row synchronously (free) and
+        // records the misses with the output slot they belong to; phase 2
+        // fetches those concurrently under a fixed bound, so wall-clock becomes
+        // the slowest fetch per batch instead of the sum of all of them. Slots
+        // keep the row order identical to the key walk, so a scan with no
+        // ORDER BY stays byte-for-byte as deterministic as it was.
+        let mut out: Vec<Option<(String, Json)>> = Vec::new();
+        let mut misses: Vec<(usize, String, String)> = Vec::new();
         let mut seen = 0usize;
+        let mut hit_rows = 0u64;
+        let mut miss_rows = 0u64;
+        let mut miss_ms = 0u64;
         for key in keys {
             let Some(row_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
             seen += 1;
+            let slot = out.len();
+            out.push(None);
+            match index.get_bytes(&key).map_err(map_err)? {
+                Some(bytes) => {
+                    hit_rows += 1;
+                    out[slot] = Self::unwrap_doc(&bytes)?.map(|doc| (row_id.to_string(), doc));
+                }
+                None => {
+                    miss_rows += 1;
+                    misses.push((slot, row_id.to_string(), key));
+                }
+            }
             if seen % 5000 == 0 {
                 tracing::info!(
                     collection = %collection,
                     matched = seen,
+                    hit_rows,
+                    miss_rows,
                     elapsed_ms = walk_started.elapsed().as_millis() as u64,
                     "sql: scan progress"
                 );
             }
-            // Cached value first (free); otherwise the lazy async fetch —
-            // never skip a row the index knows only by hash.
-            let doc = match index.get_bytes(&key).map_err(map_err)? {
-                Some(bytes) => Self::unwrap_doc(&bytes)?,
-                None => self.fetch_wrapped(&key).await?,
-            };
-            if let Some(doc) = doc {
-                out.push((row_id.to_string(), doc));
-            }
         }
+        if !misses.is_empty() {
+            let fetch_started = std::time::Instant::now();
+            let fetched: Vec<(usize, String, RelResult<Option<Json>>)> =
+                futures::stream::iter(misses.into_iter().map(|(slot, row_id, key)| async move {
+                    (slot, row_id, self.fetch_wrapped(&key).await)
+                }))
+                .buffer_unordered(SCAN_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+            for (slot, row_id, doc) in fetched {
+                if let Some(doc) = doc? {
+                    out[slot] = Some((row_id, doc));
+                }
+            }
+            miss_ms = fetch_started.elapsed().as_millis() as u64;
+        }
+        let out: Vec<(String, Json)> = out.into_iter().flatten().collect();
         tracing::info!(
             collection = %collection,
             rows = out.len(),
+            keys = total_keys,
+            hit_rows,
+            miss_rows,
+            miss_ms,
             elapsed_ms = walk_started.elapsed().as_millis() as u64,
             "sql: scan done"
         );
