@@ -26,6 +26,16 @@ pub trait RelationalStorage: Send + Sync {
     /// Return every live `(row_id, document)` pair in a collection.
     async fn scan(&self, collection: &str) -> Result<Vec<(String, Json)>>;
 
+    /// Return every live row id in a collection, WITHOUT reading or decoding
+    /// any row's value. Exists because a whole table's row ids are a pure
+    /// function of the key set, while its values are not: `COUNT(*)` needs no
+    /// value, and paying a blob fetch plus a JSON parse per row to then throw
+    /// the values away was the single largest cost in the engine (36k rows on
+    /// the ledger exceeded the whole 10 s statement budget). Only row ids are
+    /// returned, so this is exact for any aggregate over row ids and useless
+    /// for anything that reads a column.
+    async fn row_ids(&self, collection: &str) -> Result<Vec<String>>;
+
     /// Fetch a single row document by id.
     async fn get(&self, collection: &str, row_id: &str) -> Result<Option<Json>>;
 
@@ -77,6 +87,16 @@ impl RelationalStorage for MemoryStorage {
             .unwrap()
             .get(collection)
             .map(|c| c.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default())
+    }
+
+    async fn row_ids(&self, collection: &str) -> Result<Vec<String>> {
+        Ok(self
+            .collections
+            .read()
+            .unwrap()
+            .get(collection)
+            .map(|c| c.keys().cloned().collect())
             .unwrap_or_default())
     }
 

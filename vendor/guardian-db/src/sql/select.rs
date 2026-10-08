@@ -1,9 +1,10 @@
 //! The SELECT execution pipeline (synchronous, over pre-loaded tables).
 
-use crate::relational::{SqlType, SqlValue};
+use crate::relational::{QualifiedName, SqlType, SqlValue};
 use crate::sql::error::{Result, SqlError};
 use crate::sql::exec::{Exec, Frame};
 use crate::sql::funcs;
+use crate::sql::Catalog;
 use crate::sql::names::{ident_name, object_name_parts, split_schema_table};
 use crate::sql::row::{FieldRef, RowSchema, RowSet, Tuple};
 use sqlparser::ast::{
@@ -267,6 +268,57 @@ impl Exec {
 
     // ---- core single-block SELECT --------------------------------------
 
+    /// Does `select` have exactly the shape `SELECT COUNT(*) FROM t` — the one
+    /// shape whose answer depends on row ids alone and on no column value?
+    ///
+    /// Shared by the executor (to take the fast path) and by the loader (to
+    /// load the table ids-only, before any value is read). Both must agree on
+    /// what qualifies, so the predicate lives here once rather than in two
+    /// places that could drift.
+    pub(crate) fn count_star_target(
+        select: &Select,
+        catalog: &Catalog,
+        order_by: Option<&OrderBy>,
+    ) -> Option<QualifiedName> {
+        use sqlparser::ast::{Expr, GroupByExpr, SelectItem, TableFactor};
+        if order_by.is_some()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || select.into.is_some()
+            || select.top.is_some()
+        {
+            return None;
+        }
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) if exprs.is_empty() => {}
+            _ => return None,
+        }
+        if select.from.len() != 1 {
+            return None;
+        }
+        let TableFactor::Table { name, args: None, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let (schema, tname) = split_schema_table(name);
+        let q = catalog.resolve_table_name(schema.as_deref(), &tname)?;
+        if select.projection.len() != 1 {
+            return None;
+        }
+        let SelectItem::UnnamedExpr(Expr::Function(call)) = &select.projection[0] else {
+            return None;
+        };
+        let fname = object_name_parts(&call.name);
+        if call.filter.is_some() || call.over.is_some() || !fname.iter().any(|p| p.eq_ignore_ascii_case("count")) {
+            return None;
+        }
+        let (is_star, arg, distinct) = aggregate_arg(call).ok()?;
+        if distinct || !is_star || arg.is_some() {
+            return None;
+        }
+        Some(q)
+    }
+
     /// COUNT(*) over a single base table with no WHERE / GROUP BY / HAVING /
     /// DISTINCT / ORDER BY / LIMIT — counted from the loaded table instead of
     /// materializing a Tuple per row.
@@ -282,48 +334,11 @@ impl Exec {
     /// name and type are identical. Any clause that could change the result
     /// disables the fast path rather than being approximated.
     fn try_count_star(&self, select: &Select, order_by: Option<&OrderBy>) -> Result<Option<RowSet>> {
-        use sqlparser::ast::{
-            Expr, GroupByExpr, SelectItem, TableFactor,
-        };
-        if order_by.is_some()
-            || select.selection.is_some()
-            || select.having.is_some()
-            || select.distinct.is_some()
-            || select.into.is_some()
-            || select.top.is_some()
-        {
-            return Ok(None);
-        }
-        match &select.group_by {
-            GroupByExpr::Expressions(exprs, _) if exprs.is_empty() => {}
-            _ => return Ok(None),
-        }
-        if select.from.len() != 1 {
-            return Ok(None);
-        }
-        let TableFactor::Table { name, args: None, .. } = &select.from[0].relation else {
+        // Same predicate the loader uses to decide whether this table can be
+        // loaded ids-only — one definition, so the two can never disagree.
+        let Some(q) = Self::count_star_target(select, &self.catalog, order_by) else {
             return Ok(None);
         };
-        let (schema, tname) = split_schema_table(name);
-        let Some(q) = self.catalog.resolve_table_name(schema.as_deref(), &tname) else {
-            return Ok(None);
-        };
-        // Only the provably-safe shape: exactly one projected item, COUNT(*) with
-        // no FILTER / DISTINCT / per-row argument.
-        if select.projection.len() != 1 {
-            return Ok(None);
-        }
-        let SelectItem::UnnamedExpr(Expr::Function(call)) = &select.projection[0] else {
-            return Ok(None);
-        };
-        let fname = object_name_parts(&call.name);
-        if call.filter.is_some() || call.over.is_some() || !fname.iter().any(|p| p.eq_ignore_ascii_case("count")) {
-            return Ok(None);
-        }
-        let (is_star, arg, distinct) = aggregate_arg(call)?;
-        if distinct || !is_star || arg.is_some() {
-            return Ok(None);
-        }
         let Some(loaded) = self.tables.get(&q) else {
             return Ok(None);
         };
@@ -339,7 +354,7 @@ impl Exec {
             .filter(|rid| filter.map(|f| f.contains(*rid)).unwrap_or(true))
             .filter(|rid| hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
             .count() as i64;
-        let alias = tname.clone();
+        let alias = q.name.clone();
         let input_fields: Vec<FieldRef> = loaded
             .meta
             .columns

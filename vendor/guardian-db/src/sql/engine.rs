@@ -647,12 +647,36 @@ impl<S: RelationalStorage> Session<S> {
             Some(t) => std::mem::take(&mut t.table_cache),
             None => HashMap::new(),
         };
+        // `COUNT(*)` needs no column value, so its table is loaded from the key
+        // set alone — no blob fetch, no JSON parse, no per-row `RowValues`.
+        // Restricted to autocommit: inside an explicit transaction the loaded
+        // table is cached for later statements, which may read columns, and an
+        // ids-only table would answer NULL for every one of them.
+        let count_target = match (&self.txn, stmt) {
+            (None, Statement::Query(query)) => match &*query.body {
+                sqlparser::ast::SetExpr::Select(select) => {
+                    crate::sql::exec::Exec::count_star_target(
+                        select,
+                        &catalog,
+                        query.order_by.as_ref(),
+                    )
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         for (schema, name) in &names {
             if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
                 && !tables.contains_key(&q)
-                && let Some(loaded) = self.load_table(&catalog, &q).await?
             {
-                tables.insert(q, loaded);
+                let loaded = if count_target.as_ref() == Some(&q) {
+                    self.load_table_ids(&catalog, &q).await?
+                } else {
+                    self.load_table(&catalog, &q).await?
+                };
+                if let Some(loaded) = loaded {
+                    tables.insert(q, loaded);
+                }
             }
         }
 
@@ -1407,6 +1431,38 @@ impl<S: RelationalStorage> Session<S> {
             );
         }
         Ok(Some(loaded))
+    }
+
+    /// Load `q` as row ids only — the `COUNT(*)` shape. See
+    /// `select::count_star_target` for the proof that no column is read, and
+    /// `LoadedTable::build_ids` for why the result must never be cached into a
+    /// transaction.
+    async fn load_table_ids(
+        &self,
+        catalog: &Catalog,
+        q: &QualifiedName,
+    ) -> Result<Option<LoadedTable>> {
+        let Some(table) = catalog.get_table(q) else {
+            return Ok(None);
+        };
+        let collection = table.storage_collection.clone();
+        let started = std::time::Instant::now();
+        let ids = self.db.storage.row_ids(&collection).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let index_defs = catalog
+            .indexes_for_table(&q.schema, &q.name)
+            .into_iter()
+            .cloned()
+            .collect();
+        if elapsed_ms >= 50 {
+            tracing::info!(
+                collection = %collection,
+                rows = ids.len(),
+                elapsed_ms,
+                "sql: load_table_ids"
+            );
+        }
+        Ok(Some(LoadedTable::build_ids(table.clone(), ids, index_defs)))
     }
 
     /// Load `q` reflecting explicitly-given `overlay`/`truncated` writes —

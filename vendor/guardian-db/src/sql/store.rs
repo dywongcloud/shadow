@@ -97,6 +97,30 @@ impl LoadedTable {
         Ok(table)
     }
 
+    /// Build a row-ids-only view: same shape as `build`, no document decoded.
+    ///
+    /// Correct ONLY for consumers that read no column — `COUNT(*)` and the
+    /// row-id-level RLS / `FOR UPDATE` filters, all of which key on the row id
+    /// alone. Every `RowValues` is empty and every version is 0, so any column
+    /// read through this table returns NULL instead of the stored value. That
+    /// is why the engine takes this path only for a statement it has proven is
+    /// a bare `COUNT(*)`, and only outside an explicit transaction (where a
+    /// later statement could legitimately read the cached table's columns).
+    pub fn build_ids(meta: Table, ids: Vec<String>, index_defs: Vec<Index>) -> Self {
+        LoadedTable {
+            meta,
+            rows: ids.into_iter().map(|id| (id, RowValues::new())).collect(),
+            versions: HashMap::new(),
+            indexes: index_defs
+                .into_iter()
+                .map(|m| LoadedIndex {
+                    data: SecondaryIndex::new(m.unique),
+                    meta: m,
+                })
+                .collect(),
+        }
+    }
+
     pub fn rebuild_indexes(&mut self) {
         for idx in &mut self.indexes {
             idx.data.clear();

@@ -259,6 +259,31 @@ impl RelationalStorage for GuardianRelationalStorage {
         Ok(out)
     }
 
+    /// Row ids only — a pure key walk, no value read and no JSON parse. See
+    /// the trait method: every row the index knows is a live row, and neither
+    /// `COUNT(*)` nor the row-id-based RLS / `FOR UPDATE` filters need a value.
+    async fn row_ids(&self, collection: &str) -> RelResult<Vec<String>> {
+        let prefix = format!("{collection}{SEP}");
+        let keys = self.store.index().keys().map_err(map_err)?;
+        let started = std::time::Instant::now();
+        let mut ids = Vec::new();
+        for key in keys {
+            if let Some(row_id) = key.strip_prefix(&prefix) {
+                ids.push(row_id.to_string());
+            }
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= 50 {
+            tracing::info!(
+                collection = %collection,
+                keys = ids.len(),
+                elapsed_ms,
+                "sql: row_ids"
+            );
+        }
+        Ok(ids)
+    }
+
     async fn get(&self, collection: &str, row_id: &str) -> RelResult<Option<Json>> {
         let gkey = Self::gkey(collection, row_id);
         match self.store.index().get_bytes(&gkey).map_err(map_err)? {
