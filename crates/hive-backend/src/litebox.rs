@@ -3034,6 +3034,16 @@ async fn runtime_source_sha256(
     hasher.update(GUEST_RESOLV_CONF);
     hasher.update((GUEST_NSSWITCH_CONF.len() as u64).to_le_bytes());
     hasher.update(GUEST_NSSWITCH_CONF);
+    // The CA bundle is guest CONTENT too: without it in the key, shipping
+    // roots wouldn't invalidate artifacts built before they were added.
+    if let Some(ca) = host_ca_bundle() {
+        for path in GUEST_CA_PATHS {
+            hasher.update((path.len() as u64).to_le_bytes());
+            hasher.update(path.as_bytes());
+        }
+        hasher.update((ca.len() as u64).to_le_bytes());
+        hasher.update(&ca);
+    }
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; 128 * 1024];
     for path in paths {
@@ -3947,6 +3957,40 @@ const GUEST_RESOLV_CONF: &[u8] =
 /// so /etc/hosts still wins, then `dns`.
 const GUEST_NSSWITCH_CONF: &[u8] = b"hosts: files dns\n";
 
+/// Where the guest expects CA roots. Both spellings are planted because distros
+/// disagree and Node/OpenSSL use the compiled-in path, not ours.
+const GUEST_CA_PATHS: [&str; 2] = [
+    "etc/ssl/certs/ca-certificates.crt",
+    "etc/pki/tls/certs/ca-bundle.crt",
+];
+
+/// The host's CA bundle, best-effort.
+///
+/// Without roots in the guest, Node cannot validate ANY server certificate:
+/// measured 2026-10-08 inside a live litebox guest, `https.get` to both
+/// `api.clerk.com` and the app's own Clerk Frontend API failed with
+/// `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. That is fatal for server-side auth
+/// (`auth()` -> Backend API) and for any HTTPS a tenant app makes, and it was
+/// hidden behind the DNS failure until `use-vc` cleared that.
+///
+/// `None` is not an error — the guest simply keeps whatever roots its base
+/// image has.
+fn host_ca_bundle() -> Option<Vec<u8>> {
+    for path in [
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/cert.pem",
+        "/etc/ssl/cert.pem",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn append_litebox_runtime_augmentation_blocking(
     mut archive: File,
@@ -4166,6 +4210,11 @@ fn append_litebox_runtime_augmentation_blocking(
         Path::new("etc/nsswitch.conf"),
         GUEST_NSSWITCH_CONF,
     )?;
+    if let Some(ca) = host_ca_bundle() {
+        for path in GUEST_CA_PATHS {
+            append_platform_tar_entry(&mut builder, Path::new(path), &ca)?;
+        }
+    }
     append_platform_tar_entry(
         &mut builder,
         Path::new(GUEST_BIND_SHIM_PATH.trim_start_matches('/')),
