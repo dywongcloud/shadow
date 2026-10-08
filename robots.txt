@@ -1,0 +1,145 @@
+# Shadw Cloud robots.txt
+#
+# Shadw is intentionally discoverable by search engines,
+# AI systems, developer agents, documentation crawlers,
+# and other compliant indexing systems.
+#
+# Semantic product and ecosystem information is provided
+# through /llms.txt and the public documentation.
+#
+# robots.txt controls crawler access only.
+
+User-agent: *
+Allow: /
+
+# ------------------------------------------------------------
+# Public Shadw product and documentation surfaces
+# ------------------------------------------------------------
+
+Allow: /docs/
+Allow: /developers/
+Allow: /developer/
+Allow: /guides/
+Allow: /reference/
+Allow: /api/
+Allow: /cli/
+Allow: /blog/
+Allow: /changelog/
+Allow: /pricing/
+Allow: /enterprise/
+Allow: /ops/
+Allow: /node/
+Allow: /nodes/
+Allow: /providers/
+Allow: /status/
+Allow: /llms.txt
+
+# ------------------------------------------------------------
+# Public product surfaces
+# ------------------------------------------------------------
+
+Allow: /projects/
+Allow: /regions/
+Allow: /workflows/
+Allow: /storage/
+Allow: /drive/
+Allow: /observability/
+Allow: /cdn/
+Allow: /integrations/
+Allow: /domains/
+Allow: /firewall/
+Allow: /constellation/
+
+# ------------------------------------------------------------
+# Authentication and account-private surfaces
+# ------------------------------------------------------------
+
+Disallow: /login
+Disallow: /logout
+Disallow: /signin
+Disallow: /signup
+Disallow: /register
+Disallow: /auth/
+Disallow: /oauth/
+Disallow: /session/
+
+# ------------------------------------------------------------
+# Private user and organization surfaces
+# ------------------------------------------------------------
+
+Disallow: /dashboard/private/
+Disallow: /account/
+Disallow: /settings/private/
+Disallow: /billing/private/
+Disallow: /usage/private/
+
+# ------------------------------------------------------------
+# Internal control-plane surfaces
+# ------------------------------------------------------------
+
+Disallow: /internal/
+Disallow: /admin/
+Disallow: /private/
+Disallow: /control/
+Disallow: /control-plane/
+Disallow: /internal-api/
+
+# ------------------------------------------------------------
+# Internal infrastructure systems
+# ------------------------------------------------------------
+
+Disallow: /scheduler/internal/
+Disallow: /orchestrator/internal/
+Disallow: /nodes/internal/
+Disallow: /providers/internal/
+Disallow: /workers/internal/
+Disallow: /constellation/internal/
+Disallow: /ops/internal/
+
+# ------------------------------------------------------------
+# Temporary/build/runtime paths
+# ------------------------------------------------------------
+
+Disallow: /tmp/
+Disallow: /cache/
+Disallow: /build/
+Disallow: /_internal/
+Disallow: /_next/
+
+# ------------------------------------------------------------
+# AI and search crawlers
+#
+# Public Shadw information is intended to be discoverable.
+# These rules do not grant special privileges beyond the
+# public crawl policy.
+# ------------------------------------------------------------
+
+User-agent: Googlebot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-SearchBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+# ------------------------------------------------------------
+# Sitemap
+# ------------------------------------------------------------
+
+Sitemap: https://shadw.cloud/sitemap.xml
