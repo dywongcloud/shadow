@@ -267,6 +267,104 @@ impl Exec {
 
     // ---- core single-block SELECT --------------------------------------
 
+    /// COUNT(*) over a single base table with no WHERE / GROUP BY / HAVING /
+    /// DISTINCT / ORDER BY / LIMIT — counted from the loaded table instead of
+    /// materializing a Tuple per row.
+    ///
+    /// The general path builds a full RowSet first (`loaded_to_rowset` clones
+    /// every column value of every row) and only then counts the rows and throws
+    /// the tuples away: measured >10 s for count(*) over ~21.5k rows, while
+    /// `load_table` is under 200 ms. musql's row store does not materialize rows
+    /// for an aggregate either.
+    ///
+    /// Output is built with the SAME helpers the general path uses
+    /// (`projection_columns` -> `default_col_name` + `infer_type`), so the field
+    /// name and type are identical. Any clause that could change the result
+    /// disables the fast path rather than being approximated.
+    fn try_count_star(&self, select: &Select, order_by: Option<&OrderBy>) -> Result<Option<RowSet>> {
+        use sqlparser::ast::{
+            Expr, FunctionArg, FunctionArgExpr, GroupByExpr, SelectItem, SetExpr, TableFactor,
+        };
+        if order_by.is_some()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || select.into.is_some()
+            || select.top.is_some()
+        {
+            return Ok(None);
+        }
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) if exprs.is_empty() => {}
+            _ => return Ok(None),
+        }
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let TableFactor::Table { name, args: None, .. } = &select.from[0].relation else {
+            return Ok(None);
+        };
+        let (schema, tname) = split_schema_table(name);
+        let Some(q) = self.catalog.resolve_table_name(schema.as_deref(), &tname) else {
+            return Ok(None);
+        };
+        // Only the provably-safe shape: exactly one projected item, COUNT(*) with
+        // no FILTER / DISTINCT / per-row argument.
+        if select.projection.len() != 1 {
+            return Ok(None);
+        }
+        let SelectItem::UnnamedExpr(Expr::Function(call)) = &select.projection[0] else {
+            return Ok(None);
+        };
+        let fname = object_name_parts(&call.name);
+        if call.filter.is_some() || call.over.is_some() || !fname.iter().any(|p| p.eq_ignore_ascii_case("count")) {
+            return Ok(None);
+        }
+        let (is_star, arg, distinct) = aggregate_arg(call)?;
+        if distinct || !is_star || arg.is_some() {
+            return Ok(None);
+        }
+        let Some(loaded) = self.tables.get(&q) else {
+            return Ok(None);
+        };
+        let filter = self
+            .for_update_filter
+            .as_ref()
+            .filter(|(fq, _)| fq == &q)
+            .map(|(_, s)| s);
+        let hidden = self.rls_select_hidden(&q);
+        let n = loaded
+            .rows
+            .keys()
+            .filter(|rid| filter.map(|f| f.contains(*rid)).unwrap_or(true))
+            .filter(|rid| hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
+            .count() as i64;
+        let alias = tname.clone();
+        let input_fields: Vec<FieldRef> = loaded
+            .meta
+            .columns
+            .iter()
+            .map(|c| FieldRef {
+                table: Some(alias.clone()),
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+            })
+            .collect();
+        let cols = self.projection_columns(select, &RowSchema::new(input_fields))?;
+        let out_fields: Vec<FieldRef> = cols
+            .iter()
+            .map(|c| FieldRef {
+                table: None,
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+            })
+            .collect();
+        Ok(Some(RowSet {
+            schema: RowSchema::new(out_fields),
+            rows: vec![vec![SqlValue::Int8(n)]],
+        }))
+    }
+
     fn exec_select(
         &self,
         select: &Select,
@@ -291,6 +389,9 @@ impl Exec {
             return Err(SqlError::WindowingError(
                 "window functions are not allowed in HAVING".into(),
             ));
+        }
+        if let Some(rs) = self.try_count_star(select, order_by)? {
+            return Ok(rs);
         }
         // Planner: prefer an index scan when a single base table is filtered by
         // an equality on an indexed column; otherwise fall back to a full scan.
