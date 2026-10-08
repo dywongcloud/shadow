@@ -2736,6 +2736,12 @@ impl LiteboxBackend {
             .env("HOME", "/")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            // Node honours this regardless of OpenSSL's compiled-in default
+            // path, which is what the planted bundle at
+            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
+            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
+            // 226 KiB bundle present, measured 2026-10-08).
+            .envs(guest_ca_env())
             .env("NODE_OPTIONS", format!("--require {GUEST_BIND_SHIM_PATH}"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -4001,6 +4007,24 @@ fn host_ca_bundle() -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Absolute path of the bundle inside the guest, for `NODE_EXTRA_CA_CERTS`.
+const GUEST_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// `Some((key, value))` when a real bundle gets planted, else `None`.
+///
+/// `Option` is `IntoIterator`, so callers pass this straight to `.envs()`:
+/// it adds the variable when present and adds nothing when not — which keeps
+/// hosts with no readable trust store from pointing Node at a file that
+/// doesn't exist.
+fn guest_ca_env() -> Option<(String, String)> {
+    host_ca_bundle().map(|_| {
+        (
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            GUEST_CA_BUNDLE_PATH.to_string(),
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -5333,6 +5357,12 @@ impl CellBackend for LiteboxBackend {
             .env("HOME", "/")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            // Node honours this regardless of OpenSSL's compiled-in default
+            // path, which is what the planted bundle at
+            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
+            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
+            // 226 KiB bundle present, measured 2026-10-08).
+            .envs(guest_ca_env())
             .env("HIVE_RUNTIME_WORKDIR", &reference.guest_workdir)
             .env(
                 "HIVE_RUNTIME_ARTIFACT_PROTOCOL",
@@ -5652,6 +5682,12 @@ impl CellBackend for LiteboxBackend {
             .env("PATH", "/usr/bin:/bin")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            // Node honours this regardless of OpenSSL's compiled-in default
+            // path, which is what the planted bundle at
+            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
+            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
+            // 226 KiB bundle present, measured 2026-10-08).
+            .envs(guest_ca_env())
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -5878,6 +5914,12 @@ impl CellBackend for LiteboxBackend {
             .env("HISTFILE", "")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            // Node honours this regardless of OpenSSL's compiled-in default
+            // path, which is what the planted bundle at
+            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
+            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
+            // 226 KiB bundle present, measured 2026-10-08).
+            .envs(guest_ca_env())
             .current_dir(&cwd)
             // SAFETY: dup'd fds are valid, open, and owned until this Stdio
             // takes them — the runner inherits them across exec as its own
