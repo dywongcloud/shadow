@@ -3975,15 +3975,27 @@ const GUEST_CA_PATHS: [&str; 2] = [
 ///
 /// `None` is not an error — the guest simply keeps whatever roots its base
 /// image has.
+/// A real bundle holds many PEM certs; the 49-byte stubs some images leave at
+/// the well-known paths do not. Accepting a non-empty file shipped one of those
+/// into every guest and the cert error persisted unchanged (measured
+/// 2026-10-08), so require both a BEGIN CERTIFICATE marker and a realistic
+/// size rather than trusting non-emptiness.
+fn is_real_ca_bundle(bytes: &[u8]) -> bool {
+    bytes.len() > 16 * 1024 && bytes.windows(27).any(|w| w == *b"-----BEGIN CERTIFICATE-----")
+}
+
 fn host_ca_bundle() -> Option<Vec<u8>> {
     for path in [
+        // First on RHEL/TencentOS: the assembled trust store. The paths below
+        // are the compat stubs that can be near-empty.
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/cert.pem",
         "/etc/ssl/cert.pem",
     ] {
         if let Ok(bytes) = std::fs::read(path) {
-            if !bytes.is_empty() {
+            if is_real_ca_bundle(&bytes) {
                 return Some(bytes);
             }
         }
