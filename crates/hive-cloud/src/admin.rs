@@ -3157,7 +3157,23 @@ pub(crate) async fn deploy_zip(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let zip_b64 = base64::engine::general_purpose::STANDARD.encode(body.as_ref());
     let filename = meta.filename.unwrap_or_else(|| "archive.zip".into());
-    let redeploy = meta.redeploy.unwrap_or(false);
+    // `redeploy` means "this named project already exists and I own it" — it is
+    // decided HERE from the authoritative store, not taken from the client. The
+    // upload page always sends `redeploy: true` (so a same-named re-upload to a
+    // project the same tenant owns keeps its name instead of 409ing). That broke
+    // NEW projects: with the flag forced on, `start_named_deploy` saw a redeploy
+    // of a nonexistent project and answered 404 "the project no longer exists".
+    // Now a free name creates the project; a name owned by this tenant is a
+    // redeploy; a name owned by someone else falls through to the honest 409.
+    let redeploy = meta.redeploy.unwrap_or(false)
+        && meta
+            .project
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .and_then(|n| c.projects.find_key_ci(n))
+            .map(|k| norm(&c.projects.team_of(&k)) == t)
+            .unwrap_or(false);
     let req = fluid_core::GitDeployRequest {
         source_deployment_ids: Vec::new(),
         repo_url: format!("upload://{filename}"),

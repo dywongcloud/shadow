@@ -173,11 +173,28 @@ impl RelationalStorage for GuardianRelationalStorage {
         let prefix = format!("{collection}{SEP}");
         let index = self.store.index();
         let keys = index.keys().map_err(map_err)?;
+        let total_keys = keys.len();
+        // Progress log: the previous timer only fired on COMPLETION, so its
+        // absence was consistent with "fast" and with "never finished" — an
+        // inference error that mis-attributed the 10 s. Emitting while the walk
+        // runs distinguishes them.
+        let walk_started = std::time::Instant::now();
+        tracing::info!(collection = %collection, keys = total_keys, "sql: scan start");
         let mut out = Vec::new();
+        let mut seen = 0usize;
         for key in keys {
             let Some(row_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
+            seen += 1;
+            if seen % 5000 == 0 {
+                tracing::info!(
+                    collection = %collection,
+                    matched = seen,
+                    elapsed_ms = walk_started.elapsed().as_millis() as u64,
+                    "sql: scan progress"
+                );
+            }
             // Cached value first (free); otherwise the lazy async fetch —
             // never skip a row the index knows only by hash.
             let doc = match index.get_bytes(&key).map_err(map_err)? {
@@ -188,6 +205,12 @@ impl RelationalStorage for GuardianRelationalStorage {
                 out.push((row_id.to_string(), doc));
             }
         }
+        tracing::info!(
+            collection = %collection,
+            rows = out.len(),
+            elapsed_ms = walk_started.elapsed().as_millis() as u64,
+            "sql: scan done"
+        );
         Ok(out)
     }
 
