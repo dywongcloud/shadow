@@ -416,9 +416,12 @@ async fn proxy_local(
     // this machine. Prefer the public origin the edge already computed whenever
     // the supplied host is loopback.
     //
-    // Non-loopback hosts are left strictly alone: an origin that routes ON its
-    // Host (an ngrok tunnel) 421s "Misdirected Request" the moment it is
-    // overridden — live-reproduced in hive-cloud's `dashboard_proxy`.
+    // Non-loopback hosts are left strictly alone. A host is also a routing key
+    // for some upstreams, and rewriting one that routes on it 421s "Misdirected
+    // Request" — that was live-reproduced years ago when `dashboard_proxy`
+    // forced Host to the public domain (see the comment at
+    // hive-cloud/src/main.rs `dashboard_proxy`). Rewriting only loopback keeps
+    // that failure unreachable without depending on which upstreams exist.
     let fwd_host = meta
         .headers
         .iter()
