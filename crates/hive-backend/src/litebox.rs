@@ -4102,10 +4102,17 @@ fn append_litebox_runtime_augmentation_blocking(
     // `nsswitch.conf` is spelled out rather than left to glibc's built-in
     // default so the lookup order is explicit and identical on every base
     // image: `files` first (so /etc/hosts still wins), then `dns`.
+    // `use-vc` forces glibc onto TCP for DNS, which is the whole point: a
+    // litebox guest has no UDP egress. Measured 2026-10-08 with a probe app
+    // inside a guest — `net.connect(443, '1.1.1.1')` returned OK (so the route
+    // and NAT are fine) while `dns.lookup` returned EAI_AGAIN, i.e. TCP out
+    // works and UDP does not. PATCHES.md:138 describes litebox's UDP support
+    // as a `bind()` concern, not an outbound one. Without `use-vc` the
+    // resolver config below is present and correct and still unusable.
     append_platform_tar_entry(
         &mut builder,
         Path::new("etc/resolv.conf"),
-        b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n",
+        b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 use-vc\n",
     )?;
     append_platform_tar_entry(
         &mut builder,
