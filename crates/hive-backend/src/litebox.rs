@@ -1838,15 +1838,22 @@ impl LiteboxBackend {
               # untrusted tenant code the node's own credentials. Guests get
               # the internet and nothing else. These are appended BEFORE the
               # ACCEPTs below, so they win.
+              # `-I FORWARD 1`, never `-A`: these must sit AHEAD of the ACCEPTs
+              # below. The ACCEPT rules may already exist from an earlier run,
+              # and iptables matches in order — appending the denies put them
+              # after the accepts and left every one of them dead (measured
+              # 2026-10-08: a correctly-installed-looking ruleset where a guest
+              # could still reach 169.254.169.254). Inserting at the head is
+              # order-independent.
               for DST in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
-                iptables -C FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP
+                iptables -C FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 10.88.0.0/16 -d "$DST" -j DROP
               done
               # The platform's own admin API, by port and regardless of
               # destination: it is not only on a private address, so the
               # ranges above do not cover it. A guest that reaches it can
               # mint operator JWTs and drive the whole control plane.
               for PORT in 8786; do
-                iptables -C FORWARD -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP
+                iptables -C FORWARD -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP
               done
               iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -j MASQUERADE
               iptables -C FORWARD -s 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -j ACCEPT
