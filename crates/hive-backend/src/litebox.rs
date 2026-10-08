@@ -2993,6 +2993,15 @@ async fn runtime_source_sha256(
     hasher.update(bind_shim.as_bytes());
     hasher.update((runtime_guard.len() as u64).to_le_bytes());
     hasher.update(runtime_guard.as_bytes());
+    // The guest /etc files are part of the artifact's CONTENTS, so they belong
+    // in its key. Without this, editing them leaves every cached runtime
+    // archive still valid and the change never reaches a guest — measured
+    // 2026-10-08: `use-vc` was rolled twice and a live guest still reported the
+    // old resolv.conf.
+    hasher.update((GUEST_RESOLV_CONF.len() as u64).to_le_bytes());
+    hasher.update(GUEST_RESOLV_CONF);
+    hasher.update((GUEST_NSSWITCH_CONF.len() as u64).to_le_bytes());
+    hasher.update(GUEST_NSSWITCH_CONF);
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; 128 * 1024];
     for path in paths {
@@ -3893,6 +3902,19 @@ fn append_platform_tar_entry(
     Ok(())
 }
 
+/// Guest resolver config. `use-vc` forces glibc onto TCP, which is the whole
+/// point: a litebox guest has no UDP egress. Measured 2026-10-08 with a probe
+/// app inside a live guest — `net.connect(443, '1.1.1.1')` returned OK (so the
+/// route and NAT are fine) while `dns.lookup` returned EAI_AGAIN, i.e. TCP out
+/// works and UDP does not. PATCHES.md:138 describes litebox's UDP support as a
+/// `bind()` concern, not an outbound one. Without `use-vc` this config is
+/// present and correct and still unusable.
+const GUEST_RESOLV_CONF: &[u8] =
+    b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 use-vc\n";
+/// Explicit lookup order so it is identical on every base image: `files` first,
+/// so /etc/hosts still wins, then `dns`.
+const GUEST_NSSWITCH_CONF: &[u8] = b"hosts: files dns\n";
+
 #[cfg(target_os = "linux")]
 fn append_litebox_runtime_augmentation_blocking(
     mut archive: File,
@@ -4102,22 +4124,15 @@ fn append_litebox_runtime_augmentation_blocking(
     // `nsswitch.conf` is spelled out rather than left to glibc's built-in
     // default so the lookup order is explicit and identical on every base
     // image: `files` first (so /etc/hosts still wins), then `dns`.
-    // `use-vc` forces glibc onto TCP for DNS, which is the whole point: a
-    // litebox guest has no UDP egress. Measured 2026-10-08 with a probe app
-    // inside a guest — `net.connect(443, '1.1.1.1')` returned OK (so the route
-    // and NAT are fine) while `dns.lookup` returned EAI_AGAIN, i.e. TCP out
-    // works and UDP does not. PATCHES.md:138 describes litebox's UDP support
-    // as a `bind()` concern, not an outbound one. Without `use-vc` the
-    // resolver config below is present and correct and still unusable.
     append_platform_tar_entry(
         &mut builder,
         Path::new("etc/resolv.conf"),
-        b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 use-vc\n",
+        GUEST_RESOLV_CONF,
     )?;
     append_platform_tar_entry(
         &mut builder,
         Path::new("etc/nsswitch.conf"),
-        b"hosts: files dns\n",
+        GUEST_NSSWITCH_CONF,
     )?;
     append_platform_tar_entry(
         &mut builder,
