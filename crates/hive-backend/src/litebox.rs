@@ -1841,6 +1841,13 @@ impl LiteboxBackend {
               for DST in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
                 iptables -C FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -d "$DST" -j DROP
               done
+              # The platform's own admin API, by port and regardless of
+              # destination: it is not only on a private address, so the
+              # ranges above do not cover it. A guest that reaches it can
+              # mint operator JWTs and drive the whole control plane.
+              for PORT in 8786; do
+                iptables -C FORWARD -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -p tcp --dport "$PORT" -j DROP
+              done
               iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -j MASQUERADE
               iptables -C FORWARD -s 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.88.0.0/16 -j ACCEPT
               iptables -C FORWARD -d 10.88.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.88.0.0/16 -j ACCEPT
@@ -1862,6 +1869,9 @@ impl LiteboxBackend {
               # node's admin listener, the VPC, and 169.254.169.254, whose reply
               # gives untrusted tenant code the node's cloud credentials.
               nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 ip daddr '{ 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }' drop 2>/dev/null
+              # Admin API by port, regardless of destination — see the
+              # iptables branch.
+              nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 tcp dport 8786 drop 2>/dev/null
               nft add rule ip hive_nat_litebox fwd ip saddr 10.88.0.0/16 accept 2>/dev/null
               nft add rule ip hive_nat_litebox fwd ip daddr 10.88.0.0/16 accept 2>/dev/null
             fi"#;
