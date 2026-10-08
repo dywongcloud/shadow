@@ -1811,7 +1811,20 @@ impl Gateway {
             })
             .map(|d| d.id.clone());
         if let Some(id) = target {
-            st.aliases_full.insert(host, id);
+            st.aliases_full.insert(host.clone(), id.clone());
+            // `www.<domain>` routes too. Every layer above the gateway already
+            // treats it as platform-owned: `dns.rs` creates the `www` CNAME and
+            // `acme.rs` orders the `www` SAN, but the alias map was the one
+            // layer that only ever learned the bare apex — so a delegated zone
+            // served `www` as a certified 404 (`DEPLOYMENT_NOT_FOUND`) while
+            // the apex served the project. Adding it here fixes all five
+            // activation paths at once, since they all funnel through this.
+            // Not a hijack: an alias only answers requests that DNS already
+            // sent to our edge, and both the CNAME and the SAN above are
+            // created the same way for every attached domain.
+            if !host.starts_with("www.") {
+                st.aliases_full.insert(format!("www.{host}"), id);
+            }
             true
         } else {
             false
@@ -1830,6 +1843,12 @@ impl Gateway {
         let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let mut st = self.state.lock();
         st.aliases_full.remove(&host);
+        // Mirror of `add_alias`: detach drops the `www` twin too, or a detach
+        // would leave a routable `www` behind pointing at a project that no
+        // longer owns the domain.
+        if !host.starts_with("www.") {
+            st.aliases_full.remove(&format!("www.{host}"));
+        }
     }
 
     /// Promote an existing deployment to be its project's production (rollback /
