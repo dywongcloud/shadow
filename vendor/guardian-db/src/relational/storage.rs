@@ -26,14 +26,15 @@ pub trait RelationalStorage: Send + Sync {
     /// Return every live `(row_id, document)` pair in a collection.
     async fn scan(&self, collection: &str) -> Result<Vec<(String, Json)>>;
 
-    /// Return every live row id in a collection, WITHOUT reading or decoding
-    /// any row's value. Exists because a whole table's row ids are a pure
-    /// function of the key set, while its values are not: `COUNT(*)` needs no
-    /// value, and paying a blob fetch plus a JSON parse per row to then throw
-    /// the values away was the single largest cost in the engine (36k rows on
-    /// the ledger exceeded the whole 10 s statement budget). Only row ids are
-    /// returned, so this is exact for any aggregate over row ids and useless
-    /// for anything that reads a column.
+    /// Return every live row id in a collection, WITHOUT decoding any row's
+    /// values. Exists because `COUNT(*)` needs no value, and paying a JSON
+    /// parse per row to then throw the values away was the single largest cost
+    /// in the engine (36k ledger rows exceeded the whole 10 s statement
+    /// budget). Values are still *read* to decide reachability — a row whose
+    /// blob no peer can serve is dropped here exactly as `scan` drops it — but
+    /// never decoded into `RowValues`. Only row ids are returned, so this is
+    /// exact for any aggregate over row ids and useless for anything that
+    /// reads a column.
     async fn row_ids(&self, collection: &str) -> Result<Vec<String>>;
 
     /// Fetch a single row document by id.

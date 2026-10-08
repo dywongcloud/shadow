@@ -259,24 +259,63 @@ impl RelationalStorage for GuardianRelationalStorage {
         Ok(out)
     }
 
-    /// Row ids only — a pure key walk, no value read and no JSON parse. See
-    /// the trait method: every row the index knows is a live row, and neither
-    /// `COUNT(*)` nor the row-id-based RLS / `FOR UPDATE` filters need a value.
+    /// Row ids only — no value decoded. See the trait method: `COUNT(*)` and
+    /// the row-id-level RLS / `FOR UPDATE` filters need no column value, and
+    /// paying a blob fetch plus a JSON parse per row to then throw the values
+    /// away was the largest single cost in the engine.
+    ///
+    /// Reachability is decided EXACTLY as `scan` decides it — a row counts
+    /// when its value is cached or when the lazy fetch of it succeeds — so the
+    /// two can never disagree. That matters: rows whose blob no peer can serve
+    /// ("P2P blob fetch failed from every admitted peer", 433 of them in 20
+    /// minutes on the leader) are legitimately dropped by `scan`, and a count
+    /// taken from the bare key set would report them as present while
+    /// `SELECT *` did not. Same two-phase shape as `scan` (cached pass, then a
+    /// bounded concurrent fetch of the misses); only the decode is skipped.
     async fn row_ids(&self, collection: &str) -> RelResult<Vec<String>> {
         let prefix = format!("{collection}{SEP}");
-        let keys = self.store.index().keys().map_err(map_err)?;
+        let index = self.store.index();
+        let keys = index.keys().map_err(map_err)?;
         let started = std::time::Instant::now();
-        let mut ids = Vec::new();
+        let mut ids: Vec<Option<String>> = Vec::new();
+        let mut misses: Vec<(usize, String, String)> = Vec::new();
         for key in keys {
-            if let Some(row_id) = key.strip_prefix(&prefix) {
-                ids.push(row_id.to_string());
+            let Some(row_id) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let slot = ids.len();
+            match index.get_bytes(&key).map_err(map_err)? {
+                Some(bytes) => ids.push(if Self::unwrap_doc(&bytes)?.is_some() {
+                    Some(row_id.to_string())
+                } else {
+                    None
+                }),
+                None => {
+                    ids.push(None);
+                    misses.push((slot, row_id.to_string(), key));
+                }
             }
         }
+        if !misses.is_empty() {
+            let fetched: Vec<(usize, String, RelResult<Option<Json>>)> =
+                futures::stream::iter(misses.into_iter().map(|(slot, row_id, key)| async move {
+                    (slot, row_id, self.fetch_wrapped(&key).await)
+                }))
+                .buffer_unordered(SCAN_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+            for (slot, row_id, doc) in fetched {
+                if doc?.is_some() {
+                    ids[slot] = Some(row_id);
+                }
+            }
+        }
+        let ids: Vec<String> = ids.into_iter().flatten().collect();
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms >= 50 {
             tracing::info!(
                 collection = %collection,
-                keys = ids.len(),
+                rows = ids.len(),
                 elapsed_ms,
                 "sql: row_ids"
             );
