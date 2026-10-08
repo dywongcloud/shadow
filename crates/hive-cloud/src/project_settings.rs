@@ -1990,7 +1990,14 @@ fn upsert_env(row: &mut ProjectSettings, mut value: EnvVar) {
         _ => "runtime",
     }
     .to_string();
-    if !value.sensitive && looks_like_secret(&value.value) {
+    // Image-deploy env maps do not carry a client sensitive flag. Force game
+    // credentials through encrypted/masked storage by key, not token shape.
+    let game_secret = matches!(
+        value.key.trim().to_ascii_uppercase().as_str(),
+        "PASSWORD" | "STEAM_LOGIN" | "BETA_ACCESSCODE" | "DISCORD_WEBHOOK_URL" | "STEAM_USER" | "STEAM_PASSWORD" | "STEAM_BRANCH_PASSWORD" | "SERVER_PASS"
+            | "SERVER_PASSWORD" | "ADMIN_PASSWORD" | "RCON_PASSWORD" | "SUPERVISOR_HTTP_PASS"
+    );
+    if !value.sensitive && (game_secret || looks_like_secret(&value.value)) {
         value.sensitive = true;
     }
     if value.value.is_empty() {

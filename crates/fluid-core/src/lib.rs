@@ -3790,6 +3790,10 @@ pub struct GitDeployRequest {
     /// allocation but cross-node forwarding to it isn't wired yet.
     #[serde(default)]
     pub image_ports: Option<Vec<PortSpec>>,
+    /// Container-internal mount point for an image deployment's named volume.
+    /// None keeps the project setting (or `/data`); never a host path.
+    #[serde(default)]
+    pub image_volume_path: Option<String>,
     /// GitHub access token for cloning a PRIVATE repo. Fed to the git process
     /// through a 0600 temp-file descriptor-backed credential helper (never embedded
     /// in a URL, argv, or env), cleared (`take()`) right after clone so no persisted/

@@ -13,6 +13,9 @@ import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
 import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
+import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, type GameServerPreset, type GamePresetFields } from "@/lib/game-server-presets";
+
+import { GamesMenu, ConfigureGame } from "@/components/game-hosting";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -38,7 +41,7 @@ interface GhDetail {
   live?: boolean;
 }
 
-interface Template {
+interface Template extends GamePresetFields {
   name: string;
   desc: string;
   tag: string; // framework label for the monogram fallback
@@ -59,6 +62,7 @@ interface Template {
   protocol?: string;
   env?: Record<string, string>;
   memory?: string;
+  volumeMountPath?: string;
 }
 
 // Vercel-style starters: official `vercel/vercel` examples (built from the
@@ -90,7 +94,7 @@ const TEMPLATES: Template[] = [
   // explanation. Real Java Edition server (itzg/minecraft-server), a
   // world-standard, actively-maintained public image — EULA=TRUE is
   // Mojang's own required acceptance flag, not a platform invention.
-  { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
+  ...GAME_SERVER_PRESETS,
 ];
 
 function slug(s: string) {
@@ -170,8 +174,9 @@ export default function NewProjectPage() {
   const [preparing, setPreparing] = useState<{ template: Template | null; team: string; src: string; dest: string } | null>(null);
 
   const TPL_PER = 5;
-  const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
-  const shownTemplates = TEMPLATES.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
+  const nonGameTemplates = TEMPLATES.filter(t => !t.gameId);
+  const tplPages = Math.max(1, Math.ceil(nonGameTemplates.length / TPL_PER));
+  const shownTemplates = nonGameTemplates.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
 
   useEffect(() => {
     cachedJson<GhDetail>("/api/github/status", 30_000).then(async (s) => {
@@ -354,6 +359,7 @@ export default function NewProjectPage() {
     cpus?: string;
     ports?: { container_port: number; protocol: string; label?: string }[];
     env?: Record<string, string>;
+    volumeMountPath?: string;
     template?: Template | null;
   }) {
     setDeploying(true);
@@ -368,6 +374,7 @@ export default function NewProjectPage() {
         memory: opts.memory,
         cpus: opts.cpus,
         ports: opts.ports,
+        volume_mount_path: opts.volumeMountPath,
         env: opts.env && Object.keys(opts.env).length ? opts.env : undefined,
       });
       const guessed = slug(opts.image.split("/").pop()?.split(":")[0] || "app");
@@ -430,6 +437,7 @@ export default function NewProjectPage() {
 
   // ----- Configure screen (after a template is selected) -----
   if (selected) {
+    if (selected.gameId) return <ConfigureGame key={selected.gameId} game={selected as GameServerPreset} onBack={() => { setSelected(null); setError(""); }} onCreate={opts => runImageDeploy({ ...opts, template: selected })} deploying={deploying} error={error} />;
     return selected.image ? (
       <ConfigureImageTemplate
         template={selected}
@@ -584,6 +592,7 @@ export default function NewProjectPage() {
       </p>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
+      <GamesMenu onSelect={game => { setError(""); setSelected(game); }} disabled={deploying} />
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
         {/* Import Git Repository */}
         <div>
@@ -939,6 +948,7 @@ function ConfigureImageTemplate({
     memory?: string;
     ports?: { container_port: number; protocol: string; label?: string }[];
     env?: Record<string, string>;
+    volumeMountPath?: string;
   }) => void;
   deploying: boolean;
   error: string;
@@ -947,7 +957,7 @@ function ConfigureImageTemplate({
   const [port, setPort] = useState(String(template.port ?? ""));
   const [protocol, setProtocol] = useState(template.protocol ?? "tcp");
   const [memory, setMemory] = useState(template.memory ?? "");
-  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>([]);
+  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>(() => (template.extraPorts ?? []).map(row => ({ ...row, port: String(row.port) })));
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>(() => {
     const rows = Object.entries(template.env ?? {}).map(([key, value]) => ({ key, value }));
     return rows.length ? rows : [{ key: "", value: "" }];
@@ -964,6 +974,8 @@ function ConfigureImageTemplate({
     for (const { key, value } of envVars) if (key.trim()) out[key.trim()] = value;
     return out;
   };
+
+  const envErrors = gamePresetEnvErrors(template, buildEnv());
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -985,8 +997,10 @@ function ConfigureImageTemplate({
 
         <p className="mb-6 text-sm text-secondary">
           A pre-built image — no build step. The platform pulls it directly and attaches a persistent
-          volume at <span className="font-mono">/data</span> that survives redeploys.
+          volume at <span className="font-mono">{template.volumeMountPath ?? "/data"}</span> that survives redeploys.
         </p>
+
+        {!!template.setupNotes?.length && <ul className="mb-6 list-disc space-y-2 pl-5 text-xs text-secondary">{template.setupNotes.map(note => <li key={note}>{note}</li>)}</ul>}
 
         <div className="mb-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
@@ -1070,7 +1084,7 @@ function ConfigureImageTemplate({
               <div key={i} className="flex items-center gap-2">
                 <Input value={row.key} placeholder="KEY" className="flex-1 font-mono text-xs"
                   onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)))} />
-                <Input value={row.value} placeholder="value" className="flex-1 font-mono text-xs"
+                <Input type={isSensitiveGameEnv(row.key) ? "password" : "text"} autoComplete="off" value={row.value} placeholder="value" className="flex-1 font-mono text-xs"
                   onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))} />
                 <button type="button" className="shrink-0 rounded-md p-2 text-muted hover:bg-subtle hover:text-fg"
                   onClick={() => setEnvVars((rows) => (rows.length <= 1 ? [{ key: "", value: "" }] : rows.filter((_, j) => j !== i)))}>
@@ -1088,10 +1102,12 @@ function ConfigureImageTemplate({
           </button>
         </div>
 
+        {envErrors.length > 0 && <p role="alert" className="mb-4 text-sm text-red-600">{envErrors.join(" ")}</p>}
         {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
 
         <Button
           onClick={async () => {
+            if (gamePresetEnvErrors(template, buildEnv()).length) return;
             if (typeof window !== "undefined") {
               await switchTeam(team === "personal" ? "__personal__" : team);
             }
@@ -1114,9 +1130,10 @@ function ConfigureImageTemplate({
               memory: memory.trim() || undefined,
               ports,
               env: buildEnv(),
+              volumeMountPath: template.volumeMountPath,
             });
           }}
-          disabled={deploying}
+          disabled={deploying || envErrors.length > 0}
           className="w-full justify-center bg-fg py-2.5 text-bg"
         >
           {deploying ? <><Loader2 className="h-4 w-4 animate-spin" /> Creating…</> : "Create"}

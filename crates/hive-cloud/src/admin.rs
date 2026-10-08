@@ -3201,6 +3201,7 @@ pub(crate) async fn deploy_zip(
         image_cpus: None,
         image_pids: None,
         image_ports: None,
+        image_volume_path: None,
         git_token: None, // zip upload has no git clone
     };
     start_named_deploy(&c, &t, req, None).await
@@ -3247,6 +3248,9 @@ pub(crate) struct ImageDeployReq {
     /// doc for the replace-not-merge semantics and the mesh-forwarding caveat.
     #[serde(default)]
     ports: Option<Vec<fluid_core::PortSpec>>,
+    /// Container-internal mount point for the project's named volume.
+    #[serde(default)]
+    volume_mount_path: Option<String>,
     #[serde(default)]
     env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -3271,6 +3275,16 @@ pub(crate) async fn deploy_image(
         return Err((
             StatusCode::BAD_REQUEST,
             "Provide an image reference, e.g. fruitbox12/simplifi:latest".into(),
+        ));
+    }
+    if body
+        .volume_mount_path
+        .as_deref()
+        .is_some_and(|path| !crate::git::valid_image_volume_path(path))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "volume_mount_path must be a normalized absolute container directory".into(),
         ));
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
@@ -3303,6 +3317,7 @@ pub(crate) async fn deploy_image(
         image_cpus: body.cpus,
         image_pids: body.pids,
         image_ports: body.ports,
+        image_volume_path: body.volume_mount_path,
         git_token: None, // prebuilt image deploy has no git clone
     };
     start_named_deploy(&c, &t, req, None).await
@@ -7283,6 +7298,7 @@ fn redeploy_request(
         // the single-port restore this field sits beside has the exact same
         // shape it always did.
         image_ports: None,
+        image_volume_path: None,
         git_token,
     }
 }
@@ -7964,6 +7980,7 @@ async fn git_webhook(
             image_cpus: None,
             image_pids: None,
             image_ports: None,
+            image_volume_path: None,
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
