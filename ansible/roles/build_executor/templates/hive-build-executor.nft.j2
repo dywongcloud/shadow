@@ -47,7 +47,21 @@ table inet {{ build_executor_nft_table }} {
     counter ingress_to_executor_denied {}
 
     chain executor_to_host {
-        type filter hook input priority 10; policy accept;
+        # NEGATIVE priority, deliberately: this chain must see traffic from the
+        # build bridge BEFORE any host firewall with a default-DROP input policy
+        # at the standard `filter` priority (0) can swallow it. Otherwise the
+        # packet is still denied -- the host's table drops it -- but it is denied
+        # somewhere this role does not own, so host_denied stays at 0 and the
+        # provisioning assertion that proves "traffic delivered to the host is
+        # denied" fails on a host whose firewall default-drops input, even
+        # though the isolation is actually working. Witnessed on fc-orlando
+        # (2026-10-09): its vendor `ip filter` table is `policy drop` at
+        # priority 0, so every probe to a host-local address was dropped there
+        # and never reached this chain at priority 10 (host=0, need >=2) while
+        # the FORWARD-path counters (also priority 10, but the vendor FORWARD
+        # chain is `policy accept`) incremented normally. -50 keeps this after
+        # hive_lockdown's own -100 peer table and before the host firewall.
+        type filter hook input priority -50; policy accept;
 
         iifname "{{ build_executor_network_bridge }}" meta nfproto ipv6 counter name ipv6_denied drop comment "be-input-ipv6"
         iifname "{{ build_executor_network_bridge }}" ip daddr {{ build_executor_network_gateway }} meta l4proto udp ct original proto-dst 53 counter name dns_allowed accept comment "be-input-dns-udp"

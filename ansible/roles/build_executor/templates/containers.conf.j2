@@ -2,6 +2,17 @@
 [containers]
 env_host = false
 http_proxy = false
+# runsc (gVisor) rejects ANY SELinux label in the OCI spec -- it fails the
+# launch outright with `FetchSpec failed: reading spec: SELinux is not
+# supported: system_u:system_r:container_t:s0`. Every BuildExecutor container
+# runs under runsc, so host SELinux labeling must be off unconditionally, not
+# only on hosts where SELinux happens to be Disabled. Without this, a host in
+# Permissive/Enforcing mode (fc-orlando, 2026-10-09) labels the spec, every
+# probe container dies, /var/lib/hive/build-executor.json is never published,
+# and the hive-node drop-in that gates startup on that file crash-loops
+# hive-node instead. gVisor enforces its own sandbox independently of the
+# host's SELinux mode, so disabling the label costs no isolation here.
+label = false
 
 [engine]
 hooks_dir = ["{{ build_executor_oci_hooks_dir }}"]
