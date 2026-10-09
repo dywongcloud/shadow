@@ -48,10 +48,12 @@ for a in "$@"; do [ "$a" = "--clean-jemalloc" ] && CLEAN=1; done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-has_symtab() { # $1 path -> 0 when .symtab is present
-  python3 - "$1" <<'PY'
+# $1 path, $2 "linked" (require .symtab; DWARF still present is expected)
+#           | "stripped" (require .symtab AND no .debug_* left)
+elf_check() {
+  python3 - "$1" "$2" <<'PY'
 import struct, sys
-p = sys.argv[1]
+p, mode = sys.argv[1], sys.argv[2]
 with open(p, "rb") as f:
     h = f.read(64)
     shoff, = struct.unpack_from("<Q", h, 0x28)
@@ -65,8 +67,14 @@ with open(p, "rb") as f:
 names = [st[shdr(i)[0]:st.index(b"\0", shdr(i)[0])].decode() for i in range(shnum)]
 sym = ".symtab" in names
 dbg = sum("debug" in n for n in names)
-print(f"  sections={len(names)} symtab={sym} debug_sections={dbg}")
-sys.exit(0 if sym and dbg == 0 else 1)
+# The two modes differ on purpose. Right after the link DWARF is still there
+# (we asked for strip=none), so demanding zero .debug_* there is a check that
+# can only ever fail -- it rejected a healthy 40-section build with
+# "FATAL: no .symtab after link" while `.symtab` was in fact present
+# (2026-10-09). The post-link gate is one thing only: the symbol table exists.
+ok = sym if mode == "linked" else (sym and dbg == 0)
+print(f"  sections={len(names)} symtab={sym} debug_sections={dbg} ({mode})")
+sys.exit(0 if ok else 1)
 PY
 }
 
@@ -77,6 +85,18 @@ for G in "${TARGET_GROUPS[@]}"; do
     rm -rf "target/$TRIPLE/release/build/tikv-jemalloc-sys-"*
     echo "  cleaned tikv-jemalloc-sys artifacts"
   fi
+  # cargo-zigbuild maps BOTH `...gnu.2.38` and `...gnu.2.39` onto the real rustc
+  # triple `x86_64-unknown-linux-gnu`, so the two groups share one directory and
+  # one fingerprint namespace. Observed 2026-10-09: switching from one group to
+  # the other reported "Finished in 2.66s" -- cargo relinked nothing, so the
+  # binary sitting in that shared dir was whatever the PREVIOUS group built,
+  # silently stamped with this group's name. The glibc version is applied by zig
+  # at LINK time, so a guaranteed relink is what makes the group tag true.
+  # Removing the binary and bumping the bin crate's mtime invalidates that one
+  # target's fingerprint: a recompile of hive-cloud, not of the workspace.
+  rm -f "target/x86_64-unknown-linux-gnu/release/hive-cloud"
+  touch crates/hive-cloud/src/main.rs
+
   AR="$AR_BIN" RANLIB="$RANLIB_BIN" CARGO_PROFILE_RELEASE_STRIP=none \
     cargo zigbuild --release --target "$TRIPLE" -p hive-cloud
 
@@ -89,9 +109,10 @@ for G in "${TARGET_GROUPS[@]}"; do
   [ -f "$SRC" ] || { echo "FATAL: no artifact at $SRC"; exit 1; }
   cp "$SRC" "$OUT"
 
-  echo "post-link:"; has_symtab "$OUT" || { echo "FATAL: no .symtab after link"; exit 1; }
+  echo "post-link:"; elf_check "$OUT" linked \
+    || { echo "FATAL: no .symtab after link"; exit 1; }
   "$STRIP_BIN" --strip-debug "$OUT"
-  echo "after llvm-strip --strip-debug:"; has_symtab "$OUT" \
+  echo "after llvm-strip --strip-debug:"; elf_check "$OUT" stripped \
     || { echo "FATAL: .symtab lost while stripping DWARF"; exit 1; }
 
   echo "  artifact $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
