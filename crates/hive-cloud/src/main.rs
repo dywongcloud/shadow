@@ -1201,6 +1201,7 @@ async fn async_main() -> anyhow::Result<()> {
         // the 24h window from then on.
         started_ms: crate::restart_audit::started_ms(),
         oom_restarts_24h: crate::restart_audit::oom_restarts_24h(),
+        unclean_restarts_24h: crate::restart_audit::unclean_restarts_24h(),
         last_oom_ms: crate::restart_audit::last_oom_ms(),
         backend: backend_name.clone(),
         gpu_count: gpus.0,
@@ -2093,7 +2094,7 @@ async fn async_main() -> anyhow::Result<()> {
     // exactly why the kill was invisible), and re-states an OOM-cycling
     // verdict periodically so it is loud in a log tail taken at any moment —
     // not only in the seconds right after the restart. See restart_audit.rs.
-    restart_audit::spawn(args.name.clone());
+    restart_audit::spawn(args.name.clone(), cloud.clone());
 
     // Reap browser-function artifacts no live deployment references anymore.
     // Every node (the store is per-host), guarded against empty/mostly-orphaned
@@ -3465,6 +3466,7 @@ fn spawn_disk_refresh(
                 registry.set_self_restart_audit(
                     crate::restart_audit::started_ms(),
                     crate::restart_audit::oom_restarts_24h(),
+                    crate::restart_audit::unclean_restarts_24h(),
                     crate::restart_audit::last_oom_ms(),
                 );
             }

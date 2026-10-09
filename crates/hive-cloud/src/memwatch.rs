@@ -22,6 +22,15 @@
 //!    and DUMPS when it crosses a high one, so the next burst leaves a profile
 //!    on disk instead of only a kernel kill line.
 //!
+//!    Arming is OPT-IN (`HIVE_MEM_PROF=1`), never automatic. jemalloc captures
+//!    a backtrace per sampled allocation with `prof_backtrace_impl`, a
+//!    frame-pointer stack walk; a release build without frame pointers hands it
+//!    a garbage saved-rbp chain and it faults. Measured on fc-sanjose
+//!    2026-10-10: eight SIGSEGV cores, each 2–3 s after this watchdog armed
+//!    `prof.active`, on the only one of five nodes running the identical binary
+//!    whose RSS crossed `HIVE_MEM_ARM_MB` — arming was killing the node it
+//!    existed to diagnose.
+//!
 //! Both halves are bounded and honest: dumps are rate-limited, capped in count,
 //! and written under `$HIVE_DATA` (never `/tmp`, which a reboot wipes — the
 //! `git::deploy_root` lesson); arming is logged at WARN naming the threshold
@@ -38,6 +47,9 @@ static LAST_DUMP_MS: AtomicU64 = AtomicU64::new(0);
 /// Dumps written this process — reported so an operator can tell "never fired"
 /// from "fired and the files were reaped".
 static DUMPS: AtomicU64 = AtomicU64::new(0);
+/// Logged once that profiling was SKIPPED, so a dump with no attribution is
+/// never a mystery.
+static PROF_SKIP_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -189,9 +201,15 @@ fn prune_dumps(keep: usize) {
 /// resource is per-host), not leader-only.
 ///
 /// Thresholds, all env-tunable, all in MiB:
-/// * `HIVE_MEM_ARM_MB`   (default 3072) — turn jemalloc sampling on. Chosen
-///   well above the ~1–1.8 GB idle band so a normal node never pays for it,
-///   and well below the ~93 GiB kill point so there is time to sample.
+/// * `HIVE_MEM_ARM_MB`   (default 3072) — start reporting, and (only with
+///   `HIVE_MEM_PROF=1`) turn jemalloc sampling on. Chosen well above the
+///   ~1–1.8 GB idle band so a normal node never pays for it, and well below
+///   the ~93 GiB kill point so there is time to sample.
+/// * `HIVE_MEM_PROF=1`   — the opt-in that actually arms `prof.active`. Off by
+///   default: see the module doc (a frame-pointer backtrace walk faults on a
+///   release build without frame pointers). Each tier below fires whether or
+///   not profiling is armed; without it a dump still lands, just without
+///   per-site attribution.
 /// * `HIVE_MEM_DUMP_MB`  (default 8192) — write a profile.
 /// * `HIVE_MEM_RESTART_MB` (default 16384) — self-restart. A confirmed real
 ///   leak (not fragmentation — see the module doc's "80 MB live vs 1.09 GB
@@ -228,6 +246,7 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::Cont
         .unwrap_or(16384 * 1024 * 1024);
     let cooldown_ms = env_u64("HIVE_MEM_DUMP_COOLDOWN_SECS", 120) * 1000;
     let keep = env_u64("HIVE_MEM_DUMP_KEEP", 8) as usize;
+    let prof_enabled = std::env::var("HIVE_MEM_PROF").ok().as_deref() == Some("1");
 
     tokio::spawn(async move {
         loop {
@@ -237,23 +256,41 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::Cont
                 // than spin forever reading a file that will never exist.
                 return;
             };
-            if rss < arm_bytes {
-                continue;
+
+            // Tier 1: report (and, only when opted in, arm profiling).
+            //
+            // NOT a `continue` gate for the tiers below. When the arm threshold
+            // also gated dump and restart, `HIVE_MEM_ARM_MB` was really
+            // "watchdog on/off": raising it to stop arming silently disabled
+            // leak protection too, which is how a node ends up with no dump and
+            // no restart on a genuine runaway. Each tier tests its own number.
+            if rss >= arm_bytes {
+                // Above the arm threshold: emit the full reading every tick.
+                // This is the record that survives the kill — the kernel's OOM
+                // line reports one number and no attribution.
+                let snap = snapshot(Some(&hive));
+                tracing::warn!(
+                    rss_mb = rss / 1024 / 1024,
+                    arm_mb = arm_bytes / 1024 / 1024,
+                    snapshot = %snap,
+                    "memory above watchdog arm threshold"
+                );
+
+                if prof_enabled {
+                    arm_profiling();
+                } else if !PROF_SKIP_WARNED.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "memory watchdog did NOT arm heap profiling (HIVE_MEM_PROF != 1) — \
+                         dumps below will carry no allocation-site attribution. Set \
+                         HIVE_MEM_PROF=1 to opt in: jemalloc's prof_backtrace_impl walks \
+                         frame pointers and SIGSEGVs a release build that has none \
+                         (fc-sanjose, 2026-10-10)"
+                    );
+                }
             }
 
-            // Above the arm threshold: emit the full reading every tick. This
-            // is the record that survives the kill — the kernel's OOM line
-            // reports one number and no attribution.
-            let snap = snapshot(Some(&hive));
-            tracing::warn!(
-                rss_mb = rss / 1024 / 1024,
-                arm_mb = arm_bytes / 1024 / 1024,
-                snapshot = %snap,
-                "memory above watchdog arm threshold"
-            );
-
-            arm_profiling();
-
+            // Tier 2: write a profile. Tested on its own threshold, so it still
+            // fires on a node whose arm threshold was raised.
             if rss >= dump_bytes {
                 let now = hive_core::now_ms();
                 let last = LAST_DUMP_MS.load(Ordering::Relaxed);

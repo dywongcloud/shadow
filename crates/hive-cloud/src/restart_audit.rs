@@ -61,7 +61,7 @@ use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Set by `mark_clean_exit`; read by the heartbeat before every marker write.
 /// The graceful tail runs tens of seconds past the clean-exit stamp, so a
@@ -585,7 +585,10 @@ pub fn audit_boot(node: &str) -> Value {
              this process");
         lock(&HISTORY_FAULT).get_or_insert_with(|| format!("restart history write failed: {e}"));
     }
-    let (restarts_24h, oom_24h, min_uptime) = window_stats(&hist);
+    let w = window_stats(&hist);
+    let restarts_24h = w.restarts;
+    let oom_24h = w.oom;
+    let min_uptime = w.min_uptime_ms;
     if let Some(ms) = hist.iter().filter(|r| r.is_oom()).map(|r| r.ts_ms).max() {
         LAST_OOM_MS.store(ms, Ordering::Relaxed);
     }
@@ -607,6 +610,7 @@ pub fn audit_boot(node: &str) -> Value {
         "mem_limit_bytes": rec.mem_limit_bytes,
         "restarts_24h": restarts_24h,
         "oom_restarts_24h": oom_24h,
+        "unclean_restarts_24h": w.unclean,
         "min_uptime_ms_24h": min_uptime,
     });
 
@@ -633,6 +637,8 @@ pub fn audit_boot(node: &str) -> Value {
             prev_pid = rec.prev_pid,
             prev_uptime_secs = rec.prev_uptime_ms / 1000,
             restarts_24h,
+            unclean_restarts_24h = w.unclean,
+            crash_cycling = w.crashy() >= CRASH_CYCLE_MIN,
             "UNCLEAN RESTART: the previous process died without a graceful shutdown"
         ),
         "host_reboot" => tracing::warn!(
@@ -651,29 +657,77 @@ pub fn audit_boot(node: &str) -> Value {
     summary
 }
 
-/// `(restarts_24h, oom_restarts_24h, shortest_uptime_ms_24h)`.
+/// A 24h window's [`WindowStats`].
 ///
 /// `first_boot` is excluded from the restart count — a wiped data dir is not a
 /// restart, and counting it as one would make every fresh node look unstable.
-fn window_stats(hist: &[RestartRecord]) -> (u32, u32, Option<u64>) {
+/// One 24h window's restart counts.
+///
+/// `unclean` is the number this module existed to produce and did not: restarts
+/// whose verdict is neither a graceful exit nor a host reboot, i.e. the process
+/// DIED (SIGSEGV, panic, a SIGKILL it did not ask for). It is the only counter
+/// that sees an involuntary crash — [`crate::ControlledRestart`] is the
+/// chokepoint for restarts hive CHOOSES, and a process that segfaulted is
+/// already gone, so no rate cap, no reason tally and no admission check ever
+/// observes it. Measured on fc-sanjose 2026-10-10: 42 restarts in 24h, 34 of
+/// them `unclean_exit`, `oom_restarts_24h` = 0 — an OOM-only view of this node
+/// reported perfect health for the whole crash loop.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowStats {
+    pub restarts: u32,
+    pub oom: u32,
+    pub unclean: u32,
+    pub min_uptime_ms: Option<u64>,
+}
+
+impl WindowStats {
+    /// Deaths that were neither chosen nor a host reboot: OOM kills plus every
+    /// other involuntary exit.
+    pub fn crashy(&self) -> u32 {
+        self.oom.saturating_add(self.unclean)
+    }
+}
+
+/// How many involuntary deaths in 24h make a node crash-cycling. Three, not
+/// one: a single unclean exit is a deploy SIGKILLed at the shutdown deadline or
+/// a one-off panic, and calling that a loop would make this signal worthless.
+const CRASH_CYCLE_MIN: u32 = 3;
+
+fn window_stats(hist: &[RestartRecord]) -> WindowStats {
     let cutoff = now_ms().saturating_sub(DAY_MS);
     let recent: Vec<&RestartRecord> = hist
         .iter()
         .filter(|r| r.ts_ms >= cutoff && r.verdict != "first_boot")
         .collect();
     let oom = recent.iter().filter(|r| r.is_oom()).count() as u32;
+    let unclean = recent
+        .iter()
+        .filter(|r| r.verdict == "unclean_exit")
+        .count() as u32;
     let min_uptime = recent
         .iter()
         .filter(|r| r.prev_uptime_ms > 0)
         .map(|r| r.prev_uptime_ms)
         .min();
-    (recent.len() as u32, oom, min_uptime)
+    WindowStats {
+        restarts: recent.len() as u32,
+        oom,
+        unclean,
+        min_uptime_ms: min_uptime,
+    }
 }
 
 /// Gossiped counters (see `NodeInfo`), so a cycling node is visible from the
 /// dashboard and `/v1/nodes` without reading any host's logs.
 pub fn oom_restarts_24h() -> u32 {
-    window_stats(&history().read()).1
+    window_stats(&history().read()).oom
+}
+
+/// Involuntary deaths in the last 24h. Gossiped on `NodeInfo` next to
+/// `oom_restarts_24h` so `/v1/nodes` shows a crash loop rather than a node that
+/// merely looks freshly started.
+pub fn unclean_restarts_24h() -> u32 {
+    window_stats(&history().read()).unclean
 }
 
 pub fn last_oom_ms() -> Option<u64> {
@@ -754,12 +808,23 @@ pub fn mark_clean_exit(node: &str) {
 /// tradeoff — too long and the recorded RSS predates the burst that killed us.
 ///
 /// The reminder exists because a single boot-time log line scrolls away. While
-/// this node has OOM restarts inside the 24h window it re-states the fact
-/// periodically, so a node cycling every 2–3 hours is loud in a log tail taken
-/// at ANY moment, not just the one right after a kill.
-pub fn spawn(node: String) {
+/// this node is crash-cycling it re-states the fact periodically, so a node
+/// dying every few minutes is loud in a log tail taken at ANY moment, not just
+/// the one right after a kill.
+///
+/// What counts as cycling: ANY involuntary death, OOM or not. Gating this on
+/// `oom > 0` alone was the blind spot — it is silent for exactly the loop that
+/// repeats most reliably, because a SIGSEGV/panic loop produces
+/// `verdict = unclean_exit` and `oom_restarts_24h = 0` forever. Witnessed on
+/// fc-sanjose 2026-10-10: 8 SIGSEGVs in 3h, `restarts_24h` = 42,
+/// `oom_restarts_24h` = 0, and this reminder never fired once.
+pub fn spawn(node: String, cloud: Arc<crate::CloudState>) {
     let interval = std::time::Duration::from_secs(env_u64("HIVE_RESTART_MARKER_SECS", 20));
     let remind_ms = env_u64("HIVE_RESTART_REMIND_SECS", 900) * 1000;
+    // Three passes of this loop, the incidents.rs convention: the observation
+    // lapses and the leader-only reconciler resolves the incident as soon as the
+    // node stops dying, so a crash loop never leaves a permanent row behind.
+    let ttl_ms = interval.as_millis() as u64 * 3;
     tokio::spawn(async move {
         let mut last_remind = 0u64;
         loop {
@@ -770,19 +835,50 @@ pub fn spawn(node: String) {
                 return;
             }
             save_marker(&current_marker(&node, false));
-            let (restarts, oom, min_uptime) = window_stats(&history().read());
+            let w = window_stats(&history().read());
             let now = now_ms();
-            if oom > 0 && now.saturating_sub(last_remind) >= remind_ms {
+
+            // Level-triggered: re-asserted every pass while the condition holds,
+            // never opened once and left to rot (incidents.rs).
+            if w.crashy() >= CRASH_CYCLE_MIN {
+                cloud.incidents.open(crate::incidents::OpenReq {
+                    condition: format!("crash-cycle:{node}"),
+                    ttl_ms,
+                    title: format!("{node} is crash-cycling"),
+                    severity: crate::incidents::Severity::Critical,
+                    affected: vec![node.clone()],
+                    message: format!(
+                        "{unclean} unclean exits and {oom} OOM kills in the last 24h \
+                         ({restarts} restarts total, shortest uptime {min}s). These are \
+                         involuntary: the process died, so none of the controlled-restart \
+                         caps ever saw it. Every health, probe, placement and \
+                         FUNCTION_NO_RESPONSE symptom on this node is downstream of this. \
+                         Detail: GET /v1/node/restarts on the node.",
+                        unclean = w.unclean,
+                        oom = w.oom,
+                        restarts = w.restarts,
+                        min = w.min_uptime_ms.map(|m| m / 1000).unwrap_or(0),
+                    ),
+                });
+            } else {
+                cloud.incidents.clear(&format!("crash-cycle:{node}"), "no involuntary deaths in the last 24h");
+            }
+
+            if w.crashy() >= CRASH_CYCLE_MIN && now.saturating_sub(last_remind) >= remind_ms {
                 last_remind = now;
                 tracing::error!(
                     node = %node,
-                    oom_restarts_24h = oom,
-                    restarts_24h = restarts,
-                    shortest_uptime_secs = min_uptime.map(|m| m / 1000).unwrap_or(0),
+                    oom_restarts_24h = w.oom,
+                    unclean_restarts_24h = w.unclean,
+                    restarts_24h = w.restarts,
+                    shortest_uptime_secs = w.min_uptime_ms.map(|m| m / 1000).unwrap_or(0),
                     uptime_secs = now.saturating_sub(started_ms()) / 1000,
-                    "node is OOM-CYCLING: it has been killed for memory within the last 24h. \
-                     Treat unhealthy/probe/placement anomalies on this node as symptoms. \
-                     Detail: GET /v1/node/restarts"
+                    "node is CRASH-CYCLING: {n} processes died without a graceful shutdown in \
+                     the last 24h. Treat unhealthy/probe/placement anomalies on this node as \
+                     symptoms, and a chain-head owner that keeps dying as a fleet-wide event \
+                     (leader-only jobs pause on every crash). \
+                     Detail: GET /v1/node/restarts",
+                    n = w.crashy(),
                 );
             }
         }
@@ -795,7 +891,7 @@ pub fn spawn(node: String) {
 /// page-serving node's — the gossiped `NodeInfo` counters are the fleet view.
 pub fn snapshot(node: &str) -> Value {
     let hist = history().read().clone();
-    let (restarts, oom, min_uptime) = window_stats(&hist);
+    let w = window_stats(&hist);
     let started = started_ms();
     json!({
         "node": node,
@@ -803,10 +899,11 @@ pub fn snapshot(node: &str) -> Value {
         "started_ms": started,
         "uptime_ms": now_ms().saturating_sub(started),
         "boot_verdict": boot_record().get(),
-        "restarts_24h": restarts,
-        "oom_restarts_24h": oom,
+        "restarts_24h": w.restarts,
+        "oom_restarts_24h": w.oom,
+        "unclean_restarts_24h": w.unclean,
         "last_oom_ms": last_oom_ms(),
-        "shortest_uptime_ms_24h": min_uptime,
+        "shortest_uptime_ms_24h": w.min_uptime_ms,
         "rss_bytes": crate::memwatch::rss_bytes(),
         "mem_limit_bytes": mem_limit_bytes(),
         "cgroup_oom_kills": cgroup_oom_kills(),

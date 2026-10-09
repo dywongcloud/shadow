@@ -304,6 +304,14 @@ pub struct NodeInfo {
     /// i.e. unknown — it is a floor, never a proof of health.
     #[serde(default)]
     pub oom_restarts_24h: u32,
+    /// Restarts in the last 24h whose predecessor died WITHOUT a graceful
+    /// shutdown (`verdict = unclean_exit`: SIGSEGV, panic, a SIGKILL it never
+    /// asked for). Gossiped because it is the only fleet-visible counter that
+    /// sees an involuntary crash: `ControlledRestart` — and so every restart
+    /// rate cap and reason tally — only ever observes the restarts hive CHOOSES.
+    /// `0` also means "pre-upgrade peer", i.e. unknown.
+    #[serde(default)]
+    pub unclean_restarts_24h: u32,
     /// Epoch-ms of the most recent boot whose predecessor was OOM-killed.
     /// `None` = never observed (or not reported).
     #[serde(default)]
@@ -661,11 +669,13 @@ impl NodeRegistry {
         &self,
         started_ms: u64,
         oom_restarts_24h: u32,
+        unclean_restarts_24h: u32,
         last_oom_ms: Option<u64>,
     ) {
         let mut me = self.me.write();
         me.started_ms = started_ms;
         me.oom_restarts_24h = oom_restarts_24h;
+        me.unclean_restarts_24h = unclean_restarts_24h;
         me.last_oom_ms = last_oom_ms;
     }
 
@@ -1231,6 +1241,7 @@ mod tests {
             gpu_free_mb: None,
             started_ms: 0,
             oom_restarts_24h: 0,
+            unclean_restarts_24h: 0,
             last_oom_ms: None,
             backend: String::new(),
             provider: None,

@@ -1042,6 +1042,7 @@ mod tests {
             gpu_free_mb: None,
             started_ms: 0,
             oom_restarts_24h: 0,
+            unclean_restarts_24h: 0,
             last_oom_ms: None,
             backend: String::new(),
             provider: None,
