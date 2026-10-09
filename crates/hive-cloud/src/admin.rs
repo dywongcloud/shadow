@@ -12878,19 +12878,82 @@ async fn database_create(
     // candidate exists there; any miss (unknown region, nothing eligible)
     // falls through to self — this must never turn an empty placement into
     // a failed database create, only an occasionally-suboptimal one.
-    let host_node = req
+    //
+    // ADMISSIBILITY is checked on top of that pick and is the whole point of
+    // this block. `schedule::place` filters on health/region/reachability but
+    // never on "this node can publish a public address", and the no-region
+    // path pinned the host to `c.node_name` unconditionally — so a database
+    // could be born on a node that has since left the registry (or that never
+    // had a public IP) and be unreachable from the moment it was created,
+    // still advertising `status: ready`. Measured 2026-10-09: 4 of 18
+    // databases were stranded that way, each behind an A record pointing at
+    // an IP its provider has since re-issued to another customer. See
+    // `databases::db_host_admissible`.
+    let requested_region = req
         .region
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    let admissible = |node: &str| crate::databases::db_host_admissible(&c, node);
+    let mut host_node: Option<String> = requested_region
+        .as_deref()
         .and_then(|region| {
             let regions = [region.to_string()];
             crate::schedule::place(&c, &regions, true, true, false, false, false, false, None)
                 .into_iter()
                 .next()
+                .map(|t| t.node)
         })
-        .map(|t| t.node)
-        .unwrap_or_else(|| c.node_name.clone());
+        .filter(|node| admissible(node));
+    if host_node.is_none() {
+        if let Some(region) = requested_region.as_deref() {
+            tracing::warn!(
+                region = %region,
+                "database create: no registry node with a public address serves this region, so a \
+                 database placed there could never publish a resolvable <slug> A record; picking a \
+                 host that can"
+            );
+        }
+        // Pre-existing default: this node. Kept only when this node can
+        // actually publish the record.
+        if admissible(&c.node_name) {
+            host_node = Some(c.node_name.clone());
+        } else {
+            // This node advertises no public address (NAT'd, or one of the
+            // macOS launchd nodes where `public_ip` is None by construction),
+            // so a database hosted here would be stranded on creation. Any
+            // reachable, capable node that CAN publish beats that.
+            host_node =
+                crate::schedule::place(&c, &[], true, true, false, false, false, false, None)
+                    .into_iter()
+                    .map(|t| t.node)
+                    .find(|node| admissible(node));
+            if let Some(node) = &host_node {
+                tracing::warn!(
+                    node = %node,
+                    "database create: this node advertises no public address, so a database hosted \
+                     here could never publish an A record; placing it on a node that can"
+                );
+            }
+        }
+    }
+    let host_node = host_node.unwrap_or_else(|| {
+        // Nothing in the registry can publish an address (single-node fleet,
+        // or every node still NAT'd). Hosting here is the only way to honour
+        // the create at all; say so loudly rather than letting the record
+        // look healthy.
+        tracing::warn!(
+            node = %c.node_name,
+            "database create: NO node in the registry advertises a public address; hosting here \
+             anyway, but this database's <slug> A record cannot be published until one does"
+        );
+        c.node_name.clone()
+    });
+    // `provision()` takes ownership of the request. Keep a mutable copy so the
+    // local-provisioning fallback below can drop `region` when the requested
+    // one was not honoured, instead of the record claiming it anyway.
+    let mut local_req = req.clone();
 
     if host_node != c.node_name {
         // The chosen node is a PEER, never this node: dispatch the actual
@@ -12967,16 +13030,30 @@ async fn database_create(
         // the same "admit and let the floor catch it" direction placement
         // already takes elsewhere in this codebase (AGENTS.md's disk-floor
         // section).
+        //
+        // The requested region was NOT honoured, though — and `provision()`
+        // writes `req.region` straight into `Database::region`, so leaving it
+        // set stamped a record claiming a region its bytes do not live in.
+        // That silent lie is the second half of the stranding: the operator
+        // reads `region: sao-paulo` on a record whose container runs wherever
+        // the control-plane leader happened to be, and has no signal that the
+        // request was downgraded. The backing really runs on `c.node_name`, so
+        // drop the claim and let `provision()` fall back to this node's own
+        // region.
         tracing::warn!(
             node = %host_node,
-            "database create: chosen region node unreachable, provisioning locally instead"
+            requested_region = %requested_region.as_deref().unwrap_or_default(),
+            actual_host = %c.node_name,
+            "database create: chosen region node unreachable, provisioning locally instead — the \
+             record will name THIS node, not the requested region"
         );
+        local_req.region = None;
     }
 
     let db = crate::databases::provision(
         c.databases.clone(),
         c.region.clone(),
-        req,
+        local_req,
         c.db_domain.clone(),
         c.node_name.clone(),
         c.api_base(),

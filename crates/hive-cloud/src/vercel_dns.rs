@@ -2811,6 +2811,20 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     }
                 }
                 let mut seen = std::collections::HashSet::new();
+                // (slug, host_node) pairs this pass could NOT be given a valid
+                // address. Collected so the whole condition is reported once,
+                // level-triggered, after the loop — never acted on per-slug.
+                let mut stranded: Vec<(String, String)> = Vec::new();
+                let mut addressless: Vec<(String, String)> = Vec::new();
+                // Stable condition key + observation ttl for the automated
+                // incident (AGENTS.md: an opener re-asserts EVERY pass and the
+                // store dedups, so per-pass is free). This reconciler's cadence
+                // is HIVE_DNS_RECONCILE_SECS (30s default) and its write-failure
+                // backoff stretches one pass to at most 300s, so 30min is ~6
+                // worst-case passes of headroom and a condition that stops being
+                // observed still self-clears well inside a day.
+                const DB_STRANDED_CONDITION: &str = "db:stranded-host";
+                const DB_STRANDED_TTL_MS: u64 = 30 * 60 * 1000;
                 for (db_host, host_node) in dir {
                     let Some(slug) = db_host.strip_suffix(&suffix) else {
                         continue;
@@ -2841,8 +2855,20 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     // publishable nodes + forward) — full-set behavior
                     // returns automatically in the one case it helps.
                     let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else {
+                        // STRANDED. The node this database lives on is not in
+                        // the registry at all — its instance is gone, so there
+                        // is no address left to publish and no node that can
+                        // serve it. Reported after the loop.
+                        stranded.push((slug.to_string(), host_node.clone()));
                         continue;
                     };
+                    // The same failure one step earlier: the host is known but
+                    // advertises no public address, so neither an A nor an AAAA
+                    // can be written for it (every macOS launchd node is in this
+                    // bucket today).
+                    if node.public_ip.is_none() && node.public_ip6.is_none() {
+                        addressless.push((slug.to_string(), host_node.clone()));
+                    }
                     if let Some(ip) = &node.public_ip {
                         db_desired.push(DesiredRecord {
                             name: slug.into(),
@@ -2859,6 +2885,77 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                             ttl: 60,
                         });
                     }
+                }
+                // ---- Stranded-database detection: OBSERVE ONLY, never repair ----
+                // Two facts make this the whole admissible response:
+                // 1. It is not fixable in DNS. `db_gateway` splices to
+                //    `127.0.0.1:<local_port>` on the SAME node with no forward
+                //    hop, so falling back to the wildcard cannot rescue a
+                //    stranded slug — deleting the stale A record to achieve
+                //    that was implemented and refuted
+                //    (`db-dns-omitted-owner-hold-defeat`).
+                // 2. It is a DATA-PLACEMENT fact, not a DNS fact. Managed-DB
+                //    payloads are node-local and never replicate — only the
+                //    catalog row does — so the bytes went with the host.
+                // Re-provisioning under the same slug would therefore hand the
+                // tenant an EMPTY database their app reconnects to happily,
+                // which is strictly worse than an honest failure, and it would
+                // destroy the old data's last claim to the name. So: report,
+                // level-triggered, and leave the decision to the operator.
+                for (slug, host) in &stranded {
+                    tracing::error!(
+                        slug = %slug,
+                        host_node = %host,
+                        "database stranded: its host_node has left the registry, so no valid A \
+                         record exists for it and no node can serve it. The data lives only on \
+                         that (vanished) node — OPERATOR DECISION REQUIRED; nothing was \
+                         re-hosted and nothing was deleted"
+                    );
+                }
+                for (slug, host) in &addressless {
+                    tracing::warn!(
+                        slug = %slug,
+                        host_node = %host,
+                        "database unpublishable: its host is in the registry but advertises no \
+                         public address, so no A/AAAA record can be written for it"
+                    );
+                }
+                if stranded.is_empty() && addressless.is_empty() {
+                    cloud.incidents.clear(
+                        DB_STRANDED_CONDITION,
+                        "every managed database's host is present in the registry and advertises a \
+                         public address",
+                    );
+                } else {
+                    let mut affected: Vec<String> = stranded
+                        .iter()
+                        .chain(addressless.iter())
+                        .map(|(slug, host)| format!("{slug}@{host}"))
+                        .collect();
+                    affected.sort();
+                    affected.dedup();
+                    let message = format!(
+                        "{} managed database(s) cannot be given a valid <slug>.{} A record: {} sit \
+                         on a host_node that has LEFT the registry (their data lived only on that \
+                         node, which no longer exists — presumed unrecoverable without the cloud \
+                         account's own disk/snapshot), {} on a host in the registry that advertises \
+                         no public address. Recovery needs the host or its disk/volume back: \
+                         re-provisioning under the same slug yields an EMPTY database under the same \
+                         name. Nothing was deleted, re-hosted or truncated — operator decision.",
+                        stranded.len() + addressless.len(),
+                        cloud.db_domain,
+                        stranded.len(),
+                        addressless.len(),
+                    );
+                    cloud.incidents.open(crate::incidents::OpenReq {
+                        title: "Managed database stranded on a host that cannot be published"
+                            .to_string(),
+                        severity: crate::incidents::Severity::Critical,
+                        affected,
+                        message,
+                        condition: DB_STRANDED_CONDITION.to_string(),
+                        ttl_ms: DB_STRANDED_TTL_MS,
+                    });
                 }
                 let managed_refs: Vec<&str> = managed.iter().map(|s| s.as_str()).collect();
                 if let Err(e) = reconcile_zone(

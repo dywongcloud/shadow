@@ -1401,6 +1401,38 @@ fn with_external_endpoint(
     conn
 }
 
+/// Whether `host` can actually carry a managed database's public endpoint.
+///
+/// A managed database is reachable ONLY through its own `<slug>.{db_domain}`
+/// A record, and that record is published from `host_node`'s public address
+/// (the DB zone in `vercel_dns`). `db_gateway` then splices the connection to
+/// `127.0.0.1:<local_port>` on that SAME node with no forward hop, so a host
+/// that has left `registry.nodes()` strands the database permanently: there is
+/// no address left to publish and no node that can serve it. Measured
+/// 2026-10-09 — 4 of 18 databases sat on `fc-hongkong`, `fc-sanjose-2`,
+/// `fc-sanjose-cvm-1` and `fc-virginia-4`, none present in the registry any
+/// more (`hive_retired=true`: the instance no longer exists), each still
+/// advertising `status: ready` behind a stale A record.
+///
+/// A node that IS in the registry but advertises no public address is the same
+/// failure one step earlier (every macOS launchd node has `public_ip: None`),
+/// so it is inadmissible for the same reason — and that is why this is one
+/// predicate both `admin::database_create` and `vercel_dns` read, rather than
+/// a check each call site re-derives.
+///
+/// This answers reachability only. It says nothing about whether the bytes on
+/// `host` still exist, and nothing here may act on a false result beyond
+/// refusing to place NEW work there: re-hosting a stranded database under the
+/// same slug produces an EMPTY database the tenant's app happily reconnects
+/// to, which is a worse outcome than an honest failure.
+pub fn db_host_admissible(cloud: &crate::state::CloudState, host: &str) -> bool {
+    cloud
+        .registry
+        .nodes()
+        .iter()
+        .any(|n| n.name == host && (n.public_ip.is_some() || n.public_ip6.is_some()))
+}
+
 /// Provision a database. Returns the record immediately (status=provisioning)
 /// and finishes the backing service in the background.
 pub fn provision(
