@@ -38,8 +38,10 @@ for tool in "$AR_BIN" "$RANLIB_BIN" "$STRIP_BIN"; do
   [ -x "$tool" ] || { echo "FATAL: missing $tool (brew install llvm)"; exit 1; }
 done
 
-GROUPS=("2.38" "2.39")
-if [ "${1:-}" = "2.38" ] || [ "${1:-}" = "2.39" ]; then GROUPS=("$1"); fi
+# NOTE: not named `GROUPS` -- that is a special array in zsh, and assigning
+# "2.38"/"2.39" to it yields coerced integers, not the glibc versions.
+TARGET_GROUPS=("2.38" "2.39")
+if [ "${1:-}" = "2.38" ] || [ "${1:-}" = "2.39" ]; then TARGET_GROUPS=("$1"); fi
 CLEAN=0
 for a in "$@"; do [ "$a" = "--clean-jemalloc" ] && CLEAN=1; done
 
@@ -68,7 +70,7 @@ sys.exit(0 if sym and dbg == 0 else 1)
 PY
 }
 
-for G in "${GROUPS[@]}"; do
+for G in "${TARGET_GROUPS[@]}"; do
   TRIPLE="x86_64-unknown-linux-gnu.$G"
   echo "== building glibc $G ($TRIPLE) =="
   if [ "$CLEAN" = 1 ]; then
@@ -78,7 +80,11 @@ for G in "${GROUPS[@]}"; do
   AR="$AR_BIN" RANLIB="$RANLIB_BIN" CARGO_PROFILE_RELEASE_STRIP=none \
     cargo zigbuild --release --target "$TRIPLE" -p hive-cloud
 
-  SRC="target/$TRIPLE/release/hive-cloud"
+  # cargo names the target directory from the ABI-STRIPPED triple: both
+  # `...gnu.2.38` and `...gnu.2.39` build into `x86_64-unknown-linux-gnu/`.
+  # So each group's binary is copied out to /tmp immediately below, before the
+  # next group's build overwrites it in place.
+  SRC="target/x86_64-unknown-linux-gnu/release/hive-cloud"
   OUT="/tmp/hive-cloud-$G"
   [ -f "$SRC" ] || { echo "FATAL: no artifact at $SRC"; exit 1; }
   cp "$SRC" "$OUT"
