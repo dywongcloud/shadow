@@ -410,3 +410,47 @@ platform never implemented `wait_for_cross_process_exit`/`spawn_cross_process_ex
 exits 101 `unreachable!`); a 45-line waitpid spike got as far as `threads should not terminate unexpectedly`. Re-pin
 only after that lands, then drop this patch. Incidental, not fork-related, still open: the `time` builtin prints
 garbled user/sys times (rusage/`wait4`), and every litebox runner burns 25-100% of a core idle (net poll thread).
+
+## 2026-10-09: TCP keep-alive patch (`tcp-keepalive.patch`) -- an in-flight connect must not die on TCP_KEEPIDLE
+
+Applied THIRD, AFTER `networking.patch` and `fork-inplace.patch`, by the role
+(`git apply ../litebox-tcp-keepalive.patch`). Touches only
+`litebox_shim_linux/src/syscalls/net.rs` (61-line diff, 2 hunks).
+
+**The bug.** `setsockopt(TCP_KEEPIDLE)` / `TCP_KEEPCNT` (and `TCP_KEEPINTVL`) were answered
+`EOPNOTSUPP`. libuv's `uv__tcp_keepalive` -- which backs Node's `socket.setKeepAlive` and therefore
+undici's global `fetch` -- issues `SO_KEEPALIVE` and then these options immediately after
+`connect()`, while the socket is still in SYN_SENT. A kernel stack accepts all of them and lets the
+connect finish; returning `EOPNOTSUPP` here made libuv fail the *pending connect* with ENOTSUP, so
+every Node outbound `fetch()` in a guest failed before the TCP handshake could complete.
+
+**The change.** All three are accepted and ignored (a `debug!` line, then `Ok(())`), and the old
+`TcpOption::KEEPINTVL` arm that forwarded the value into smoltcp's `set_keep_alive` is removed.
+Ignoring rather than applying is deliberate, not laziness: `uv_tcp_keepalive` is
+`uv_tcp_keepalive_ex(handle, on, idle, 1, 10)` -- a HARDCODED 1-second interval -- so an applied
+value produces real probes, one per second per idle socket across undici's connection pool. The
+2-hour default that `SO_KEEPALIVE` already installs is kept. `TCP_INFO` stays `EOPNOTSUPP` (it is
+get-only on Linux).
+
+**Why a third patch file instead of folding it into `networking.patch`.** It is a different defect
+class (socket-option errno policy, not addressing/guest-IP configuration), it has to land AFTER the
+other two so the role's apply order stays meaningful, and a re-diff of one must not invalidate the
+others when the pin moves.
+
+**Verified 2026-10-09** (see PRD `litebox-tcp-keepalive-third-patch`): all three patches
+`git apply --check` cleanly, in order, against a clean clone of the pin `c325d5d9`; the resulting
+tree is byte-identical to the deployed `/root/litebox-fix-src` on fc-sanjose
+(`diff -rq --exclude=target --exclude=.git` -> no differences; `net.rs` sha256
+`5465f8971e55a15d54c65dea5688650ffdaeb3409c4412259852ace2ce79e36c` on both sides). Deployed runner
+sha256 `6ae607e8dd783a6062caf766f09c7ace75ea0bfb7319e03e18d51c3c6318f6c0` (glibc 2.39) on both live
+litebox nodes, fc-phoenix first and fc-sanjose last. Live: `TCP_KEEPIDLE`/`TCP_KEEPCNT` now return
+OK instead of errno 95, a Node global `fetch` to a single-A-record destination completes (308 round
+trip), and `getsockopt(TCP_KEEPINTVL)` after setting 1 returns 7200 -- the 2-hour default survives,
+so there is no probe-per-second.
+
+**Note on the pin.** This patch was re-diffed against the pinned `c325d5d9` tree ON TOP OF the other
+two patches, from the tree that produced the deployed binary. It contains nothing else: the two
+committed patches account for exactly the other eight modified files in that tree
+(`litebox/src/fs/{in_mem,layered,resolver}.rs`, `litebox/src/net/mod.rs`,
+`litebox_runner_linux_userland/src/lib.rs`, `litebox_shim_linux/src/{lib.rs, syscalls/mm.rs,
+syscalls/process.rs}`), so `net.rs` is the only file this patch adds.

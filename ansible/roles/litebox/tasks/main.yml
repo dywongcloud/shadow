@@ -110,6 +110,33 @@
       -- re-diff it. Building without it would ship the wedge-on-the-second-
       external-command sandbox shell back.
 
+- name: Copy the TCP keep-alive patch to the target host (setsockopt(TCP_KEEPIDLE/KEEPCNT/KEEPINTVL) must not fail an in-flight connect)
+  ansible.builtin.copy:
+    src: tcp-keepalive.patch
+    dest: "{{ litebox_src_dir }}/../litebox-tcp-keepalive.patch"
+    mode: "0644"
+
+- name: Apply it on top of the networking + fork patches (same idempotency argument -- the clone above resets tracked files every run)
+  ansible.builtin.command:
+    cmd: git apply ../litebox-tcp-keepalive.patch
+    chdir: "{{ litebox_src_dir }}"
+  register: _keepalive_patch_apply
+  changed_when: true
+  failed_when: false
+
+- name: Fail loudly if the keep-alive patch no longer applies cleanly (litebox_commit moved -- re-diff files/tcp-keepalive.patch, see files/PATCHES.md)
+  ansible.builtin.assert:
+    that: _keepalive_patch_apply.rc == 0
+    fail_msg: >-
+      files/tcp-keepalive.patch (see files/PATCHES.md, "TCP keep-alive patch")
+      no longer applies cleanly on top of networking.patch + fork-inplace.patch
+      against litebox_commit={{ litebox_commit }}:
+      {{ _keepalive_patch_apply.stderr }} -- re-diff it. Building without it
+      would ship the ENOTSUP-on-TCP_KEEPIDLE bug back: libuv's
+      uv__tcp_keepalive (Node's socket.setKeepAlive, and therefore undici's
+      global fetch) sets these while the connect is still in SYN_SENT, and
+      EOPNOTSUPP there fails the PENDING connect.
+
 - name: Build litebox_runner_linux_userland (release) -- long-running, first build is the slow one
   ansible.builtin.command:
     cmd: cargo build --release --bin litebox_runner_linux_userland
