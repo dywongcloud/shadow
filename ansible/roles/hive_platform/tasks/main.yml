@@ -54,6 +54,42 @@
   register: _build
   notify: restart hive-node
 
+# The cell agent runs as PID 1 INSIDE the guest, whose glibc comes from the OCI
+# base image (node:20-slim = Debian bookworm, glibc 2.36) and has nothing to do
+# with this build host's. A dynamically-linked agent therefore binds to a glibc
+# version the guest does not ship: witnessed 2026-10-09 on fc-orlando, where the
+# agent required GLIBC_2.39 against a 2.36 guest and every Firecracker cell died
+# with "version `GLIBC_2.39' not found" then "Kernel panic - not syncing:
+# Attempted to kill init!". The agent is baked into the rootfs as /sbin/init, so
+# it must carry its own libc. Only this crate is relinked -- hive-cloud stays
+# dynamically linked against the host glibc it was built for.
+- name: Relink the cell agent statically (it is the guest's PID 1)
+  ansible.builtin.command:
+    cmd: >-
+      cargo rustc --release -p hive-cell-agent --
+      -C target-feature=+crt-static
+    chdir: "{{ hive_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TARGET_DIR: "{{ hive_cargo_target_dir }}"
+  async: 1800
+  poll: 15
+
+- name: Confirm the cell agent carries no dynamic interpreter
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import struct,sys;
+      h=open(sys.argv[1],'rb').read(64);
+      off,=struct.unpack_from('<Q',h,0x20);
+      cnt,=struct.unpack_from('<H',h,0x38);
+      f=open(sys.argv[1],'rb'); f.seek(off);
+      ph=[struct.unpack('<II',f.read(8)) for _ in range(cnt)];
+      sys.exit(1 if any(t==3 for t,_ in ph) else 0)"
+      {{ hive_cargo_target_dir }}/release/hive-cell-agent
+  register: _agent_static
+  changed_when: false
+  failed_when: _agent_static.rc != 0
+
 - name: Confirm the controller binary was produced
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"

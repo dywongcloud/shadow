@@ -91,6 +91,36 @@ preflight_agent() {
     echo "missing non-symlink executable agent binary at $AGENT_BIN (run the backend packaging role first)" >&2
     return 1
   }
+  # The agent becomes /sbin/hive-cell-agent -- the guest's PID 1 -- so it must
+  # run against whatever libc the OCI base image happens to ship, which is
+  # unrelated to the build host. A dynamically-linked agent binds to the build
+  # host's glibc version and the guest usually does not have it: witnessed
+  # 2026-10-09 on fc-orlando, where the agent needed GLIBC_2.39 and the
+  # node:20-slim (bookworm) guest had 2.36, so every Firecracker cell died with
+  # "version `GLIBC_2.39' not found" followed by "Kernel panic - not syncing:
+  # Attempted to kill init!". Refuse the bake instead of shipping a rootfs that
+  # boots to a panic -- this is the one place every agent reaches the guest, so
+  # it is the only place that can catch the whole class.
+  if ! python3 - "$AGENT_BIN" <<'PYSTATIC'
+import struct, sys
+with open(sys.argv[1], "rb") as handle:
+    header = handle.read(64)
+if header[:4] != b"\x7fELF":
+    raise SystemExit("cell agent is not an ELF executable")
+phoff, = struct.unpack_from("<Q", header, 0x20)
+phentsize, phnum = struct.unpack_from("<HH", header, 0x36)
+with open(sys.argv[1], "rb") as handle:
+    handle.seek(phoff)
+    types = [struct.unpack_from("<I", handle.read(phentsize), 0)[0] for _ in range(phnum)]
+# PT_INTERP (3) present => the loader, and therefore the guest's glibc, decides
+# whether this binary runs at all.
+if 3 in types:
+    raise SystemExit("cell agent is dynamically linked")
+PYSTATIC
+  then
+    echo "refusing to bake a cell agent that is not self-contained (build it with -C target-feature=+crt-static)" >&2
+    return 1
+  fi
   [ -f "$AGENT_RELEASE_FACT" ] && [ ! -L "$AGENT_RELEASE_FACT" ] || {
     echo "missing cell-agent release fact at $AGENT_RELEASE_FACT (run the backend packaging role first)" >&2
     return 1

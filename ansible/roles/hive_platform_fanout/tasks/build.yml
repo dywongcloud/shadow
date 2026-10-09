@@ -90,6 +90,38 @@
   async: 1800
   poll: 15
 
+# Same reason as hive_platform's relink: /sbin/hive-cell-agent is the guest's
+# PID 1 and the guest glibc is the OCI base image's, not this lane host's. A
+# dynamic agent required GLIBC_2.39 against a bookworm (2.36) guest and panicked
+# every Firecracker cell on fc-orlando (2026-10-09). Only the agent is relinked;
+# hive-cloud keeps the host glibc it was built against.
+- name: Relink the cell agent statically on this glibc lane
+  ansible.builtin.command:
+    cmd: >-
+      cargo rustc --release -p hive-cell-agent --
+      -C target-feature=+crt-static
+    chdir: "{{ hive_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TARGET_DIR: "{{ hive_cargo_target_dir }}"
+  async: 1800
+  poll: 15
+
+- name: Confirm the lane cell agent carries no dynamic interpreter
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import struct,sys;
+      h=open(sys.argv[1],'rb').read(64);
+      off,=struct.unpack_from('<Q',h,0x20);
+      cnt,=struct.unpack_from('<H',h,0x38);
+      f=open(sys.argv[1],'rb'); f.seek(off);
+      ph=[struct.unpack('<II',f.read(8)) for _ in range(cnt)];
+      sys.exit(1 if any(t==3 for t,_ in ph) else 0)"
+      {{ hive_cargo_target_dir }}/release/hive-cell-agent
+  register: _agent_static
+  changed_when: false
+  failed_when: _agent_static.rc != 0
+
 - name: Confirm and checksum the canonical controller
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
