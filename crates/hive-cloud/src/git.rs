@@ -10705,18 +10705,19 @@ async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
     )
 }
 
-fn cache_hash_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
-    use sha2::Digest;
-    hasher.update((label.len() as u64).to_le_bytes());
-    hasher.update(label.as_bytes());
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
-}
-
 /// Cache identity binds every authority and executable-input dimension. A
 /// production key cannot name a preview/fork artifact because the signed key
 /// commits to the lane as well as tenant, canonical and actual repositories,
 /// lock inputs, selected toolchain, and build policy.
+///
+/// `hive-build-cache-v4` is BLAKE3 ([`fluid_core::ContentHasher`]); v3 was
+/// SHA-256. This is the one digest in the tree a switch is safe on by
+/// construction: the key is a LOOKUP into a cache, so every already-written
+/// v3 entry simply misses once and is rebuilt — a miss is never a corruption,
+/// never a false integrity failure, and never an orphaned stored object. Any
+/// digest that NAMES stored bytes (a runtime-artifact store directory, a
+/// browser-artifact filename, a GC keep-set entry) is the opposite case and
+/// deliberately keeps its writer on the algorithm that produced it.
 async fn compute_cache_key(
     install_dir: &Path,
     pm: &str,
@@ -10726,28 +10727,21 @@ async fn compute_cache_key(
     policy: &str,
     build_env: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    cache_hash_field(&mut hasher, "domain", b"hive-build-cache-v3");
-    cache_hash_field(&mut hasher, "tenant", tenant.as_bytes());
-    cache_hash_field(
-        &mut hasher,
-        "canonical-repo",
-        trust.canonical_repo.as_bytes(),
-    );
-    cache_hash_field(&mut hasher, "actual-repo", trust.actual_repo.as_bytes());
-    cache_hash_field(
-        &mut hasher,
-        "trust-lane",
-        trust.lane.cache_label().as_bytes(),
-    );
-    cache_hash_field(&mut hasher, "package-manager", pm.as_bytes());
-    cache_hash_field(&mut hasher, "toolchain", toolchain.as_bytes());
-    cache_hash_field(&mut hasher, "policy", policy.as_bytes());
+    let mut hasher = fluid_core::ContentHasher::new(b"hive-build-cache-v4");
+    hasher.field("tenant", tenant.as_bytes());
+    hasher.field("canonical-repo", trust.canonical_repo.as_bytes());
+    hasher.field("actual-repo", trust.actual_repo.as_bytes());
+    hasher.field("trust-lane", trust.lane.cache_label().as_bytes());
+    hasher.field("package-manager", pm.as_bytes());
+    hasher.field("toolchain", toolchain.as_bytes());
+    hasher.field("policy", policy.as_bytes());
     for (key, value) in build_env {
-        cache_hash_field(&mut hasher, "build-env-key", key.as_bytes());
-        let value_digest = Sha256::digest(value.as_bytes());
-        cache_hash_field(&mut hasher, "build-env-value-sha256", &value_digest);
+        hasher.field("build-env-key", key.as_bytes());
+        // Folded through the same shared primitive rather than pulling a hash
+        // crate into this crate: one BLAKE3 implementation, one place to audit.
+        let value_digest =
+            fluid_core::content_hash(b"hive-build-cache-v4-env-value", value.as_bytes());
+        hasher.field("build-env-value-blake3", value_digest.as_bytes());
     }
 
     let mut found = false;
@@ -10760,20 +10754,14 @@ async fn compute_cache_key(
         "package.json",
     ] {
         if let Ok(bytes) = tokio::fs::read(install_dir.join(name)).await {
-            cache_hash_field(&mut hasher, name, &bytes);
+            hasher.field(name, &bytes);
             found = true;
         }
     }
     if !found {
         return None;
     }
-    Some(
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    Some(hasher.finish())
 }
 
 // ---- #22 build-artifact integrity + authenticity --------------------------

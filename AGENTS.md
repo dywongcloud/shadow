@@ -455,4 +455,97 @@ memories/notes whose durable content it absorbed.
   in add/import/zone-parse so the proof channel is unforgeable; wildcards follow
   RFC 4592 (never at the apex, never over reserved names).
 
+## Hashing: content identity vs. security binding
+
+**BLAKE3 is the platform content-addressing hash.** `fluid_core::content_hash`
+/ `ContentHasher` mint every NEW content identity; `fluid_core::verify_content`
+verifies a stored digest under EITHER BLAKE3 or the legacy hex(SHA-256) over
+the same domain. Nothing here is a flag day.
+
+**hex(BLAKE3) and hex(SHA-256) are both 64 lowercase hex characters**, so no
+shape check anywhere in the tree can tell them apart — `validate_sha256`,
+`validate_digest`, `is_hex64` all prove shape and never algorithm. That is the
+whole hazard: a rehash is undetectable by inspection, so it must be detectable
+by construction. `verify_content` is the ONLY thing allowed to decide which
+algorithm a stored digest came from.
+
+**A digest that NAMES stored bytes must not have its writer flipped** until
+every reader dual-accepts: a runtime-artifact store directory, a content-
+addressed filename, a GC keep-set entry. Flipping one makes every object
+already written read as a miss or an orphan. A digest that is only a LOOKUP
+KEY (the build cache key, `hive-build-cache-v4`) is the exception — a miss is
+merely a miss, so it moved to BLAKE3.
+
+### Exclusion list — SECURITY BINDINGS, never touch the algorithm
+
+The hash is the security property here, not an identifier for content.
+
+- **Signatures (ed25519).** `hive-cloud/src/integrity_signer.rs:19,24,47,60,80`
+  (per-node keypair; `:80` signs the chain head) ·
+  `hive-core/src/integrity.rs:32,161,168,180` — **this SHA-256 chain fold looks
+  like content addressing and is not**: its output is the message
+  `integrity_signer.rs:79` signs, so changing the fold invalidates every
+  signature ever made. · `hive-p2p/src/lib.rs:319,328,379,729` (gossip
+  signature domain + verify) · `hive-cloud/src/gossip.rs:2017` ·
+  `hive-cloud/src/browser_admission.rs:785,1034,1826` ·
+  `hive-browser/src/lib.rs:1174,1331,1340,1359,1372,1387,2503,2565` ·
+  `hive-p2p/src/dht.rs:33` · `hive-cloud/src/discovery.rs:16` ·
+  `hive-cloud/src/admin.rs:8692` (transport identity stays classical ed25519 —
+  no ML-DSA enrollment exists in this tree).
+- **MAC / HMAC.** `hive-cloud/src/admin.rs:8061,8067` (`hmac_sha256`, shared by
+  GitHub + Stripe webhook verification) · `hive-cloud/src/main.rs:1681,4064`
+  (mesh hot-join HMAC over the endpoint id) ·
+  `hive-cloud/src/git.rs:10825,10851,10863,10879` (artifact authenticity
+  signature) · `webhooks.rs:15,186` · `billing.rs:1480,1854` ·
+  `db_rest.rs:1374` · `tencent_eip.rs:28,303-338` (TC3-HMAC-SHA256) ·
+  `hive-p2p/src/lib.rs:329,3858`.
+- **TLS / certificates.** `hive-cloud/src/acme.rs:284-290` (`FleetTicketer`,
+  key derived from `HIVE_SECRET_KEY`) and `acme.rs:1262` (ACME key
+  authorization / JWK thumbprint).
+- **Credential hashing.** `apikeys.rs:10,13` ·
+  `browser_db_rest.rs:138-141,209,256` (bearer-token hash, a DB lookup key) ·
+  `drive_api.rs:485-489,529,588,646,673` (share tokens + WebDAV passwords) ·
+  `world.rs:1096-1101,1054` (hook-token index) · `enterprise.rs:281-324`
+  (Argon2id is current; the legacy `sha256(project ":" password)` verify branch
+  must keep working for every value already stored) · `zkauth.rs:44,265` and
+  `hive-zkauth/src/lib.rs:34,231,243,260` (SHA-512, zk proof).
+- **Handshake / supply-chain proofs.** `hive-backend/src/firecracker.rs:3471`
+  and `hive-cell-agent/src/main.rs:336` (`agent_handshake_transcript`) ·
+  `hive-cloud/src/build_executor.rs:4290` (`runsc.sha256`, checked against a
+  published value) and `:4308` (`image_digest` parses a literal `sha256:` OCI
+  digest — OCI is SHA-256, full stop).
+
+### Content identity — already BLAKE3, do not move
+
+`fluid-core/src/lib.rs:837-838` (`browser_source_digest`) and `:851-905`
+(`browser_policy_digest`, mirrored byte-for-byte in
+`hive-browser/www/function-runtime.js`) ·
+`hive-browser-proto/src/lib.rs:133` (`BLAKE3_DIGEST_LEN = 64`), `:316` ·
+`hive-cloud/src/browser_artifacts.rs:449-462,485-503,954-963` (policy digest is
+the store filename, the route, and the ETag) ·
+`hive-cloud/src/browser_db.rs:1694,1719,1720-1732,1864,2003,2076` (fragment,
+membership and plan digests) · `hive-cloud/src/guardian.rs:3396`
+(`iroh_blobs::Hash` is BLAKE3 internally) ·
+`hive-cloud/src/git.rs:10708-10763` (build cache key, `hive-build-cache-v4`).
+
+### Content identity — still SHA-256, writer deliberately not flipped
+
+Readers dual-accept where marked; the writer stays until every node can verify
+both. `hive-backend/src/runtime_artifact.rs:142,239-243,302,315,1105,1621,2151`
+— `content_sha256` IS the store directory name and binds
+`semantic_tree_sha256`, so a rehash orphans every staged artifact ·
+`hive-cloud/src/deployment_ledger.rs:762` writer / `:805` reader (dual-accept;
+this file already survived fc-phoenix crash-looping 21,679 times on exactly
+this class of change) · `fluid-core/src/lib.rs:3152`
+(`normalized_manifest_sha256`, consumed by `git.rs:5746`,
+`runtime_artifact_transfer_wire.rs:497,519`,
+`runtime_artifact_transfer_sender.rs:107` — all dual-accept) ·
+`fluid-build/src/deployment_snapshot.rs:305` and `repository_snapshot.rs:303`
+(cross-node sealed snapshot digest) · `hive-cloud/src/repository_build.rs:196` ·
+`app_discovery.rs:128` · `build_executor.rs:889` ·
+`billing.rs:677-702` (ledger checkpoint chain).
+
+Verification of this section ran from a scratch crate OUTSIDE the repo against
+the real on-disk ledgers, not a test file — see the commit for the witness.
+
 @.gm/next-step.md

@@ -516,9 +516,15 @@ pub fn decode_verified_manifest(request: &BeginRequest) -> anyhow::Result<fluid_
     if request.manifest_bytes.is_empty() || request.manifest_bytes.len() > MAX_MANIFEST_BYTES {
         bail!("canonical manifest bytes must contain 1..={MAX_MANIFEST_BYTES} bytes");
     }
-    if fluid_core::normalized_manifest_sha256(&request.manifest_bytes)
-        != request.normalized_manifest_sha256
-    {
+    // Dual-algorithm on purpose: a peer may seal its manifest under BLAKE3
+    // once it has moved forward, and this node must still accept it — and keep
+    // accepting the SHA-256 seals every ledger and generation already holds.
+    // Rejecting one algorithm is how a mixed-version fleet turns a roll into
+    // an outage.
+    if !fluid_core::verify_normalized_manifest(
+        &request.manifest_bytes,
+        &request.normalized_manifest_sha256,
+    ) {
         bail!("canonical manifest bytes do not match the normalized manifest digest");
     }
     let manifest: fluid_core::Manifest = serde_json::from_slice(&request.manifest_bytes)

@@ -3157,6 +3157,159 @@ pub fn normalized_manifest_sha256(canonical_manifest: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+//
+// ---------------------------------------------------------------------------
+// Content identity: BLAKE3 for anything newly addressed, legacy SHA-256 still
+// accepted on every read.
+// ---------------------------------------------------------------------------
+//
+// BLAKE3 is already the platform hash where we hash for content addressing
+// ([`browser_source_digest`], [`browser_policy_digest`]) and the two digests
+// are the same width — hex(BLAKE3) and hex(SHA-256) are BOTH 64 lowercase hex
+// characters — so no shape check anywhere in the tree can tell them apart.
+// That is the whole hazard this block exists to contain: a rehash is
+// undetectable by inspection, so it must be detectable by construction.
+//
+// Two rules, and they are not symmetric:
+//
+//   * `content_hash` (BLAKE3) is what NEW addresses are minted with.
+//   * `verify_content` accepts EITHER algorithm, so every digest already
+//     written to disk, gossiped to a peer, or sealed into a ledger keeps
+//     verifying under the algorithm that produced it. Nothing here is a flag
+//     day: a store that holds SHA-256-named objects and one that holds
+//     BLAKE3-named objects verify identically to a reader holding only the
+//     bytes.
+//
+// A digest that names STORED BYTES (a content-addressed filename, a store
+// directory, a GC keep-set key) therefore must NOT switch writers until
+// every reader dual-accepts — otherwise every existing object reads as a
+// miss or as an orphan. See [`ContentHasher`]'s docs for the one place a
+// switch is safe precisely because a miss is not a corruption.
+//
+// SECURITY BOUNDARY — this block is content identity ONLY. It is never a
+// signature, a MAC, a JWT/HMAC, a TLS/certificate input, or a credential
+// hash. Those stay on their own algorithms; see the exclusion list in
+// AGENTS.md. Mixing them is how a content-addressing change silently becomes
+// an authentication change.
+//
+
+/// Domain separator for the platform's general BLAKE3 content-identity
+/// namespace. One namespace, one formula: `domain || bytes`.
+pub const CONTENT_HASH_DOMAIN: &[u8] = b"hive-content-hash-v1\0";
+
+/// Whether `value` is the one canonical shape every platform digest uses: 64
+/// lowercase hexadecimal characters. BLAKE3 and SHA-256 hex are the SAME
+/// width, so this proves shape and never algorithm — [`verify_content`] is
+/// the only thing that may decide which algorithm a stored digest came from.
+pub fn is_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// BLAKE3 (lowercase hex, 64 chars) of `domain || bytes` — the content
+/// identity every NEW address is minted with.
+pub fn content_hash(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// hex(SHA-256) of `domain || bytes` — the LEGACY content identity this
+/// namespace is migrating away from. Kept as a named function so a verifier
+/// states both algorithms explicitly instead of burying one in a fallback
+/// branch, and so a caller can mint a legacy digest deliberately during a
+/// mixed-version roll.
+pub fn legacy_content_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(domain);
+    hash.update(bytes);
+    format!("{:x}", hash.finalize())
+}
+
+/// Verify `bytes` against a stored digest that may be EITHER the current
+/// BLAKE3 [`content_hash`] or the legacy [`legacy_content_sha256`] over the
+/// same `domain`.
+///
+/// This is the coexistence primitive: it is what lets one node mint BLAKE3
+/// addresses while another still holds SHA-256 ones, in any order, with no
+/// coordinated cutover and no digest that starts failing. Rejecting a stored
+/// digest is only correct when NEITHER algorithm reproduces it, which is
+/// also the only honest "these bytes are not what was sealed" signal.
+///
+/// Not constant-time, and does not need to be: a content digest is public
+/// data, and the bytes are already in hand. Anything secret is not content
+/// identity and has no business reaching this function.
+pub fn verify_content(domain: &[u8], bytes: &[u8], stored: &str) -> bool {
+    if !is_hex64(stored) {
+        return false;
+    }
+    // Legacy first: in a mixed fleet almost every stored digest is still
+    // SHA-256, so the common case costs one hash, not two.
+    legacy_content_sha256(domain, bytes) == stored || content_hash(domain, bytes) == stored
+}
+
+/// Verify canonical manifest bytes against a stored normalized-manifest
+/// digest, accepting either algorithm. Same contract as [`verify_content`],
+/// pinned to [`NORMALIZED_MANIFEST_DOMAIN`] so no caller re-types the domain
+/// and drifts from the producer at [`normalized_manifest_sha256`].
+pub fn verify_normalized_manifest(canonical_manifest: &[u8], stored: &str) -> bool {
+    verify_content(NORMALIZED_MANIFEST_DOMAIN, canonical_manifest, stored)
+}
+
+/// Streaming [`content_hash`] for callers that fold many labelled fields into
+/// one digest rather than hashing one contiguous buffer.
+///
+/// The field encoding is length-delimited in BOTH directions — `u64le label
+/// length || label || u64le value length || value` — so no field boundary is
+/// ambiguous and two different field sets can never collide. That encoding
+/// was already open-coded in two places (`git::compute_cache_key` and
+/// `build_executor::policy_digest`); this is the shared form of it.
+///
+/// A `ContentHasher` digest is safe to switch algorithms on ONLY where the
+/// digest is a lookup key and a miss is merely a miss (a build cache key,
+/// say). Where the digest NAMES stored bytes — a store directory, a
+/// content-addressed filename, a GC keep-set entry — switching makes every
+/// already-written object unreachable, so leave the writer alone.
+pub struct ContentHasher {
+    hasher: blake3::Hasher,
+}
+
+impl ContentHasher {
+    /// Start a digest in the given domain. Every caller passes its own
+    /// domain — including a version — so a caller can move to BLAKE3 by
+    /// bumping its domain string instead of silently reinterpreting an old
+    /// one.
+    pub fn new(domain: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        Self { hasher }
+    }
+
+    /// Fold one labelled field in, length-delimited on both sides.
+    pub fn field(&mut self, label: &str, value: &[u8]) {
+        self.hasher.update(&(label.len() as u64).to_le_bytes());
+        self.hasher.update(label.as_bytes());
+        self.hasher.update(&(value.len() as u64).to_le_bytes());
+        self.hasher.update(value);
+    }
+
+    /// Fold opaque bytes in with no label. Use only where the caller has
+    /// already established the framing (a file's whole contents, say).
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    /// The digest, lowercase hex. Takes `&self` so a caller can fork a prefix
+    /// and keep extending, which is what makes incremental cache keys cheap.
+    pub fn finish(&self) -> String {
+        self.hasher.finalize().to_hex().to_string()
+    }
+}
+
 /// Strict deploy-time protocol validation for raw `fluid.json` text: walk
 /// every `functions[*].protocol` and `functions[*].ports[*].protocol` string
 /// in the RAW JSON and reject unrecognized values via the strict

@@ -758,11 +758,32 @@ fn canonical_bytes(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(value).context("serialize deployment ledger value")
 }
 
+/// Mint the checksum a NEWLY WRITTEN ledger carries.
+///
+/// Still SHA-256, and deliberately so: this digest is written to disk by this
+/// node and read back by every other node in the fleet, including nodes still
+/// running the previous binary. Flipping the writer is a flag day no rolling
+/// deploy can express — an old reader would reject a BLAKE3 checksum it
+/// cannot reproduce, which is exactly how fc-phoenix crash-looped 21,679
+/// times over ~20 h (see the note at the read site below). The READ side
+/// already accepts both, so the writer flip is safe the moment every node has
+/// taken this change and not before.
 fn raw_payload_checksum(payload_json: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(CHECKSUM_DOMAIN);
     digest.update(payload_json);
     format!("{:x}", digest.finalize())
+}
+
+/// Dual-algorithm read-side twin of [`raw_payload_checksum`]: accepts a stored
+/// checksum minted by EITHER algorithm over [`CHECKSUM_DOMAIN`].
+///
+/// This is the whole point of the coexistence shape. Once every node can
+/// verify both, the writer can move to BLAKE3 in any order with no ledger
+/// anywhere failing — a node that has already flipped and one that has not
+/// still agree on every file either of them wrote.
+fn raw_payload_checksum_matches(payload_json: &[u8], stored: &str) -> bool {
+    fluid_core::verify_content(CHECKSUM_DOMAIN, payload_json, stored)
 }
 
 fn payload_checksum(payload: &LedgerPayload) -> anyhow::Result<String> {
@@ -801,8 +822,13 @@ fn load_payload(path: &Path) -> anyhow::Result<Option<LedgerPayload>> {
     // earlier binary fails closed on the next one: fc-phoenix crash-looped
     // 21,679 times over ~20 h after `integrity_chain` was added, with the file
     // byte-for-byte intact.
+    //
+    // Dual-algorithm: a checksum minted by EITHER SHA-256 or BLAKE3 over
+    // CHECKSUM_DOMAIN verifies. A mismatch is therefore only ever "these bytes
+    // are not what was sealed", never "someone changed the algorithm" — which
+    // is the failure this file has already lived through once.
     anyhow::ensure!(
-        raw_payload_checksum(stored.payload.get().as_bytes()) == stored.checksum_sha256,
+        raw_payload_checksum_matches(stored.payload.get().as_bytes(), &stored.checksum_sha256),
         "deployment ledger checksum mismatch"
     );
     let payload: LedgerPayload =

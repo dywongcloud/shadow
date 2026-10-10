@@ -104,9 +104,12 @@ impl TransferGeneration {
         let snapshot_bytes = snapshot
             .canonical_contract_bytes()
             .context("encode deployment build snapshot before transfer")?;
-        if fluid_core::normalized_manifest_sha256(&manifest_bytes)
-            != snapshot.contract().authority.normalized_manifest_sha256()
-        {
+        // Dual-algorithm on the read side for the same reason the receiver is:
+        // a sealed authority minted under either hash must still re-prove.
+        if !fluid_core::verify_normalized_manifest(
+            &manifest_bytes,
+            snapshot.contract().authority.normalized_manifest_sha256(),
+        ) {
             bail!("canonical manifest bytes do not match the sealed build authority");
         }
 
