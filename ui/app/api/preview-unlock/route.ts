@@ -50,6 +50,26 @@ function unlockError(status: number, stage: "enroll" | "mint"): string {
 }
 
 /**
+ * The configured platform owner(s).
+ *
+ * `HIVE_OWNER_EMAIL` is a COMMA-SEPARATED list (ansible's
+ * `hive_owner_email` is `"ops@{{ hive_platform_domain }},dylanwong007@gmail.com"`),
+ * and `/api/token` already reads it that way (`OWNER_EMAILS`). Treating it as one
+ * address here made the whole string the only accepted value, so the list form
+ * matched nobody and EVERY personal-namespace unlock was denied — previews
+ * broken for the owner. Parse it into a set exactly like `/api/token` does.
+ */
+function ownerEmails(): Set<string> {
+  return new Set(
+    (process.env.HIVE_OWNER_EMAIL || "")
+      .toLowerCase()
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
  * A personal namespace belongs to exactly ONE user, so membership in it can be
  * checked directly rather than through Clerk orgs.
  *
@@ -57,19 +77,19 @@ function unlockError(status: number, stage: "enroll" | "mint"): string {
  * check entirely, which meant ANY signed-in user could unlock a preview whose
  * team was `personal` — including another person's private deployments.
  * Per-user namespaces (`u_<clerkUid>`) are matched exactly. The legacy shared
- * `personal` tenant belongs to the platform owner, so it's checked against
+ * `personal` tenant belongs to the platform owner(s), so it's checked against
  * HIVE_OWNER_EMAIL when that is configured; with no owner configured we keep
  * the previous permissive behavior rather than locking everyone out.
  */
 async function personalAccessOk(team: string, userId: string): Promise<boolean> {
   if (team.startsWith("u_")) return team === `u_${userId}`;
-  const owner = (process.env.HIVE_OWNER_EMAIL || "").trim().toLowerCase();
-  if (!owner) return true;
+  const owners = ownerEmails();
+  if (owners.size === 0) return true;
   try {
     const client = (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient) as any;
     const u = await client.users.getUser(userId);
     const emails: string[] = (u?.emailAddresses ?? []).map((e: any) => String(e?.emailAddress || "").toLowerCase());
-    return emails.includes(owner);
+    return emails.some((e) => owners.has(e));
   } catch {
     // Never convert an identity-service hiccup into a lockout.
     return true;
