@@ -202,7 +202,17 @@ require_table(bridge_rows, "bridge", capability["nft_bridge_table"])
 inet_chains = {row["name"]: row for row in records(inet_rows, "chain")}
 bridge_chains = {row["name"]: row for row in records(bridge_rows, "chain")}
 expected_chains = {
-    "executor_to_host": ("input", 10, "accept"),
+    # `executor_to_host` runs at -50, BEFORE a host input chain that has
+    # `priority filter` (0) and `policy drop` -- a vendor/cloud image (e.g.
+    # Atlantic.Net's `ip filter INPUT`) would otherwise drop the packet
+    # before this table's own deny counters could ever see it, so the role's
+    # denial probes measured 0 packets and provisioning failed closed. It
+    # also runs after `inet hive_lockdown` (-100), so the fleet's generated
+    # peer policy still decides first. Keep these priorities in lockstep with
+    # hive-build-executor.nft.j2: this verifier is the check that the LIVE
+    # table still matches the reviewed policy, so a drift here is a refusal,
+    # not a warning.
+    "executor_to_host": ("input", -50, "accept"),
     "executor_forward": ("forward", 10, "accept"),
 }
 if set(inet_chains) != set(expected_chains) or set(bridge_chains) != {"executor_lateral"}:

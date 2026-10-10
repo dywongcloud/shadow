@@ -1282,10 +1282,20 @@ impl BuildExecutor {
             .await?;
         require_success("start build container", &started)?;
 
+        // The workspace-prep exec runs with `WORKSPACE_MOUNT` as its working
+        // directory, never `SOURCE_ROOT`: this exec is the thing that CREATES
+        // `/workspace/source`, and `podman exec --workdir <path>` chdirs into
+        // <path> before running anything, so asking for SOURCE_ROOT here makes
+        // the runtime refuse before the shell ever starts ("failed to find
+        // initial working directory \"/workspace/source\": no such file or
+        // directory" — reproduced live on fc-orlando 2026-10-09, and it fails
+        // identically under runc, so this path could never have completed a
+        // repository build on any node). The script uses absolute paths only,
+        // so the mount root is the correct and sufficient cwd.
         let prep = self
             .exec_fixed(
                 &container,
-                SOURCE_ROOT,
+                WORKSPACE_MOUNT,
                 "set -eu; mkdir -p /workspace/source /workspace/home; test -w /workspace/source",
                 &[],
                 Duration::from_secs(20),
@@ -1293,18 +1303,19 @@ impl BuildExecutor {
             .await?;
         require_success("prepare build workspace", &prep)?;
 
-        let mut source = checkout.into_os_string();
-        source.push("/.");
+        // `podman cp` cannot import the checkout here: it writes through the
+        // container's ROOTFS, and the builder runs `--read-only` with its
+        // workspace on a SEPARATE tmpfs volume, so podman resolves the
+        // destination against a rootfs that has no `/workspace` at all and is
+        // read-only anyway ("could not be found on container", then "read-only
+        // file system" — reproduced live on fc-orlando 2026-10-09; this is a
+        // property of `--read-only` plus a volume-mounted destination, not of
+        // any one OCI runtime, so this import has never succeeded anywhere).
+        // Stream a tar through `podman exec -i` instead: the extract writes
+        // into the sandbox's own writable workspace volume — exactly where
+        // every later build step runs — and no host path is mounted in.
         let copied = self
-            .podman_output(
-                [
-                    os("cp"),
-                    os("--archive=false"),
-                    source,
-                    os(format!("{container}:{SOURCE_ROOT}")),
-                ],
-                self.inner.config.limits.max_step_time,
-            )
+            .import_checkout(&container, &checkout, self.inner.config.limits.max_step_time)
             .await?;
         require_success("copy checkout into isolated volume", &copied)?;
         self.verify_volume_capacity(
@@ -1865,6 +1876,334 @@ impl BuildExecutor {
         ];
         args.extend(script_args.iter().map(os));
         self.podman_output(args, timeout).await
+    }
+
+    /// Stream `checkout/.` into the build container's workspace over stdin.
+    ///
+    /// `podman cp` is unusable for this — see the call site in [`Self::begin`]:
+    /// it writes through the container's read-only rootfs, which does not
+    /// contain the workspace volume. `tar` produces the stream on the host and
+    /// consumes it inside the sandbox, so the guest still never sees a host
+    /// path mounted in, and the bytes land on the workspace volume the build
+    // actually executes against.
+    async fn import_checkout(
+        &self,
+        container: &str,
+        checkout: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<CommandOutput> {
+        const OPERATION: &str = "copy checkout into isolated volume";
+        let user = &self.inner.config.user;
+        let mut tar = Command::new("tar");
+        tar.args(["-cf", "-", "-C"])
+            .arg(checkout)
+            .arg(".")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut tar_child = tar.spawn().map_err(|error| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                OPERATION,
+                format!("cannot run tar: {error}"),
+            )
+        })?;
+        let mut tar_stdout = tar_child.stdout.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                OPERATION,
+                "missing tar stdout pipe",
+            )
+        })?;
+        let tar_stderr = tar_child.stderr.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                OPERATION,
+                "missing tar stderr pipe",
+            )
+        })?;
+        let tar_err_task = tokio::spawn(read_admin_stream(tar_stderr));
+
+        let mut exec = Command::new(&self.inner.config.podman_path);
+        exec.args([
+            os("exec"),
+            os("-i"),
+            os("--user"),
+            os(format!("{}:{}", user.uid, user.gid)),
+            os("--workdir"),
+            os(WORKSPACE_MOUNT),
+            os(container),
+            os("/usr/bin/env"),
+            os("-i"),
+            os(format!("PATH={BASE_PATH}")),
+            os("HOME=/workspace/home"),
+            os("CI=1"),
+            os("/bin/sh"),
+            os("-c"),
+            os(format!(
+                "set -eu; mkdir -p {SOURCE_ROOT}; tar -xf - -C {SOURCE_ROOT}"
+            )),
+            os("hive-build"),
+        ])
+        .env_clear()
+        .envs(&self.inner.config.podman_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        let mut exec_child = exec.spawn().map_err(|error| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::PodmanFailed,
+                OPERATION,
+                error.to_string(),
+            )
+        })?;
+        // Bridge the producer into the consumer: tokio has no
+        // `From<ChildStdout> for Stdio`, so the two pipes are joined by a copy
+        // task instead of by handing one child's stdout to the other's stdin.
+        let mut exec_stdin = exec_child.stdin.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::PodmanFailed,
+                OPERATION,
+                "missing stdin pipe",
+            )
+        })?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut tar_stdout, &mut exec_stdin).await;
+        });
+        let exec_stdout = exec_child.stdout.take().ok_or_else(|| {
+            BuildExecutorError::new(BuildExecutorErrorCode::PodmanFailed, OPERATION, "missing stdout pipe")
+        })?;
+        let exec_stderr = exec_child.stderr.take().ok_or_else(|| {
+            BuildExecutorError::new(BuildExecutorErrorCode::PodmanFailed, OPERATION, "missing stderr pipe")
+        })?;
+        let out_task = tokio::spawn(read_admin_stream(exec_stdout));
+        let err_task = tokio::spawn(read_admin_stream(exec_stderr));
+        let status = tokio::time::timeout(timeout, exec_child.wait())
+            .await
+            .map_err(|_| {
+                let _ = exec_child.start_kill();
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    format!("checkout import exceeded {} ms", duration_ms(timeout)),
+                )
+            })?
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })?;
+        let (stdout, _) = out_task
+            .await
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })??;
+        let (stderr, _) = err_task
+            .await
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })??;
+        // Reap the producer and surface its own failure (an unreadable or
+        // vanished checkout) rather than only the extract's truncated-input
+        // error, which is the symptom and not the cause.
+        let _ = tar_child.wait().await;
+        let (tar_stderr, _) = tar_err_task
+            .await
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })??;
+        if !status.success() && !tar_stderr.is_empty() {
+            return Ok(CommandOutput {
+                status,
+                stdout,
+                stderr: tar_stderr,
+            });
+        }
+        Ok(CommandOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Stream `<container>:<source>/.` out to a host directory as a tar on the
+    /// container's stdout.
+    ///
+    /// Mirror of [`Self::import_checkout`] and for the same reason: `podman cp`
+    /// resolves paths against the container's read-only rootfs, which holds
+    /// neither the workspace nor the sealed-artifact volume, so it cannot read
+    /// the build output at all. `tar` runs inside the sandbox to produce the
+    /// stream and on the host to unpack it.
+    async fn export_directory(
+        &self,
+        container: &str,
+        source: &str,
+        destination: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<CommandOutput> {
+        const OPERATION: &str = "materialize build output";
+        let user = &self.inner.config.user;
+        let mut exec = Command::new(&self.inner.config.podman_path);
+        exec.args([
+            os("exec"),
+            os("--user"),
+            os(format!("{}:{}", user.uid, user.gid)),
+            os("--workdir"),
+            os("/"),
+            os(container),
+            os("/usr/bin/env"),
+            os("-i"),
+            os(format!("PATH={BASE_PATH}")),
+            os("HOME=/workspace/home"),
+            os("CI=1"),
+            os("/bin/sh"),
+            os("-c"),
+            os(format!("set -eu; tar -cf - -C {source} .")),
+            os("hive-build"),
+        ])
+        .env_clear()
+        .envs(&self.inner.config.podman_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        let mut exec_child = exec.spawn().map_err(|error| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::PodmanFailed,
+                OPERATION,
+                error.to_string(),
+            )
+        })?;
+        let mut exec_stdout = exec_child.stdout.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::PodmanFailed,
+                OPERATION,
+                "missing stdout pipe",
+            )
+        })?;
+        let exec_stderr = exec_child.stderr.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::PodmanFailed,
+                OPERATION,
+                "missing stderr pipe",
+            )
+        })?;
+        let exec_err_task = tokio::spawn(read_admin_stream(exec_stderr));
+
+        let mut tar = Command::new("tar");
+        tar.args(["-xf", "-", "-C"])
+            .arg(destination)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut tar_child = tar.spawn().map_err(|error| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                OPERATION,
+                format!("cannot run tar: {error}"),
+            )
+        })?;
+        // Bridge the two pipes (tokio has no `From<ChildStdout> for Stdio`).
+        let mut tar_stdin = tar_child.stdin.take().ok_or_else(|| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                OPERATION,
+                "missing tar stdin pipe",
+            )
+        })?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut exec_stdout, &mut tar_stdin).await;
+        });
+        let tar_out_task = tokio::spawn(read_admin_stream(tar_child.stdout.take().ok_or_else(
+            || {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    OPERATION,
+                    "missing tar stdout pipe",
+                )
+            },
+        )?));
+        let tar_err_task = tokio::spawn(read_admin_stream(tar_child.stderr.take().ok_or_else(
+            || {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    OPERATION,
+                    "missing tar stderr pipe",
+                )
+            },
+        )?));
+        let status = tokio::time::timeout(timeout, tar_child.wait())
+            .await
+            .map_err(|_| {
+                let _ = tar_child.start_kill();
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    format!("output export exceeded {} ms", duration_ms(timeout)),
+                )
+            })?
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })?;
+        let _ = exec_child.wait().await;
+        let (exec_err, _) = exec_err_task
+            .await
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })??;
+        let _ = tar_out_task.await;
+        let (tar_err, _) = tar_err_task
+            .await
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::PodmanFailed,
+                    OPERATION,
+                    error.to_string(),
+                )
+            })??;
+        // Surface the sandbox's own failure when the unpack only saw truncated
+        // input: the unpack error is the symptom, the exec error is the cause.
+        if !status.success() && !exec_err.is_empty() {
+            return Ok(CommandOutput {
+                status,
+                stdout: Vec::new(),
+                stderr: exec_err,
+            });
+        }
+        Ok(CommandOutput {
+            status,
+            stdout: Vec::new(),
+            stderr: tar_err,
+        })
     }
 
     async fn verify_volume_capacity(
@@ -3097,16 +3436,18 @@ exit 74
                 format!("cannot create sibling staging directory: {error}"),
             )
         })?;
-        let source = format!("{}:/sealed/artifact/.", self.keeper);
+        // Mirror of `import_checkout`: `podman cp` resolves its container-side
+        // path against the container's read-only ROOTFS, which does not contain
+        // the sealed-artifact volume, so it fails with "could not be found on
+        // container" before any byte moves (reproduced live on fc-orlando
+        // 2026-10-09). Stream a tar out through `podman exec` and unpack it on
+        // the host into the staging directory instead.
         let copied = self
             .executor
-            .podman_output(
-                [
-                    os("cp"),
-                    os("--archive=false"),
-                    os(source),
-                    staging.as_os_str().to_os_string(),
-                ],
+            .export_directory(
+                &self.keeper,
+                "/sealed/artifact",
+                &staging,
                 self.executor.inner.config.limits.max_step_time,
             )
             .await;

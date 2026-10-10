@@ -1213,9 +1213,15 @@ async fn async_main() -> anyhow::Result<()> {
         // re-probes it on its tick. `None` on a microVM backend: those builds
         // run inside the builder image, not against this host's PATH.
         build_toolchains: build_toolchains.clone(),
-        // The executor may be initialized above, but this stays fail-closed until
-        // every git build surface consumes it in this binary.
-        build_isolation_protocol: None,
+        // Advertised ONLY from the boot-time LIVE probe above: the executor is
+        // re-hashed, re-verified and actually exercised (runsc + quota + nested
+        // Buildah) before this is ever `Some`, so a node with no working
+        // executor still advertises `None` and stays out of repository-build
+        // placement. That is the condition the former `None` literal was
+        // waiting on, and it is met: every git build surface routes repository
+        // commands through `build_executor` (`require_build_session` at each
+        // command chokepoint in git.rs).
+        build_isolation_protocol,
         // Published after CloudState::new proves the transfer receiver actually
         // initialized (its worker, durable store and recovery all succeeded) —
         // never asserted from this literal.
