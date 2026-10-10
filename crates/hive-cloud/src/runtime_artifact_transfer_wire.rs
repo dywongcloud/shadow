@@ -447,8 +447,13 @@ pub fn validate_request(request: &TransferRequest) -> anyhow::Result<()> {
                 bail!("runtime artifact transfer chunk must contain 1..={MAX_CHUNK_BYTES} bytes");
             }
             validate_digest(&request.chunk_sha256, "chunk digest")?;
-            let actual = sha256_hex(&request.bytes);
-            if actual != request.chunk_sha256 {
+            // Dual-algorithm: the sender mints this digest, so a sender still
+            // on the legacy SHA-256 mint and one already minting BLAKE3 hand
+            // over the same bytes behind different digests. Rejecting either
+            // one is a false "chunk digest does not match its bytes" on every
+            // chunk of every transfer, not a safety property — the bytes are
+            // already in hand here.
+            if !fluid_core::verify_raw_content(&request.bytes, &request.chunk_sha256) {
                 bail!("runtime artifact transfer chunk digest does not match its bytes");
             }
             Ok(())

@@ -10887,9 +10887,12 @@ fn verify_pulled_artifact(
     sig: Option<&str>,
 ) -> Result<(), String> {
     // Content digest: if present, it MUST match (corruption guard).
+    // Dual-algorithm: a peer still on the legacy SHA-256 mint and one already
+    // minting BLAKE3 both address the same bytes, so accept either — rejecting
+    // one turns a mixed-version roll into "every peer's cache is corrupt".
     if let Some(sha) = sha {
-        if !artifact_sha256(bytes).eq_ignore_ascii_case(sha) {
-            return Err("content sha256 mismatch (corrupted artifact)".into());
+        if !fluid_core::verify_raw_content(bytes, sha) {
+            return Err("content digest mismatch (corrupted artifact)".into());
         }
     }
     // Authenticity: if THIS node has a secret configured, a valid signature is

@@ -2,7 +2,7 @@ use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
 
 use crate::runtime_artifact_transfer_wire::{
-    decode_request, encode_request, sha256_hex, BeginRequest, ReplyCode, TransferReply,
+    decode_request, encode_request, BeginRequest, ReplyCode, TransferReply,
     TransferRequest, TransferState, MAX_ERROR_BYTES,
 };
 
@@ -379,8 +379,4 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
-}
-
-pub fn chunk_sha256(bytes: &[u8]) -> String {
-    sha256_hex(bytes)
 }

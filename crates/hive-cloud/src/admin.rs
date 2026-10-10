@@ -58,6 +58,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/mesh/establish", get(mesh_establish))
         // Runtime stall counters (node-local, operator-only): see runtime_watch.
         .route("/v1/admin/runtime", get(admin_runtime))
+        // Which algorithm content verifiers on this node actually accepted
+        // (operator-only, node-local) — the gate for flipping any content-hash
+        // writer off legacy SHA-256. See fluid_core::content_verify_stats.
+        .route("/v1/admin/content-hash", get(admin_content_hash))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -8246,6 +8250,21 @@ async fn admin_runtime(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     Ok(Json(crate::runtime_watch::stats()))
+}
+
+/// Which algorithm content verifiers on THIS node actually accepted.
+///
+/// Operator-only and deliberately node-local (like `/v1/admin/runtime`). This
+/// is the inspection point for the coexistence migration: `accepted_sha256`
+/// still climbing means stored digests this node reads are legacy-minted, so a
+/// writer flip here would make them read as a miss or an orphan. A writer may
+/// move only once every node reports `accepted_sha256` flat across a full
+/// deploy cycle — never on a flag day.
+async fn admin_content_hash(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!({ "content_hash": fluid_core::content_verify_stats() })))
 }
 
 /// THIS node's supervised background loops: restart counts + heartbeat age.

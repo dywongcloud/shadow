@@ -462,6 +462,23 @@ memories/notes whose durable content it absorbed.
 verifies a stored digest under EITHER BLAKE3 or the legacy hex(SHA-256) over
 the same domain. Nothing here is a flag day.
 
+**Digests minted before domain separation** (transfer chunk digests, runtime-
+artifact package / semantic-tree digests, litebox archive digests) are a bare
+hash of the bytes, so they cannot move onto `verify_content` without changing
+what their producer writes — the digest IS the value on the wire. They use the
+explicitly-named pair `fluid_core::raw_content_hash` /
+`legacy_raw_content_sha256` / `verify_raw_content`: same dual-accept rule, no
+domain. Never point a domain-separated call site at them, or vice versa.
+
+**`verify_content_alg` / `verify_raw_content_alg` return WHICH algorithm
+matched** (`fluid_core::ContentAlg`), not just a bool. A stored digest is 64
+hex under either algorithm, so "accepted" alone can never answer whether this
+fleet still reads legacy-minted digests. `fluid_core::content_verify_stats()`
+counts both accepts plus rejections, served at `GET /v1/admin/content-hash`
+(operator-only, node-local). **A writer on any digest that names stored bytes
+may flip only once every node reports `accepted_sha256` flat across a full
+deploy cycle** — never on a flag day, never because a shape check looks fine.
+
 **hex(BLAKE3) and hex(SHA-256) are both 64 lowercase hex characters**, so no
 shape check anywhere in the tree can tell them apart — `validate_sha256`,
 `validate_digest`, `is_hex64` all prove shape and never algorithm. That is the
@@ -544,6 +561,15 @@ this class of change) · `fluid-core/src/lib.rs:3152`
 (cross-node sealed snapshot digest) · `hive-cloud/src/repository_build.rs:196` ·
 `app_discovery.rs:128` · `build_executor.rs:889` ·
 `billing.rs:677-702` (ledger checkpoint chain).
+
+Already dual-accepting on the READ side: `deployment_ledger.rs:805` ·
+`runtime_artifact_transfer_wire.rs:524` ·
+`runtime_artifact_transfer_sender.rs:107` ·
+`runtime_artifact_transfer_service.rs:676` (chunk re-verify against durable
+bytes — the only transfer site with the bytes in hand) · `git.rs:10891`
+(`verify_pulled_artifact`, a peer build-artifact pull; a peer still on the
+legacy mint and one already minting BLAKE3 address the same bytes, so
+rejecting either reads as "every peer's cache is corrupt").
 
 Verification of this section ran from a scratch crate OUTSIDE the repo against
 the real on-disk ledgers, not a test file — see the commit for the witness.

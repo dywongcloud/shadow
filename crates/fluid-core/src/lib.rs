@@ -3244,12 +3244,154 @@ pub fn legacy_content_sha256(domain: &[u8], bytes: &[u8]) -> String {
 /// data, and the bytes are already in hand. Anything secret is not content
 /// identity and has no business reaching this function.
 pub fn verify_content(domain: &[u8], bytes: &[u8], stored: &str) -> bool {
-    if !is_hex64(stored) {
-        return false;
+    let alg = verify_content_alg(domain, bytes, stored);
+    record_verify_outcome(alg);
+    alg.is_some()
+}
+
+/// Which algorithm a stored content digest was actually minted under.
+///
+/// This enum exists because hex(BLAKE3) and hex(SHA-256) are the same width,
+/// so a stored digest never SAYS which algorithm produced it. A verifier that
+/// only returns `bool` throws that answer away, and with it the only way to
+/// ask "how much of this fleet is still reading legacy-minted digests?" — the
+/// question that gates flipping any writer off SHA-256. A writer may only move
+/// once every node reports its legacy accepts flat, because a flip before that
+/// makes every already-written object read as a miss or an orphan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum ContentAlg {
+    /// BLAKE3: every address minted from now on.
+    Blake3,
+    /// hex(SHA-256): the legacy address, accepted on read for as long as any
+    /// stored digest was minted under it.
+    Sha256,
+}
+
+impl ContentAlg {
+    /// Stable wire/spelling for logs and the admin inspection point.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blake3 => "blake3",
+            Self::Sha256 => "sha256",
+        }
     }
-    // Legacy first: in a mixed fleet almost every stored digest is still
-    // SHA-256, so the common case costs one hash, not two.
-    legacy_content_sha256(domain, bytes) == stored || content_hash(domain, bytes) == stored
+}
+
+/// Decide which algorithm `stored` was minted under, or `None` when NEITHER
+/// reproduces it — the only honest "these bytes are not what was sealed".
+///
+/// Comparison is hex-case-insensitive: a digest's case carries no information
+/// (`git::verify_pulled_artifact` has compared case-insensitively since it was
+/// written), and rejecting an uppercase-but-correct digest would be a false
+/// integrity failure wearing a strictness costume.
+///
+/// Legacy first: in a mixed fleet almost every stored digest is still SHA-256,
+/// so the common case costs one hash, not two.
+pub fn verify_content_alg(domain: &[u8], bytes: &[u8], stored: &str) -> Option<ContentAlg> {
+    if stored.len() != 64 {
+        return None;
+    }
+    if legacy_content_sha256(domain, bytes).eq_ignore_ascii_case(stored) {
+        return Some(ContentAlg::Sha256);
+    }
+    if content_hash(domain, bytes).eq_ignore_ascii_case(stored) {
+        return Some(ContentAlg::Blake3);
+    }
+    None
+}
+
+//
+// The un-domain-separated namespace.
+//
+// Several content digests predate domain separation and were minted as a BARE
+// hash of the bytes: transfer chunk digests, runtime-artifact package and
+// semantic-tree digests, litebox archive digests. They cannot be moved onto
+// [`verify_content`] without changing what their producer writes — the digest
+// IS the value on the wire — so they get their own explicitly-named pair under
+// the same dual-accept rule. They are named `raw_*` precisely so nobody
+// mistakes them for the domain-separated namespace, and a future writer flip
+// in this namespace must domain-separate at the same time (bump the field),
+// never silently reinterpret an old one.
+//
+
+/// BLAKE3 (lowercase hex) of `bytes` with no domain prefix: the current mint
+/// for the raw namespace.
+pub fn raw_content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// hex(SHA-256) of `bytes` with no domain prefix: the legacy mint for the raw
+/// namespace, and what every digest already on disk in it was produced with.
+pub fn legacy_raw_content_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// [`verify_content_alg`] for the raw namespace.
+pub fn verify_raw_content_alg(bytes: &[u8], stored: &str) -> Option<ContentAlg> {
+    if stored.len() != 64 {
+        return None;
+    }
+    if legacy_raw_content_sha256(bytes).eq_ignore_ascii_case(stored) {
+        return Some(ContentAlg::Sha256);
+    }
+    if raw_content_hash(bytes).eq_ignore_ascii_case(stored) {
+        return Some(ContentAlg::Blake3);
+    }
+    None
+}
+
+/// [`verify_content`] for the raw namespace: accepts a stored digest minted
+/// under either algorithm over the same bytes.
+pub fn verify_raw_content(bytes: &[u8], stored: &str) -> bool {
+    let alg = verify_raw_content_alg(bytes, stored);
+    record_verify_outcome(alg);
+    alg.is_some()
+}
+
+//
+// Observability. A dual-accepting verifier that reports nothing is a
+// permanently unverifiable claim that "the fleet has moved" — the counters
+// below are the inspection point that turns it into a measurable one. Served
+// at `GET /v1/admin/content-hash` (operator-only, node-local).
+//
+
+static VERIFY_BLAKE3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VERIFY_SHA256: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VERIFY_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_verify_outcome(alg: Option<ContentAlg>) {
+    let slot = match alg {
+        Some(ContentAlg::Blake3) => &VERIFY_BLAKE3,
+        Some(ContentAlg::Sha256) => &VERIFY_SHA256,
+        None => &VERIFY_REJECTED,
+    };
+    slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-local counts of which algorithm the content verifiers actually
+/// accepted on THIS node. Purely monotonic counters, never a correctness
+/// input: nothing in a verify path reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ContentVerifyStats {
+    /// Verifications accepted because BLAKE3 reproduced the stored digest.
+    pub accepted_blake3: u64,
+    /// Verifications accepted because legacy SHA-256 reproduced it. Non-zero
+    /// and climbing means stored digests here are still legacy-minted.
+    pub accepted_sha256: u64,
+    /// Verifications where NEITHER algorithm reproduced it — a genuine
+    /// mismatch (corruption, tampering, or a wrong domain).
+    pub rejected: u64,
+}
+
+/// Snapshot of [`ContentVerifyStats`].
+pub fn content_verify_stats() -> ContentVerifyStats {
+    use std::sync::atomic::Ordering;
+    ContentVerifyStats {
+        accepted_blake3: VERIFY_BLAKE3.load(Ordering::Relaxed),
+        accepted_sha256: VERIFY_SHA256.load(Ordering::Relaxed),
+        rejected: VERIFY_REJECTED.load(Ordering::Relaxed),
+    }
 }
 
 /// Verify canonical manifest bytes against a stored normalized-manifest

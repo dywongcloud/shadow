@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc};
 
 use crate::runtime_artifact_transfer_fs::TransferFs;
 use crate::runtime_artifact_transfer_store::{
-    chunk_sha256, decode_record, encode_record, ChunkSeal, TransferRecord,
+    decode_record, encode_record, ChunkSeal, TransferRecord,
 };
 use crate::runtime_artifact_transfer_wire::{
     self as wire, BeginRequest, CommitRequest, ReplyCode, TransferKey, TransferReply,
@@ -673,7 +673,11 @@ fn apply_chunk(
             ));
         };
         let durable = directory.read_package_range(chunk.offset, chunk.bytes.len())?;
-        if durable != chunk.bytes || chunk_sha256(&durable) != chunk.chunk_sha256 {
+        // Dual-algorithm: a chunk digest minted by a peer still on the legacy
+        // SHA-256 mint must keep verifying here, and one minted under BLAKE3
+        // must too. Rejecting either is a false ChunkConflict, not a safety
+        // property — the bytes are already in hand.
+        if durable != chunk.bytes || !fluid_core::verify_raw_content(&durable, &chunk.chunk_sha256) {
             return Ok(record.reply(
                 ReplyCode::ChunkConflict,
                 "runtime artifact transfer duplicate chunk conflicts with durable bytes",
