@@ -699,8 +699,20 @@ impl CloudState {
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
         // The platform-admin set: HIVE_ADMIN_EMAILS (comma-separated) plus the
-        // owner, all lowercased so the mint-time compare is case-insensitive
+        // owner(s), all lowercased so the mint-time compare is case-insensitive
         // and order/dupe-independent.
+        //
+        // HIVE_OWNER_EMAIL is ITSELF a comma-separated list (ansible's
+        // `hive_owner_email` is `"ops@{{ hive_platform_domain }},dylanwong007@gmail.com"`).
+        // Pushing the unsplit string as one entry — the previous behaviour — made
+        // that combined string the only accepted value, which equals nobody's
+        // address, so on every node configured with the LIST form the owner
+        // silently lost `platform_admin` while keeping it on the nodes whose
+        // inventory line carries a single address (observed live: va/va3/sj list,
+        // sj7/phx single) — a fleet-splitting, intermittent operator-status loss.
+        // `admin_emails` is the strictly wider set, so it is the right place to
+        // expand; `owner_email` stays a single address by design (it seeds the
+        // default team), and is left untouched.
         let admin_emails: Vec<String> = {
             let mut v: Vec<String> = std::env::var("HIVE_ADMIN_EMAILS")
                 .unwrap_or_default()
@@ -708,9 +720,14 @@ impl CloudState {
                 .map(|s| s.trim().to_ascii_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let owner = owner_email.trim().to_ascii_lowercase();
-            if !owner.is_empty() && !v.contains(&owner) {
-                v.push(owner);
+            for owner in owner_email
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+            {
+                if !v.contains(&owner) {
+                    v.push(owner);
+                }
             }
             v
         };

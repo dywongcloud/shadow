@@ -17,7 +17,11 @@ const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 // The global integration-index collection is operator-gated (data_create ->
 // require_operator), so the mint must carry the owner email for the backend to
 // derive platform-operator authority. Server-only; never exposed to the browser.
-const OWNER_EMAIL = process.env.HIVE_OWNER_EMAIL || "";
+// HIVE_OWNER_EMAIL is a COMMA-SEPARATED list (ansible's `hive_owner_email`), and
+// the backend matches the mint's `email` claim against ONE entry of its
+// `admin_emails` set with `eq_ignore_ascii_case` — so the claim must be a single
+// address, never the whole list.
+const OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
 const INDEX = "integration_index";
 
 // The index write is a MUTATION on the backend admin API, which require_auth

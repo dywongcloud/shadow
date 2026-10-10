@@ -113,7 +113,9 @@ export async function POST(req: NextRequest) {
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
         // `email` lets the backend derive `platform_admin` from its own
         // HIVE_OWNER_EMAIL — the dev mint asserts no platform claim itself.
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: process.env.HIVE_OWNER_EMAIL || "" }),
+        // One address, not the comma-separated list: the backend compares this
+        // claim against a single `admin_emails` entry.
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim() }),
         cache: "no-store",
       });
       if (!r.ok) {

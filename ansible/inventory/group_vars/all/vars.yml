@@ -153,8 +153,12 @@ hive_extra_peers: []
 hive_container_runtime: "runc"   # bkk/fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
 
 # ---------- Owner ----------
-# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS
-# (lowercased, split on ",", trimmed). EVERY owner address must live HERE.
+# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS and by the
+# backend's `admin_emails` (crates/hive-cloud/src/state.rs) — lowercased, split on
+# ",", trimmed, in BOTH. Any reader that forgets to split matches nobody, which is
+# how the owner lost `platform_admin` on the nodes carrying the list form while
+# keeping it on the nodes whose inventory line holds a single address.
+# EVERY owner address must live HERE.
 #
 # `HIVE_OWNER_EMAIL` decides `isOwner`, and `isOwner` decides whether the mint
 # assigns the legacy "personal" tenant or isolates the account under
