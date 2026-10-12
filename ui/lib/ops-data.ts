@@ -10,7 +10,8 @@ const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 // One address, not the list: the backend compares this claim against a single
-// `admin_emails` entry when it derives `platform_admin`.
+// `admin_emails` entry when it derives `platform_admin`. The FIRST entry is the
+// backend-authoritative owner address (see the opsBearer note below).
 const OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
 
 /* ---- The ops console's own credential -------------------------------------
@@ -32,9 +33,16 @@ const OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
  * below. The pages that call it are already gated on the platform-owner
  * allow-list by proxy.ts, so minting operator authority here grants nothing a
  * non-owner can reach.
+ *
+ * Cache invalidation is a TIMER, never a clock read: these pages are partially
+ * prerendered (Cache Components), and `Date.now()` inside that prerender makes
+ * Next fail the route with "encountered the unstable value Date.now() while
+ * prerendering" (live-witnessed on /admin/nodes, /admin/databases, /admin/teams
+ * and /admin, 2026-10-12).
  */
-type Minted = { token: string; exp: number };
+type Minted = { token: string };
 let minted: Minted | null = null;
+let expiry: ReturnType<typeof setTimeout> | null = null;
 let minting: Promise<string | null> | null = null;
 
 async function mintOpsBearer(): Promise<string | null> {
@@ -55,10 +63,17 @@ async function mintOpsBearer(): Promise<string | null> {
     if (!r.ok) return null;
     const d = (await r.json()) as { token?: string; expires_in?: number };
     if (!d.token) return null;
-    // Refresh well before the backend's own expiry so a read never races the
-    // token's death.
+    // Retire the token well before the backend's own expiry so a read never
+    // races its death. `unref` keeps a pending timer from holding a build
+    // worker open for the token's whole TTL.
     const ttl = Math.max(60, (typeof d.expires_in === "number" ? d.expires_in : 3600) - 120);
-    minted = { token: d.token, exp: Date.now() + ttl * 1000 };
+    minted = { token: d.token };
+    if (expiry) clearTimeout(expiry);
+    expiry = setTimeout(() => {
+      minted = null;
+      expiry = null;
+    }, ttl * 1000);
+    (expiry as unknown as { unref?: () => void }).unref?.();
     return d.token;
   } catch {
     return null;
@@ -69,7 +84,7 @@ async function mintOpsBearer(): Promise<string | null> {
  *  cached JWT expired or the backend rotated its secret); concurrent callers
  *  share one in-flight mint instead of stampeding the token endpoint. */
 function opsBearer(force = false): Promise<string | null> {
-  if (!force && minted && Date.now() < minted.exp) return Promise.resolve(minted.token);
+  if (!force && minted) return Promise.resolve(minted.token);
   if (!minting) {
     minting = mintOpsBearer().finally(() => {
       minting = null;
