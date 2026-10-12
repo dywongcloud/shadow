@@ -271,6 +271,17 @@ pub struct NodeInfo {
     /// on the root host and must never receive a source build as fallback.
     #[serde(default)]
     pub build_isolation_protocol: Option<u16>,
+    /// This node can run musql as a managed-SQLite storage engine: a usable
+    /// `musqld` was PROBED here (`-h` prints `-dir` + `-idle-timeout`, the two
+    /// flags this lane depends on), not merely configured.
+    ///
+    /// Probed and advertised, never assumed — the same rule `wasm_runtime` and
+    /// `bun_runtime` follow, and `None` means NOT CAPABLE for the same reason:
+    /// a node that cannot start the engine must never be handed a `musql`
+    /// database. It is `None` on every node that has not opted in
+    /// (`HIVE_SQLITE_ENGINE=musql`), which is every node today.
+    #[serde(default)]
+    pub musql_engine: Option<bool>,
     /// Sealed runtime-artifact TRANSFER protocol (coordinator→target
     /// Begin/Chunk/Finalize/Prepare/Commit generation delivery) served by this
     /// node's receiver. `None` = pre-upgrade peer or a receiver that failed to
@@ -659,6 +670,13 @@ impl NodeRegistry {
     /// immutable-generation transfer target.
     pub fn set_self_artifact_transfer_protocol(&self, protocol: Option<u16>) {
         self.me.write().artifact_transfer_protocol = protocol;
+    }
+
+    /// Publish this node's musql capability. Re-published on the same refresh
+    /// tick as the other capabilities: the binary can appear (a provisioning
+    /// run installs it) or disappear (a bad swap) under a running process.
+    pub fn set_self_musql_engine(&self, musql_engine: Option<bool>) {
+        self.me.write().musql_engine = musql_engine;
     }
 
     /// Refresh this node's restart-audit counters (see `hive-cloud`'s
@@ -1209,6 +1227,7 @@ mod tests {
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             artifact_transfer_protocol: None,
+            musql_engine: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: id.into(),

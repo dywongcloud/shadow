@@ -137,7 +137,38 @@ pub fn sqlite_file_name(id: &str) -> String {
     format!("hive-sqlite-{}.db", crate::git::sanitize_tag(id))
 }
 
-/// Absolute path of a managed SQLite database file, or `None` when `id` is not
+/// The platform-templated file STEM for a managed SQLite database — identical
+/// for both engines, because musqld's `-dir` mode routes by the file name's
+/// first label and the two engines must agree on which file belongs to which
+/// database id.
+pub fn sqlite_musql_stem(id: &str) -> String {
+    format!("hive-sqlite-{}", crate::git::sanitize_tag(id))
+}
+
+/// Name of a database's musql file. Rust side: the engine writes
+/// `.musq`; SQLite's own `-wal`/`-shm` do not exist for it (musql keeps a
+/// 0-byte `.musq.lock` and, transiently, a `.musq.delta` instead — see
+/// `crate::musql_migrate`, which backs up all three).
+pub fn sqlite_musql_file_name(id: &str) -> String {
+    format!("{}.musq", sqlite_musql_stem(id))
+}
+
+/// Absolute path of a database's musql file, `None` for a non-platform id.
+/// Same id-shape proof as [`sqlite_file_path`] — a crafted id must never become
+/// a path component in either engine's store.
+pub fn sqlite_musql_path(id: &str) -> Option<std::path::PathBuf> {
+    let hex = id.strip_prefix("db_")?;
+    if !(8..=64).contains(&hex.len())
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    Some(sqlite_store_dir().join(sqlite_musql_file_name(id)))
+}
+
+/// Absolute path of a database's SQLite file, or `None` when `id` is not
 /// a platform-issued database id (`db_` + 8..=64 lowercase hex).
 pub fn sqlite_file_path(id: &str) -> Option<std::path::PathBuf> {
     let hex = id.strip_prefix("db_")?;
@@ -878,6 +909,31 @@ impl DatabaseStore {
         } else {
             v.push(db);
         }
+    }
+
+    /// Flip one managed SQLite database's storage engine. This is the ONLY way
+    /// an `engine` value changes, so the record can never claim an engine whose
+    /// file does not exist: `crate::musql_migrate` verifies the converted file
+    /// first and calls this afterwards.
+    ///
+    /// The value rides the ordinary replicated record (it lives in `connection`,
+    /// which `snapshot_synced` carries), so every node sees the same engine for
+    /// the same database — which matters because every node PROXIES to the
+    /// owner, and a proxying node that disagreed about the engine would be
+    /// unable to say anything useful about the file.
+    pub fn set_engine(&self, id: &str, engine: crate::musql::Engine) {
+        self.update(id, |d| {
+            d.connection
+                .insert("engine".into(), engine.label().to_string());
+            d.connection.insert(
+                "file".into(),
+                if engine == crate::musql::Engine::Musql {
+                    sqlite_musql_file_name(id)
+                } else {
+                    sqlite_file_name(id)
+                },
+            );
+        });
     }
 
     /// Allocate a loopback port for a new DB container. The in-memory cursor RESETS
@@ -1776,32 +1832,50 @@ async fn provision_sqlite(
     let path = sqlite_file_path(id).ok_or_else(|| {
         format!("refusing to derive a file path from a non-platform database id {id:?}")
     })?;
-    let create = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            let conn = hive_crsql::rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
-            let _: String = conn
-                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        })
-        .await
-    };
-    match create {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(format!("cannot create SQLite database file: {e}")),
-        Err(e) => return Err(format!("SQLite provisioning task failed: {e}")),
+    // The file is created through whichever engine this database will run on,
+    // so a broken data directory fails HERE, loudly, instead of on the tenant's
+    // first query. A musql database gets a real `.musq` (converted from an empty
+    // seed), never musqld's `-create`, which would happily invent one for any
+    // unknown name.
+    if crate::musql::default_engine() == crate::musql::Engine::Musql {
+        crate::musql_migrate::provision(id).await?;
+    } else {
+        let create = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                let conn =
+                    hive_crsql::rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+                let _: String = conn
+                    .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
+        };
+        match create {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("cannot create SQLite database file: {e}")),
+            Err(e) => return Err(format!("SQLite provisioning task failed: {e}")),
+        }
     }
 
     let mut c = HashMap::new();
+    let engine = crate::musql::default_engine();
     c.insert("provider".into(), "Hive SQLite (libsql/Hrana)".into());
-    c.insert("engine".into(), "sqlite".into());
+    c.insert("engine".into(), engine.label().into());
     // The file NAME is safe to show (the dashboard already shows the browser_db
     // replica name); the absolute path is node-local detail and stays out.
-    c.insert("file".into(), sqlite_file_name(id));
+    c.insert(
+        "file".into(),
+        if engine == crate::musql::Engine::Musql {
+            sqlite_musql_file_name(id)
+        } else {
+            sqlite_file_name(id)
+        },
+    );
     // Dedicated, independently-revocable bearer — the same key `db_rest`'s
     // `credential_matches` treats as the ONLY credential once present, so this
     // lane never accepts an engine password (it has none) and the token can be

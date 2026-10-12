@@ -1006,6 +1006,7 @@ mod tests {
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             artifact_transfer_protocol: None,
+            musql_engine: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

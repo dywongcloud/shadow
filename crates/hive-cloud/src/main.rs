@@ -56,6 +56,9 @@ mod guardian;
 mod health;
 mod hrana;
 mod hrana_proto;
+mod musql;
+mod musql_migrate;
+mod sqlite_engine;
 mod identity;
 mod incidents;
 mod runtime_watch;
@@ -451,6 +454,16 @@ struct Args {
     /// table legitimately misses the first attempts). Non-zero exit on a miss.
     #[arg(long = "dht-probe", value_delimiter = ',')]
     dht_probe: Vec<String>,
+    /// Operator diagnostic (same family as `--dns-probe`): run one Hrana
+    /// pipeline through BOTH managed-SQLite engines on the same data —
+    /// rusqlite first, then a `musql-convert`ed copy through the musqld
+    /// sidecar — and print both envelopes plus whether they are identical.
+    /// This is how "the engine swap is invisible on the wire" gets measured
+    /// instead of asserted. Needs `HIVE_SQLITE_ENGINE=musql`,
+    /// `HIVE_MUSQLD_BIN`, `HIVE_MUSQL_CONVERT_BIN` and a scratch `HIVE_DATA`;
+    /// touches nothing else. Non-zero exit if the envelopes differ.
+    #[arg(long = "sqlite-engine-probe")]
+    sqlite_engine_probe: bool,
     /// Operator diagnostic (same family as `--dns-probe`/`--dht-probe`): parse a
     /// compose file through the REAL `compose::parse_compose` the build pipeline
     /// uses and print exactly what the platform will run and route — every
@@ -583,6 +596,9 @@ async fn async_main() -> anyhow::Result<()> {
     }
     if !args.dht_probe.is_empty() {
         return dht_probe::run_cli(&args.dht_probe).await;
+    }
+    if args.sqlite_engine_probe {
+        return crate::musql_migrate::run_probe().await;
     }
     if let Some(path) = &args.compose_probe {
         let text = std::fs::read_to_string(path)
@@ -1226,6 +1242,9 @@ async fn async_main() -> anyhow::Result<()> {
         // initialized (its worker, durable store and recovery all succeeded) —
         // never asserted from this literal.
         artifact_transfer_protocol: None,
+        // Published after the sidecar proves itself — `musql::spawn` sets it,
+        // never this literal (see the wasm/bun capability rule).
+        musql_engine: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
         provider: std::env::var("HIVE_CLOUD_PROVIDER")
@@ -1279,6 +1298,15 @@ async fn async_main() -> anyhow::Result<()> {
         ),
     }
     let registry = NodeRegistry::new(me);
+    // The musql sidecar, if this node opted in (HIVE_SQLITE_ENGINE=musql).
+    // Started before any request can reach the SQLite lane and advertised from
+    // the PROBE (not from the flag), so a node that merely set the env var but
+    // has no usable musqld never claims the capability and is never handed a
+    // musql database. Everything else about this node is unaffected: the
+    // default engine is rusqlite, so a roll of this binary changes nothing.
+    if crate::musql::spawn() {
+        registry.set_self_musql_engine(crate::musql::probe());
+    }
     // Populate this node's own relay_url now that `registry` exists (mirrors
     // `set_self_guardian_addr`'s post-boot fill-in pattern) — it rides along in
     // the very next `/v1/nodes/announce` gossip broadcast, no new RPC surface.
@@ -3464,6 +3492,13 @@ fn spawn_disk_refresh(
                     runtime_capabilities.runtime_artifact_protocol,
                     runtime_capabilities.build_toolchains.clone(),
                 );
+                // Same reasoning as the tuple above: the musqld binary can be
+                // installed or swapped under a running process. Probed only on
+                // nodes that opted in, so the fleet does not spawn a process
+                // every tick for a capability nobody uses.
+                if crate::musql::default_engine() == crate::musql::Engine::Musql {
+                    registry.set_self_musql_engine(crate::musql::probe());
+                }
                 // Same tick, same reason as the disk figure: the restart
                 // audit's 24h window SLIDES, so a boot-time-only value goes
                 // stale in the direction that matters (a node keeps

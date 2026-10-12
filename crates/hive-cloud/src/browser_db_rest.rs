@@ -428,13 +428,20 @@ async fn pipeline(
         resolved.clone(),
         read_only,
         move |conn| {
-            let o = crate::hrana_proto::execute_pipeline(
+            // This lane NEVER runs on musql. `conn` is a cr-sqlite CRR replica
+            // opened through `hive_crsql::open`; a plain SQL engine writing it
+            // would bypass the clock tables the CRR merge reads and diverge
+            // permanently. The pipeline implementation is shared with the
+            // managed-SQLite lane, but the ENGINE here is always this file's
+            // own connection. Driven to completion inside `spawn_blocking`
+            // (it is blocking file IO), never awaited on the runtime.
+            let o = futures::executor::block_on(crate::hrana_proto::execute_pipeline(
                 conn,
                 requests,
                 crate::hrana_proto::SqlCache::new(),
                 version,
                 read_only,
-            );
+            ));
             Ok(o.results)
         },
     )

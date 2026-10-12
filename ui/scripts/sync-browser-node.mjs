@@ -161,3 +161,40 @@ for (const rel of SQLITE_SET) {
 }
 console.log(`[sync-browser-node] synced ${srcPkg} -> ${destPkg}`);
 console.log(`[sync-browser-node] synced sqlite set (${sqliteSynced}/${SQLITE_SET.length} files) -> ${join(destRoot, "sqlite")}`);
+
+// The musql browser lane: an IN-MEMORY musql (wasm) database, for analysis and
+// sandbox work over an exported snapshot. A THIRD surface, not a replacement
+// for the CRR lane above -- it has no clock tables, no CRR, no replication and
+// no persistence, so nothing points it at browser-dbs. musql.wasm is a build
+// artifact of crates/hive-browser/www/musql/build-musql.sh and is gitignored,
+// so an unbuilt tree warns here exactly the way the crsqlite wasm does.
+const MUSQL_SET = [
+  "musql/musql-worker.js",
+  "musql/musql-client.js",
+  "musql/index.js",
+  "musql/glue.js",
+  "musql/memfs.js",
+  "musql/wasm_exec.js",
+  "musql/musql.wasm",
+];
+let musqlSynced = 0;
+for (const rel of MUSQL_SET) {
+  const src = join(srcRoot, rel);
+  const dest = join(destRoot, rel);
+  if (!existsSync(src)) {
+    console.warn(
+      `[sync-browser-node] ${src} missing — the musql browser lane will report unavailable until it exists (run crates/hive-browser/www/musql/build-musql.sh first).`,
+    );
+    continue;
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  if (!readFileSync(src).equals(readFileSync(dest))) {
+    console.error(`[sync-browser-node] byte mismatch after copy: ${rel}`);
+    process.exit(1);
+  }
+  musqlSynced++;
+}
+console.log(
+  `[sync-browser-node] synced musql set (${musqlSynced}/${MUSQL_SET.length} files) -> ${join(destRoot, "musql")}`,
+);

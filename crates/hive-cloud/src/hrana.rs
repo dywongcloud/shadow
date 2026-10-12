@@ -50,6 +50,7 @@
 
 use crate::databases::{Database, DbKind};
 use crate::hrana_proto::{execute_pipeline, SqlCache};
+use crate::musql::{Engine as DbEngine, MusqlEngine};
 use crate::sqlite_pool::{PoolError, PooledConn};
 use crate::state::CloudState;
 use axum::extract::{Path as AxPath, State};
@@ -76,8 +77,78 @@ fn stream_idle_ms() -> u64 {
 /// Max request body for a pipeline POST.
 const BODY_CAP: usize = 4 * 1024 * 1024;
 
+/// One Hrana stream's connection to whichever engine this database runs on.
+///
+/// Both arms execute the SAME pipeline implementation
+/// (`hrana_proto::execute_pipeline`), so the wire contract cannot drift between
+/// engines. They differ only in where the work happens: the rusqlite arm is
+/// moved onto `spawn_blocking` (its engine is blocking file IO and must never
+/// run on a serving tokio worker), the musql arm is awaited on the runtime (its
+/// engine is loopback HTTP).
+enum EngineConn {
+    Rusqlite(PooledConn),
+    Musql(MusqlEngine),
+}
+
+impl EngineConn {
+    fn is_live(&self) -> bool {
+        match self {
+            EngineConn::Rusqlite(c) => c.is_live(),
+            // A musql stream is live as long as it is checked out; the sidecar
+            // owns the underlying file handle and reports its own failures as
+            // request errors.
+            EngineConn::Musql(_) => true,
+        }
+    }
+
+    async fn pipeline(
+        &mut self,
+        requests: Vec<Value>,
+        cache: SqlCache,
+        version: u8,
+    ) -> Result<crate::hrana_proto::ExecOutput, String> {
+        match self {
+            EngineConn::Rusqlite(c) => c
+                .call_blocking(move |conn| {
+                    Box::pin(execute_pipeline(conn, requests, cache, version, false))
+                })
+                .await
+                .map_err(|e| e.to_string()),
+            EngineConn::Musql(e) => Ok(execute_pipeline(e, requests, cache, version, false).await),
+        }
+    }
+
+    async fn cursor(
+        &mut self,
+        batch: Value,
+        cache: &SqlCache,
+        version: u8,
+    ) -> Result<Vec<Value>, String> {
+        match self {
+            EngineConn::Rusqlite(c) => {
+                let cache = cache.clone();
+                c.call_blocking(move |conn| {
+                    // The closure must own everything the future borrows: it is
+                    // `for<'a>` over the connection's lifetime, so a borrow of a
+                    // local could not be shown to outlive it.
+                    let cache = cache.clone();
+                    Box::pin(async move {
+                        crate::hrana_proto::execute_cursor(conn, batch, &cache, version, false)
+                            .await
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())
+            }
+            EngineConn::Musql(e) => {
+                Ok(crate::hrana_proto::execute_cursor(e, batch, cache, version, false).await)
+            }
+        }
+    }
+}
+
 struct Stream {
-    conn: PooledConn,
+    conn: EngineConn,
     cache: SqlCache,
     db_id: String,
     last_ms: u64,
@@ -238,7 +309,6 @@ async fn serve_local(
     endpoint: Endpoint,
     body: &[u8],
 ) -> Response {
-    let _ = cloud;
     match endpoint {
         Endpoint::Probe(v) => (
             StatusCode::OK,
@@ -246,14 +316,18 @@ async fn serve_local(
             json!({ "version": v, "encoding": "json" }).to_string(),
         )
             .into_response(),
-        Endpoint::Pipeline(v) => pipeline(db, v, body).await,
-        Endpoint::Cursor(v) => cursor(db, v, body).await,
+        Endpoint::Pipeline(v) => pipeline(cloud, db, v, body).await,
+        Endpoint::Cursor(v) => cursor(cloud, db, v, body).await,
     }
 }
 
 /// Take the stream named by `baton`, or open a fresh one. Returns the stream
 /// plus whether it was newly opened (only used for logging).
-async fn checkout(db: &Database, baton: Option<&str>) -> Result<Stream, Response> {
+async fn checkout(
+    cloud: &Arc<CloudState>,
+    db: &Database,
+    baton: Option<&str>,
+) -> Result<Stream, Response> {
     sweep();
     if let Some(b) = baton {
         // ONE guard covers take-and-restore. Writing this as
@@ -291,32 +365,57 @@ async fn checkout(db: &Database, baton: Option<&str>) -> Result<Stream, Response
             )
         });
     }
-    let Some(path) = crate::databases::sqlite_file_path(&db.id) else {
-        return Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database id is not a platform-issued id",
-            None,
-        ));
+    let engine = crate::musql::engine_for_db(&db.connection);
+    let conn = match engine {
+        DbEngine::Musql => {
+            let e = MusqlEngine::connect(cloud.http.clone(), &db.id).await.map_err(|e| {
+                // A database whose record says musql while the engine is not
+                // serving is an honest 503, never a locally-invented empty
+                // database and never a silent fall-through to rusqlite — those
+                // two files are different databases and serving one as the other
+                // is exactly the divergence owner-routing exists to prevent.
+                err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("musql engine unavailable for this database: {e}"),
+                    Some("SQLITE_BUSY"),
+                )
+            })?;
+            EngineConn::Musql(e)
+        }
+        DbEngine::Rusqlite => {
+            let Some(path) = crate::databases::sqlite_file_path(&db.id) else {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database id is not a platform-issued id",
+                    None,
+                ));
+            };
+            let pool = crate::sqlite_pool::pool_for(&db.id, &path);
+            match pool.acquire().await {
+                Ok(conn) => EngineConn::Rusqlite(conn),
+                Err(PoolError::Busy) => {
+                    return Err(err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &PoolError::Busy.to_string(),
+                        Some("SQLITE_BUSY"),
+                    ))
+                }
+                Err(e) => {
+                    return Err(err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &e.to_string(),
+                        Some("SQLITE_ERROR"),
+                    ))
+                }
+            }
+        }
     };
-    let pool = crate::sqlite_pool::pool_for(&db.id, &path);
-    match pool.acquire().await {
-        Ok(conn) => Ok(Stream {
-            conn,
-            cache: SqlCache::new(),
-            db_id: db.id.clone(),
-            last_ms: hive_core::now_ms(),
-        }),
-        Err(PoolError::Busy) => Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &PoolError::Busy.to_string(),
-            Some("SQLITE_BUSY"),
-        )),
-        Err(e) => Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-            Some("SQLITE_ERROR"),
-        )),
-    }
+    Ok(Stream {
+        conn,
+        cache: SqlCache::new(),
+        db_id: db.id.clone(),
+        last_ms: hive_core::now_ms(),
+    })
 }
 
 /// Re-insert a live stream under a FRESH baton and return it. `None` when the
@@ -335,7 +434,7 @@ fn checkin(mut stream: Stream) -> Option<String> {
     Some(baton)
 }
 
-async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
+async fn pipeline(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -357,15 +456,12 @@ async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
         .cloned()
         .unwrap_or_default();
 
-    let mut stream = match checkout(db, baton.as_deref()).await {
+    let mut stream = match checkout(cloud, db, baton.as_deref()).await {
         Ok(s) => s,
         Err(r) => return r,
     };
     let cache = std::mem::take(&mut stream.cache);
-    let out = stream
-        .conn
-        .call(move |c| execute_pipeline(c, requests, cache, version, false))
-        .await;
+    let out = stream.conn.pipeline(requests, cache, version).await;
     let (results, closed) = match out {
         Ok(o) => {
             stream.cache = o.cache;
@@ -393,7 +489,7 @@ async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
     }))
 }
 
-async fn cursor(db: &Database, version: u8, body: &[u8]) -> Response {
+async fn cursor(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -411,15 +507,11 @@ async fn cursor(db: &Database, version: u8, body: &[u8]) -> Response {
         .map(|b| b.to_string());
     let batch = parsed.get("batch").cloned().unwrap_or(Value::Null);
 
-    let mut stream = match checkout(db, baton.as_deref()).await {
+    let mut stream = match checkout(cloud, db, baton.as_deref()).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let cache = stream.cache.clone();
-    let out = stream
-        .conn
-        .call(move |c| crate::hrana_proto::execute_cursor(c, batch, &cache, version, false))
-        .await;
+    let out = stream.conn.cursor(batch, &stream.cache, version).await;
     let entries = match out {
         Ok(e) => e,
         Err(e) => {
@@ -672,6 +764,125 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         .route("/v1/sqlite/:id/v3", get(api_probe_v3).options(preflight))
         .route("/v1/databases/:id/hrana-mesh", post(mesh_route))
         .route("/v1/databases/sqlite-pools", get(pool_stats))
+        .route("/v1/databases/sqlite-engines", get(engine_stats))
+        .route("/v1/databases/:id/sqlite-engine", post(set_engine_route))
+        .route("/v1/databases/:id/sqlite-engine/plan", get(engine_plan_route))
+}
+
+/// Dry run: what a switch to musql WOULD do, including the blockers
+/// (`integrity_check` and the non-finite REAL scan) — so an operator can see a
+/// refusal before asking for the real thing.
+async fn engine_plan_route(
+    State(c): State<Arc<CloudState>>,
+    AxPath(id): AxPath<String>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Response {
+    if let Err(e) = crate::admin::require_operator(claims.as_ref().map(|e| &e.0)) {
+        return e.into_response();
+    }
+    let Some(db) = c.databases.get_raw(&id) else {
+        return err(StatusCode::NOT_FOUND, "no such database", None);
+    };
+    if db.kind != DbKind::Sqlite {
+        return err(StatusCode::NOT_FOUND, "no such database", None);
+    }
+    match crate::musql_migrate::plan(&id).await {
+        Ok(v) => ok_json(v),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e, Some("SQLITE_ERROR")),
+    }
+}
+
+/// Operator view of every managed SQLite database's storage engine on this
+/// node, plus the sidecar's own state. Node-local like `sqlite-pools` (a pool
+/// and a sidecar are both things on one machine), read per node.
+async fn engine_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<axum::Json<Value>, (StatusCode, String)> {
+    crate::admin::require_operator(claims.as_ref().map(|e| &e.0))?;
+    let dbs: Vec<Value> = c
+        .databases
+        .snapshot()
+        .into_iter()
+        .filter(|d| d.kind == DbKind::Sqlite)
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "engine": crate::musql::engine_for_db(&d.connection).label(),
+                "host_node": d.host_node,
+                "owned_here": d.host_node == c.node_name,
+                "file": d.connection.get("file").cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(axum::Json(json!({
+        "node": c.node_name,
+        "sidecar": crate::musql::status_json(),
+        "databases": dbs,
+    })))
+}
+
+/// Switch one managed SQLite database's engine, with the conversion VERIFIED
+/// before the record moves. `{"engine":"musql"}` converts and checks
+/// row-for-row; `{"engine":"rusqlite"}` exports back and checks the same way.
+///
+/// Owner-only by design: the file lives on one node and a non-owner has nothing
+/// to convert. It answers 421 rather than proxying — this is an operator action,
+/// not tenant traffic, and an honest refusal beats a silent no-op.
+async fn set_engine_route(
+    State(c): State<Arc<CloudState>>,
+    AxPath(id): AxPath<String>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    if let Err(e) = crate::admin::require_operator(claims.as_ref().map(|e| &e.0)) {
+        return e.into_response();
+    }
+    let Some(db) = c.databases.get_raw(&id) else {
+        return err(StatusCode::NOT_FOUND, "no such database", None);
+    };
+    if db.kind != DbKind::Sqlite {
+        return err(StatusCode::NOT_FOUND, "no such database", None);
+    }
+    if !is_owner(&c, &db) {
+        return err(
+            StatusCode::MISDIRECTED_REQUEST,
+            "this database is hosted on another node; run the engine switch there",
+            Some("HOST_UNREACHABLE"),
+        );
+    }
+    let want = body.get("engine").and_then(|v| v.as_str()).unwrap_or("");
+    let target = match want {
+        "musql" => DbEngine::Musql,
+        "rusqlite" => DbEngine::Rusqlite,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "engine must be \"musql\" or \"rusqlite\"",
+                None,
+            )
+        }
+    };
+    let current = crate::musql::engine_for_db(&db.connection);
+    if current == target {
+        return ok_json(json!({ "db_id": id, "engine": target.label(), "changed": false }));
+    }
+    let result = if target == DbEngine::Musql {
+        crate::musql_migrate::migrate(&id).await
+    } else {
+        crate::musql_migrate::rollback(&id).await
+    };
+    match result {
+        Ok(report) => {
+            // Only a VERIFIED conversion reaches this line: `migrate`/`rollback`
+            // both refuse to return `Ok` with a divergent table.
+            c.databases.set_engine(&id, target);
+            crate::hrana::close_streams(&id);
+            crate::sqlite_pool::close(&id);
+            ok_json(json!({ "changed": true, "report": report.json() }))
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e, Some("SQLITE_ERROR")),
+    }
 }
 
 /// Operator view of this NODE's live SQLite pools + open streams. Node-local by

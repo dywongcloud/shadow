@@ -240,19 +240,29 @@ pub struct PooledConn {
 }
 
 impl PooledConn {
-    /// Run `f` against the connection on the blocking pool. The connection is
-    /// moved in and moved back out; a panic inside `f` loses the connection
-    /// (reported as [`PoolError::Lost`]) but never the permit.
-    pub async fn call<F, R>(&mut self, f: F) -> Result<R, PoolError>
+    /// Run an ASYNC `f` against the connection on the blocking pool, driving it
+    /// to completion there.
+    ///
+    /// The connection is moved in and moved back out. `f` is a future because
+    /// the pipeline implementation is shared with the musql engine and is
+    /// therefore async, but this engine's work is blocking file IO, so it is
+    /// driven by `futures::executor::block_on` inside `spawn_blocking` rather
+    /// than awaited on a serving tokio worker. A panic inside `f` loses the
+    /// connection (reported as [`PoolError::Lost`]) but never the permit.
+    pub async fn call_blocking<F, R>(&mut self, f: F) -> Result<R, PoolError>
     where
-        F: FnOnce(&mut Connection) -> R + Send + 'static,
+        F: for<'a> FnOnce(
+                &'a mut Connection,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>>
+            + Send
+            + 'static,
         R: Send + 'static,
     {
         let Some(mut conn) = self.conn.take() else {
             return Err(PoolError::Lost);
         };
         match tokio::task::spawn_blocking(move || {
-            let out = f(&mut conn);
+            let out = futures::executor::block_on(f(&mut conn));
             (conn, out)
         })
         .await

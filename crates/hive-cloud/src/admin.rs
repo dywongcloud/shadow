@@ -13209,16 +13209,36 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
     if d.kind == crate::databases::DbKind::Sqlite {
         crate::hrana::close_streams(id);
         crate::sqlite_pool::close(id);
-        if let Some(path) = crate::databases::sqlite_file_path(id) {
-            for suffix in ["", "-wal", "-shm"] {
+        // Both engines' files, because a database may have been migrated and
+        // rolled back: whichever files exist get removed, and a `.musq` left
+        // behind would be served as a live database by the sidecar after its
+        // record is gone. musql keeps `.musq` plus a 0-byte `.musq.lock` and,
+        // transiently, a `.musq.delta`; SQLite keeps `-wal`/`-shm`. Missing
+        // files are expected, not an error.
+        for suffix in ["", "-wal", "-shm"] {
+            if let Some(p) = crate::databases::sqlite_file_path(id) {
                 let p = if suffix.is_empty() {
-                    path.clone()
+                    p
                 } else {
-                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+                    std::path::PathBuf::from(format!("{}{suffix}", p.display()))
                 };
                 if let Err(e) = std::fs::remove_file(&p) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove SQLite database file");
+                    }
+                }
+            }
+        }
+        for suffix in ["", ".lock", ".delta"] {
+            if let Some(p) = crate::databases::sqlite_musql_path(id) {
+                let p = if suffix.is_empty() {
+                    p
+                } else {
+                    std::path::PathBuf::from(format!("{}{suffix}", p.display()))
+                };
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove musql database file");
                     }
                 }
             }
