@@ -123,10 +123,32 @@ export function SandboxesPage({ paramsPromise }: { paramsPromise: Promise<{ proj
 
 function RowActions({ project, sandbox, onChanged }: { project: string; sandbox: SandboxRecord; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
+  async function start() {
+    setBusy(true);
+    try {
+      await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/start`);
+      onChanged();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
   async function stop() {
     setBusy(true);
     try {
       await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/stop`);
+      onChanged();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function restart() {
+    setBusy(true);
+    try {
+      await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/restart`);
       onChanged();
     } catch (e) {
       alert(String(e));
@@ -162,9 +184,18 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       <Link href={`/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}`}>
         <Button variant="ghost">Open</Button>
       </Link>
-      {sandbox.status === "running" && (
-        <Button variant="ghost" onClick={stop} disabled={busy}>
-          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Stop"}
+      {sandbox.status === "running" ? (
+        <>
+          <Button variant="ghost" onClick={stop} disabled={busy}>
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Stop"}
+          </Button>
+          <Button variant="ghost" onClick={restart} disabled={busy}>
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Restart"}
+          </Button>
+        </>
+      ) : (
+        <Button variant="ghost" onClick={start} disabled={busy}>
+          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Start"}
         </Button>
       )}
       <Button variant="ghost" onClick={snapshot} disabled={busy}>Snapshot</Button>

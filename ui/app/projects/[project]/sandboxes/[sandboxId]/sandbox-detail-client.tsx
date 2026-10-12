@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Copy, Loader2, Play, Plus, Square, Trash2, X } from "lucide-react";
+import { ArrowLeft, Copy, Loader2, Play, Plus, RotateCw, Square, Trash2, X } from "lucide-react";
 import { Badge, Button, Card, Input, PageHeader, Switch } from "@/components/ui";
 import {
   apiGet,
@@ -34,8 +34,19 @@ export function SandboxDetail({ paramsPromise }: { paramsPromise: Promise<{ proj
   const base = `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandboxId}`;
   const { data: sandbox, error, refresh } = usePoll<SandboxRecord>(base, 3000);
 
+  async function start() {
+    await apiSend("POST", `${base}/start`);
+    refresh();
+  }
   async function stop() {
     await apiSend("POST", `${base}/stop`);
+    refresh();
+  }
+  // Restart tears the cell down and provisions a fresh one — the fix for a
+  // running sandbox whose guest has wedged, which `start` cannot do (start is
+  // a no-op refresh while the sandbox is already running).
+  async function restart() {
+    await apiSend("POST", `${base}/restart`);
     refresh();
   }
   async function destroy() {
@@ -65,7 +76,14 @@ export function SandboxDetail({ paramsPromise }: { paramsPromise: Promise<{ proj
         action={
           <div className="flex items-center gap-2">
             <Badge tone={statusTone(sandbox.status)}>{sandbox.status}</Badge>
-            {sandbox.status === "running" && <Button variant="outline" onClick={stop}><Square className="h-4 w-4" /> Stop</Button>}
+            {sandbox.status === "running" ? (
+              <>
+                <Button variant="outline" onClick={stop}><Square className="h-4 w-4" /> Stop</Button>
+                <Button variant="outline" onClick={restart}><RotateCw className="h-4 w-4" /> Restart</Button>
+              </>
+            ) : (
+              <Button variant="outline" onClick={start}><Play className="h-4 w-4" /> Start</Button>
+            )}
             <Button variant="danger" onClick={destroy}><Trash2 className="h-4 w-4" /> Delete</Button>
           </div>
         }

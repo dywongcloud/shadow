@@ -22,7 +22,7 @@
 //!   typed 503 `SANDBOX_NO_CAPABLE_NODE` naming every candidate tried and why.
 //!   The winning owner's record (with `owner_node` = that peer) is ADOPTED on
 //!   the leader as metadata so later leader-forwarded mutations can route.
-//! * `stop`/`delete`/`run`/`kill` re-route to `SandboxRecord::owner_node` via
+//! * `start`/`stop`/`delete`/`run`/`kill` re-route to `SandboxRecord::owner_node` via
 //!   ONE typed internal RPC (`owner_op`, always `POST`) — the owner
 //!   re-authorizes the tenant against its own record and never re-proxies.
 //!   Reads reach the owner through `proxy_read` (the `fetch_from_host`
@@ -69,6 +69,21 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route(
             "/v1/projects/:project/sandboxes/:sandbox_id/stop",
             post(stop_sandbox),
+        )
+        // `start` is stop's inverse: it re-provisions the cell a stop (or a
+        // node restart) tore down and publishes the record as Running. Without
+        // it a stopped sandbox is terminal — the single cause of "stopped and
+        // cannot start again".
+        .route(
+            "/v1/projects/:project/sandboxes/:sandbox_id/start",
+            post(start_sandbox),
+        )
+        // `restart` is `start` after a teardown — the verb a Running sandbox
+        // needs when its cell is wedged, which `start` alone cannot fix
+        // (start is a no-op refresh while the record is already Running).
+        .route(
+            "/v1/projects/:project/sandboxes/:sandbox_id/restart",
+            post(restart_sandbox),
         )
         .route(
             "/v1/projects/:project/sandboxes/:sandbox_id/commands",
@@ -250,6 +265,82 @@ async fn remote_owner(c: &Arc<CloudState>, project: &str, sandbox_id: &str) -> O
     } else {
         Some(rec.owner_node)
     }
+}
+
+/// The node that must execute a cell-touching MUTATION for `sandbox_id`, or
+/// `None` when that is this node.
+///
+/// `remote_owner` answers only from THIS node's record, and a node that never
+/// adopted the sandbox has none — so `start` 404'd where the equivalent GET
+/// (which falls back to the leader via `read_target`) answered fine. Reads and
+/// writes have to agree on where a sandbox lives: ask the leader, which holds
+/// an adopted copy of every record, and use the `owner_node` it reports.
+async fn mutation_owner(
+    c: &Arc<CloudState>,
+    project: &str,
+    sandbox_id: &str,
+    team: &str,
+) -> Option<String> {
+    if let Some(owner) = remote_owner(c, project, sandbox_id).await {
+        return Some(owner);
+    }
+    // No remote owner and a local record: we own it, run it here.
+    if c.sandboxes.get_sandbox(project, sandbox_id).await.is_ok() {
+        return None;
+    }
+    let leader = c.leader_forward_target()?;
+    if leader == c.node_name {
+        return None;
+    }
+    let v = proxy_read(
+        c,
+        &leader,
+        &format!("/v1/projects/{project}/sandboxes/{sandbox_id}"),
+        team,
+    )
+    .await?;
+    let owner = v.get("owner_node")?.as_str()?.to_string();
+    if owner.is_empty() || owner == c.node_name {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+/// Run a cell-touching mutation on the node that owns the sandbox. `Ok(None)`
+/// means "no remote owner — apply it locally"; `Ok(Some(rec))` is the owner's
+/// record, adopted here so every later hop and read finds it.
+async fn forward_mutation(
+    c: &Arc<CloudState>,
+    project: &str,
+    sandbox_id: &str,
+    team: &str,
+    op: &str,
+) -> Result<Option<SandboxRecord>, (StatusCode, String)> {
+    let Some(owner) = mutation_owner(c, project, sandbox_id, team).await else {
+        return Ok(None);
+    };
+    let req = OwnerOpReq {
+        tenant: team.to_string(),
+        project: project.to_string(),
+        sandbox_id: sandbox_id.to_string(),
+        op: op.to_string(),
+        command_id: String::new(),
+        run: None,
+    };
+    let v = forward_owner_op(c, &owner, team, &req, owner_op_budget()).await?;
+    let rec: SandboxRecord = owner_reply_field(&v, "sandbox", &owner)?;
+    c.sandboxes.adopt_record(rec.clone());
+    c.audit.record(
+        team,
+        "user",
+        op,
+        "sandbox",
+        sandbox_id,
+        &format!("owner: {owner}"),
+    );
+    crate::persist::persist(c);
+    Ok(Some(rec))
 }
 
 /// Where a READ for `sandbox_id` should go when this node cannot answer it:
@@ -838,20 +929,39 @@ async fn patch_sandbox(
     Path((project, sandbox_id)): Path<(String, String)>,
     Json(b): Json<PatchReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require(&c, &headers, &claims, &project)?;
-    // Sandboxes doesn't expose a raw mutable-record API on the trait (every
-    // mutation is a specific verb: stop/network-policy/etc.) — tags/retention
-    // are the two purely-cosmetic/config fields with no dedicated verb, so we
-    // read-modify-through the record here via the store directly is NOT
-    // available on the trait; keep this endpoint honest about what it can do.
+    // Authz only: this verb writes nothing, so there is no tenant to stamp on
+    // an audit row (a PATCH that carries a field we cannot apply is refused
+    // below, and one that carries none has nothing to record).
+    require(&c, &headers, &claims, &project)?;
+    // Sandboxes expose no raw mutable-record API on the trait (every mutation
+    // is a specific verb: start/restart/stop/network-policy/etc.) — tags and
+    // retention are the two purely-cosmetic fields with no dedicated verb, and
+    // there is still no provider setter for them. So this endpoint serves the
+    // record and REFUSES a write it cannot apply, rather than answering 200
+    // over a dropped field.
     let rec = c
         .sandboxes
         .get_sandbox(&project, &sandbox_id)
         .await
         .map_err(sandbox_err)?;
-    let _ = (b.tags, b.keep_last_snapshots); // reserved: no trait setter yet (see writeup)
-    c.audit
-        .record(&t, "user", "update", "sandbox", &sandbox_id, "");
+    // Honest, never a silent no-op: there is still no trait setter for these
+    // two fields, so a PATCH that sends one is REFUSED (400) instead of
+    // answering 200 and dropping the write on the floor — a caller that thinks
+    // it renamed a sandbox must not find the old tags on the next read.
+    if b.tags.is_some() || b.keep_last_snapshots.is_some() {
+        let mut fields: Vec<&str> = Vec::new();
+        if b.tags.is_some() {
+            fields.push("tags");
+        }
+        if b.keep_last_snapshots.is_some() {
+            fields.push("keep_last_snapshots");
+        }
+        return Err(bad(&format!(
+            "sandbox PATCH does not support {} yet — no provider setter exists (delete and recreate to change {})",
+            fields.join(" / "),
+            if fields.len() == 1 { "it" } else { "them" }
+        )));
+    }
     Ok(Json(json!(masked_sandbox(rec))))
 }
 
@@ -869,7 +979,7 @@ pub(crate) struct OwnerOpReq {
     tenant: String,
     project: String,
     sandbox_id: String,
-    /// "stop" | "delete" | "run" | "kill"
+    /// "start" | "restart" | "stop" | "delete" | "run" | "kill"
     op: String,
     #[serde(default)]
     command_id: String,
@@ -910,6 +1020,37 @@ pub(crate) async fn owner_op(
     }
     let sandbox_id = rec.id.clone();
     match b.op.as_str() {
+        "start" => {
+            let rec = c
+                .sandboxes
+                .start_sandbox(&b.project, &sandbox_id)
+                .await
+                .map_err(sandbox_err)?;
+            c.audit
+                .record(&b.tenant, "user", "start", "sandbox", &sandbox_id, "");
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "sandbox": rec })))
+        }
+        "restart" => {
+            // Both halves, in order, in this one hop: the cell a stop tears
+            // down can only be re-provisioned by the node that owns the
+            // record, so a restart split into two owner hops could leave the
+            // sandbox stopped when the second hop never landed.
+            c.sandboxes
+                .stop_sandbox(&b.project, &sandbox_id)
+                .await
+                .map_err(sandbox_err)?;
+            crate::persist::persist(&c);
+            let rec = c
+                .sandboxes
+                .start_sandbox(&b.project, &sandbox_id)
+                .await
+                .map_err(sandbox_err)?;
+            c.audit
+                .record(&b.tenant, "user", "restart", "sandbox", &sandbox_id, "");
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "sandbox": rec })))
+        }
         "stop" => {
             let rec = c
                 .sandboxes
@@ -1101,6 +1242,83 @@ async fn stop_sandbox(
         .map_err(sandbox_err)?;
     c.audit
         .record(&t, "user", "stop", "sandbox", &sandbox_id, "");
+    crate::persist::persist(&c);
+    Ok(Json(json!(masked_sandbox(rec))))
+}
+
+/// Start (or restart) a stopped sandbox. Same owner-routing shape as `stop`:
+/// the record's `owner_node` does the provisioning, this node only proxies and
+/// adopts the result. Idempotent — starting an already-Running sandbox just
+/// refreshes its idle deadline.
+async fn start_sandbox(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Path((project, sandbox_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    // A start consumes a running slot, so it pays the same quota check `create`
+    // does — but only when it would actually add one: re-starting a sandbox
+    // that is already Running must never be refused by its own slot. Skipped
+    // when this node holds no record at all (the owner enforces its own quota).
+    if let Ok(current) = c.sandboxes.get_sandbox(&project, &sandbox_id).await {
+        if current.status != SandboxStatus::Running {
+            let plan = plan_of(&c, &t);
+            let max_running = crate::billing::plan_max_running_sandboxes(&plan);
+            if max_running > 0 {
+                let running = c.sandboxes.count_running_for_project(&project);
+                if running >= max_running {
+                    return Err(sandbox_err(SandboxError::QuotaExceeded(format!(
+                        "running-sandbox limit reached ({running}/{max_running}) on the {plan} plan — stop one or upgrade"
+                    ))));
+                }
+            }
+        }
+    }
+    if let Some(rec) = forward_mutation(&c, &project, &sandbox_id, &t, "start").await? {
+        return Ok(Json(json!(masked_sandbox(rec))));
+    }
+    let rec = c
+        .sandboxes
+        .start_sandbox(&project, &sandbox_id)
+        .await
+        .map_err(sandbox_err)?;
+    c.audit
+        .record(&t, "user", "start", "sandbox", &sandbox_id, "");
+    crate::persist::persist(&c);
+    Ok(Json(json!(masked_sandbox(rec))))
+}
+
+/// Restart a Running sandbox: the same cell-touching path as `start`, except
+/// the old cell is torn down first so the sandbox comes back on a freshly
+/// provisioned one (a wedged guest, a leaked process, a filesystem that has
+/// drifted — all fixed by a restart, none of them by `start`, which is a
+/// no-op refresh on an already-Running record). One hop, on the owner, so a
+/// restart can never leave the sandbox stopped because only half of it landed.
+async fn restart_sandbox(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Path((project, sandbox_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    if let Some(rec) = forward_mutation(&c, &project, &sandbox_id, &t, "restart").await? {
+        return Ok(Json(json!(masked_sandbox(rec))));
+    }
+    // Persist between the halves: the stop is a real state change, and losing
+    // it to a failed start would leave disk saying Running over a dead cell.
+    c.sandboxes
+        .stop_sandbox(&project, &sandbox_id)
+        .await
+        .map_err(sandbox_err)?;
+    crate::persist::persist(&c);
+    let rec = c
+        .sandboxes
+        .start_sandbox(&project, &sandbox_id)
+        .await
+        .map_err(sandbox_err)?;
+    c.audit
+        .record(&t, "user", "restart", "sandbox", &sandbox_id, "");
     crate::persist::persist(&c);
     Ok(Json(json!(masked_sandbox(rec))))
 }
@@ -1529,8 +1747,32 @@ async fn open_shell(
         .open_shell(&project, &sandbox_id, q.cols, q.rows)
         .await
         .map_err(sandbox_err)?;
+    // An open terminal makes the sandbox BUSY, not idle: the idle-timeout reap
+    // refreshes its deadline instead of stopping it. Held by a `Drop` guard for
+    // the whole session, so a client that vanishes mid-session (axum drops the
+    // upgrade future — it never sends a close frame) still releases it.
+    c.sandboxes.begin_shell_session(&sandbox_id);
+    let session = ShellSessionGuard {
+        cloud: c.clone(),
+        sandbox_id: sandbox_id.clone(),
+    };
+    Ok(ws.on_upgrade(move |socket| {
+        let _session = session;
+        pump_shell(socket, rx, pty)
+    }))
+}
 
-    Ok(ws.on_upgrade(move |socket| pump_shell(socket, rx, pty)))
+/// Releases `begin_shell_session` — see `open_shell`. Drop-only by design:
+/// every exit from the upgrade future (clean close, client gone, panic) runs
+/// it, where an explicit "on close" call would miss all but the first.
+struct ShellSessionGuard {
+    cloud: Arc<CloudState>,
+    sandbox_id: String,
+}
+impl Drop for ShellSessionGuard {
+    fn drop(&mut self) {
+        self.cloud.sandboxes.end_shell_session(&self.sandbox_id);
+    }
 }
 
 /// The typed close a client gets when its sandbox's cell is on `owner` and this

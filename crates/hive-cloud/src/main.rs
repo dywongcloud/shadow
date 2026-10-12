@@ -1797,6 +1797,7 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_guardian_snapshot_loop(cloud.clone());
     spawn_guardian_reap_loop(cloud.clone());
     spawn_lease_loop(cloud.clone());
+    spawn_sandbox_timeout_reap_loop(cloud.clone());
 
     // Self-management GC: reap stale clone/build working dirs under the deploy
     // roots ($HIVE_DATA/deploys, plus the legacy /tmp/hive-deploys) every 10 min
@@ -3670,6 +3671,37 @@ pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
 
 /// Container placement: every few seconds, for each container deployment this node
 /// holds, compute the preferred owner (rendezvous hash over LIVE holders) and
+/// Enforce the sandbox idle timeout: every `HIVE_SANDBOX_REAP_SECS` (default
+/// 30) stop each `Running` sandbox whose `timeout_expires_at` has passed.
+///
+/// Without this loop `timeout_ms` was decorative — `reap_expired` had no call
+/// site, so a sandbox created with a 10-minute timeout ran forever. The store
+/// is owner-scoped, so a node holding only an adopted metadata copy (the
+/// leader) never tears down a cell it does not own; the owner that provisioned
+/// the cell is the only node that stops it.
+///
+/// Cheap by construction: one read-lock scan over a per-project record list,
+/// and it touches the disk (persist) only on a tick that actually stopped
+/// something. 0 disables.
+fn spawn_sandbox_timeout_reap_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_SANDBOX_REAP_SECS", 30));
+    if interval.is_zero() {
+        return;
+    }
+    crate::supervise::spawn_supervised("sandbox-timeout-reap", move || {
+        let cloud = cloud.clone();
+        async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                crate::supervise::beat("sandbox-timeout-reap");
+                if cloud.sandboxes.reap_expired().await > 0 {
+                    crate::persist::persist(&cloud);
+                }
+            }
+        }
+    });
+}
+
 /// either acquire/renew our fenced lease (if we're preferred) or release it (so the
 /// preferred node can take over). A short liveness window gives fast failover.
 fn spawn_lease_loop(cloud: Arc<CloudState>) {

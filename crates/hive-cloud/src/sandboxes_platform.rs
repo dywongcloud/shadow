@@ -32,7 +32,7 @@ use crate::sandboxes::*;
 use hive_backend::{CellBackend, CellHandle, CellSpec};
 use hive_core::{CellId, ExecRequest as GuestExecRequest, ResourceSpec};
 use parking_lot::RwLock as PLRwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Holds a freshly provisioned cell between `provision` returning and the
@@ -139,6 +139,13 @@ pub struct PlatformSandboxProvider {
     /// Live kill-channels for detached execs, keyed by command id, so
     /// `kill_command` can stop draining even if the guest-side kill races.
     killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Sandbox ids with an interactive SHELL session open on this node right
+    /// now. A terminal someone is typing in is not idle, so the idle-timeout
+    /// reap refreshes its deadline instead of tearing the cell down under it.
+    /// Released by a `Drop` guard in the websocket handler, never by the
+    /// client's close frame alone (a vanished client drops the upgrade future
+    /// and never sends one).
+    open_shells: Arc<PLRwLock<HashSet<String>>>,
     backend: Option<Arc<dyn CellBackend>>,
     region: String,
     /// This node's own name — stamped onto `SandboxRecord::owner_node` for
@@ -155,6 +162,7 @@ impl PlatformSandboxProvider {
             mounts: Arc::new(PLRwLock::new(Vec::new())),
             cells: Arc::new(PLRwLock::new(HashMap::new())),
             killers: Arc::new(PLRwLock::new(HashMap::new())),
+            open_shells: Arc::new(PLRwLock::new(HashSet::new())),
             backend,
             region,
             node_name,
@@ -179,6 +187,15 @@ impl PlatformSandboxProvider {
 
     pub fn node_name(&self) -> &str {
         &self.node_name
+    }
+
+    /// Mark `sandbox_id` as having a live terminal session. Paired with
+    /// `end_shell_session`, which the caller's `Drop` guard runs.
+    pub fn begin_shell_session(&self, sandbox_id: &str) {
+        self.open_shells.write().insert(sandbox_id.to_string());
+    }
+    pub fn end_shell_session(&self, sandbox_id: &str) {
+        self.open_shells.write().remove(sandbox_id);
     }
 
     /// Adopt a record provisioned on ANOTHER node (its `owner_node` names the
@@ -255,9 +272,14 @@ impl PlatformSandboxProvider {
         *self.mounts.write() = m;
         // Cells don't survive a restart; any RUNNING record is stale until the
         // sandbox is used again (mirrors Fluid's own cold-restart behavior).
+        // Stamp `last_stopped_at` too — otherwise a record stopped by a restart
+        // is indistinguishable from one never started, and `stop`'s
+        // `total_duration_ms` accumulation silently drops that run.
+        let now = hive_core::now_ms();
         for rec in self.sandboxes.write().iter_mut() {
             if rec.status == SandboxStatus::Running {
                 rec.status = SandboxStatus::Stopped;
+                rec.last_stopped_at = Some(now);
             }
         }
     }
@@ -283,8 +305,26 @@ impl PlatformSandboxProvider {
 
     /// Idle-timeout reap: mirrors `fluid_compute::reconcile()`'s idle/drain
     /// pattern — a real deadline, real teardown, not just a status flip.
-    pub async fn reap_expired(&self) {
+    ///
+    /// Returns how many sandboxes it stopped. The stopped records live only in
+    /// memory until something persists, so the CALLER persists when the count
+    /// is non-zero (this provider holds no `CloudState`): an unpersisted reap
+    /// would let a process restart resurrect an already-expired record as
+    /// `Running`.
+    pub async fn reap_expired(&self) -> usize {
         let now = hive_core::now_ms();
+        // A sandbox with a command in flight is BUSY, never idle: tearing its
+        // cell down mid-command is the one thing "keep sandboxes running"
+        // forbids, and a long command must not be killed by the deadline its
+        // own start set.
+        let busy: HashSet<String> = self
+            .commands
+            .read()
+            .iter()
+            .filter(|c| matches!(c.status, CommandStatus::Queued | CommandStatus::Running))
+            .map(|c| c.sandbox_id.clone())
+            .chain(self.open_shells.read().iter().cloned())
+            .collect();
         let expired: Vec<(String, String)> = self
             .sandboxes
             .read()
@@ -292,6 +332,7 @@ impl PlatformSandboxProvider {
             .filter(|s| {
                 s.status == SandboxStatus::Running
                     && s.timeout_expires_at.map(|t| now >= t).unwrap_or(false)
+                    && !busy.contains(&s.id)
                     // Only the OWNER reaps: an adopted metadata copy (leader)
                     // has no cell to tear down, and flipping it to Stopped
                     // here would claim a state the owner has not reached.
@@ -299,9 +340,31 @@ impl PlatformSandboxProvider {
             })
             .map(|s| (s.project_id.clone(), s.id.clone()))
             .collect();
+        let mut reaped = 0usize;
+        let mut kept = 0usize;
         for (project_id, id) in expired {
-            let _ = SandboxProvider::stop_sandbox(self, &project_id, &id).await;
+            if busy.contains(&id) {
+                // Busy, not idle: a command in flight or an open terminal. Its
+                // cell stays up and the deadline restarts from now, so the
+                // countdown the UI shows never runs out under live work.
+                self.mark_running(&project_id, &id, None);
+                kept += 1;
+            } else if SandboxProvider::stop_sandbox(self, &project_id, &id)
+                .await
+                .is_ok()
+            {
+                reaped += 1;
+            }
         }
+        if reaped > 0 || kept > 0 {
+            tracing::info!(
+                reaped,
+                kept_busy = kept,
+                node = %self.node_name,
+                "sandbox idle timeout sweep"
+            );
+        }
+        reaped
     }
 
     fn secret_values(&self, sandbox: &SandboxRecord) -> Vec<String> {
@@ -526,10 +589,54 @@ impl PlatformSandboxProvider {
         Ok(rec)
     }
 
+    /// Publish that this sandbox HAS a live cell right now: status `Running`
+    /// plus a fresh idle deadline. This is the ONE place a record becomes
+    /// `Running` after create, so every path that (re)provisions a cell —
+    /// `start`, and any exec/shell that resurrected a cell via `ensure_cell`
+    /// — reports the same state instead of leaving a stopped record over a
+    /// live cell (which is what made a stopped sandbox look unstartable).
+    ///
+    /// Idempotent and non-destructive to accounting: an already-`Running`
+    /// record keeps its `last_started_at`, so `stop`'s
+    /// `last_stopped_at - last_started_at` accumulation never double-counts.
+    fn mark_running(&self, project_id: &str, id: &str, endpoint: Option<String>) {
+        let mut w = self.sandboxes.write();
+        let Some(rec) = w
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id && s.deleted_at.is_none())
+        else {
+            return;
+        };
+        let now = hive_core::now_ms();
+        if rec.status != SandboxStatus::Running {
+            rec.status = SandboxStatus::Running;
+            rec.last_started_at = Some(now);
+            rec.last_stopped_at = None;
+        }
+        rec.timeout_expires_at = Some(now + rec.timeout_ms);
+        rec.updated_at = now;
+        rec.container = cell_id_for(&rec.id).to_string();
+        if let Some(ep) = endpoint {
+            rec.provider_sandbox_id = Some(ep);
+        }
+    }
+
+    /// Tear the sandbox's cell down and forget it. A teardown FAILURE is never
+    /// silent: the handle is dropped either way (the caller's state change is
+    /// what the user asked for) but a WARN names the orphan, because nothing
+    /// reaps it — `reap_orphaned_runners` runs only at backend construction,
+    /// so a leaked runner keeps its TUN device and cell root dir.
     async fn terminate_cell(&self, sandbox_id: &str) {
         let handle = self.cells.write().remove(sandbox_id);
         if let (Some(handle), Some(backend)) = (handle, self.backend.as_ref()) {
-            let _ = backend.terminate(&handle).await;
+            if let Err(e) = backend.terminate(&handle).await {
+                tracing::warn!(
+                    sandbox = %sandbox_id,
+                    node = %self.node_name,
+                    error = %e,
+                    "sandbox cell teardown FAILED — the provider has forgotten this cell but its runner, TUN device and root dir may still exist"
+                );
+            }
         }
     }
 }
@@ -604,6 +711,25 @@ impl SandboxProvider for PlatformSandboxProvider {
         self.create_sandbox(tenant_id, project_id, input).await
     }
 
+    async fn start_sandbox(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
+        let sandbox = self.get_sandbox(project_id, id).await?;
+        if !self.local_exec_capable() {
+            return Err(self.engine_unavailable());
+        }
+        // `ensure_cell` is the ONE provision/resurrect primitive: it returns the
+        // live handle if this node still holds the cell, else provisions fresh.
+        // A cell lost to `stop`, `delete` or a restart is gone for good, so a
+        // start is always a fresh provision — never a resume of dead state.
+        let handle = self.ensure_cell(&sandbox).await?;
+        self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
+        tracing::info!(sandbox = %sandbox.id, node = %self.node_name, backend = self.backend_name().unwrap_or("none"), "sandbox cell started");
+        self.get_sandbox(project_id, &sandbox.id).await
+    }
+
     async fn stop_sandbox(
         &self,
         project_id: &str,
@@ -661,6 +787,13 @@ impl SandboxProvider for PlatformSandboxProvider {
             .as_ref()
             .ok_or_else(|| self.engine_unavailable())?;
         let handle = self.ensure_cell(&sandbox).await?;
+        // Idempotent, so it runs on EVERY exec and not only on a resurrect:
+        // an already-Running sandbox gets a fresh idle deadline, which is what
+        // "keep running" means — the timeout is measured from the last time
+        // anyone used the sandbox, never from when it was created. Guarded to
+        // `status != Running` it would let a busy sandbox be reaped at its
+        // original deadline mid-command.
+        self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
         let secrets = self.secret_values(&sandbox);
         let cmd_id = format!("cmd_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
         let now = hive_core::now_ms();
@@ -768,6 +901,10 @@ impl SandboxProvider for PlatformSandboxProvider {
             .as_ref()
             .ok_or_else(|| self.engine_unavailable())?;
         let handle = self.ensure_cell(&sandbox).await?;
+        // Same rule as `run_command`: a STOPPED record whose cell `ensure_cell`
+        // just resurrected must say so, AND a live one must get a fresh idle
+        // deadline so an open shell is never reaped out from under the user.
+        self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
         let session_id = format!("sh_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
 
         let env = sandbox

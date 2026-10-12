@@ -657,6 +657,14 @@ pub trait SandboxProvider: Send + Sync {
         project_id: &str,
         input: CreateSandboxInput,
     ) -> Result<SandboxRecord, SandboxError>;
+    /// Bring a STOPPED sandbox back up: re-provision its cell (the cell handle
+    /// is dropped by `stop`/`delete`/a restart, so `start` is a fresh
+    /// provision, never a resume of dead state) and publish it as `Running`.
+    /// Idempotent: starting an already-`Running` sandbox refreshes only its
+    /// idle deadline and never resets `last_started_at`, so
+    /// `stop`'s `total_duration_ms` accumulation stays correct.
+    async fn start_sandbox(&self, project_id: &str, id: &str)
+        -> Result<SandboxRecord, SandboxError>;
     async fn stop_sandbox(&self, project_id: &str, id: &str)
         -> Result<SandboxRecord, SandboxError>;
     async fn delete_sandbox(&self, project_id: &str, id: &str) -> Result<(), SandboxError>;
@@ -884,6 +892,26 @@ impl SandboxProvider for MockSandboxProvider {
             return Ok(existing);
         }
         self.create_sandbox(tenant_id, project_id, input).await
+    }
+    async fn start_sandbox(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
+        let mut m = self.sandboxes.lock();
+        let s = m
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id && s.deleted_at.is_none())
+            .ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
+        let now = 2;
+        if s.status != SandboxStatus::Running {
+            s.status = SandboxStatus::Running;
+            s.last_started_at = Some(now);
+            s.last_stopped_at = None;
+        }
+        s.timeout_expires_at = Some(now + s.timeout_ms);
+        s.updated_at = now;
+        Ok(s.clone())
     }
     async fn stop_sandbox(
         &self,
