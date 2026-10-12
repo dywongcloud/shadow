@@ -39,7 +39,35 @@
 //! `SQLITE_ERROR`, its `base_url` is dropped, its `baton` is kept internal (it
 //! hands out a fresh one on EVERY response, which would cost every client an
 //! extra round trip), and its constant `rows_read: 0` is replaced with the rows
-//! actually produced.
+//! actually stepped — which is why the engine is asked for rows even when the
+//! caller did not want them (see [`MusqlEngine::run`]).
+//!
+//! # Four measured divergences from SQLite, and what was decided about each
+//!
+//! * **`rows_read` with `want_rows: false`.** musqld returns no row bodies, so
+//!   counting what came back reported 0 for a SELECT that stepped rows. Fixed:
+//!   the engine is always asked for rows and the count is taken from the step,
+//!   matching the rusqlite engine byte for byte.
+//! * **A non-finite REAL.** musqld's row encoder has no representation for
+//!   `Inf`/`-Inf`/`NaN` and emits `{"type":"null"}`, indistinguishable from a
+//!   real NULL — yet `SELECT 1e308*10 IS NULL` answers 0 and
+//!   `CAST(1e308*10 AS TEXT)` answers `Inf`, so the engine still knows. Fixed:
+//!   a NULL in a REAL-capable column is re-checked against the engine and
+//!   turned into the same loud error `hrana_proto::encode_value` raises, rather
+//!   than handed to a client as a NULL it never wrote.
+//! * **Negative zero.** musqld normalises a STORED `-0.0` to `0.0` (measured on
+//!   the live sidecar: `INSERT INTO t VALUES(-0.0)` then `SELECT x` answers
+//!   `{"type":"float","value":0}`; a literal `SELECT -0.0` is preserved).
+//!   ACCEPTED, NOT FIXED: `-0.0 = 0.0` is true in SQL, the two sort, compare
+//!   and sum identically, and the only observable difference is their TEXT
+//!   rendering (`CAST(x AS TEXT)`), which nothing in this lane reads. Closing
+//!   it would mean re-encoding every REAL on the way in and out.
+//! * **Error message text.** `SELECT FROM` is `near "FROM": syntax error` on
+//!   SQLite and `no such column: FROM` on musqld; both are `SQLITE_ERROR`.
+//!   Decided: message text is NOT part of the wire contract (clients match on
+//!   the code and the envelope, and `hrana_proto` re-tags every code to
+//!   `SQLITE_ERROR` regardless), so musqld's more specific text is passed
+//!   through unchanged instead of being rewritten to imitate SQLite's parser.
 
 use crate::sqlite_engine::{Budget, Col, DescribeResult, NamedArg, RunResult, SqlEngine, SqlValue};
 use async_trait::async_trait;
@@ -86,15 +114,29 @@ impl Engine {
     }
 }
 
-/// Per-database override, read from the `engine` key the provisioner already
-/// writes into the database record's `connection` map.
+/// Per-database override, read from the `engine` key the provisioner writes into
+/// the database record's `connection` map.
+///
+/// **Every value other than `musql` resolves to [`Engine::Rusqlite`], never to
+/// [`default_engine`].** That is the whole point of this function and it is a
+/// correctness property, not a style choice: the pre-change provisioner wrote
+/// `engine: "sqlite"`, so a `_ => default_engine()` arm silently re-routed
+/// EVERY existing database — a `.db` file, never converted, never verified —
+/// onto musql the moment an operator set `HIVE_SQLITE_ENGINE=musql`, and where
+/// no `.musq` existed the database answered "no such database" instead of its
+/// data. An unverified record must not be able to become musql by env var
+/// alone; the only thing that makes a database musql is the explicit,
+/// verified-after-the-fact flip in `musql_migrate`.
 pub fn engine_for_db(connection: &HashMap<String, String>) -> Engine {
-    match connection.get("engine").map(|s| s.as_str()) {
+    let v = connection
+        .get("engine")
+        .map(|s| s.trim().to_ascii_lowercase());
+    match v.as_deref() {
         Some("musql") => Engine::Musql,
-        Some("rusqlite") => Engine::Rusqlite,
-        // A record with no `engine` key predates this field; it is a rusqlite
-        // file by construction and must keep being one.
-        _ => default_engine(),
+        // "rusqlite", the legacy "sqlite", a record with no `engine` key at
+        // all, and every unknown spelling: a rusqlite file by construction, and
+        // it stays one until it is converted and proven.
+        _ => Engine::Rusqlite,
     }
 }
 
@@ -243,9 +285,34 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
             }
         };
         if wait_ready(&sc.base).await {
-            sc.ready.store(true, Ordering::SeqCst);
-            backoff = Duration::from_millis(500);
-            tracing::info!(addr = %addr, dir = %dir.display(), "musqld sidecar ready");
+            // The probe proves only that SOMETHING answered on the port — an
+            // ORPHANED musqld from a previous boot answers it identically, and
+            // one was witnessed live: it survived its parent's shutdown, kept
+            // holding 127.0.0.1:8099, and every supervised child afterwards
+            // died on `bind: address already in use` while the readiness probe
+            // still saw 404s and reported ready. Serving tenant databases
+            // through that process would hand them to a writer this node does
+            // not supervise — exactly the "one writer per file" property the
+            // module doc stakes out. So readiness is gated on OUR child still
+            // being alive at the moment the probe succeeded.
+            match child.try_wait() {
+                Ok(None) => {
+                    sc.ready.store(true, Ordering::SeqCst);
+                    backoff = Duration::from_millis(500);
+                    tracing::info!(addr = %addr, dir = %dir.display(), "musqld sidecar ready");
+                }
+                other => {
+                    // Another process owns the port (or musqld died on startup).
+                    // Stay NOT ready: an honest 503 beats serving a foreign
+                    // writer, and the restart counter makes it operator-visible.
+                    tracing::error!(
+                        addr = %addr,
+                        status = ?other,
+                        "musqld is not the process serving this port (another musqld already \
+                         holds it, or it exited on startup); the SQLite lane stays unready"
+                    );
+                }
+            }
         } else {
             tracing::error!(addr = %addr, "musqld bound but never answered its readiness probe");
         }
@@ -265,6 +332,10 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
 /// Readiness = the port answers AND speaks musqld's error shape. A bare TCP
 /// connect would also succeed against anything else that grabbed the port, and
 /// the whole point of the probe is to know the ENGINE is there.
+///
+/// It proves that for SOME process, not for the one this supervisor spawned —
+/// the caller must additionally confirm its own child is alive (see
+/// `supervise`), because an orphaned musqld answers this probe identically.
 async fn wait_ready(base: &str) -> bool {
     let client = match reqwest::Client::builder()
         .no_proxy()
@@ -459,6 +530,14 @@ impl MusqlEngine {
     /// `crate::hrana_proto` re-tags everything `SQLITE_ERROR` on the way out, so
     /// the client-visible code is unchanged and only the message (which is
     /// genuinely more specific) moves.
+    ///
+    /// That message text is DECISION, not accident: it differs from SQLite's
+    /// (`SELECT FROM` is `near "FROM": syntax error` there, `no such column:
+    /// FROM` here) and it is deliberately NOT rewritten to imitate it. Message
+    /// text is not part of the Hrana wire contract — clients branch on the code
+    /// and the envelope, both of which are identical — and musqld's text is
+    /// more specific than SQLite's parser's, so normalising it would trade real
+    /// information for cosmetic agreement.
     fn unwrap(result: &Value) -> Result<Value, String> {
         match result.get("type").and_then(|t| t.as_str()) {
             Some("ok") => Ok(result.get("response").cloned().unwrap_or(Value::Null)),
@@ -540,6 +619,111 @@ impl MusqlEngine {
             })
             .unwrap_or_default()
     }
+
+    /// Whether a NULL rendered by musqld in this column could be a non-finite
+    /// REAL rather than a NULL. Only a column the engine declares REAL (or does
+    /// not declare at all — every computed expression, including `SELECT
+    /// 1e308*10`) can hold one, so a NULL in an INTEGER or TEXT column is never
+    /// probed. SQLite's affinity rules: a declared type containing REAL, FLOA
+    /// or DOUB takes REAL affinity.
+    fn could_be_non_finite(col: Option<&Col>) -> bool {
+        match col.and_then(|c| c.decltype.as_deref()) {
+            None => true,
+            Some(d) => {
+                let u = d.to_ascii_uppercase();
+                u.contains("REAL") || u.contains("FLOA") || u.contains("DOUB")
+            }
+        }
+    }
+
+    /// Decide whether a NULL musqld rendered is a non-finite REAL.
+    ///
+    /// musqld's row encoder has no representation for `Inf`/`-Inf`/`NaN` and
+    /// emits `{"type":"null"}` — byte-identical to a real NULL, so the rendered
+    /// row alone cannot tell them apart. The ENGINE still can, measured against
+    /// the live sidecar: `SELECT 1e308*10 IS NULL` answers 0 and
+    /// `CAST(1e308*10 AS TEXT)` answers `Inf`. So ask it: re-run the statement
+    /// wrapped in a subquery and project, per suspect column, the text
+    /// rendering musqld itself would have used.
+    ///
+    /// Three gates keep that safe and bounded:
+    /// * only for a statement the engine itself reports read-only — re-running a
+    ///   write would apply it twice;
+    /// * only when the first pass actually rendered a NULL, and only in a column
+    ///   that can hold a REAL (`could_be_non_finite`);
+    /// * one probe statement covering every suspect column at once, so the cost
+    ///   is one extra execution of the statement, never one per column.
+    ///
+    /// That cost is accepted: a non-finite handed to a client as a NULL it never
+    /// wrote is the one divergence this lane raises a loud error for everywhere
+    /// else (`hrana_proto::encode_value` refuses to encode one), and a silent
+    /// wrong value is worse than a second read.
+    async fn non_finite_probe(
+        &mut self,
+        sql: &str,
+        cols: &[Col],
+        idxs: &[usize],
+    ) -> Option<(String, f64)> {
+        // Read-only is the engine's own verdict; a statement it will not vouch
+        // for is not re-run, and the NULL is left as a NULL.
+        if !self.describe(sql).await.ok()?.is_readonly {
+            return None;
+        }
+        let inner = sql.trim().trim_end_matches(';').trim();
+        if inner.is_empty() {
+            return None;
+        }
+        let mut guards: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for i in idxs {
+            let name = cols.get(*i)?.name.as_str();
+            // An unnamed column cannot be addressed from the wrapper; musqld
+            // answers "no such column" for `t.""`. Skipping is honest — it
+            // leaves that one column unchecked.
+            if name.is_empty() {
+                continue;
+            }
+            let q = format!("\"{}\"", name.replace('"', "\"\""));
+            guards.push(format!(
+                "MAX(CASE WHEN typeof(t.{q}) = 'real' AND CAST(t.{q} AS TEXT) \
+                 IN ('Inf','-Inf','NaN') THEN CAST(t.{q} AS TEXT) ELSE NULL END)"
+            ));
+            names.push(name.to_string());
+        }
+        if guards.is_empty() {
+            return None;
+        }
+        // `post` directly, never `run`: `run` would probe its own probe.
+        let results = self
+            .post(vec![json!({
+                "type": "execute",
+                "stmt": { "sql": format!("SELECT {} FROM ({}) AS t", guards.join(", "), inner),
+                          "want_rows": true },
+            })])
+            .await
+            .ok()?;
+        let first = results.into_iter().next().unwrap_or(Value::Null);
+        let res = Self::unwrap(&first).ok()?;
+        let result = res.get("result").cloned().unwrap_or(Value::Null);
+        let arr = result
+            .get("rows")
+            .and_then(|r| r.as_array())?
+            .first()?
+            .as_array()?;
+        for (i, v) in arr.iter().enumerate() {
+            let Some(s) = v.get("value").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let f = match s {
+                "Inf" => f64::INFINITY,
+                "-Inf" => f64::NEG_INFINITY,
+                "NaN" => f64::NAN,
+                _ => continue,
+            };
+            return Some((names.get(i).cloned().unwrap_or_default(), f));
+        }
+        None
+    }
 }
 
 /// The `Host` that selects a database in musqld's `-dir` mode: the file's own
@@ -558,7 +742,15 @@ impl SqlEngine for MusqlEngine {
         named: &[NamedArg],
         budget: Budget,
     ) -> Result<RunResult, String> {
-        let mut stmt = json!({ "sql": sql, "want_rows": want_rows });
+        // The engine is asked for rows UNCONDITIONALLY. musqld answers
+        // `rows_read: 0` for every statement, so the step count is the only
+        // honest source for the number the wire publishes — and with
+        // `want_rows: false` musqld returns no row bodies at all, which would
+        // report 0 for a `SELECT` that stepped rows. The rusqlite engine counts
+        // every stepped row BEFORE it looks at `want_rows`, and that is what
+        // clients see today, so that is the contract. The rows are discarded
+        // below when the caller did not ask for them.
+        let mut stmt = json!({ "sql": sql, "want_rows": true });
         if !args.is_empty() {
             stmt["args"] = Value::Array(args.iter().map(Self::encode).collect());
         }
@@ -580,11 +772,18 @@ impl SqlEngine for MusqlEngine {
         let cols = Self::cols(&result);
         let mut rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut bytes = 0usize;
+        let mut realish_nulls: Vec<usize> = Vec::new();
         for row in result.get("rows").and_then(|r| r.as_array()).unwrap_or(&vec![]) {
             let arr = row.as_array().ok_or("musql returned a non-array row")?;
             let mut out = Vec::with_capacity(arr.len());
-            for v in arr {
+            for (i, v) in arr.iter().enumerate() {
                 let decoded = Self::decode(v)?;
+                if matches!(decoded, SqlValue::Null)
+                    && Self::could_be_non_finite(cols.get(i))
+                    && !realish_nulls.contains(&i)
+                {
+                    realish_nulls.push(i);
+                }
                 bytes += decoded.approx_bytes();
                 out.push(decoded);
             }
@@ -604,11 +803,26 @@ impl SqlEngine for MusqlEngine {
                 ));
             }
         }
+        // A NULL in a REAL-capable column is the one place musqld's encoder is
+        // lossy, so it is re-checked against the engine before the row is
+        // handed out. See `non_finite_probe`.
+        if !realish_nulls.is_empty() {
+            if let Some((col, value)) = self.non_finite_probe(sql, &cols, &realish_nulls).await {
+                return Err(crate::hrana_proto::non_finite_message(&col, value));
+            }
+        }
         // musqld reports rows_read: 0 unconditionally, so the honest substitute
-        // is what this statement produced. Never a fabrication of rows it did
-        // not step: when `want_rows` is false musqld returns no row bodies and
-        // this reports 0 rather than claiming a count it never had.
+        // is what this statement stepped. Deliberately taken from every row the
+        // statement produced, not from the rows the caller asked for:
+        // `want_rows: false` still executes and still counts.
         let rows_read = rows.len() as u64;
+        if !want_rows {
+            // The rusqlite engine does not materialise a row it was told not to
+            // return; the budget above is still applied to the set that had to
+            // be materialised to count it, which is the safer direction (a
+            // refusal, not an unbounded buffer).
+            rows.clear();
+        }
         let rows_written = result
             .get("affected_row_count")
             .and_then(|n| n.as_u64())

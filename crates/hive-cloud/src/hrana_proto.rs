@@ -350,17 +350,26 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("invalid base64 in blob argument: {e}"))
 }
 
+/// The one message a non-finite REAL produces, whichever engine produced it.
+///
+/// Shared on purpose: the rusqlite path refuses to ENCODE one here, and the
+/// musql path has to re-derive it from the engine after musqld's lossy row
+/// encoder turned it into a NULL. Two engines, one message, so a client cannot
+/// tell which engine it is talking to by the error text.
+pub(crate) fn non_finite_message(col: &str, f: f64) -> String {
+    format!(
+        "column {col:?} holds a non-finite float ({f}), which JSON cannot represent — \
+         cast it in the query (e.g. CAST(x AS TEXT))"
+    )
+}
+
 fn encode_value(v: SqlValue, col: &str) -> Result<Value, String> {
     Ok(match v {
         SqlValue::Null => json!({ "type": "null" }),
         SqlValue::Integer(i) => json!({ "type": "integer", "value": i.to_string() }),
         SqlValue::Real(f) => {
-            let n = serde_json::Number::from_f64(f).ok_or_else(|| {
-                format!(
-                    "column {col:?} holds a non-finite float ({f}), which JSON cannot represent — \
-                     cast it in the query (e.g. CAST(x AS TEXT))"
-                )
-            })?;
+            let n = serde_json::Number::from_f64(f)
+                .ok_or_else(|| non_finite_message(col, f))?;
             json!({ "type": "float", "value": n })
         }
         SqlValue::Text(t) => json!({ "type": "text", "value": t }),

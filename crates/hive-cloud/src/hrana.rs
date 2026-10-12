@@ -75,7 +75,25 @@ fn stream_idle_ms() -> u64 {
 }
 
 /// Max request body for a pipeline POST.
+///
+/// ENFORCED TWICE ON PURPOSE, because the two mounts differ in where the bytes
+/// arrive. `axum`'s own default body limit (2 MiB) otherwise rejects first —
+/// measured live on this very route: a 1.9 MiB body answered 200 and a 2 MiB
+/// one answered `413 text/plain`, so the number below was never the number a
+/// client met. The routes now carry `DefaultBodyLimit::max(BODY_CAP)` so the
+/// documented cap is the enforced one. It still fires in the framework, before
+/// `serve` runs: an over-cap body therefore gets 413 with axum's text/plain
+/// message and no `code`, and it does so BEFORE the bearer is checked (measured:
+/// an over-cap body with a wrong token answers 413, not 401). The check in
+/// `serve` remains the chokepoint for every caller that reaches the handler with
+/// bytes already in hand — notably `mesh_serve`, whose body arrives base64
+/// inside a JSON envelope and is checked after decoding.
 const BODY_CAP: usize = 4 * 1024 * 1024;
+
+/// The mesh hop carries the same bytes base64-encoded inside a JSON envelope,
+/// so its transport limit has to clear the encoded size of a full-cap body
+/// (~5.6 MiB) or a pipeline the owner would accept could not reach it.
+const MESH_BODY_CAP: usize = BODY_CAP * 2;
 
 /// One Hrana stream's connection to whichever engine this database runs on.
 ///
@@ -211,6 +229,47 @@ pub fn close_streams(db_id: &str) {
     drop(dropped);
 }
 
+// ---- Conversion quiesce ---------------------------------------------------
+
+/// Databases whose file is mid-conversion, keyed by database id.
+///
+/// `close_streams` closes what is ALREADY open, which is not enough: a client
+/// that dials in one second later reopens the file behind the migration's back,
+/// and a write landing after `musql_migrate` snapshotted the source is lost the
+/// moment the record flips. Witnessed live: `-shm` mtimes moved nine minutes
+/// after the snapshot. So the whole conversion holds this set and `checkout`
+/// REFUSES new streams for it (refuses, never queues — a queued stream would
+/// open onto a file that has already been replaced).
+fn quiescing() -> &'static Mutex<std::collections::HashSet<String>> {
+    static Q: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Held for the duration of a conversion. The set entry is removed by `Drop`,
+/// never on a success or error branch: a conversion that panics or returns
+/// early must not leave a database refusing every request forever.
+pub struct ConversionGuard(String);
+
+impl Drop for ConversionGuard {
+    fn drop(&mut self) {
+        quiescing().lock().remove(&self.0);
+        tracing::info!(db = %self.0, "storage-engine conversion window closed");
+    }
+}
+
+/// Refuse new streams on `db_id` until the returned guard is dropped.
+pub fn begin_conversion(db_id: &str) -> ConversionGuard {
+    quiescing().lock().insert(db_id.to_string());
+    tracing::info!(db = %db_id, "storage-engine conversion window open; new Hrana streams refused");
+    ConversionGuard(db_id.to_string())
+}
+
+/// Whether a conversion is holding `db_id`: while it is, `checkout` refuses to
+/// open a new stream on that database.
+pub fn is_quiescing(db_id: &str) -> bool {
+    quiescing().lock().contains(db_id)
+}
+
 // ---- HTTP surface ---------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -329,6 +388,15 @@ async fn checkout(
     baton: Option<&str>,
 ) -> Result<Stream, Response> {
     sweep();
+    // A conversion is running on this file: refuse, loudly and retryably,
+    // rather than open a connection onto a database that is being replaced.
+    if is_quiescing(&db.id) {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this database is being converted between storage engines; retry shortly",
+            Some("SQLITE_BUSY"),
+        ));
+    }
     if let Some(b) = baton {
         // ONE guard covers take-and-restore. Writing this as
         // `match streams().lock().remove(b) { … }` is a self-deadlock: the
@@ -762,7 +830,17 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         )
         .route("/v1/sqlite/:id/v2", get(api_probe_v2).options(preflight))
         .route("/v1/sqlite/:id/v3", get(api_probe_v3).options(preflight))
-        .route("/v1/databases/:id/hrana-mesh", post(mesh_route))
+        // The documented body cap, enforced where the bytes arrive (see
+        // `BODY_CAP`). `add_cors` rides along because an over-cap body is
+        // rejected by the framework and never reaches `cors()` inside the
+        // handler — without it a browser client sees an opaque network error
+        // instead of the 413.
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_CAP))
+        .layer(axum::middleware::map_response(add_cors))
+        .route(
+            "/v1/databases/:id/hrana-mesh",
+            post(mesh_route).layer(axum::extract::DefaultBodyLimit::max(MESH_BODY_CAP)),
+        )
         .route("/v1/databases/sqlite-pools", get(pool_stats))
         .route("/v1/databases/sqlite-engines", get(engine_stats))
         .route("/v1/databases/:id/sqlite-engine", post(set_engine_route))
@@ -868,7 +946,10 @@ async fn set_engine_route(
         return ok_json(json!({ "db_id": id, "engine": target.label(), "changed": false }));
     }
     let result = if target == DbEngine::Musql {
-        crate::musql_migrate::migrate(&id).await
+        // `live_is_musql` is false here by construction (an equal target
+        // returned above), so a `.musq` staged by an earlier verified run is
+        // moved aside rather than blocking the flip.
+        crate::musql_migrate::migrate(&id, current == DbEngine::Musql).await
     } else {
         crate::musql_migrate::rollback(&id).await
     };
@@ -947,6 +1028,13 @@ async fn api_probe_v3(
 
 async fn preflight() -> Response {
     cors(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `cors` as a response-mapping middleware, so a response produced OUTSIDE the
+/// handlers (the framework's over-cap 413) still carries the headers the
+/// browser preflight was promised.
+async fn add_cors(resp: Response) -> Response {
+    cors(resp)
 }
 
 async fn api_serve(
