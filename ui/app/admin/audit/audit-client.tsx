@@ -2,6 +2,7 @@
 
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
 import { useOpsPoll, type Event } from "@/lib/api";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 
 export interface AuditEvent extends Event {
   project: string;
@@ -18,8 +19,15 @@ const tone: Record<string, "green" | "red" | "amber" | "blue" | "default"> = {
   rewrite: "default",
 };
 
-export function AdminAuditClient({ initialEvents }: { initialEvents: AuditEvent[] | null }) {
-  const { data: events } = useOpsPoll<AuditEvent[]>("/v1/admin/audit", 4000, true, initialEvents);
+export function AdminAuditClient({
+  initialEvents,
+  initialError,
+}: {
+  initialEvents: AuditEvent[] | null;
+  initialError?: string | null;
+}) {
+  const { data: events, error } = useOpsPoll<AuditEvent[]>("/v1/admin/audit", 4000, true, initialEvents);
+  const failure = error ?? initialError ?? null;
 
   return (
     <div>
@@ -43,7 +51,8 @@ export function AdminAuditClient({ initialEvents }: { initialEvents: AuditEvent[
           ))}
         </tbody>
       </Table>
-      {!events?.length && <Card className="mt-4 py-12 text-center text-sm text-secondary">No audit events yet.</Card>}
+      {!failure && !events?.length && <Card className="mt-4 py-12 text-center text-sm text-secondary">No audit events yet.</Card>}
+      <OpsFetchError error={failure} label="the audit log" />
     </div>
   );
 }

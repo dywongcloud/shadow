@@ -46,3 +46,24 @@ export async function fetchOpsServer<T>(path: string): Promise<T> {
   if (!r.ok) throw new Error(`ops GET ${path} -> ${r.status}`);
   return (await r.json()) as T;
 }
+
+/**
+ * `fetchOpsServer` that hands the failure back instead of throwing.
+ *
+ * Every admin server component used to write `.catch(() => null)`, which made a
+ * REFUSED ops read indistinguishable from an empty one: with
+ * `/v1/admin/databases` answering 403 the Databases page rendered "0 provisioned
+ * · No databases provisioned" and no operator could tell a broken gate from an
+ * empty fleet (2026-10-12). One primitive returns `{ data, error }` so every
+ * page surfaces the refusal; callers that genuinely want to ignore a failure
+ * still can, but they now have to say so.
+ */
+export type OpsResult<T> = { data: T | null; error: string | null };
+
+export async function fetchOpsResult<T>(path: string): Promise<OpsResult<T>> {
+  try {
+    return { data: await fetchOpsServer<T>(path), error: null };
+  } catch (e) {
+    return { data: null, error: e instanceof Error ? e.message : String(e) };
+  }
+}

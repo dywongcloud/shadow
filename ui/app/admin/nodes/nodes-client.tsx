@@ -3,18 +3,25 @@
 import { Server, Globe2 } from "lucide-react";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
 import { useOpsPoll, type NodeInfo, type AdminOverview } from "@/lib/api";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 import { timeAgo } from "@/lib/utils";
 
 export function AdminNodesClient({
   initialNodes,
   initialOverview,
+  initialNodesError,
+  initialOverviewError,
 }: {
   initialNodes: NodeInfo[] | null;
   initialOverview: AdminOverview | null;
+  initialNodesError?: string | null;
+  initialOverviewError?: string | null;
 }) {
-  const { data: nodes } = useOpsPoll<NodeInfo[]>("/v1/nodes", 5000, true, initialNodes);
+  const { data: nodes, error: nodesError } = useOpsPoll<NodeInfo[]>("/v1/nodes", 5000, true, initialNodes);
   // Matches the backend's 15 s response cache for the overview fan-out.
-  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
+  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
+  const nodesFailure = nodesError ?? initialNodesError ?? null;
+  const ovFailure = ovError ?? initialOverviewError ?? null;
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (
@@ -27,7 +34,7 @@ export function AdminNodesClient({
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Card className="flex flex-col gap-1 p-4">
           <span className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted"><Server className="h-3.5 w-3.5" />Nodes</span>
-          <span className="text-2xl font-semibold">{nodes?.length ?? 0}</span>
+          <span className="text-2xl font-semibold">{nodesFailure ? "—" : nodes?.length ?? 0}</span>
         </Card>
         <Card className="flex flex-col gap-1 p-4">
           <span className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted"><Globe2 className="h-3.5 w-3.5" />Regions</span>
@@ -57,6 +64,8 @@ export function AdminNodesClient({
           ))}
         </tbody>
       </Table>
+      <OpsFetchError error={nodesFailure} label="nodes" />
+      <OpsFetchError error={ovFailure} label="cluster overview" />
     </div>
   );
 }

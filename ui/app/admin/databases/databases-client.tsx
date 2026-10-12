@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
 import { useOpsPoll, type Database, type DbKind } from "@/lib/api";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 import { timeAgo } from "@/lib/utils";
 
 const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> = {
@@ -10,8 +11,15 @@ const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> =
   sqlite: "green", supabase: "green",
 };
 
-export function AdminDatabasesClient({ initialDbs }: { initialDbs: Database[] | null }) {
-  const { data: dbs } = useOpsPoll<Database[]>("/v1/admin/databases", 3000, true, initialDbs);
+export function AdminDatabasesClient({
+  initialDbs,
+  initialError,
+}: {
+  initialDbs: Database[] | null;
+  initialError?: string | null;
+}) {
+  const { data: dbs, error } = useOpsPoll<Database[]>("/v1/admin/databases", 3000, true, initialDbs);
+  const failure = error ?? initialError ?? null;
   const active = (dbs ?? []).filter((d) => d.status === "ready").length;
   const live = (dbs ?? []).filter((d) => d.mode === "live").length;
   const byKind = (dbs ?? []).reduce<Record<string, number>>((a, d) => { a[d.kind] = (a[d.kind] ?? 0) + 1; return a; }, {});
@@ -20,7 +28,7 @@ export function AdminDatabasesClient({ initialDbs }: { initialDbs: Database[] | 
     <div>
       <div className="mb-6">
         <h1 className="text-2xl font-semibold tracking-tight">Database Fleet</h1>
-        <p className="mt-1 text-sm text-secondary">{dbs?.length ?? 0} provisioned · {active} active · {live} live · across all teams and projects.</p>
+        <p className="mt-1 text-sm text-secondary">{failure ? "Unavailable — the database fleet could not be read." : `${dbs?.length ?? 0} provisioned · ${active} active · ${live} live · across all teams and projects.`}</p>
       </div>
 
       <div className="mb-6 flex flex-wrap gap-2">
@@ -46,7 +54,8 @@ export function AdminDatabasesClient({ initialDbs }: { initialDbs: Database[] | 
           ))}
         </tbody>
       </Table>
-      {!dbs?.length && <Card className="mt-4 py-12 text-center text-sm text-secondary">No databases provisioned.</Card>}
+      {!failure && !dbs?.length && <Card className="mt-4 py-12 text-center text-sm text-secondary">No databases provisioned.</Card>}
+      <OpsFetchError error={failure} label="the database fleet" />
     </div>
   );
 }

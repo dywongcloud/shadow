@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 import { PageSkeleton } from "@/components/page-skeleton";
-import { fetchOpsServer } from "@/lib/ops-data";
+import { fetchOpsResult } from "@/lib/ops-data";
 import type { Database } from "@/lib/api";
 import { AdminDatabasesClient } from "./databases-client";
 
@@ -14,6 +14,6 @@ export default function AdminDatabasesPage() {
 
 async function AdminDatabasesData() {
   // Platform-owner view -> ALL databases across every tenant (global endpoint).
-  const dbs = await fetchOpsServer<Database[]>("/v1/admin/databases").catch(() => null);
-  return <AdminDatabasesClient initialDbs={dbs} />;
+  const { data: dbs, error } = await fetchOpsResult<Database[]>("/v1/admin/databases");
+  return <AdminDatabasesClient initialDbs={dbs} initialError={error} />;
 }

@@ -8,6 +8,7 @@ import {
 import { Card, Badge } from "@/components/ui";
 import { useOpsPoll, type AdminOverview, type Metrics, type Incident } from "@/lib/api";
 import { OPEN_INCIDENTS_LIMIT, OPEN_INCIDENTS_PATH } from "@/lib/incident-paths";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 
 // Tremor's AreaChart pulls in a sizeable charting dependency -- lazy-load it so
 // pages that don't render a chart (or before this one streams in) don't pay for
@@ -19,16 +20,19 @@ export function AdminOverviewClient({
   initialOverview,
   initialMetrics,
   initialIncidents,
+  initialError,
 }: {
   initialOverview: AdminOverview | null;
   initialMetrics: Metrics | null;
   initialIncidents: Incident[] | null;
+  initialError?: string | null;
 }) {
   // Poll cadences match the backend's 15 s response cache for these fan-outs
   // (POLLED_RESPONSE_CACHE_TTL): faster polling only re-reads the same entry.
-  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
-  const { data: metrics } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 10000, true, initialMetrics);
-  const { data: incidents } = useOpsPoll<Incident[]>(OPEN_INCIDENTS_PATH, 10000, true, initialIncidents);
+  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
+  const { data: metrics, error: metricsError } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 10000, true, initialMetrics);
+  const { data: incidents, error: incidentsError } = useOpsPoll<Incident[]>(OPEN_INCIDENTS_PATH, 10000, true, initialIncidents);
+  const failure = ovError ?? metricsError ?? incidentsError ?? initialError ?? null;
 
   const series = (metrics?.series ?? []).map((b) => ({
     time: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -47,11 +51,12 @@ export function AdminOverviewClient({
           <h1 className="text-2xl font-semibold tracking-tight">Platform Overview</h1>
           <p className="mt-1 text-sm text-secondary">Owner: <span className="font-mono">{ov?.owner ?? "—"}</span></p>
         </div>
-        <Badge tone={healthy ? "green" : "red"}>
-          <span className={`h-2 w-2 rounded-full ${healthy ? "bg-green" : "bg-red-500"}`} />
-          {healthy ? "All systems operational" : `${ov?.incidents_open} active incident(s)`}
+        <Badge tone={failure ? "amber" : healthy ? "green" : "red"}>
+          <span className={`h-2 w-2 rounded-full ${failure ? "bg-amber-400" : healthy ? "bg-green" : "bg-red-500"}`} />
+          {failure ? "Status unavailable" : healthy ? "All systems operational" : `${ov?.incidents_open} active incident(s)`}
         </Badge>
       </div>
+      <OpsFetchError error={failure} label="the platform overview" />
 
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Tile icon={<Users className="h-4 w-4" />} label="Teams" value={ov?.teams} />
@@ -102,6 +107,8 @@ export function AdminOverviewClient({
                 </Link>
               ) : null}
             </div>
+          ) : failure ? (
+            <div className="flex h-40 flex-col items-center justify-center gap-2 text-center text-sm text-secondary">Unavailable</div>
           ) : (
             <div className="flex h-40 flex-col items-center justify-center gap-2 text-center text-sm text-secondary">
               <span className="flex h-9 w-9 items-center justify-center rounded-full bg-green/10 text-green">✓</span>
