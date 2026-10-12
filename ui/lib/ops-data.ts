@@ -8,41 +8,114 @@ import { cookies } from "next/headers";
 // fetch here hits exactly what the browser's /ops/* proxy would have hit.
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
+const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
+// One address, not the list: the backend compares this claim against a single
+// `admin_emails` entry when it derives `platform_admin`.
+const OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
 
-/**
- * Fetch ops/admin data directly from the backend, server-side. No auth token
- * is forwarded -- proxy.ts middleware already gates every /admin/* page
- * request on isPlatformOwner before this ever runs, and the client's own
- * opsGet (lib/api.ts) sends no bearer token for these reads either (only an
- * informational x-hive-team header the backend does not trust for tenant
- * derivation). Intentionally uncached (no-store): ops data is live
- * operational state, matching the existing no-store policy at the browser
- * cache-control layer (next.config.mjs headers()) -- never `"use cache"`.
+/* ---- The ops console's own credential -------------------------------------
+ *
+ * HIVE_INTERNAL_TOKEN authorizes TOKEN MINTING (`POST /v1/token`, proved by
+ * `x-hive-internal`), not data reads: presenting it as a bearer (or as
+ * `x-hive-internal`) on a data GET still answers 401 "missing or invalid bearer
+ * token" (measured on the live DevHub admin listener, 2026-10-12). Forwarding
+ * the operator's session cookie helped only when a request scope existed AND
+ * that session carried `platform_admin` — with no cookie (or a tenant-scoped
+ * one) every server-rendered ops read 401/403'd, so admin pages painted empty
+ * shells and only the client poll ever showed data.
+ *
+ * So this process exchanges its internal token for a REAL platform JWT and
+ * sends that as `Authorization: Bearer …`, falling back to the session cookie
+ * when minting is unavailable. The mint is server-to-server only; this module is
+ * `server-only` and the token never appears in a rendered payload, a client
+ * bundle, or a response header — it exists solely in the headers of the fetch
+ * below. The pages that call it are already gated on the platform-owner
+ * allow-list by proxy.ts, so minting operator authority here grants nothing a
+ * non-owner can reach.
  */
-export async function fetchOpsServer<T>(path: string): Promise<T> {
-  // Forward the operator's own session cookie. Every ops read is gated by the
-  // backend's `require_operator`, which reads the `hive_jwt` cookie (auth.rs);
-  // without it this server-side fetch was anonymous and answered 403 on every
-  // call (witnessed 2026-10-01: 84 operator-403 lines in 2 h on the leader,
-  // all from this loopback caller), so the "first paint with real numbers"
-  // never actually happened and every admin page showed a skeleton until the
-  // first client poll. The cookie is the same credential the browser sends on
-  // `/ops/*`; proxy.ts has already gated the page on the owner allow-list.
-  const headers: Record<string, string> = {};
+type Minted = { token: string; exp: number };
+let minted: Minted | null = null;
+let minting: Promise<string | null> | null = null;
+
+async function mintOpsBearer(): Promise<string | null> {
+  if (!INTERNAL) return null;
   try {
-    const tok = (await cookies()).get("hive_jwt")?.value;
-    if (tok) headers.cookie = `hive_jwt=${tok}`;
+    const r = await fetch(`${ADMIN}/v1/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hive-internal": INTERNAL },
+      body: JSON.stringify({
+        sub: "ui-ops-server",
+        tenant: "personal",
+        role: "owner",
+        email: OWNER_EMAIL || undefined,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return null;
+    const d = (await r.json()) as { token?: string; expires_in?: number };
+    if (!d.token) return null;
+    // Refresh well before the backend's own expiry so a read never races the
+    // token's death.
+    const ttl = Math.max(60, (typeof d.expires_in === "number" ? d.expires_in : 3600) - 120);
+    minted = { token: d.token, exp: Date.now() + ttl * 1000 };
+    return d.token;
   } catch {
-    // Outside a request scope (build-time prerender): nothing to forward.
+    return null;
   }
-  // Bounded: an unreachable admin host must fail FAST with an honest error,
-  // never hang the server component's render indefinitely — previously a bare
-  // fetch with no timeout at all (ui-cloud-proxy-admin-fallback).
-  const r = await fetch(`${ADMIN_OPS}${path}`, {
+}
+
+/** Cached operator bearer. `force` re-mints (used after a 401/403, i.e. the
+ *  cached JWT expired or the backend rotated its secret); concurrent callers
+ *  share one in-flight mint instead of stampeding the token endpoint. */
+function opsBearer(force = false): Promise<string | null> {
+  if (!force && minted && Date.now() < minted.exp) return Promise.resolve(minted.token);
+  if (!minting) {
+    minting = mintOpsBearer().finally(() => {
+      minting = null;
+    });
+  }
+  return minting;
+}
+
+// Bounded: an unreachable admin host must fail FAST with an honest error, never
+// hang the server component's render indefinitely — previously a bare fetch with
+// no timeout at all (ui-cloud-proxy-admin-fallback).
+function opsFetch(path: string, bearer: string | null, cookie: string | null): Promise<Response> {
+  const headers: Record<string, string> = {};
+  if (bearer) headers.authorization = `Bearer ${bearer}`;
+  else if (cookie) headers.cookie = `hive_jwt=${cookie}`;
+  return fetch(`${ADMIN_OPS}${path}`, {
     cache: "no-store",
     headers,
     signal: AbortSignal.timeout(10_000),
   });
+}
+
+/**
+ * Fetch ops/admin data directly from the backend, server-side, AS AN OPERATOR.
+ * Intentionally uncached (no-store): ops data is live operational state,
+ * matching the existing no-store policy at the browser cache-control layer
+ * (next.config.mjs headers()) -- never `"use cache"`.
+ */
+export async function fetchOpsServer<T>(path: string): Promise<T> {
+  // Fallback credential: the operator's own session cookie, read inside the
+  // request scope when there is one (a build-time prerender has none). The
+  // minted bearer is preferred — it carries `platform_admin`, which a
+  // tenant-scoped session cookie does not (witnessed 2026-10-01: 84
+  // operator-403 lines in 2 h on the leader, all from this loopback caller).
+  let cookie: string | null = null;
+  try {
+    cookie = (await cookies()).get("hive_jwt")?.value ?? null;
+  } catch {
+    /* outside a request scope: nothing to forward */
+  }
+  let bearer = await opsBearer();
+  let r = await opsFetch(path, bearer, cookie);
+  if ((r.status === 401 || r.status === 403) && bearer) {
+    const fresh = await opsBearer(true);
+    if (fresh && fresh !== bearer) r = await opsFetch(path, fresh, null);
+  }
   if (!r.ok) throw new Error(`ops GET ${path} -> ${r.status}`);
   return (await r.json()) as T;
 }
