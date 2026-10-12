@@ -168,6 +168,16 @@ struct FunctionPool {
     /// Cleared by any successful start, so a genuinely broken app circuits
     /// normally.
     last_node_fault: Option<&'static str>,
+    /// Instances removed because the request path proved they had STOPPED
+    /// ANSWERING (the tunnel closed after N requests got no reply at all, or a
+    /// connect was refused) during the current sustained-failure run. This is
+    /// the health signal an instance-count gate cannot see, and it is what
+    /// opens the circuit while instances are still PRESENT — see
+    /// [`UNHEALTHY_CIRCUIT_THRESHOLD`].
+    unhealthy_reaps: u32,
+    /// `now_ms()` of the most recent such removal; the run's window anchor
+    /// (see [`UNHEALTHY_REAP_WINDOW_MS`]).
+    unhealthy_reap_ms: u64,
     /// Dynamic per-instance safe-concurrency ceiling. `None` = use
     /// `cfg.max_concurrency`. A pressure monitor LOWERS this (CPU-heavy / event-loop
     /// lag / memory pressure) so the scheduler scales out earlier instead of piling
@@ -219,6 +229,8 @@ impl FunctionPool {
             last_warm_ok_ms: 0,
             crash_streak: 0,
             circuit_probe_after_ms: 0,
+            unhealthy_reaps: 0,
+            unhealthy_reap_ms: 0,
             last_node_fault: None,
             safe_concurrency,
             nack_concurrency: 0,
@@ -266,6 +278,12 @@ pub struct FunctionStats {
     pub savings_pct: f64,
     /// Instances reaped as unhealthy/unreachable and replaced.
     pub dead_reaped: u64,
+    /// Of those, how many were reaped because the instance was REGISTERED but
+    /// STOPPED ANSWERING, within the current sustained-failure run. Non-zero at
+    /// or above `UNHEALTHY_CIRCUIT_THRESHOLD` is why this deployment's circuit
+    /// is open while instances are still present.
+    #[serde(default)]
+    pub unhealthy_reaps: u32,
     /// Requests served by a donated browser node instead of fleet compute.
     #[serde(default)]
     pub browser_requests: u64,
@@ -632,6 +650,32 @@ pub const CRASH_CIRCUIT_THRESHOLD: u32 = 3;
 /// a container that exits before listening), or arriving requests keep finding the
 /// gate expired and pay the full failure cost every time.
 pub const CIRCUIT_PROBE_INTERVAL_MS: u64 = 30_000;
+
+/// Consecutive INSTANCE failures within [`UNHEALTHY_REAP_WINDOW_MS`] after
+/// which the pool's circuit OPENS although instances are still PRESENT.
+///
+/// This is the gap an instance-count gate leaves open. `warm_fail_streak` and
+/// `crash_streak` are START failures — a cold start that never listened, an
+/// instance that exited — so both need an empty pool to mean anything. An
+/// instance that is registered, holds its slot, and never REPLIES is neither:
+/// it is present the whole time, so the pool was never circuited, never reaped,
+/// and every request against it was reported as overload (`FUNCTION_NO_RESPONSE`
+/// / `CAPACITY_EXHAUSTED`) instead of `DEPLOYMENT_CIRCUIT_OPEN`. Health, not
+/// count, is what decides this arm.
+pub const UNHEALTHY_CIRCUIT_THRESHOLD: u32 = 3;
+/// How far apart two instance failures may be and still count as ONE sustained
+/// run. Past this with no further failure the run is over: a guest that wedged
+/// once and was replaced is not a broken deployment.
+pub const UNHEALTHY_REAP_WINDOW_MS: u64 = 300_000;
+/// How long the unhealthy-instance circuit stays open. It must outlast the
+/// failure it guards: one probe can pay the tunnel's whole response deadline
+/// (`fluid-tunnel`'s `LOCAL_RESPONSE_DEADLINE`, 60s today) on each of up to 5
+/// tunnel-level attempts, so ~300s worst case. It is ALSO re-armed at the
+/// instant the probe lease is handed out (see `lease`), which is what actually
+/// guarantees the window outlasts the attempt however long the attempt really
+/// takes: exactly one request per window pays that cost, and every request
+/// arriving behind it fails fast.
+pub const UNHEALTHY_CIRCUIT_PROBE_MS: u64 = 300_000;
 
 /// One AIMD step for a function's per-instance safe-concurrency ceiling (#2), given
 /// the most-pressured instance's CPU utilization (% of allocated vCPU). Classic
@@ -1302,6 +1346,7 @@ impl Fluid {
                     fluid_ms,
                     savings_pct,
                     dead_reaped: p.dead_reaped,
+                    unhealthy_reaps: p.unhealthy_reaps,
                     active_cpu_ms,
                     memory_gb_hrs,
                     active_cpu_savings_pct,
@@ -1341,16 +1386,17 @@ impl Fluid {
         // `classify_lease_error` maps this to DEPLOYMENT_CIRCUIT_OPEN so a broken
         // app stops masquerading as host CAPACITY_EXHAUSTED. Reconcile keeps
         // retrying on its backoff curve, so a fixed deployment recovers on its own.
-        if let Some(p) = self.registry.lock().get(key) {
+        if let Some(p) = self.registry.lock().get_mut(key) {
             // Why a struggling pool did or did not circuit. Gated on a non-zero
             // streak so a healthy pool logs nothing, which also makes this the
             // first thing to read when a deployment is failing in production.
-            if p.warm_fail_streak > 0 || p.crash_streak > 0 {
+            if p.warm_fail_streak > 0 || p.crash_streak > 0 || p.unhealthy_reaps > 0 {
                 warn!(
                     func = %key,
                     instances = p.instances.len(),
                     warm_fail_streak = p.warm_fail_streak,
                     crash_streak = p.crash_streak,
+                    unhealthy_reaps = p.unhealthy_reaps,
                     probe_gate_ms_left = p.circuit_probe_after_ms.saturating_sub(now_ms()),
                     "lease against a failing pool"
                 );
@@ -1410,6 +1456,42 @@ impl Fluid {
                          deployment's logs, entrypoint and required env (DeploymentCircuitOpen)"
                     );
                 }
+            }
+            // (c) Instances are PRESENT but have STOPPED ANSWERING.
+            //
+            // Every arm above is a START failure and needs an empty pool, so an
+            // instance that is registered, holds its slot and never replies
+            // reached NONE of them: it was never reaped, never circuited, and
+            // the deployment read as overload (504 FUNCTION_NO_RESPONSE /
+            // 503 CAPACITY_EXHAUSTED) forever. AGENTS.md: "A broken deployment
+            // reports DEPLOYMENT_CIRCUIT_OPEN, never CAPACITY_EXHAUSTED".
+            // Decay the run first, then decide on HEALTH, never on count.
+            let now = now_ms();
+            if now.saturating_sub(p.unhealthy_reap_ms) > UNHEALTHY_REAP_WINDOW_MS {
+                p.unhealthy_reaps = 0;
+            }
+            if p.unhealthy_reaps >= UNHEALTHY_CIRCUIT_THRESHOLD {
+                if now < p.circuit_probe_after_ms {
+                    let n = p.unhealthy_reaps;
+                    anyhow::bail!(
+                        "function '{key}' is not answering — {n} of its instances were reaped \
+                         because requests to them got no response at all (the function starts \
+                         and stays registered but does not reply on its port); check the \
+                         deployment's logs, entrypoint and required env (DeploymentCircuitOpen)"
+                    );
+                }
+                // HALF-OPEN: hand this ONE request through as the probe and
+                // re-arm the window FROM NOW, so the window always outlasts
+                // however long the failing attempt actually takes. Without the
+                // re-arm, a probe slower than the window would let every
+                // request arriving behind it pay the full deadline too.
+                p.circuit_probe_after_ms = now + UNHEALTHY_CIRCUIT_PROBE_MS;
+                warn!(
+                    func = %key,
+                    unhealthy_reaps = p.unhealthy_reaps,
+                    probe_ms = UNHEALTHY_CIRCUIT_PROBE_MS,
+                    "unhealthy-instance circuit half-open: one probe lease"
+                );
             }
         }
         let deadline = tokio::time::Instant::now() + self.cfg.lease_timeout;
@@ -2053,7 +2135,27 @@ impl Fluid {
             };
             let inst = pool.instances.remove(pos);
             pool.dead_reaped += 1;
-            pool.instance_ms_retired += now_ms().saturating_sub(inst.started_at_ms);
+            // Instance HEALTH, not instance count: a reap proves the request
+            // path found this instance unreachable while it was still
+            // REGISTERED. Counting the run here is what lets a present-but-
+            // not-answering instance open the circuit (see `lease`).
+            let now = now_ms();
+            if now.saturating_sub(pool.unhealthy_reap_ms) > UNHEALTHY_REAP_WINDOW_MS {
+                pool.unhealthy_reaps = 0; // previous failure aged out of the run
+            }
+            pool.unhealthy_reaps = pool.unhealthy_reaps.saturating_add(1);
+            pool.unhealthy_reap_ms = now;
+            pool.instance_ms_retired += now.saturating_sub(inst.started_at_ms);
+            if pool.unhealthy_reaps >= UNHEALTHY_CIRCUIT_THRESHOLD {
+                pool.circuit_probe_after_ms = now + UNHEALTHY_CIRCUIT_PROBE_MS;
+                warn!(
+                    func = %key,
+                    cell = %cell_id,
+                    unhealthy_reaps = pool.unhealthy_reaps,
+                    probe_ms = UNHEALTHY_CIRCUIT_PROBE_MS,
+                    "instances stopped answering while still registered; circuit open"
+                );
+            }
             (inst.handle, inst.requests_served)
         };
         let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();

@@ -23,12 +23,12 @@
 use crate::codec::{read_frame, Frame, FrameKind};
 use crate::{Metrics, ReqMeta, RespMeta};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Write-queue depth (frames waiting to be flushed to the router) at or above
 /// which we count a backpressure event (#14). Tuned to be well clear of normal
@@ -51,6 +51,61 @@ static LOCAL_CONNECT_PERMITS: std::sync::atomic::AtomicUsize =
 /// Set by the backend that owns this process's cells, once, at init.
 pub fn set_local_connect_permits(permits: usize) {
     LOCAL_CONNECT_PERMITS.store(permits.max(1), Ordering::Relaxed);
+}
+
+/// Ceiling on completing a TCP connect to the local (guest) hop. Loopback, so
+/// a healthy guest answers in microseconds; 15s matches the window a litebox
+/// cold start is already given to reach a listening state.
+const LOCAL_CONNECT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Ceiling on the two waits that can hold a guest's connect permit: queueing
+/// for that permit, and reading the response head once connected.
+///
+/// A guest that accepts a connect and then never answers used to hold the
+/// address's ONLY permit (litebox lowers `LOCAL_CONNECT_PERMITS` to 1) and one
+/// `inflight` slot until the OS gave up on its own — ~130s of a serialized
+/// wedge — so once `max_concurrency` requests were pinned, every later request
+/// was nacked `overloaded` instantly and the node read as permanently out of
+/// capacity while almost idle. Witnessed live on fc-sanjose 2026-10-13
+/// (geniee.site / project ughjh): 2,134 `local connect failed ... Connection
+/// timed out (os error 110)` in 6h across 20+ guest ports, 504
+/// `FUNCTION_NO_RESPONSE` in ~0.15s — a nack, not a wait — while the node held
+/// 16,342 free litebox slots, 500GB RAM and 1.3TB disk.
+///
+/// Both deadlines are deliberately generous: they only have to be shorter than
+/// "forever", never shorter than a slow app's genuine work. A healthy request
+/// finishes orders of magnitude inside them, so bounding these waits converts a
+/// permanent capacity loss into one retryable failure.
+const LOCAL_RESPONSE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Consecutive requests that reached this function's address and produced NO
+/// response at all — connect refused or timed out, or the guest accepted the
+/// connect and then never wrote a response head — after which the tunnel
+/// declares the instance NOT ANSWERING and closes the connection.
+///
+/// Closing is the only failure signal that reaches the scheduler from here:
+/// `fluid-gateway` reads the closed connection as `client.is_closed()`, calls
+/// `Fluid::mark_dead`, and the instance is reaped and replaced. Left open, that
+/// instance stays REGISTERED and "present" forever, so no start-failure arm in
+/// `fluid-compute` ever fires (it never crashed, it never failed to start) and
+/// every later request is reported as overload instead of
+/// `DEPLOYMENT_CIRCUIT_OPEN` — the circuit-breaker gap this closes.
+///
+/// Any request that DOES get a response resets the count, so a slow-but-healthy
+/// function, or one that legitimately answers 502 of its own accord, can never
+/// trip this: only an instance that answers NOTHING, over and over.
+const UNHEALTHY_FAILURE_STREAK: u32 = 5;
+
+/// Releases one `inflight` slot on Drop. A request that never completes — or
+/// whose spawned task is abandoned — must still hand its slot back, or
+/// `inflight` ratchets up to `max_concurrency` and every later request is
+/// nacked `overloaded` for the remaining life of the process.
+struct InflightSlot(Arc<AtomicU32>);
+
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Per-upstream-address gates. Keyed by the literal `local_http` string; the
@@ -179,8 +234,33 @@ impl TunnelServer {
         }
 
         // Reader loop: demux requests.
+        let failures = Arc::new(AtomicU32::new(0));
+        let stuck = Arc::new(AtomicBool::new(false));
+        let stuck_notify = Arc::new(Notify::new());
         loop {
-            let frame = match read_frame(&mut rd).await {
+            // Woken either by the next request frame or by the no-response
+            // streak below crossing its threshold, so the connection closes
+            // promptly even when no further request arrives to notice.
+            let notified = stuck_notify.notified();
+            let frame = match tokio::select! {
+                f = read_frame(&mut rd) => f,
+                _ = notified => {
+                    if stuck.load(Ordering::Relaxed) {
+                        // Break (not `continue`): the instance is registered
+                        // but answers nothing, so the only useful thing this
+                        // connection can still do is end and let the scheduler
+                        // replace the instance.
+                        tracing::warn!(
+                            local = %local_http,
+                            failures = failures.load(Ordering::Relaxed),
+                            "function answered none of the last requests; closing the tunnel \
+                             so this instance is reaped"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            } {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -201,10 +281,33 @@ impl TunnelServer {
                     inflight.fetch_add(1, Ordering::Relaxed);
                     let out = out_tx.clone();
                     let local = local_http.clone();
-                    let inflight = inflight.clone();
+                    // Taken BEFORE the spawn, released by Drop. It used to be
+                    // decremented by the statement after `handle_request(..).await`
+                    // inside the spawned task, so any request that never returned
+                    // — or whose task the runtime dropped — leaked its slot for
+                    // good. `inflight` then stayed at `max_concurrency` and every
+                    // subsequent request took the Nack branch above forever.
+                    let slot = InflightSlot(inflight.clone());
+                    let failures = failures.clone();
+                    let stuck = stuck.clone();
+                    let stuck_notify = stuck_notify.clone();
                     tokio::spawn(async move {
-                        handle_request(id, frame.payload, &local, &out).await;
-                        inflight.fetch_sub(1, Ordering::Relaxed);
+                        let _slot = slot;
+                        // "Answered" = a response head actually reached the
+                        // caller, which is the ONLY progress signal this hop
+                        // has. It resets the no-response streak, so a function
+                        // that is merely slow (or that answers 502 itself)
+                        // never accumulates one.
+                        if handle_request(id, frame.payload, &local, &out).await {
+                            failures.store(0, Ordering::Relaxed);
+                        } else {
+                            let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n >= UNHEALTHY_FAILURE_STREAK
+                                && !stuck.swap(true, Ordering::Relaxed)
+                            {
+                                stuck_notify.notify_one();
+                            }
+                        }
                     });
                 }
                 _ => {}
@@ -234,10 +337,25 @@ impl TunnelServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let mut backend = match TcpStream::connect(&local_addr).await {
-            Ok(b) => b,
-            Err(e) => {
+        // Bounded for the same reason `proxy_local`'s connect is: an unbounded
+        // connect to a wedged guest is a slot this node never gets back.
+        let mut backend = match tokio::time::timeout(
+            LOCAL_CONNECT_DEADLINE,
+            TcpStream::connect(&local_addr),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
                 tracing::warn!(local = %local_addr, error = %e, "raw splice: local connect failed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    local = %local_addr,
+                    deadline = ?LOCAL_CONNECT_DEADLINE,
+                    "raw splice: local connect timed out"
+                );
                 return;
             }
         };
@@ -281,7 +399,11 @@ impl TunnelServer {
     }
 }
 
-async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) {
+/// Returns whether a response head actually reached the caller — the progress
+/// signal [`UNHEALTHY_FAILURE_STREAK`] counts. A 502 the FUNCTION sent is an
+/// answer (the instance is alive and serving); only "no response at all" is
+/// evidence the instance has stopped answering.
+async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) -> bool {
     // An idempotent request whose upstream connection died BEFORE any response
     // frame was emitted is retried against a fresh connection. Litebox guests
     // intermittently accept-then-close a connect that lands while another is
@@ -314,7 +436,7 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
     for attempt in 0..MAX_ATTEMPTS {
         let mut head_sent = false;
         match proxy_local(id, &payload, local_http, out, &mut head_sent).await {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(error) => {
                 if head_sent || !idempotent || attempt + 1 == MAX_ATTEMPTS {
                     if head_sent {
@@ -326,7 +448,9 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
                             error = %error,
                             "tunnel: upstream request failed after response head was already sent — truncating stream"
                         );
-                        return;
+                        // The function DID speak (frames flowed), so the
+                        // instance is answering: not a no-response failure.
+                        return true;
                     }
                     last_error = Some(error);
                     break;
@@ -374,6 +498,7 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         ));
         let _ = out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()));
     }
+    false
 }
 
 async fn proxy_local(
@@ -392,9 +517,25 @@ async fn proxy_local(
 
     // Held for the whole request/response exchange (`connect_gate` also
     // matches litebox guests up to their own backlog) — see
-    // `set_local_connect_permits`.
-    let _connect_permit = connect_gate(local_http).acquire_owned().await?;
-    let mut conn = TcpStream::connect(local_http).await?;
+    // `set_local_connect_permits`. Bounded: a guest that never finishes its
+    // previous request must not be able to hold this permit indefinitely.
+    let _connect_permit = tokio::time::timeout(
+        LOCAL_RESPONSE_DEADLINE,
+        connect_gate(local_http).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "timed out after {LOCAL_RESPONSE_DEADLINE:?} waiting for a local connect permit to {local_http}"
+        )
+    })??;
+    let mut conn = tokio::time::timeout(LOCAL_CONNECT_DEADLINE, TcpStream::connect(local_http))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "local connect to {local_http} timed out after {LOCAL_CONNECT_DEADLINE:?}"
+            )
+        })??;
 
     // Write HTTP/1.1 request. Deliberately NOT `Connection: close`: asking the
     // guest to close triggers litebox's guest network stack to send a bare
@@ -469,7 +610,17 @@ async fn proxy_local(
             split = pos;
             break;
         }
-        let n = conn.read(&mut tmp).await?;
+        // Bounded: a guest that accepts the connect and then never writes a
+        // byte used to hold this request (and the address's single connect
+        // permit) until the OS timed the socket out, which is the wedge that
+        // pinned `inflight` at `max_concurrency` on fc-sanjose 2026-10-13.
+        let n = tokio::time::timeout(LOCAL_RESPONSE_DEADLINE, conn.read(&mut tmp))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "function accepted the request but sent no response head within {LOCAL_RESPONSE_DEADLINE:?}"
+                )
+            })??;
         anyhow::ensure!(n > 0, "function closed before headers");
         raw.extend_from_slice(&tmp[..n]);
         anyhow::ensure!(raw.len() < 1024 * 1024, "function headers too large");
