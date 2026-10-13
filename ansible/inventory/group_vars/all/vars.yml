@@ -1,133 +1,46 @@
 ---
-# Fleet-wide defaults for every hive-cloud node. Override per-host in
-# hosts.ini (hive_name/hive_region) or per-group in group_vars/fc_kvm.yml /
-# group_vars/fc_pvm.yml. Secrets referenced here (vault_*) live in
-# group_vars/all/vault.yml (this file's own directory), which is
-# ansible-vault encrypted and gitignored --
-# see roles/README's Secrets section. This file documents every var this
-# repo's own fleet actually runs with; it is not the full set the codebase
-# recognizes (grep crates/hive-cloud/src/*.rs for `std::env::var("HIVE_` for
-# the exhaustive list if you need something not templated here).
+# Only the vars this fleet runs with; the full HIVE_* set: grep crates/hive-cloud/src for `std::env::var("HIVE_`.
 
-# ---------- Repo / build ----------
 hive_repo_url: "https://github.com/your-org/hive.git"   # or a private mirror
 hive_repo_ref: "main"
-hive_src_dir: "/root/hive"                                # flat (non-crates/-prefixed) layout mirrors fc-bangkok
+hive_src_dir: "/root/hive"                                # flat (non-crates/-prefixed) layout
 hive_cargo_target_dir: "/root/fc-target"                   # matches the fc_pvm hosts' convention; fc_kvm hosts can use hive_src_dir/target
 hive_binary_path: "{{ hive_cargo_target_dir }}/release/hive-cloud"
 hive_data_dir: "/var/lib/hive/data"
 
-# ---------- Identity / mesh ----------
 # hive_name and hive_region come from inventory (per-host vars).
 hive_listen: "0.0.0.0:8787"
 hive_admin: "127.0.0.1:8786"
-# HIVE_BOOTSTRAP_PEERS: one existing node's 64-hex iroh NodeId is enough for
-# a NEW node to join (see roles/mesh_bootstrap and playbooks/node-join.yml).
-# For a from-scratch fleet, leave the first node's bootstrap_peers empty.
 hive_bootstrap_peers: ""
 hive_discovery_dns: ""     # comma-separated http://<ip>:3350 of discovery-capable nodes
-hive_relay_urls: ""        # comma-separated self-hosted iroh relay URLs; TLS relays MUST use their https://<name>.relay.shadw.app:3343 form (the plaintext :3340 socket is captive-portal-only once TLS is on — see hosts.ini)
+hive_relay_urls: ""        # comma-separated self-hosted iroh relay URLs; TLS relays MUST use their https://<name>.relay.shadw.app:3343 form (the plaintext :3340 socket is captive-portal-only once TLS is on)
 hive_discovery_n0: "0"     # 0 = opt out of public n0 discovery, use self-hosted only (fleet default)
-# ---------- Public mainline-DHT address lookup ----------
-# The ONLY address source that needs no fleet peer to be reachable first, which
-# is why it is on by default. With hive_discovery_n0=0 above and an empty
-# hive_bootstrap_peers/hive_discovery_dns, a node registers NO address-lookup
-# provider at all: PeerPool::dial_fresh has nothing to consult, so a node whose
-# data dir is wiped can never re-learn a peer's address and stays dark.
-#
-# WHAT BECOMES PUBLICLY RESOLVABLE: a pkarr (BEP-44) record signed by the node's
-# own key and stored on the public BitTorrent DHT under a key that IS its
-# 64-hex EndpointId. With hive_dht_publish_direct="0" (default) it contains
-# ONLY the node's home relay URL -- i.e. anyone who knows the id learns the
-# relay hostname, never the node's IP. Set "1" only on a node with a real
-# public IP and a pinned HIVE_IROH_PORT; even then RFC1918/CGNAT/link-local
-# addresses are filtered out and never published. hive_discovery_dht="0" turns
-# the whole mechanism off (no DHT socket, no packets); a middle setting
-# HIVE_DHT_PUBLISH=0 keeps resolving while publishing nothing.
+# Public mainline-DHT address lookup, on by default (the only address source needing no reachable fleet peer):
+# "0" = no DHT socket at all; HIVE_DHT_PUBLISH=0 resolves without publishing.
 hive_discovery_dht: "1"
-# Deliberately EMPTY, not "6881". The DHT runs in client mode (outbound UDP +
-# the NAT return path, no inbound rule and no listening service to firewall), so
-# a pinned source port buys nothing operationally -- while setting it REMOVES
-# the crate's own 6881-then-ephemeral fallback and turns a port conflict into a
-# skipped provider. Set a number only if you genuinely need a predictable port.
+# Deliberately EMPTY: pinning a port removes the crate's 6881-then-ephemeral fallback.
 hive_dht_port: ""
 hive_dht_publish_direct: "0"   # 1 = also publish this node's public ip:HIVE_IROH_PORT
-# dial_fresh's budget for the WHOLE address-lookup set. The code default is
-# 4000ms; measured steady-state DHT resolve is 2.0-4.6s on top of a 2-6s cold
-# routing-table warm-up, so at 4000 the DHT is cancelled before it can answer
-# and ships inert. dial_fallback_ceiling (connect+discovery+1s) grows 10s->14s
-# automatically and all three of its callers already floor their timeouts at it.
 hive_p2p_discovery_ms: "8000"
 hive_gossip_iroh: "1"
 hive_gossip_sign: "1"
 hive_gossip_verify: "enforce"
 
-# ---------- Tencent CCN private-path preference (hive-p2p private_path.rs) ----------
-# `HIVE_CCN_REGIONS`/`HIVE_PRIVATE_ADDR`/`HIVE_PROVIDER` are NOT yet wired into
-# this playbook (no vars/templates below reference them) -- this block is
-# operator documentation for the manual opt-in only, not evidence the feature
-# is deployed. When a node opts in, its private-path candidate is dialed on
-# the SAME port as every other iroh QUIC peer: `resolve_private_addr()`
-# (crates/hive-cloud/src/main.rs) requires HIVE_IROH_PORT to build the
-# `ip:port` candidate from a bare IP, and that is the identical port
-# `hive_p2p::lib.rs` pins the endpoint's QUIC bind to (see the DHT block
-# above) -- there is no separate CCN port to open.
-#
-# CONSEQUENCE FOR THE TENCENT SECURITY GROUP: two Tencent-CCN peers dialing
-# each other over the VPC-private path need inbound UDP/HIVE_IROH_PORT open
-# between them -- this is ADDITIONAL to the existing rule the raw TCP port
-# range (20000-29999, see AGENTS.md "Compose published ports") already needs
-# at the VPC edge, because CCN peer-to-peer traffic crosses a different
-# boundary (inter-VPC via CCN, not host-to-internet). The source CIDR for
-# that rule MUST be the Tencent VPC/CCN CIDR range the fleet's private
-# subnets actually live in (e.g. the CCN instance's route-table CIDR) --
-# NEVER 0.0.0.0/0: `is_private_path_candidate` (private_path.rs) already
-# gates dial eligibility on both peers declaring `provider=tencent` and a
-# configured region pair, but the SG rule is the network-layer half of that
-# same "Tencent-only" intent, and an open-to-the-world UDP/HIVE_IROH_PORT
-# rule would let ANY host on the internet attempt the same handshake this
-# private path is meant to keep off the public internet. This is
-# documentation only -- no Tencent SG resource is created or modified by
-# this repo; apply the rule by hand (or via your own Tencent IaC) scoped to
-# exactly the CCN CIDR, per node pair that opts in via HIVE_PRIVATE_ADDR.
-
-# Opt-in static peer-trust allowlist (see roles/mesh_bootstrap). Off by
-# default; the join-proof self-admit mechanism (RUNBOOK.md) is sufficient
-# for most fleets. Turn on only if you need an explicit pre-authorized list.
 hive_peer_trust_enabled: false
 hive_trusted_node_ids: []   # populated automatically by node-join.yml when enabled
 
-# ---------- Control plane ----------
 hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
-# hive_cp_owner_chain comes from inventory [platform:vars]; list only LIVE
-# public servers (a powered-off entry makes the next one fail over to on every
-# gossip lapse -- the 2026-09-24 fc-virginia self-election).
-# hive_cp_voters (also [platform:vars]): the quorum set leadership::may_act
-# requires a BACKUP chain owner (not the chain head) to have direct contact
-# with a strict majority of before any leader-only job runs on it. Public
-# servers only, odd count, identical on every node; laptops never vote.
-# Empty (with a chain set) logs an ERROR at boot and drops the quorum term --
-# voters are never derived from the chain. Deliberately NOT defaulted
-# here: group_vars/all outranks inventory-file group vars in Ansible's
-# precedence, so a default here would silently blank [platform:vars]. The
-# template's `| default('')` covers the unset case.
 
-# ---------- Ingress / domains ----------
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode
 hive_platform_domain: "shadw.cloud"
 hive_apps_domain: "shadw.app"
-# Managed-database gateway zone (Postgres/Redis/Supabase Studio wire + REST).
-# Empty disables the whole `db_rest`/`db_gateway` surface fleet-wide; set to
-# match the live zone (downstash.xyz) so every node — not just whichever ones
-# were hand-configured — presents the `*.{hive_db_domain}` TLS cert and can
-# serve/owner-forward `<slug>.{hive_db_domain}` requests. See the template's
-# own comment for the incident this closes.
+# Managed-database gateway zone; empty disables db_rest/db_gateway fleet-wide, so set it on EVERY node
+# (each presents the `*.{hive_db_domain}` cert).
 hive_db_domain: "downstash.xyz"
 hive_deploy_zone: "deploy.{{ hive_apps_domain }}"
 hive_public_dashboard_url: "https://{{ hive_platform_domain }}"
 hive_dashboard_url: "http://localhost:3002"
-# The edge's dashboard reverse-proxy target — REQUIRED for apex/www to serve
-# the dashboard at all (see hive-node.service.j2's comment on the 404 class).
+# The edge's dashboard reverse-proxy target; REQUIRED for apex/www to serve the dashboard at all.
 hive_dashboard_upstream: "http://127.0.0.1:3002"
 hive_http_listen: "0.0.0.0:80"
 hive_https_listen: "0.0.0.0:443"
@@ -135,74 +48,29 @@ hive_tls_addr: "127.0.0.1:8443"
 hive_dns_addr: "127.0.0.1:5354"
 hive_dns_leader_node: "{{ hive_cp_owner_chain.split(',')[0] }}"
 
-# ---------- DNS (Vercel) / ACME ----------
 hive_acme_email: "ops@{{ hive_platform_domain }}"
 hive_acme_staging: "1"     # 1 = Let's Encrypt staging (KEEP during setup/testing; prod has a 5-cert/week limit)
 hive_ingress_enabled: true  # set false per-host (hosts.ini) for an internal-only node never published to DNS
-# hive_public_ip / hive_public_ip6: NOT defaulted here -- set per-host in
-# hosts.ini for every node that should be published to DNS (RUNBOOK.md
-# Phase-0 step 4: a node without hive_public_ip is never published).
+# hive_public_ip / hive_public_ip6: per-host in hosts.ini; a node without hive_public_ip is never published to DNS.
 
-# ---------- Extra --peer args (rarely needed -- HIVE_BOOTSTRAP_PEERS/
-# HIVE_DISCOVERY_DNS handle normal mesh join; this is for the SSH-tunnel-
-# bridged --peer http://127.0.0.1:<port> pattern used when admin ports
-# aren't directly reachable across hosts) ----------
+# Extra --peer args: the SSH-tunnel-bridged `--peer http://127.0.0.1:<port>` pattern for admin ports not
+# directly reachable across hosts.
 hive_extra_peers: []
 
-# ---------- Container runtime ----------
-hive_container_runtime: "runc"   # bkk/fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
+hive_container_runtime: "runc"   # fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
 
-# ---------- Owner ----------
-# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS and by the
-# backend's `admin_emails` (crates/hive-cloud/src/state.rs) — lowercased, split on
-# ",", trimmed, in BOTH. Any reader that forgets to split matches nobody, which is
-# how the owner lost `platform_admin` on the nodes carrying the list form while
-# keeping it on the nodes whose inventory line holds a single address.
-# EVERY owner address must live HERE.
-#
-# `HIVE_OWNER_EMAIL` decides `isOwner`, and `isOwner` decides whether the mint
-# assigns the legacy "personal" tenant or isolates the account under
-# `u_<uid>`. An address missing from this list therefore gets a tenant that owns
-# nothing -- the dashboard loads, authenticates, and truthfully shows zero
-# projects.
-#
-# It is written ONLY from this variable: env.local.j2 renders the whole file, so
-# an address hand-added to a node's .env.local survives exactly until the next
-# `--tags ui` run silently resets it to this default. That is not hypothetical --
-# it happened on 2026-08-08 and took the owner's own projects offline on 3 of 4
-# nodes while a 4th (fr, not re-rendered) still worked, which is precisely the
-# kind of split that reads as "it works sometimes".
+# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS and the backend's admin_emails: EVERY
+# owner address must live here (env.local.j2 renders the whole file from this variable).
 hive_owner_email: "ops@{{ hive_platform_domain }},dylanwong007@gmail.com"
-# Platform admins beyond the owner (comma-separated). These emails mint
-# platform_admin JWTs (operator console + public browser-node capability) and
-# are locked to the enterprise plan. Override per-inventory in hosts.ini.
+# Platform admins beyond the owner (comma-separated): mint platform_admin JWTs and are locked to the enterprise plan.
 hive_admin_emails: "noahbladenbankers@gmail.com,dylan@simplyfi.cloud,dylan@shadw.cloud,dylan@weave.cloud,dylan@shadw.com"
-# Clerk org tenants whose MEMBERS (not just owners/admins) may run a public
-# browser node. Comma-separated; default is the Thoth division.
+# Clerk org tenants whose MEMBERS (not just owners/admins) may run a public browser node (comma-separated).
 hive_public_node_tenants: "thoth-division"
 
-# ---------- RUST_LOG ----------
 hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
 
-# ---------- Health probing ----------
-# The code defaults (HIVE_HEALTH_TIMEOUT=2, HIVE_HEALTH_INTERVAL=5) are too
-# tight for this fleet's real geography and caused a production outage on
-# 2026-07-31. hive-p2p's connect_budget is 5s, so a 2s probe timeout cancels
-# any peer needing a FRESH dial before it can even connect -- that peer can
-# never be re-probed successfully and flaps unhealthy. On the control-plane
-# LEADER that flapping is customer-visible: unhealthy nodes are filtered out of
-# client DNS (lb_records' health gate) and out of placement, so deployments on
-# them surface as "not found", and the resulting DNS create/retry churn drove
-# the Vercel API into sustained 429 rate limiting (159 429s in 30 minutes).
-#
-# Measured cross-continent probe latencies from fc-sanjose: fc-saopaulo 798ms,
-# fc-virginia 315ms, fc-lax 4330ms. Raising the timeout to 10s took the
-# leader's unhealthy set from 5-7 nodes flapping every few seconds to a stable
-# 0, and restored 4 nodes (frankfurt/bkk/hk/saopaulo) to the shadw.app
-# round-robin.
-#
-# Interval must stay GREATER than the timeout: the loop join_all's every target
-# per tick, so a timeout longer than the interval makes probe rounds overlap.
+# The code defaults (timeout 2 s, interval 5 s) are too tight for this geography; the interval must stay
+# GREATER than the timeout or probe rounds overlap.
 hive_health_timeout: 10
 hive_health_interval: 15
 hive_health_fail_threshold: 2

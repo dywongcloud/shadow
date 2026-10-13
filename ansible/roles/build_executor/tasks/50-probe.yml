@@ -105,16 +105,6 @@
           - --cap-add=SYS_ADMIN
           - --cap-add=MKNOD
           - --cap-add=SETFCAP
-          # NOT --security-opt=no-new-privileges here, deliberately: the
-          # image's own init needs no_new_privs CLEAR at entry (it retains
-          # elevated capabilities only inside its own PID-separated broker,
-          # then drops every capability and latches no_new_privs itself
-          # before exec'ing the tenant command) — see build_executor.rs's
-          # own container-create path and module doc, "Invocation/image
-          # capability contract". Setting it externally here made init exit
-          # 125 with "no_new_privs must start clear, got 1" (isolated live
-          # on sj2, 2026-08-28); the real hive-cloud invocation never sets
-          # this flag for exactly this reason.
           - --annotation=io.kubernetes.cri.container-type=sandbox
           - --ipc=private
           - --pid=private
@@ -134,19 +124,6 @@
           - "--volume={{ _build_executor_probe_volume }}:/workspace:rw,nosuid,nodev"
           - --workdir=/workspace
           - "--hostname={{ _build_executor_probe_container }}"
-          # The image's own init (hive-build-init, pinned as the real
-          # BUILDER_INIT_ENTRYPOINT_FLAG in build_executor.rs) re-verifies its
-          # entry capability contract before exec'ing the argv below, and
-          # refuses to proceed ("capability 0 differs from exact executor
-          # set") unless the container was started with exactly the eleven
-          # BUILDER_CAPABILITIES re-added via --cap-add on top of
-          # --cap-drop=all — matching real hive-cloud invocations exactly
-          # (build_executor.rs's own BuildExecutorConfig container-create
-          # path). A bare --cap-drop=all (capability 0, no re-add) is NOT
-          # what real builds ever run with; the probe must mirror the real
-          # contract or it is not proving what it claims to prove. Isolated
-          # live on sj2 (2026-08-28): the probe container exited 125 in
-          # under 1s with exactly that init message before this fix.
           - --entrypoint=/usr/local/libexec-hive-build-init
           - "{{ build_executor_builder_image_id }}"
           - /bin/sh
@@ -179,16 +156,6 @@
           - --cap-add=SYS_ADMIN
           - --cap-add=MKNOD
           - --cap-add=SETFCAP
-          # NOT --security-opt=no-new-privileges here, deliberately: the
-          # image's own init needs no_new_privs CLEAR at entry (it retains
-          # elevated capabilities only inside its own PID-separated broker,
-          # then drops every capability and latches no_new_privs itself
-          # before exec'ing the tenant command) — see build_executor.rs's
-          # own container-create path and module doc, "Invocation/image
-          # capability contract". Setting it externally here made init exit
-          # 125 with "no_new_privs must start clear, got 1" (isolated live
-          # on sj2, 2026-08-28); the real hive-cloud invocation never sets
-          # this flag for exactly this reason.
           - --annotation=io.kubernetes.cri.container-type=sandbox
           - --ipc=private
           - --pid=private
@@ -230,8 +197,6 @@
           - (_build_executor_probe_inspect.Image | regex_replace('^sha256:', '')) == (build_executor_builder_image_id | regex_replace('^sha256:', ''))
           - _build_executor_probe_inspect.OCIRuntime in [build_executor_runsc_path, (build_executor_runsc_path | basename)]
           - _build_executor_probe_inspect.Config.User == ((build_executor_container_uid | string) ~ ':' ~ (build_executor_container_gid | string))
-          # podman 5.x reports HostConfig.NetworkMode as "bridge" for a named
-          # bridge network; the authoritative membership is the Networks map key.
           - >-
             _build_executor_probe_inspect.HostConfig.NetworkMode == build_executor_network_name
             or build_executor_network_name in ((_build_executor_probe_inspect.NetworkSettings.Networks | default({})) | list)
@@ -247,20 +212,6 @@
       ansible.builtin.command:
         argv: ["{{ build_executor_podman_path }}", start, "{{ _build_executor_probe_container }}"]
 
-    # The primary probe's own start is netavark's trigger to bring up the
-    # dedicated bridge (hive-build0 / {{ build_executor_network_gateway }}),
-    # and `podman start` returning success does not prove that side effect
-    # has landed yet: measured live on sj2 (2026-08-28), the peer's
-    # immediately-following `--publish={{ build_executor_network_gateway
-    # }}:...` start intermittently hit "cannot listen on the TCP port: ...
-    # bind: cannot assign requested address" with the bridge device
-    # genuinely absent at that instant, on a real, otherwise fully correct
-    # probe/peer pair and network definition (reproduced only via the exact
-    # ansible task sequence — an isolated manual create+start of the same
-    # containers back-to-back did not reliably reproduce it, suggesting a
-    # narrow kernel netlink-event ordering window rather than a fixed delay
-    # to design around). A short bounded poll is the direct fix: wait on the
-    # actual condition the peer's start needs, not a guessed sleep.
     - name: Wait for the bridge gateway address to be assigned
       ansible.builtin.command:
         argv: ["ip", "-4", "addr", "show", "{{ build_executor_network_bridge }}"]
@@ -385,49 +336,6 @@
         - { host: "{{ build_executor_network_gateway }}", port: "{{ build_executor_probe_listener_port }}" }
         - { host: "{{ build_executor_probe_host_private_ipv4 }}", port: "{{ build_executor_probe_listener_port }}" }
 
-    # The peer's own listener (172.31.252.x:18081) and the gateway's hairpin
-    # publish (gateway-ip:18082 -> peer:18081) are BOTH on the far side of the
-    # fail-closed bridge firewall from the host's own perspective, and that
-    # firewall's design makes them UNREACHABLE from the host by construction,
-    # not by accident: executor_to_host (chain hook=input) allows only DNS
-    # inbound from the bridge, so a host-initiated connection to the hairpin
-    # publish (which answers ON the gateway IP, hitting INPUT) is dropped by
-    # be-input-default; and a host-initiated connection to the peer's bare IP
-    # goes out oifname=hive-build0 in executor_forward, where the "ingress to
-    # executor" default (be-forward-ingress-default) drops anything that
-    # isn't already ct state established -- a fresh SYN can never become
-    # established in the first place, so this is a permanent, unbreakable
-    # chicken-and-egg for ANY host-initiated first packet, not a timing
-    # window. Isolated live on sj2 (2026-08-28): the exact same listener,
-    # confirmed printing "BOUND OK" well under 1s after container start,
-    # was unreachable via host curl/ping for the container's ENTIRE runtime
-    # (30s+ of retries, host_denied nft counter incrementing on every
-    # attempt) -- proving this is the firewall working as designed, not a
-    # race. "Attempt forbidden HTTP connections" below independently proves
-    # the SAME two addresses are unreachable FROM A PEER container on the
-    # bridge (lateral cross-bridge deny), so testing reachability from the
-    # host here would be redundant with a DIFFERENT policy question even if
-    # it were possible. What this check actually needs to prove -- the
-    # listener is really up, not merely that podman reports the container
-    # running -- is answered correctly and cheaply by a self-connect INSIDE
-    # each container's own network namespace, which never crosses the bridge
-    # firewall at all (same-netns loopback, no iifname/oifname match
-    # possible), so it cannot be confused with either allow or deny policy.
-    # This proves the listener itself is live (bound, accepting) via a
-    # same-network-namespace self-connect on the peer's OWN address --
-    # deliberately not 127.0.0.1, so it also confirms the process bound the
-    # real bridge IP rather than loopback-only. The gateway hairpin's actual
-    # DNAT mapping (gateway-ip:18082 -> peer:18081) is a SEPARATE fact this
-    # check cannot and does not claim to prove: exercising a real DNAT
-    # requires a packet that ingresses from outside the peer's own namespace,
-    # and every such vantage (host, this same peer, any other bridge
-    # container) is exactly what the fail-closed firewall exists to block
-    # (see the note above) -- there is no permitted vantage left to test it
-    # from. Netavark's own port-publish path is what installs the DNAT rule
-    # ("Prove Netavark installed nftables state for the active network" and
-    # "Require the active bridge in Netavark's nftables table", earlier in
-    # this file) and that installation is proved structurally, not by a live
-    # traffic test.
     - name: Prove the peer's own listener is live via same-namespace self-connect
       ansible.builtin.command:
         argv:
@@ -474,25 +382,6 @@
       ansible.builtin.set_fact:
         _build_executor_counters_before: "{{ _build_executor_counters_before_raw.stdout | from_json }}"
 
-    # CapEff here is deliberately read from the TENANT process's own
-    # /proc/<pid>/status, never /proc/self/status: `podman exec` attaches a
-    # brand-new process into the container's namespaces by a SEPARATE runsc
-    # exec call that never passes through hive-build-init's fork/de-cap path
-    # at all, so an exec'd process always carries the full entry capability
-    # set the container was CREATED with, regardless of how correctly the
-    # init de-capped the real tenant PID -- checking /proc/self/status here
-    # tests podman-exec's own capability inheritance, not the tenant
-    # contract this probe exists to prove. Isolated live on sj2
-    # (2026-08-28): the real tenant PID (found by cmdline, excluding
-    # hive-build-init's own broker PIDs) reported CapEff all-zero exactly as
-    # documented, while an exec'd process into the SAME container
-    # simultaneously reported the full 11-capability entry mask -- proving
-    # the init's de-cap is correct and this was a probe-side measurement bug,
-    # not a hive-build-init defect. The tenant PID is not deterministically
-    # PID 1 (hive-build-init forks at least one broker helper ahead of it,
-    # observed as PIDs 1-2 broker / 3 tenant / 4 tenant's own child), so it
-    # is found by scanning for the one process whose cmdline is NOT the init
-    # path.
     - name: Prove command identity, gVisor kernel, empty host env, and workspace write
       ansible.builtin.command:
         argv:
@@ -532,22 +421,6 @@
             touch /workspace/non-root-write-ok
       changed_when: false
 
-    # The absolute-ceiling check on `du -sk /workspace` (as opposed to a
-    # delta from a measured baseline) had no headroom for pre-existing
-    # content already in the volume before this probe ever writes to it:
-    # the reviewed image's own workspace layer carries a `.buildah`/`.cache`
-    # directory pair, and `rm -f` above only clears the two files THIS probe
-    # created, never that pre-existing content (correctly -- a real tenant
-    # build needs it). Isolated live on sj2 (2026-08-28): baseline usage
-    # (before any probe write) measured ~4 KiB, and an intentionally
-    # maximal under-cap write of exactly 8388608 bytes (the tmpfs's own
-    # enforced size) pushed `du -sk` to 8196 KiB against the old check's
-    # flat 8192 KiB ceiling -- a real 4 KiB overshoot even though the
-    # filesystem's OWN cap enforcement (the property this probe actually
-    # exists to prove) worked perfectly: `dd` hit ENOSPC and stopped
-    # exactly at the tmpfs's real byte limit. The fix measures baseline
-    # usage first and asserts the DELTA the write added, never an absolute
-    # figure blind to what the image already puts there.
     - name: Prove the named tmpfs workspace byte ceiling
       ansible.builtin.command:
         argv:
@@ -567,16 +440,6 @@
             [ "$delta" -le "{{ ((build_executor_probe_workspace_bytes | int) // 1024) }}" ]
       changed_when: false
 
-    # The broker socket is per-boot and reaches buildah only through the
-    # environment hive-build-init gives the tenant process. `podman exec`
-    # attaches a brand-new process that inherits none of it, so the socket
-    # name is recovered from the supervising init (container PID 1, same
-    # uid) exactly the way build_executor.rs:1392 does for a real build --
-    # without it buildah answers "trusted broker is unavailable: Operation
-    # not permitted" and the probe reports a broken executor that is not
-    # broken. Isolation is chroot, not rootless: the broker's option
-    # allowlist enforces chroot, and build_executor.rs:1380 records that a
-    # rootless invocation has no working path in this image.
     - name: Prove nested brokered Buildah produces a real OCI archive
       ansible.builtin.command:
         argv:
@@ -616,16 +479,6 @@
             test -s /workspace/probe.oci
       changed_when: false
 
-    # /dev/fuse and /dev/net/tun are synthesized by the gVisor sentry in
-    # EVERY runsc container -- measured 2026-09-28 on fc-virginia: both carry
-    # the host's major/minor (10:229, 10:200) but a DIFFERENT st_dev than the
-    # host's /dev (21 vs 6), and /dev/kvm, /dev/mem and /dev/dri all exist on
-    # that host yet are absent inside. Asserting their mere absence therefore
-    # fails on every node and says nothing about passthrough, so the real
-    # property is asserted instead: a device node backed by the host's
-    # devtmpfs would carry the host's st_dev, while the sentry's own nodes
-    # share st_dev with /dev/null. Genuinely dangerous host devices stay on
-    # the absence list.
     - name: Prove IPv6, host paths, host IPC, and dangerous devices are absent
       ansible.builtin.command:
         argv:
@@ -686,13 +539,6 @@
           - --show-error
           - --output
           - /dev/null
-          # The image's curl (8.14.1) rejects the `--opt=value` form and
-          # accepts only `--opt value` -- measured 2026-09-28 inside this
-          # exact image: `--connect-timeout=3` exits 2 "option ... is
-          # unknown" while `--connect-timeout 3` exits 0. With the equals
-          # form every denial probe died on a usage error before sending a
-          # packet, so the deny counters stayed at zero and the probe proved
-          # nothing while still looking like a firewall failure.
           - --connect-timeout
           - "{{ build_executor_probe_connect_timeout_seconds }}"
           - --max-time
@@ -785,11 +631,6 @@
       ansible.builtin.set_fact:
         _build_executor_counters_after: "{{ _build_executor_counters_after_raw.stdout | from_json }}"
 
-    # host_denied counts only the INPUT path (traffic delivered to the host
-    # itself), while the other counters sit on FORWARD, so a probe that never
-    # reaches the input path is invisible here. Printing the per-attempt exit
-    # and error alongside both counter snapshots is what makes a short delta
-    # diagnosable instead of a bare "Assertion failed".
     - name: Report forbidden-attempt outcomes and deny counter deltas
       ansible.builtin.debug:
         msg:

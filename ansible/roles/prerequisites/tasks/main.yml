@@ -1,23 +1,7 @@
 ---
-# Base OS packages, Rust toolchain, container runtime, and the handful of
-# host settings every hive-cloud node needs regardless of KVM/PVM flavor.
-# Idempotent throughout -- safe to re-run.
 
 - name: "Assert a dnf-based distro (matches the current fleet: TencentOS/Rocky 10)"
   ansible.builtin.assert:
-    # ansible_pkg_mgr, not ansible_os_family: TencentOS Server reports
-    # os_family as the literal string "TencentOS Server", not "RedHat" --
-    # ansible's fact-gathering doesn't classify it into the RedHat bucket
-    # even though it's dnf-based and RHEL-app-compatible enough to run every
-    # task in this role. Live-witnessed this assert never actually firing
-    # against a TencentOS node in this fleet's history (it's been here since
-    # the very first ansible commit) because every current TencentOS node
-    # was hand-provisioned before this role ever ran against it -- the first
-    # real run, mid this-session, would have failed outright on a distro
-    # this role has run dnf against successfully all along. pkg_mgr is also
-    # more directly meaningful here than any os-family label: this role's
-    # own tasks are dnf-based, so "is dnf the package manager" is exactly
-    # the question that matters.
     that: ansible_pkg_mgr == "dnf"
     fail_msg: >-
       This role's package tasks are dnf-based. The fleet this repo was built
@@ -41,49 +25,17 @@
       - podman
       - policycoreutils-python-utils   # semanage, for podman/SELinux interplay
       - jq
-      # bindgen (vendor/cr-sqlite's sqlite3_capi build.rs) needs a real
-      # libclang.so at build time -- absent on a stock Rocky image, so
-      # `make loadable` panics "Unable to find libclang" partway through
-      # `hive_platform`'s release build. clang-devel pulls in clang-libs
-      # (the actual libclang.so.N shared object bindgen dlopen()s), never
-      # just clang. Witnessed live 2026-08-29: fc-sanjose (the control-plane
-      # leader) failed this exact step, halting a fleet rollout there --
-      # every other already-provisioned node had it from an earlier, more
-      # complete manual bring-up and never revealed the gap.
       - clang-devel
     state: present
 
-# The fleet's SOLE firewall is scripts/hive-lockdown.sh's own iptables/nft
-# chain (see that script's header) -- `firewalld` must be disabled+masked,
-# never enabled. It runs an independent netfilter layer whose restrictive
-# default zone (80/443/ssh only) silently blocks ports hive-lockdown.sh
-# explicitly allows for peers. Live-witnessed on fc-sanjose-2: a fresh
-# Rocky 10 image ships firewalld ACTIVE by default, which blocked the
-# relay/discovery ports from every other fleet node until disabled here --
-# the confirmed fleet convention (sj/bkk/va) is firewalld inactive+disabled.
 - name: Disable + mask firewalld (hive-lockdown.sh is the sole firewall)
   ansible.builtin.systemd:
     name: firewalld
     state: stopped
     enabled: false
     masked: true
-  failed_when: false   # some images (e.g. bkk's TencentOS) never had it installed at all
+  failed_when: false   # some images never had it installed at all
 
-# Single canonical source in scripts/ -- this role used to carry its own
-# hand-mirrored copy under files/, and its PEERS roster silently drifted from
-# scripts/hive-lockdown.sh's (6 of 12 current nodes). Regenerate the PEERS
-# list via scripts/gen-hive-lockdown.sh before running this role; never
-# hand-edit a second copy.
-#
-# The three lockdown tasks carry their own `lockdown` tag so a roster refresh
-# rolls ALONE: `ansible-playbook playbooks/site.yml --tags lockdown`. Without
-# it the only way to push a regenerated PEERS line was the whole prerequisites
-# role (dnf installs, a force-redownloaded runsc, toolchain checks), which is
-# why the live roster sat at 13 of 22 hosts for weeks -- every node added
-# after the last full prerequisites run (fr, phx, tokyo, seoul, va4, va5,
-# sj3-5) was a stranger to every other node's 8787/50052/5010x, so their
-# HTTP admin dispatch and inference reach were silently dropped. Witnessed
-# 2026-09-02 while resolving a Tencent exposure ticket.
 - name: Install hive-lockdown.sh
   ansible.builtin.copy:
     src: "{{ role_path }}/../../../scripts/hive-lockdown.sh"
@@ -132,17 +84,6 @@
     daemon_reload: true
   tags: [lockdown]
 
-# Host hardening that every node gets. Each item is safe fleet-wide:
-# - Cockpit ships enabled on Rocky 10 (cockpit.socket on :9090) and accepts
-#   PASSWORD logins for root, which Tencent images give a console password.
-#   Nothing in the fleet uses it.
-# - rp_filter=2 (loose) drops spoofed sources without breaking the
-#   asymmetric paths a 1:1-NAT cloud host and its TUN/bridge interfaces use.
-# - sshd: key-only root, no X11/GSSAPI, short login grace, idle-client
-#   timeout. MaxAuthTries is deliberately NOT lowered: operators' SSH agents
-#   offer several keys and would hit "Too many authentication failures".
-#   The drop-in is named 00- because sshd keeps the FIRST value it reads and
-#   the images ship 01-permitrootlogin.conf (yes) and 50-redhat.conf (X11 yes).
 - name: Disable + mask Cockpit (web console with root password login)
   ansible.builtin.systemd:
     name: cockpit.socket
@@ -169,11 +110,6 @@
   when: hive_host_hardening | bool and hive_hardening_sysctl is changed
   tags: [hardening]
 
-# iroh asks the kernel for a 7 MiB UDP socket buffer and gets at most
-# 2 x rmem_max. At the distro default (212992) the mesh socket was clamped to
-# 416 KiB and dropped datagrams under load: UdpRcvbufErrors of 39-200 per
-# 10 min on the followers, 0 after raising it (2026-09-30). The socket buffer
-# is sized at bind time, so hive-node must restart once to pick it up.
 - name: Mesh UDP socket buffer ceiling
   ansible.builtin.copy:
     dest: /etc/sysctl.d/90-hive-udp.conf
@@ -194,8 +130,6 @@
   ansible.builtin.copy:
     dest: /etc/ssh/sshd_config.d/00-hive-hardening.conf
     mode: "0600"
-    # The fragment is syntax-checked on its own here; the task after it
-    # checks the EFFECTIVE merged config with `sshd -T`.
     validate: /usr/sbin/sshd -t -f %s
     content: |
       PermitRootLogin prohibit-password
@@ -258,14 +192,6 @@
     name: nodejs
     state: present
 
-# Node >= 22.5 floor: the @workflow/web console server build (dashboard /wfc)
-# requires node:sqlite, which dnf's nodejs (20 on TencentOS) does not have —
-# a v20 node 500s every console request with ERR_UNKNOWN_BUILTIN_MODULE
-# (live-witnessed fleet-wide 2026-07-29 on the six TencentOS/CVM nodes, fixed
-# by hand with exactly this tarball). deploy-ui-fleet.sh's preflight floors
-# this too, but a reprovisioned node would serve the broken console BEFORE
-# the next UI deploy, so the floor belongs in provisioning. Idempotent: the
-# check skips entirely when the installed node already has node:sqlite.
 - name: Check whether the installed node has node:sqlite (>= 22.5)
   ansible.builtin.command: node -e "require('node:sqlite')"
   register: hive_node_sqlite_check
@@ -307,45 +233,12 @@
     - name: Verify node:sqlite is now loadable
       ansible.builtin.command: /usr/local/bin/node -e "require('node:sqlite')"
 
-# Wasmer (hive_core::Runtime::Wasmer): `wasmer run --net --forward-host-env
-# <entry>.wasm` is the start_cmd the build pipeline emits for an explicit
-# `runtime: "wasmer"` function (see git.rs's detect_wasmer_start_cmd).
-#
-# WHERE THIS BINARY IS USEFUL, PRECISELY — this distinction is the whole
-# reason the feature's first cut was broken. A cell's `start_cmd` is exec'd
-# against DIFFERENT filesystems depending on the backend:
-#   * mock / litebox — spawned on the HOST, so this install is what runs.
-#   * firecracker    — `hive-cell-agent` runs as PID1 INSIDE the microVM and
-#                      execs against the GUEST rootfs, where this host install
-#                      is completely invisible. Those nodes need wasmer baked
-#                      into the rootfs IMAGE instead; see
-#                      `ansible/roles/firecracker_kvm` (`hive_wasmer_in_rootfs`)
-#                      and `scripts/build-rootfs.sh`'s WASMER_TARBALL.
-# A node only advertises `NodeInfo::wasm_runtime` when the probe finds wasmer
-# on the filesystem that node actually execs against (hive-cloud's
-# `detect_wasm_runtime`), and placement hard-filters on it — so a node missing
-# it is simply never chosen, rather than failing every cold start.
-#
-# Live-verified end-to-end on this exact pinned version: a real axum+tokio
-# server built with `cargo wasix build --release` (target wasm32-wasmer-wasi)
-# bound a real socket and served a real HTTP request under `wasmer run --net`,
-# with `--forward-host-env` correctly carrying the dynamically-assigned $PORT
-# into the guest.
-#
-# DISK: only `bin/wasmer` is installed — 200 MiB. The full tarball extracts to
-# 861 MiB, but 560 MiB of that is `lib/libwasmer*.a` static archives for
-# EMBEDDING wasmer in another program, which `wasmer run` never opens. Given
-# AGENTS.md's "Storage capacity & placement" incident (fc-sanjose reached 0
-# bytes free and took 9 customer deployments down), shipping 660 MiB of unused
-# artifacts to every node is not a rounding error.
 - name: Check whether wasmer v7.2.1 is already installed
   ansible.builtin.command: /usr/local/bin/wasmer --version
   register: hive_wasmer_check
   failed_when: false
   changed_when: false
 
-# Exact-version test, NOT a substring: `'wasmer 7.2.1' not in stdout` would
-# also accept a future `wasmer 7.2.10` and silently skip the install.
 - name: Install Wasmer v7.2.1 from the official release tarball (sha256-verified)
   when: hive_wasmer_check.rc != 0 or hive_wasmer_check.stdout.strip() != 'wasmer 7.2.1'
   block:
@@ -361,7 +254,6 @@
         state: directory
         mode: "0755"
 
-    # `extra_opts` limits extraction to the CLI only (see the DISK note above).
     - name: Extract only bin/wasmer from the v7.2.1 tarball
       ansible.builtin.unarchive:
         src: /tmp/wasmer-v7.2.1-linux-amd64.tar.gz
@@ -386,50 +278,15 @@
     - name: Verify wasmer is now runnable
       ansible.builtin.command: /usr/local/bin/wasmer --version
 
-# bun (package manager + hive_core::Runtime::Bun interpreter): a repo whose
-# resolved package manager is bun — a bun.lock, a packageManager declaration,
-# or an explicit `bun install` settings override — runs `bun …` through the
-# node-local toolchain on every lane whose builds/exec reach the host, and
-# dies with exit 127 on any host without it. Witnessed 2026-08-24 (tokenhun
-# build dpl-0c9ba9d462): bun existed on NO fleet host, so the build died
-# `/bin/sh: bun: command not found` and surfaced to the tenant as an
-# application failure for what was a HOST provisioning gap.
-#
-# WHERE THIS BINARY IS USEFUL, PRECISELY (the wasmer lesson above applies
-# verbatim):
-#   * builds under the currently deployed binaries run repository commands on
-#     the HOST via /bin/sh — this install is what they resolve;
-#   * mock-backend start_function spawns on the HOST, and its
-#     NodeInfo::bun_runtime advertisement is probed via which_on_path("bun");
-#   * firecracker execs start_cmd INSIDE the microVM guest — this host
-#     install is invisible there; those nodes need bun baked into the rootfs
-#     IMAGE instead (scripts/build-rootfs.sh's BUN_TARBALL/BUN_BINARY, which
-#     writes the .bun capability marker next to the image);
-#   * litebox can never run Bun (its pinned upstream syscall shim panics on
-#     Bun's own boot probe — hive-backend/src/litebox.rs refuses pre-spawn).
-# The isolated BuildExecutor's pinned image asserts bun at image build time
-# (ansible/roles/build_executor/templates/Containerfile.j2), so executor-path
-# builds do not depend on this host install; this covers the host/legacy/mock
-# lane and the advertisement probe.
-#
-# ASSET SELECTION: bun-linux-x64 requires AVX2; bun-linux-x64-baseline is the
-# official pre-AVX2 build (the same selection bun's own install script
-# makes). Pinned + sha256-verified exactly like the Node/Wasmer installs
-# above — a mutable URL is how the runsc fleet spread happened. The zip
-# ships only `bun`; bunx is the same binary dispatched on argv[0], installed
-# as a symlink exactly like bun's own install script.
 - name: Check whether bun v1.4.0 is already installed
   ansible.builtin.command: /usr/local/bin/bun --version
   register: hive_bun_check
   failed_when: false
   changed_when: false
 
-# Exact-version test, NOT a substring (the wasmer lesson two blocks up).
 - name: Install bun v1.4.0 from the official release (sha256-verified)
   when: hive_bun_check.rc != 0 or hive_bun_check.stdout.strip() != '1.4.0'
   block:
-    # lookup('file', ...) would read the CONTROL node's cpuinfo — the probe
-    # must run on the managed host.
     - name: Detect AVX2 on the managed host (selects the bun asset variant)
       ansible.builtin.command: grep -qw avx2 /proc/cpuinfo
       register: hive_bun_avx2
@@ -448,31 +305,12 @@
         checksum: "sha256:{{ hive_bun_sha256 }}"
         force: true
 
-    # unarchive's `dest` does NOT create the directory (unlike get_url's
-    # `dest`) -- unlike the copy-paste-adjacent wasmer block above, this one
-    # never had its own `file: state=directory` step, so it only ever
-    # "worked" on already-provisioned fleet nodes where /usr/local/bun-v1.4.0
-    # happened to pre-exist from an earlier manual bring-up. Witnessed live
-    # 2026-08-29: fails "dest '/usr/local/bun-v1.4.0' must be an existing
-    # dir" on 3 genuinely fresh Rocky 10.2 nodes (sj3/sj4/sj5).
     - name: Create versioned install dir /usr/local/bun-v1.4.0
       ansible.builtin.file:
         path: "/usr/local/bun-v1.4.0/{{ hive_bun_asset }}"
         state: directory
         mode: "0755"
 
-    # Versioned extract dir (the wasmer convention two blocks up): an
-    # unversioned dir plus `creates` would skip extraction on a future version
-    # bump, leaving the symlink on the old binary while the check demands the
-    # new one.
-    # No `extra_opts` member-filter here (unlike wasmer's tar.gz extract
-    # above): ansible's unarchive module places extra_opts in a position in
-    # the constructed `unzip` argv that does NOT work as a member selector for
-    # zip archives -- witnessed live 2026-08-29, `unzip -o bun-linux-x64/bun
-    # /tmp/....zip -d dest` (archive and member swapped), "cannot find or
-    # open bun-linux-x64/bun". The bun release zip ships ONLY the `bun`
-    # binary under one directory (see this block's own doc comment above), so
-    # a full extract is equivalent to a filtered one anyway.
     - name: Extract bun from the v1.4.0 archive into /usr/local/bun-v1.4.0
       ansible.builtin.unarchive:
         src: "/tmp/{{ hive_bun_asset }}-v1.4.0.zip"
@@ -498,34 +336,6 @@
     - name: Verify bun is now runnable
       ansible.builtin.command: /usr/local/bin/bun --version
 
-# pnpm + yarn: the two remaining package managers a tenant repository can name
-# (`pnpm-lock.yaml` / `yarn.lock`, or an explicit install command), and the ONLY
-# two with no provisioning at all before this block — measured 2026-09-25:
-# fc-phoenix had bun, node, npm, pnpm and yarn; fc-virginia had node and npm
-# ONLY, so a `pnpm install` or `yarn install` there died exactly like the
-# `bun install` that prompted the capability probe. Unlike bun (a native
-# binary), both ship through npm, which this role already guarantees — one
-# download channel to audit, and npm resolves the right platform binary.
-#
-# WHY PROVISION WHEN THE CODE NOW DEGRADES: because degradation is a fallback,
-# not a substitute for capability. The build lane falls back to npm so a
-# missing manager never fails a deploy, but `pnpm install --frozen-lockfile`
-# and `npm install` are not interchangeable — a pnpm workspace's
-# `node_modules` layout and its lockfile resolution differ, and a repository
-# pinned to `packageManager: pnpm@X` is asking for pnpm. Advertising the tool
-# only where it genuinely exists and provisioning it fleet-wide are the same
-# fix seen from both ends.
-#
-# VERSIONS PINNED, not `latest`: an unpinned global install makes two
-# reprovisions of the same node two different toolchains, which is exactly the
-# non-determinism the build cache identity and the capability advertisement
-# exist to prevent. Bump deliberately.
-#
-# YARN IS CLASSIC (1.x) on purpose: `yarn` resolves to it on npm, and it is
-# what every `yarn.lock` v1 repository expects. A Berry repository (lockfile
-# v2+, `yarn install --immutable`) still resolves through corepack from its own
-# `packageManager` field — unverified here, and called out rather than papered
-# over.
 - name: Check whether pnpm and yarn are already installed
   ansible.builtin.command: "{{ item.tool }} --version"
   register: hive_npm_pm_check
@@ -536,15 +346,6 @@
     - { tool: yarn, pkg: "yarn@1.22.22" }
 
 - name: Install the missing package manager into the global npm prefix
-  # `failed_when: false` above means rc != 0 covers BOTH "absent" and
-  # "present but not runnable" (a broken install), and both are worth
-  # replacing here.
-  # `--prefix /usr/local` pins the shims to /usr/local/bin, which is on the
-  # hive-node unit's PATH. Without it npm uses node's OWN prefix: on a fresh
-  # host that got node from the v22.23.2 tarball above that is
-  # /usr/local/node-v22.23.2-linux-x64/bin, which is on no PATH, so the verify
-  # task below failed "No such file or directory: pnpm" (fc-sanjose-7,
-  # 2026-09-30) and the build lane would never see pnpm/yarn.
   when: item.rc != 0
   ansible.builtin.command: "npm install -g --prefix /usr/local {{ item.item.pkg }}"
   loop: "{{ hive_npm_pm_check.results }}"
@@ -564,26 +365,6 @@
     state: started
     enabled: true
 
-# The fleet runs container/DB deployments under gVisor (HIVE_CONTAINER_RUNTIME=
-# runsc) for stronger isolation than plain runc. Without runsc installed, every
-# container/DB deployment fails at launch -- discovered live on a fresh node
-# that had the runsc env set but no gVisor binary. Install + register it with
-# podman so the runsc runtime the node is configured for actually exists.
-# PINNED + CHECKSUMMED, and both halves matter. This used to fetch
-# `release/latest` with no checksum, which is precisely the mechanism that
-# produced the observed fleet spread (runsc release-20260622.0 through
-# 20260727.0 across nodes): `get_url` does NOT re-download when `dest` already
-# exists, so each node froze at whatever `latest` happened to mean on its
-# provisioning day and no converge could ever move it — drifting apart on the
-# way in, and unupdatable afterwards. A mutable URL also means the bytes a
-# converge installs are not the bytes anyone reviewed.
-#
-# `hive_runsc_version` is the single place to bump it; the checksum is
-# gVisor's own published `runsc.sha512` for that exact release, so a wrong or
-# tampered download fails the task instead of becoming this node's container
-# runtime. Bumping the version alone will NOT reinstall over an existing
-# binary (same `get_url` semantics) — `force: true` is set so a version change
-# actually lands, and the checksum is what makes that safe.
 - name: Install gVisor runsc (the container runtime the fleet's HIVE_CONTAINER_RUNTIME=runsc needs)
   ansible.builtin.get_url:
     url: "https://storage.googleapis.com/gvisor/releases/release/{{ hive_runsc_version }}/{{ ansible_architecture }}/runsc"

@@ -1,80 +1,16 @@
 ---
-# Fleet-wide deploy of BOTH the hive-cloud backend and the ui/ dashboard,
-# replacing scripts/roll-backend-fleet.sh + scripts/deploy-ui-fleet.sh with
-# one Ansible entry point across all 14 hosts.
-#
-# Parallelism model (deliberately NOT "restart all 14 at once" -- see
-# AGENTS.md's mesh quorum-loss / round-robin-dashboard-availability notes,
-# and playbooks/platform-only.yml's existing serial: 1):
-#
-#   1. BUILD (parallel, strategy: free): one host per glibc group builds
-#      one hive-cloud + hive-cell-agent release pair; one host (the
-#      control-plane leader) builds the ui/
-#      Next.js bundle once. All builds run concurrently with each other and
-#      don't lockstep on each other's task boundaries.
-#   2. PUSH (parallel, strategy: free): every host pulls its group's/the
-#      canonical artifact and verifies its checksum. No service is touched
-#      yet, so this step is safe to fan out to every host at once -- bounded
-#      by ansible.cfg's `forks` (>= host count, see its comment) so this is
-#      actually one fan-out and not batches of 5. The artifact copy itself
-#      additionally carries its own `throttle:` (see hive_push_throttle
-#      below) independent of forks: forks bounds how many hosts run ANY
-#      task concurrently, throttle caps just the heavy ~100MB binary/bundle
-#      transfer so it doesn't try to saturate the operator machine's own
-#      uplink pushing to a dozen hosts simultaneously (the same residential-
-#      uplink problem scripts/roll-backend-fleet.sh's header names as why it
-#      went node-to-node in the first place -- here we get node-to-node's
-#      MaxStartups safety for free, because every artifact copy originates
-#      from THIS control host to one target each, never one fleet node
-#      relaying to several peers at once, and only bound the operator
-#      uplink's bandwidth instead).
-#   3. RESTART (serial, linear strategy -- batches must fully complete,
-#      health check included, before the next starts): hive-node and hive-ui
-#      are swapped in and restarted a bounded number of hosts at a time.
-#      Backend and UI have SEPARATE, differently-reasoned defaults (see
-#      deploy_serial_backend / deploy_serial_ui below) -- collapsing them to
-#      one shared "deploy_serial" is exactly the bug this playbook used to
-#      have: the UI's own dashboard-availability requirement (a batch of 2-3
-#      is plenty safe, round-robin DNS just needs >=1 node up) has nothing
-#      to do with the backend's control-plane-leader-chain requirement
-#      (hive_cp_owner_chain has only 3 candidate nodes fleet-wide; batching
-#      more than 1 at a time risks two of those three landing in the same
-#      restart batch with no live measurement that's safe).
+# Fleet-wide deploy of the hive-cloud backend and the ui/ dashboard (replaces scripts/roll-backend-fleet.sh
+# + scripts/deploy-ui-fleet.sh); the plays below are build, push, serial restart and content verification.
 #
 # Usage:
 #   ansible-playbook playbooks/parallel-deploy.yml
-#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_ui=2        # UI restart batch size (default 3)
-#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_backend=2   # backend restart batch size (default 1 -- raise only with real evidence multi-node restart is quorum-safe)
-#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2          # legacy: sets BOTH if the specific vars above aren't given
-#   ansible-playbook playbooks/parallel-deploy.yml -e hive_push_throttle=8     # allow more concurrent big-artifact pushes (needs a well-provisioned uplink)
-#   ansible-playbook playbooks/parallel-deploy.yml --tags backend       # backend only
-#   ansible-playbook playbooks/parallel-deploy.yml --tags ui            # ui only
-#   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset -- MUST also include each represented glibc group's BUILD host
-#   ansible-playbook playbooks/parallel-deploy.yml -e allow_noop_deploy=true   # permit a run that changes no host's binary content
-#
-# VERIFICATION (the reason a deploy here cannot silently do nothing). After the
-# restart plays, two verification plays compare CONTENT, not task exit codes:
-# every host's on-disk binary AND the image its running process is actually
-# executing (`/proc/<MainPID>/exe`) must equal the sha256 of the artifact built
-# in THIS run, and each unit's start timestamp must be after this run began.
-# A missing canonical fact -- which is what "the build never ran" looks like --
-# is a hard failure, never a skipped comparison. Finally, a run in which NO
-# host's binary content changed is refused outright (`allow_noop_deploy` opts
-# out), because the failure mode this playbook has actually produced three
-# times is a deploy-shaped NON-EVENT with a recap that reads fine.
-#
-#   A --limit that excludes the build host cannot work: the build play targets
-#   glibc239_builder:glibc238_builder (elected as groups['glibc239'][0] /
-#   groups['glibc238'][0]), so limiting it away means nothing is ever built and
-#   the push then dies with "Could not find or access .../hive-cloud-glibc239 on
-#   the Ansible Controller" -- three phases after the real mistake. Witnessed on
-#   a --limit fr canary. The preflight assert below now catches it up front and
-#   names the host to add. Builders today: va (glibc239), bkk (glibc238), so a
-#   frankfurt-only canary is `--limit fr,va`.
-#
-# Every step below is idempotent (matches hive_platform/hive_ui's own
-# idempotency) so a partial re-run after a mid-deploy failure picks up
-# rather than redoing completed work.
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_ui=2        # UI restart batch size
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_backend=2   # raise only with real quorum-safety evidence
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2          # legacy: sets both unless the specific vars are given
+#   ansible-playbook playbooks/parallel-deploy.yml -e hive_push_throttle=8     # more concurrent big-artifact pushes
+#   ansible-playbook playbooks/parallel-deploy.yml --tags backend | --tags ui
+#   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # MUST also include each represented glibc group's BUILD host
+#   ansible-playbook playbooks/parallel-deploy.yml -e allow_noop_deploy=true   # permit a run that changes no host's binary
 
 - name: Elect build hosts and stage the shared artifact directory
   hosts: platform
@@ -85,11 +21,6 @@
       ansible.builtin.group_by:
         key: "{{ 'glibc239_builder' if inventory_hostname == groups['glibc239'][0] else ('glibc238_builder' if inventory_hostname == groups['glibc238'][0] else 'glibc_follower') }}"
 
-    # Fail HERE, naming the fix, rather than three phases later with an opaque
-    # "Could not find or access .../hive-cloud-glibc239 on the Ansible
-    # Controller". A --limit that keeps hosts of a glibc group but drops that
-    # group's build host builds nothing for them, and the push is the first task
-    # that notices.
     - name: Assert each represented glibc group's build host is in this run
       delegate_to: localhost
       become: false
@@ -109,11 +40,6 @@
           This run has: {{ ansible_play_hosts_all | join(',') }}.
         success_msg: "build hosts present for every represented glibc group"
 
-    # hive_name is a per-host var, not a hostname -- the control-plane
-    # leader (hive_cp_owner_chain's first entry) is identified by matching
-    # its own hive_name against the chain, same ordering intent
-    # scripts/deploy-ui-fleet.sh derived from inventory (leader deployed
-    # first).
     - name: Elect the control-plane leader as the UI build host
       ansible.builtin.group_by:
         key: "{{ 'ui_builder' if hive_name == hive_cp_owner_chain.split(',')[0] else 'ui_follower' }}"
@@ -128,28 +54,10 @@
       run_once: true
       register: _artifact_tmp
 
-    # Read the registered value DIRECTLY, not through hostvars['localhost'].
-    #
-    # `delegate_facts: true` governs facts a module SETS (setup, set_fact); it
-    # does not move a `register` result, which is always stored on the inventory
-    # host the task ran for. So `hostvars['localhost']['_artifact_tmp']` never
-    # existed and every run of this playbook died here with
-    # "object of type 'HostVarsVars' has no attribute '_artifact_tmp'" —
-    # witnessed on a --limit fr canary (ok=3 changed=3 failed=1, and the node's
-    # binary provably unchanged afterwards).
-    #
-    # `run_once: true` already copies the registered result to every host in the
-    # play, so the plain name resolves on all of them.
     - name: Publish the artifact root to every host's facts
       ansible.builtin.set_fact:
         hive_artifact_root: "{{ _artifact_tmp.path }}"
 
-    # Verification baseline: the moment this run began, read from EACH HOST'S
-    # OWN clock rather than the control host's. The later "did the service
-    # actually restart?" assert compares this against systemd's
-    # ExecMainStartTimestamp on the same host, and control-host clock skew
-    # would otherwise make that comparison lie in whichever direction the skew
-    # happens to point.
     - name: Stamp this run's start time on every host
       ansible.builtin.command: date +%s
       changed_when: false
@@ -190,10 +98,6 @@
 - name: Backend restart (serial -- mesh quorum safety)
   hosts: platform
   become: true
-  # Default 1: hive_cp_owner_chain has only 3 candidate leader nodes
-  # fleet-wide (fc-sanjose, fc-bangkok, fc-virginia) out of 14 -- there is no
-  # live measurement showing a bigger batch can't land 2 of those 3 in the
-  # same restart window, so this stays conservative unless overridden.
   serial: "{{ deploy_serial_backend | default(deploy_serial | default(1)) }}"
   tags: [backend]
   vars:
@@ -204,18 +108,6 @@
         name: hive_platform_fanout
         tasks_from: restart
 
-# The check that makes a deploy which changed NOTHING impossible to mistake for
-# success. Every task above can succeed while the fleet still runs the previous
-# binary -- that has happened three separate ways in this playbook's own history
-# (an undefined hostvars fact, the same defect in the cleanup play, and a
-# --limit that silently dropped the build host), each time with a recap that
-# read partially fine and a node whose binary was provably unchanged. So this
-# play ignores exit codes entirely and compares CONTENT: the sha256 of the
-# artifact built in THIS run against what is on disk and, separately, against
-# the image the running process is actually executing.
-#
-# any_errors_fatal: a single unverified host means the fleet is heterogeneous;
-# that is a failed deploy, not a footnote in the recap.
 - name: Backend verification (artifact CONTENT, every host)
   hosts: platform
   become: true
@@ -244,10 +136,6 @@
       delegate_to: localhost
       become: false
 
-    # A run in which no host's binary content changed deployed nothing. That is
-    # sometimes legitimate (re-running after a mid-deploy failure, source truly
-    # unchanged) and is never something to discover later from a recap, so it
-    # is a hard stop with an explicit opt-out rather than a line of output.
     - name: Refuse a deploy that changed nothing (no-op detector)
       vars:
         _v: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_backend') | select('defined') | list }}"
@@ -276,18 +164,7 @@
       delegate_to: localhost
       become: false
 
-# The first-restarted node forms its trunks against a fleet that then bounces
-# 13 more times behind it, and its half-dead trunk state does not reliably
-# self-heal: measured live (2026-08-17 roll), the three EARLIEST restarts
-# (fc-bangkok, fc-sanjose, fc-saopaulo) were exactly the trio that wedged —
-# fc-bangkok at 3/18 visible peers for 90 minutes — while every later restart
-# converged cleanly against the already-settled fleet. One extra kick of node
-# #1 after the whole serial pass lets it re-form every trunk against the FINAL
-# fleet, the same remediation an operator applied by hand that night.
 - name: Re-kick the earliest-restarted nodes (trunks re-form against the settled fleet)
-  # First THREE, serially — the measured incident wedged exactly the three
-  # earliest restarts (bkk, sj, sp), not only node #1; every later restart
-  # converged against the already-settled fleet and needs nothing.
   hosts: "{{ groups['platform'][0:3] | join(':') }}"
   serial: 1
   become: true
@@ -310,8 +187,6 @@
       register: rekick_mesh
       retries: 18
       delay: 10
-      # The meshwatch degraded floor (expected/4) is the failure shape this
-      # step exists to prevent; demand comfortably above it.
       until: >-
         rekick_mesh.status == 200 and
         (rekick_mesh.json.visible_healthy_peers | int) >=
@@ -349,12 +224,6 @@
 - name: UI restart (serial -- dashboard never down fleet-wide)
   hosts: platform
   become: true
-  # Default 3: the dashboard is round-robin DNS across every node with no
-  # leader-election concern (unlike the backend chain above), so a batch of
-  # 2-3 out of 14 is plenty safe -- 11+ nodes still serve while a batch
-  # restarts, and this is explicitly NOT left at 1 (full serial:1 here would
-  # take ~14 sequential restart-and-health-check rounds to defeat the whole
-  # point of parallelizing the roll).
   serial: "{{ deploy_serial_ui | default(deploy_serial | default(3)) }}"
   tags: [ui]
   vars:
@@ -411,14 +280,6 @@
   gather_facts: false
   tags: [always]
   tasks:
-    # Same defect as the publish task above, one play later: this play's host IS
-    # localhost, which was never in the play that registered `_artifact_tmp`, so
-    # `hostvars['localhost']['_artifact_tmp']` is undefined here too. Read the
-    # already-published `hive_artifact_root` off a platform host instead.
-    #
-    # `default('')` + the `when` guard so a run that failed BEFORE the fact was
-    # published cleans up nothing rather than dying in its own cleanup — a
-    # cleanup task that errors masks the real failure above it.
     - ansible.builtin.file:
         path: "{{ _root }}"
         state: absent
