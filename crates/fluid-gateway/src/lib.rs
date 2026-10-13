@@ -2096,11 +2096,16 @@ impl Gateway {
     /// (empty target = legacy production lane) and KEEP every preview — a preview was placed where it
     /// was placed and only a user delete or retention policy may remove it. Returns the removed ids.
     pub async fn remove_project_superseded(&self, project: &str) -> Vec<String> {
+        // Production-lane = promoted (`production`) OR built for the production
+        // environment (`target`). `promote_exact` flips `production` without
+        // touching `target`, so a record promoted out of the staged lane carries
+        // `production: true, target: "preview"` and must still be reaped here —
+        // the same one-authoritative-answer rule `view_of` applies on read.
         let ids: Vec<String> = {
             let st = self.state.lock();
             st.deployments
                 .values()
-                .filter(|d| d.project == project && d.target != "preview")
+                .filter(|d| d.project == project && (d.production || d.target != "preview"))
                 .map(|d| d.id.to_string())
                 .collect()
         };
