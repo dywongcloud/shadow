@@ -1,8 +1,5 @@
 ---
-# Deploy the hive-cloud controller and its exact hive-cell-agent companion to one
-# node. Source is pushed from the Ansible control host's checkout; both binaries
-# are compiled in one Cargo invocation, so a later manual rootfs bake cannot
-# consume bootstrap-vintage guest code.
+# Deploy the hive-cloud controller and its exact hive-cell-agent companion to one node: the source is pushed from the control host's checkout and both binaries are built in one Cargo invocation.
 
 - name: Ensure the source directory exists on the target
   ansible.builtin.file:
@@ -19,10 +16,6 @@
       - "--exclude=target"
       - "--exclude=.git"
 
-# vendor/ needs the SAME excludes as crates/ above. Without them this ships
-# vendor/guardian-db/target — 2.9GB of local build artifacts (gitignored, so
-# invisible in the repo) plus a 155MB tmp/ — to every node on every deploy,
-# against 4.3MB of actual source.
 - name: Sync vendor/ (patched crates, e.g. guardian-db)
   ansible.posix.synchronize:
     src: "{{ playbook_dir }}/../../vendor/"
@@ -54,15 +47,6 @@
   register: _build
   notify: restart hive-node
 
-# The cell agent runs as PID 1 INSIDE the guest, whose glibc comes from the OCI
-# base image (node:20-slim = Debian bookworm, glibc 2.36) and has nothing to do
-# with this build host's. A dynamically-linked agent therefore binds to a glibc
-# version the guest does not ship: witnessed 2026-10-09 on fc-orlando, where the
-# agent required GLIBC_2.39 against a 2.36 guest and every Firecracker cell died
-# with "version `GLIBC_2.39' not found" then "Kernel panic - not syncing:
-# Attempted to kill init!". The agent is baked into the rootfs as /sbin/init, so
-# it must carry its own libc. Only this crate is relinked -- hive-cloud stays
-# dynamically linked against the host glibc it was built for.
 - name: Relink the cell agent statically (it is the guest's PID 1)
   ansible.builtin.command:
     cmd: >-
@@ -127,10 +111,6 @@
     path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
   register: _cell_agent_fact_before
 
-# The publisher copies into /usr/local/bin first, SHA-verifies it, then gives the
-# candidate a hard-bounded exact protocol-fact probe. Only a complete schema-2
-# release fact is atomically switched into place. The previous binary remains at
-# hive-cell-agent.old.
 - name: Preflight and atomically install the exact built cell-agent
   ansible.builtin.command:
     argv:
@@ -200,10 +180,6 @@
       Cell-agent publication did not leave root-owned mode-0755 bytes plus a
       root-owned mode-0444 release fact matching the canonical build.
 
-# The browser_db lanes (CRR exchange + browser_db_rest) hard-refuse every
-# round when the cr-sqlite loadable extension is missing — and nothing in a
-# backend-only roll ships it (the binary's baked default path points into the
-# source tree, which only full hive_platform runs sync).
 - name: Build the cr-sqlite loadable extension (no-op when current)
   ansible.builtin.command:
     cmd: make

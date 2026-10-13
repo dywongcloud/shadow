@@ -338,7 +338,7 @@
       geo_error={{ hive_bn_health.json.geo_error | default('none') or 'none' }}
       caps=[mem {{ hive_browser_node_memory_max_mb }}MiB / cpu {{ hive_browser_node_cpu_quota_pct }}% / tasks {{ hive_browser_node_tasks_max }}]
 
-- name: "Gate: exactly ONE browser-node unit is running on this host"
+- name: "Gate: exactly the browser-node unit and its broker are running on this host"
   ansible.builtin.shell: |
     set -o pipefail
     systemctl list-units --type=service --state=running --no-legend 'hive-browser-node*.service' | wc -l
@@ -346,4 +346,4 @@
     executable: /bin/bash
   register: hive_bn_units
   changed_when: false
-  failed_when: (hive_bn_units.stdout | trim | int) != 2   # the browser + its broker, nothing else
+  failed_when: (hive_bn_units.stdout | trim | int) != 2
