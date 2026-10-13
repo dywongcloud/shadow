@@ -1128,8 +1128,6 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Tenant project inventory: a follower proxies the dashboard's summary
-        // read to the leader (the row writer) for read-your-writes.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/gitops/projects") => {
             let query = p.split_once('?').map(|(_, q)| q).unwrap_or("");
             let view = query

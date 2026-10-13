@@ -1104,10 +1104,8 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // own per-build log records internally (git.rs) -- no duplicate needed
     // here, only the DeployRecord-side gap above was missing.
     cloud.builds.load(snap.builds);
-    // Rows learn the outcome of builds that finished before the row carried
-    // one (first boot after the field arrived) and of builds `BuildStore::load`
-    // just finalized as interrupted.
-    for build in cloud.builds.list() {
+    let terminal_builds_to_replay_into_rows = cloud.builds.list();
+    for build in terminal_builds_to_replay_into_rows {
         let Some(incarnation) = build.project_incarnation else {
             continue;
         };

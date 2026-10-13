@@ -1,8 +1,6 @@
-//! The tenant's project inventory: every `ProjectSettings` row it owns, with
-//! deployment counts and the newest build outcome — deployed or not. A project
-//! whose first build failed has a row and no deployment; before this view the
-//! dashboard derived projects from deployments alone, so such a project was
-//! invisible while its name stayed reserved.
+//! The tenant's project inventory: every `ProjectSettings` row it owns, with deployment counts and
+//! the newest build outcome — a project whose first build failed has a row and no deployment, and
+//! is listed here instead of hiding behind the deployment list.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,9 +30,8 @@ struct DeploymentFacts {
     production_alias: Option<String>,
 }
 
-/// One pass over this node's gateway plus the gossiped peer view. Local
-/// records fall back to the project row's team when untagged; peer records
-/// are trusted only on their own tag — the same rules as `dep_list`.
+/// One pass over this node's gateway plus the gossiped peer view; local untagged records fall back
+/// to the row's team, peer records are trusted only on their own tag (as `dep_list`).
 fn deployment_facts(c: &Arc<CloudState>, tenant: &str) -> HashMap<String, DeploymentFacts> {
     let mut facts: HashMap<String, DeploymentFacts> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -90,9 +87,8 @@ fn repo_url_of(c: &Arc<CloudState>, project: &str, row: &ProjectSettings) -> Str
         .unwrap_or_default()
 }
 
-/// The newest outcome the tenant should see: the stored terminal stub, or the
-/// live build record for a newer admitted build (in flight, or finished here
-/// before the stub landed), or a lost build once `STALE_BUILD_MS` has passed.
+/// The newest outcome the tenant should see: the stored terminal stub, the live record of a newer
+/// admitted build, or a lost build once `STALE_BUILD_MS` has passed.
 fn build_state(c: &Arc<CloudState>, row: &ProjectSettings) -> (Option<LastBuild>, Option<Value>) {
     let stored = row.last_build.clone();
     let pointer = row.last_build_id.as_str();

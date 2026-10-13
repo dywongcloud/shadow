@@ -2990,9 +2990,6 @@ pub(crate) async fn start_named_deploy(
             .find_key_ci(requested.trim())
             .map(|k| norm(&c.projects.team_of(&k)) == t)
             .unwrap_or(false);
-    // An own project that never deployed (its first build failed) and whose
-    // last build pulled this same repository is being retried, not created:
-    // reuse its row, as `redeploy: true` would, instead of answering 409.
     let reuse = if req.no_fanout || requested.trim().is_empty() || redeploy_existing {
         None
     } else {
@@ -3123,9 +3120,6 @@ pub(crate) async fn start_named_deploy(
                     ));
                 }
             }
-            // Every failed first build leaves a row behind; a tenant that keeps
-            // minting new names instead of retrying is bounded here (the
-            // retry path reuses the row and never counts).
             let empty = crate::project_inventory::empty_project_count(c, &t);
             let max_empty = crate::project_inventory::max_empty_projects();
             if empty >= max_empty {
@@ -8251,10 +8245,6 @@ async fn project_redeploy(
     // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
     // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
     // zip-uploaded or image-based project (the reported bug).
-    // A project whose builds never produced a deployment has no deployment to
-    // source from, but its last build names the repository: a retry rebuilds
-    // that, on the production lane. Only here — the webhook and the git poll
-    // keep ignoring never-deployed projects.
     let last_build_source = || {
         let row = c.projects.get_if_set(&project)?;
         let build = row.last_build?;
@@ -8423,10 +8413,8 @@ async fn project_redeploy(
 /// project on 4 of 8 fleet nodes.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct GitopsProjectsQuery {
-    /// `summary`: the dashboard's inventory view (`project_inventory::summary`)
-    /// — every row the tenant owns with deployment counts and the newest build
-    /// outcome, served by the leader so a just-finished build is visible on
-    /// the next poll from any node. Absent: the GitOps artifact rows below.
+    /// `summary`: the dashboard's inventory view (`project_inventory::summary`), served by the leader so
+    /// a just-finished build is visible from any node; absent: the GitOps artifact rows below.
     #[serde(default)]
     pub view: Option<String>,
     /// Set by a proxying node: answer from this node's own view, never re-proxy.

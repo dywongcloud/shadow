@@ -415,9 +415,8 @@ pub struct ProjectSettings {
     /// dashboard surface the gap and offer a retry.
     #[serde(default)]
     pub git_ci: Option<GitCiStatus>,
-    /// Terminal outcome of the newest build the coordinator finished for this
-    /// incarnation — the only build state stored here; an in-flight build is
-    /// derived from `last_build_id` against the live `BuildStore`.
+    /// Terminal outcome of the newest build the coordinator finished for this incarnation; an
+    /// in-flight build is derived from `last_build_id` against the live `BuildStore`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_build: Option<LastBuild>,
     /// Newest build admitted for this incarnation (empty = none).
@@ -425,9 +424,8 @@ pub struct ProjectSettings {
     pub last_build_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub last_build_started_ms: u64,
-    /// Grow-only: when this incarnation's first deployment registered. `0`
-    /// means the project has never deployed, which is what makes its name
-    /// reusable by its own tenant.
+    /// Grow-only: when this incarnation's first deployment registered; `0` = never deployed, which is
+    /// what makes the name reusable by its own tenant.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub first_deployed_ms: u64,
 }
@@ -2098,9 +2096,8 @@ impl ProjectStore {
         Ok(())
     }
 
-    /// Compare-and-set ownership: an untagged row is claimed, the owner's own
-    /// claim is a no-op, another tenant's row is refused. Two tenants importing
-    /// one new name concurrently can no longer both "win" the row.
+    /// Compare-and-set ownership: an untagged row is claimed, the owner's own claim is a no-op,
+    /// another tenant's row is refused — two tenants importing one new name can no longer both win.
     pub fn claim_team_exact(
         &self,
         project: &str,

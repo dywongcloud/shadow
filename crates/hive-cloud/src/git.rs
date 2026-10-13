@@ -503,9 +503,8 @@ struct BuildCompletionGuard {
     slot: Arc<BuildCancelSlot>,
 }
 
-/// Every exit of a build task — return, `?`, cancel abort, panic — passes
-/// here, so this is where a build record is guaranteed a terminal state and
-/// where the project row learns that outcome.
+/// Every exit of a build task (return, `?`, cancel abort, panic) passes here, so a build record is
+/// guaranteed a terminal state and the project row learns the outcome.
 impl Drop for BuildCompletionGuard {
     fn drop(&mut self) {
         let cancelled = self
