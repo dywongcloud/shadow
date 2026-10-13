@@ -1,7 +1,4 @@
 ---
-# These assertions are deliberately controller/input-only. In particular, an
-# omitted builder digest or runsc checksum fails before this role mutates the
-# managed host.
 - name: Require immutable BuildExecutor inputs
   ansible.builtin.assert:
     that:

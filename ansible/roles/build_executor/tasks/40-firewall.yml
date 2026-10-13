@@ -121,8 +121,6 @@
     enabled: true
     daemon_reload: true
 
-# Reapply even when no file changed: an out-of-band nft flush must not leave a
-# still-published capability paired with a missing policy.
 - name: Atomically converge the live executor nftables table
   ansible.builtin.command:
     argv:
