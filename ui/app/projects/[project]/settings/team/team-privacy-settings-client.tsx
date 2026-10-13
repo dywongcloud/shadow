@@ -40,7 +40,6 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
     }
   }
 
-  // Enterprise deployment protection (password / scope).
   const [protMode, setProtMode] = useState<"off" | "standard" | "password">("off");
   const [protScope, setProtScope] = useState<"preview" | "all" | "production">("preview");
   const [protPassword, setProtPassword] = useState("");
@@ -117,7 +116,6 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
         </div>
       </SettingCard>
 
-      {/* Enterprise deployment protection — password / scope ("only production"). */}
       <SettingCard
         title="Deployment Protection"
         desc="Require authentication or a shared password to view deployments. Choose which deployments are protected — previews, all, or only production."
@@ -170,7 +168,6 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
         {protErr ? <p className="mt-3 text-sm text-red-500">{protErr}</p> : null}
       </SettingCard>
 
-      {/* Plan & Enterprise capabilities for the owning team. */}
       <SettingCard
         title="Plan & Enterprise"
         desc="Your team's tier. Enterprise unlocks automatic region fail-over, 1-hour function runtimes (3600s), and optional Org SSO."

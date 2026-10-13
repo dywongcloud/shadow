@@ -9,6 +9,7 @@ import { OPEN_LIMIT, OPEN_PATH, RESOLVED_PAGE, resolvedPath } from "@/lib/incide
 import { OpsFetchError } from "@/components/ops-fetch-error";
 
 const STATUSES: IncidentStatus[] = ["investigating", "identified", "monitoring", "resolved"];
+const TIMELINE_PREVIEW_ENTRIES = 5;
 
 export function IncidentsClient({
   initialOpen,
@@ -23,8 +24,6 @@ export function IncidentsClient({
 }) {
   const { data: open, error: openError, refresh } = useOpsPoll<Incident[]>(OPEN_PATH, 5000, true, initialOpen);
   const openFailure = openError ?? initialOpenError ?? null;
-  // The resolved list is paged by hand (loadMore), never polled, so the server
-  // prefetch's failure is the only error it can ever report.
   const resolvedFailure = initialResolvedError ?? null;
   const [resolved, setResolved] = useState<Incident[]>(initialResolved ?? []);
   const [resolvedDone, setResolvedDone] = useState((initialResolved?.length ?? 0) < RESOLVED_PAGE);
@@ -43,8 +42,6 @@ export function IncidentsClient({
   }
 
   async function onChanged() {
-    // A posted update may have resolved an open incident: refresh both lists
-    // from the first page so it moves columns instead of vanishing.
     refresh();
     const page = await opsGet<Incident[]>(resolvedPath(0), { fresh: true }).catch(() => null);
     if (page) {
@@ -118,11 +115,9 @@ function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }
   const [status, setStatus] = useState<IncidentStatus>(inc.status);
   const [msg, setMsg] = useState("");
   const automated = inc.origin === "automated";
-  // The timeline can be long on a condition that flapped for weeks; show the
-  // latest entries and let the operator expand the rest.
   const [showAll, setShowAll] = useState(false);
   const timeline = [...inc.updates].reverse();
-  const shown = showAll ? timeline : timeline.slice(0, 5);
+  const shown = showAll ? timeline : timeline.slice(0, TIMELINE_PREVIEW_ENTRIES);
 
   async function post() {
     if (!msg.trim()) return;

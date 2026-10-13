@@ -128,7 +128,6 @@ export default function SolutionsPage() {
         </Link>
       </MarketingHero>
 
-      {/* By audience */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">Solutions for every team</h2>
@@ -158,7 +157,6 @@ export default function SolutionsPage() {
         </div>
       </MarketingSection>
 
-      {/* By use case */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">By use case</h2>
@@ -180,7 +178,6 @@ export default function SolutionsPage() {
         </div>
       </MarketingSection>
 
-      {/* Closing CTA */}
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
           <h2 className="text-3xl font-bold tracking-tight text-white">

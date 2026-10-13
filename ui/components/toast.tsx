@@ -4,12 +4,9 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
-// Lightweight global toast system. Mount <Toaster/> once (in the root layout),
-// then fire a toast from anywhere with `toast("message")`. Decoupled via a window
-// CustomEvent so callers don't need context/providers and toasts survive client
-// navigation (the Toaster lives in the persistent layout).
-
 export type ToastTone = "blue" | "default";
+
+const DEFAULT_TOAST_MS = 6000;
 
 interface ToastDetail {
   message: string;
@@ -18,13 +15,14 @@ interface ToastDetail {
   duration: number;
 }
 
-/** Fire a toast. Defaults to the blue "info" tone shown bottom-right. */
+/** Fire a toast from anywhere: it dispatches the `hive-toast` window event, so callers need no context or provider and toasts survive client navigation (mount `<Toaster/>` once in
+ *  the persistent root layout). Defaults to the blue "info" tone shown bottom-right. */
 export function toast(message: string, opts: { tone?: ToastTone; duration?: number } = {}) {
   if (typeof window === "undefined") return;
   const detail: ToastDetail = {
     message,
     tone: opts.tone ?? "blue",
-    duration: opts.duration ?? 6000,
+    duration: opts.duration ?? DEFAULT_TOAST_MS,
   };
   window.dispatchEvent(new CustomEvent("hive-toast", { detail }));
 }

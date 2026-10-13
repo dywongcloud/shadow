@@ -1,7 +1,5 @@
 import { Skeleton, SkeletonPageHeader, SkeletonTable } from "@/components/ui";
 
-// Overrides the generic root loading.tsx — shaped like the real page:
-// PageHeader (+ "New Deployment" action) followed by the deployments table.
 export default function Loading() {
   return (
     <div>

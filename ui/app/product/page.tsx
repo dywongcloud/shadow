@@ -122,7 +122,6 @@ export default function ProductPage() {
         </Link>
       </MarketingHero>
 
-      {/* Capabilities */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight text-white">
@@ -147,7 +146,6 @@ export default function ProductPage() {
         </div>
       </MarketingSection>
 
-      {/* How it works */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight text-white">
@@ -176,7 +174,6 @@ export default function ProductPage() {
         </div>
       </MarketingSection>
 
-      {/* Closing CTA */}
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
           <div className="mx-auto max-w-2xl py-8">

@@ -33,11 +33,8 @@ const config: Config = {
         },
       },
       fontFamily: {
-        // ABC Diatype is the platform typeface; Geist is the graceful fallback
-        // until the licensed woff2 files are added to /public/fonts.
         sans: ["ABC Diatype", "var(--font-geist-sans)", "ui-sans-serif", "system-ui", "sans-serif"],
         mono: ["ABC Diatype Mono", "var(--font-geist-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
-        // Display typeface for the Shadow brand wordmark + landing headlines.
         display: ["var(--font-display)", "var(--font-geist-sans)", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       boxShadow: {
@@ -48,7 +45,6 @@ const config: Config = {
   },
   safelist: [
     { pattern: /(bg|text|border|ring|fill|stroke)-(tremor)-.*/ },
-    // Tremor chart colors are applied at runtime, so keep these utilities.
     {
       pattern:
         /(bg|fill|stroke|text)-(blue|amber|emerald|rose|purple|cyan|slate|green|red)-(400|500|600)/,

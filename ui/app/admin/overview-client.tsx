@@ -10,11 +10,8 @@ import { useOpsPoll, type AdminOverview, type Metrics, type Incident } from "@/l
 import { OPEN_INCIDENTS_LIMIT, OPEN_INCIDENTS_PATH } from "@/lib/incident-paths";
 import { OpsFetchError } from "@/components/ops-fetch-error";
 
-// Tremor's AreaChart pulls in a sizeable charting dependency -- lazy-load it so
-// pages that don't render a chart (or before this one streams in) don't pay for
-// it in the initial bundle. No SSR needed: it only renders once ov/metrics data
-// (client- or server-seeded) exists, so there's nothing useful to server-render.
 const AreaChart = dynamic(() => import("@tremor/react").then((m) => m.AreaChart), { ssr: false });
+const OVERVIEW_POLL_MS = 10_000;
 
 export function AdminOverviewClient({
   initialOverview,
@@ -27,11 +24,9 @@ export function AdminOverviewClient({
   initialIncidents: Incident[] | null;
   initialError?: string | null;
 }) {
-  // Poll cadences match the backend's 15 s response cache for these fan-outs
-  // (POLLED_RESPONSE_CACHE_TTL): faster polling only re-reads the same entry.
-  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
-  const { data: metrics, error: metricsError } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 10000, true, initialMetrics);
-  const { data: incidents, error: incidentsError } = useOpsPoll<Incident[]>(OPEN_INCIDENTS_PATH, 10000, true, initialIncidents);
+  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", OVERVIEW_POLL_MS, true, initialOverview);
+  const { data: metrics, error: metricsError } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", OVERVIEW_POLL_MS, true, initialMetrics);
+  const { data: incidents, error: incidentsError } = useOpsPoll<Incident[]>(OPEN_INCIDENTS_PATH, OVERVIEW_POLL_MS, true, initialIncidents);
   const failure = ovError ?? metricsError ?? incidentsError ?? initialError ?? null;
 
   const series = (metrics?.series ?? []).map((b) => ({

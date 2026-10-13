@@ -7,14 +7,13 @@ import { Button, SettingCard, Switch } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type CronJob, type ProjectSettings } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
-/** Best-effort English label for the common cron shapes; falls back to the
- * raw expression (never lies about a schedule it can't confidently describe). */
+/** Best-effort English label for the common cron shapes; falls back to the raw expression (never lies about a schedule it can't confidently describe). A 6-field expression is the
+ *  platform's native form with a leading seconds field, which is dropped before labelling. */
 function describeSchedule(expr: string): string | null {
   const f = expr.trim().split(/\s+/);
   if (f.length !== 5 && f.length !== 6) return null;
-  // Normalize to 5 fields (min hour dom month dow) — drop a leading seconds
-  // field (this platform's own native format) when present and "0".
-  const [min, hour, dom, month, dow] = f.length === 6 ? f.slice(1) : f;
+  const withoutSeconds = f.length === 6 ? f.slice(1) : f;
+  const [min, hour, dom, month, dow] = withoutSeconds;
   const every = (field: string) => /^\*\/(\d+)$/.exec(field)?.[1];
   if (dom === "*" && month === "*" && dow === "*") {
     const everyMin = every(min);

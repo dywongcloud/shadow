@@ -25,10 +25,6 @@ export const metadata: Metadata = {
 };
 
 
-/* The API Reference overview ("Using the REST API") — intro + API basics +
- * Authentication + team scoping + rate limits + errors + the Endpoints grid, with
- * an "On this page" table of contents on the right (Vercel-style). */
-
 const TOC = [
   { id: "api-basics", label: "API basics" },
   { id: "authentication", label: "Authentication" },
@@ -158,7 +154,6 @@ export default function ApiReferencePage() {
         </div>
       </article>
 
-      {/* On this page */}
       <aside className="sticky top-20 hidden h-fit w-52 shrink-0 xl:block">
         <div className="mb-3 text-xs font-medium text-muted">On this page</div>
         <ul className="space-y-2 border-l border-border">

@@ -1,8 +1,7 @@
 import * as React from "react";
 import Image from "next/image";
 
-// Providers we have real logo PNGs for (in /public/providers).
-const PNG = new Set([
+const PROVIDERS_WITH_PNG_LOGO = new Set([
   "upstash", "redis", "aws", "supabase", "nile", "motherduck",
   "convex", "drizzle", "turso", "prisma", "postgres",
 ]);
@@ -21,7 +20,7 @@ function Tile({ color, name }: { color: string; name?: string }) {
 /** Brand icon for a marketplace storage provider — real logo PNG when we have
  *  one, otherwise a clean brand-colored lettermark. */
 export function BrandIcon({ id, name, color }: { id: string; name: string; color: string }) {
-  if (PNG.has(id)) {
+  if (PROVIDERS_WITH_PNG_LOGO.has(id)) {
     return (
       <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white/5">
         <Image src={`/providers/${id}.png`} alt={name} width={28} height={28} className="h-7 w-7 object-contain" />

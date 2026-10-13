@@ -11,7 +11,6 @@ import {
   findEndpoint,
 } from "@/lib/api-catalog";
 
-// Statically generate a page for every endpoint in the catalog.
 export function generateStaticParams() {
   return API_CATEGORIES.flatMap((c) => c.endpoints.map((e) => ({ category: c.slug, method: e.slug })));
 }
@@ -54,7 +53,6 @@ export default async function MethodPage(props: { params: Promise<{ category: st
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8 lg:flex-row lg:gap-10">
-      {/* Main content */}
       <article className="min-w-0 flex-1 pb-24">
         <div className="mb-6 flex flex-wrap items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
@@ -107,7 +105,6 @@ export default async function MethodPage(props: { params: Promise<{ category: st
         ) : null}
       </article>
 
-      {/* Right column: request examples + response */}
       <aside className="w-full shrink-0 space-y-4 lg:sticky lg:top-20 lg:h-fit lg:w-[420px]">
         <CodeBlock
           tabs={[

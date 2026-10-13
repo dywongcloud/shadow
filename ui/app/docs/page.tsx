@@ -92,7 +92,6 @@ const CARDS = [
 export default function DocsIndex() {
   return (
     <div className="mx-auto max-w-5xl">
-      {/* Hero */}
       <div className="grid gap-10 pb-8 lg:grid-cols-[1.05fr_1fr] lg:items-center">
         <div>
           <h1 className="text-5xl font-bold leading-[1.05] tracking-tight sm:text-6xl">
@@ -115,7 +114,6 @@ export default function DocsIndex() {
         <CodeBlock tabs={HERO_TABS} />
       </div>
 
-      {/* Intro line */}
       <p className="border-t border-border pt-8 text-[15px] leading-relaxed text-secondary">
         Connect your{" "}
         <Link href="/docs/getting-started#gitops" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">Git repository</Link>{" "}
@@ -124,7 +122,6 @@ export default function DocsIndex() {
         for testing changes before production.
       </p>
 
-      {/* Cards */}
       <h2 className="mb-5 mt-12 text-2xl font-semibold tracking-tight">Build with shadw</h2>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {CARDS.map((c) => (

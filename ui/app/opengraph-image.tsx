@@ -1,12 +1,10 @@
 import { ImageResponse } from "next/og";
 
-// Default social / AI-search preview card (1200×630) for every page that doesn't
-// declare its own. Self-contained (system font, no external fetch) so it builds
-// under the self-hosted node runtime.
 export const alt = "shadw — a peer-to-peer cloud";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
+/** Default social / AI-search preview card (1200×630) for every page that declares none: self-contained (system font, no external fetch) so it builds under the self-hosted node runtime. */
 export default function OpengraphImage() {
   return new ImageResponse(
     (

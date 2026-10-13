@@ -36,8 +36,6 @@ export function SecureComputeSettings({ paramsPromise }: { paramsPromise: Promis
                   <Td className="font-mono text-xs text-secondary">{l.local_addr}</Td>
                   <Td className="font-mono text-xs">{l.env_var || <span className="text-muted">—</span>}</Td>
                   <Td><Badge tone={l.status === "active" ? "green" : "default"}>{l.status}</Badge></Td>
-                  {/* Date.now() read directly during render is flagged as impure, but this list
-                      already re-renders every 4s from usePoll — approximately fresh is intended. */}
                   {/* eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate "expires in" display; already re-renders every 4s via usePoll */}
                   <Td className="text-secondary">{l.status === "active" ? `in ${Math.max(0, Math.round((l.expires_ms - Date.now()) / 60000))}m` : "—"}</Td>
                   <Td><button onClick={() => remove(l.id)} className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button></Td>

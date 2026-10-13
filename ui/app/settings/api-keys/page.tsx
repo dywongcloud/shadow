@@ -20,7 +20,7 @@ export default function ApiKeysPage() {
     setBusy(true);
     try {
       const key = await apiSend<ApiKey>("POST", "/v1/apikeys", { name, role });
-      setCreated(key); // shows the token once
+      setCreated(key);
       setName("");
       refresh();
     } catch (e) { alert(String(e)); } finally { setBusy(false); }
@@ -48,7 +48,6 @@ export default function ApiKeysPage() {
         <code className="mx-1 rounded bg-subtle px-1 font-mono text-xs">Authorization: Bearer hive_…</code>.
       </p>
 
-      {/* one-time token reveal */}
       {created?.token && (
         <Card className="mb-6 border-amber-500/40 bg-amber-500/[0.04]">
           <div className="mb-2 flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-400">
@@ -62,7 +61,6 @@ export default function ApiKeysPage() {
         </Card>
       )}
 
-      {/* create */}
       <Card className="mb-6">
         <div className="mb-3 text-sm font-medium">Create API Key</div>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -82,7 +80,6 @@ export default function ApiKeysPage() {
         </div>
       </Card>
 
-      {/* list */}
       {keys?.length ? (
         <div className="divide-y divide-border rounded-xl border border-border bg-card">
           {keys.map((k) => (

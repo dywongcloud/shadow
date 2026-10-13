@@ -1,8 +1,5 @@
 import { Skeleton, SkeletonPageHeader } from "@/components/ui";
 
-// Streaming shell for /integrations (the only audited page that lacked one):
-// PageHeader + the marketplace card grid, so navigation paints instantly while
-// the client bundle hydrates and the toolkit catalog loads.
 export default function Loading() {
   return (
     <div>

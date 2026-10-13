@@ -7,7 +7,6 @@ import { Badge, Button, Card } from "@/components/ui";
 import { apiSend, usePoll, type Webhook, type Delivery, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
-// Grouped event catalog (mirrors Vercel's Add Webhooks picker).
 const GROUPS: { title: string; events: { label: string; slug: string }[] }[] = [
   { title: "Deployment Events", events: [
     { label: "Deployment Created", slug: "deployment.created" },
@@ -97,7 +96,6 @@ export default function WebhooksPage() {
       <h1 className="mb-6 text-2xl font-semibold tracking-tight">Add Webhooks</h1>
 
       <Card className="p-6">
-        {/* Projects */}
         <div className="mb-2 text-sm font-semibold">Projects</div>
         <p className="mb-3 text-sm text-secondary">Choose which projects should send events to the specified endpoint.</p>
         <div className="mb-6 flex gap-6 text-sm">
@@ -119,7 +117,6 @@ export default function WebhooksPage() {
           </div>
         )}
 
-        {/* Events */}
         <div className="mb-1 text-sm font-semibold">Events</div>
         <p className="mb-4 text-sm text-secondary">Select the events the webhook will listen to. At least one must be selected.</p>
         <div className="grid grid-cols-1 gap-x-8 gap-y-6 rounded-lg border border-border p-5 sm:grid-cols-2 lg:grid-cols-3">
@@ -141,7 +138,6 @@ export default function WebhooksPage() {
           ))}
         </div>
 
-        {/* Endpoint */}
         <div className="mb-1 mt-6 text-sm font-semibold">Endpoint</div>
         <p className="mb-2 text-sm text-secondary">Webhook events will be sent as a <code className="rounded bg-subtle px-1 font-mono text-xs">POST</code> request to this URL.</p>
         <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://my-app.com/webhooks"
@@ -153,7 +149,6 @@ export default function WebhooksPage() {
         </div>
       </Card>
 
-      {/* Existing webhooks */}
       {!!hooks?.length && (
         <div className="mt-8 space-y-3">
           <h2 className="text-lg font-semibold">Active webhooks</h2>
@@ -174,7 +169,6 @@ export default function WebhooksPage() {
         </div>
       )}
 
-      {/* Deliveries */}
       {!!deliveries?.length && (
         <div className="mt-8 space-y-2">
           <h2 className="text-lg font-semibold">Recent deliveries</h2>

@@ -24,9 +24,6 @@ export default function TeamsPage() {
   return clerkOn ? <ClerkTeams /> : <LocalTeams />;
 }
 
-/* ------------------------------------------------------------------ */
-/* Clerk-native team & member management (invites, roles, pending…).  */
-/* ------------------------------------------------------------------ */
 function ClerkTeams() {
   const { organization } = useOrganization();
   const appearance = useClerkAppearance();
@@ -68,9 +65,6 @@ function ClerkTeams() {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Local fallback (no Clerk key) — backend TeamStore.                 */
-/* ------------------------------------------------------------------ */
 function LocalTeams() {
   const { data: teams, refresh } = usePoll<Team[]>("/v1/teams", 4000);
   const [creating, setCreating] = useState(false);

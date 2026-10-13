@@ -2,11 +2,7 @@ import type { MetadataRoute } from "next";
 
 const BASE = (process.env.NEXT_PUBLIC_SITE_URL || "https://shadw.cloud").replace(/\/$/, "");
 
-/**
- * sitemap.xml (served at /sitemap.xml) — the public, crawlable surface for search
- * + AI discovery. Only universal-content routes are listed (never per-user
- * dashboard pages).
- */
+/** sitemap.xml (served at /sitemap.xml): the public, crawlable surface for search and AI discovery; only universal-content routes are listed, never per-user dashboard pages. */
 export default function sitemap(): MetadataRoute.Sitemap {
   const now = new Date();
   const routes: { path: string; freq: MetadataRoute.Sitemap[number]["changeFrequency"]; priority: number }[] = [

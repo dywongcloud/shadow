@@ -9,7 +9,6 @@ export function RoutingSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const project = decodeURIComponent(params.project);
   const [cfg, setCfg] = useState<RoutingConfig | null>(null);
 
-  // New-rule drafts.
   const [rdSource, setRdSource] = useState("");
   const [rdDest, setRdDest] = useState("");
   const [rdStatus, setRdStatus] = useState(308);
@@ -21,8 +20,6 @@ export function RoutingSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `project` isn't read by the request itself, but reloading on project switch is intended (server scopes /v1/routing by current session/team)
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal await resolves, syncing external (server) config into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
   }, [load]);

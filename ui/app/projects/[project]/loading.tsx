@@ -1,9 +1,5 @@
 import { Skeleton, SkeletonCard } from "@/components/ui";
 
-// Overrides the generic root loading.tsx for a project's overview tab (and,
-// as a reasonable approximation, its settings/logs sub-routes): the header
-// row (name + domain + action buttons), then the Production Deployment card
-// and the 3-up stat row below it.
 export default function Loading() {
   return (
     <div>

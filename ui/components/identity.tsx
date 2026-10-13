@@ -28,7 +28,6 @@ function derive(user: ReturnType<typeof useUser>["user"]): Identity {
   };
 }
 
-// Calls Clerk's useUser — only rendered when Clerk is enabled (see WithIdentity).
 function ClerkIdentity({ children }: { children: (id: Identity) => React.ReactNode }) {
   const { user } = useUser();
   return <>{children(derive(user))}</>;
@@ -36,11 +35,7 @@ function ClerkIdentity({ children }: { children: (id: Identity) => React.ReactNo
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
-/**
- * Provides the signed-in user's identity (name/email/avatar) to its children via
- * a render prop. Uses Clerk when enabled, otherwise a local default — so the UI
- * reflects the actual logged-in account instead of a hard-coded name.
- */
+/** Provides the signed-in user's identity (name/email/avatar) to its children through a render prop: Clerk when enabled, otherwise a local default. */
 export function WithIdentity({ children }: { children: (id: Identity) => React.ReactNode }) {
   if (!clerkOn) return <>{children(LOCAL_IDENTITY)}</>;
   return <ClerkIdentity>{children}</ClerkIdentity>;

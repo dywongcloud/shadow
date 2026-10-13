@@ -37,9 +37,8 @@ export function DeploymentCanvas({ project, prod }: { project: string; prod: Dep
   const procIcon = isContainer ? <Container className="h-4 w-4" /> : isStatic ? <FileCode className="h-4 w-4" /> : <Globe className="h-4 w-4" />;
   const procLabel = isContainer ? "Container" : isStatic ? "Static Site" : "Web Process";
 
-  // Instances for this deployment's functions.
-  const myFns = (fnstats ?? []).filter((f) => prod && f.key.startsWith(prod.id));
-  const instances = myFns.reduce((a, f) => a + (f.instances || 0), 0) || (isStatic ? 0 : 1);
+  const deploymentFns = (fnstats ?? []).filter((f) => prod && f.key.startsWith(prod.id));
+  const instances = deploymentFns.reduce((a, f) => a + (f.instances || 0), 0) || (isStatic ? 0 : 1);
   const memory = settings?.functions?.memory_mib ?? 512;
 
   const conns = [
@@ -60,7 +59,6 @@ export function DeploymentCanvas({ project, prod }: { project: string; prod: Dep
       }}
     >
       <div className="flex flex-col items-stretch gap-6 lg:flex-row lg:items-center lg:justify-between">
-        {/* Networking / Ingress */}
         <div className="w-full lg:w-[260px]">
           <div className="mb-2 flex items-center gap-2 text-sm font-medium"><Network className="h-4 w-4" /> Networking</div>
           <div className="rounded-xl border border-border bg-card p-3 shadow-card">
@@ -81,7 +79,6 @@ export function DeploymentCanvas({ project, prod }: { project: string; prod: Dep
 
         <Connector label={isStatic ? "https" : "8787"} active />
 
-        {/* Service / process */}
         <div className="w-full lg:flex-1 lg:max-w-[380px]">
           <div className="rounded-xl border border-border bg-card p-3 shadow-card">
             <div className="mb-2 flex items-center justify-between text-sm font-semibold">
@@ -111,7 +108,6 @@ export function DeploymentCanvas({ project, prod }: { project: string; prod: Dep
 
         <Connector label="" active={conns.length > 0} dashed />
 
-        {/* Connected services */}
         <div className="w-full lg:w-[260px]">
           <div className="rounded-xl border border-border bg-card p-3 shadow-card">
             <div className="mb-2 flex items-center gap-2 text-sm font-medium"><Boxes className="h-4 w-4" /> Connected services</div>

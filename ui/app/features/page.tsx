@@ -145,7 +145,6 @@ export default function FeaturesPage() {
         </Link>
       </MarketingHero>
 
-      {/* 1. Feature grid */}
       <MarketingSection className="py-16">
         <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map(({ icon: Icon, title, desc }) => (
@@ -160,7 +159,6 @@ export default function FeaturesPage() {
         </div>
       </MarketingSection>
 
-      {/* 2. Deploy in seconds */}
       <MarketingSection className="py-16">
         <div className="grid items-center gap-10 lg:grid-cols-2">
           <div>
@@ -202,7 +200,6 @@ export default function FeaturesPage() {
         </div>
       </MarketingSection>
 
-      {/* 3. Closing CTA */}
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
           <h2 className="text-3xl font-bold tracking-tight text-white">Ship on your own cloud today</h2>

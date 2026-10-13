@@ -3,9 +3,6 @@ import type { Metadata } from "next";
 import { ExternalLink } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-// Perf: prerender this public page (see root layout note). This page is linked
-// from the edge's own 404 screen, so it must render for signed-out visitors and
-// must not depend on any request-time data.
 const DESC =
   "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, unattached custom domain, or a region that does not host the deployment.";
 

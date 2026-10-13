@@ -13,9 +13,7 @@ const FEATURES = [
   "Multi-tenant teams with strict isolation",
 ];
 
-/** Polished split-screen auth layout shared by sign-in / sign-up. Left: brand
- *  + value props on a subtle gradient. Right: the Clerk widget. Looks good in
- *  both light and dark. */
+/** Split-screen auth layout shared by sign-in and sign-up: brand and value props on a subtle gradient on the left, the Clerk widget on the right; works in light and dark. */
 export function AuthShell({
   render,
   footer,
@@ -31,7 +29,6 @@ export function AuthShell({
 
   return (
     <div className="fixed inset-0 z-50 grid grid-cols-1 bg-bg lg:grid-cols-2">
-      {/* Brand / marketing panel */}
       <div className="relative hidden flex-col justify-between overflow-hidden border-r border-border p-12 lg:flex">
         <div
           className="pointer-events-none absolute inset-0 opacity-70"
@@ -64,7 +61,6 @@ export function AuthShell({
         <div className="relative text-xs text-muted">© {2026} shadw · The peer-to-peer cloud.</div>
       </div>
 
-      {/* Auth panel */}
       <div className="relative flex flex-col items-center justify-center px-4 py-10">
         <div className="absolute right-4 top-4"><ThemeToggle /></div>
         <div className="mb-6 flex items-center lg:hidden">

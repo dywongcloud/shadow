@@ -1,9 +1,5 @@
-// AUTO-GENERATED committed reference data: ISO 3166-1 alpha-2 -> country
-// name + geographic centroid (lat/lon). Source: Google canonical countries
-// dataset (public domain) + a few manual entries for codes iptv-org uses that
-// the dataset omits (e.g. XK Kosovo, INT international). Used to plot a TV
-// marker per country on the world map. Flags are derived from the code, not
-// stored. Regenerate: parse the CSV the same way if the country set changes.
+// Generated reference data: ISO 3166-1 alpha-2 -> country name + geographic centroid, from Google's canonical countries dataset (public domain) plus manual entries for codes
+// iptv-org uses that it omits (XK Kosovo, INT international); flags are derived from the code, not stored.
 
 export interface CountryGeo { name: string; lat: number; lon: number }
 

@@ -116,7 +116,6 @@ export default function BlogPage() {
       />
 
       <MarketingSection className="py-16">
-        {/* Featured post */}
         <GlowCard>
           <div className="flex flex-col gap-4">
             <span className="w-fit rounded-full bg-white/10 px-3 py-1 text-xs text-zinc-200">
@@ -137,7 +136,6 @@ export default function BlogPage() {
           </div>
         </GlowCard>
 
-        {/* Post grid */}
         <div className="mt-12">
           <h3 className="text-3xl font-bold tracking-tight text-white">Latest posts</h3>
           <div className="mt-8 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
@@ -160,7 +158,6 @@ export default function BlogPage() {
           </div>
         </div>
 
-        {/* Newsletter sign-up */}
         <div className="mt-12">
           <GlowCard className="text-center">
             <div className="mx-auto flex max-w-xl flex-col items-center gap-4">

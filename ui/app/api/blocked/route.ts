@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
-// Target of the next.config rewrite that blocks public access to the node's ZK
-// preview endpoints. Those are server-to-server only (membership-verified by
-// /api/preview-unlock + /api/zk-enroll), so any browser hit here is rejected.
+/** Target of the next.config rewrite that blocks public access to the node's ZK preview endpoints (server-to-server only: `/api/preview-unlock` and `/api/zk-enroll` verify
+ *  membership), so every browser hit is rejected. */
 function blocked() {
   return NextResponse.json({ error: "not available" }, { status: 403 });
 }
