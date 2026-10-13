@@ -14,9 +14,10 @@ memories whose durable content was absorbed.
   Attribution is dywongcloud ONLY — no `Co-Authored-By`/trailers.
 - **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`,
   mocking libraries); verify with `cargo test --workspace` plus live execution.
-  Fix a failure CLASS once at the shared primitive, never per call site. `cargo check` skips `cfg(target_os =
-  "linux")` code AND test targets: run `cargo test --workspace --no-run`. A
-  dependency change ships its `Cargo.lock` diff in the same pass (`--locked`).
+  Fix a failure CLASS once at the shared primitive, never per call site.
+  `cargo check` skips `cfg(target_os = "linux")` code AND test targets: run
+  `cargo test --workspace --no-run`. A dependency change ships its `Cargo.lock`
+  diff in the same pass (`--locked`).
 - `scripts/build-fleet-binary.sh [2.38|2.39] [--clean-jemalloc]` builds fleet
   binaries (verifies `.symtab`); a link failing on undefined
   `sdallocx`/`mallocx` is a 96-byte stub `libjemalloc.a` from a killed build
@@ -24,16 +25,16 @@ memories whose durable content was absorbed.
   `ansible-playbook ansible/playbooks/parallel-deploy.yml --tags backend`; prove
   the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log
   text>'`. `scripts/deploy-ui-fleet.sh` rolls the dashboard; it awk-matches
-  `ansible_host=` INCLUDING comments — delete dead hosts from `hosts.ini`,
-  never comment them.
+  `ansible_host=` INCLUDING comments — delete dead hosts, never comment them.
 
 ## Fleet, hosts, access
 
 - Live roster = non-`hive_retired` lines of `ansible/inventory/hosts.ini`:
   fc-orlando 209.23.0.183, va, va3, sj (chain head), sj7, phx; va2/fr/sp/bkk/hk
-  were DELETED (still named in the `[glibc*]`/`[browser_nodes]` groups → undefined to
-  ansible). Every live host is glibc 2.39 (`[glibc238]` has no live member,
-  `scripts/audit-runtime-versions.sh`); membership is by OS image, never region. `[platform:vars]` templates `HIVE_CP_OWNER_CHAIN=fc-sanjose,
+  were DELETED but still named in `[glibc*]`/`[browser_nodes]` (undefined to
+  ansible). Every live host is glibc 2.39 (`[glibc238]` has no live member;
+  `scripts/audit-runtime-versions.sh`); membership is by OS image, never
+  region. `[platform:vars]` templates `HIVE_CP_OWNER_CHAIN=fc-sanjose,
   fc-phoenix,fc-virginia-3,fc-virginia` and `HIVE_CP_VOTERS=fc-sanjose,fc-phoenix,
   fc-virginia-3`; a node drop-in overrides the unit — read `/proc/<pid>/environ`.
 - SSH `ssh -i ~/.ssh/billing.pem root@<ip>` (orlando: `sysadmin`, `id_ed25519`).
@@ -85,7 +86,7 @@ memories whose durable content was absorbed.
 
 - Canonical state is ONE in-memory representation (`state.json` + store_sync),
   never derived from, translated through or gated on GuardianDB or its SQL
-  mirror (a derived read-only projection at most).
+  mirror (at most a read-only projection).
 - `admin_ingress` forwards MUTATIONS to the leader and serves GET/HEAD LOCALLY;
   public hosts are round-robin DNS, so a GET over NODE-LOCAL data (a file under
   `persist::data_dir()`, an in-process `Mutex`/`OnceLock`) answers empty/404
