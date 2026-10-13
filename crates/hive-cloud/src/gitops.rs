@@ -267,6 +267,26 @@ impl GitRepoIndex {
         by_repo.entry(norm).or_default().insert(project.to_string());
     }
 
+    /// Move a project's git connection to its new name (rename) — the repo it
+    /// is connected to does NOT change, so the reverse index must keep pointing
+    /// at the same repo under the new name, or a push to that repo stops
+    /// finding the project (which is how auto-deploy silently dies).
+    pub fn rename_project(&self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let mut by_project = self.by_project.write();
+        let Some(repo) = by_project.remove(from) else {
+            return;
+        };
+        by_project.insert(to.to_string(), repo.clone());
+        let mut by_repo = self.by_repo.write();
+        if let Some(set) = by_repo.get_mut(&repo) {
+            set.remove(from);
+            set.insert(to.to_string());
+        }
+    }
+
     /// Forget a project entirely (deletion) — evicts it from its repo's set too.
     pub fn remove_project(&self, project: &str) {
         let mut by_project = self.by_project.write();

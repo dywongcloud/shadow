@@ -1144,6 +1144,42 @@ async fn edge_pipeline_inner(
     // every build failed / nothing is Ready / no healthy route exists from here"
     // are different facts with different fixes, and answering both with the same
     // 404 sent owners hunting a DNS/typo problem for a broken build. Say which.
+    // A renamed-away project name. The old name is RESERVED forever
+    // (`ProjectStore::rename_row`), so no future project can ever claim it —
+    // which is what makes a PERMANENT redirect here safe instead of a hijack:
+    // there is no future owner for this label to hand traffic to. Checked only
+    // on this already-failing path (nothing served it locally and no peer
+    // answered), never on a hot hit.
+    if !serve_local && !already_proxied && !host.is_empty() {
+        if let Some(target) = cloud.projects.rename_target(&sub) {
+            // A project legitimately serving this exact label is never
+            // redirected — only a label nothing else can answer is.
+            if !target.eq_ignore_ascii_case(&sub) && cloud.projects.find_key_ci(&sub).is_none() {
+                let path_q = if query.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{path}?{query}")
+                };
+                let location = format!("{}{}", cloud.deploy_url(&target), path_q);
+                let ev = cloud.event(
+                    &region,
+                    &method,
+                    &host,
+                    &path,
+                    308,
+                    "project-renamed",
+                    &format!("{}->{}", sub, target),
+                );
+                cloud.record(ev);
+                let mut resp = (StatusCode::PERMANENT_REDIRECT, "").into_response();
+                set(&mut resp, "location", &location);
+                set(&mut resp, "x-hive-region", &region);
+                set(&mut resp, "x-hive-error", "PROJECT_RENAMED");
+                return resp;
+            }
+        }
+    }
+
     if !serve_local && !already_proxied && !host.is_empty() {
         if let Some(known) = known_label_status(&cloud, &sub) {
             let ev = cloud.event(

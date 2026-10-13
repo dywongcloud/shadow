@@ -251,6 +251,46 @@ impl PlatformSandboxProvider {
             .cloned()
     }
 
+    /// Rename a project's sandboxes IN PLACE: live records plus their command
+    /// / snapshot / mount history. Sandbox ids are minted (never derived from
+    /// the project name), so nothing on disk or in the cell moves — only the
+    /// ownership label every list/authorize call filters on.
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut n = 0;
+        {
+            let mut w = self.sandboxes.write();
+            for rec in w.iter_mut().filter(|s| s.project_id == from) {
+                rec.project_id = to.to_string();
+                n += 1;
+            }
+        }
+        {
+            let mut w = self.commands.write();
+            for rec in w.iter_mut().filter(|c| c.project_id == from) {
+                rec.project_id = to.to_string();
+                n += 1;
+            }
+        }
+        {
+            let mut w = self.snapshots.write();
+            for rec in w.iter_mut().filter(|s| s.project_id == from) {
+                rec.project_id = to.to_string();
+                n += 1;
+            }
+        }
+        {
+            let mut w = self.mounts.write();
+            for rec in w.iter_mut().filter(|m| m.project_id == from) {
+                rec.project_id = to.to_string();
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn snapshot(
         &self,
     ) -> (

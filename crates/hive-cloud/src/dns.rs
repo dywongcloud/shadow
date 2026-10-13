@@ -518,6 +518,29 @@ impl DomainStore {
         out
     }
 
+    /// Rename the project a verified custom domain is attached to. The routing
+    /// key is the FULL hostname (`aliases_full`), never the project name, so a
+    /// rename cannot disturb `geniee.site`-style routing — but the attachment's
+    /// `verify.project` names the owning project and every authorize/re-attach
+    /// check compares against it, so it must move or the domain detaches from
+    /// its project on the next verification compare. Returns affected domains.
+    pub fn rename_project(&self, from: &str, to: &str) -> Vec<String> {
+        if from == to {
+            return Vec::new();
+        }
+        let mut m = self.map.write();
+        let mut out = Vec::new();
+        for d in m.values_mut() {
+            if d.verify.as_ref().is_some_and(|v| v.project == from) {
+                if let Some(v) = d.verify.as_mut() {
+                    v.project = to.to_string();
+                }
+                out.push(d.domain.clone());
+            }
+        }
+        out
+    }
+
     /// Replace the zone's serving records for a verified attachment: the
     /// system apex A/AAAA set (the platform's live edge addresses) plus a
     /// `www` CNAME to the apex — LE's HTTP-01 order carries a `www` SAN and

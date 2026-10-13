@@ -215,11 +215,13 @@ pub static REGISTRY: &[SyncedStore] = &[
                     Some(crate::project_settings::SyncedProjects {
                         rows: m,
                         tombstones: Default::default(),
+                        rename_tombstones: Default::default(),
                         incarnation_tombstones: Default::default(),
                     })
                 })?;
             if synced.rows.is_empty()
                 && synced.tombstones.is_empty()
+                && synced.rename_tombstones.is_empty()
                 && synced.incarnation_tombstones.is_empty()
             {
                 return None;

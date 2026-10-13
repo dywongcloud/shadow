@@ -99,6 +99,32 @@ impl ProductionDeploymentStore {
         }
     }
 
+    /// Rename a project's production-host record IN PLACE. Dropping this row
+    /// (rather than moving it) would blind node-death self-heal for the whole
+    /// project. The OLD name is tombstoned exactly like a delete, so a sparse
+    /// peer still holding the old row cannot resurrect it.
+    pub fn rename(&self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let now = now_ms();
+        let mut map = self.map.write();
+        let Some(mut row) = map.remove(from) else {
+            drop(map);
+            self.remove(from);
+            return;
+        };
+        row.project = to.to_string();
+        row.updated_ms = row.updated_ms.max(now);
+        map.insert(to.to_string(), row);
+        drop(map);
+        let mut tombs = self.tombstones.write();
+        let e = tombs.entry(from.to_string()).or_insert(now);
+        if now > *e {
+            *e = now;
+        }
+    }
+
     pub fn get(&self, project: &str) -> Option<ProductionDeploymentRecord> {
         self.map.read().get(project).cloned()
     }

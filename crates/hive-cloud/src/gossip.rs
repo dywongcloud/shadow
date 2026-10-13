@@ -665,6 +665,93 @@ async fn dispatch_verified(
             )
             .unwrap_or_default()
         }
+        // Mesh project-RENAME (single hop): the coordinator's cross-node rewrite
+        // for nodes reachable only over iroh. Team must OWN the project on THIS
+        // node (settings tag, a local deployment, or the relational fallback) —
+        // the same three tiers the delete arm checks, because a rename hands the
+        // caller another project's URLs. Ordered BEFORE the `/delete` arm and
+        // alongside the other `/v1/projects/` arms (longest-prefix-first); no
+        // other arm matches `/rename`.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.split('?').next().unwrap_or("").ends_with("/rename") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            // Verified-token parse, never a raw `split_once("?team=")` — under
+            // enforcement that swallowed the token into the team string and
+            // every ownership compare below missed silently.
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
+                .unwrap_or_default();
+            let new = qparam(p, "name").unwrap_or_default().trim().to_ascii_lowercase();
+            // Same shape rules as the HTTP route: a name that sanitizes
+            // differently would produce a volume/checkout path that does not
+            // match its own lookup prefix.
+            if crate::admin::invalid_project_name(&new).is_some() {
+                return serde_json::to_vec(&serde_json::json!({ "error": "invalid project name" }))
+                    .unwrap_or_default()
+            }
+            let rename_ms = match qparam(p, "rename_ms") {
+                Some(raw) => match raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|ms| crate::admin::valid_rename_generation(*ms))
+                {
+                    Some(ms) => ms,
+                    None => {
+                        return serde_json::to_vec(
+                            &serde_json::json!({ "error": "invalid rename generation" }),
+                        )
+                        .unwrap_or_default()
+                    }
+                },
+                None => {
+                    return serde_json::to_vec(
+                        &serde_json::json!({ "error": "rename generation required" }),
+                    )
+                    .unwrap_or_default()
+                }
+            };
+            if project.is_empty() || new.is_empty() || team.is_empty() {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
+            }
+            let owner = cloud.projects.team_of(&project);
+            let owns_settings = crate::admin::norm(&owner) == team;
+            let owns_deploys = cloud.gw.list().iter().any(|d| {
+                d.project == project && crate::admin::record_tenant(&d.tenant) == team
+            });
+            let owns_relational = crate::relational::projects_for_team(&team)
+                .await
+                .iter()
+                .any(|p| p == &project);
+            if !(owns_settings || owns_deploys || owns_relational) {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
+            }
+            let outcome =
+                crate::admin::rename_project_local(&cloud, &project, &new, &team, rename_ms).await;
+            serde_json::to_vec(&serde_json::json!({
+                "project": new,
+                "previous": project,
+                "rename_ms": outcome.rename_ms,
+                "renamed": if outcome.local_renamed { outcome.renamed } else { 0 },
+                "local_renamed": outcome.local_renamed,
+            }))
+            .unwrap_or_default()
+        }
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
         // project on THIS node (or the project must be absent — idempotent).

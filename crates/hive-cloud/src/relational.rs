@@ -967,6 +967,51 @@ pub(crate) async fn remove_project(project: &str, deleted_ms: u64) {
     }
 }
 
+/// Move a project's relational identity to its new name. Two halves in ONE
+/// transaction, and the OLD name is tombstoned rather than deleted: a hard
+/// DELETE would let a delayed pre-rename backfill INSERT the stale ownership
+/// again with no conflict, putting the project back under its old name in the
+/// mirror (the exact resurrection `remove_project` exists to prevent).
+///
+/// This mirror is a DERIVED READ-ONLY projection used only as an authorization
+/// fallback — it is never an input to the rename and never gates it. A failure
+/// here is logged and non-fatal.
+pub(crate) async fn rename_project(from: &str, to: &str, updated_ms: u64) {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
+    let mut s = session(db).await;
+    reconcile_project_teams_schema(&mut s).await;
+    let probe = format!(
+        "SELECT team, root_dir FROM project_teams WHERE project = {}",
+        q(from)
+    );
+    let (team, root_dir) = match exec(&mut s, &probe).await {
+        Ok(res) => {
+            let cols = all_text_firsts(&res);
+            (
+                cols.first().cloned().unwrap_or_default(),
+                cols.get(1).cloned().unwrap_or_default(),
+            )
+        }
+        Err(_) => (String::new(), String::new()),
+    };
+    let query = format!(
+        "BEGIN; \
+         UPDATE project_teams SET deleted_ms = {updated_ms} WHERE project = {qf} AND deleted_ms = 0; \
+         INSERT INTO project_teams (project, team, root_dir, updated_ms, deleted_ms) \
+         VALUES ({qt}, {qteam}, {qroot}, {updated_ms}, 0) ON CONFLICT (project) DO NOTHING; \
+         COMMIT;",
+        qf = q(from),
+        qt = q(to),
+        qteam = q(&team),
+        qroot = q(&root_dir),
+    );
+    if let Err(e) = exec(&mut s, &query).await {
+        tracing::debug!(from, to, error = %e, "relational: rename_project failed (non-fatal)");
+    }
+}
+
 /// Every (project, team) pair this node's replica currently holds for `team`
 /// — backs `gitops_projects`'s fleet-visibility fallback (and any future
 /// "list every project for team X" surface) with a source that includes

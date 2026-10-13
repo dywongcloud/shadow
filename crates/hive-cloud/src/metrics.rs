@@ -209,6 +209,40 @@ impl MetricsStore {
         }
     }
 
+    /// Rename a project inside the persisted hour/day rollups (and the live
+    /// minute buckets), merging into the target when it already has a bucket
+    /// entry — a rename is not a chance to lose history.
+    ///
+    /// Bounded by construction: every bucket map is capped at
+    /// `MAX_HOUR_BUCKETS`/`MAX_DAY_BUCKETS`/`MAX_BUCKETS` by
+    /// `accumulate_bucket`, so the whole critical section is O(tenants ×
+    /// capped buckets) map-key surgery, never O(requests). It still runs under
+    /// the project lifecycle writer (never per request) and holds one write
+    /// lock for the whole walk.
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut map = self.by_tenant.write();
+        let mut n = 0;
+        for tm in map.values_mut() {
+            for buckets in [
+                &mut tm.buckets,
+                &mut tm.hour_buckets,
+                &mut tm.day_buckets,
+            ] {
+                for bucket in buckets.values_mut() {
+                    let Some(count) = bucket.by_project.remove(from) else {
+                        continue;
+                    };
+                    n += 1;
+                    *bucket.by_project.entry(to.to_string()).or_insert(0) += count;
+                }
+            }
+        }
+        n
+    }
+
     /// Record an event under its owning `tenant` (the team that owns the request's
     /// project; [`SYSTEM_TENANT`] when there is no project).
     pub fn record(&self, ev: &crate::state::Event, tenant: &str) {

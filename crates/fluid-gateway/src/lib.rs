@@ -2203,6 +2203,66 @@ impl Gateway {
         records
     }
 
+    /// Rename a project IN PLACE across this node's deployment table.
+    ///
+    /// Every routing identity that is DERIVED from the project name moves with
+    /// it: `Deployment.project`, `Manifest.project` and the label aliases built
+    /// from the name (`<project>`, `<project>-<sha>`, `<project>-git-<branch>`).
+    /// Every identity that is not derived from it is left byte-identical —
+    /// notably `id_alias` (`<deployment-id>.<domain>`) and the `aliases_full`
+    /// custom-domain entries, both of which key on something else entirely, so
+    /// a rename can never break a per-deployment URL or an attached domain.
+    ///
+    /// The caller holds the project lifecycle writer; this is a single
+    /// critical section under the gateway lock, so no request can observe a
+    /// half-renamed project. Returns the number of deployments rewritten.
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut st = self.state.lock();
+        let ids: Vec<DeploymentId> = st
+            .deployments
+            .values()
+            .filter(|d| d.project == from)
+            .map(|d| d.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        for id in &ids {
+            if let Some(d) = st.deployments.get_mut(id) {
+                d.project = to.to_string();
+                if d.manifest.project == from {
+                    d.manifest.project = to.to_string();
+                }
+            }
+        }
+        // Drop every name-derived alias pointing at one of these deployments.
+        // The per-deployment alias (`id -> id`) is keyed by the deployment's own
+        // id and is deliberately preserved: `id_alias` is what makes old
+        // per-deployment links survive a rename untouched.
+        let owned = |target: &DeploymentId| ids.iter().any(|id| id == target);
+        st.aliases.retain(|label, target| {
+            !(owned(target) && !ids.iter().any(|id| id.as_str() == label.as_str()))
+        });
+        for id in &ids {
+            insert_deploy_aliases(&mut st, id);
+        }
+        // The bare `<project>` production alias follows the newest production
+        // deployment, matching what a fresh production deploy would install.
+        if let Some(newest) = st
+            .deployments
+            .values()
+            .filter(|d| d.project == to && d.state == fluid_core::DeployState::Ready)
+            .max_by_key(|d| (d.production, d.created_at_ms))
+            .map(|d| d.id.clone())
+        {
+            st.aliases.insert(to.to_string(), newest);
+        }
+        ids.len()
+    }
+
     pub fn image_is_referenced(&self, image: &str) -> bool {
         self.state
             .lock()

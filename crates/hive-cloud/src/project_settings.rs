@@ -486,6 +486,11 @@ pub struct SyncedProjects {
     pub rows: std::collections::BTreeMap<String, ProjectSettings>,
     #[serde(default)]
     pub tombstones: std::collections::BTreeMap<String, u64>,
+    /// Renamed-away names. Replicated so EVERY node reserves the old name —
+    /// a node that never saw the rename would otherwise happily let someone
+    /// create a project with it (see [`SyncedProjects`]'s rationale).
+    #[serde(default)]
+    pub rename_tombstones: std::collections::BTreeMap<String, ProjectRenameTombstone>,
     #[serde(default)]
     pub incarnation_tombstones: std::collections::BTreeMap<
         String,
@@ -518,6 +523,75 @@ impl std::fmt::Display for ProjectIncarnationError {
 
 impl std::error::Error for ProjectIncarnationError {}
 
+/// Old names a project was renamed FROM (old name -> new name). Populated by
+/// every rename this process applies and rebuilt at boot from the persisted
+/// rename tombstones, so scanners that match on-disk NAME PREFIXES (checkout
+/// dirs, volumes) can still find artifacts written under an older name.
+///
+/// A rename deliberately does not rename a podman volume or a checkout dir in
+/// place (live mounts, the fixed 2048-lock pool, `rm` needing `-v`), so
+/// pre-rename artifacts keep their old names forever — without this they would
+/// become invisible to GC/redeploy/purge and leak.
+static RENAMED_FROM: std::sync::OnceLock<
+    parking_lot::RwLock<std::collections::BTreeMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn record_rename(from: &str, to: &str) {
+    if from.is_empty() || to.is_empty() || from == to {
+        return;
+    }
+    RENAMED_FROM
+        .get_or_init(|| parking_lot::RwLock::new(Default::default()))
+        .write()
+        .insert(from.to_string(), to.to_string());
+}
+
+/// Every name `project` was previously known by, transitively (a project can be
+/// renamed more than once: `a -> b -> c` yields `[a, b]` for `c`). Bounded, so
+/// a cycle in a corrupted persisted map can never spin.
+pub(crate) fn previous_names(project: &str) -> Vec<String> {
+    const MAX_HOPS: usize = 16;
+    let Some(map) = RENAMED_FROM.get() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = project.to_string();
+    for _ in 0..MAX_HOPS {
+        let prev = {
+            let m = map.read();
+            m.iter()
+                .find(|(_, new)| new.as_str().eq_ignore_ascii_case(&cur))
+                .map(|(old, _)| old.clone())
+        };
+        match prev {
+            Some(old) => {
+                if out.iter().any(|p| p == &old) {
+                    break;
+                }
+                out.push(old.clone());
+                cur = old;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Checkout-dir prefixes a project's on-disk artifacts may carry: every
+/// [`crate::git::checkout_prefixes`] form of its CURRENT name plus the same for
+/// every name it was renamed FROM.
+pub(crate) fn checkout_prefixes_including_previous(project: &str) -> Vec<String> {
+    let mut v = crate::git::checkout_prefixes(project);
+    for old in previous_names(project) {
+        for prefix in crate::git::checkout_prefixes(&old) {
+            if !v.contains(&prefix) {
+                v.push(prefix);
+            }
+        }
+    }
+    v
+}
+
 pub struct ProjectStore {
     map: RwLock<HashMap<String, ProjectSettings>>,
     /// project → deletion ms. Records deletions so absence can replicate
@@ -525,12 +599,30 @@ pub struct ProjectStore {
     /// node can return after any bounded GC window and otherwise resurrect a
     /// deleted project, while this map grows only once per deleted project.
     tombstones: RwLock<std::collections::BTreeMap<String, u64>>,
+    /// old project name → where it went. Renames are PERMANENT and
+    /// platform-global: the old name stays reserved so no future project can
+    /// claim it and inherit its traffic, and old labels can be answered with a
+    /// permanent redirect (see [`ProjectStore::rename_row`]).
+    rename_tombstones:
+        RwLock<std::collections::BTreeMap<String, ProjectRenameTombstone>>,
     incarnation_tombstones: RwLock<
         std::collections::BTreeMap<
             String,
             std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
         >,
     >,
+}
+
+/// Where a renamed-away project name went. See [`ProjectStore::rename_row`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectRenameTombstone {
+    /// The project's name AFTER the rename.
+    pub new: String,
+    /// The incarnation the rename carried across (invariant under rename).
+    #[serde(default)]
+    pub incarnation: Option<fluid_core::ProjectIncarnation>,
+    /// Generation of the rename — the causal floor the new row dominates.
+    pub rename_ms: u64,
 }
 
 fn project_time_ceiling(now: u64) -> u64 {
@@ -545,6 +637,7 @@ impl ProjectStore {
         ProjectStore {
             map: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(std::collections::BTreeMap::new()),
+            rename_tombstones: RwLock::new(std::collections::BTreeMap::new()),
             incarnation_tombstones: RwLock::new(std::collections::BTreeMap::new()),
         }
     }
@@ -906,6 +999,7 @@ impl ProjectStore {
         SyncedProjects {
             rows: self.map.read().clone().into_iter().collect(),
             tombstones: self.tombstones.read().clone(),
+            rename_tombstones: self.rename_tombstones.read().clone(),
             incarnation_tombstones: self.incarnation_tombstones.read().clone(),
         }
     }
@@ -962,6 +1056,24 @@ impl ProjectStore {
                     let current = local_tombstones.entry(incarnation).or_insert(deleted_ms);
                     if deleted_ms > *current {
                         *current = deleted_ms;
+                    }
+                }
+            }
+        }
+        {
+            let mut renames = self.rename_tombstones.write();
+            for (old, remote_tomb) in remote.rename_tombstones {
+                if remote_tomb.rename_ms > ceiling {
+                    tracing::warn!(old = %old, new = %remote_tomb.new, rename_ms = remote_tomb.rename_ms, ceiling_ms = ceiling, "dropping relayed project rename tombstone with implausibly future generation");
+                    continue;
+                }
+                match renames.get(&old) {
+                    // Newest rename wins: a name can be renamed, re-created and
+                    // renamed again, and the ONLY live redirect target is the
+                    // latest one.
+                    Some(local) if local.rename_ms >= remote_tomb.rename_ms => {}
+                    _ => {
+                        renames.insert(old, remote_tomb);
                     }
                 }
             }
@@ -1086,6 +1198,20 @@ impl ProjectStore {
                 }
             }
         }
+        // A renamed-away name must never come back — from a peer, from a
+        // Guardian replay of a pre-rename snapshot, or from this node's own
+        // restored rows. Applied AFTER the remote merge (not before) because a
+        // pre-rename row arriving in `remote.rows` otherwise slips straight
+        // back in and the project serves under its old name again.
+        {
+            let renames = self.rename_tombstones.read().clone();
+            map.retain(|name, row| {
+                !renames.iter().any(|(old, tomb)| {
+                    old.eq_ignore_ascii_case(name)
+                        && row.updated_ms <= tomb.rename_ms.saturating_add(1)
+                })
+            });
+        }
         map.retain(|name, row| match row.incarnation {
             Some(incarnation) => !incarnation_tombstones
                 .get(name)
@@ -1189,6 +1315,175 @@ impl ProjectStore {
             .get(project)
             .and_then(|tombstones| tombstones.get(&incarnation))
             .copied()
+    }
+
+/// Rename a project's settings row IN PLACE under the lifecycle writer.
+    ///
+    /// The INCARNATION is invariant: this is the same project with a new name,
+    /// not a new identity — minting a fresh one would orphan every in-flight
+    /// delete/reap path and break `legacy_deployment_ids` lineage.
+    ///
+    /// Two permanent tombstones are recorded for the OLD name, with different
+    /// meanings:
+    /// - `tombstones[old]` (the ordinary delete-style tombstone) so a sparse
+    ///   peer that still holds the old row cannot resurrect it — absence has to
+    ///   replicate as an explicit fact, exactly as it does for a delete.
+    /// - `rename_tombstones[old]` so the old name stays RESERVED: no future
+    ///   project may claim it (see [`ProjectStore::renamed_away`]) and old URLs
+    ///   can be answered with a permanent redirect instead of a hijackable
+    ///   404. Reservation is what makes that redirect safe.
+    ///
+    /// Returns the moved row, or `None` when this node held no row to move.
+    pub fn rename_row(
+        &self,
+        from: &str,
+        to: &str,
+        rename_ms: u64,
+    ) -> Option<ProjectSettings> {
+        if from == to {
+            return None;
+        }
+        let ceiling = project_time_ceiling(now_ms());
+        let rename_ms = rename_ms.min(ceiling);
+        let mut map = self.map.write();
+        let Some(mut row) = map.remove(from) else {
+            return None;
+        };
+        // The row must strictly dominate its own tombstone, or the very merge
+        // pass that drops the old name would also drop the new row here.
+        row.updated_ms = row
+            .updated_ms
+            .max(row.incarnation_created_ms)
+            .saturating_add(1)
+            .max(rename_ms.saturating_add(1));
+        map.insert(to.to_string(), row.clone());
+        drop(map);
+        {
+            let mut tombs = self.tombstones.write();
+            let entry = tombs.entry(from.to_string()).or_insert(rename_ms);
+            if rename_ms > *entry {
+                *entry = rename_ms;
+            }
+        }
+        {
+            let mut renames = self.rename_tombstones.write();
+            renames.insert(
+                from.to_string(),
+                ProjectRenameTombstone {
+                    new: to.to_string(),
+                    incarnation: row.incarnation,
+                    rename_ms,
+                },
+            );
+        }
+        // Checkout dirs and volumes keep their pre-rename names, so the
+        // prefix scanners have to be told what this project used to be
+        // called (`git::checkout_prefixes`).
+        record_rename(from, to);
+        Some(row)
+    }
+
+    /// Record a rename this node has no row for (a sparse observer whose
+    /// cascade a real owner accepted). The reservation is the whole point: the
+    /// old name must never be claimable again, on ANY node.
+    pub fn record_rename_tombstone(&self, from: &str, to: &str, rename_ms: u64) {
+        let rename_ms = rename_ms.min(project_time_ceiling(now_ms()));
+        {
+            let mut tombs = self.tombstones.write();
+            let entry = tombs.entry(from.to_string()).or_insert(rename_ms);
+            if rename_ms > *entry {
+                *entry = rename_ms;
+            }
+        }
+        {
+            let mut renames = self.rename_tombstones.write();
+            renames.insert(
+                from.to_string(),
+                ProjectRenameTombstone {
+                    new: to.to_string(),
+                    incarnation: None,
+                    rename_ms,
+                },
+            );
+        }
+        record_rename(from, to);
+    }
+
+    /// Whether `name` was renamed away and is therefore RESERVED forever.
+    /// Case-insensitive, matching `find_key_ci`: project names are
+    /// platform-unique case-insensitively because the name becomes the podman
+    /// volume, the checkout dir and `hive-browserdb-{tag}.db`, so "Foo" and
+    /// "foo" can never be different projects.
+    pub fn renamed_away(&self, name: &str) -> Option<ProjectRenameTombstone> {
+        self.rename_tombstones
+            .read()
+            .iter()
+            .find(|(old, _)| old.eq_ignore_ascii_case(name))
+            .map(|(_, tomb)| tomb.clone())
+    }
+
+    /// Where `name` ultimately points today, following a chain of renames
+    /// (`a → b → c` resolves `a` to `c`). Bounded, so a cycle in a corrupted
+    /// persisted map can never spin. `None` when the name was never renamed.
+    pub fn rename_target(&self, name: &str) -> Option<String> {
+        const MAX_HOPS: usize = 16;
+        let mut cur = name.to_string();
+        let mut moved = false;
+        for _ in 0..MAX_HOPS {
+            let Some(next) = self.renamed_away(&cur) else {
+                break;
+            };
+            if next.new.eq_ignore_ascii_case(&cur) {
+                break;
+            }
+            cur = next.new;
+            moved = true;
+        }
+        moved.then_some(cur)
+    }
+
+    /// The rename tombstone for this EXACT name, if any.
+    pub fn rename_tombstone_of(&self, name: &str) -> Option<ProjectRenameTombstone> {
+        self.rename_tombstones.read().get(name).cloned()
+    }
+
+    pub fn rename_tombstones_snapshot(&self) -> std::collections::BTreeMap<String, ProjectRenameTombstone> {
+        self.rename_tombstones.read().clone()
+    }
+
+    pub fn rename_tombstones_load(
+        &self,
+        mut data: std::collections::BTreeMap<String, ProjectRenameTombstone>,
+    ) {
+        let now = now_ms();
+        let ceiling = project_time_ceiling(now);
+        for (old, tomb) in data.iter_mut() {
+            if tomb.rename_ms > ceiling {
+                tracing::warn!(
+                    renamed_to = %tomb.new,
+                    rename_ms = tomb.rename_ms,
+                    ceiling_ms = ceiling,
+                    "normalizing implausibly future persisted project rename tombstone"
+                );
+                tomb.rename_ms = now;
+            }
+            record_rename(old, &tomb.new);
+        }
+        // MERGE, never replace. `persist::restore` can run more than once on a
+        // live process (a Guardian restore replays an earlier snapshot), and a
+        // wholesale replace would silently forget every rename applied since —
+        // un-reserving old names and letting them be claimed again. Newest wins.
+        {
+            let mut renames = self.rename_tombstones.write();
+            for (old, tomb) in data {
+                match renames.get(&old) {
+                    Some(local) if local.rename_ms >= tomb.rename_ms => {}
+                    _ => {
+                        renames.insert(old, tomb);
+                    }
+                }
+            }
+        }
     }
 
     pub fn begin_delete_exact(

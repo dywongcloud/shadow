@@ -129,6 +129,24 @@ impl WebhookStore {
         }
     }
 
+    /// Move this project's subscriptions to its new name. A webhook row whose
+    /// `project` no longer matches any project is silently undeliverable —
+    /// every future event for the renamed project would match nothing, and the
+    /// settings page would still show a webhook that can never fire. `*` rows
+    /// (team-wide) are untouched.
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut hooks = self.hooks.write();
+        let mut n = 0;
+        for w in hooks.iter_mut().filter(|w| w.project == from) {
+            w.project = to.to_string();
+            n += 1;
+        }
+        n
+    }
+
     pub fn snapshot(&self) -> Vec<Webhook> {
         self.hooks.read().clone()
     }

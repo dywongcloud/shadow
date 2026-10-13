@@ -936,6 +936,23 @@ impl DatabaseStore {
         });
     }
 
+    /// Rename a project's databases IN PLACE. The database's OWN identity (its
+    /// id, `db_host`, the SQLite file name) is keyed by id and never by project
+    /// name, so nothing on disk moves — only the ownership label the Storage
+    /// page filters on. Called under the project lifecycle writer.
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut v = self.dbs.write();
+        let mut n = 0;
+        for db in v.iter_mut().filter(|d| d.project == from) {
+            db.project = to.to_string();
+            n += 1;
+        }
+        n
+    }
+
     /// Allocate a loopback port for a new DB container. The in-memory cursor RESETS
     /// to 0 on restart, so a naive `base + cursor` re-hands `base` to a second DB
     /// created post-restart — colliding with a pre-existing DB that already holds it

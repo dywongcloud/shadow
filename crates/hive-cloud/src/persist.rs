@@ -91,6 +91,12 @@ pub struct PlatformSnapshot {
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
+    /// Old names of renamed projects, kept durable for the same reason the
+    /// delete tombstones are: a restart must not forget that a name is
+    /// reserved, or it would let someone create it and inherit its traffic.
+    #[serde(default)]
+    pub project_rename_tombstones:
+        std::collections::BTreeMap<String, crate::project_settings::ProjectRenameTombstone>,
     #[serde(default)]
     pub project_incarnation_tombstones: std::collections::BTreeMap<
         String,
@@ -533,6 +539,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
     let SyncedProjects {
         rows: projects,
         tombstones: project_tombstones,
+        rename_tombstones: project_rename_tombstones,
         incarnation_tombstones: project_incarnation_tombstones,
     } = cloud.projects.snapshot_synced();
     // ONE team read: live rows and tombstones share a lock and must describe one
@@ -572,6 +579,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         queues: cloud.queues.snapshot_synced(),
         production_deployments: cloud.production_deployments.snapshot_synced(),
         project_tombstones,
+        project_rename_tombstones,
         project_incarnation_tombstones,
         metrics_rollup: cloud.metrics.rollup_snapshot(),
         builds: cloud.builds.snapshot(),
@@ -842,9 +850,11 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
 
 /// Apply a loaded snapshot to a freshly constructed CloudState (boot restore).
 pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
+    cloud.projects.rename_tombstones_load(snap.project_rename_tombstones.clone());
     cloud.projects.merge_synced(SyncedProjects {
         rows: snap.projects.into_iter().collect(),
         tombstones: snap.project_tombstones,
+        rename_tombstones: snap.project_rename_tombstones,
         incarnation_tombstones: snap.project_incarnation_tombstones,
     });
     let project_authority = cloud.projects.snapshot_synced();

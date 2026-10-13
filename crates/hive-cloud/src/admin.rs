@@ -50,7 +50,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/wqueue/enqueue", post(wqueue_enqueue))
         .route("/v1/wqueue/stats", get(wqueue_stats))
         .route("/v1/logs", get(logs))
-        .route("/v1/functions", get(functions))
+        .route("/v1/functions", get(functions_public))
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
         .route("/v1/gpu-pools", get(gpu_pools))
@@ -130,6 +130,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         )
         .route("/v1/deployments/:id/promote", post(dep_promote))
         .route("/v1/projects/:project", delete(project_delete))
+        .route("/v1/projects/:project/rename", post(project_rename))
         .route(
             "/v1/project-delete/capabilities",
             get(project_delete_capabilities),
@@ -2874,7 +2875,13 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     // Case-insensitive collision check: `<project>.localhost` aliases are global
     // and host routing is case-insensitive, so "Foo" and "foo" must not coexist.
     // Uses find_key_ci (key-only, no full-map clone) on this hot deploy path.
-    let existing_ci = |name: &str| c.projects.find_key_ci(name);
+    // A name a project was RENAMED AWAY FROM counts as taken too: it is
+    // reserved permanently so nobody can inherit the old project's URLs.
+    let existing_ci = |name: &str| {
+        c.projects
+            .find_key_ci(name)
+            .or_else(|| c.projects.renamed_away(name).map(|_| name.to_string()))
+    };
     let Some(hit) = existing_ci(&base) else {
         return base; // free — use it
     };
@@ -2988,6 +2995,21 @@ pub(crate) async fn start_named_deploy(
             StatusCode::NOT_FOUND,
             "the project no longer exists; start a new deployment instead of redeploying it".into(),
         ));
+    }
+    // A name a project was renamed away from is RESERVED permanently: issuing
+    // it would put a new project on the old project's bookmarked URLs and on
+    // the redirect that already points at the renamed one.
+    if !requested.trim().is_empty() {
+        if let Some(tomb) = c.projects.renamed_away(requested.trim()) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "The name \"{}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+                    requested.trim(),
+                    tomb.new
+                ),
+            ));
+        }
     }
     let project = if (req.no_fanout || redeploy_existing) && !requested.trim().is_empty() {
         c.projects
@@ -3898,6 +3920,25 @@ pub(crate) fn require_project(
     project: &str,
 ) -> Result<String, (StatusCode, String)> {
     let t = tenant(c, h, claims);
+    // A renamed-away name is RESERVED: it must never be claimable again, by
+    // anyone, or a new project would inherit the renamed project's bookmarked
+    // URLs and the permanent redirect that already points at the new name.
+    // Checked HERE rather than in each settings PUT because every write path
+    // (`/build`, `/env`, `/team`, `/domains`, …) funnels through this one
+    // authority check — and a settings PUT on a name with no row MATERIALIZES
+    // one, so without this a reserved old name could be resurrected by a single
+    // settings write.
+    if c.projects.get_if_set(project).is_none() {
+        if let Some(tomb) = c.projects.renamed_away(project) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "The name \"{project}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+                    tomb.new
+                ),
+            ));
+        }
+    }
     if project_owned_by(c, project, &t) {
         Ok(t)
     } else {
@@ -4160,6 +4201,29 @@ async fn anycast_public(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
     Ok(anycast_table(State(c)).await)
+}
+
+/// Public mount for [`functions`] — the same CWE-306 class as the five above,
+/// but tenant-shaped, so it takes the ordinary authenticated-read guard
+/// [`require_auth_read`] (401 when there is no session), exactly like
+/// [`anycast_public`] and `/v1/nodes`.
+///
+/// Why it cannot stay open: the handler's top-level branch appends every peer's
+/// `?local=true` slice, which the peer serves UNFILTERED on purpose (the billing
+/// meter's aggregation path), and re-filters only this node's own
+/// `c.fluid.stats()`. Confirmed live: an unauthenticated `GET /v1/functions`
+/// answered 200 with `x-hive-anon: 1` and a real entry carrying a deployment
+/// key and the owner's tenant slug. The mesh leg is unaffected: gossip calls
+/// the handler directly with no headers, and the peer hop carries a mesh
+/// token, so `claims` is `Some` and the guard passes.
+async fn functions_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: axum::extract::Query<LocalQ>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(functions(State(c), headers, claims, q).await)
 }
 
 /// Like [`require_operator`], but also honors the internal node-to-node
@@ -5107,7 +5171,7 @@ fn path_build_id(
         return None;
     }
     let name = path.file_name()?.to_str()?;
-    crate::git::checkout_prefixes(project)
+    crate::project_settings::checkout_prefixes_including_previous(project)
         .iter()
         .find_map(|prefix| deploy_entry_build_id(prefix, name))
         .map(str::to_string)
@@ -5657,7 +5721,11 @@ async fn purge_project_source_dirs(
     project: &str,
     build_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<ProjectCleanupResidual> {
-    let prefixes = crate::git::checkout_prefixes(project);
+    // Prefixes of the CURRENT name plus every name this project was renamed
+    // FROM: pre-rename checkouts keep their old dir names (a rename never
+    // renames a checkout in place), so matching only the current name would
+    // strand them -- invisible to this purge and leaking forever.
+    let prefixes = crate::project_settings::checkout_prefixes_including_previous(project);
     let mut residuals = Vec::new();
     for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
         let targets = match enumerate_owned_deploy_entries(&base, &prefixes, build_ids).await {
@@ -6315,6 +6383,654 @@ pub(crate) async fn dispatch_project_delete_with(
         "project delete dispatch failed on every transport after retries — peer may keep \
          serving the deleted project until it receives a delete for another reason"
     );
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Project rename
+//
+// A project's name is the platform's routing identity, not a settings field:
+// it is the first DNS label every deployment is served on, the podman volume
+// name, the checkout dir and the browserdb filename. Renaming therefore has to
+// move EVERY tree that keys on it (see `rename_project_owned`) and keep the old
+// name reserved forever, or a later project could claim it and inherit its
+// traffic. It is modelled on `project_delete` — same identity gate, same four
+// authorization tiers, same fleet cascade shape — because it is the same class
+// of fleet-mutating operation.
+// ---------------------------------------------------------------------------
+
+/// A project name is tenant-chosen text that becomes a real identifier
+/// downstream, so it is bounded and its sanitized form must equal the name
+/// itself: a name that sanitized differently would produce a volume/checkout
+/// path that does not match its own lookup prefix.
+const MAX_PROJECT_NAME_LEN: usize = 64;
+
+/// Query for `POST /v1/projects/:project/rename`. `rename_ms` is the immutable
+/// generation issued by the originating rename and reused by every retry;
+/// absent on a user-originated request. `name` rides the query on the mesh
+/// path (a gossip POST has no body) and the JSON body on HTTP.
+#[derive(Deserialize, Default)]
+struct RenameQ {
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    cascade: Option<bool>,
+    #[serde(default)]
+    rename_ms: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RenameBody {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ProjectRenameOutcome {
+    /// Deployments whose project name was rewritten on this node.
+    pub renamed: usize,
+    /// Trees rewritten, for the response's honest accounting.
+    pub moved_domains: Vec<String>,
+    pub moved_databases: usize,
+    pub moved_service_graphs: usize,
+    pub moved_metric_buckets: usize,
+    pub moved_sandboxes: usize,
+    /// True when the local rewrite committed and was persisted.
+    pub local_renamed: bool,
+    pub rename_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<fluid_core::ProjectIncarnation>,
+    pub residuals: Vec<ProjectCleanupResidual>,
+}
+
+/// A rename generation is validated exactly like a delete generation: it may
+/// lead this receiver's clock only by the skew the origin intentionally adds
+/// plus this receiver's opposite-direction skew, and older generations stay
+/// valid forever so an idempotent retry is always accepted.
+pub(crate) fn valid_rename_generation(rename_ms: u64) -> bool {
+    valid_delete_generation(rename_ms)
+}
+
+/// Reject a new project name that cannot be used: empty, too long, or one whose
+/// sanitized form differs from itself (see [`MAX_PROJECT_NAME_LEN`]).
+pub(crate) fn invalid_project_name(new: &str) -> Option<&'static str> {
+    if new.is_empty() {
+        return Some("a new project name is required");
+    }
+    if new.len() > MAX_PROJECT_NAME_LEN {
+        return Some("project name is too long (64 characters maximum)");
+    }
+    if crate::git::sanitize_tag(new) != new.to_ascii_lowercase() {
+        return Some("project name may only contain letters, digits, '.', '_' and '-'");
+    }
+    None
+}
+
+async fn project_rename(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Query(q): Query<RenameQ>,
+    body: Option<Json<RenameBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // SAME gate as `project_delete`, for the same reason: on an unenforced node
+    // a credential-less caller resolves to team "personal" — the platform
+    // owner's namespace — which trivially "owns" every project. Without this,
+    // every unenforced node's admin port is an anonymous rename-any-project
+    // endpoint, and renaming is how you take over another tenant's URLs.
+    let claims_ref = claims.as_ref().map(|e| &e.0);
+    if !has_explicit_caller_identity(
+        claims.is_some(),
+        headers.get("x-hive-team").and_then(|v| v.to_str().ok()),
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "rename requires an authenticated caller (a JWT or an explicit x-hive-team header)"
+                .into(),
+        ));
+    }
+    let cascade = q.cascade.unwrap_or(true);
+    let supplied_rename_ms = q.rename_ms;
+    if supplied_rename_ms.is_some()
+        && (cascade || !delete_forward_is_internal(&headers, claims_ref))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a rename generation is only accepted on an internal single-hop forward".into(),
+        ));
+    }
+    if supplied_rename_ms.is_some_and(|ms| !valid_rename_generation(ms)) {
+        return Err((StatusCode::BAD_REQUEST, "invalid rename generation".into()));
+    }
+    let t = tenant(&c, &headers, claims_ref);
+    let new = q
+        .name
+        .clone()
+        .or_else(|| body.and_then(|Json(b)| b.name))
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if let Some(reason) = invalid_project_name(&new) {
+        return Err((StatusCode::BAD_REQUEST, reason.into()));
+    }
+    if new.eq_ignore_ascii_case(&project) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the project is already named that".into(),
+        ));
+    }
+    // Project names are unique across the whole PLATFORM (the name becomes the
+    // podman volume, the checkout dir and `hive-browserdb-{tag}.db`), so the
+    // colliding name may belong to a tenant this caller cannot see. Say so
+    // instead of silently minting `<name>-2`.
+    if let Some(hit) = c.projects.find_key_ci(&new) {
+        let taken_by_caller = project_owned_by(&c, &hit, &t);
+        return Err((
+            StatusCode::CONFLICT,
+            if taken_by_caller {
+                format!("You already have a project named \"{new}\". Choose a different name.")
+            } else {
+                format!("The name \"{new}\" is already taken by another project. Choose a different name.")
+            },
+        ));
+    }
+    // An old name is RESERVED, never reusable: letting someone claim it would
+    // hand them the previous project's bookmarked URLs and its redirect.
+    if let Some(tomb) = c.projects.renamed_away(&new) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "The name \"{new}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+                tomb.new
+            ),
+        ));
+    }
+    // Four authorization tiers, identical to `project_delete`: anything the
+    // platform will LIST for a tenant must be actionable by it.
+    let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
+        || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || crate::relational::projects_for_team(&t).await.iter().any(|p| p == &project);
+    if !authorized {
+        if !cascade {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no project by that name is owned by this tenant here".into(),
+            ));
+        }
+        // Not locally verifiable ≠ deniable: this node may hold no trace of a
+        // project that lives entirely on a peer. Broadcast and let every owner
+        // authorize locally; require at least one real acceptance before
+        // answering 2xx, because the dashboard treats any 2xx as success and a
+        // rename that happened nowhere is worse than an honest failure.
+        let rename_ms = supplied_rename_ms.unwrap_or_else(|| {
+            now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
+        });
+        let peers: Vec<String> = c
+            .registry
+            .nodes()
+            .into_iter()
+            .filter(|n| !n.is_self)
+            .map(|n| n.name)
+            .collect();
+        let n_peers = peers.len();
+        let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
+            let c = c.clone();
+            let project = project.clone();
+            let new = new.clone();
+            let t = t.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(28),
+                    dispatch_project_rename_with(&c, node, &project, &new, &t, rename_ms, 1),
+                )
+                .await
+                .unwrap_or(false)
+            }
+        }))
+        .await;
+        let accepted = results.iter().filter(|ok| **ok).count();
+        if accepted == 0 {
+            tracing::warn!(
+                project, new, tenant = %t, peers = n_peers,
+                "project rename: not owned locally and no peer accepted the rename"
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "no node that owns this project could be reached to perform the rename".into(),
+            ));
+        }
+        // Authorization is now witnessed by at least one owner. Record the
+        // reservation locally BEFORE scheduling slower retries, so the old name
+        // is reserved here even if this HTTP request disappears.
+        c.projects.record_rename_tombstone(&project, &new, rename_ms);
+        crate::persist::persist(&c);
+        let unreached: Vec<String> = peers
+            .iter()
+            .zip(results.iter())
+            .filter(|(_, ok)| !**ok)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !unreached.is_empty() {
+            let (c2, project2, new2, team2) = (c.clone(), project.clone(), new.clone(), t.clone());
+            tokio::spawn(async move {
+                futures::future::join_all(unreached.iter().map(|node| {
+                    dispatch_project_rename_with(&c2, node, &project2, &new2, &team2, rename_ms, 3)
+                }))
+                .await;
+            });
+        }
+        return Ok(Json(json!({
+            "project": &new,
+            "previous": &project,
+            "rename_ms": rename_ms,
+            "renamed": 0,
+            "accepted_by": accepted,
+            "local_renamed": false,
+            "cleanup_residuals": [{
+                "resource": "peer_rename_observation",
+                "id": &project,
+                "reason": "at least one peer accepted the rename, but this coordinator held no copy and did not observe the rewrite"
+            }],
+            "note": "not hosted here — rename accepted by peers; this coordinator performed no local rewrite",
+        })));
+    }
+
+    let outcome = rename_project_local_requested(&c, &project, &new, &t, supplied_rename_ms).await;
+    if !outcome.local_renamed {
+        let reason = outcome
+            .residuals
+            .first()
+            .map(|r| r.reason.clone())
+            .unwrap_or_else(|| "the rename could not be applied locally".into());
+        tracing::warn!(project, new, reason, "project rename refused");
+        return Err((StatusCode::CONFLICT, reason));
+    }
+    let rename_ms = outcome.rename_ms;
+    crate::webhooks::dispatch(
+        &c.webhooks,
+        &new,
+        "project.renamed",
+        json!({
+            "project": &new,
+            "previous": &project,
+            "deployments": outcome.renamed,
+            "rename_ms": rename_ms,
+        }),
+    );
+    if cascade {
+        let c2 = c.clone();
+        let project2 = project.clone();
+        let new2 = new.clone();
+        let team2 = t.clone();
+        tokio::spawn(async move {
+            let peers: Vec<String> = c2
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self)
+                .map(|n| n.name)
+                .collect();
+            futures::future::join_all(peers.iter().map(|node| {
+                dispatch_project_rename(&c2, node, &project2, &new2, &team2, rename_ms)
+            }))
+            .await;
+        });
+    }
+    Ok(Json(json!({
+        "project": &new,
+        "previous": &project,
+        "rename_ms": rename_ms,
+        "incarnation": outcome.incarnation,
+        "renamed": outcome.renamed,
+        "moved_domains": outcome.moved_domains,
+        "moved_databases": outcome.moved_databases,
+        "moved_service_graphs": outcome.moved_service_graphs,
+        "moved_metric_buckets": outcome.moved_metric_buckets,
+        "moved_sandboxes": outcome.moved_sandboxes,
+        "local_renamed": outcome.local_renamed,
+        "cleanup_residuals": outcome.residuals,
+    })))
+}
+
+pub(crate) async fn rename_project_local(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+) -> ProjectRenameOutcome {
+    rename_project_local_requested(c, project, new, team, Some(rename_ms)).await
+}
+
+async fn rename_project_local_requested(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    requested_rename_ms: Option<u64>,
+) -> ProjectRenameOutcome {
+    // Two lifecycle writers, always taken in the same (lexicographic) order, so
+    // a concurrent rename in the other direction cannot deadlock.
+    let (first, second) = if project.to_ascii_lowercase() <= new.to_ascii_lowercase() {
+        (project.to_string(), new.to_string())
+    } else {
+        (new.to_string(), project.to_string())
+    };
+    let _lifecycle_first = crate::project_settings::lifecycle_write(&first).await;
+    let _lifecycle_second = crate::project_settings::lifecycle_write(&second).await;
+    rename_project_owned(c, project, new, team, requested_rename_ms).await
+}
+
+/// The one place a rename is applied. Holds BOTH lifecycle writers; every tree
+/// that keys on the project name is rewritten here, in one order, followed by
+/// exactly ONE `persist()` — a rename is never a delete, so no resource is
+/// purged and no tenant data is dropped.
+async fn rename_project_owned(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    requested_rename_ms: Option<u64>,
+) -> ProjectRenameOutcome {
+    let refused = |reason: String| ProjectRenameOutcome {
+        renamed: 0,
+        moved_domains: Vec::new(),
+        moved_databases: 0,
+        moved_service_graphs: 0,
+        moved_metric_buckets: 0,
+        moved_sandboxes: 0,
+        local_renamed: false,
+        rename_ms: requested_rename_ms.unwrap_or(0),
+        incarnation: None,
+        residuals: vec![ProjectCleanupResidual::new("rename", project, reason)],
+    };
+    // Idempotent retry (or a cascade arriving after the fact): the rename
+    // already happened under this exact generation. Re-running it would try to
+    // move a row that no longer exists and report a failure for work that is
+    // already done.
+    if let Some(tomb) = c.projects.rename_tombstone_of(project) {
+        if tomb.new.eq_ignore_ascii_case(new) {
+            return ProjectRenameOutcome {
+                renamed: 0,
+                moved_domains: Vec::new(),
+                moved_databases: 0,
+                moved_service_graphs: 0,
+                moved_metric_buckets: 0,
+                moved_sandboxes: 0,
+                local_renamed: true,
+                rename_ms: tomb.rename_ms,
+                incarnation: tomb.incarnation,
+                residuals: Vec::new(),
+            };
+        }
+        return refused(format!(
+            "\"{project}\" was already renamed to \"{}\"",
+            tomb.new
+        ));
+    }
+    let Some(row) = c.projects.get_if_set(project) else {
+        // No settings row: the caller authorized on a deployment/peer/relational
+        // tier, so a rename here has no authoritative row to move. Refuse rather
+        // than fabricating one — the owning node's own cascade is what applies it.
+        return refused(
+            "this node holds no settings row for the project; the rename must be applied by a node that owns it".into(),
+        );
+    };
+    if record_tenant(&row.team) != UNTAGGED_TENANT && norm(&row.team) != norm(team) {
+        return refused("active project settings belong to another tenant".into());
+    }
+    // Re-check the collision under the writer — a concurrent create may have
+    // taken the name between the request-path check and here.
+    if c.projects.find_key_ci(new).is_some() {
+        return refused(format!("a project named \"{new}\" already exists"));
+    }
+    if c.projects.renamed_away(new).is_some() {
+        return refused(format!("the name \"{new}\" is permanently reserved"));
+    }
+    let incarnation = row.incarnation;
+    let generation_floor = row.updated_ms.max(row.incarnation_created_ms);
+    if let Some(rename_ms) = requested_rename_ms {
+        if rename_ms < generation_floor {
+            return refused("the rename generation is older than this project's last write".into());
+        }
+    }
+    // Cancel and drain in-flight builds first: a build that lands after the
+    // rewrite would register a deployment under the OLD name and resurrect it.
+    let mut residuals = Vec::new();
+    if let Some(incarnation) = incarnation {
+        if let Err(ids) = c
+            .build_cancels
+            .cancel_project_and_drain(c, project, incarnation, Duration::from_secs(10))
+            .await
+        {
+            residuals.extend(ids.into_iter().map(|id| {
+                ProjectCleanupResidual::new(
+                    "build_drain",
+                    id,
+                    "build task did not release its Drop-owned completion before the 10s deadline",
+                )
+            }));
+        }
+        if let Err(paths) =
+            crate::git::wait_for_checkout_drain(project, incarnation, Duration::from_secs(10)).await
+        {
+            residuals.extend(paths.into_iter().map(|path| {
+                ProjectCleanupResidual::new(
+                    "checkout_drain",
+                    path.display().to_string(),
+                    "checkout reservation did not release before the 10s deadline",
+                )
+            }));
+        }
+    }
+    if !residuals.is_empty() {
+        return ProjectRenameOutcome {
+            renamed: 0,
+            moved_domains: Vec::new(),
+            moved_databases: 0,
+            moved_service_graphs: 0,
+            moved_metric_buckets: 0,
+            moved_sandboxes: 0,
+            local_renamed: false,
+            rename_ms: requested_rename_ms.unwrap_or(0),
+            incarnation,
+            residuals,
+        };
+    }
+    let rename_ms = requested_rename_ms.unwrap_or_else(|| {
+        now_ms().max(observed_project_version_ms(c, project).saturating_add(1))
+    });
+    // 1. The settings row moves first: it is the authority every other tree is
+    //    keyed off, and it carries the incarnation across unchanged (a rename is
+    //    the same project under a new name, never a new identity).
+    let moved_row = c.projects.rename_row(project, new, rename_ms);
+    if moved_row.is_none() {
+        return refused("the project's settings row disappeared before it could be moved".into());
+    }
+    // 2. Routing: deployments + every name-derived alias.
+    let renamed = c.gw.rename_project(project, new);
+    // 3. Node-death self-heal's durable "who hosts production" row — dropping it
+    //    blinds relocation for the whole project.
+    c.production_deployments.rename(project, new);
+    // 4. Custom domains: routing keys on the FULL hostname so nothing about
+    //    `geniee.site` moves, but the attachment's owning project does.
+    let moved_domains = c.domains.rename_project(project, new);
+    let moved_databases = c.databases.rename_project(project, new);
+    let moved_service_graphs = c.svcgraph.rename_project(project, new);
+    let moved_metric_buckets = c.metrics.rename_project(project, new);
+    let moved_sandboxes = c.sandboxes.rename_project(project, new);
+    // 5. Event subscriptions: a webhook row naming the old project is
+    //    undeliverable forever, so it follows the rename.
+    let moved_webhooks = c.webhooks.rename_project(project, new);
+    // 5. Git auto-deploy index + the in-memory poll watermark. The REPO is not
+    //    renamed — only the project's name inside these two maps.
+    c.git_index.rename_project(project, new);
+    {
+        let mut seen = c.git_poll_seen.write();
+        if let Some(sha) = seen.remove(project) {
+            seen.entry(new.to_string()).or_insert(sha);
+        }
+    }
+    // 6. The relational mirror is a derived projection and never gates this, but
+    //    it is an authorization fallback, so it must follow.
+    crate::relational::rename_project(project, new, rename_ms).await;
+    // ONE persist: the whole rewrite must be durable before anything can answer.
+    crate::persist::persist(c);
+    c.audit.record(
+        team,
+        "system",
+        "rename",
+        "project",
+        new,
+        &format!("from={project} incarnation={} rename_ms={rename_ms}", incarnation.map(|i| i.to_string()).unwrap_or_else(|| "none".into())),
+    );
+    record_event(
+        c,
+        new,
+        "rename",
+        &format!("renamed from {project} at generation {rename_ms}; deployments={renamed}; webhooks={moved_webhooks}"),
+    );
+    ProjectRenameOutcome {
+        renamed,
+        moved_domains,
+        moved_databases,
+        moved_service_graphs,
+        moved_metric_buckets,
+        moved_sandboxes,
+        local_renamed: true,
+        rename_ms,
+        incarnation,
+        residuals: Vec::new(),
+    }
+}
+
+/// Dispatch a rename to ONE peer over whichever control-plane transport reaches
+/// it (HTTP admin when known, else the iroh mesh). Returns true only when the
+/// peer ACCEPTED the rename and echoed the same generation.
+///
+/// Deliberately a NEW arm rather than a parameter on the delete arm: a
+/// pre-upgrade peer answers 404 / NO_HANDLER, which is a safe no-op (a rename
+/// it cannot perform is reported as a residual), instead of an old binary
+/// ignoring the new name and running a teardown.
+pub(crate) async fn dispatch_project_rename(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+) -> bool {
+    dispatch_project_rename_with(c, node, project, new, team, rename_ms, 3).await
+}
+
+pub(crate) async fn dispatch_project_rename_with(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+    attempts: u32,
+) -> bool {
+    if node == c.node_name {
+        return true; // local copy already handled by the caller
+    }
+    // A validated project name is `[a-z0-9._-]` only (`invalid_project_name`),
+    // so it needs no percent-encoding to ride a query string.
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+        }
+        let admin = c.node_admins.read().get(node).cloned();
+        if let Some(admin) = &admin {
+            let mut request = c
+                .http
+                .post(format!(
+                    "{admin}/v1/projects/{project}/rename?cascade=false&rename_ms={rename_ms}&name={new}"
+                ))
+                .header("x-hive-team", team.to_string());
+            if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if !token.trim().is_empty() {
+                    request = request.header("x-hive-internal", token);
+                }
+            }
+            if crate::auth::enforced() {
+                if let Ok(token) = crate::auth::issue(
+                    "mesh-internal",
+                    team,
+                    "service",
+                    false,
+                    crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+                ) {
+                    request = request.bearer_auth(token);
+                }
+            }
+            match request
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    let ok = r
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .map(|v| {
+                            v.get("rename_ms").and_then(Value::as_u64) == Some(rename_ms)
+                                && v.get("renamed").is_some()
+                        })
+                        .unwrap_or(false);
+                    if ok {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let target = c
+            .registry
+            .nodes()
+            .into_iter()
+            .find(|n| n.name == node)
+            .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+        if let Some((id, addr)) = target {
+            let path = format!(
+                "/v1/projects/{project}/rename?{}&rename_ms={rename_ms}&name={new}",
+                mesh_team_qs(team)
+            );
+            if let Some(body) =
+                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+            {
+                // The mesh protocol carries no status code, so a REFUSAL
+                // arrives as a perfectly well-delivered body. Acceptance means
+                // the arm actually ran the rewrite (it answers `renamed`).
+                let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                let accepted = v
+                    .as_ref()
+                    .map(|v| {
+                        v.get("error").is_none()
+                            && v.get("renamed").is_some()
+                            && v.get("rename_ms").and_then(Value::as_u64) == Some(rename_ms)
+                    })
+                    .unwrap_or(false);
+                if accepted {
+                    return true;
+                }
+                if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
+                    return false;
+                }
+            }
+        } else if admin.is_none() {
+            tracing::warn!(
+                node,
+                project,
+                "project rename: no route to peer (no admin URL, no iroh identity)"
+            );
+            return false;
+        }
+    }
     false
 }
 
@@ -8698,6 +9414,17 @@ pub async fn functions(
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("")
             ))
         });
+        // A peer answers `?local=true` UNFILTERED on purpose (the billing
+        // meter's aggregation path must see every tenant), so its rows carry
+        // whatever tenants that peer hosts. Re-scope them to the caller before
+        // they leave a tenant-scoped request -- otherwise one tenant's
+        // dashboard page lists every other tenant's functions, and an
+        // unauthenticated read (`t == ANON_TENANT`) matched the peer slice
+        // only because the local filter never ran on it. Internal (`service`)
+        // callers keep the unfiltered aggregate.
+        if !internal {
+            list.retain(|v| norm(v.get("tenant").and_then(|x| x.as_str()).unwrap_or("")) == t);
+        }
     }
     let out = json!(list);
     if is_top_level {
