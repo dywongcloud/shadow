@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-13 — the host build lane reads tenant output through the capped reader
+
+`IsolatedBuild::run_host` drained a build command's stdout and stderr with
+`BufReader::lines().next_line()`, which has no length limit: a step that prints a
+long run of bytes without a newline (progress bar, one-line source map, a hostile
+command) grew one `String` until the node died, and the store-boundary cap
+(`MAX_BUILD_LOG_LINE_BYTES`) only bounded what the `Build` record kept afterwards.
+Both readers now use `hive_core::logcap::read_capped_line` like the mock backend,
+the cell agent and the isolated executor: the pipe is still drained, at most 16 KiB
+of a line is retained, truncations are counted in `LOG_CAP_STATS`
+(`GET /v1/debug/memory`). Witness (hermetic node, build script printing 256 MiB with
+no newline): node RSS peak 644 MB (+548 MB) before, 140 MB (+28 MB) after. Not rolled.
+
 ## 2026-10-13 — a failed first build no longer hides its project or locks its name
 
 A project whose first build failed had a `ProjectSettings` row (created at
