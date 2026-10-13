@@ -1,0 +1,13 @@
+{
+  "name": "Deploy to Shadw",
+  "description": "Deploy this repository to Shadw using shadw.yml.",
+  "iconName": "shadw-deploy",
+  "categories": [
+    "Deployment"
+  ],
+  "filePatterns": [
+    "shadw\\.ya?ml$",
+    "package\\.json$",
+    "vercel\\.json$"
+  ]
+}

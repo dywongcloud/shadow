@@ -14,6 +14,7 @@
 
 pub mod build_output;
 pub mod deployment_snapshot;
+pub mod shadw_config;
 pub mod framework;
 pub mod nextjs;
 pub mod parser;
@@ -41,6 +42,10 @@ pub use repository_snapshot::{
     GeneratedStep, MetadataInputSeal, PackageManagerSnapshot, ParentPath, RepositoryBuildContract,
     RepositoryBuildSnapshot, RepositoryCoordinates, RepositoryPath, StepAuthority,
     WorkspaceSnapshot,
+};
+pub use shadw_config::{
+    load_shadw_config, load_shadw_config_checked, ShadwBuild, ShadwConfig, ShadwDeploy,
+    SHADW_CONFIG_VERSION,
 };
 pub use vercel_config::{
     load_vercel_config, load_vercel_config_checked, ConditionValue, VercelCondition, VercelConfig,

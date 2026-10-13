@@ -1,0 +1,24 @@
+# shadw.yml — standard Shadw project config (v1)
+# Read by the "Deploy to Shadw" GitHub Action (dywongcloud/shadow).
+# Schema: https://raw.githubusercontent.com/dywongcloud/shadow/main/schemas/shadw.schema.json
+version: 1
+
+# Shadw project name (lowercase DNS label). Omit to let Shadw assign one.
+project: my-app
+
+# Monorepo subdirectory to build. "." = repository root.
+root_dir: .
+
+# auto = classify by branch (production branch -> production, others/PRs -> preview).
+target: auto
+
+build:
+  cache: true            # false = clean install (npm ci, no cached node_modules)
+
+# Non-secret runtime env. Put secrets in the action's `env` input from GitHub secrets.
+env:
+  NODE_ENV: production
+
+deploy:
+  wait: true             # follow build logs and fail the job if the build errors
+  timeout_minutes: 20
