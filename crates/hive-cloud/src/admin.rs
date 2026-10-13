@@ -6285,11 +6285,6 @@ async fn delete_project_owned(
             )
         }));
     }
-    // Inventory only after cancellation/drain has settled. An already-admitted
-    // build can create exact-incarnation workflow storage while the delete is
-    // acquiring this writer; snapshotting before the drain would miss that new
-    // database and then falsely report cleanup complete. The pre-cancel checkout
-    // paths above remain source-lineage evidence even after their guards drop.
     let inventory = project_delete_inventory(&c, &project, &team, &settings, &active_checkouts);
 
     let delete_ms = match requested_delete_ms {
@@ -6323,10 +6318,6 @@ async fn delete_project_owned(
     };
 
     c.git_index.remove_project(&project);
-    // Node-death self-heal: a deleted project's last-known production host
-    // must not survive it — the reconciler must never "relocate" a project
-    // the tenant deliberately removed. Tombstoned, same durability discipline
-    // as `ProjectStore`'s own tombstones.
     c.production_deployments.remove(&project);
     let preserved_domains: std::collections::HashSet<String> = c
         .projects
@@ -6336,9 +6327,6 @@ async fn delete_project_owned(
         .collect();
     c.domains
         .clear_verify_for_project(&project, &preserved_domains);
-    // Persist the exact logical tombstone before any async runtime/resource
-    // teardown. A process death after this point may leave residual bytes, but
-    // it can never resurrect routing or the project lifetime.
     crate::persist::persist(&c);
 
     let removed_records = c.gw.remove_project_incarnation(&project, incarnation).await;
@@ -6423,10 +6411,9 @@ async fn delete_project_owned(
     }
 }
 
-/// LOCAL-ONLY project teardown used by HTTP and mesh receivers. The owned
-/// lifecycle guard moves into a spawned task before any await that request
-/// cancellation can drop; the task owns cancellation, tombstoning, exact route
-/// removal, and bounded physical cleanup to completion.
+/// LOCAL-ONLY project teardown for HTTP and mesh receivers: the owned lifecycle guard moves into a
+/// spawned task before any await a request cancellation can drop, and that task owns cancellation,
+/// tombstoning, exact route removal and bounded physical cleanup to completion.
 async fn delete_project_local_requested(
     c: &Arc<CloudState>,
     project: &str,
@@ -6459,9 +6446,9 @@ async fn delete_project_local_requested(
     }
 }
 
-/// Mixed-version mesh/main call seam: propagated deletes always carry a
-/// generation. User-originated deletes call `delete_project_local_requested`
-/// with `None` so the exact owner issues the generation under its writer.
+/// Mixed-version mesh/main call seam: propagated deletes always carry a generation; user-originated
+/// deletes call `delete_project_local_requested` with `None` so the exact owner issues the
+/// generation under its writer.
 pub(crate) async fn delete_project_local(
     c: &Arc<CloudState>,
     project: &str,
@@ -6471,10 +6458,9 @@ pub(crate) async fn delete_project_local(
     delete_project_local_requested(c, project, team, Some(delete_ms)).await
 }
 
-/// Query for project_delete: `cascade=false` deletes only on this node (no mesh
-/// fan-out). `delete_ms` is the immutable generation issued by the originating
-/// delete and reused by every retry; absent on a user-originated request and on
-/// pre-upgrade peers. Defaults to cascade when absent.
+/// Query for project_delete: `cascade=false` deletes only on this node (no mesh fan-out);
+/// `delete_ms` is the immutable generation of the originating delete, reused by every retry (absent
+/// on a user request and on pre-upgrade peers); cascade defaults to true.
 #[derive(Deserialize, Default)]
 struct CascadeQ {
     #[serde(default, deserialize_with = "de_lenient_bool")]
@@ -6483,9 +6469,8 @@ struct CascadeQ {
     delete_ms: Option<u64>,
 }
 
-/// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
-/// a bare `{}` still works). `target` chooses the environment (production /
-/// preview); `use_cache` toggles the existing build cache.
+/// Body of the Redeploy modal (every field optional, a bare `{}` works): `target` picks the
+/// environment (production/preview), `use_cache` toggles the build cache.
 #[derive(Deserialize, Default)]
 struct RedeployBody {
     #[serde(default)]
@@ -6498,10 +6483,9 @@ struct RedeployBody {
     git_token: Option<String>,
 }
 
-/// Redeploy a project's newest git source (create a fresh deployment).
-/// Find the latest git source for a project — from this node's gateway, OR (when
-/// the placement scheduler put the project on a peer) from the gossiped fleet
-/// deployments. Lets redeploy work even when the project is hosted remotely.
+/// The newest git source of a project from this node's gateway or, when the placement scheduler put
+/// the project on a peer, from the gossiped fleet deployments, so redeploy works for remotely
+/// hosted projects.
 pub(crate) fn git_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
@@ -6519,32 +6503,21 @@ pub(crate) fn git_for_project_fleet(
         .and_then(|d| d.git.clone())
 }
 
-/// The newest deployment's SOURCE for `project`, fleet-aware and INCLUDING the
-/// non-real-git pseudo-sources (`upload://` zip, `image://` prebuilt image). Unlike
-/// `git_for_project_fleet` (which filters `is_real_git`, powering GitHub-webhook
-/// lookups), this powers REDEPLOY, which must reconstruct a build for zip- and
-/// image-based projects too — those return `None` from the git-only helper and were
-/// the exact cause of redeploy 404ing for every non-git project.
-/// Returns the source plus whether it came from the PRODUCTION lane. A redeploy
-/// must rebuild from the newest PRODUCTION deployment when one exists — picking
-/// the newest record across ALL environments meant any preview (PR branch) that
-/// landed after the last production deploy hijacked "Redeploy": the rebuild
-/// cloned the preview's branch, branch-vs-production_branch classification then
-/// filed the result as a preview, and the project's production alias kept
-/// serving whatever was there before (or a failed preview).
+/// The newest deployment's SOURCE for `project`, fleet-aware and INCLUDING the non-real-git
+/// pseudo-sources (`upload://` zip, `image://` prebuilt image), unlike `git_for_project_fleet`
+/// (which filters `is_real_git` for GitHub-webhook lookups): redeploy must rebuild zip- and
+/// image-based projects too. Returns the source, whether it came from the PRODUCTION lane and the
+/// selected upload source's platform-issued BUILD ids (`GitSource.commit`; checkout dirs and
+/// retained archives are keyed by build id, not deployment id). A redeploy rebuilds from the newest
+/// PRODUCTION deployment when one exists (the newest record across all environments let a later
+/// preview hijack "Redeploy"), and the LIVE promoted deployment (`production == true`) outranks the
+/// lane heuristic entirely: `target` is immutable while promote/rollback flips only `production`,
+/// so sourcing the newest `target = "production"` record would re-promote the very deployment the
+/// operator just rolled back from.
 fn source_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
 ) -> Option<(fluid_core::GitSource, bool, Vec<String>)> {
-    // The third element is the selected upload source's platform-issued BUILD
-    // id (`GitSource.commit`). Checkout dirs and retained archives are keyed by
-    // build id, not by the independently-minted deployment id.
-    // The LIVE promoted deployment (production == true) outranks the lane
-    // heuristic entirely: `target` is immutable while promote/rollback flips
-    // only `production`, so after promoting a preview the current production
-    // deployment is stamped target="preview" — sourcing the newest
-    // target="production" record instead would rebuild (and re-promote) the
-    // very deployment the operator just rolled back from.
     let mut best_live: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_prod: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_any: Option<(u64, fluid_core::GitSource)> = None;
@@ -6554,8 +6527,6 @@ fn source_for_project_fleet(
                 best_live = Some((ts, g.clone()));
             }
         }
-        // `target` is immutable ("production"/"preview"); empty = pre-target
-        // snapshot, fall back to the live promoted flag.
         let prod_lane = match target.trim() {
             "production" => true,
             "preview" => false,
@@ -6604,33 +6575,20 @@ fn source_for_project_fleet(
     })
 }
 
-/// The port + protocol the newest deployment for `project` was actually running with
-/// (its `web` function's declared port, whatever `container_manifest` baked in at
-/// deploy time — an explicit override or the auto-detected value) — LOCAL only (this
-/// node's own `deployment_records`; a project placed entirely on a peer has no
-/// manifest available here, since `peer_deployments`'/`DeploymentInfo` carries no
-/// port info, only `GitSource` — same fleet-locality gap `source_for_project_fleet`
-/// itself only partially closes). Feeds `redeploy_request` so an image redeploy
-/// restores the ORIGINAL port/protocol instead of blindly re-running auto-detection
-/// (which silently drops a manual override, and can't even land on the right answer
-/// for a multi-port image). `None` when there's no prior deployment with a declared
-/// port (no deploy yet, non-container deployment, or the record lives only on a peer).
+/// The port + protocol the project's newest deployment actually ran with (its `web` function's
+/// declared port, an explicit override or the auto-detected value), from LOCAL records only:
+/// `peer_deployments` carries no port info, so a project placed entirely on a peer has none here.
+/// Feeds `redeploy_request` so an image redeploy restores the ORIGINAL port/protocol instead of
+/// re-running auto-detection (which drops a manual override and cannot get a multi-port image
+/// right); `None` when no prior deployment declared a port.
 fn image_port_spec_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
 ) -> Option<fluid_core::PortSpec> {
     fn spec_from(f: &fluid_core::FunctionConfig) -> Option<fluid_core::PortSpec> {
-        // Post-fix records carry the real spec directly.
         if let Some(p) = f.ports.first() {
             return Some(fluid_core::PortSpec::single(p.container_port, p.protocol));
         }
-        // Back-compat: a record written before `FunctionConfig.ports` existed —
-        // recover the port from the `__container__` structured marker
-        // (start_cmd = ["__container__", image, port, run_cfg_json], see
-        // `container_manifest`/`image_container_manifest` in git.rs) with whatever
-        // protocol was baked in (pre-fix that was always `http`, so this only ever
-        // recovers a plain TCP/HTTP port — the only kind that could exist before
-        // this patch).
         if f.runtime == "container"
             && f.start_cmd.first().map(String::as_str) == Some("__container__")
         {
@@ -6639,9 +6597,6 @@ fn image_port_spec_for_project_fleet(
         }
         None
     }
-    // Mirror source_for_project_fleet's lane preference: the redeploy sources
-    // the live/production record, so restoring the port spec from a NEWER
-    // preview record would pair a production source with a preview's ports.
     let mut best_live: Option<(u64, fluid_core::PortSpec)> = None;
     let mut best_prod: Option<(u64, fluid_core::PortSpec)> = None;
     let mut best_any: Option<(u64, fluid_core::PortSpec)> = None;
@@ -6682,9 +6637,9 @@ fn image_port_spec_for_project_fleet(
     best_live.or(best_prod).or(best_any).map(|(_, spec)| spec)
 }
 
-/// Build a placement `Target` addressing a specific node by NAME: self (both None),
-/// its HTTP admin URL when known, else its iroh mesh route. `None` when the node is
-/// unknown/unreachable. Used to pin a zip redeploy to the node holding the source.
+/// Builds a placement `Target` addressing a node by NAME: self (both None), its HTTP admin URL when
+/// known, else its iroh mesh route; `None` when the node is unknown or unreachable. Used to pin a
+/// zip redeploy to the node holding the source.
 fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::Target> {
     if node == c.node_name {
         return Some(crate::schedule::Target {
@@ -6711,9 +6666,9 @@ fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::T
     }
 }
 
-/// One deterministic node hosting `project`, preferring the live production
-/// record and then the newest record. Project-level owner proxies use this when
-/// public round-robin ingress lands on a node with no local deployment state.
+/// One deterministic node hosting `project`, preferring the live production record, then the
+/// newest; project-level owner proxies use it when public round-robin ingress lands on a node with
+/// no local deployment state.
 fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
     let mut candidates = Vec::new();
     for deployment in c.gw.list() {
@@ -6746,9 +6701,9 @@ fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
     candidates.into_iter().next().map(|(_, _, node)| node)
 }
 
-/// Peer node NAMES hosting `project` — addressed by node (not HTTP admin URL) so the
-/// caller can reach them over the iroh mesh via `fetch_from_host` (FC nodes have no
-/// HTTP admin URL in `node_admins`). Pairs with `peer_nodes_for_tenant` below.
+/// Peer node NAMES hosting `project`, addressed by node (not HTTP admin URL) so callers reach them
+/// over the iroh mesh via `fetch_from_host` (FC nodes have no HTTP admin URL in `node_admins`);
+/// pairs with `peer_nodes_for_tenant`.
 fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
     c.peer_deployments
         .read()
@@ -6758,11 +6713,10 @@ fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
         .collect()
 }
 
-/// GET `path` from a peer admin, forwarding the team header; returns parsed JSON.
-/// Byte-oriented sibling of [`fetch_from_host`], for reads whose payload isn't
-/// JSON (blob objects). Kept deliberately simple — HTTP admin URL only — since
-/// its callers all fall back to their existing not-found behaviour when it
-/// returns `None`, so it can never make a read worse than it is today.
+/// GET `path` from a peer admin, forwarding the team header, as raw bytes: the byte-oriented
+/// sibling of [`fetch_from_host`] for payloads that are not JSON (blob objects). Deliberately
+/// HTTP-admin-only: its callers all fall back to their existing not-found behaviour on `None`, so
+/// it can never make a read worse.
 pub(crate) async fn fetch_bytes_from_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -6799,10 +6753,6 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
         .get(format!("{admin}{path}"))
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(10));
-    // Under JWT enforcement `x-hive-team` alone resolves to ANON on the target
-    // (headers are client-supplied, never trusted) — every tenant-gated read
-    // proxied here silently 403'd. Attach the same short-lived signed service
-    // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
         if let Ok(tok) = crate::auth::issue(
             "mesh-internal",
@@ -6821,13 +6771,6 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     resp.json::<Value>().await.ok()
 }
 
-// ---- node-addressed read-view proxying (HTTP admin OR iroh mesh) ----------------
-// The NAT'd coordinator has NO HTTP admin path to the FC nodes (SSH tunnels cut), so
-// `node_admins` is empty for them and the HTTP `host_admin_for_*` helpers return None
-// — which silently emptied the dashboard's per-deployment read views (resources, and
-// the workflows tab) for FC-hosted projects. These resolve the host NODE NAME instead
-// and fetch over whichever transport works: HTTP admin if known, else the iroh mesh.
-
 /// Host node NAME for deployment `id` (no HTTP-admin requirement).
 pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
     c.peer_deployments
@@ -6837,9 +6780,9 @@ pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<
         .map(|(node, _)| node.clone())
 }
 
-/// Host node NAME for the selected upload source lineage. Matching the
-/// platform-issued build id stamped in `GitSource.commit` is load-bearing: a
-/// host carrying only a newer preview checkout cannot rebuild production.
+/// Host node NAME for the selected upload source lineage; matching the platform-issued build id
+/// stamped in `GitSource.commit` is load-bearing, since a host carrying only a newer preview
+/// checkout cannot rebuild production.
 fn host_node_for_source_ids(c: &Arc<CloudState>, ids: &[String]) -> Option<String> {
     c.peer_deployments
         .read()
@@ -6867,13 +6810,10 @@ fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// Every deployment across the WHOLE fleet, ALL tenants (operator scope): the
-/// locally-hosted set plus every gossiped `peer_deployments` entry, deduped by id.
-/// The ops overview + data browser run on one node, but the placement scheduler
-/// hosts deployments on peers — a bare `c.gw.list()` returns only what this node
-/// hosts (often nothing on a coordinator), which is why the ops console showed
-/// "0 deployments" while peers served every project. This mirrors `dep_list`'s
-/// aggregation but WITHOUT the tenant filter (operator-only callers).
+/// Every deployment across the WHOLE fleet, ALL tenants (operator scope): the locally hosted set
+/// plus every gossiped `peer_deployments` entry, deduped by id. `dep_list`'s aggregation without
+/// the tenant filter (operator-only callers), since a bare `c.gw.list()` returns only what this
+/// node hosts (often nothing on a coordinator).
 fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
     let mut list = c.gw.list();
     let mut seen: std::collections::HashSet<String> =
@@ -6889,17 +6829,12 @@ fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
     list.into_iter().map(|d| json!(d)).collect()
 }
 
-/// GET a read-view from a host node by NAME: HTTP admin if we have one, else over the
-/// iroh mesh (resolve the node's id+addr from the gossip registry). Team rides as a
-/// query param on the iroh path (no HTTP headers over that transport).
-/// Aggregate per-function usage stats across the WHOLE fleet: the local node's
-/// live stats plus each peer's `/v1/functions` (over HTTP admin or iroh gossip).
-/// The billing meter loop uses this so a NAT'd coordinator still bills compute that
-/// actually ran on the Firecracker nodes. Each `FunctionStats` carries its `tenant`.
+/// Aggregates per-function usage stats across the WHOLE fleet: this node's live stats plus each
+/// peer's `/v1/functions` (HTTP admin or iroh gossip), so the billing meter still bills compute
+/// that ran on Firecracker nodes behind a NAT'd coordinator; each `FunctionStats` carries its
+/// `tenant`.
 pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::FunctionStats> {
     let mut out: Vec<fluid_compute::FunctionStats> = c.fluid.stats();
-    // `local=true` is REQUIRED now that `/v1/functions` fans out itself —
-    // without it each peer would re-fan to every other peer.
     for v in fan_out_peers(c, &all_healthy_peers(c), "", "/v1/functions?local=true").await {
         if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
             out.append(&mut stats);
@@ -6908,11 +6843,10 @@ pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::Fun
     out
 }
 
-/// Build the mesh tenant query segment: `team=<t>` plus a signed, short-lived
-/// (`&tok=<jwt>`) delegation token when JWT signing is configured. The host node
-/// verifies the token as an authoritative, expiring tenant assertion instead of
-/// trusting the raw `team=` param (see `gossip::team_claims`). Empty `team`
-/// yields an empty segment (callers append nothing).
+/// The mesh tenant query segment: `team=<t>` plus a signed, short-lived `&tok=<jwt>` delegation
+/// when JWT signing is configured; the host node verifies the token as an authoritative expiring
+/// tenant assertion instead of trusting the raw `team=` param (`gossip::team_claims`). An empty
+/// `team` yields an empty segment.
 pub(crate) fn mesh_team_qs(team: &str) -> String {
     if team.is_empty() {
         return String::new();
@@ -6931,14 +6865,15 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
     format!("team={team}")
 }
 
+/// GETs a read-view from a host node by NAME: the HTTP admin when known, else over the iroh mesh
+/// (node id + addr from the gossip registry), where the team rides as a query param because that
+/// transport has no HTTP headers.
 pub(crate) async fn fetch_from_host(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,
     team: &str,
 ) -> Option<Value> {
-    // Bind out of the lock FIRST so no parking_lot guard is held across the await
-    // (the dispatched future must be `Send`).
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
         if let Some(v) = proxy_get_json(c, &admin, path, team).await {
@@ -6954,20 +6889,16 @@ pub(crate) async fn fetch_from_host(
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        // 20s (not the old flat 10s): `acquire`'s cached-hint attempt can now fall
-        // back to a fresh-discovery dial (`PeerPool::dial_fresh`) when the hint is
-        // stale, which needs headroom beyond `connect_budget()` alone to actually
-        // complete instead of being cut off by this outer timeout.
-        //
-        // `addr` here is `n.iroh_addr` — a snapshot serialized at the HOST's own
-        // boot/last-gossip time, so its relay (if any) can go stale exactly like
-        // the direct addrs can. `request_to` re-hints the relay transport (this
-        // node's live-gossiped registry view of `id`'s own/nearest relay_url —
-        // see `gossip::relay_hinted_addr`) before dialing, so a call from e.g.
-        // fc-hongkong to fc-sanjose hints sj's own live relay_url rather than
-        // whatever was cached in `addr` at gossip time.
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_GET,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -6975,73 +6906,33 @@ pub(crate) async fn fetch_from_host(
     None
 }
 
-/// `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh) are
-/// DIAL-RESILIENCE budgets — right for one-shot control operations,
-/// structurally wrong for anything on a request path: one registry-healthy
-/// peer whose trunk is cold made `/v1/functions` and `/v1/metrics` take a flat
-/// ~20s per poll (measured live), which the 3-5s dashboard polling then piled
-/// onto until the usage page rendered nothing at all. The fetches run
-/// concurrently, so the whole fan-out costs at most one budget; a peer that
-/// misses it contributes to the next poll instead (the wf_runs PHASE_BUDGET
-/// precedent, applied at the shared chokepoint). Kept for CONTROL callers
-/// (the billing meter's `fleet_function_stats`); polled dashboard reads use
-/// `POLLED_READ_PER_PEER_BUDGET` instead.
+/// Per-peer budget for CONTROL fan-outs (the billing meter's `fleet_function_stats`):
+/// `fetch_from_host`'s own 10 s HTTP / 20 s iroh budgets are dial-resilience budgets, wrong on a
+/// request path (one cold-trunk peer made `/v1/functions` and `/v1/metrics` take a flat ~20 s per
+/// poll). Fetches run concurrently, so the whole fan-out costs at most one budget and a peer that
+/// misses it contributes to the next poll; polled dashboard reads use
+/// [`POLLED_READ_PER_PEER_BUDGET`].
 const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
 
-/// Per-peer budget for a POLLED dashboard read (every `fan_out_peers_polled`
-/// caller). Live-measured on the 11-node fleet: a peer's `?local=true` handler
-/// answers in ~0.5 ms locally and the mesh round trip is 100-200 ms, so 3s is
-/// >10x headroom over a healthy peer — while 8s is exactly what turned a
-/// congested trunk into a flat 8.00 s page load (`/v1/functions` and
-/// `/v1/metrics` measured at 8.0028 s / 8.0030 s on fc-sanjose, and hitting
-/// 8.00 s on fc-virginia / fc-virginia-3 on every second poll). The mesh was
-/// NOT idle: every node's own gossip collect phase consumed its full 8000 ms
-/// deadline on 30-46 of 46-54 rounds per 10 min (`gossip rounds (last 10 min)`
-/// in the journal), because the admin fan-out shares the pooled trunks with
-/// gossip and the multi-MB store_sync pulls. A peer that misses this budget is
-/// still merged on the next poll, exactly as it was when it missed 8s.
+/// Per-peer budget for a POLLED dashboard read (every `fan_out_peers_polled` caller): a peer's
+/// `?local=true` handler answers in ~0.5 ms and the mesh round trip is 100-200 ms, so 3 s is >10x
+/// headroom over a healthy peer, while 8 s turned a congested trunk into a flat 8 s page load (the
+/// admin fan-out shares the pooled trunks with gossip and the multi-MB store_sync pulls). A peer
+/// that misses it is merged on the next poll.
 const POLLED_READ_PER_PEER_BUDGET: Duration = Duration::from_secs(3);
 
-/// TTL for the dashboard-polled response caches (`/v1/functions`,
-/// `/v1/metrics`) — and REQUIRED to outlast one poll INTERVAL plus one build,
-/// or a poller never sees a warm entry.
-///
-/// Live-witnessed 2026-09-30: both endpoints cost 3.0028 s to build on the
-/// control-plane leader (fc-sanjose) — exactly `POLLED_READ_PER_PEER_BUDGET`,
-/// i.e. one unreachable-but-healthy-listed peer burning the whole fan-out
-/// budget. A 3 s TTL is therefore shorter than one poll interval plus one
-/// build: an entry stored at T expired at T+3, while the dashboard's 3-5 s poll
-/// cadence next asks at ~T+3.5 — so every poll missed and rebuilt. (Back-to-
-/// back calls DID hit it — 3.0149 s then 0.0008 s, measured on the old binary —
-/// which is what masked this: it looks cached under `curl` twice and uncached
-/// under a real dashboard.)
-///
-/// The missed polls are not evenly distributed either: because the dashboard's
-/// `/ops/*` proxy forwards to the leader, the slow node is the one users hit.
-///
-/// 15 s is >4x the measured worst-case build, so a poll every 3-5 s hits a
-/// warm entry. Metrics are minute-granular so that staleness is invisible, and
+/// TTL of the dashboard-polled response caches (`/v1/functions`, `/v1/metrics`): it MUST outlast
+/// one poll interval plus one build, or a poller never sees a warm entry (a 3 s TTL expired before
+/// the dashboard's 3-5 s cadence asked again, so every poll rebuilt, while back-to-back `curl`
+/// calls looked cached). 15 s is >4x the measured worst-case build; metrics are minute-granular and
 /// the functions list only changes on a deploy.
 const POLLED_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(15);
 
-/// Fan out `path` (identical for every peer — only the target host varies) to
-/// every node in `peers` CONCURRENTLY, returning each reachable peer's parsed
-/// JSON response (unreachable/malformed peers are silently absent — never
-/// fail the whole read over one bad node).
-///
-/// Replaces the hand-rolled `for node in <peer list> { ...fetch_from_host
-/// (...).await... }` sequential loop that used to live in every one of these
-/// "merge every peer's view" handlers (metrics_get, wf_list, wf_runs,
-/// wf_summary, cron_list, fleet_function_stats, admin_overview). Each hop can
-/// carry up to `fetch_from_host`'s own 20s timeout, so N sequential hops could
-/// cost up to N×20s in the worst case (live-witnessed as the dashboard's
-/// slowest reads); `join_all` bounds the total added latency to the SLOWEST
-/// single hop instead of the sum of every hop — with a 10-node fleet this is
-/// up to a ~9x cut. Callers keep their own per-endpoint merge logic (it's
-/// cheap, in-memory, never the bottleneck) — only the network fan-out itself
-/// changes shape. `peers` is caller-supplied (not always "every healthy fleet
-/// node" — `peer_nodes_for_tenant` narrows to only nodes hosting the tenant's
-/// projects for the workflow endpoints).
+/// Fans `path` (identical for every peer) out to every node in `peers` CONCURRENTLY and returns
+/// each reachable peer's parsed JSON; unreachable or malformed peers are silently absent, never
+/// failing the whole read. `join_all` bounds the added latency to the SLOWEST single hop instead of
+/// the sum of sequential hops; callers keep their own merge logic, and `peers` is caller-supplied
+/// (`peer_nodes_for_tenant` narrows to the nodes hosting the tenant's projects).
 async fn fan_out_peers(
     c: &Arc<CloudState>,
     peers: &[String],
@@ -7051,13 +6942,11 @@ async fn fan_out_peers(
     fan_out_peers_bounded(c, peers, team, path, PER_PEER_BUDGET).await
 }
 
-/// `fan_out_peers` for the endpoints the dashboard re-asks every few seconds
-/// (functions, metrics, cron, workflows, webhooks, notifications, ops
-/// overview, service-graph). Identical shape, tighter per-peer budget — see
-/// `POLLED_READ_PER_PEER_BUDGET`. Deliberately NOT used by the billing
-/// meter's `fleet_function_stats`: under-counting metered compute is a
-/// revenue-correctness question, and that loop is not latency-critical, so it
-/// keeps the generous control-operation budget.
+/// [`fan_out_peers`] for the endpoints the dashboard re-asks every few seconds (functions, metrics,
+/// cron, workflows, webhooks, notifications, ops overview, service graph), with the tighter
+/// [`POLLED_READ_PER_PEER_BUDGET`]. Deliberately NOT used by the billing meter's
+/// `fleet_function_stats`: under-counting metered compute is a revenue-correctness question and
+/// that loop is not latency-critical.
 async fn fan_out_peers_polled(
     c: &Arc<CloudState>,
     peers: &[String],
@@ -7098,15 +6987,12 @@ fn all_healthy_peers(c: &Arc<CloudState>) -> Vec<String> {
         .collect()
 }
 
-/// Assemble the deploy request for a redeploy from the resolved source. `no_fanout`
-/// pins a zip redeploy to the node holding the retained source (see below); git/image
-/// redeploys leave it false so the normal placement scheduler runs. `image_port_spec`
-/// is the ORIGINAL port/protocol the project's newest deployment ran with (see
-/// `image_port_spec_for_project_fleet`) — restored onto `image_port`/`image_protocol`
-/// so an image redeploy doesn't silently discard an explicit override (or a
-/// UDP-only image's only possible port) and blindly re-detect from scratch every
-/// time. Harmless to set for a non-image (git/zip) redeploy: `image_ref` stays
-/// `None` there, so `produce_manifest` never even looks at these two fields.
+/// Assembles the deploy request for a redeploy from the resolved source. `no_fanout` pins a zip
+/// redeploy to the node holding the retained source, git/image redeploys leave it false so the
+/// placement scheduler runs. `image_port_spec` is the ORIGINAL port/protocol of the project's
+/// newest deployment, restored onto `image_port`/`image_protocol` so an image redeploy keeps an
+/// explicit override (or a UDP-only image's only port); harmless for git/zip, where `image_ref`
+/// stays `None`.
 fn redeploy_request(
     project: &str,
     src: &fluid_core::GitSource,
@@ -7122,12 +7008,7 @@ fn redeploy_request(
         source_deployment_ids,
         repo_url: src.repo_url.clone(),
         branch: Some(src.branch.clone()).filter(|b| !b.is_empty()),
-        // Manual redeploy has no specific webhook-notified commit — build
-        // whatever the branch currently points to, same as before this field
-        // existed.
         commit: None,
-        // A redeploy always clones the project's own configured repo — there is
-        // no webhook PR payload here to have identified a fork in the first place.
         head_repo_url: None,
         project: Some(project.to_string()),
         project_incarnation: None,
@@ -7136,34 +7017,31 @@ fn redeploy_request(
         target,
         use_cache,
         root_dir,
-        env: None, // redeploy: existing project env is read from the store at build time
+        env: None,
         no_fanout,
-        // A pinned zip redeploy (`no_fanout: true`) targets exactly ONE node (the
-        // retained-source holder) — never one-of-many — so it is never a secondary.
         fanout_secondary: false,
-        build_config: None, // coordinator reads its own store; fanout fills these per-target
+        build_config: None,
         function_settings: None,
-        redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
+        redeploy: false,
         zip_b64: None,
         image_ref: None,
         image_port: image_port_spec.as_ref().map(|p| p.container_port),
         image_protocol: image_port_spec.as_ref().map(|p| p.protocol),
-        // Resource overrides (unlike port/protocol above) aren't restored from
-        // the project's deployment history — a redeploy takes the node's
-        // default until the caller re-specifies one.
         image_memory: None,
         image_cpus: None,
         image_pids: None,
-        // A multi-port declaration isn't restored from history on redeploy
-        // (only the single primary image_port_spec is) — a genuinely narrower,
-        // separately-tracked residual of this restore path, not a regression:
-        // the single-port restore this field sits beside has the exact same
-        // shape it always did.
         image_ports: None,
         git_token,
     }
 }
 
+/// Redeploys a project from its newest deployment's source (see [`source_for_project_fleet`]): a
+/// zip project rebuilds from the RETAINED source (locally when this node holds it, else dispatched
+/// to the holder), an image project is redeployed as an image, a real git source re-clones through
+/// the normal placement path. Without an explicit environment the rebuild lands in the sourced
+/// deployment's OWN environment, never branch-vs-production_branch guessing. A project that never
+/// deployed falls back to its `last_build` source (a failed first build is retried on the
+/// production lane); the webhook and the git poll keep ignoring never-deployed projects.
 async fn project_redeploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7184,8 +7062,6 @@ async fn project_redeploy(
         }
     };
 
-    // Environment chosen in the modal: "production" | "preview". When absent the
-    // branch decides (Vercel's classification).
     let target = body
         .target
         .as_ref()
@@ -7200,10 +7076,6 @@ async fn project_redeploy(
     )
     .filter(|s| !s.is_empty());
 
-    // Resolve the newest deployment's SOURCE including the non-git pseudo-sources
-    // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
-    // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
-    // zip-uploaded or image-based project (the reported bug).
     let last_build_source = || {
         let row = c.projects.get_if_set(&project)?;
         let build = row.last_build?;
@@ -7232,21 +7104,9 @@ async fn project_redeploy(
             format!("Project '{project}' has no deployment or build to redeploy from yet."),
         ));
     };
-    // No explicit environment in the modal: a redeploy rebuilds the deployment
-    // it sourced from into that deployment's OWN environment (Vercel's model).
-    // Leaving `target: None` fell through to branch-vs-production_branch
-    // guessing at build time, which misfiled production redeploys as previews
-    // whenever the sourced branch string didn't exactly match.
     let target = target.or_else(|| Some(if prod_lane { "production" } else { "preview" }.into()));
-    // Original port/protocol to restore on an image redeploy (see `redeploy_request`'s
-    // doc comment) — resolved once, reused across every branch below.
     let image_spec = image_port_spec_for_project_fleet(&c, &project);
 
-    // Zip-uploaded project: there is no re-fetchable remote — rebuild from the RETAINED
-    // source, which lives on the node that built it. Build locally (no re-placement)
-    // when this node holds it, else dispatch the redeploy to the host node so it
-    // rebuilds from its own source. (Git/image sources are re-fetchable anywhere and
-    // fall through to the normal placement path below.)
     if !src.is_real_git() && src.repo_url.starts_with("upload://") {
         if crate::git::has_local_source_for_ids(&project, &source_ids) {
             let req = redeploy_request(
@@ -7298,7 +7158,6 @@ async fn project_redeploy(
         ));
     }
 
-    // Prebuilt-image project: reconstruct the image ref and redeploy as an image.
     if src.repo_url.starts_with("image://") {
         let image_ref = src
             .repo_url
@@ -7322,15 +7181,6 @@ async fn project_redeploy(
             image_spec.clone(),
             source_ids.clone(),
         );
-        // Keep the SAME synthetic `image://…` source URL a fresh prebuilt-image
-        // deploy records (see `git_deploy_public`'s image branch) — never blank
-        // it. A prebuilt-image deploy has no repository to clone, but the
-        // source URL is still the deployment record's source identity and
-        // `validate_deploy_source`/`resolve_build_trust` legitimately parse it:
-        // blanking it made every image redeploy fail at the front door with
-        // "repository URL: repository URL is empty" (witnessed 2026-09-26,
-        // project `minecwaft` -> image://itzg/minecraft-server:latest, HTTP
-        // 409). `image_ref` remains what actually gets deployed.
         req.repo_url = src.repo_url.clone();
         req.branch = None;
         req.image_ref = Some(image_ref);
@@ -7340,7 +7190,6 @@ async fn project_redeploy(
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
-    // Real git source: re-clone + rebuild through the normal placement/fanout path.
     let req = redeploy_request(
         &project,
         &src,
@@ -7358,18 +7207,6 @@ async fn project_redeploy(
     Ok(Json(json!({ "build_id": build_id })))
 }
 
-// ---- GitOps ----
-
-/// All projects owned by a tenant plus their settings + git source — the data the
-/// dashboard serializes into the committed `openedge.yaml`. FLEET-AWARE: iterating
-/// only the local `ProjectStore` snapshot (as this handler did before) misses any
-/// project this node never locally built/saw — `ProjectSettings` rows are
-/// confirmed node-local-only, never gossiped (unlike `dep_list`/`admin_overview`,
-/// which already merge `peer_deployments`). Union local settings with every
-/// project name a fleet-aggregated deployment carries for this tenant, so a
-/// project created (even with zero deployments yet) on ANOTHER node still
-/// appears here — the exact class of bug that hid team Simpfi's `drugs-wtf`
-/// project on 4 of 8 fleet nodes.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct GitopsProjectsQuery {
     /// `summary`: the dashboard's inventory view (`project_inventory::summary`), served by the leader so
@@ -7381,6 +7218,11 @@ pub(crate) struct GitopsProjectsQuery {
     pub local: Option<bool>,
 }
 
+/// All projects the tenant owns with their settings and git source, the data the dashboard
+/// serializes into the committed `openedge.yaml`. Fleet-aware: the union of local settings rows,
+/// every project a fleet-aggregated deployment names for this tenant and the fleet-replicated
+/// relational mirror, so a project created (even with zero deployments) on ANOTHER node still
+/// appears. `view=summary` serves the inventory view (`project_inventory::summary`).
 pub(crate) async fn gitops_projects(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7417,8 +7259,6 @@ pub(crate) async fn gitops_projects(
             c.gw.list()
                 .into_iter()
                 .find(|d| d.project == project && d.production);
-        // Enterprise deployment protection is part of the declarative config too —
-        // include mode/scope (never the password) so protection changes commit.
         let prot = c.enterprise.protection(&project);
         out.push(json!({
             "project": project,
@@ -7429,11 +7269,6 @@ pub(crate) async fn gitops_projects(
             "protection": { "mode": prot.mode, "scope": prot.scope },
         }));
     }
-    // Fleet-visible fallback rows: a project this node has never locally seen a
-    // ProjectSettings row for, but that the tenant owns per a gossiped deployment
-    // record. Settings/git/protection are unavailable here (this node genuinely
-    // has none) — surfaced with defaults rather than silently omitted, so the
-    // project is at least visible/selectable instead of invisible.
     for (_node, deps) in c.peer_deployments.read().iter() {
         for d in deps {
             if record_tenant(&d.tenant) != t || !seen.insert(d.project.clone()) {
@@ -7449,12 +7284,6 @@ pub(crate) async fn gitops_projects(
             }));
         }
     }
-    // Second fallback tier: the fleet-replicated relational mirror (see
-    // relational.rs) — the DURABLE fix. Unlike peer_deployments (which can
-    // only know about a project that has at least one deployment somewhere),
-    // this catches a project that was CREATED but never successfully
-    // deployed anywhere in the fleet — `drugs-wtf`'s exact bug (zero
-    // deployments fleet-wide, live-witnessed).
     for project in crate::relational::projects_for_team(&t).await {
         if !seen.insert(project.clone()) {
             continue;
@@ -7540,30 +7369,17 @@ async fn gitops_synced(
     Json(json!(link))
 }
 
-/// Inbound GitHub webhook: on a push (or merged/updated PR) to a repo that backs
-/// one or more existing projects, trigger a fresh production build+deploy from the
-/// pushed commit — repos become deployable workflows (taubyte-style GitOps CI).
-///
-/// Auth: this route is in the `open` allowlist (GitHub can't present a platform
-/// JWT). When `GITHUB_WEBHOOK_SECRET` is set the HMAC-SHA256 signature is
-/// verified. When it is unset, the safe default is to REJECT the delivery
-/// (401) rather than silently accepting anything unsigned — that permissive
-/// behavior must now be deliberately opted into via
-/// `GITHUB_WEBHOOK_ALLOW_UNSIGNED=1`, intended for local/dev convenience only
-/// (never set it in production once the secret is fleet-provisioned).
+/// Inbound GitHub webhook: a push (or an opened/updated PR) to a repo that backs existing projects
+/// triggers a build of the notified commit; a PR always builds a PREVIEW, a push is classified per
+/// project from its branch. The route is in the auth `open` allowlist (GitHub cannot present a
+/// platform JWT), so the HMAC-SHA256 signature is the gate: verified whenever
+/// `GITHUB_WEBHOOK_SECRET` is set, and with no secret an unsigned delivery is rejected (401) unless
+/// `GITHUB_WEBHOOK_ALLOW_UNSIGNED=1` (local/dev only).
 async fn git_webhook(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Signature policy: a SIGNED delivery is always verified when a secret is
-    // configured (a bad/forged signature is rejected). An UNSIGNED delivery is
-    // accepted ONLY with the explicit `GITHUB_WEBHOOK_ALLOW_UNSIGNED` opt-in —
-    // this restores auto-deploy for hooks that were installed before the UI
-    // was provisioned with the signing secret (they carry no signature and
-    // would otherwise 401 forever), without dropping verification of the
-    // hooks that DO sign. Re-signing those legacy hooks (reconnect GitHub) lets
-    // this flag be removed again for strict-everywhere verification.
     let secret = std::env::var("GITHUB_WEBHOOK_SECRET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -7571,48 +7387,14 @@ async fn git_webhook(
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    // The opt-in is honored ONLY while no secret is configured. Its documented
-    // purpose is legacy hooks installed before the signing secret existed, which
-    // carry no signature — that is a pre-secret condition by construction. Left
-    // ungated it did something far larger: with a secret configured and this flag
-    // set, an unsigned delivery was accepted, so an attacker did not need to forge
-    // a signature at all — merely OMIT the header — and signature verification
-    // became unreachable for anyone who bothered.
-    //
-    // That was live, not theoretical: an ansible-invisible drop-in
-    // (`hive-node.service.d/webhook-unsigned.conf`) set it on 10 of 14 fleet
-    // nodes, including the control-plane leader, while the main unit correctly
-    // configured a secret. A public unsigned POST to `/v1/git/webhook` on the
-    // round-robin host returned 200 while the same request WITH a bogus signature
-    // correctly returned 401 — i.e. presenting no credential beat presenting a
-    // wrong one, and the webhook clones and deploys attacker-named source into a
-    // victim project WITH that project's env injected.
-    //
-    // Gating on `secret.is_none()` keeps the escape hatch working for the case it
-    // was written for (genuine local/dev with no secret provisioned) and makes it
-    // inert everywhere the fleet has one. A legacy unsigned hook on a
-    // secret-configured node is now rejected with the existing message, which
-    // already names the remedy: reconnect GitHub to re-sign it.
     let allow_unsigned = secret.is_none()
         && std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     if !sig.is_empty() {
-        // Signed: verify against the secret. A signed delivery with no secret
-        // configured can't be verified — accept only under the opt-in.
         match &secret {
             Some(s) => {
                 if !verify_github_sig(s.as_bytes(), &body, sig) {
-                    // WARN, because this rejection used to be completely silent
-                    // and it has two very different causes that look identical
-                    // from outside: a forged/replayed delivery (correctly
-                    // refused, nothing to do) or a SECRET MISMATCH between the
-                    // UI that installed the hook and the backend that verifies
-                    // it — under which every real GitHub delivery is dropped and
-                    // auto-deploy is dead platform-wide, with no log, no event
-                    // and no incident to notice it by. The repo/event context is
-                    // what lets an operator tell the two apart: a mismatch shows
-                    // a steady stream from THEIR OWN repos.
                     let repo = serde_json::from_slice::<Value>(&body)
                         .ok()
                         .and_then(|v| {
@@ -7648,7 +7430,6 @@ async fn git_webhook(
             }
         }
     } else if !allow_unsigned {
-        // Unsigned and not opted in → reject (the strict default).
         return Err((
             StatusCode::UNAUTHORIZED,
             "unsigned webhook delivery rejected. The GitHub hook has no signing \
@@ -7668,28 +7449,18 @@ async fn git_webhook(
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
 
-    // Extract the repo + branch + head commit, supporting `push` and
-    // `pull_request` (opened/synchronize/reopened/closed) events. The deploy
-    // TARGET follows Vercel's model: a PR always builds a PREVIEW; a push is
-    // classified per-project from its branch (None => the production branch wins).
     let repo_full = payload["repository"]["full_name"]
         .as_str()
         .unwrap_or("")
         .to_string();
     let mut target: Option<String> = None;
     let mut pr_number: Option<u64> = None;
-    // `head_repo_url`: Some only for a PR opened FROM A FORK — its clone URL, used
-    // to override the clone SOURCE further down (never the project-matching repo,
-    // which always stays `repo_full`/the base repo — see `want` below).
     let (branch, commit, head_repo_url) = match event.as_str() {
         "pull_request" => {
             let action = payload["action"].as_str().unwrap_or("");
-            // A closed PR has nothing to (re)build. A merge fires a separate push
-            // to the base branch, which is what produces the production deployment.
             if action == "closed" {
                 return Ok(Json(json!({ "ignored": "pr closed" })));
             }
-            // opened / synchronize / reopened / ready_for_review -> preview.
             target = Some("preview".into());
             pr_number = payload["number"]
                 .as_u64()
@@ -7702,14 +7473,6 @@ async fn git_webhook(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            // `head.repo` is the repo the PR branch actually lives on — null/absent
-            // for a same-repo PR (GitHub omits it in that case for some payload
-            // shapes) as well as for a PR opened from a since-deleted/inaccessible
-            // fork (nothing left to clone; falls through to the base-repo clone,
-            // which will then fail downstream with a clear git error, same as
-            // today). Only when it's PRESENT and differs from the base repo is
-            // this a genuine fork PR whose branch/commit live somewhere the base
-            // repo's remote has never heard of.
             let head_repo_full = payload["pull_request"]["head"]["repo"]["full_name"]
                 .as_str()
                 .map(str::to_string);
@@ -7718,9 +7481,6 @@ async fn git_webhook(
                 None => false,
             };
             let head_repo_url = if is_fork {
-                // Prefer GitHub's own clone_url when present; fall back to
-                // constructing it from full_name (covers hand-built test payloads
-                // and any delivery shape that omits clone_url).
                 payload["pull_request"]["head"]["repo"]["clone_url"]
                     .as_str()
                     .map(str::to_string)
@@ -7736,7 +7496,6 @@ async fn git_webhook(
         }
         "ping" => return Ok(Json(json!({ "pong": true }))),
         _ => {
-            // push event -> classified from the branch at build time.
             if payload["deleted"].as_bool().unwrap_or(false) {
                 return Ok(Json(json!({ "ignored": "branch deleted" })));
             }
@@ -7750,21 +7509,9 @@ async fn git_webhook(
     if repo_full.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "missing repository".into()));
     }
-    // PROJECT MATCHING always uses the BASE repo's full_name — a fork-originated
-    // PR still belongs to the base project; only the clone SOURCE (below) forks.
     let want = crate::gitops::norm_repo(&repo_full);
     tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, fork = ?head_repo_url, "git_webhook: received");
 
-    // Private-repo credential for every deploy this delivery triggers below,
-    // resolved ONCE (every triggered project shares the same `repo_full`).
-    // FIRST CHOICE: a GitHub App installation access token, minted server-side
-    // with no user session required (see `github_app_auth`) — this is what
-    // lets a repo that was only ever connected via a user's interactive
-    // GitHub App session (no node-wide GITHUB_TOKEN configured) still
-    // auto-deploy on push. `None` here (App not configured, App not
-    // installed on this repo, or a mint failure) is NOT fatal: `git.rs`'s
-    // clone path transparently falls back to the node-wide GITHUB_TOKEN env
-    // var exactly as it did before this existed.
     let webhook_git_token: Option<String> = if crate::github_app_auth::configured() {
         match repo_full.split_once('/') {
             Some((owner, repo)) => {
@@ -7775,9 +7522,6 @@ async fn git_webhook(
                         None
                     }
                     Err(e) => {
-                        // Never log `e`'s source token/key content — the error
-                        // variants in `github_app_auth` never carry credential
-                        // material, only status codes / parse failures.
                         tracing::warn!(repo = %want, error = %e, "git_webhook: GitHub App installation-token mint failed — falling back to node GITHUB_TOKEN");
                         None
                     }
@@ -7789,13 +7533,6 @@ async fn git_webhook(
         None
     };
 
-    // Candidate projects for this repo: O(1) via the reverse index
-    // (`gitops::GitRepoIndex`) in the normal case, instead of an O(projects)
-    // fleet-wide scan on every single webhook delivery. An index that has NEVER
-    // been populated at all (fresh boot before the first rebuild, or a bug) is
-    // NOT the same as "this repo genuinely has zero projects" — that specific
-    // case falls back to the original full scan defensively (not the normal
-    // path). See `GitRepoIndex`'s doc comment for what keeps it in sync.
     let candidates: Vec<String> = if !c.git_index.is_empty() {
         c.git_index.projects_for(&want)
     } else {
@@ -7803,17 +7540,8 @@ async fn git_webhook(
         c.projects.snapshot().into_keys().collect()
     };
 
-    // Deploy every project pointing at this repo for the pushed/PR branch. We do
-    // NOT filter by branch: a push to a non-production branch (or a PR) is exactly
-    // how preview deployments are created — the branch decides production vs
-    // preview at build time (or `target` forces a preview for PRs).
     let mut triggered = Vec::new();
     for project in candidates {
-        // Fleet-aware git lookup: a project placed on a peer node (the common case —
-        // most projects run on Firecracker nodes, not this coordinator) has no LOCAL
-        // gateway git source, so `gw.git_for_project` returns None and the webhook
-        // would silently trigger NOTHING. Use the gossiped fleet view so pushes/PRs
-        // to remotely-placed projects still create deployments.
         let Some(git) = git_for_project_fleet(&c, &project) else {
             continue;
         };
@@ -7826,18 +7554,6 @@ async fn git_webhook(
             branch.clone()
         };
 
-        // Already-building guard, matching `git_poll_cycle`'s (git.rs) — a
-        // webhook delivery firing near-simultaneously with a poll tick (or a
-        // redelivered/duplicate webhook) for the same commit would otherwise
-        // start a full duplicate build: production safety is already covered
-        // by `deploy_full`'s superseded-by veto (only the newest-started build
-        // goes live), but the loser still burns a full clone+install+build and
-        // fires a spurious `deployment.error` webhook when it's vetoed. Only
-        // guards when the commit is actually known at receipt time (every real
-        // `push`/`pull_request` payload carries one; a malformed/edge-case
-        // delivery with an empty SHA can't be deduped this way and falls
-        // through to start a build as before — an honest under-cover, not a
-        // silent one).
         if !commit.is_empty() {
             let already_building = c.builds.list().iter().any(|b| {
                 b.project == project
@@ -7862,46 +7578,31 @@ async fn git_webhook(
             source_deployment_ids: Vec::new(),
             repo_url: git.repo_url.clone(),
             branch: Some(deploy_branch).filter(|b| !b.is_empty()),
-            // Pin to the EXACT commit GitHub notified us about — without this the
-            // clone just builds "whatever the branch currently points to", which
-            // races a rapid double-push into building the wrong commit.
             commit: Some(commit.clone()).filter(|s| !s.is_empty()),
-            // Fork-originated PR: clone/fetch from the FORK's repo, not the base
-            // repo `git.repo_url` — the fork's branch (and, without SHA-fetch
-            // support, its commits) don't exist on the base repo's remote at all.
-            // None for same-repo PRs and every push — clones `git.repo_url` as before.
             head_repo_url: head_repo_url.clone(),
             project: Some(project.clone()),
             project_incarnation: None,
             creator: Some("github".into()),
-            production: true, // legacy field; classification uses `target`/branch
+            production: true,
             target: target.clone(),
-            use_cache: true, // git push redeploy: reuse the warm dependency cache
+            use_cache: true,
             root_dir,
-            env: None,               // git push redeploy: env comes from the project store
-            no_fanout: false,        // gitops redeploy is a coordinator deploy → schedule + fanout
-            fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
+            env: None,
+            no_fanout: false,
+            fanout_secondary: false,
             build_config: None,
             function_settings: None,
-            redeploy: false, // webhook push → start_build directly (bypasses git_deploy naming)
+            redeploy: false,
             zip_b64: None,
             image_ref: None,
             image_port: None,
             image_protocol: None,
-            image_memory: None, // git push deploy has no image_ref, so no container override to carry
+            image_memory: None,
             image_cpus: None,
             image_pids: None,
             image_ports: None,
-            // webhook auto-deploy: GitHub App installation token (first choice,
-            // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
         };
-        // Webhook push: not a fanout receiver and no pre-resolved incarnation
-        // (`req.project_incarnation` above is `None` too) — `start_build`
-        // determines/mints the current one itself under its own
-        // `lifecycle_write`. The project's own recorded team authenticates
-        // legacy-deployment adoption the same way `team_of` gates ownership
-        // elsewhere in this handler.
         let webhook_team = norm(&c.projects.team_of(&project)).to_string();
         let build_id = crate::git::start_build(c.clone(), req, None, Some(webhook_team))
             .await
@@ -7936,12 +7637,6 @@ async fn git_webhook(
     }
 
     if triggered.is_empty() {
-        // The single most common "preview build never starts" shape: a
-        // webhook/Actions-fallback delivery arrived and was accepted (no auth/
-        // signature error), but matched zero locally-known-or-fleet-gossiped
-        // projects for `want` — invisible before this line, since a 200 with
-        // `triggered: 0` looks identical to a genuine no-op from the GitHub
-        // delivery's own "Recent Deliveries" view.
         tracing::warn!(repo = %want, event = %event, "git_webhook: no project matched this repo — build not started");
     } else {
         tracing::info!(repo = %want, event = %event, triggered = triggered.len(), "git_webhook: build(s) started");
@@ -7964,7 +7659,6 @@ fn verify_github_sig(secret: &[u8], body: &[u8], header: &str) -> bool {
     };
     let expected = hmac_sha256(secret, body);
     let expected_hex = hex_lower(&expected);
-    // length-independent compare
     if hex.len() != expected_hex.len() {
         return false;
     }
@@ -7983,9 +7677,8 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// HMAC-SHA256, hex-encoded — shared by every webhook verifier in this crate
-/// (GitHub's `X-Hub-Signature-256`, Stripe's `Stripe-Signature`) so there's one
-/// implementation of the actual crypto primitive.
+/// HMAC-SHA256, hex-encoded: the one implementation of the primitive shared by every webhook
+/// verifier in this crate (GitHub's `X-Hub-Signature-256`, Stripe's `Stripe-Signature`).
 pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     hex_lower(&hmac_sha256(key, msg))
 }
@@ -8021,24 +7714,18 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     res
 }
 
-// ---- Mesh: a peer announces itself to us ----
-
 pub(crate) async fn node_announce(
     State(c): State<Arc<CloudState>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Json<Value> {
-    // Converge the control-plane fencing epoch on the max witnessed anywhere.
     c.cluster.adopt_epoch(node.cp_epoch);
-    // The announcing node is describing ITSELF — the authoritative copy that
-    // may rename it past a stale registry entry (upsert_peer_self_report).
     c.registry.upsert_peer_self_report(node);
     Json(json!(c.registry.nodes()))
 }
 
-/// Observability for the hot-join mesh: the persisted key-addressed roster (this
-/// node's dial map, `endpoint_id -> (endpoint_id, iroh_addr)` — no IPs) plus the
-/// live trust-set size, so an operator can see who this node knows/trusts without
-/// SSH. Read-only; requires an operator token when JWT is enforced.
+/// Observability for the hot-join mesh: the persisted key-addressed roster (this node's dial map,
+/// `endpoint_id -> (endpoint_id, iroh_addr)`, no IPs) plus the live trust-set size, so an operator
+/// sees who this node knows and trusts without SSH. Read-only, operator token when JWT is enforced.
 async fn mesh_roster_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8061,14 +7748,12 @@ struct MeshAdmitReq {
     endpoint_id: String,
 }
 
-/// Operator-initiated admission: pre-register an endpoint id into this node's
-/// trust set before it ever connects (e.g. onboarding a node whose key you got
-/// out-of-band). Redundant with — but not required by — the zero-touch join-proof
-/// path (`STREAM_JOIN`, hive-p2p): a node holding `HIVE_JWT_SECRET` self-admits on
-/// first contact without this call. This exists for HIVE_PEER_TRUST-enforced
-/// fleets that also want an explicit, audited allowlist edit. Does NOT propagate
-/// to peers directly; the admitted id becomes visible to them transitively the
-/// next time this node gossips a NodeInfo carrying that iroh_addr (main.rs:1264).
+/// Operator-initiated admission: pre-registers an endpoint id into this node's trust set before it
+/// ever connects (a node whose key arrived out-of-band). Not required by the zero-touch join-proof
+/// path (`STREAM_JOIN`: a node holding `HIVE_JWT_SECRET` self-admits on first contact); it exists
+/// for `HIVE_PEER_TRUST` fleets that want an explicit, audited allowlist edit. It does not
+/// propagate to peers directly: the id becomes visible to them when this node next gossips a
+/// NodeInfo carrying that `iroh_addr`.
 async fn mesh_admit(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -8100,23 +7785,18 @@ async fn mesh_admit(
     ))
 }
 
-/// Unauthenticated, liveness-adjacent mesh-membership probe (`/v1/mesh`) — no
-/// JWT, matching `/healthz`, since the watchdog/monitoring polling it has none.
-/// Deliberately separate from `/healthz`: liveness ("is the process serving
-/// HTTP") tells you nothing about mesh membership. See `MeshHealth`'s doc.
+/// Unauthenticated, liveness-adjacent mesh-membership probe (`/v1/mesh`): no JWT, like `/healthz`,
+/// since the watchdog polling it has none; deliberately separate from `/healthz` because liveness
+/// says nothing about mesh membership (see `MeshHealth`'s doc).
 async fn mesh_health(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.mesh_health()))
 }
 
-/// The transport's connection-ESTABLISHMENT counters
-/// (`hive_p2p::EstablishStats`: `accept_stuck`, `accept_inflight_oldest_ms`,
-/// `last_*_established_ms`, the `*_window` counts over meshwatch's
-/// establishment window, `budget_in_use`/`budget_limit` per class, the top-10
-/// `budget_by_peer`) — the numbers meshwatch's `establishment_wedge` trigger
-/// reads. Operator-only, unlike `/v1/mesh`: to an outsider they are an exact
-/// oracle for the watchdog's arming state and for how close each inbound
-/// budget is to refusing. NODE-LOCAL, like `/v1/mesh/discovery` — query a
-/// node's own admin port (the dashboard's `/ops/*` proxy reads the leader's).
+/// The transport's connection-ESTABLISHMENT counters (`hive_p2p::EstablishStats`), the numbers
+/// meshwatch's `establishment_wedge` trigger reads. Operator-only, unlike `/v1/mesh`: to an
+/// outsider they are an exact oracle for the watchdog's arming state and how close each inbound
+/// budget is to refusing. NODE-LOCAL like `/v1/mesh/discovery`: query a node's own admin port (the
+/// dashboard's `/ops/*` proxy reads the leader's).
 async fn mesh_establish(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -8176,14 +7856,10 @@ async fn admin_runtime(
     Ok(Json(crate::runtime_watch::stats()))
 }
 
-/// Which algorithm content verifiers on THIS node actually accepted.
-///
-/// Operator-only and deliberately node-local (like `/v1/admin/runtime`). This
-/// is the inspection point for the coexistence migration: `accepted_sha256`
-/// still climbing means stored digests this node reads are legacy-minted, so a
-/// writer flip here would make them read as a miss or an orphan. A writer may
-/// move only once every node reports `accepted_sha256` flat across a full
-/// deploy cycle — never on a flag day.
+/// Which algorithm content verifiers on THIS node actually accepted: operator-only and node-local
+/// (like `/v1/admin/runtime`). `accepted_sha256` still climbing means stored digests this node
+/// reads are legacy-minted, so a writer flip would make them read as a miss or an orphan; a writer
+/// may move only once every node reports it flat across a full deploy cycle, never on a flag day.
 async fn admin_content_hash(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
