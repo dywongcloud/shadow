@@ -1,10 +1,7 @@
-//! Deploy from a git repository with a live, Vercel-style **build log**.
-//!
-//! `start_build` creates a build record (state = building) and returns its id
-//! immediately; a background task clones the repo, emits timestamped log lines
-//! (region, machine config, cloning, install/build commands, ready), then
-//! registers the routable deployment via the gateway. The dashboard polls
-//! `GET /v1/builds/:id` to stream the logs as they appear.
+//! Deploy from a git repository with a live build log: `start_build` creates the build record and
+//! returns its id at once, a background task clones, logs timestamped lines (region, machine
+//! config, install/build commands, ready) and registers the routable deployment via the gateway.
+//! The dashboard polls `GET /v1/builds/:id`.
 
 use anyhow::Context as _;
 use base64::Engine;
@@ -50,23 +47,13 @@ pub struct Build {
     pub deployment_id: Option<String>,
     #[serde(default)]
     pub alias: Option<String>,
-    /// Set when a NEWER build of the same project started while this one was
-    /// in flight — `run_build` checks it just before `deploy_full` and vetoes
-    /// its own production flip, so the last flip is always the newest push,
-    /// never merely the last-finishing build (latest-push-wins).
+    /// Set when a NEWER build of the same project started mid-flight: `run_build` checks it just
+    /// before `deploy_full` and vetoes its own production flip, so the last flip is the newest
+    /// push, never merely the last-finishing build (latest-push-wins).
     #[serde(default)]
     pub superseded_by: Option<String>,
-    /// Human-readable reason a build reached `Error`, structured (not just a
-    /// buried log line) so a caller can answer "why did this fail" without
-    /// re-deriving it by parsing `lines`. This field DID NOT EXIST before —
-    /// any reader pulling `build["error"]` off the raw record always got the
-    /// zero-value `""` no matter what actually failed, because there was
-    /// nothing to clear: the key was never modeled. Witnessed live: 10
-    /// consecutive `internet-structure` build failures, each with a full
-    /// diagnostic message sitting in `lines` (e.g. "lost contact with remote
-    /// build after 400 failed polls") and an empty top-level error every
-    /// time. `#[serde(default)]` so pre-existing persisted records without
-    /// this key still deserialize.
+    /// Structured reason a build reached `Error`, so callers need not parse `lines` for it;
+    /// `#[serde(default)]` keeps older persisted records deserializing.
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,29 +62,27 @@ pub struct Build {
     pub lines: Vec<LogLine>,
 }
 
-/// Cap on how many builds the snapshot persists (newest by `started_ms`) —
-/// bounds the state file while keeping every deployment a user can realistically
-/// navigate to covered with its build logs.
+/// Newest builds (by `started_ms`) the snapshot persists: bounds the state file while covering
+/// every deployment a user can realistically open.
 const SNAPSHOT_BUILD_CAP: usize = 200;
 
-/// Cap on how many builds are retained IN MEMORY. The snapshot was already
-/// bounded; the live map was not, so a node that builds continuously kept every
-/// build it had ever run — with its log lines — until it restarted. Set above
-/// `SNAPSHOT_BUILD_CAP` so nothing that would have been persisted is dropped
-/// from memory first (a build visible after a restart but not before would be
-/// an absurd failure mode).
+/// Builds retained IN MEMORY: bounds the live map of a node that builds continuously, set above
+/// `SNAPSHOT_BUILD_CAP` so nothing that would be persisted is evicted first.
 const MEMORY_BUILD_CAP: usize = 400;
 
-/// Cap on the bytes retained for ONE log line. The build-output reader already
-/// caps what it takes off the pipe (`hive_core::logcap`), but `log()` is also
-/// called with internally-formatted messages (command echoes, error text that
-/// embeds subprocess output) — a byte bound belongs at the store boundary too,
-/// so no future caller can reintroduce an unbounded line.
+/// Bytes retained for ONE log line. Every build-output reader already caps what it takes off the
+/// pipe (the host lane through `hive_core::logcap`, the isolated executor through its own
+/// `read_capped_line`); this bound sits at the store boundary too, because `log()` also takes
+/// internally formatted messages (command echoes, error text embedding subprocess output) and no
+/// future caller may reintroduce an unbounded line.
 const MAX_BUILD_LOG_LINE_BYTES: usize = 16 * 1024;
 
 /// Fanout capability boundary for paired host-static/runtime-artifact semantics.
 /// Its location deliberately cannot match the legacy mesh prefix arm.
 const RUNTIME_ARTIFACT_FANOUT_PATH: &str = "/v1/runtime-artifact/v1/git/deploy";
+
+const CANCEL_GRACE_POLLS: u32 = 20;
+const CANCEL_GRACE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 pub struct BuildStore {
@@ -116,22 +101,16 @@ impl BuildStore {
     pub fn list(&self) -> Vec<Build> {
         self.map.lock().values().cloned().collect()
     }
-    /// Persistable view (newest `SNAPSHOT_BUILD_CAP` builds). Builds were
-    /// purely in-memory before this — every node restart silently erased all
-    /// build logs, which is why /deployments/<id> showed "No build record
-    /// found" for anything deployed before the last restart. DeployRecords
-    /// survived (they ARE persisted), making the loss invisible until a user
-    /// opened the build-logs panel.
+    /// Persistable view: the newest `SNAPSHOT_BUILD_CAP` builds.
     pub fn snapshot(&self) -> Vec<Build> {
         let mut v: Vec<Build> = self.map.lock().values().cloned().collect();
         v.sort_by(|a, b| b.started_ms.cmp(&a.started_ms));
         v.truncate(SNAPSHOT_BUILD_CAP);
         v
     }
-    /// Boot-time restore. A build persisted mid-flight (`Queued`/`Building`)
-    /// is dead — its process did not survive the restart — so it is finalized
-    /// as `Error` with an explanatory log line rather than presenting as
-    /// running forever.
+    /// Boot-time restore: a build persisted mid-flight (`Queued`/`Building`) lost its process in
+    /// the restart, so it is finalized as `Error` with an explanatory log line instead of
+    /// presenting as running forever.
     pub fn load(&self, builds: Vec<Build>) {
         let mut m = self.map.lock();
         for mut b in builds {
@@ -151,10 +130,6 @@ impl BuildStore {
     fn insert(&self, b: Build) {
         let mut m = self.map.lock();
         m.insert(b.id.clone(), b);
-        // Bound the live map, not just the persisted snapshot. Evict the oldest
-        // FINISHED builds only — an in-flight build must never lose its record
-        // out from under `log()`/`update()`, which would silently stop
-        // collecting its output.
         if m.len() > MEMORY_BUILD_CAP {
             let mut finished: Vec<(u64, String)> = m
                 .values()
@@ -184,7 +159,6 @@ impl BuildStore {
             let mut line: String = line.into();
             if line.len() > MAX_BUILD_LOG_LINE_BYTES {
                 let dropped = line.len() - MAX_BUILD_LOG_LINE_BYTES;
-                // Cut on a char boundary — `truncate` panics mid-codepoint.
                 let mut cut = MAX_BUILD_LOG_LINE_BYTES;
                 while cut > 0 && !line.is_char_boundary(cut) {
                     cut -= 1;
@@ -196,11 +170,6 @@ impl BuildStore {
                 ts_ms: now_ms(),
                 line,
             });
-            // Cap per-build log retention: a chatty build could otherwise grow
-            // an unbounded Vec<LogLine> that is then cloned into EVERY 120s
-            // replicated platform snapshot (a real contributor to the fleet's
-            // snapshot-churn heap pressure). Keep the most recent lines; a build
-            // that needs more than this is already pathological.
             const MAX_BUILD_LOG_LINES: usize = 2_000;
             let len = b.lines.len();
             if len > MAX_BUILD_LOG_LINES {
@@ -213,9 +182,8 @@ impl BuildStore {
             f(b);
         }
     }
-    /// Remove build records proved to belong to one deleted incarnation. Legacy
-    /// records carry no identity and are retained rather than guessed from a
-    /// project-name prefix.
+    /// Removes the build records proved to belong to one deleted incarnation; legacy records carry
+    /// no identity and are retained rather than guessed from a project-name prefix.
     pub fn remove_for_incarnation(
         &self,
         project: &str,
@@ -248,29 +216,9 @@ impl BuildStore {
     }
 }
 
-// ---- Build cancellation ----------------------------------------------------
-//
-// A build's actual work (git clone, npm/pnpm/yarn install, the framework
-// build command, a `podman build`) runs as real OS child processes spawned
-// from `run_build`'s background task. Marking the `Build` record `Cancelled`
-// alone does not stop any of that — the child keeps running to completion
-// (or hanging forever) unless something actually signals it. This registry is
-// the "something": every long-running command in the pipeline runs through
-// `run_cancellable_output` (git clone chain) or is wrapped equivalently in
-// `run_streamed` (install/build), each of which publishes the live process's
-// GROUP id here before awaiting it. `cancel_build` then (1) flips a flag so no
-// FURTHER step starts, (2) SIGKILLs that whole process group — not just one
-// pid, since a shell driving `npm install` forks `npm`/`node` as children that
-// inherit its group, and a single-pid kill would leave them running as
-// orphans — (3) asks a MIRRORED build's real remote host to cancel too, and
-// (4) aborts the Rust task driving the build so it can't proceed once its
-// process is dead.
-
-/// Where a MIRRORED build's real backing process actually lives: the "pure
-/// remote placement" fanout branch in `run_build` dispatches the real build to
-/// a peer and only mirrors its logs/state here (see `mirror_remote_build`).
-/// Cancelling the coordinator's (mirror) build must also cancel the REAL
-/// process, which runs on this target under its OWN, different build id.
+/// Where a MIRRORED build's real process lives: the "pure remote placement" fanout branch of
+/// `run_build` dispatches the real build to a peer, under its OWN build id, and mirrors only its
+/// logs/state here (`mirror_remote_build`), so cancelling the mirror must also cancel that process.
 #[derive(Clone)]
 struct MirrorTarget {
     admin: Option<String>,
@@ -311,11 +259,11 @@ impl BuildCancelSlot {
     }
 }
 
-/// Registry of in-flight builds' cancellation handles, keyed by build id.
-/// Lives on `CloudState` (`cloud.build_cancels`) — deliberately NOT persisted
-/// or gossiped: it describes only a live local OS process, which cannot
-/// survive a restart (and a restarted node already finalizes any
-/// Queued/Building record to `Error` on boot — see `BuildStore::load`).
+/// In-flight builds' cancellation handles by build id (`cloud.build_cancels`), deliberately NOT
+/// persisted or gossiped: they describe live local OS processes, which cannot survive a restart
+/// (`BuildStore::load` finalizes Queued/Building records to `Error` on boot). Every long-running
+/// step publishes its process GROUP id here (`run_cancellable_output`, `run_streamed`) so `cancel`
+/// can SIGKILL the whole tree, not one pid.
 #[derive(Default)]
 pub struct BuildCancelRegistry {
     map: Mutex<HashMap<String, Arc<BuildCancelSlot>>>,
@@ -326,9 +274,9 @@ impl BuildCancelRegistry {
         Self::default()
     }
 
-    /// Register a fresh slot before the driving task is spawned. Returning the
-    /// exact Arc lets the task's Drop guard remove only its own slot, never a
-    /// later replacement that reused the same build id.
+    /// Registers a fresh slot before the driving task is spawned; returning the exact Arc lets the
+    /// task's Drop guard remove only its own slot, never a later replacement that reused the build
+    /// id.
     fn register(
         &self,
         bid: &str,
@@ -350,9 +298,8 @@ impl BuildCancelRegistry {
         self.map.lock().get(bid).cloned()
     }
 
-    /// Whether `bid` has been asked to cancel — checked cooperatively at step
-    /// boundaries throughout `run_build` so a build already mid-cancel never
-    /// starts a fresh, unkillable-until-spawned step.
+    /// Whether `bid` was asked to cancel: checked at step boundaries in `run_build`, so a build
+    /// already mid-cancel never starts a fresh step.
     pub fn is_cancelled(&self, bid: &str) -> bool {
         self.map
             .lock()
@@ -360,10 +307,9 @@ impl BuildCancelRegistry {
             .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// Publish (or clear, `None`) the OS process-GROUP id THIS build is
-    /// currently blocked on. Called by every cancellable command wrapper
-    /// right after spawn, and again (with `None`) once that command exits —
-    /// so a later, unrelated step never targets a stale/reused pid.
+    /// Publishes (or clears, `None`) the process-GROUP id THIS build is blocked on: set right after
+    /// spawn and cleared when the command exits, so a later step never targets a stale or reused
+    /// pid.
     fn set_running(&self, bid: &str, pgid: Option<u32>) {
         if let Some(slot) = self.slot(bid) {
             *slot.pgid.lock() = pgid;
@@ -404,18 +350,13 @@ impl BuildCancelRegistry {
         }
     }
 
-    /// Cancel an in-flight build: mark it cancelled, SIGKILL whatever OS
-    /// process GROUP it's currently blocked on, ask its mirror target (if any)
-    /// to cancel the REAL remote build, then give the Rust task driving it a
-    /// brief grace window to notice its child died and unwind NORMALLY —
-    /// running its own remaining cleanup (e.g. removing a first-deploy
-    /// placeholder, `forget`ting this very slot) — before force-aborting it.
-    /// A self-driven exit is strictly better than an abort: abort tears the
-    /// task down mid-poll with NONE of its remaining cleanup ever running, so
-    /// it's the fallback for a task truly stuck somewhere with no tracked
-    /// child (a step this registry doesn't instrument), never the common case.
-    /// Returns `false` when `bid` has no live slot (already terminal, or
-    /// never existed) — the caller's own "not found" handling covers that.
+    /// Cancels an in-flight build: flags it, SIGKILLs the process GROUP it is blocked on, asks its
+    /// mirror target (if any) to cancel the REAL remote build, then gives the driving task a grace
+    /// window to unwind NORMALLY (running its own cleanup: a first-deploy placeholder, `forget`ting
+    /// this slot) before force-aborting it, since abort skips all remaining cleanup. Completion is
+    /// owned by the task's Drop guard, so the slot is never erased here: a deletion may hold the
+    /// Arc and must see the task and every checkout guard unwind before reclaiming source. Returns
+    /// `false` when `bid` has no live slot.
     pub async fn cancel(&self, cloud: &Arc<CloudState>, bid: &str) -> bool {
         let slot = match self.slot(bid) {
             Some(s) => s,
@@ -425,10 +366,10 @@ impl BuildCancelRegistry {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let pgid = *slot.pgid.lock();
         if let Some(pg) = pgid {
-            // Negative pid = signal the whole process GROUP (see module doc).
+            let whole_group = format!("-{pg}");
             let _ = tokio::process::Command::new("kill")
                 .arg("-KILL")
-                .arg(format!("-{pg}"))
+                .arg(whole_group)
                 .output()
                 .await;
         }
@@ -438,30 +379,24 @@ impl BuildCancelRegistry {
         }
         let task = slot.task.lock().clone();
         if let Some(task) = task {
-            // SIGKILL delivery + the task noticing (its `child.wait()` return)
-            // is normally low tens of ms; 1s at 50ms steps gives it ample room
-            // without making a cancel request feel stuck.
-            for _ in 0..20 {
+            for _ in 0..CANCEL_GRACE_POLLS {
                 if task.is_finished() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(CANCEL_GRACE_POLL_INTERVAL).await;
             }
             if !task.is_finished() {
                 task.abort();
             }
         }
-        // Completion is owned by the task's Drop guard. Never erase the slot
-        // here: deletion may already hold this Arc and must observe the task and
-        // every checkout guard unwind before reclaiming source.
         let _ =
             Self::wait_completed(&slot, tokio::time::Instant::now() + Duration::from_secs(2)).await;
         true
     }
 
-    /// Cancel every active build owned by one exact incarnation and wait for
-    /// their Drop-owned completion. The returned residual ids are observable
-    /// cleanup failures; callers must not reclaim source while it is non-empty.
+    /// Cancels every active build of one exact incarnation and waits for their Drop-owned
+    /// completion; the returned residual ids are observable cleanup failures, so callers must not
+    /// reclaim source while it is non-empty.
     pub async fn cancel_project_and_drain(
         &self,
         cloud: &Arc<CloudState>,
@@ -545,10 +480,9 @@ impl Drop for BuildCompletionGuard {
     }
 }
 
-/// Ask a remote node to cancel a build it's actually running (the target of a
-/// mirrored/fanned-out build) — same transport `fanout_remote`/
-/// `mirror_remote_build` use. Best-effort: a failure here still leaves the
-/// LOCAL kill (if any) and the cancelled-flag/task-abort in effect.
+/// Asks a remote node to cancel the build it is actually running (the target of a
+/// mirrored/fanned-out build) over the same transport as `fanout_remote`/`mirror_remote_build`;
+/// best-effort, the local kill and the cancelled flag stay in effect when it fails.
 async fn cancel_remote_build(cloud: &Arc<CloudState>, m: &MirrorTarget) -> bool {
     let path = format!("/v1/builds/{}/cancel", m.target_bid);
     if let Some(admin) = &m.admin {
@@ -569,14 +503,10 @@ async fn cancel_remote_build(cloud: &Arc<CloudState>, m: &MirrorTarget) -> bool 
     false
 }
 
-/// Like `Command::output()`, but first drops `cmd` into its OWN process group
-/// (`process_group(0)`: pgid == its own pid) and publishes that group into the
-/// per-build cancel registry — so `cancel_build` can SIGKILL the whole tree,
-/// not just this one pid, if the user cancels while THIS command is the one
-/// hung. Cleared again once the command exits so a later, unrelated step
-/// never targets a stale/reused pid. Used by the git clone/fetch/checkout
-/// chain; `run_streamed` (install/build) does the equivalent inline since it
-/// already manages its own child for log streaming.
+/// Like `Command::output()`, but drops `cmd` into its OWN process group and publishes it to the
+/// per-build cancel registry, cleared once the command exits, so `cancel` can SIGKILL the whole
+/// tree if the user cancels while THIS command is hung. Used by the git clone/fetch/checkout chain;
+/// `run_streamed` does the equivalent inline.
 async fn run_cancellable_output(
     cmd: &mut Command,
     cloud: &Arc<CloudState>,
@@ -588,10 +518,8 @@ async fn run_cancellable_output(
     cmd.stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     cloud.build_cancels.set_running(bid, child.id());
-    if cloud.build_cancels.is_cancelled(bid) {
-        // A cancel landed in the tiny window between the caller's last
-        // cooperative check and this spawn — kill it now rather than let it
-        // run unkilled to completion.
+    let cancel_landed_before_spawn = cloud.build_cancels.is_cancelled(bid);
+    if cancel_landed_before_spawn {
         let _ = child.start_kill();
     }
     let out = child.wait_with_output().await;
@@ -599,32 +527,17 @@ async fn run_cancellable_output(
     out
 }
 
-/// Feed a GitHub token to a git subprocess without ever putting it on the
-/// command line, in an environment variable, or into `.git/config`. Standard
-/// `git credential.helper` mechanism: the helper is a FIXED shell one-liner
-/// that reads a pre-formatted `username=...\npassword=...\n` credential
-/// response off an inherited file descriptor. The descriptor backs a 0600 temp
-/// file that is `unlink()`-ed the instant after it opens — the fd stays valid
-/// and readable, but the path is gone immediately, so no other process can
-/// reach it by name, and root-owns it by construction (this daemon runs as
-/// root) — with FD_CLOEXEC explicitly cleared so it survives into git's
-/// `exec()` (`std::fs::File` sets FD_CLOEXEC by default; git must not lose the
-/// fd at the very step that needs it). `-c credential.helper=` is applied
-/// FIRST to clear any inherited helper — a base image's `osxkeychain`/
-/// `libsecret`/`store` entry would otherwise be consulted ahead of ours and
-/// could leak an unrelated stored credential into a tenant's build (witnessed
-/// directly while prototyping this fix: `git credential fill` silently filled
-/// in a real, unrelated macOS-keychain-stored PAT before a custom helper ever
-/// ran, because nothing had cleared the existing helper chain first) — and the
-/// replacement is scoped to `credential.https://github.com.helper`, never the
-/// blanket `credential.helper` slot, so it is offered only for github.com
-/// HTTPS, matching every existing token resolver (`resolve_git_poll_token`,
-/// `git_webhook`'s installation-token minting), which are github.com-only.
-/// Every caller MUST keep the returned `File` alive until `Command::spawn`
-/// returns: `fork()` copies the parent's fd table before `spawn()` returns, so
-/// the child already holds its own reference by then and the parent's copy
-/// (dropped when the `File` goes out of scope — including on cancellation,
-/// this repo's Drop-releases-on-abort discipline) can close right after.
+/// Feeds a GitHub token to a git subprocess without it ever touching the command line, an
+/// environment variable or `.git/config`: a FIXED `credential.helper` one-liner reads
+/// `username=...\npassword=...\n` off an inherited fd backed by a 0600 temp file that is unlinked
+/// at once (readable fd, no path, root-owned) with FD_CLOEXEC cleared so it survives git's
+/// `exec()`. `-c credential.helper=` comes FIRST to clear any inherited helper (a base image's
+/// keychain/store entry would otherwise be consulted ahead of ours and leak an unrelated stored
+/// credential into a tenant's build) and the helper is scoped to
+/// `credential.https://github.com.helper`, matching the github.com-only token resolvers
+/// (`resolve_git_poll_token`, `git_webhook`). Callers MUST keep the returned `File` alive until
+/// `Command::spawn` returns: `fork()` copies the fd table first, so the child already holds its own
+/// reference.
 fn credential_feed(token: &str) -> anyhow::Result<(std::fs::File, [String; 4])> {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
@@ -642,8 +555,6 @@ fn credential_feed(token: &str) -> anyhow::Result<(std::fs::File, [String; 4])> 
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("open credential feed {}", path.display()))?;
-    // Unlink immediately: the fd stays valid and readable, but the path is gone
-    // the instant after open — never a file with a persistent path.
     let _ = std::fs::remove_file(&path);
     write!(file, "username=x-access-token\npassword={token}\n").context("write credential feed")?;
     file.flush().context("flush credential feed")?;
@@ -672,12 +583,10 @@ fn credential_feed(token: &str) -> anyhow::Result<(std::fs::File, [String; 4])> 
     ))
 }
 
-/// Apply credential config to a git subprocess: always clears any inherited
-/// `credential.helper` first (see `credential_feed`'s doc — this alone closes
-/// the "ambient stored credential leaks into a tenant build" surface even for
-/// an anonymous/public clone), then wires the fixed FD-backed helper when a
-/// token is present. Returns the open `File` the caller must hold alive until
-/// the command has actually been spawned.
+/// Applies credential config to a git subprocess: always clears any inherited `credential.helper`
+/// first (closing the ambient-credential surface even for anonymous clones), then wires the fixed
+/// fd-backed helper when a token is present. Returns the `File` the caller must keep alive until
+/// the command has been spawned.
 fn apply_credential(
     cmd: &mut Command,
     token: Option<&str>,
@@ -695,10 +604,9 @@ fn apply_credential(
     }
 }
 
-/// Marker error: `run_build` returned `Err` because the user cancelled it, not
-/// because a step genuinely failed. Lets the outer catch (in `start_build`'s
-/// driving task) set `DeployState::Cancelled` instead of `Error` without
-/// fragile string-matching on the message.
+/// Marker error: `run_build` returned `Err` because the user cancelled, not because a step failed,
+/// so the driving task sets `DeployState::Cancelled` instead of `Error` without string-matching the
+/// message.
 #[derive(Debug)]
 struct BuildCancelled;
 impl std::fmt::Display for BuildCancelled {
@@ -751,10 +659,9 @@ pub(crate) fn project_volume_name(
     name
 }
 
-/// Extract only current-incarnation volume names that the server-authored
-/// container run configuration will actually hand to podman. A stored legacy
-/// or malformed configuration is not cleanup authority: callers either reject
-/// registration or retain it as an observable cleanup residual.
+/// Current-incarnation volume names the server-authored container run configuration will actually
+/// hand to podman; a stored legacy or malformed configuration is not cleanup authority (callers
+/// reject registration or retain it as an observable cleanup residual).
 pub(crate) fn project_volume_names(
     project: &str,
     incarnation: ProjectIncarnation,
@@ -805,10 +712,9 @@ pub(crate) fn project_volume_names(
     Ok(names)
 }
 
+/// Project name from a repo URL; for an `image://` ref it is the image NAME without registry,
+/// namespace or `:tag`, so a tag change does not fork the project.
 pub fn project_name_from_url(url: &str) -> String {
-    // Container-image refs (`image://ns/name:tag`): the project is the image NAME —
-    // drop the registry/namespace prefix AND the `:tag` (else "simplifi:latest"
-    // slugs to the ugly "simplifi-latest" and every tag change forks the project).
     let last = url
         .trim_end_matches('/')
         .rsplit('/')
@@ -832,41 +738,32 @@ pub fn project_name_from_url(url: &str) -> String {
         .collect()
 }
 
-/// Durable deployment root: `$HIVE_DATA/deploys`. The mock backend serves files
-/// straight from a deployment's `root` for the deployment's whole life, so the
-/// root must survive a host reboot for exactly as long as the (replicated)
-/// deployment RECORD does. Under `/tmp` it did not: a reboot wiped the checkout
-/// while the record persisted, and the node then 404'd DEPLOYMENT_NOT_FOUND for
-/// a deployment it believed it had (witnessed live: dan.shadw.app, 2026-08-03).
-/// Pre-change roots under [`legacy_deploy_root`] keep working untouched — records
-/// carry absolute paths and the boot restore keys off `root` existing — until
-/// their host reboots; the lookup/purge/GC paths below all fall back to the
-/// legacy root so pre-change zip projects can still redeploy from retained
-/// source and their stale dirs still get reaped.
+/// Durable deployment root `$HIVE_DATA/deploys`: the mock backend serves files straight from a
+/// deployment's `root`, so it must outlive a host reboot exactly as long as the replicated
+/// deployment RECORD does (under `/tmp` a reboot wiped the checkout and the node 404'd
+/// `DEPLOYMENT_NOT_FOUND`). Roots under [`legacy_deploy_root`] keep working untouched until their
+/// host reboots, so the lookup, purge and GC paths all fall back to it.
 pub(crate) fn deploy_root() -> PathBuf {
     crate::persist::data_dir().join("deploys")
 }
 
-/// The pre-durability deployment root (`$TMPDIR/hive-deploys`). Nothing writes
-/// here anymore; it remains a read fallback (retained source for redeploys) and
-/// a GC/purge target until every pre-change checkout has aged out or rebooted away.
+/// The pre-durability root (`$TMPDIR/hive-deploys`): nothing writes here anymore, it remains a read
+/// fallback (retained source for redeploys) and a GC/purge target until every pre-change checkout
+/// has aged out or rebooted away.
 pub(crate) fn legacy_deploy_root() -> PathBuf {
     std::env::temp_dir().join("hive-deploys")
 }
 
-/// A project's on-disk name component under the deploy root. A project name is
-/// tenant-controlled text, so it is NEVER interpolated into a path verbatim —
-/// `sanitize_tag` maps it to `[a-z0-9._-]` (the same discipline as `hive-vol-`
-/// volume names), so a project called `..` or `a/b` can never escape the root.
-/// Pre-sanitization checkouts used the raw name; readers that must still find
-/// those take both prefixes (see `checkout_prefixes`).
+/// A project's on-disk name component under the deploy root: tenant-controlled text is NEVER
+/// interpolated into a path verbatim, `sanitize_tag` maps it to `[a-z0-9._-]` (the `hive-vol-`
+/// discipline), so `..` or `a/b` cannot escape the root. Pre-sanitization checkouts used the raw
+/// name; readers that must still find them take both prefixes (`checkout_prefixes`).
 fn checkout_tag(project: &str) -> String {
     sanitize_tag(project)
 }
 
-/// Dir-name prefixes a project's checkouts can carry: the sanitized component
-/// (current), plus the raw project name (pre-sanitization dirs). Matching both
-/// is what lets redeploy/GC/purge see checkouts written by older binaries.
+/// Dir-name prefixes a project's checkouts can carry: the sanitized component plus the raw project
+/// name (pre-sanitization dirs), so redeploy, GC and purge see checkouts written by older binaries.
 pub(crate) fn checkout_prefixes(project: &str) -> Vec<String> {
     let tag = checkout_tag(project);
     let mut v = vec![format!("{tag}-")];
@@ -877,10 +774,9 @@ pub(crate) fn checkout_prefixes(project: &str) -> Vec<String> {
     v
 }
 
-/// Checkout directories currently being created or read by a build. The GC
-/// and source-selector share this one lock: either a build owns a directory or
-/// the reaper owns its deletion, never both. Counts keep nested/reentrant reads
-/// honest without making the path registry a set with premature release.
+/// Checkout directories being created or read by a build: GC and the source selector share this one
+/// lock, so either a build owns a directory or the reaper owns its deletion, never both; counts
+/// keep nested reads honest without a premature release.
 #[derive(Default)]
 struct ActiveCheckoutOwners {
     total: usize,
@@ -970,10 +866,9 @@ pub(crate) fn active_checkout_paths(
         .collect()
 }
 
-/// Wait until every checkout reader/writer for one deleted incarnation has
-/// released its Drop-owned reservation. The bounded error names the exact paths
-/// that remain owned, so deletion can retain and report them rather than race a
-/// reader or claim complete cleanup.
+/// Waits until every checkout reader/writer of one deleted incarnation has released its Drop-owned
+/// reservation; the bounded error names the paths still owned, so deletion retains and reports them
+/// rather than racing a reader or claiming complete cleanup.
 pub(crate) async fn wait_for_checkout_drain(
     project: &str,
     incarnation: ProjectIncarnation,
@@ -992,12 +887,10 @@ pub(crate) async fn wait_for_checkout_drain(
     }
 }
 
-/// The newest on-disk deploy checkout for a project (`<deploy_root>/<tag>-*`),
-/// preferring a completed checkout with a package.json/Dockerfile. Lets a node that
-/// holds the SOURCE derive the service graph even when it holds no deployment
-/// RECORD (container deploys register the record on the coordinator, run on the
-/// lease-owner node). Scans BOTH the durable root and the legacy /tmp root.
-/// Returns None if no source is on disk.
+/// The newest on-disk deploy checkout of a project (`<deploy_root>/<tag>-*`, durable and legacy
+/// roots), preferring a completed one with a package.json/Dockerfile: lets a node that holds the
+/// SOURCE derive the service graph without a deployment RECORD (container deploys register the
+/// record on the coordinator and run on the lease owner). None when no source is on disk.
 pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
     let prefixes = checkout_prefixes(project);
     let mut cands: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
@@ -1014,11 +907,10 @@ pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
             if !p.is_dir() {
                 continue;
             }
-            // Only real checkouts (has a package.json or a container build file).
-            if !p.join("package.json").exists()
-                && !p.join("Dockerfile").exists()
-                && !p.join("Containerfile").exists()
-            {
+            let has_build_input = p.join("package.json").exists()
+                || p.join("Dockerfile").exists()
+                || p.join("Containerfile").exists();
+            if !has_build_input {
                 continue;
             }
             if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
@@ -1045,9 +937,9 @@ fn checkout_matches_source_id(name: &str, prefixes: &[String], id: &str) -> bool
     })
 }
 
-/// `newest_deploy_dir` restricted to checkouts belonging to specific
-/// BUILD ids: dirs are named `{tag}-{ms}-{build_id}`. An empty allowlist is
-/// never an upload-redeploy wildcard; absent provenance fails closed.
+/// [`newest_deploy_dir`] restricted to checkouts of specific BUILD ids (dirs are named
+/// `{tag}-{ms}-{build_id}`); an empty allowlist is never an upload-redeploy wildcard, absent
+/// provenance fails closed.
 pub(crate) fn newest_deploy_dir_for_ids(project: &str, ids: &[String]) -> Option<PathBuf> {
     newest_deploy_dir_for_ids_inner(project, ids)
 }
@@ -1077,10 +969,10 @@ fn newest_deploy_dir_for_ids_inner(project: &str, ids: &[String]) -> Option<Path
             if !p.is_dir() {
                 continue;
             }
-            if !p.join("package.json").exists()
-                && !p.join("Dockerfile").exists()
-                && !p.join("Containerfile").exists()
-            {
+            let has_build_input = p.join("package.json").exists()
+                || p.join("Dockerfile").exists()
+                || p.join("Containerfile").exists();
+            if !has_build_input {
                 continue;
             }
             if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
@@ -1092,9 +984,9 @@ fn newest_deploy_dir_for_ids_inner(project: &str, ids: &[String]) -> Option<Path
     cands.pop().map(|(_, p)| p)
 }
 
-/// Select and pin retained source under the same lock the reaper takes before
-/// deletion. The selector can therefore never hand a path to `copy_dir_into`
-/// after GC has decided to remove it, nor can GC claim it after selection.
+/// Selects and pins retained source under the same lock the reaper takes before deletion, so the
+/// selector never hands `copy_dir_into` a path GC already decided to remove, nor can GC claim it
+/// after selection.
 fn acquire_deploy_dir_for_ids(
     project: &str,
     incarnation: ProjectIncarnation,
@@ -1107,12 +999,10 @@ fn acquire_deploy_dir_for_ids(
     Some((path, guard))
 }
 
-/// Whether `project` already has a deployment ANYWHERE in the fleet — the local
-/// gateway OR a peer node (via gossiped `peer_deployments`). This distinguishes a
-/// FIRST deploy from a REDEPLOY. Critical for remotely-placed projects: the
-/// coordinator doesn't serve the host locally, so a local-only `serves_host` check
-/// wrongly treats every redeploy as a first deploy — spawning a phantom "Building…"
-/// placeholder deployment (git-less → classified Preview) and forcing `npm ci`.
+/// Whether `project` already has a deployment ANYWHERE in the fleet (local gateway or gossiped
+/// `peer_deployments`), which tells a FIRST deploy from a REDEPLOY: for a remotely-placed project a
+/// local-only `serves_host` check would treat every redeploy as a first deploy, spawning a phantom
+/// "Building…" placeholder and forcing `npm ci`.
 fn project_has_deployment(cloud: &Arc<CloudState>, project: &str) -> bool {
     if cloud.gw.serves_host(&format!("{project}.localhost")) {
         return true;
@@ -1137,10 +1027,9 @@ fn checkout_paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(&right) || right.starts_with(&left)
 }
 
-/// Claim and remove one stale candidate under the same lock used to register
-/// active checkouts. A completed build registers its deployment before its
-/// guard drops, so checking active owners first and current deployment roots
-/// second leaves no gap where neither can protect the directory.
+/// Claims and removes one stale candidate under the lock that registers active checkouts: a
+/// completed build registers its deployment before its guard drops, so checking active owners first
+/// and deployment roots second leaves no gap where neither protects the directory.
 fn reap_build_dir_if_unprotected(cloud: &Arc<CloudState>, path: &Path) -> bool {
     let active = active_checkouts().lock();
     if active
@@ -1160,16 +1049,11 @@ fn reap_build_dir_if_unprotected(cloud: &Arc<CloudState>, path: &Path) -> bool {
     std::fs::remove_dir_all(path).is_ok()
 }
 
-/// Self-management GC: reap stale clone/build working dirs under the deploy
-/// roots. Each build clones a repo into `<root>/<tag>-<stamp>-<bid>` (and
-/// `-building-<ms>-<bid>`); these are NOT removed after the build, so they
-/// accumulate and exhaust disk over time. Remove any dir untouched for longer
-/// than `max_age` — UNLESS it is the `root` of a LIVE deployment. The mock
-/// backend serves files straight from `root`, and the restart restore keys off
-/// `root` existing, so reaping an active root would take a deployment offline /
-/// drop it on the next restart (this is the bug that dropped shoomoo). Sweeps
-/// BOTH the durable root and the legacy /tmp root (pre-durability checkouts
-/// still age out there). Best-effort; returns the number of dirs removed.
+/// Self-management GC: reaps stale clone/build working dirs (`<root>/<tag>-<stamp>-<bid>`,
+/// `-building-<ms>-<bid>`; never removed after a build) untouched for longer than `max_age`, UNLESS
+/// the dir is the `root` of a LIVE deployment (the mock backend serves straight from `root` and the
+/// restart restore keys off it existing). Sweeps the durable and the legacy root; best-effort,
+/// returns the number removed.
 pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize {
     let now = std::time::SystemTime::now();
     let mut removed = 0usize;
@@ -1210,15 +1094,10 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
     removed
 }
 
-/// Releases the `Building…` placeholder's hold on the project's host alias even
-/// when the build task never finishes.
-///
-/// `Drop` runs when a spawned task is ABORTED (the future is dropped) and when
-/// it panics — the two cases that used to leak the placeholder forever, since
-/// the removal lived at the end of the happy path. Removal is async and `Drop`
-/// is not, so the guard hands the work to a detached task; outside a runtime
-/// (process teardown) it degrades to the boot reconciler + reaper, which reap
-/// the same shells.
+/// Releases the `Building…` placeholder's hold on the project's host alias even when the build task
+/// never finishes: `Drop` runs when the task is ABORTED or panics, the cases that used to leak it.
+/// Removal is async, so the guard hands it to a detached task; outside a runtime (process teardown)
+/// the boot reconciler and the reaper reap the same shells.
 struct PlaceholderGuard {
     cloud: Arc<CloudState>,
     id: Option<String>,
@@ -1250,18 +1129,15 @@ impl Drop for PlaceholderGuard {
     }
 }
 
-/// Start a build and return its id after its lifecycle reservations exist.
-/// `expected_incarnation` is authority passed separately by the authenticated
-/// fanout receiver; the identically-named request field is never trusted here.
+/// Starts a build and returns its id once its lifecycle reservations exist. `expected_incarnation`
+/// is authority passed separately by the authenticated fanout receiver; the identically-named
+/// request field is never trusted here.
 pub async fn start_build(
     cloud: Arc<CloudState>,
     mut req: GitDeployRequest,
     expected_incarnation: Option<ProjectIncarnation>,
     admission_team: Option<String>,
 ) -> anyhow::Result<String> {
-    // Reject a credential-bearing or structurally-unsafe source BEFORE any of
-    // it can reach a `Build` row, a webhook payload, a log line, or process
-    // argv — everything below this line persists/emits `req.repo_url`.
     validate_deploy_source(&req)?;
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
     let project = req
@@ -1269,15 +1145,7 @@ pub async fn start_build(
         .clone()
         .unwrap_or_else(|| project_name_from_url(&req.repo_url));
     req.project_incarnation = None;
-    // Non-Git sources carry no Git credential need; strip it here so it can
-    // never ride a fanout/mirror payload for a source that never clones.
-    if req.image_ref.is_some()
-        || req.zip_b64.is_some()
-        || req.repo_url.starts_with("upload://")
-        || req.repo_url.starts_with("image://")
-    {
-        req.git_token = None;
-    }
+    drop_git_token_for_non_git_source(&mut req);
 
     let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
     let legacy_deployment_ids = admission_team
@@ -1326,8 +1194,6 @@ pub async fn start_build(
     cloud.git_index.set_project_repo(&project, &req.repo_url);
     req.project_incarnation = Some(incarnation);
 
-    // Latest-push-wins is incarnation-scoped: a new same-name project cannot
-    // supersede work retained from a deleted predecessor.
     for b in cloud.builds.list() {
         if b.project == project
             && b.project_incarnation == Some(incarnation)
@@ -1419,9 +1285,9 @@ pub async fn start_build(
     Ok(id)
 }
 
-/// True when THIS node holds retained source that can rebuild one of `ids`.
-/// `ids` are platform-issued BUILD ids stamped into upload GitSource.commit;
-/// empty/legacy provenance fails closed instead of selecting a different lane.
+/// Whether THIS node holds retained source that can rebuild one of `ids` (platform-issued BUILD ids
+/// stamped into upload `GitSource.commit`); empty or legacy provenance fails closed instead of
+/// selecting a different lane.
 pub(crate) fn has_local_source_for_ids(project: &str, ids: &[String]) -> bool {
     retained_source_path_for_ids(project, ids).is_some()
         || newest_deploy_dir_for_ids(project, ids).is_some()
@@ -1441,9 +1307,9 @@ pub(crate) fn upload_source_build_id(source: &fluid_core::GitSource) -> Option<S
         .then(|| source.commit.clone())
 }
 
-/// Durable retained source for one upload lineage. The build id is platform-
-/// issued and validated before it becomes a path component; previews and
-/// production uploads therefore never overwrite one project-wide archive.
+/// Durable retained source for one upload lineage: the build id is platform-issued and validated
+/// before it becomes a path component, so previews and production uploads never overwrite one
+/// project-wide archive.
 fn retained_source_write_path(project: &str, build_id: &str) -> PathBuf {
     debug_assert!(valid_source_build_id(build_id));
     deploy_root().join(format!("{}-{build_id}.src.zip", checkout_tag(project)))
@@ -1456,50 +1322,18 @@ fn retained_source_path_for_ids(project: &str, ids: &[String]) -> Option<PathBuf
         .find(|path| path.is_file())
 }
 
-/// Find a browser-handler file for a function that did NOT opt in via
-/// fluid.json — the entry point for AUTOMATIC browser eligibility.
-///
-/// Fixed, function-scoped-then-generic names are probed, first existing match
-/// wins: the explicit `<fn>.browser.{js,mjs,cjs}` / `browser.{js,mjs,cjs}`
-/// convention first, then the function's OWN plausible entry files
-/// (`<fn>.handler.*`, `<fn>.*`, then generic `handler.*` / `index.*` /
-/// `main.*`) — so a function whose ordinary handler file exports
-/// `module.exports` is served in browsers with zero config, not just one that
-/// ships a dedicated `.browser.js`. What makes probing a function's own entry
-/// safe (rather than "shipping the wrong code" from a long-running server) is
-/// `bundle()`'s BUILD-TIME gate: `handler_export_present` drops any entry that
-/// never assigns a handler (`module.exports` / `exports.handler` /
-/// `exports.default`, or an ESM `export default` / `export const handler`,
-/// which `browser_esm::rewrite_esm` rewrites to CommonJS), and the
-/// unimplementable-surface scan drops machine code no browser Worker can run
-/// (`process.dlopen`, a `*.node` addon). Node/framework surfaces
-/// (`require`/`process`/`Buffer`/`fetch`/ESM `import`) are NOT rejected — the
-/// substrate is a real Node runtime (vendored node-worker), and a module it
-/// cannot provide is named at the point of use. A server's entry assigns no
-/// handler export, so it is filtered, never bundled. A synthesized
-/// candidate that fails to bundle is skipped SILENTLY (the function just serves
-/// the normal fleet path); only an explicit fluid.json opt-in fails the build.
-/// The `start_cmd` argv itself is still never parsed for an entry (it may be
-/// `next start`/`npm start` with no JS file at all); the file names above are
-/// probed on disk instead. The function name only builds a bare filename
-/// (rejected unless `[a-z0-9._-]`), and `bundle()`'s `resolve_entry` re-checks
-/// the final path stays inside the deployment root — no walk outside `build_dir`.
-/// Resolve a Node SERVER entry for a framework app that has no handler-shaped
-/// file: `package.json` (`main`/`module`/`exports`/`scripts.start` naming a JS
-/// file) and the built server outputs of the frameworks the platform detects.
-///
-/// Returns a deployment-root-relative path, the same shape
-/// `infer_browser_entry` returns. Only real, existing files are ever returned --
-/// a framework directory that was not built is not an entry.
+/// Resolves a Node SERVER entry for a framework app with no handler-shaped file: `package.json`
+/// (`main`/`module`/`exports`/`scripts.start` naming a JS file) and the built server outputs of the
+/// detected frameworks. Returns a deployment-root-relative path (the shape `infer_browser_entry`
+/// returns); only real, existing files are returned, so an unbuilt framework directory is not an
+/// entry.
 fn infer_package_server_entry(root: &Path) -> Option<String> {
     let is_js = |p: &str| {
         let lower = p.to_ascii_lowercase();
         lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs")
     };
     let exists = |rel: &str| root.join(rel).is_file();
-    // Framework build outputs first: these are the REAL server entry of a built
-    // app, and package.json `main` often still points at unbuilt source.
-    for rel in [
+    const BUILT_SERVER_ENTRIES: [&str; 8] = [
         ".next/standalone/server.js",
         "build/index.js",
         "build/server/index.js",
@@ -1508,7 +1342,8 @@ fn infer_package_server_entry(root: &Path) -> Option<String> {
         ".output/server/index.mjs",
         "server.js",
         "app.js",
-    ] {
+    ];
+    for rel in BUILT_SERVER_ENTRIES {
         if exists(rel) {
             return Some(rel.to_string());
         }
@@ -1533,8 +1368,6 @@ fn infer_package_server_entry(root: &Path) -> Option<String> {
         .and_then(|s| s.get("start"))
         .and_then(|v| v.as_str())
     {
-        // `next start` / `node build/index.js` -- take only the argv token that
-        // names a JS file, never the whole command line.
         for token in start.split_whitespace() {
             if is_js(token) {
                 candidates.push(token.trim_start_matches("./").to_string());
@@ -1545,6 +1378,15 @@ fn infer_package_server_entry(root: &Path) -> Option<String> {
     candidates.into_iter().find(|rel| exists(rel))
 }
 
+/// Finds a browser-handler file for a function that did NOT opt in via fluid.json (automatic
+/// browser eligibility): `<fn>.browser.*` and `browser.*` first, then the function's own plausible
+/// entries (`<fn>.handler.*`, `<fn>.*`, `handler.*`, `index.*`, `main.*`), first existing match
+/// wins. Probing a function's own entry is safe because `bundle()` gates at build time
+/// (`handler_export_present` drops server entries that assign no handler, the
+/// unimplementable-surface scan drops machine code); a synthesized candidate that fails to bundle
+/// is skipped silently and only an explicit fluid.json opt-in fails the build. `start_cmd` is never
+/// parsed for an entry, and `bundle()`'s `resolve_entry` keeps the final path inside the deployment
+/// root.
 fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     let safe_name = fn_name
@@ -1559,10 +1401,6 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     for ext in ["js", "mjs", "cjs"] {
         candidates.push(format!("browser.{ext}"));
     }
-    // The function's own plausible handler files, most-specific first. Each is
-    // still gated by bundle()'s handler-export + unimplementable-surface
-    // checks, so a matched-but-ineligible file (a server entry) is skipped,
-    // not shipped.
     if safe_name {
         for ext in ["js", "mjs", "cjs"] {
             candidates.push(format!("{fn_name}.handler.{ext}"));
@@ -1579,79 +1417,43 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     candidates.into_iter().find(|c| build_dir.join(c).is_file())
 }
 
-/// The ONE platform-generated browser entry adapter, and the reservoir it is
-/// derived from. See `assets/browser-adapter.cjs` for the full contract; the
-/// points that bind here:
-///
-/// * It is a CommonJS module assigning `module.exports` to one `async
-///   (request, ops)` function, so it passes `bundle()`'s handler-export gate
-///   for a function that owns no handler-shaped file of its own — no
-///   `api.browser.js` / `browser.js` / `handler.js` / `index.js` / `main.js`,
-///   no `package.json` main/module/exports/scripts.start JS file, and no
-///   framework build output has to be shipped for the function to be served in
-///   donor browsers.
-/// * The server it adapts is EMBEDDED at build time (single-file artifact: a
-///   browser Worker's filesystem holds the artifact and nothing else) and the
-///   remaining candidates are probed with a guarded `require` at runtime, each
-///   miss a skipped attempt rather than a crash. Probe specifiers are
-///   RELATIVE (`./…`) because the artifact's own directory is the `require`
-///   base: a bare specifier resolves through `node_modules`, which a one-file
-///   artifact never has. Nothing adapt-able ⇒ the handler throws a named
-///   `HiveBrowserAdapterError` at the point of use.
-/// * It adds no capability: no host path, no port, no fork, no socket — the
-///   app is invoked with a synthetic request and a collecting response.
-/// * The embedded server is evaluated EXACTLY ONCE (a promise memoized on
-///   `globalThis`, awaited by every invocation): `bundle()` embeds this file
-///   inside the `async function (request, ops)` it exports, so anything at its
-///   top level would otherwise re-run the whole server program per request.
-/// * `require("http")` is answered by a stub that captures the listener AND
-///   answers the rest honestly — `listen()` invokes its callback and emits
-///   `'listening'`, `on/once/emit` are a real registry, `address()` reports
-///   the requested port. A server gated on `await new Promise(r =>
-///   server.listen(0, r))` must complete, not hang.
-/// * `res.statusCode` / `res.statusMessage` are ACCESSORS over the one place
-///   the status lives, so the idiomatic `res.statusCode = 404` reaches the
-///   envelope instead of being dropped for a 200.
+/// The ONE platform-generated browser entry adapter (full contract in
+/// `assets/browser-adapter.cjs`): a CommonJS module assigning `module.exports` to one
+/// `async (request, ops)` function, so a function with no handler-shaped file still passes
+/// `bundle()`'s handler-export gate. The server it adapts is EMBEDDED at build time and the
+/// remaining candidates are probed with guarded RELATIVE `require`s (the artifact's own directory
+/// is the base). It adds no capability (no host path, port, fork or socket), evaluates the embedded
+/// server EXACTLY ONCE (promise memoized on `globalThis`), answers `require("http")` with an honest
+/// stub (`listen()` calls back and emits `'listening'`) and makes `res.statusCode`/`statusMessage`
+/// accessors so `res.statusCode = 404` reaches the envelope.
 const BROWSER_ADAPTER_JS: &str = include_str!("../assets/browser-adapter.cjs");
 
-/// Platform-reserved name of the generated entry inside a deployment root.
-/// Dot-prefixed and function-suffixed so two functions of one deployment never
-/// collide and a repository file can never be mistaken for it.
+/// Platform-reserved name of the generated entry in a deployment root: dot-prefixed and
+/// function-suffixed so two functions never collide and a repository file is never mistaken for it.
 const BROWSER_ADAPTER_FILE_PREFIX: &str = ".hive-browser-entry-";
 const BROWSER_ADAPTER_FILE_SUFFIX: &str = ".cjs";
 
-/// Hard bound on a server source we will embed into the generated adapter.
-/// `bundle()` sizes the whole entry at
-/// `fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES` (256 KiB); the adapter itself
-/// is ~26 KiB, so this leaves real headroom and is checked BEFORE the string
-/// is built rather than discovered as a rejected bundle afterwards.
+/// Hard bound on a server source embedded into the generated adapter, checked BEFORE the entry
+/// string is built rather than discovered as a rejected bundle.
 const BROWSER_ADAPTER_EMBED_MAX_BYTES: usize =
-    fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES - 64 * 1024;
+    fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES - BROWSER_ADAPTER_HEADROOM_BYTES;
+const BROWSER_ADAPTER_HEADROOM_BYTES: usize = 64 * 1024;
 
-/// The framework server-entry probe table: where a BUILT server actually
-/// lives, in one deterministic order. Deliberately WIDER than
-/// `infer_package_server_entry`'s list — that function only needs to answer
-/// "is there an entry file at all", while this table decides which server the
-/// generated adapter embeds and, failing that, which specifiers it probes at
-/// runtime, so an omitted output here is a deployment that silently serves
-/// nothing in browsers.
+/// The framework server-entry probe table in one deterministic order, deliberately WIDER than
+/// `infer_package_server_entry`'s list: it decides which server the generated adapter embeds and
+/// what it probes at runtime, so an omitted output serves nothing in browsers.
 const BROWSER_SERVER_PROBES: &[&str] = &[
-    // Next.js
     ".next/standalone/server.js",
     ".next/server/index.js",
-    // Nuxt / Nitro
     ".output/server/index.mjs",
     ".output/server/index.js",
     ".nuxt/dist/server/index.mjs",
-    // SvelteKit
     ".svelte-kit/output/server/index.js",
     "build/server/index.js",
-    // Astro / Remix / generic Vite server builds
     "dist/server/entry.mjs",
     "dist/server/server.js",
     "dist/server/index.js",
     "dist/server/main.js",
-    // Generic compiled/bundled outputs (tsc, esbuild, bun build, swc)
     "build/index.js",
     "build/main.js",
     "build/server.js",
@@ -1671,24 +1473,19 @@ const BROWSER_SERVER_PROBES: &[&str] = &[
     "index.js",
 ];
 
-/// A probe/target path as a `require` SPECIFIER: `./`-prefixed and never
-/// absolute. The generated artifact sits at the root of the guest filesystem
-/// the browser substrate mounts (`/hive`, with the artifact's own directory
-/// as its `require` base), so a relative specifier is the only form that can
-/// resolve a sibling file. A BARE specifier (`"server.js"`) resolves through
-/// `node_modules`, which a one-file artifact never has — the bare form made
-/// every runtime probe a guaranteed MODULE_NOT_FOUND, i.e. a dead fallback.
-/// The same string is still a valid build-dir-relative path for locating and
-/// embedding the server, so one list serves both halves.
+/// A probe/target path as a `require` SPECIFIER: `./`-prefixed, never absolute. The artifact sits
+/// at the root of the guest filesystem with its own directory as the `require` base, and a BARE
+/// specifier resolves through `node_modules`, which a one-file artifact never has (every probe a
+/// guaranteed MODULE_NOT_FOUND); the same string is still a valid build-dir-relative path, so one
+/// list serves both halves.
 fn browser_probe_spec(rel: &str) -> String {
     let trimmed = rel.trim().trim_start_matches('/');
     let stripped = trimmed.strip_prefix("./").unwrap_or(trimmed);
     format!("./{stripped}")
 }
 
-/// [`BROWSER_SERVER_PROBES`] resolved for one function: the function's own
-/// directory first when the manifest names one (Build Output API v3 `.func`
-/// directories), then the deployment root, in the table's order.
+/// [`BROWSER_SERVER_PROBES`] resolved for one function: its own directory first when the manifest
+/// names one (Build Output API v3 `.func` directories), then the deployment root, in table order.
 fn browser_server_probe_table(f: &fluid_core::FunctionConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(BROWSER_SERVER_PROBES.len() * 2);
     if let Some(cwd) = f.cwd_relative.as_deref() {
@@ -1705,10 +1502,9 @@ fn browser_server_probe_table(f: &fluid_core::FunctionConfig) -> Vec<String> {
     out
 }
 
-/// Reduce a function name to the `[a-z0-9._-]` shape a generated file name may
-/// carry — the `container_volume_cfg` / `hive-vol-` discipline applied to a
-/// write path: a tenant-controlled string is never interpolated into a path
-/// unsanitized, and the platform prefix is prepended AFTER sanitization.
+/// Reduces a function name to the `[a-z0-9._-]` shape a generated file name may carry (the
+/// `hive-vol-` discipline applied to a write path): a tenant-controlled string is never
+/// interpolated into a path unsanitized, and the platform prefix is prepended AFTER sanitization.
 fn browser_adapter_file_name(fn_name: &str) -> String {
     let mut slug = String::with_capacity(fn_name.len() + 32);
     for ch in fn_name.chars() {
@@ -1725,30 +1521,28 @@ fn browser_adapter_file_name(fn_name: &str) -> String {
     )
 }
 
-/// Generate + stage the platform's browser entry adapter for one Node/Bun
-/// function that owns no handler-shaped entry.
-///
-/// `preferred` is a file inference already located but `bundle()` rejected —
-/// almost always a real server that exports nothing, which is exactly the shape
-/// this adapter exists to host. When it is given it is tried first; otherwise
-/// the probe table decides.
-///
-/// Returns `(entry path, embedded server path)` — the deployment-root-relative
-/// entry path to stamp onto `FunctionConfig::browser`, plus the server the
-/// adapter embedded (so the build log can name it). The file is written
-/// ATOMICALLY (tmp + rename) and read-only (0444), mirroring
-/// `stage_build_output_node_launchers`: the path is platform-reserved, so a
-/// pre-existing symlink there is a refusal and a pre-existing regular file (a
-/// previous pass in the same build dir) is replaced, never followed.
-///
-/// It REFUSES when no server file could be embedded: an entry that adapts
-/// nothing is an artifact that throws in every donor's browser while looking
-/// perfectly bundled.
+/// Generates and stages the platform's browser entry adapter for one Node/Bun function that owns no
+/// handler-shaped entry. `preferred` is a file inference located but `bundle()` rejected (typically
+/// a real server that exports nothing, the shape this adapter hosts) and is tried first, else the
+/// probe table decides. Returns `(entry path, embedded server path)`. The file is written
+/// ATOMICALLY (tmp + rename) and read-only (0444), like `stage_build_output_node_launchers`: a
+/// pre-existing symlink at the reserved path is a refusal, a regular file is replaced, never
+/// followed. The embedded source passes the unimplementable-surface gate here, and the synthesis
+/// REFUSES when no server file could be embedded: an entry that adapts nothing throws in every
+/// donor's browser while looking perfectly bundled.
 fn synthesize_browser_entry(
     build_dir: &Path,
     f: &fluid_core::FunctionConfig,
     preferred: Option<&str>,
 ) -> Result<(String, String), String> {
+    struct EmbeddedServer {
+        rel: String,
+        source: String,
+        uses_import_meta: bool,
+    }
+    fn lf_normalize(raw: &str) -> String {
+        raw.replace("\r\n", "\n").replace('\r', "\n")
+    }
     let file_name = browser_adapter_file_name(&f.name);
     let table = browser_server_probe_table(f);
     let mut candidates: Vec<String> = Vec::with_capacity(table.len() + 1);
@@ -1764,18 +1558,10 @@ fn synthesize_browser_entry(
         }
     }
 
-    // Locate the server to embed. A candidate that cannot be embedded is
-    // recorded and SKIPPED, not fatal — another candidate may embed — but when
-    // NO candidate embeds there is no server to adapt, and the synthesis
-    // refuses (below) rather than shipping an entry that always throws.
-    let mut embedded: Option<(String, String, bool)> = None; // (rel, cjs source, uses_import_meta)
-    let mut skips: Vec<String> = Vec::new();
+    let mut embedded: Option<EmbeddedServer> = None;
+    let mut present_but_unembeddable: Vec<String> = Vec::new();
     for rel in &candidates {
         let path = build_dir.join(rel);
-        // Not present is not a skip — the table is a superset of what any one
-        // deployment contains, and a refusal line naming 28 absent paths says
-        // nothing. Only a file that IS there and could not be embedded is
-        // recorded.
         if !path.is_file() {
             continue;
         }
@@ -1788,78 +1574,66 @@ fn synthesize_browser_entry(
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
-            skips.push(format!("{rel}: unreadable"));
+            present_but_unembeddable.push(format!("{rel}: unreadable"));
             continue;
         };
-        // Deterministic bytes: LF-normalize before hashing, exactly as
-        // `bundle()` does.
-        let src = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let src = lf_normalize(&raw);
         if src.is_empty() || src.len() > BROWSER_ADAPTER_EMBED_MAX_BYTES {
-            skips.push(format!(
+            present_but_unembeddable.push(format!(
                 "{rel}: {} bytes (embeddable range 1..{BROWSER_ADAPTER_EMBED_MAX_BYTES})",
                 src.len()
             ));
             continue;
         }
-        // The unimplementable-surface gate, applied HERE because the embedded
-        // source is what would otherwise ride into the artifact past it:
-        // machine code in a donor's browser is a refusal at build, never a
-        // runtime surprise.
         let unimplementable = crate::browser_artifacts::unimplementable_lines(&src);
         if !unimplementable.is_empty() {
-            skips.push(format!(
+            present_but_unembeddable.push(format!(
                 "{rel}: line {} {}",
                 unimplementable[0].0, unimplementable[0].1
             ));
             continue;
         }
         let Ok(rewritten) = crate::browser_esm::rewrite_esm(&src) else {
-            skips.push(format!("{rel}: module syntax with no CommonJS equivalent"));
+            present_but_unembeddable
+                .push(format!("{rel}: module syntax with no CommonJS equivalent"));
             continue;
         };
-        embedded = Some((rel.clone(), rewritten.source, rewritten.uses_import_meta));
+        embedded = Some(EmbeddedServer {
+            rel: rel.clone(),
+            source: rewritten.source,
+            uses_import_meta: rewritten.uses_import_meta,
+        });
         break;
     }
 
-    // No server located ⇒ REFUSE. An entry embedding nothing still assigns
-    // `module.exports`, so it passes `bundle()`'s handler-export gate, gets a
-    // `browser_artifact` stamped and is auto-served to donors — where every
-    // invocation throws `HiveBrowserAdapterError` and nothing anywhere says
-    // why. The reason names what was looked for, and the auto pass records it
-    // as `browser_ineligible_reason`.
-    let (rel, source, uses_import_meta) = match embedded {
+    let EmbeddedServer {
+        rel,
+        source,
+        uses_import_meta,
+    } = match embedded {
         Some(found) => found,
         None => {
             let mut reason = format!(
                 "no server file in the deployment root to adapt — looked for [{}]",
                 summarize_list(&candidates, 12)
             );
-            if !skips.is_empty() {
+            if !present_but_unembeddable.is_empty() {
                 reason.push_str(&format!(
                     "; present but not embeddable [{}]",
-                    summarize_list(&skips, 8)
+                    summarize_list(&present_but_unembeddable, 8)
                 ));
             }
             return Err(reason);
         }
     };
-    // The name as it is displayed (and as the adapter reports it): the same
-    // path without the `require`-specifier prefix.
     let embed_name = rel.strip_prefix("./").unwrap_or(&rel).to_string();
     let embed_block = {
-        let name = embed_name.replace("*/", "* /"); // never close the block comment
+        let comment_safe_name = embed_name.replace("*/", "* /");
         let meta = if uses_import_meta {
             crate::browser_artifacts::import_meta_binding(&rel)
         } else {
             String::new()
         };
-        // An ASYNC init function, not a top-level IIFE: `bundle()` embeds this
-        // adapter verbatim inside the `async function (request, ops)` it
-        // exports, so a top-level statement re-evaluates the whole server
-        // program on EVERY invocation (leaking each later instance's app
-        // object, timers and sockets). `__hive_init()` awaits this exactly
-        // once and memoizes the result on `globalThis`. `async` also keeps a
-        // top-level `await` inside a rewritten ES module legal.
         format!(
             "async function __hive_embedded_init() {{\n\
              \x20 const module = {{ exports: {{}} }};\n\
@@ -1872,14 +1646,12 @@ fn synthesize_browser_entry(
              \x20 return module.exports;\n\
              }}\n",
             meta = meta,
-            name = name,
+            name = comment_safe_name,
             source = source
         )
     };
     let probes_json = serde_json::to_string(&candidates)
         .map_err(|e| format!("cannot encode the browser probe table: {e}"))?;
-    // One JSON string literal holding the table's JSON text, so the generated
-    // module is a valid JS file whatever the table contains.
     let probes_literal = serde_json::to_string(&probes_json)
         .map_err(|e| format!("cannot encode the browser probe table: {e}"))?;
     let embed_name_literal = serde_json::to_string(&embed_name)
@@ -1893,8 +1665,6 @@ fn synthesize_browser_entry(
     }
 
     let target = build_dir.join(&file_name);
-    // Reserved-path discipline: a symlink here is a refusal (never followed),
-    // a regular file is this build's own earlier pass and is replaced.
     match std::fs::symlink_metadata(&target) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(format!(
@@ -1942,22 +1712,13 @@ fn summarize_list(items: &[String], limit: usize) -> String {
     out
 }
 
-/// Every function name a repo's `fluid.json` EXPLICITLY opted into browser
-/// execution, read straight off the raw file.
-///
-/// Load-bearing because only ONE of `produce_manifest`'s five manifest shapes
-/// (the plain-`fluid.json` branch) deserializes the file into a `Manifest` at
-/// all: the prebuilt-image, docker-compose, Dockerfile, and FDI branches each
-/// SYNTHESIZE `functions` from their own source, so `FunctionConfig::browser`
-/// arrives at the bundling pass as `None` and the opt-in evaporates with no
-/// error, no log, and no artifact — the deployment goes Ready and the picker
-/// silently omits it. The build-contract rule is loud-or-honored, never
-/// silently dropped, so `deploy_full` compares this against the manifest it
-/// actually produced (see its "dropped browser opt-in" guard) and fails the
-/// build naming each lost function. Parsed with a minimal local shape (not
-/// `Manifest`) so a container-path `fluid.json` that carries only a `container`
-/// block — or a malformed one, which those paths tolerate today — still yields
-/// an empty list rather than becoming a new way to fail a build.
+/// Every function name a repo's `fluid.json` EXPLICITLY opted into browser execution, read straight
+/// off the raw file. Load-bearing because only the plain-`fluid.json` branch of `produce_manifest`
+/// deserializes the file into a `Manifest`: the prebuilt-image, compose, Dockerfile and FDI
+/// branches synthesize `functions`, so the opt-in would silently evaporate. `deploy_full` compares
+/// this list with the manifest it produced and fails the build naming each lost function
+/// (loud-or-honored). Parsed with a minimal local shape, so a container-only or malformed
+/// `fluid.json` yields an empty list instead of a new way to fail a build.
 async fn fluid_json_browser_optins(build_dir: &Path) -> Vec<String> {
     #[derive(serde::Deserialize)]
     struct Fn_ {
@@ -1985,11 +1746,10 @@ async fn fluid_json_browser_optins(build_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Redeploy a project whose retained source lives on a SPECIFIC host node (not this
-/// coordinator). Dispatch the rebuild to that node over the existing fanout transport
-/// (HTTP admin or iroh mesh); the target, receiving an `upload://` request with no
-/// archive, rebuilds from ITS OWN retained source. The remote build is mirrored into a
-/// local build record so the dashboard shows a single build. Returns the build id.
+/// Redeploys a project whose retained source lives on a SPECIFIC host node: dispatches the rebuild
+/// to it over the fanout transport (HTTP admin or iroh mesh), where an `upload://` request with no
+/// archive rebuilds from ITS OWN retained source; the remote build is mirrored into a local build
+/// record so the dashboard shows one build. Returns the build id.
 pub(crate) async fn redeploy_on_host(
     cloud: Arc<CloudState>,
     project: String,
@@ -1997,20 +1757,8 @@ pub(crate) async fn redeploy_on_host(
     host: crate::schedule::Target,
     expected_incarnation: Option<ProjectIncarnation>,
 ) -> anyhow::Result<String> {
-    // Same gate as `start_build` — every `cloud.builds.insert` site validates
-    // first. This path's `repo_url` normally comes from an already-validated
-    // stored project record, but validating again is cheap and keeps the
-    // invariant absolute rather than trust-dependent on the caller.
     validate_deploy_source(&req)?;
-    // Same non-Git-source token strip as `start_build` — this path exists
-    // specifically for retained upload/image redeploys, which never clone.
-    if req.image_ref.is_some()
-        || req.zip_b64.is_some()
-        || req.repo_url.starts_with("upload://")
-        || req.repo_url.starts_with("image://")
-    {
-        req.git_token = None;
-    }
+    drop_git_token_for_non_git_source(&mut req);
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
     req.project_incarnation = None;
     let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
@@ -2222,11 +1970,6 @@ fn repository_identity(raw: &str) -> anyhow::Result<String> {
         !raw.chars().any(char::is_control),
         "repository URL contains control characters"
     );
-    // A value starting with '-' could be parsed as a git OPTION instead of a
-    // positional URL/pathspec by any downstream `git` invocation that forwards
-    // it verbatim (clone/fetch/ls-remote all take the url as a bare arg) —
-    // reject it here, once, rather than trusting every call site to guard
-    // argv order.
     anyhow::ensure!(
         !raw.starts_with('-'),
         "repository URL may not begin with '-'"
@@ -2254,13 +1997,11 @@ fn repository_identity(raw: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-/// An OCI reference may contain at most one `@`, and only ever as a content
-/// digest pin (`@sha256:<hex>`, or another registered digest algorithm) — that
-/// is the ONLY place `@` is valid in OCI reference grammar. A crafted string
-/// shaped like HTTP userinfo (`user:token@registry/...`) is not valid OCI
-/// syntax, but nothing downstream re-validates it before it reaches
-/// `podman pull`'s argv and every log line that names the image verbatim
-/// (`image_container_manifest`) — reject it here, before either happens.
+/// An OCI reference may contain at most one `@`, only as a content digest pin (`@sha256:<hex>` or
+/// another registered digest algorithm); a string shaped like HTTP userinfo
+/// (`user:token@registry/...`) is not valid OCI syntax, yet nothing downstream re-validates it
+/// before it reaches `podman pull`'s argv and every log line naming the image, so it is rejected
+/// here.
 fn reject_credential_bearing_image_ref(image: &str) -> anyhow::Result<()> {
     let image = image.trim();
     anyhow::ensure!(!image.is_empty(), "image reference is empty");
@@ -2295,10 +2036,9 @@ fn reject_credential_bearing_image_ref(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reject a credential-bearing or structurally-unsafe deploy source before it
-/// can reach a `Build` row, a webhook payload, a log line, or process argv.
-/// Callers MUST run this before `cloud.builds.insert` — the two insertion
-/// sites in this file (`start_build`, `redeploy_on_host`) both call it first.
+/// Rejects a credential-bearing or structurally-unsafe deploy source before it can reach a `Build`
+/// row, a webhook payload, a log line or process argv; callers MUST run it before
+/// `cloud.builds.insert` (`start_build` and `redeploy_on_host` both call it first).
 fn validate_deploy_source(req: &GitDeployRequest) -> anyhow::Result<()> {
     repository_identity(&req.repo_url).context("repository URL")?;
     if let Some(head) = req.head_repo_url.as_deref().filter(|s| !s.is_empty()) {
@@ -2308,6 +2048,16 @@ fn validate_deploy_source(req: &GitDeployRequest) -> anyhow::Result<()> {
         reject_credential_bearing_image_ref(image).context("image reference")?;
     }
     Ok(())
+}
+
+fn drop_git_token_for_non_git_source(req: &mut GitDeployRequest) {
+    let is_non_git_source = req.image_ref.is_some()
+        || req.zip_b64.is_some()
+        || req.repo_url.starts_with("upload://")
+        || req.repo_url.starts_with("image://");
+    if is_non_git_source {
+        req.git_token = None;
+    }
 }
 
 fn resolve_build_trust(
@@ -2341,6 +2091,7 @@ fn resolve_build_trust(
         );
     }
 
+    let first_source_deploy = production_branch.is_empty();
     let lane = if source_is_fork {
         BuildTrustLane::PreviewFork
     } else {
@@ -2354,10 +2105,7 @@ fn resolve_build_trust(
                     BuildTrustLane::PreviewBase
                 }
             }
-            // First source deploy establishes its branch as production. A
-            // branch-less request for an existing project cannot prove that it
-            // targets production and therefore fails toward preview.
-            _ if production_branch.is_empty() => BuildTrustLane::Production,
+            _ if first_source_deploy => BuildTrustLane::Production,
             _ => BuildTrustLane::PreviewBase,
         }
     };
@@ -2369,50 +2117,32 @@ fn resolve_build_trust(
     })
 }
 
-/// The ONE `BUILD_ISOLATION_UNAVAILABLE` message, shared by both refusal sites
-/// in `run_build` (the fleet-wide gate and the region-filtered one) so they
-/// cannot drift apart.
-///
-/// It states what the requirement actually is — a node that can run repository
-/// build commands, i.e. an isolated BuildExecutor v1 OR a host-exec
-/// mock/litebox backend that builds on the host (`schedule::
-/// build_isolation_capable`) — instead of "protocol v1" alone, and it keeps the
-/// three counts that used to be conflated separate: capable fleet-wide, capable
-/// in the configured region(s), and (the one that explains an empty placement)
-/// capable AND healthy/reachable there. Printing only the fleet-wide figure
-/// next to "no healthy reachable placement" is what made a fleet whose capable
-/// nodes were all unhealthy read as "capacity exists but the platform refuses",
-/// sending tenants — and us — hunting a missing BuildExecutor on macOS/litebox
-/// nodes that never needed one.
+/// The ONE `BUILD_ISOLATION_UNAVAILABLE` message, shared by both refusal sites in `run_build` (the
+/// fleet-wide gate and the region-filtered one) so they cannot drift. It states the real
+/// requirement (a node that can run repository build commands: an isolated BuildExecutor v1 or a
+/// host-exec mock/litebox backend, `schedule::build_isolation_capable`) and keeps three counts
+/// apart: capable fleet-wide, capable in the configured region(s), and capable AND
+/// healthy/reachable there, the one that explains an empty placement.
 fn build_isolation_unavailable_message(
     diagnosis: &crate::schedule::BuildPlacementDiagnosis,
     regions: &[String],
 ) -> String {
     let requirement = "this source deployment needs a node that can run repository build commands (an isolated BuildExecutor v1, or a host-exec mock/litebox backend that builds on the host), but no healthy reachable placement satisfying the request offers one";
-    // Assembled from single-line pieces on purpose: a `\`-continued Rust
-    // string literal keeps its source indentation, which ships as a run of
-    // spaces mid-sentence in a message users actually read. Pieces that do not
-    // apply are left OUT, never joined as an empty string (a double space reads
-    // as a broken sentence in the build log).
     let mut sentences: Vec<String> = Vec::new();
-    if diagnosis.capable_total == 0 {
-        // Nothing to count: the fleet has no build-capable node at all.
-    } else if regions.is_empty() {
+    if diagnosis.capable_total > 0 && regions.is_empty() {
         sentences.push(format!(
             "{} node(s) known to the mesh can run repository build commands, of which {} currently pass placement (healthy, reachable and otherwise eligible).",
             diagnosis.capable_total, diagnosis.placeable_in_region
         ));
-    } else {
+    } else if diagnosis.capable_total > 0 {
         let head = format!(
             "{} node(s) known to the mesh can run repository build commands; {} of those are in the project's configured region(s) ({})",
             diagnosis.capable_total,
             diagnosis.capable_in_region,
             regions.join(", ")
         );
-        // With nothing in the configured region(s), the healthy/reachable
-        // figure is 0 by construction — printing it too just repeats the
-        // region count and buries the real reason one clause deeper.
-        if diagnosis.capable_in_region == 0 {
+        let nothing_in_configured_regions = diagnosis.capable_in_region == 0;
+        if nothing_in_configured_regions {
             sentences.push(format!("{head}."));
         } else {
             sentences.push(format!(
