@@ -108,7 +108,7 @@ while true; do
   fi
   # Any HTTP status proves the broker is alive (degraded is waited out); only no answer at all
   # (000) is a wedge recycling can repair.
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${ORIGIN}/healthz" 2>/dev/null || echo 000)"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${ORIGIN}/healthz" 2>/dev/null)" || code=000
   if [[ "$code" != "000" ]]; then
     if (( fails > 0 )); then
       echo "hive-browser-node: broker reachable again after ${fails} unreachable probe(s)"
