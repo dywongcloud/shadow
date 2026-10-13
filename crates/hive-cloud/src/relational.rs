@@ -1,57 +1,20 @@
-//! Fleet-consistent state via guardian-db's native relational/SQL layer
-//! (`guardian_db::sql` — in-process, zero network hop; NOT the pgwire wire
-//! protocol, which is never enabled — see `Cargo.toml`'s guardian-db feature
-//! comment). Every node opens the same named database ("hive") against the
-//! same shared, already relay-patched `GuardianDB` instance `guardian::handle`
-//! uses; guardian-db's own iroh-docs CRDT replication converges every node's
-//! local copy of every table within seconds of a write anywhere in the fleet.
-//!
-//! Scope: `ProjectStore` and `BillingStore` — both confirmed node-local with
-//! zero live cross-node merge (the Simpfi/drugs-wtf visibility bug and the
-//! 5-way billing-state divergence bug). Both have RARE writes (a project
-//! settings change, or the once-a-minute metering tick) and need
-//! fleet-consistent reads — exactly what this layer buys. `MetricsStore` is
-//! deliberately NOT here: its writes fire on every request (a hot path), and
-//! migrating those onto CRDT-replicated storage would be a real performance
-//! regression for no correctness gain — its fix is the fleet-fan-out-on-READ
-//! in `metrics_get` instead (see admin.rs).
-//!
-//! Writes still funnel through the EXISTING single-writer discipline
-//! (`admin_ingress` forwards every mutation to the control-plane leader;
-//! `spawn_billing_meter_loop` metering ticks only fire on the elected
-//! billing leader) — this layer adds fleet-wide REPLICATED READS on top of
-//! that, not a new write-consistency model. guardian-db's own docs describe
-//! its default mode as local-first / eventually-consistent CRDT (LWW) —
-//! single-writer sidesteps that risk entirely by construction (there is
-//! never a second concurrent writer to conflict with).
-//!
-//! Additive only: every existing store (`ProjectStore`, `BillingStore`) and
-//! its on-disk/guardian-KV backup (`persist.rs`, `guardian::replicate`) is
-//! completely unchanged and remains the source of truth for local reads and
-//! for the process's own in-memory state. This module is a best-effort
-//! fleet-replicated CACHE layered alongside it: a failure here never blocks
-//! the mutation it mirrors (same "durability/consistency on top, never on
-//! the critical path" convention as `guardian::replicate`).
+//! Fleet-replicated read mirror of project ownership, billing, teams, deployments and shadw-drive
+//! metadata in guardian-db's in-process SQL layer (`guardian_db::sql`, never pgwire). Writes still
+//! funnel through the existing single writers (control-plane leader, billing authority) and the
+//! in-memory stores stay the source of truth, so a failure here never blocks the mutation it
+//! mirrors. `teams`, `team_members` and `deployments` are view-only (admin SQL browser): nothing
+//! reads them back.
 
 use guardian_db::sql::{ExecResult, Session, SqlValue};
 use serde::{Deserialize, Serialize};
 
 use crate::guardian::SqlDb;
 
-/// Idempotent schema bring-up — safe to call on every boot (`CREATE TABLE IF
-/// NOT EXISTS`), PLUS an unconditional `billing_accounts` column
-/// reconciliation (`reconcile_billing_accounts_schema`) every single call —
-/// see that function's doc comment for why `CREATE TABLE IF NOT EXISTS`
-/// alone is not enough for that one table. Best-effort: GuardianDB may not
-/// be ready yet (same init-race as every other guardian.rs caller); a
-/// failure here just means the fleet fallback is unavailable until the next
-/// successful call, never a boot failure.
+/// Idempotent schema bring-up, safe on every boot and the ONLY path that creates the catalog's
+/// tables: waits for the first index walk, creates and verifies each table, then reconciles the
+/// columns added after first release. Best-effort: a failure only leaves the fleet read fallback
+/// unavailable until the next successful call, never a boot failure.
 pub(crate) async fn init_schema() {
-    // GuardianDB's own bring-up routinely outlasts the boot moment this is
-    // spawned at (minutes on a large store), and this is the ONLY path that
-    // creates the catalog and its tables: a single deferred attempt left a
-    // node with no schema for its whole process life. Retry until the handle
-    // opens, bounded like the index walk it then waits for.
     let deadline = std::time::Instant::now() + index_build_timeout();
     let db = loop {
         match crate::guardian::sql_db().await {
@@ -66,11 +29,6 @@ pub(crate) async fn init_schema() {
             }
         }
     };
-    // The catalog is one whole-document read-modify-write. Against an unbuilt
-    // (empty) index every CREATE TABLE below would "succeed" into a fresh
-    // catalog and persist it over the real one, so DDL waits for the first
-    // full walk (bounded like the walk itself) and is skipped, loudly, if
-    // that never comes.
     spawn_index_refresher(db.clone());
     let bound = index_build_timeout();
     if !wait_index_ready(bound).await {
@@ -94,8 +52,6 @@ pub(crate) async fn init_schema() {
             deleted_ms BIGINT NOT NULL DEFAULT 0\
         )",
         ),
-        // Normalized (real columns, one row per fact) — replaces the old
-        // single-JSON-blob-per-tenant `account_json`. See `upsert_billing`.
         (
             "billing_accounts",
             "CREATE TABLE IF NOT EXISTS billing_accounts (\
@@ -162,8 +118,6 @@ pub(crate) async fn init_schema() {
             created_ms BIGINT NOT NULL\
         )",
         ),
-        // DEPRECATED-PENDING-REMOVAL: retained until a separately witnessed
-        // fleet-wide backfill proves every legacy row is normalized.
         (
             "billing_ledger_snapshot",
             "CREATE TABLE IF NOT EXISTS billing_ledger_snapshot (\
@@ -220,15 +174,6 @@ pub(crate) async fn init_schema() {
             updated_ms BIGINT NOT NULL\
         )",
         ),
-        // shadw drive (bn-shadw-drive-v1) -- see the "Drive" section below for
-        // every query helper. `parent_id` is '' for a top-level entry (no
-        // materialized root row); `deleted_at` is a tombstone (0 = live),
-        // LWW-safe under this table's own CRDT merge -- a hard delete racing a
-        // concurrent rename is undefined in any LWW store, so tombstone-then-GC
-        // is the only safe shape (AGENTS.md's own drive_nodes doc). `owner_node`
-        // is NOT in the design doc's abbreviated column list but is required
-        // for the doc's own fetch-on-miss mechanism ("resolved from
-        // drive_nodes") to have anything to resolve.
         (
             "drive_nodes",
             "CREATE TABLE IF NOT EXISTS drive_nodes (\
@@ -247,8 +192,6 @@ pub(crate) async fn init_schema() {
             deleted_at BIGINT NOT NULL DEFAULT 0\
         )",
         ),
-        // `token_hash` (SHA-256, apikeys.rs's own convention) rather than the
-        // raw capability token -- a DB dump must not hand out live share links.
         (
             "drive_shares",
             "CREATE TABLE IF NOT EXISTS drive_shares (\
@@ -260,12 +203,6 @@ pub(crate) async fn init_schema() {
             created_ms BIGINT NOT NULL\
         )",
         ),
-        // One long-lived, revocable WebDAV Basic-auth credential per project
-        // (design §3). Lives in the SAME replicated table every node's Basic
-        // auth check reads, so the check succeeds regardless of which
-        // round-robin node the WebDAV client's TCP connection lands on --
-        // not named in the design's storage-model section, but required for
-        // its own WebDAV auth requirement to work from any node at all.
         (
             "drive_tokens",
             "CREATE TABLE IF NOT EXISTS drive_tokens (\
@@ -277,26 +214,10 @@ pub(crate) async fn init_schema() {
     ] {
         ensure_table_exists(&mut session, table, ddl).await;
     }
-    // `billing_ledger_snapshot` / `billing_invoices_snapshot` are deprecated,
-    // but remain intact until a separately witnessed migration proves every
-    // legacy row has been normalized fleet-wide. Dropping them during ordinary
-    // schema bring-up would destroy the only copy of pre-normalization billing
-    // history before the backfill can read it, and would break mixed-version
-    // nodes that still expect the legacy tables.
-    // `CREATE TABLE IF NOT EXISTS billing_accounts` above is a genuine no-op
-    // against the OLD 3-column shape every real production node already has
-    // (see `reconcile_billing_accounts_schema`'s doc comment for the full
-    // finding) — reconcile it unconditionally, on every boot, before any
-    // `upsert_billing`/`billing_snapshot` call is ever possible. This makes
-    // correct schema a boot-time guarantee rather than an operator-remembered
-    // manual step (previously this only ran inside the admin-triggered
-    // `backfill_billing_normalize` endpoint).
     reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
     reconcile_billing_invoices_schema(&mut session).await;
-    // Success used to be silent, so a node whose bring-up never ran was
-    // indistinguishable in the journal from one whose bring-up succeeded.
     let failed = SCHEMA_BRINGUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
     if failed == 0 {
         tracing::info!(
@@ -317,53 +238,17 @@ pub(crate) async fn init_schema() {
 static SCHEMA_BRINGUP_FAILURES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Attempts to bring up a single table before giving up and logging loudly —
-/// see `ensure_table_exists`'s doc comment for why a `CREATE TABLE IF NOT
-/// EXISTS` reporting `Ok` is not sufficient proof the table actually exists.
 const SCHEMA_BRINGUP_MAX_ATTEMPTS: u32 = 4;
 
-/// Run `ddl` (a `CREATE TABLE IF NOT EXISTS ...` statement for `table`) and
-/// then VERIFY the table actually exists afterward — retrying (re-running the
-/// DDL, then re-verifying) if it doesn't, up to `SCHEMA_BRINGUP_MAX_ATTEMPTS`
-/// times, before logging loudly and giving up.
-///
-/// LIVE-WITNESSED ROOT CAUSE this closes: on a genuinely fresh/empty
-/// GuardianDB, `billing_ledger` silently failed to come into existence with
-/// NO warning logged at all — not a swallowed `Err`, the `if let Err` branch
-/// never fired, because `exec()` genuinely returned `Ok` for that statement.
-/// Root-caused by reading `vendor/guardian-db/src/sql/engine.rs` +
-/// `guardian_storage.rs`: guardian-db's SQL catalog is a SINGLE JSON document
-/// (`GuardianRelationalStorage::{load_catalog,save_catalog}`, keyed
-/// `__gdb_sql_catalog/catalog`) that every autocommit statement reads whole
-/// (`Session::execute_inner`'s `None => self.load_catalog().await?` when not
-/// inside an explicit transaction), mutates in memory, and writes back whole
-/// (`if catalog_dirty { self.save_catalog(&new_catalog).await? }`) — with NO
-/// compare-and-swap or lock around that read-modify-write pair. `init_schema`
-/// runs its DDL loop on ONE `Session`, sequentially — but main.rs boots other
-/// loops concurrently (`spawn_billing_meter_loop` / `spawn_relational_mirror_loop`)
-/// that open their OWN, separate `Session`s (this module's `session()`
-/// helper) and can issue their own autocommit DDL at the same time (e.g.
-/// `upsert_billing`'s unconditional `reconcile_billing_accounts_schema` ->
-/// `ALTER TABLE billing_accounts ADD COLUMN ...`, which is `catalog_dirty`
-/// too). If that concurrent session's `load_catalog()` snapshots the catalog
-/// just BEFORE this loop's `CREATE TABLE billing_ledger` persists, and its
-/// own `save_catalog()` lands just AFTER, its stale-based whole-document
-/// overwrite silently ERASES the just-created table — a lost-update race,
-/// not a syntax error or a timeout. Every individual statement in BOTH
-/// sessions genuinely returned `Ok`, so `exec()`'s `if let Err` never had
-/// anything to catch and nothing was ever logged. `CREATE TABLE IF NOT
-/// EXISTS` itself can't detect this (it only ever sees its OWN session's
-/// view), so the only reliable defense is to check afterward, from a freshly
-/// reloaded session view, whether the table is REALLY there — which is what
-/// this function does.
+/// Runs `ddl`, then VERIFIES the table is in the catalog, re-running up to
+/// `SCHEMA_BRINGUP_MAX_ATTEMPTS` times. The SQL catalog is ONE JSON document that every autocommit
+/// statement loads and rewrites whole with no compare-and-swap, so a concurrent session's catalog
+/// write can silently erase a just-created table while every statement still returns `Ok`.
 async fn ensure_table_exists(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     table: &str,
     ddl: &str,
 ) {
-    // Never CREATE against an unbuilt catalog (see `session`'s doc): the
-    // "missing" table is an artifact of the empty index, and persisting a
-    // fresh catalog here would erase the real one.
     if !index_ready() {
         warn_index_not_ready(table);
         return;
@@ -372,12 +257,6 @@ async fn ensure_table_exists(
         if let Err(e) = exec(s, ddl).await {
             tracing::warn!(table, attempt, error = %e, "relational: schema bring-up CREATE TABLE statement failed");
         }
-        // Verify against a freshly reloaded catalog view (every autocommit
-        // statement reloads the catalog — see this fn's doc comment). The
-        // check reads the CATALOG, never the table's rows: `SELECT 1 FROM t`
-        // scans every row, and on a cold index each row is a peer fetch, so
-        // that form timed out at 10 s for `teams` and `billing_ledger` and
-        // reported genuinely-created tables as missing (2026-09-02).
         let verify = format!(
             "SELECT table_name FROM information_schema.tables WHERE table_name = '{table}'"
         );
@@ -436,10 +315,8 @@ async fn ensure_table_exists(
 static PROJECT_TEAMS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Add the relational tombstone column on nodes whose `project_teams` table
-/// predates deletion generations. `CREATE TABLE IF NOT EXISTS` never alters an
-/// existing table, so every read/write path calls this memoized reconciliation
-/// before referring to `deleted_ms`.
+/// Adds the `deleted_ms` tombstone column to a `project_teams` table that predates deletion
+/// generations (`CREATE TABLE IF NOT EXISTS` never alters an existing table); memoized.
 async fn reconcile_project_teams_schema(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
 ) {
@@ -467,23 +344,10 @@ async fn reconcile_project_teams_schema(
     PROJECT_TEAMS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// One-time boot backfill: mirror THIS node's existing `ProjectStore` snapshot
-/// into the relational table. Without this, a project created BEFORE this
-/// migration shipped (e.g. `drugs-wtf`) would never appear in the mirror —
-/// `set_project_team` only fires on the NEXT mutation, and most projects'
-/// team tag is set once at creation and never touched again. Safe to run on
-/// EVERY node unconditionally (unlike billing — see below): the upsert is
-/// idempotent and every node's local row for a given project is, by
-/// construction, a copy of the same project's data, so a multi-node backfill
-/// race converges to the same correct value, never a conflict.
-///
-/// Billing is deliberately NOT backfilled here: only the CURRENTLY-elected
-/// billing authority's local `BillingStore` is correct/live (every other
-/// node's is stale-by-design, only ever bootstrapped from a peer snapshot at
-/// boot) — backfilling from a non-authority node would overwrite the mirror
-/// with wrong data. Billing self-heals instead via `spawn_billing_meter_loop`,
-/// which mirrors every actively-metered tenant on every tick (default 60s)
-/// from whichever node is actually authoritative at the time.
+/// One-time boot backfill of THIS node's `ProjectStore` rows into the mirror; safe on every node
+/// (idempotent upserts of the same data). Rows the replica already holds identically are skipped:
+/// LWW compares document timestamps, so re-asserting a stale live row would resurrect it over a
+/// newer tombstone. Billing is NOT backfilled here: only the billing authority's store is live.
 pub(crate) async fn backfill_projects(projects: Vec<(String, String, String, u64)>) {
     if projects.is_empty() {
         return;
@@ -494,15 +358,6 @@ pub(crate) async fn backfill_projects(projects: Vec<(String, String, String, u64
     let mut s = session(db).await;
     reconcile_project_teams_schema(&mut s).await;
     for (project, team, root_dir, updated_ms) in projects {
-        // Skip rows the replica already holds IDENTICALLY (same live row,
-        // same version): re-asserting an unchanged row still lands a FRESH
-        // doc put, and GuardianDB's LWW compares DOC timestamps, not row
-        // values — a long-offline node's boot backfill would otherwise
-        // resurrect a stale live row over the fleet's newer tombstone for a
-        // whole converge window (adversarial finding). Rows the replica
-        // holds only as a TOMBSTONE are written (the causal arms refuse
-        // stale content); rows absent or genuinely different are written
-        // (the migration's purpose).
         let probe = format!(
             "SELECT team, root_dir, updated_ms, deleted_ms FROM project_teams WHERE project = {}",
             q(&project)
@@ -546,13 +401,8 @@ pub(crate) async fn backfill_projects(projects: Vec<(String, String, String, u64
     }
 }
 
-/// SQL single-quote escaping for a hand-built literal (doubles embedded `'`,
-/// the SQL-standard escape). Every caller in this module passes
-/// already-constrained identifiers (project/team slugs, tenant ids) or our
-/// own `serde_json`-serialized JSON — never raw, unvalidated user SQL — so
-/// this (not a full parameter-binding API, which `Session` does not expose
-/// today) is a safe, standard, minimal-surface approach for this internal,
-/// non-user-facing use.
+/// SQL single-quote escape for hand-built literals; callers pass only constrained identifiers or
+/// our own serialized JSON, never raw user SQL (`Session` exposes no parameter binding).
 fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -595,29 +445,10 @@ fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
     out
 }
 
-/// The relational index is READY only once one full walk of the `hive`
-/// namespace has COMPLETED in this process. Before that the guardian document
-/// index is empty — not "stale", EMPTY: the SQL catalog document
-/// (`__gdb_sql_catalog/catalog`, a single JSON value) is not in it, every
-/// `Session` loads `Catalog::new()` and every table reads as
-/// `relation "X" does not exist`, `pg_catalog.pg_class` counts 0, and a
-/// `CREATE TABLE IF NOT EXISTS` would persist a fresh catalog OVER the real
-/// one. That was the live state of every node in the fleet on 2026-09-02:
-/// the walk (`GuardianRelationalStorage::refresh` → `get_many` over the whole
-/// namespace, 7.6–57 GB guardian stores) takes longer than `SQL_OP_TIMEOUT`,
-/// and `session()` used to run it — bounded and cancelled — before EVERY
-/// operation, so no walk ever finished, every admin query took exactly 10 s
-/// and answered "does not exist", and zero mirror writes had succeeded since
-/// boot on any node.
-///
-/// Now the walk runs in ONE background task (`spawn_index_refresher`) with a
-/// bound sized to the store, not to a request; completing it once flips
-/// `INDEX_READY`, after which the document store's live sync (remote inserts
-/// via Willow) and local puts keep the index current and the same task
-/// re-walks on a timer as the belt-and-braces resync. Sessions never walk:
-/// they wait briefly for readiness and otherwise proceed, and every path
-/// that would WRITE the catalog (`init_schema`, `ensure_table_exists`,
-/// `backfill_billing_normalize`) refuses until the index is real.
+/// True once one full walk of the `hive` namespace has completed in this process. Before that the
+/// index is EMPTY, not stale: every table reads as absent and a `CREATE TABLE IF NOT EXISTS` would
+/// overwrite the real catalog, so every catalog-writing path refuses until it flips. The ONE
+/// background walker is `spawn_index_refresher`; sessions never walk.
 static INDEX_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INDEX_REFRESHER_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -659,12 +490,9 @@ fn index_build_timeout() -> std::time::Duration {
     env_secs("HIVE_RELATIONAL_INDEX_BUILD_SECS", 900)
 }
 
-/// Cadence of the background re-walk once the index is ready. Bounds the
-/// staleness of a REMOTE write the live sync somehow missed; local writes and
-/// live-synced remote inserts land in the index immediately regardless.
-/// Budget for the post-build row-value warm-up. It is an optimization only
-/// (rows materialize lazily on read without it) and it must never block the
-/// index refresher's next tick.
+/// Budget for the DETACHED post-build row-value warm-up (`HIVE_RELATIONAL_WARM_SECS`, default 600):
+/// an optimization only, since rows materialize lazily on read, and it must never block the index
+/// refresher's next tick.
 fn warm_values_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("HIVE_RELATIONAL_WARM_SECS")
@@ -675,6 +503,9 @@ fn warm_values_timeout() -> std::time::Duration {
     )
 }
 
+/// Cadence of the background re-walk once the index is ready (`HIVE_RELATIONAL_REFRESH_SECS`,
+/// default 120): bounds the staleness of a REMOTE write the live sync missed; local writes and
+/// live-synced inserts reach the index immediately.
 fn index_refresh_interval() -> std::time::Duration {
     env_secs("HIVE_RELATIONAL_REFRESH_SECS", 120)
 }
@@ -714,8 +545,6 @@ fn spawn_index_refresher(db: SqlDb) {
     if INDEX_REFRESHER_SPAWNED.swap(true, Ordering::AcqRel) {
         return;
     }
-    // Bulkhead runtime: a walk over a multi-GB namespace is exactly the kind
-    // of CPU-bound async work that must never occupy a serving worker.
     crate::bulkhead::spawn(async move {
         let bound = index_build_timeout();
         let interval = index_refresh_interval();
@@ -735,18 +564,6 @@ fn spawn_index_refresher(db: SqlDb) {
                             "relational: index built -- sessions now read the real catalog"
                         );
                         index_ready_notify().notify_waiters();
-                        // Warm every row value once, AFTER readiness (nothing
-                        // waits on it): a cold row is a peer fetch on first
-                        // read, so a whole-table scan before this finishes can
-                        // still time out.
-                        //
-                        // DETACHED and BOUNDED, not awaited inline: the warm
-                        // walks every key of the namespace (measured 38,734 on
-                        // fc-sanjose) and materializes each hash-only row, and
-                        // awaiting it inside the loop meant the index never
-                        // re-walked — no "row values warmed" line was ever
-                        // logged, so refreshes silently stopped after the first
-                        // build. It reports its own outcome when it finishes.
                         let db2 = db.clone();
                         crate::bulkhead::spawn(async move {
                             let warm_started = std::time::Instant::now();
@@ -806,11 +623,9 @@ fn spawn_index_refresher(db: SqlDb) {
     });
 }
 
-/// A `Session` over the local index. Starts the background walker if nothing
-/// has yet, waits up to `SQL_OP_TIMEOUT` for the FIRST walk to complete, and
-/// then proceeds either way: a not-yet-ready session reads an empty catalog
-/// (logged, rate-limited) and the catalog-writing callers gate on
-/// `index_ready()` themselves. Never walks the namespace on a request path.
+/// A `Session` over the local index: starts the background walker if nothing has, waits up to
+/// `SQL_OP_TIMEOUT` for the first walk, then proceeds either way (a not-yet-ready session reads an
+/// empty catalog; catalog writers gate on `index_ready()`).
 async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStorage> {
     spawn_index_refresher(db.clone());
     if !wait_index_ready(SQL_OP_TIMEOUT).await {
@@ -819,40 +634,13 @@ async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStora
     Session::new(db, "hive")
 }
 
-/// Bound on a single guardian-db SQL operation (index refresh or a query
-/// execute). Live-witnessed on a freshly-joined node (fc-sanjose-2): a
-/// corrupted/interrupted first-open of the "hive" relational namespace made
-/// `Session::execute`/`storage().refresh()` hang SILENTLY FOREVER -- near-zero
-/// CPU, connection established, no error, no log line -- while every other
-/// guardian-touching endpoint (KV reads, `/v1/nodes`) stayed instant. Unlike
-/// the KV path's `guardian::handle()` (which has its own `GUARDIAN_INIT_TIMEOUT`
-/// specifically because of this failure class), this SQL/relational path had
-/// no bound at all. A timeout turns an indefinite hang into a real, fast
-/// error a caller can log/retry/surface instead of an admin request (or a
-/// background loop iteration) that never returns.
+/// Bound on one guardian-db SQL operation (index refresh or statement): an interrupted first open
+/// once left `Session::execute` hanging silently forever.
 const SQL_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Execute one statement with `SQL_OP_TIMEOUT` bound, flattening the
-/// timeout and the inner guardian-db error into a single `Result<_, String>`
-/// so every existing call site (`?`, `if let Err`, `.ok()`) keeps working
-/// unchanged.
-/// The ONE chokepoint every SQL execution in this crate goes through.
-///
-/// The guardian SQL engine is CPU-bound by construction: every statement
-/// reloads and re-decodes every row of each table it touches
-/// (`Session::load_table` -> `scan` -> `LoadedTable::build`), so even a
-/// SELECT over `billing_ledger` costs tens of thousands of JSON decodes and
-/// a sort, and a transaction of N statements costs N of those. Run as an
-/// ordinary future on a tokio worker, that work pins the worker and starves
-/// the scheduler -- two workers at 94 % CPU for minutes froze the control-
-/// plane leader's whole runtime on 2026-10-01 (named stacks in
-/// PRD freeze-root-cause-symbolized). `block_in_place` tells the runtime this
-/// worker is about to block, so it hands the worker's queue to a fresh thread
-/// and the drivers, timers and every other task keep running; the engine
-/// then executes on this thread with the session borrowed, exactly as every
-/// caller already holds it. The heavy background callers (the relational
-/// mirror loop, the index walker) additionally run on the `bulkhead` runtime
-/// so they cannot even inflate the serving runtime's blocking pool.
+/// The ONE chokepoint for every SQL execution: bounded by `SQL_OP_TIMEOUT`, errors flattened to
+/// `String`, and run under `block_in_place` because the engine reloads every row of each table per
+/// statement and would pin a serving tokio worker.
 async fn exec(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     sql: &str,
@@ -868,10 +656,6 @@ async fn exec(
         })
     })
 }
-
-// ---------------------------------------------------------------------------
-// Projects (the durable fix for the Simpfi/drugs-wtf visibility gap)
-// ---------------------------------------------------------------------------
 
 fn project_team_upsert_sql(project: &str, team: &str, root_dir: &str, updated_ms: u64) -> String {
     format!(
@@ -901,10 +685,9 @@ fn project_team_upsert_sql(project: &str, team: &str, root_dir: &str, updated_ms
     )
 }
 
-/// Upsert a project's team tag + root dir at the ProjectStore row's own causal
-/// version. Never stamp at async execution time: a delayed pre-delete write
-/// would otherwise look newer than the deletion merely because its task ran
-/// later, and could resurrect a stale relational row indefinitely.
+/// Upserts a project's team tag at the `ProjectStore` row's own causal `updated_ms`, never the
+/// async execution time: a delayed pre-delete write would otherwise look newer than the deletion
+/// and resurrect a stale row.
 pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str, updated_ms: u64) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
@@ -917,23 +700,16 @@ pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str, 
     }
 }
 
-/// Record a project tombstone in the relational table. Keeping the row is
-/// load-bearing: after a hard DELETE, a delayed pre-delete backfill sees no
-/// conflict and can INSERT stale ownership again. A retained tombstone makes
-/// every stale insert conflict, while a causal recreation with a strictly newer
-/// `updated_ms` can clear it through `project_team_upsert_sql`.
+/// Records a project tombstone and keeps the row: after a hard DELETE a delayed pre-delete backfill
+/// would INSERT stale ownership again. A causally newer recreate clears it via
+/// `project_team_upsert_sql`; the write is skipped when a tombstone at or past `deleted_ms` already
+/// exists (every node re-asserts every tombstone periodically).
 pub(crate) async fn remove_project(project: &str, deleted_ms: u64) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
     };
     let mut s = session(db).await;
     reconcile_project_teams_schema(&mut s).await;
-    // Idempotency pre-check: a tombstone at-or-past this generation already
-    // covers the assert, so skip the write entirely. Every node's deletion
-    // reconcile re-asserts every tombstone every 60s, and each write is a
-    // signed replicated doc put — without the skip this is unbounded
-    // permanent write churn proportional to total historical deletions
-    // (adversarial finding).
     let probe = format!(
         "SELECT deleted_ms FROM project_teams WHERE project = {}",
         q(project)
@@ -967,15 +743,9 @@ pub(crate) async fn remove_project(project: &str, deleted_ms: u64) {
     }
 }
 
-/// Move a project's relational identity to its new name. Two halves in ONE
-/// transaction, and the OLD name is tombstoned rather than deleted: a hard
-/// DELETE would let a delayed pre-rename backfill INSERT the stale ownership
-/// again with no conflict, putting the project back under its old name in the
-/// mirror (the exact resurrection `remove_project` exists to prevent).
-///
-/// This mirror is a DERIVED READ-ONLY projection used only as an authorization
-/// fallback — it is never an input to the rename and never gates it. A failure
-/// here is logged and non-fatal.
+/// Moves a project's mirror identity in ONE transaction: upserts the new name and TOMBSTONES the
+/// old one (a hard DELETE would let a delayed pre-rename backfill resurrect it). A derived
+/// read-only projection: failure is logged, never fatal.
 pub(crate) async fn rename_project(from: &str, to: &str, updated_ms: u64) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
@@ -1012,11 +782,8 @@ pub(crate) async fn rename_project(from: &str, to: &str, updated_ms: u64) {
     }
 }
 
-/// Every (project, team) pair this node's replica currently holds for `team`
-/// — backs `gitops_projects`'s fleet-visibility fallback (and any future
-/// "list every project for team X" surface) with a source that includes
-/// projects with zero deployments anywhere, unlike the peer_deployments-only
-/// fallback.
+/// Every project this node's replica holds for `team`, including projects with no deployment
+/// anywhere (backs `gitops_projects`' fleet-visibility fallback).
 pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
     let Ok(db) = crate::guardian::sql_db().await else {
         return Vec::new();
@@ -1033,17 +800,13 @@ pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
 }
 
-/// The owning team for one project from a freshly-refreshed replica. `Ok(None)`
-/// means the refreshed mirror has no live row; `Err` means freshness could not
-/// be established and callers must use their lower-authority fallback rather
-/// than treating a stale index row as authoritative.
+/// The owning team from a freshly refreshed replica: `Ok(None)` = no live row; `Err` = freshness
+/// could not be established (index unbuilt, or last walk older than two refresh intervals), so
+/// callers use their lower-authority fallback instead of a stale index row.
 pub(crate) async fn team_for_project(project: &str) -> Result<Option<String>, String> {
     let db = crate::guardian::sql_db()
         .await
         .map_err(|e| format!("guardian relational database unavailable: {e}"))?;
-    // Freshness = a completed walk within two refresh intervals. The walk
-    // itself never runs here (see `spawn_index_refresher`); a caller that
-    // cannot get a fresh answer falls back to its lower-authority source.
     spawn_index_refresher(db.clone());
     if !wait_index_ready(SQL_OP_TIMEOUT).await {
         return Err("relational index not built yet".to_string());
@@ -1069,10 +832,8 @@ pub(crate) async fn team_for_project(project: &str) -> Result<Option<String>, St
         .find(|t| !t.trim().is_empty()))
 }
 
-/// EVERY (project, team) pair in this node's replica — the tenancy
-/// reconciler's repair source. Unlike `projects_for_team` it is not scoped: the
-/// reconciler does not know which teams lost rows, and the whole table is small
-/// (one row per project).
+/// EVERY (project, team) pair in this node's replica: the tenancy reconciler's repair source
+/// (unscoped; one row per project).
 pub(crate) async fn all_project_teams() -> Vec<(String, String)> {
     let Ok(db) = crate::guardian::sql_db().await else {
         return Vec::new();
@@ -1090,59 +851,7 @@ pub(crate) async fn all_project_teams() -> Vec<(String, String)> {
     all_text_pairs(&res)
 }
 
-// ---------------------------------------------------------------------------
-// Billing (fleet-consistent reads on top of the existing single-writer meter)
-// ---------------------------------------------------------------------------
-
-/// Upsert a tenant's billing account, ledger entries, finalized invoices
-/// (+ their line items), and checkouts as REAL per-row tables — no more
-/// pre-serialized JSON blobs. Called alongside every `BillingStore` mutation
-/// on whichever node is CURRENTLY the billing authority (the elected
-/// metering leader — see `admin::billing_authority_node`) so every other
-/// node's local replica converges to the SAME account state within seconds,
-/// instead of staying empty/stale until the next full-snapshot boot
-/// bootstrap. Best-effort, same as `set_project_team` — a failure here never
-/// blocks the real mutation; the existing HTTP proxy-to-leader fix
-/// (`admin::proxy_billing_read`) remains the safety net if this mirror is
-/// ever behind/unavailable.
-///
-/// ATOMICITY: the entire per-tenant write (account row + every ledger row +
-/// every invoice row + every invoice-line row + every checkout row) is a
-/// SINGLE `Session::execute` call over one `BEGIN; ...; COMMIT;` string.
-/// guardian-db's engine buffers every statement inside an explicit
-/// transaction into `Transaction::overlay` and applies it to storage
-/// atomically only at `COMMIT` (see `vendor/guardian-db/src/sql/engine.rs`'s
-/// `begin`/`commit`) — a mid-write error aborts the transaction (the failing
-/// statement flips `txn.aborted`, every statement after it short-circuits
-/// with `SqlError::InFailedTransaction`, and `execute`'s `?` propagates out
-/// before `COMMIT` ever runs), so nothing partially applies. This closes the
-/// previous gap where 3 separate autocommit statements could leave the
-/// account row updated with stale/missing ledger or invoice rows on a
-/// mid-write failure. Also `SQL_OP_TIMEOUT`-bounded via `exec()`, which the
-/// old 3-autocommit-statement version bypassed entirely (a separate,
-/// pre-existing gap fixed here too).
-///
-/// Draft invoices are filtered out defensively (`status != "paid"` is
-/// skipped) even though callers should already only ever pass finalized
-/// invoices (`BillingStore::finalized_invoices`) — a draft is transient,
-/// computed on-the-fly by `build_invoice`/`current_invoice`, and must NEVER
-/// be written as a row.
-///
-/// SCHEMA SAFETY NET: calls `reconcile_billing_accounts_schema` on every
-/// invocation, before the transaction below, using this same `Session` —
-/// not just relying on `init_schema()`'s one-shot boot-time call.
-/// `init_schema()` runs exactly once, fire-and-forget, at boot
-/// (`main.rs`'s `tokio::spawn`) with no retry; if `guardian::sql_db()` fails
-/// (or wedges) on that single attempt, `billing_accounts` never gets its
-/// `ALTER TABLE ADD COLUMN` reconciliation for this node's entire uptime,
-/// while `spawn_billing_meter_loop` / `spawn_relational_mirror_loop` keep
-/// calling this function on their own retry cadence regardless — silently
-/// failing every write against the unreconciled table. Doing it here instead
-/// means schema reconciliation inherits those loops' existing retry
-/// semantics for free: the next time this runs after guardian recovers, the
-/// schema gets fixed as a side effect. Memoized (see
-/// `BILLING_ACCOUNTS_SCHEMA_RECONCILED`) so this is a cheap no-op on every
-/// call after the first genuine success.
+/// Mirrors ONE tenant's billing rows: [`upsert_billing_many`] with a batch of one.
 pub(crate) async fn upsert_billing(
     account: &crate::billing::BillingAccount,
     ledger: &[crate::billing::LedgerEntry],
@@ -1163,28 +872,12 @@ pub(crate) type BillingRows<'a> = (
     &'a [crate::billing::Checkout],
 );
 
-/// Mirror MANY tenants' billing rows using ONE session — i.e. ONE index
-/// refresh and ONE schema reconciliation for the whole batch.
-///
-/// This exists because both billing loops used to call `upsert_billing` once
-/// per tenant inside a `for`, and `session()` at the time ran
-/// `storage().refresh()` (today the walk lives in `spawn_index_refresher`,
-/// off every request path), which re-reads the ENTIRE local relational index —
-/// every row of `billing_ledger` (one row per ledger entry, unbounded and
-/// append-only), `billing_invoices`, `billing_invoice_lines`, `teams`,
-/// `deployments`, and the rest — sequentially, one blob read per row. Doing
-/// that per tenant made a single mirror tick O(tenants x all_rows): with 50
-/// tenants and a 20k-entry ledger it re-read the whole dataset 50 times to
-/// write 50 tenants' rows.
-///
-/// Refreshing once per BATCH rather than once per tenant preserves the
-/// `refresh()`-before-read requirement exactly (the batch still starts from a
-/// freshly-synced index) while making the cost O(all_rows) again. Each
-/// tenant keeps its OWN `BEGIN; ... COMMIT;` transaction, so the atomicity
-/// guarantee AGENTS.md pins for `upsert_billing` — a tenant's account plus
-/// every ledger/invoice/invoice-line/checkout row lands together or not at
-/// all — is unchanged, and one tenant's failure still cannot roll back
-/// another's.
+/// Mirrors tenants' billing account, ledger, FINALIZED invoices (+ lines) and checkouts as per-row
+/// tables, on the billing authority. Each tenant is ONE `BEGIN; ...; COMMIT;` execute (no partial
+/// rows; one tenant's failure never rolls back another's) and the batch shares ONE session and
+/// schema reconciliation. Best-effort (`admin::proxy_billing_read` is the safety net); the
+/// `billing_*` column reconciliation runs on every call (memoized), so schema never rests on
+/// `init_schema`'s one boot-time attempt.
 pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
     if batch.is_empty() {
         return;
@@ -1218,10 +911,6 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
                  partial account/ledger/invoice/checkout row state was left behind)"
             );
         } else {
-            // The mirror's write path is one BEGIN..COMMIT per tenant whose
-            // statements each touch a DIFFERENT table, so cross-statement
-            // caching does not help it; the cost is the per-statement
-            // materialization of each table. This is the number to watch.
             let ms = started.elapsed().as_millis() as u64;
             if ms >= 500 {
                 tracing::info!(
@@ -1236,13 +925,8 @@ pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
     }
 }
 
-/// SQL for the account row alone (`ON CONFLICT (tenant) DO UPDATE`, so it
-/// converges whether or not a row already exists for this tenant — including
-/// a pre-existing OLD-shape row predating the `billing_accounts` DDL rewrite,
-/// since that rewrite only ever ADDS the new scalar columns onto the
-/// existing table — see `backfill_billing_normalize` — rather than
-/// dropping/recreating it). Factored out of `upsert_billing` so
-/// `backfill_billing_normalize` can reuse the exact same statement shape.
+/// SQL for the account row alone (`ON CONFLICT (tenant) DO UPDATE`, so it converges with a
+/// pre-existing old-shape row); shared with `backfill_billing_normalize`.
 fn build_account_sql(account: &crate::billing::BillingAccount, now: u64) -> String {
     format!(
         "INSERT INTO billing_accounts (tenant, plan, status, included_cents, used_cents, balance_cents, \
@@ -1267,19 +951,13 @@ fn build_account_sql(account: &crate::billing::BillingAccount, now: u64) -> Stri
     )
 }
 
-/// Rows per INSERT statement. The guardian SQL engine loads the WHOLE target
-/// table once PER STATEMENT (`Session::load_table`: every stored row decoded,
-/// the overlay merged into a fresh BTreeMap, the PK index rebuilt), so one
-/// row per statement made a tenant's N-row ledger cost N full table loads --
-/// O(N x M) CPU inside one transaction, which is what burned two tokio
-/// workers for 78 s each on the control-plane leader and froze its runtime
-/// (2026-10-01). N rows per statement cost one load. Chunked so a huge
-/// ledger never becomes one unbounded statement either.
+/// Rows per INSERT: the guardian engine reloads the WHOLE target table once per statement, so one
+/// row per statement made an N-row ledger cost N table loads; chunking also keeps a huge ledger
+/// from becoming one unbounded statement.
 const ROWS_PER_INSERT: usize = 500;
 
-/// `INSERT INTO ... VALUES (row),(row),... ON CONFLICT ...;` in chunks of
-/// [`ROWS_PER_INSERT`]. `prefix` ends in `VALUES ` and `on_conflict` ends in
-/// `;`. Empty `rows` yields no SQL at all.
+/// Chunks `rows` into multi-row INSERTs of [`ROWS_PER_INSERT`]: `prefix` ends in `VALUES `,
+/// `on_conflict` in `;`; no rows, no SQL.
 fn multi_row_insert(prefix: &str, rows: &[String], on_conflict: &str) -> String {
     let mut sql = String::with_capacity(rows.iter().map(|r| r.len() + 1).sum::<usize>() + 256);
     for chunk in rows.chunks(ROWS_PER_INSERT) {
@@ -1291,9 +969,8 @@ fn multi_row_insert(prefix: &str, rows: &[String], on_conflict: &str) -> String 
     sql
 }
 
-/// SQL for every ledger row (`ON CONFLICT (id) DO UPDATE` — deterministic
-/// entry ids, so a re-upsert/backfill converges instead of duplicating).
-/// Factored out of `upsert_billing` — see `build_account_sql`.
+/// SQL for every ledger row (`ON CONFLICT (id) DO UPDATE`: entry ids are deterministic, so
+/// re-upserts converge).
 fn build_ledger_sql(ledger: &[crate::billing::LedgerEntry]) -> String {
     let rows: Vec<String> = ledger
         .iter()
@@ -1319,10 +996,8 @@ fn build_ledger_sql(ledger: &[crate::billing::LedgerEntry]) -> String {
     )
 }
 
-/// Row count of `billing_ledger` for `tenant` in `[period_start_ms,
-/// period_end_ms)` — the durability-gate read: pruning must never proceed
-/// until the relational mirror has actually caught up to a checkpoint's
-/// `entry_count`.
+/// Row count of `billing_ledger` for `tenant` in `[period_start_ms, period_end_ms)`: the durability
+/// gate, since pruning waits until the mirror has caught up to a checkpoint's `entry_count`.
 pub(crate) async fn count_billing_ledger_rows(
     tenant: &str,
     period_start_ms: u64,
@@ -1354,15 +1029,9 @@ pub(crate) async fn count_billing_ledger_rows(
     Ok(0)
 }
 
-/// DELETE every `billing_ledger` row for `tenant` in `[period_start_ms,
-/// period_end_ms)` — called ONLY after the corresponding `LedgerCheckpoint`
-/// is durable (see `main.rs`'s billing-meter-loop prune step). Runs as its
-/// OWN single-statement autocommit DELETE, deliberately NOT folded into
-/// `upsert_billing_many`'s `BEGIN;...COMMIT;` write transaction: that
-/// transaction's own INSERT half has nothing left in `ledger` for this range
-/// by the time pruning runs, so mixing in a DELETE would let a prune failure
-/// roll back an unrelated account/invoice write. Idempotent: a DELETE on an
-/// already-empty range is a no-op, so a retried call after a crash is safe.
+/// Deletes `billing_ledger` rows for `tenant` in `[period_start_ms, period_end_ms)`, only once the
+/// covering `LedgerCheckpoint` is durable. Its own autocommit DELETE, never part of the upsert
+/// transaction (a prune failure must not roll back an account write); idempotent.
 pub(crate) async fn prune_billing_ledger(
     tenant: &str,
     period_start_ms: u64,
@@ -1382,16 +1051,20 @@ pub(crate) async fn prune_billing_ledger(
     Ok(())
 }
 
-/// SQL for every FINALIZED invoice (+ its line items) — a draft
-/// (`status != "paid"`) is always skipped, never persisted as a row (see
-/// `upsert_billing`'s original doc comment on why: a draft is transient,
-/// computed on-the-fly, and must never become a stored fact). Factored out
-/// of `upsert_billing` — see `build_account_sql`.
+/// An invoice in this status is final; any other (a draft) is transient and never persisted.
+const FINALIZED_INVOICE_STATUS: &str = "paid";
+
+/// Deterministic per-line id (a re-upsert converges), zero-padded so `ORDER BY id` keeps line order.
+fn invoice_line_id(invoice_id: &str, index: usize) -> String {
+    format!("{invoice_id}-{index:03}")
+}
+
+/// SQL for every FINALIZED invoice and its lines; a draft is never persisted as a row.
 fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
     let mut invoice_rows: Vec<String> = Vec::new();
     let mut line_rows: Vec<String> = Vec::new();
     for inv in invoices {
-        if inv.status != "paid" {
+        if inv.status != FINALIZED_INVOICE_STATUS {
             continue;
         }
         let (commitment, entry_count, pruned) = match inv.ledger_checkpoint.as_ref() {
@@ -1414,17 +1087,8 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
             entry_count,
             if pruned { 1 } else { 0 },
         ));
-        // Stable per-line id: parent invoice id + its zero-padded index in
-        // `lines` (e.g. "in_abc123-000", "in_abc123-001") — deterministic
-        // across ticks so a re-upsert of the same invoice converges to the
-        // same rows instead of accumulating duplicates. Zero-padded to 3
-        // digits (not just "-0", "-1") so `ORDER BY id` (relational.rs,
-        // billing_snapshot's per-invoice lines query) sorts lines correctly
-        // as strings — unpadded indices sort "…-10" before "…-2"
-        // lexicographically once an invoice has 10+ lines. 3 digits covers
-        // up to 999 lines, comfortably beyond any realistic invoice.
         for (idx, line) in inv.lines.iter().enumerate() {
-            let line_id = format!("{}-{:03}", inv.id, idx);
+            let line_id = invoice_line_id(&inv.id, idx);
             line_rows.push(format!(
                 "({}, {}, {}, {})",
                 q(&line_id),
@@ -1487,68 +1151,10 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// One-time backfill: normalize pre-migration JSON-blob billing rows into the
-// new per-row tables. NOT wired to run automatically — callable only via the
-// admin-only `POST /v1/admin/billing/backfill` endpoint (admin.rs
-// `billing_backfill_run`, `require_operator`-gated). Even then it must only
-// be run against real production data after the separate operator-approval
-// gate the migration rollout plan calls for — this function performs REAL
-// writes the moment it is invoked; it does not itself ask for confirmation.
-//
-// IDEMPOTENT / SAFE TO RE-RUN: every tenant that verifies clean is recorded
-// in `billing_backfill_state`; a later call skips any tenant already marked
-// (unless `force`), so a retry after a transient failure only reprocesses
-// tenants that did not finish — never re-applies one that already verified.
-// ---------------------------------------------------------------------------
-
-/// `billing_accounts`' new scalar columns, added via idempotent `ALTER TABLE
-/// ... ADD COLUMN IF NOT EXISTS` by `reconcile_billing_accounts_schema`
-/// below — never assumed present from `init_schema()`'s `CREATE TABLE IF NOT
-/// EXISTS` alone.
-///
-/// CRITICAL, confirmed by direct inspection (this is the load-bearing finding
-/// this whole reconciliation exists to handle): `billing_accounts` is the
-/// SAME table name the OLD JSON-blob schema used (`tenant, account_json,
-/// updated_ms`) — `git diff` on `init_schema()` shows the DDL rewrite changed
-/// that `CREATE TABLE IF NOT EXISTS billing_accounts (...)` statement's
-/// column list IN PLACE rather than renaming the table or adding a
-/// differently-named replacement. The other four tables this same migration
-/// introduced do NOT have this problem: `billing_ledger`/`billing_invoices`/
-/// `billing_invoice_lines`/`billing_checkouts` are all genuinely new,
-/// non-colliding table names (`billing_ledger`/`billing_invoices` sit next
-/// to their old `billing_ledger_snapshot`/`billing_invoices_snapshot`
-/// JSON-blob originals, retained deprecated-pending-removal until a witnessed
-/// fleet-wide backfill proves every legacy row normalized;
-/// `billing_invoice_lines`/`billing_checkouts` are net-new
-/// with no pre-migration table at all) — a
-/// plain `CREATE TABLE IF NOT EXISTS` is sufficient for all four and none of
-/// them need this ALTER-based treatment. `billing_accounts` is the ONLY
-/// name collision in this migration. `CREATE TABLE IF NOT EXISTS` is a
-/// genuine unconditional no-op when the table already exists — verified by
-/// reading guardian-db's own `exec_create_table`
-/// (`vendor/guardian-db/src/sql/ddl.rs`): `if self.catalog.has_table(&q) { if
-/// ct.if_not_exists { return Ok(ExecResult::empty_command(..)) } ... }` — it
-/// never reconciles columns against an existing table. So on any node whose
-/// `billing_accounts` already existed pre-migration (every node in the real
-/// fleet today, per this repo's own migration history), `init_schema()`'s
-/// DDL loop ALONE would leave the table in its OLD 3-column shape forever;
-/// `upsert_billing` / `billing_snapshot`'s new column-named SQL would fail
-/// outright (column not found) against live production the moment this
-/// binary ships, unless something adds the new columns first.
-/// `reconcile_billing_accounts_schema` is that something — and
-/// `init_schema()` now calls it unconditionally on every boot (not only from
-/// the manually-triggered backfill endpoint), so correct schema is a
-/// boot-time guarantee for every node, before any `upsert_billing` call is
-/// ever possible.
-///
-/// Deliberately NOT NOT NULL (unlike the target `init_schema` DDL) since
-/// these are being added onto a table that may already hold rows with no
-/// value for them yet — `backfill_billing_normalize`'s per-tenant write
-/// populates every existing row for real, but declaring NOT NULL on the
-/// ALTER itself would risk a constraint failure on old rows depending on
-/// exactly how the engine retroactively enforces it, which this function
-/// deliberately does not assume either way.
+/// `billing_accounts` columns added by `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`: the table name
+/// predates the per-row schema, so `CREATE TABLE IF NOT EXISTS` is a no-op on the old 3-column
+/// shape every existing node holds. Deliberately nullable, since the table may already hold old
+/// rows.
 const BILLING_ACCOUNTS_NEW_COLUMNS: &[(&str, &str)] = &[
     ("plan", "TEXT"),
     ("status", "TEXT"),
@@ -1561,42 +1167,15 @@ const BILLING_ACCOUNTS_NEW_COLUMNS: &[(&str, &str)] = &[
     ("period_end_ms", "BIGINT"),
 ];
 
-/// Set once `reconcile_billing_accounts_schema` has completed with every
-/// `ALTER TABLE` statement succeeding, from ANY call site in this process —
-/// memoizes the reconciliation so repeat callers (chiefly `upsert_billing`,
-/// which now calls this on every single write — see below) skip the
-/// (idempotent but non-free) `ALTER TABLE` round-trip once it's known to
-/// have already landed. Left UNSET on any failure so the very next call
-/// retries for real: this is what closes the gap where `init_schema()`'s
-/// one-shot boot-time call was the ONLY place reconciliation ever ran — if
-/// `crate::guardian::sql_db()`/`handle()` fails (or wedges — see
-/// `guardian.rs`'s "Live evidence (2026-07-06 onward)" doc comment) on that
-/// single attempt, `init_schema()` never gets a second chance for that
-/// node's entire uptime, while `spawn_billing_meter_loop` /
-/// `spawn_relational_mirror_loop` keep calling `upsert_billing` on their own
-/// retry cadence regardless. Relaxed ordering is sufficient: this is a
-/// best-effort memoization racing independent loops, not a
-/// correctness-critical lock — at worst a concurrent miss re-runs a handful
-/// of idempotent ALTERs once more, never a wrong result.
+/// Set once every `ALTER TABLE` of `reconcile_billing_accounts_schema` has succeeded in this
+/// process; left UNSET on any failure so the next call retries. Relaxed ordering suffices: a lost
+/// race only re-runs idempotent ALTERs.
 static BILLING_ACCOUNTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Idempotent `billing_accounts` column reconciliation — issues `ALTER TABLE
-/// ... ADD COLUMN IF NOT EXISTS` for every column in
-/// `BILLING_ACCOUNTS_NEW_COLUMNS`. Called from THREE sites: `init_schema()`
-/// on every boot (an early-opportunistic attempt — covers the common case
-/// where guardian is already up by the time it runs), defensively from
-/// `backfill_billing_normalize`, and — the actual safety net —
-/// unconditionally from `upsert_billing` on every write, so correct schema
-/// no longer depends on `init_schema()`'s single, unretried boot-time
-/// attempt ever landing (see `BILLING_ACCOUNTS_SCHEMA_RECONCILED`'s doc
-/// comment for the full failure mode this closes). Memoized via
-/// `BILLING_ACCOUNTS_SCHEMA_RECONCILED`: a no-op past the first genuinely
-/// successful call anywhere in this process, but still cheap and safe to
-/// call unconditionally since `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is
-/// itself idempotent. See `BILLING_ACCOUNTS_NEW_COLUMNS`'s doc comment for
-/// why this one table specifically needs ALTER-based reconciliation instead
-/// of relying on plain `CREATE TABLE IF NOT EXISTS`.
+/// Idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for each `BILLING_ACCOUNTS_NEW_COLUMNS`
+/// entry, memoized. Called from `init_schema`, the backfill and every billing upsert, so correct
+/// schema never rests on one boot-time attempt.
 async fn reconcile_billing_accounts_schema(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
 ) {
@@ -1616,25 +1195,13 @@ async fn reconcile_billing_accounts_schema(
     }
 }
 
-/// `billing_checkouts`' `sku`/`target` columns (the dedicated-IPv4 addon
-/// work), added the same ALTER-based way `billing_accounts` is — unlike the
-/// table's original five columns, which were safe under a plain `CREATE
-/// TABLE IF NOT EXISTS` because the table itself was brand new at the time
-/// (see `BILLING_ACCOUNTS_NEW_COLUMNS`'s doc comment), `billing_checkouts`
-/// now already EXISTS on every real node, so a later `CREATE TABLE IF NOT
-/// EXISTS` adding columns to that same DDL string is a no-op there — these
-/// two columns need their own reconciliation to actually land.
+/// `billing_checkouts` columns added after the table first shipped, ALTER-reconciled because
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table.
 const BILLING_CHECKOUTS_NEW_COLUMNS: &[(&str, &str)] = &[("sku", "TEXT"), ("target", "TEXT")];
 
-/// See `BILLING_ACCOUNTS_SCHEMA_RECONCILED` — same memoization discipline,
-/// separate flag because these are two independent tables that can finish
-/// reconciling at different times.
 static BILLING_CHECKOUTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// See `reconcile_billing_accounts_schema` — identical shape, called from
-/// the same three sites (`init_schema()`, `backfill_billing_normalize`,
-/// unconditionally from `upsert_billing`).
 async fn reconcile_billing_checkouts_schema(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
 ) {
@@ -1656,10 +1223,8 @@ async fn reconcile_billing_checkouts_schema(
     }
 }
 
-/// `billing_invoices`' ledger-checkpoint columns (the ephemeral tamper-evident
-/// ledger work) — `billing_invoices` already exists on every real node, so
-/// (as with `billing_checkouts` above) these need ALTER-based reconciliation
-/// rather than a `CREATE TABLE IF NOT EXISTS` edit, which is a no-op there.
+/// `billing_invoices` ledger-checkpoint columns, ALTER-reconciled like the other post-launch
+/// columns.
 const BILLING_INVOICES_NEW_COLUMNS: &[(&str, &str, &str)] = &[
     ("ledger_commitment", "TEXT", "''"),
     ("ledger_entry_count", "BIGINT", "0"),
@@ -1693,45 +1258,13 @@ async fn reconcile_billing_invoices_schema(
     }
 }
 
-/// One-time backfill entry point. Reads every existing row from the OLD
-/// JSON-blob tables (`billing_accounts.account_json`,
-/// `billing_ledger_snapshot.ledger_json`, `billing_invoices_snapshot.invoices_json`),
-/// parses each blob back into `BillingAccount` / `Vec<LedgerEntry>` /
-/// `Vec<Invoice>`, and writes normalized rows into the new tables using the
-/// SAME atomic per-tenant `BEGIN...COMMIT` pattern the real writer uses — for
-/// the common case (an old account row exists) this literally calls the
-/// production `upsert_billing` writer itself. Verifies row-count parity per
-/// tenant (1 account row + every ledger/invoice/invoice-line row actually
-/// present) before marking that tenant migrated in `billing_backfill_state`;
-/// a tenant that fails verification is left unmarked (any partial marker
-/// cleared) so a later re-run retries exactly that tenant.
-///
-/// FRESHNESS GUARD (retry-vs-live-mirror race): a tenant left unmarked after
-/// a partial/failed attempt gets reprocessed by a later call/retry. Between
-/// that first attempt and the retry, the regular mirror loop
-/// (`spawn_billing_meter_loop` / `upsert_billing`) may have already written
-/// a NEWER `billing_accounts` row for this tenant from live, current data.
-/// Blindly re-running `upsert_billing` with the frozen pre-migration blob on
-/// the retry would silently overwrite that fresher live row with stale
-/// content — a real (if self-healing within one more mirror tick)
-/// data-freshness regression. So before writing a tenant's account row, this
-/// compares the parsed old blob's `BillingAccount::updated_ms` against the
-/// CURRENT `billing_accounts.updated_ms` for that tenant (if a row already
-/// exists): the account row is only written when the blob's data is newer
-/// or equal; if the live row is already strictly fresher, the account write
-/// is skipped (a no-op, not a failure) while ledger/invoice rows — immutable,
-/// append-only historical facts, never a point-in-time snapshot like the
-/// account row — are still written/verified as normal. A tenant with no
-/// existing row to compare against (the ordinary not-yet-migrated-at-all
-/// case) always writes, preserving the existing idempotency/retry-safety.
-///
-/// Returns a JSON report. If NONE of the three old sources are queryable
-/// (columns/tables already gone), returns `{"ran": false, "blocking_finding":
-/// ...}` instead of attempting anything — this backfill must run BEFORE any
-/// destructive drop of the old JSON-blob data; if that ordering was already
-/// violated by the time this runs, fabricating a "successful" migration
-/// against data that no longer exists would be strictly worse than surfacing
-/// the gap loudly.
+/// One-time OPERATOR backfill (`POST /v1/admin/billing/backfill`; never automatic, writes for
+/// real): rewrites each tenant's legacy JSON-blob rows through the production per-tenant
+/// transaction, verifies row-count parity, then records it in `billing_backfill_state` (re-runs
+/// skip verified tenants unless `force`). An account row is overwritten only by a blob not older
+/// than the live row; with no legacy source queryable it returns `{"ran": false, ...}` rather than
+/// fabricate a migration. The legacy `*_snapshot` tables are never dropped before it has run
+/// fleet-wide.
 pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json::Value, String> {
     let db = crate::guardian::sql_db()
         .await
@@ -1762,7 +1295,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         ));
     }
 
-    // ---- Step 1: is each OLD source still queryable AT ALL? ----
     let old_accounts_res = exec(&mut s, "SELECT tenant, account_json FROM billing_accounts").await;
     let old_ledger_res = exec(
         &mut s,
@@ -1795,7 +1327,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         }));
     }
 
-    // ---- Step 2: parse whatever IS available into per-tenant buckets ----
     let mut accounts_by_tenant: std::collections::HashMap<String, crate::billing::BillingAccount> =
         std::collections::HashMap::new();
     if let Ok(res) = &old_accounts_res {
@@ -1829,16 +1360,12 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     if let Ok(res) = &old_invoices_res {
         for (tenant, blob) in all_text_pairs(res) {
             match serde_json::from_str::<Vec<crate::billing::Invoice>>(&blob) {
-                // Old snapshot was written from `BillingStore::invoices()`
-                // (see the pre-migration main.rs call site this diff
-                // replaced), which INCLUDES the current in-progress draft —
-                // filter to finalized only, matching `upsert_billing`'s own
-                // "never persist a draft" rule so the new tables end up in
-                // exactly the state they'd be in had they been written live.
                 Ok(invs) => {
                     invoices_by_tenant.insert(
                         tenant,
-                        invs.into_iter().filter(|i| i.status == "paid").collect(),
+                        invs.into_iter()
+                            .filter(|i| i.status == FINALIZED_INVOICE_STATUS)
+                            .collect(),
                     );
                 }
                 Err(e) => {
@@ -1848,13 +1375,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         }
     }
 
-    // ---- Step 3: schema reconciliation is now a boot-time guarantee (see
-    // `init_schema()` -> `reconcile_billing_accounts_schema`) -- call the
-    // SAME idempotent function here too, defensively (cheap: `ALTER TABLE
-    // ... ADD COLUMN IF NOT EXISTS` is a no-op once the columns already
-    // exist), so this function never depends on ordering relative to boot
-    // and the rest of it can assume the schema is already correct, focusing
-    // purely on data migration.
     reconcile_billing_accounts_schema(&mut s).await;
     reconcile_billing_checkouts_schema(&mut s).await;
 
@@ -1868,13 +1388,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
             .unwrap_or_default()
     };
 
-    // Current `billing_accounts.updated_ms` per tenant, queried once in bulk
-    // rather than per-tenant. `updated_ms` is a column that existed on this
-    // table even pre-migration (see `BILLING_ACCOUNTS_NEW_COLUMNS` doc
-    // comment), so this is safe to read for both a not-yet-migrated tenant
-    // (old-schema row) and one the regular mirror loop already refreshed
-    // with live, post-migration data. Used below as the freshness guard
-    // against a retry clobbering a fresher live row with the frozen blob.
     let current_account_updated_ms: std::collections::HashMap<String, u64> =
         if accounts_old_queryable {
             exec(&mut s, "SELECT tenant, updated_ms FROM billing_accounts")
@@ -1907,23 +1420,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         let empty_invoices = Vec::new();
         let invoices = invoices_by_tenant.get(&tenant).unwrap_or(&empty_invoices);
 
-        // ---- Write: the SAME atomic per-tenant BEGIN...COMMIT pattern the
-        // real writer uses — when an old account row exists (the normal
-        // case), this literally calls the production `upsert_billing`
-        // writer, checkouts empty (the old snapshot schema never captured
-        // checkouts at all — see `billing-checkouts-persistence-gap`).
-        //
-        // FRESHNESS GUARD: if a `billing_accounts` row already exists for
-        // this tenant (either its own not-yet-migrated old-schema row, or
-        // one the regular mirror loop already refreshed with live data
-        // between a prior failed/partial backfill attempt and this retry),
-        // only overwrite it when the frozen blob's data is newer or equal.
-        // A strictly fresher live row means the account write is skipped —
-        // a no-op, never a failure — while ledger/invoice rows (immutable,
-        // append-only historical facts, not a mutable point-in-time
-        // snapshot like the account row) are still written/verified as
-        // normal. No existing row to compare against -> always write,
-        // exactly the prior idempotent-retry behavior.
         let write_result: Result<(), String> = if let Some(acc) = acc {
             let live_is_fresher = current_account_updated_ms
                 .get(&tenant)
@@ -1941,11 +1437,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
                 Ok(())
             }
         } else if !ledger.is_empty() || !invoices.is_empty() {
-            // Defensive edge case: ledger/invoice history with no parsed
-            // account row for this tenant (should not happen in practice —
-            // the old code always lazily created an account before any
-            // ledger entry existed — but never silently drop real ledger/
-            // invoice data just because the account row was missing/unparseable).
             write_ledger_and_invoices_only(&mut s, ledger, invoices).await
         } else {
             Ok(())
@@ -1955,7 +1446,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
             continue;
         }
 
-        // ---- Verify: row-count parity before considering this tenant done ----
         let mut mismatches = Vec::new();
         if acc.is_some() {
             let has_row = exec(
@@ -2051,8 +1541,6 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
                 migrated.push(tenant);
             }
         } else {
-            // Never leave a stale marker for a tenant that just failed
-            // verification -- a retry must reprocess it, not skip it.
             let _ = exec(
                 &mut s,
                 &format!(
@@ -2077,10 +1565,8 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     }))
 }
 
-/// Fallback write path for the defensive edge case in
-/// `backfill_billing_normalize`: ledger/invoice history exists for a tenant
-/// with no parsed old account row. Same atomic-transaction + upsert-SQL
-/// building blocks as `upsert_billing`, just without the account statement.
+/// `upsert_billing` minus the account statement, for a tenant with ledger/invoice history but no
+/// parsable old account row (real history is never dropped).
 async fn write_ledger_and_invoices_only(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     ledger: &[crate::billing::LedgerEntry],
@@ -2092,14 +1578,6 @@ async fn write_ledger_and_invoices_only(
     sql.push_str("COMMIT;");
     exec(s, &sql).await.map(|_| ())
 }
-
-// ---------------------------------------------------------------------------
-// Teams / members / deployments (populated by main.rs's relational mirror
-// loop — see spawn_relational_mirror_loop). VIEW-ONLY tables: nothing in the
-// control plane reads them back for logic; they exist solely so the admin
-// "view as PostgreSQL" browser shows real fleet data. Same best-effort,
-// never-blocks-the-real-mutation convention as everything else here.
-// ---------------------------------------------------------------------------
 
 /// Every value of the first column across all result sets (used to diff the
 /// mirror's current rows against a fresh snapshot for stale-row deletion).
@@ -2117,11 +1595,10 @@ fn all_text_firsts(res: &[ExecResult]) -> Vec<String> {
     out
 }
 
-/// Full-snapshot sync of the `teams` + `team_members` tables. Caller gates on
-/// being the control-plane leader (the single node where every admin mutation
-/// lands, so its `TeamStore` is the authoritative copy) — same single-writer
-/// discipline as `upsert_billing`. Upserts every current team/member, then
-/// deletes rows whose team/member no longer exists in the snapshot.
+/// Full-snapshot sync of `teams` + `team_members`; the caller gates on being the control-plane
+/// leader (single writer). A row missing from the snapshot is deleted only once its `updated_ms`
+/// stopped advancing (`HIVE_RELATIONAL_TOMBSTONE_SECS`, default 600): a stand-in leader's stale
+/// `TeamStore` must never wipe real teams.
 pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
@@ -2144,13 +1621,6 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
             now,
         );
         if let Err(e) = exec(&mut s, &query).await {
-            // warn, not debug: a failed upsert here is permanently invisible
-            // otherwise (teams_hash still advances unconditionally in the
-            // main.rs caller, so a failure never retries until the team
-            // snapshot itself changes again) -- silently swallowing it at
-            // debug! (filtered out under the fleet's RUST_LOG=info default
-            // for this crate) previously let 3 of 5 real teams vanish from
-            // the SQL mirror with zero observable signal.
             tracing::warn!(team = %t.slug, error = %e, "relational: sync_teams upsert failed (row will be missing from the mirror until the next team-data change)");
         }
         for m in &t.members {
@@ -2177,20 +1647,6 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
             }
         }
     }
-    // Remove teams/members that vanished from the snapshot (team deleted,
-    // member removed) so the mirror never shows ghosts forever.
-    //
-    // TOMBSTONE GUARD: only delete a row the authoritative leader has STOPPED
-    // asserting (its updated_ms no longer advances), never one merely missing
-    // from THIS node's local store. Every sync tick re-stamps every live
-    // team's updated_ms=now, so a row the real leader still owns is always
-    // fresh. Without this guard, a brief control-plane failover (pinned
-    // leader restarting -> next node in the owner chain takes over) let the
-    // stand-in leader's STALE local TeamStore drive this reconciliation and
-    // DELETE every team it had never heard of -- live-witnessed: the mirror
-    // lost 3 of 5 real teams fleet-wide during this session's rolling
-    // restarts (the follower stores held 2/4 of the 5 teams; team mutations
-    // only ever land on the pinned leader and followers never merge them).
     let tombstone_ms = std::env::var("HIVE_RELATIONAL_TOMBSTONE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2231,11 +1687,8 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
     }
 }
 
-/// Sync THIS node's own deployments into the `deployments` table. Every node
-/// writes ONLY rows whose `node` column is itself and deletes only its own
-/// stale rows — a single writer per row by construction, so a fleet-wide
-/// multi-node sync converges without conflicts (a relocated deployment's row
-/// moves to the new host on its next tick via the id-keyed upsert).
+/// Syncs THIS node's deployments into `deployments`: each node writes and deletes only rows whose
+/// `node` is itself (one writer per row), so a fleet-wide sync converges without conflicts.
 pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentInfo]) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
@@ -2275,7 +1728,6 @@ pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentI
             tracing::debug!(deployment = %d.id, error = %e, "relational: sync_deployments upsert failed (non-fatal)");
         }
     }
-    // Delete only THIS node's rows for deployments it no longer hosts.
     let live: std::collections::HashSet<String> = deps.iter().map(|d| d.id.to_string()).collect();
     let sel = format!("SELECT id FROM deployments WHERE node = {}", q(node));
     if let Ok(res) = exec(&mut s, &sel).await {
@@ -2291,16 +1743,10 @@ pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentI
     }
 }
 
-// ---------------------------------------------------------------------------
-// Drive (shadw drive v1) — one-level CRUD primitives against drive_nodes /
-// drive_shares / drive_tokens. Multi-segment path walking (mkdir -p style
-// resolution of "/a/b/c") lives in drive_api.rs, which calls these one row at
-// a time — this module stays a thin, single-purpose storage primitive layer,
-// matching every other table above.
-// ---------------------------------------------------------------------------
-
-/// A single `drive_nodes` row. `kind` is `"file"` or `"dir"`; `parent_id` is
-/// `""` for a top-level entry.
+/// A `drive_nodes` row (one-level CRUD here; multi-segment path walking lives in `drive_api`).
+/// `kind` is `"file"` or `"dir"`; `parent_id` is `""` for a top-level entry; `deleted_at` is a
+/// tombstone (0 = live: a hard delete racing a rename is undefined under LWW); `owner_node` is the
+/// node holding the bytes, which a request landing elsewhere proxies to.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DriveNode {
     pub id: String,
@@ -2347,9 +1793,8 @@ pub(crate) async fn drive_resolve(project: &str, parent_id: &str, name: &str) ->
         .find_map(drive_node_from_row)
 }
 
-/// Look up a node by its own id, regardless of tombstone state (callers that
-/// already resolved an id — e.g. a share grant — must still see a since-
-/// deleted target so they can report it as gone rather than crash).
+/// A node by id regardless of tombstone state, so a caller holding an id (a share grant) can report
+/// a deleted target as gone.
 pub(crate) async fn drive_get(id: &str) -> Option<DriveNode> {
     let db = crate::guardian::sql_db().await.ok()?;
     let mut s = session(db).await;
@@ -2363,9 +1808,7 @@ pub(crate) async fn drive_get(id: &str) -> Option<DriveNode> {
         .find_map(drive_node_from_row)
 }
 
-/// Every live child directly under `parent_id`, directories first then files,
-/// each lexically ordered (AGENTS.md's "lexical ordering for deterministic
-/// tie-breaking").
+/// Live children of `parent_id`: directories first, each group lexically ordered.
 pub(crate) async fn drive_list_children(project: &str, parent_id: &str) -> Vec<DriveNode> {
     let Ok(db) = crate::guardian::sql_db().await else {
         return Vec::new();
@@ -2391,11 +1834,8 @@ pub(crate) enum DriveWriteError {
     WrongKind,
 }
 
-/// Upsert a file's bytes-side metadata at `(project, parent_id, name)`: update
-/// the existing row (preserving its id, so a share link minted against it
-/// keeps working across an overwrite) if one is live there, else insert a
-/// fresh row. Last-write-wins by construction (design §6's v1 scope) — no
-/// locking, no read-modify-write races beyond ordinary CRDT LWW merge.
+/// Upserts a file at `(project, parent_id, name)`: updates the live row in place (id preserved, so
+/// share links survive an overwrite) or inserts one; last-write-wins.
 pub(crate) async fn drive_put_file(
     project: &str,
     parent_id: &str,
@@ -2414,11 +1854,6 @@ pub(crate) async fn drive_put_file(
         }
     }
     let Ok(db) = crate::guardian::sql_db().await else {
-        // GuardianDB not ready: synthesize an in-memory-only row so the
-        // caller's response is still coherent, but it will never be found by
-        // a later read — the same best-effort posture every other write in
-        // this module has (a failure here never blocks the mutation it
-        // mirrors).
         return Ok(DriveNode {
             id: existing
                 .map(|e| e.id)
@@ -2481,9 +1916,8 @@ pub(crate) async fn drive_put_file(
     Ok(node)
 }
 
-/// Idempotent directory create: returns the existing dir if one is already
-/// live at this slot, errors [`DriveWriteError::WrongKind`] if a file
-/// occupies it, else inserts a fresh row.
+/// Idempotent directory create: returns the live dir at the slot, errors
+/// [`DriveWriteError::WrongKind`] if a file occupies it.
 pub(crate) async fn drive_mkdir(
     project: &str,
     parent_id: &str,
@@ -2533,8 +1967,7 @@ pub(crate) async fn drive_mkdir(
     Ok(node)
 }
 
-/// Tombstone a node (file or, per design §1, a directory too — the API layer
-/// decides whether to require an empty directory first).
+/// Tombstones a file or directory; the API layer decides whether a directory must be empty first.
 pub(crate) async fn drive_tombstone(id: &str) {
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
@@ -2569,10 +2002,8 @@ pub(crate) async fn drive_move(id: &str, new_parent_id: &str, new_name: &str) {
     }
 }
 
-/// Sum of `size_bytes` across every live file in `project` — the quota-check
-/// read. Summed in Rust rather than SQL `SUM()` to avoid depending on this
-/// embedded engine's exact aggregate-result numeric type; a project's live
-/// file count is small enough for v1 that this costs nothing real.
+/// Sum of `size_bytes` over a project's live files (the quota read), summed in Rust rather than SQL
+/// `SUM()` so it does not depend on the engine's aggregate numeric type.
 pub(crate) async fn drive_bytes_used(project: &str) -> u64 {
     let Ok(db) = crate::guardian::sql_db().await else {
         return 0;
@@ -2601,19 +2032,15 @@ pub(crate) async fn drive_bytes_used(project: &str) -> u64 {
     total
 }
 
-/// A resolved `drive_shares` row. `scope` is stored (schema-complete for a
-/// future write-consuming endpoint per design §6) but deliberately not
-/// projected here: v1's one consumer, `drive_api::share_get`, always only
-/// reads regardless of the grant's scope, so carrying an unused field would
-/// be dead code, not future-proofing.
+/// A resolved `drive_shares` row; `scope` is stored but not projected (the only consumer,
+/// `drive_api::share_get`, always reads).
 pub(crate) struct DriveShare {
     pub node_id: String,
     pub expires_at: i64,
 }
 
-/// Mint a share grant against `node_id`, keyed by the SHA-256 of the
-/// capability token (apikeys.rs's own "hash, never store the secret"
-/// convention — a share link is exactly as sensitive as an API key).
+/// Mints a share grant against `node_id`, keyed by the SHA-256 of the capability token (hash, never
+/// store: a share link is as sensitive as an API key).
 pub(crate) async fn drive_share_mint(
     node_id: &str,
     token_hash: &str,
@@ -2639,10 +2066,8 @@ pub(crate) async fn drive_share_mint(
     id
 }
 
-/// Resolve a presented share token's hash to its grant. Any row is returned
-/// regardless of expiry — the caller (drive_api.rs) is the one place that
-/// decides "expired" vs "revoked" vs "valid", so it can answer honestly
-/// rather than this layer collapsing both into one not-found.
+/// Resolves a token hash to its grant regardless of expiry: `drive_api` alone decides expired vs
+/// revoked vs valid.
 pub(crate) async fn drive_share_resolve(token_hash: &str) -> Option<DriveShare> {
     let db = crate::guardian::sql_db().await.ok()?;
     let mut s = session(db).await;
@@ -2720,10 +2145,6 @@ pub(crate) async fn drive_token_verify(project: &str, token_hash: &str) -> bool 
     false
 }
 
-// ---------------------------------------------------------------------------
-// Admin "view as PostgreSQL" browser — read-only introspection + query
-// ---------------------------------------------------------------------------
-
 /// Column shape for `known_tables()` — plain data, not tied to `guardian_db`'s
 /// own `SqlType` so the admin JSON response stays simple/stable.
 pub(crate) struct SqlColumnInfo {
@@ -2736,11 +2157,8 @@ pub(crate) struct SqlTableInfo {
     pub columns: Vec<SqlColumnInfo>,
 }
 
-/// The exact tables `init_schema()` creates. Hand-maintained rather than a
-/// live `information_schema` introspection query — this module owns both the
-/// schema and this list, they're already the single source of truth for each
-/// other, and a fixed list can't be tricked into enumerating anything this
-/// module didn't itself create.
+/// The exact tables `init_schema` creates, hand-maintained so the admin browser can never enumerate
+/// anything this module did not create.
 pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
     let col = |name: &'static str, ty: &'static str| SqlColumnInfo { name, ty };
     vec![
@@ -2835,10 +2253,6 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("updated_ms", "bigint"),
             ],
         },
-        // Audit trail + idempotency marker for `backfill_billing_normalize`
-        // (the one-time old-JSON-blob-to-normalized-rows migration) — one row
-        // per tenant that has verified clean, so a re-run of the backfill
-        // never reprocesses (or duplicates) a tenant already migrated.
         SqlTableInfo {
             name: "billing_backfill_state",
             columns: vec![
@@ -2930,25 +2344,16 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
     ]
 }
 
-/// SQL keywords that would mutate state or schema — rejected anywhere in a
-/// query submitted through the read-only admin browser, not just as the
-/// first token (defends against `SELECT 1; DROP TABLE x` multi-statement
-/// injection and Postgres data-modifying CTEs like
-/// `WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`). Matched as a
-/// whole token (split on any non-alphanumeric byte) so an ordinary column or
-/// table name that merely CONTAINS one of these words as a substring (e.g. a
-/// hypothetical `updated_by` column) is never a false-positive rejection.
+/// Keywords rejected ANYWHERE in an admin query (whole-token match, so a column like `updated_by`
+/// passes): blocks `SELECT 1; DROP ...` and data-modifying CTEs.
 const BLOCKED_SQL_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE",
     "REPLACE", "MERGE", "CALL", "EXEC", "EXECUTE", "COPY", "VACUUM",
 ];
 
-/// `Err(reason)` if `sql` contains anything beyond a single read-only
-/// statement. This is the ONLY gate between an admin's typed input and a live
-/// `Session::execute` against real fleet-replicated tables — deliberately
-/// conservative (reject-by-default on anything ambiguous) since a false
-/// rejection just shows an error, while a false acceptance is a real data-loss
-/// path.
+/// `Err(reason)` unless `sql` is a single read-only statement: the ONLY gate between typed admin
+/// input and a live `Session::execute`, reject-by-default (a false accept is a data-loss path, a
+/// false reject only an error).
 fn reject_unless_readonly(sql: &str) -> Result<(), String> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -2967,8 +2372,6 @@ fn reject_unless_readonly(sql: &str) -> Result<(), String> {
             return Err(format!("'{tok}' is not allowed in this read-only query"));
         }
     }
-    // A semicolon anywhere but trailing whitespace at the very end means a
-    // second statement is present — reject rather than guess which one runs.
     let body = trimmed.trim_end_matches(';').trim_end();
     if body.contains(';') {
         return Err("only a single statement is allowed".into());
@@ -2987,10 +2390,6 @@ fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
         SqlValue::Float8(n) => serde_json::json!(n),
         SqlValue::Text(s) => serde_json::Value::String(s.clone()),
         other => {
-            // Numeric/Uuid/Date/Time/Timestamp(tz)/Json/Array/Bytea/etc: none of
-            // this module's own tables use these types today; stringify via
-            // accessor helpers where available, else Debug — always something
-            // legible in the admin UI rather than a serialization error.
             if let Some(s) = other.as_str() {
                 serde_json::Value::String(s.to_string())
             } else if let Some(n) = other.as_f64() {
@@ -3004,19 +2403,11 @@ fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
     }
 }
 
-/// Run an admin-submitted, already-validated read-only query against the
-/// relational mirror and shape the result as `{fields: [name...], rows:
-/// [[value...]]}` for the admin "view as PostgreSQL" browser. Callers MUST
-/// have already passed `sql` through `reject_unless_readonly` — this function
-/// re-checks it anyway (cheap, and a missing call site must never become a
-/// live mutation path).
+/// Runs an admin-submitted read-only query and shapes `{fields, rows}` for the "view as PostgreSQL"
+/// browser; re-checks `reject_unless_readonly` itself, so a missing call site can never become a
+/// mutation path.
 pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, String> {
     reject_unless_readonly(sql)?;
-    // A mirror read can take seconds on a large table — measured: `SELECT
-    // count(*) FROM billing_ledger` exceeded the 10 s exec ceiling on every
-    // node. Run the whole thing on the bulkhead runtime so a slow admin query
-    // occupies a bulkhead thread, never a serving tokio worker (the same rule
-    // `relational::exec` already follows for writes).
     let sql = sql.to_string();
     let started = std::time::Instant::now();
     let out = crate::bulkhead::spawn(async move { run_readonly_query_inner(&sql).await })
@@ -3056,18 +2447,13 @@ async fn run_readonly_query_inner(sql: &str) -> Result<serde_json::Value, String
             return Ok(serde_json::json!({ "fields": field_names, "rows": json_rows }));
         }
     }
-    // A read-only statement that legitimately returns zero result sets (rare,
-    // but not itself evidence of anything unsafe having run) — an empty grid.
     Ok(
         serde_json::json!({ "fields": Vec::<String>::new(), "rows": Vec::<Vec<serde_json::Value>>::new() }),
     )
 }
 
-/// Build `{field: value, ...}` JSON objects from a query's result rows, keyed
-/// by the query's OWN returned column names — reused by `billing_snapshot`'s
-/// per-table reconstruction so each SELECT list is the single source of
-/// truth for its own output shape (no hand-maintained positional mapping to
-/// drift out of sync with a query edit).
+/// `{column: value}` objects keyed by the query's own column names, so each SELECT list is the
+/// single source of its output shape.
 fn rows_to_json_objects(res: &[ExecResult]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for r in res {
@@ -3084,49 +2470,9 @@ fn rows_to_json_objects(res: &[ExecResult]) -> Vec<serde_json::Value> {
     out
 }
 
-/// Fleet-replicated billing read: `(account_json, ledger_json, invoices_json)`
-/// reconstructed from the real per-row tables (`billing_accounts`,
-/// `billing_ledger`, `billing_invoices` + `billing_invoice_lines`) into the
-/// same JSON shapes `BillingAccount`/`LedgerEntry`/`Invoice` serialize to
-/// (field names match exactly), so both existing callers
-/// (`admin::billing_invoices`, `admin::billing_ledger`) keep working
-/// unchanged.
-///
-/// The whole read is bounded by `billing_read_budget()` and reports
-/// `BillingSnapshot::Unavailable` when it cannot finish inside it — callers
-/// fall back to the HTTP proxy-to-leader (`admin::proxy_billing_read`, itself
-/// now budgeted) and then to the in-process `BillingStore`, so a slow or
-/// wedged DB layer costs a bounded delay instead of stalling the request.
-///
-/// Mirrored-ness is decided by the presence of a `billing_accounts` row, NOT
-/// by whether the `billing_ledger`/`billing_invoices` queries themselves
-/// returned any rows: `upsert_billing` writes the account row unconditionally
-/// in the same transaction as the ledger/invoice rows, so a mirrored tenant
-/// with a genuinely empty ledger or invoice history is a real, common case —
-/// its `ledger_json`/`invoices_json` must come back `Some("[]")`, not `None`,
-/// or callers fall through to the (correct but slower) fallback for the common
-/// case of an active-but-empty tenant, silently defeating the local-read
-/// optimization.
-///
-/// `invoices_json` reflects ONLY finalized invoices — the current
-/// in-progress period's draft is never persisted here (see
-/// `upsert_billing`'s doc comment) — `admin::billing_invoices` appends
-/// `BillingStore::current_invoice` itself to restore that field for callers.
-
-/// Budget for ONE user-facing billing mirror read (`billing_snapshot`).
-///
-/// Deliberately an order of magnitude below `SQL_OP_TIMEOUT` (10 s, sized for
-/// an admin/background statement): this is on a REQUEST path, and the live
-/// failure it exists to bound was a `Session::execute` that hung until the
-/// 10 s bound fired on EVERY node — `/v1/billing/ledger` and
-/// `/v1/billing/invoices` answered in exactly 10.00 s with `[]`, then fell
-/// through to `admin::proxy_billing_read`, whose dial-resilience budget added
-/// ~20 s more. A read that misses this budget is not an outage: the caller
-/// serves the authority's (or its own) in-process billing state instead, so the
-/// worst case is bounded, never an unbounded wait.
-///
-/// `HIVE_BILLING_SQL_READ_MS` overrides the 1500 ms default (measured healthy
-/// mirror: sub-millisecond to a few hundred ms; the default is ~5x headroom).
+/// Budget for ONE user-facing billing mirror read (`HIVE_BILLING_SQL_READ_MS`, default 1500 ms):
+/// far below `SQL_OP_TIMEOUT` because this is a request path; a miss serves the authority's or the
+/// in-process billing state instead.
 fn billing_read_budget() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
@@ -3158,16 +2504,12 @@ fn warn_billing_read_slow(budget: std::time::Duration) {
     }
 }
 
-/// Outcome of `billing_snapshot`. The three cases are NOT interchangeable and
-/// callers must not collapse them: `NotMirrored` is a real absence ("this
-/// tenant has never been mirrored here") while `Unavailable` means "we could
-/// not tell". Collapsing them is what let a wedged guardian answer `[]` for a
-/// tenant with real history — an empty array is a genuine answer for an
-/// active-but-empty tenant and must never be fabricated from a failed read.
+/// Outcome of `billing_snapshot`; the cases are not interchangeable: `NotMirrored` is a real
+/// absence, `Unavailable` means "could not tell", and a failed read must never be answered as `[]`
+/// for a tenant that has history.
 pub(crate) enum BillingSnapshot {
-    /// The tenant IS mirrored here (a `billing_accounts` row exists). Each part
-    /// is `None` when THAT part's read failed or missed the budget, so a
-    /// partial failure degrades only the part it affects.
+    /// The tenant IS mirrored here; each part is `None` when that part's read failed or missed the
+    /// budget (an invoice whose lines cannot be read is withheld, never served with zero lines).
     Mirrored {
         ledger: Option<String>,
         invoices: Option<String>,
@@ -3178,6 +2520,11 @@ pub(crate) enum BillingSnapshot {
     Unavailable,
 }
 
+/// Fleet-replicated billing read, rebuilt from the per-row tables into the JSON shapes the billing
+/// types serialize to, bounded by [`billing_read_budget`] (a miss is `Unavailable`; callers fall
+/// back to `admin::proxy_billing_read`, then the in-process store). Mirrored iff the tenant's
+/// `billing_accounts` row exists, so an empty ledger is `Some("[]")`; `invoices` are FINALIZED only
+/// (`admin::billing_invoices` appends the draft).
 pub(crate) async fn billing_snapshot(tenant: &str) -> BillingSnapshot {
     let budget = billing_read_budget();
     match tokio::time::timeout(budget, billing_snapshot_uncapped(tenant)).await {
@@ -3193,12 +2540,6 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
     let Ok(db) = crate::guardian::sql_db().await else {
         return BillingSnapshot::Unavailable;
     };
-    // Never wait for the FIRST index walk here. It is a background job sized to
-    // the namespace (minutes on a multi-GB guardian store), and an unbuilt
-    // index reads an EMPTY catalog — every table "does not exist", i.e. a
-    // guaranteed `NotMirrored` that would send the caller down the slow
-    // proxy-to-authority path for no reason. `session()` would otherwise wait
-    // `SQL_OP_TIMEOUT` for it on this request path.
     if !index_ready() {
         return BillingSnapshot::Unavailable;
     }
@@ -3210,10 +2551,6 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
          FROM billing_accounts WHERE tenant = {}",
         q(tenant)
     );
-    // A FAILED query is not an ABSENT row: returning `NotMirrored` here would
-    // tell the caller "this tenant was never mirrored" when the truth is "we
-    // could not read", and the caller would then serve an authority/empty
-    // answer for a tenant whose mirror rows are intact.
     let account = match exec(&mut s, &acc_q).await {
         Ok(r) => rows_to_json_objects(&r)
             .into_iter()
@@ -3221,8 +2558,6 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
             .map(|v| v.to_string()),
         Err(_) => return BillingSnapshot::Unavailable,
     };
-    // Not mirrored at all — never write a partial/empty answer here, let the
-    // caller fall back to the HTTP proxy-to-leader (or in-memory read).
     if account.is_none() {
         return BillingSnapshot::NotMirrored;
     }
@@ -3272,8 +2607,6 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
                     obj.insert("lines".into(), serde_json::Value::Array(lines));
                 }
             }
-            // An invoice whose line items could not be read must not be served
-            // as one with zero lines — that under-reports what the tenant owes.
             Err(_) => return BillingSnapshot::Mirrored {
                 ledger,
                 invoices: None,
