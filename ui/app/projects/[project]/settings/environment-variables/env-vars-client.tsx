@@ -14,26 +14,14 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [adding, setAdding] = useState(false);
   const [loadErr, setLoadErr] = useState("");
 
-  // new-var form
   const [k, setK] = useState("");
   const [v, setV] = useState("");
   const [target, setTarget] = useState("production");
-  // Default "all" (Build + Runtime) — Vercel parity: a variable someone adds
-  // without touching the selector must be visible to the BUILD too. The old
-  // "runtime" default silently starved builds ("DATABASE_URL is not set"
-  // during migrate after the user had set it in settings).
   const [scope, setScope] = useState<"runtime" | "build" | "all">("all");
   const [sensitive, setSensitive] = useState(true);
-  // Save-path error + busy state: the server answer to a failed write (401
-  // session expired, 403 wrong workspace, network) used to be swallowed by an
-  // unhandled rejection, so every failure looked identical — "nothing
-  // happens". Surface the actual error text next to the Save button.
   const [saveErr, setSaveErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Inline EDIT state: which key is expanded + its draft value/target. Sensitive
-  // values are never returned by the API (masked to ""), so the editor shows an
-  // empty field — entering a new value REPLACES the stored one.
   const [editing, setEditing] = useState<string | null>(null);
   const [editVal, setEditVal] = useState("");
   const [editTarget, setEditTarget] = useState("production");
@@ -45,14 +33,10 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
       setVars(s.env ?? []);
       setLoadErr("");
     } catch (e) {
-      // Surface the failure instead of silently rendering an empty list — a
-      // swallowed error here looked like "my variables disappeared".
       setLoadErr(String(e));
     }
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal await resolves, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
   }, [load]);
@@ -84,15 +68,11 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
   }
   function openEdit(e: EnvVar) {
     setEditing(e.key);
-    setEditVal(e.sensitive ? "" : e.value); // sensitive values are server-masked
+    setEditVal(e.sensitive ? "" : e.value);
     setEditTarget(e.target || "production");
-    // Legacy empty scope now means Build + Runtime on the backend.
     setEditScope(e.scope || "all");
   }
   async function saveEdit(e: EnvVar) {
-    // Backend semantics: an empty value on an existing key KEEPS the stored
-    // value (secrets are never echoed back to the client), so leaving the field
-    // blank on a sensitive var means "unchanged".
     if (busy) return;
     setBusy(true);
     setSaveErr("");
@@ -208,7 +188,6 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
                 </div>
                 <div className="text-xs capitalize text-secondary">
                   {e.target} · {(e.scope || "all").replace("all", "build + runtime")}
-                  {/* Value preview: plaintext vars show their value; sensitive stay hidden. */}
                   {!e.sensitive && e.value && (
                     <span className="ml-2 font-mono normal-case text-muted">= {e.value.length > 42 ? e.value.slice(0, 42) + "…" : e.value}</span>
                   )}

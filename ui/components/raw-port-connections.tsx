@@ -6,15 +6,9 @@ import { Badge } from "@/components/ui";
 import { type Deployment, type RawPortBinding } from "@/lib/api";
 import { rawPortAddress } from "@/lib/deploy-url";
 
-/**
- * A raw TCP/UDP/gRPC deployment has no Host header to connect through — this
- * renders its allocated public port as a ready-to-copy `host:port` address,
- * the literal format every raw client accepts (psql/redis-cli's `-h/-p`, or
- * a Minecraft client's "Server Address" field). Empty/pending states (no
- * alias yet, i.e. still building) render a plain disabled placeholder rather
- * than a broken/blank row. Shared between the deployment-detail page and the
- * project settings "Network" page — one place both read from.
- */
+/** A raw TCP/UDP/gRPC deployment has no Host header to connect through: this renders its allocated public port as a ready-to-copy `host:port` address (the
+ *  literal form every raw client accepts); a pending state (no alias yet) renders a disabled placeholder instead of a broken row. Shared by the
+ *  deployment-detail page and the project Network settings. */
 function RawPortRow({ binding, alias, regionCode }: { binding: RawPortBinding; alias?: string | null; regionCode?: string | null }) {
   const [copied, setCopied] = useState(false);
   const address = alias ? rawPortAddress(alias, binding.public_port, regionCode) : "";
@@ -47,12 +41,8 @@ function RawPortRow({ binding, alias, regionCode }: { binding: RawPortBinding; a
   );
 }
 
-/**
- * The full "Connection" block for one deployment's raw port bindings — a
- * copy-to-clipboard address per binding, formatted per protocol. Renders
- * nothing for an HTTP-only deployment (no `raw_ports`), so it's always safe
- * to drop in unconditionally.
- */
+/** The "Connection" block for one deployment's raw port bindings: a copy-to-clipboard address per binding, formatted per protocol; it renders nothing for an
+ *  HTTP-only deployment (no `raw_ports`), so it is safe to drop in unconditionally. */
 export function RawPortConnections({ deployment, alias }: { deployment: Deployment | null | undefined; alias?: string | null }) {
   const bindings = deployment?.raw_ports;
   if (!bindings || bindings.length === 0) return null;
@@ -66,14 +56,8 @@ export function RawPortConnections({ deployment, alias }: { deployment: Deployme
   );
 }
 
-/**
- * Compact card/row treatment for tight real estate (project grid tiles, list
- * rows): a terse `protocol:port` for a single raw binding, or `N raw ports`
- * once there's more than one — the full copy-to-clipboard `host:port` address
- * list stays in `RawPortConnections` above; this is its space-constrained
- * sibling for a project card/tile. Renders nothing for an HTTP-only
- * deployment, same null-safety as `RawPortConnections`.
- */
+/** Compact treatment for tight space (project tiles, list rows): a terse `protocol:port` for one raw binding, or `N raw ports` for several; the full
+ *  copy-to-clipboard list stays in `RawPortConnections`. Renders nothing for an HTTP-only deployment. */
 export function RawPortsBadge({ deployment }: { deployment: Deployment | null | undefined }) {
   const bindings = deployment?.raw_ports;
   if (!bindings || bindings.length === 0) return null;

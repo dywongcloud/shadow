@@ -1,29 +1,14 @@
-/* ------------------------------------------------------------------ *
- * Landing-page marquee banner.
- *
- * A NEAR-BLACK (dark-grey) banner with a thin, sleek white outline whose exact
- * silhouette — a tab on the top edge (left-of-centre) and a tab on the bottom
- * edge (right) — is rendered from the source path (2048×69) as an inline SVG
- * (dark fill + non-scaling white stroke). An infinitely-scrolling
- * "OWN YOUR CLOUD. ·" ticker rides inside the solid strip band (y 23–55 of the
- * 69-tall viewBox) in white. It sits after the hero globe with a little black
- * space above for contrast, and generous space below before the device showcase.
- * ------------------------------------------------------------------ */
 
 const PHRASE = "Own Your Cloud";
 
-// The banner silhouette (matches /public/banner-shape.svg).
 const SHAPE =
   "M0 23H564C567 23 570 21 573 19C578 14 582 8 586 5C589 2 592 0 596 0H719C722 0 724 2 727 4C732 8 735 13 740 18C743 21 747 23 751 23H2048V55H1624C1620 55 1617 59 1613 65C1611 67 1610 68 1608 68H1543C1541 68 1539 66 1538 65C1534 61 1531 58 1527 55H0V23Z";
 
-// The solid strip occupies y23–55 of the 69-unit-tall shape; the tabs extend
-// above/below it. Position the text band over the strip only.
-const STRIP_TOP = "33.33%"; // 23 / 69
-const STRIP_HEIGHT = "46.38%"; // 32 / 69
+const STRIP_TOP = "33.33%";
+const STRIP_HEIGHT = "46.38%";
 
-/** One copy of the ticker. Two sit side-by-side so the -50% translate loops seamlessly.
- *  Each phrase is followed by a perfectly round, centred bold black bullet (a real
- *  circle, not a glyph, so it's symmetric at any size) → "OWN YOUR CLOUD • …". */
+/** One copy of the ticker; two sit side by side so the -50% translate loops seamlessly. Each phrase is followed by a round, centred black bullet (a real
+ *  circle, not a glyph, so it is symmetric at any size). */
 function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
   return (
     <div className="flex shrink-0 items-center" aria-hidden={ariaHidden}>
@@ -45,9 +30,7 @@ function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
 export function MarqueeBanner() {
   return (
     <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 pb-12 sm:pt-6 sm:pb-16">
-      {/* The element keeps the shape's native aspect ratio so the tabs aren't distorted. */}
       <div className="relative w-full" style={{ aspectRatio: "2048 / 69" }}>
-        {/* Near-black banner with a clean, thin, sleek white outline trace. */}
         <svg
           viewBox="0 0 2048 69"
           className="absolute inset-0 h-full w-full"
@@ -57,8 +40,6 @@ export function MarqueeBanner() {
           <path d={SHAPE} fill="#131316" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         </svg>
 
-        {/* Scrolling ticker, confined to the solid strip band (full-width, no tabs).
-            Bold black text + round bullets; sized to fill the strip without bleeding. */}
         <div
           className="absolute inset-x-0 overflow-hidden"
           style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(3px, 0.8vw, 12px)" }}

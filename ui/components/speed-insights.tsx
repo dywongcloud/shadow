@@ -10,27 +10,18 @@ import Image from "next/image";
 
 const LineChart = dynamic(() => import("@tremor/react").then((m) => m.LineChart), { ssr: false });
 
-// ---- web-vitals model (Core Web Vitals + RES) ----
-// UI-only types stay local; the wire shapes (VitalPercentiles, RouteScore,
-// RumSummary) moved to lib/api.ts as the one source of truth for the
-// GET /v1/speed-insights contract, shared with lib/observability-data.ts's
-// server-side fetch and the new cached route handler.
 type Rating = "great" | "needs" | "poor";
 
 interface Vital {
   key: string;
   label: string;
   value: string;
-  // 0..1 position of the value within the poor→great scale (for the mini bar).
   pos: number;
   rating: Rating;
 }
 
-// Real User Monitoring, backed by GET /v1/speed-insights (the
-// @vercel/speed-insights beacon's FCP/LCP/CLS/INP/TTFB samples, stored +
-// percentiled server-side — see fluid-gateway's RumStore). Good/poor
-// thresholds mirror the server's own res_score() exactly, so the rail's
-// great/needs/poor classification and the RES gauge always agree.
+/** Good/poor thresholds mirror the server's own `res_score()` (fluid-gateway's RumStore) exactly, so the rail's great/needs/poor classification and the RES
+ *  gauge always agree. */
 const VITAL_LABELS: { key: keyof VitalPercentiles; label: string; good: number; poor: number }[] = [
   { key: "fcp", label: "First Contentful Paint", good: 1800, poor: 3000 },
   { key: "lcp", label: "Largest Contentful Paint", good: 2500, poor: 4000 },
@@ -79,9 +70,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
   const res = data?.res ?? null;
   const rumDataPoints = data?.sample_count ?? 0;
   const hasRum = rumDataPoints > 0;
-  // No time-bucketed RUM history yet (only an aggregate over the selected
-  // range) — show the real current score as a single point rather than
-  // fabricating a trend line the backend doesn't actually have data for.
   const chart: { t: string; RES: number }[] = res !== null ? [{ t: "now", RES: res }] : [];
 
   const selectedPercentiles: VitalPercentiles | undefined = data
@@ -99,10 +87,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
     });
   }, [selectedPercentiles]);
 
-  // Real per-route scores (each route's own p75 + RES, computed server-side
-  // the same way as the aggregate) — a route only ever lands in the bucket
-  // its OWN performance earns, never forced into "Great" just because it's
-  // the only bucket with data.
   const routeBuckets = useMemo(() => {
     const buckets: Record<Rating, { route: string; points: number; res: number | null }[]> = { great: [], needs: [], poor: [] };
     for (const r of data?.routes ?? []) {
@@ -114,7 +98,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
 
   return (
     <div>
-      {/* Header */}
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Speed Insights</h1>
@@ -141,7 +124,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[280px_1fr]">
-        {/* Vitals rail */}
         <Card className="p-0">
           <RailRow
             active
@@ -157,11 +139,9 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
           ))}
         </Card>
 
-        {/* Main */}
         <div className="space-y-4">
           <Card>
             <div className="flex flex-col gap-6 lg:flex-row">
-              {/* RES summary */}
               <div className="lg:w-[320px] lg:shrink-0">
                 <div className="text-xs text-secondary">{device}</div>
                 <h2 className="mb-3 text-xl font-semibold">Real Experience Score</h2>
@@ -184,7 +164,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
                 )}
               </div>
 
-              {/* RES chart */}
               <div className="min-w-0 flex-1">
                 <div className="mb-2 flex items-center justify-between">
                   <div className="flex rounded-md border border-border p-0.5 text-xs">
@@ -227,7 +206,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
               </div>
             </div>
 
-            {/* Routes / Paths breakdown */}
             <div className="mt-6 border-t border-border pt-4">
               <div className="mb-3 flex gap-4 text-sm">
                 {(["routes", "paths"] as const).map((t) => (
@@ -257,7 +235,6 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
             </div>
           </Card>
 
-          {/* Countries choropleth */}
           <Card className="p-0">
             <div className="flex items-center justify-between border-b border-border px-4 py-3 text-sm font-semibold">
               Countries
@@ -289,13 +266,10 @@ export function SpeedInsights({ initial = null }: { initial?: RumSummary | null 
   );
 }
 
-// ---- pieces ----
-
 function Gauge({ score, size }: { score: number | null; size: number }) {
   const stroke = size > 60 ? 6 : 3.5;
   const r = (size - stroke) / 2;
   const circ = 2 * Math.PI * r;
-  // No RUM score yet → an empty ring + em-dash, never a fabricated number.
   const color = score === null ? "hsl(var(--muted))" : score >= 90 ? "#3fa45a" : score >= 50 ? "#d9a528" : "#e5484d";
   return (
     <span className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>

@@ -17,7 +17,6 @@ import { apiSend, cancelBuild, usePoll, type Deployment, type Build, type Event 
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 
-// `https://github.com/owner/repo(.git)` (or scp-style) → `owner/repo` for display.
 function ownerRepo(url: string): string {
   if (!url) return "";
   return url
@@ -39,9 +38,6 @@ function errorHeadline(build: Build | null): string {
 
 export function DeploymentDetailPage({ paramsPromise }: { paramsPromise: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
-  // useSearchParams (the top-nav `?tab=` selector) must sit under a Suspense boundary.
-  // The fallback is a VISIBLE loading state, never an empty div — if hydration or
-  // the searchParams read is slow, the user sees "Loading…", never a blank screen.
   return (
     <Suspense
       fallback={
@@ -56,22 +52,15 @@ export function DeploymentDetailPage({ paramsPromise }: { paramsPromise: Promise
 }
 
 function DeploymentDetail({ id }: { id: string }) {
-  // Which scope-view tab is active (from the top nav): overview | logs | workflows.
   const searchParams = useSearchParams();
   const tab = searchParams.get("tab");
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
-  // The build behind this deployment (logs/timing/error). 404s until one exists.
-  // `error` is surfaced (below the panel) so a fetch/proxy failure is
-  // distinguishable from "this deployment genuinely has no build record" —
-  // previously both rendered the identical "No logs." dead end.
   const { data: build, error: buildError } = usePoll<Build>(`/v1/deployments/${encodeURIComponent(id)}/build`, 2000);
   const [redeploy, setRedeploy] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const dep = useMemo(() => (deps ?? []).find((d) => d.id === id) ?? null, [deps, id]);
 
-  // Prefer the deployment's live state; fall back to the build's while it's still
-  // being placed (the deployment row appears only once it exists).
   const state = dep?.state ?? build?.state ?? "queued";
   const ready = state === "ready";
   const errored = state === "error";
@@ -82,11 +71,6 @@ function DeploymentDetail({ id }: { id: string }) {
     build && build.finished_ms ? `${Math.max(1, Math.round((build.finished_ms - build.started_ms) / 1000))}s` : building ? "in progress" : "—";
   const created = dep?.created_at_ms ?? build?.started_ms ?? 0;
   const creator = dep?.creator || "—";
-  // A preview opens at its own immutable URL; production at the production
-  // alias — and a preview with NO alias of its own renders as pending rather
-  // than falling back to the production URL (`deploymentSelfAlias` returns ""
-  // there). `build?.alias` covers the record-not-yet-visible window; the
-  // backend stamps it with the deployment's own self alias per environment.
   const self = dep ? deploymentSelfAlias(dep) : build?.alias;
   const url = self ? deploymentUrl(self, dep?.region_code) : "";
   const host = self ? deploymentHost(self, dep?.region_code) : "";
@@ -105,10 +89,7 @@ function DeploymentDetail({ id }: { id: string }) {
     }
   }
 
-  // Stops the ACTUAL server-side build process (git clone / npm install /
-  // build command) via `POST /v1/builds/:id/cancel` — the build's OWN id
-  // (`build.id`), not this deployment's id (a still-building deployment has
-  // no deployment record of its own yet on most paths).
+  /** Cancels through the build's OWN id (`build.id`), not this deployment's: a still-building deployment often has no record of its own yet. */
   async function cancel() {
     if (!build?.id) return;
     setBusy(true);
@@ -131,14 +112,8 @@ function DeploymentDetail({ id }: { id: string }) {
         <ArrowLeft className="h-4 w-4" /> {dep ? dep.project : "Deployments"}
       </Link>
       {tab === "workflows" ? (
-        // Workflows scope-tab: the upstream console, scoped to this
-        // deployment's project (same embed the project page uses).
         (dep ? (<WfConsoleFrame project={dep.project} />) : (<div className="text-sm text-secondary">Loading…</div>))
       ) : tab === "logs" ? (
-        // Request-logs scope-tab: THIS deployment's own traffic (its immutable
-        // id/commit URLs plus whichever aliases it held when requests landed) —
-        // server-scoped via the `deployment` filter, never client-filtered.
-        // This tab existed in the top nav but rendered the overview before.
         (dep ? (<DeploymentRequestLogs project={dep.project} deployment={id} />) : (<div className="text-sm text-secondary">Loading…</div>))
       ) : (
       <>
@@ -168,7 +143,6 @@ function DeploymentDetail({ id }: { id: string }) {
         </div>
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,340px)_1fr]">
-          {/* Status banner box */}
           <div
             className={`rounded-lg border p-4 ${
               errored ? "border-red-500/50 bg-red-500/5" : ready ? "border-green/40 bg-green/5" : "border-border bg-subtle/40"
@@ -199,7 +173,6 @@ function DeploymentDetail({ id }: { id: string }) {
             </p>
           </div>
 
-          {/* Meta grid */}
           <div className="grid grid-cols-2 gap-x-6 gap-y-5 sm:grid-cols-2">
             <Meta label="Created" icon={<User className="h-3.5 w-3.5" />}>
               <span className="font-medium">{creator}</span>
@@ -302,10 +275,8 @@ function DeploymentDetail({ id }: { id: string }) {
   );
 }
 
-/** Request logs scoped to ONE deployment (`?tab=logs`). The server does the
- * scoping (`deployment` filter: events tagged with this deployment id at
- * record time, plus its immutable id-alias host) — the client renders exactly
- * what it gets, same columns as the project logs view. */
+/** Request logs scoped to ONE deployment (`?tab=logs`): the server scopes them (events tagged with this deployment id at record time plus its
+ *  immutable id-alias host) and the client renders exactly what it gets, with the same columns as the project logs view. */
 function DeploymentRequestLogs({ project, deployment }: { project: string; deployment: string }) {
   const { data: events, error, loading } = usePoll<Event[]>(
     `/v1/logs?limit=200&project=${encodeURIComponent(project)}&deployment=${encodeURIComponent(deployment)}`,

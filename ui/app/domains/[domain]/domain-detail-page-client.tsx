@@ -30,14 +30,10 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
     return <div className="py-20 text-center text-sm text-secondary"><Loader2 className="mx-auto h-5 w-5 animate-spin" /></div>;
   }
   const d = data.domain;
-  // A domain with a real attach flow (`verify`) has no registrar/renewal/SSL
-  // state on the platform — those record fields are legacy simulated
-  // placeholders and must not render next to the real verification card.
   const attached = !!d.verify;
 
   return (
     <div className="pb-24">
-      {/* Breadcrumb */}
       <div className="mb-6 flex items-center gap-1.5 text-sm text-secondary">
         <Link href="/domains" className="hover:text-fg">Domains</Link>
         <ChevronRight className="h-3.5 w-3.5 text-muted" />
@@ -46,7 +42,6 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         </span>
       </div>
 
-      {/* Header */}
       <div className="mb-6 flex items-start justify-between">
         <h1 className="text-3xl font-semibold tracking-tight">{domain}</h1>
         <div className="flex items-center gap-2">
@@ -55,7 +50,6 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         </div>
       </div>
 
-      {/* Meta row */}
       <div className="mb-8 grid grid-cols-2 gap-y-4 border-b border-border pb-6 text-sm sm:grid-cols-3 lg:grid-cols-6">
         <Meta label="Expiration Date" value={<span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span>} />
         {!attached && <Meta label="Renewal Price" value={d.renewal_price} />}
@@ -65,12 +59,10 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         <Meta label="OpenEdge CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
       </div>
 
-      {/* Ownership verification (custom-domain attachment) */}
       {d.verify && (
         <VerifyCard domain={domain} v={d.verify} onChange={refresh} />
       )}
 
-      {/* Connected Projects */}
       <Section title="Connected Projects" desc="Subdomains that are connected to projects on this team." action={<Button variant="outline" onClick={() => setConnectOpen(true)}>Connect</Button>}>
         <Card className="p-0">
           {data.connected.length === 0 ? (
@@ -86,17 +78,12 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         </Card>
       </Section>
 
-      {/* DNS Records */}
       <DnsRecords domain={domain} records={d.records} onChange={refresh} />
 
-      {/* Migrate / import existing DNS */}
       <MigrateDns domain={domain} onChange={refresh} />
 
-      {/* Nameservers */}
       <Nameservers domain={domain} nameservers={d.nameservers} attached={attached} onChange={refresh} />
 
-      {/* SSL Certificates — simulated placeholder data, only meaningful for
-          legacy DNS-only records (no attach flow). */}
       {!attached && (
       <Section title="SSL Certificates" desc="By default, OpenEdge issues and auto-renews a free SSL certificate for your domains.">
         <Card className="p-0">
@@ -118,7 +105,6 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       </Section>
       )}
 
-      {/* Registrant — simulated WHOIS/registrar copy, legacy DNS-only only. */}
       {!attached && (
       <Section title="Registrant Information" desc="We collect this information to meet ICANN requirements and establish you as the legal domain holder." action={<Button variant="outline">Manage WHOIS Privacy</Button>}>
         <Card className="p-5 text-sm text-secondary">WHOIS privacy is enabled — your contact details are protected.</Card>
@@ -139,9 +125,8 @@ function Meta({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-/** The ownership-verification card for a custom-domain attachment: pending
- *  shows the TXT to add (with copy + manual re-check); verified shows the
- *  live state and offers detach. */
+/** The ownership-verification card for a custom-domain attachment: pending shows the TXT to add (copy + manual re-check), verified shows the live state
+ *  and offers detach. */
 function VerifyCard({ domain, v, onChange }: { domain: string; v: import("@/lib/api").DomainVerify; onChange: () => void }) {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -262,7 +247,6 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
   const [priority, setPriority] = useState("");
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
-  // When set, the form edits an existing record (PUT) instead of adding (POST).
   const [editId, setEditId] = useState<string | null>(null);
   const needsPriority = type === "MX" || type === "SRV";
 
@@ -300,7 +284,6 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
 
   return (
     <Section title="DNS Records" desc="DNS records point to services your domain uses — forwarding, email (MX), subdomains (A/CNAME), wildcards (*), and more.">
-      {/* Add / edit form */}
       <Card className="mb-4 p-5">
         {editId && (
           <div className="mb-3 flex items-center gap-2 rounded-md bg-link/10 px-3 py-2 text-xs text-link">
@@ -330,7 +313,6 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
         </div>
       </Card>
 
-      {/* Records table */}
       <Card className="p-0">
         <div className="grid grid-cols-[1.2fr_0.7fr_1.6fr_0.6fr_0.7fr_0.9fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
           <span>Name</span><span>Type</span><span>Value</span><span>TTL</span><span>Priority</span><span>Age</span><span></span>
@@ -377,7 +359,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
     try {
       const r = await apiGet<{ records: ScanRecord[] }>(`/v1/domains/${encodeURIComponent(domain)}/scan`);
       setScanned(r.records || []);
-      setPicked(new Set((r.records || []).map((_, i) => i))); // pre-select all
+      setPicked(new Set((r.records || []).map((_, i) => i)));
       if (!r.records?.length) setMsg("No public DNS records found for this domain yet.");
     } catch (e) { setMsg(String(e)); } finally { setScanning(false); }
   }
@@ -410,7 +392,6 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
   return (
     <Section title="Migrate DNS" desc="Moving a domain from another provider? Detect its current records automatically, or paste your existing zone file — then import them here in one step.">
       <Card className="p-5">
-        {/* Auto-detect */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-medium">Detect existing records</div>
@@ -448,7 +429,6 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
           </div>
         )}
 
-        {/* Paste a zone file */}
         <div className="mt-6 border-t border-border pt-5">
           <div className="text-sm font-medium">Or paste a zone file</div>
           <div className="mt-0.5 text-xs text-muted">BIND-style lines, e.g. <span className="font-mono">www 3600 IN A 76.76.21.21</span></div>
@@ -492,8 +472,6 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
       const r = await attachDomain(project, fqdn);
       onChange();
       if (r.status === "pending" && r.verify) {
-        // Attached but not live: ownership TXT is outstanding — show it
-        // instead of closing as if the domain were already routed.
         setPending(r);
       } else {
         onClose(); setProject(""); setSub(""); setPending(null);
@@ -572,9 +550,6 @@ function Nameservers({ domain, nameservers, attached, onChange }: { domain: stri
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(nameservers.join("\n"));
   const [roster, setRoster] = useState<NsRoster | null>(null);
-  // Attached domains have no stored nameserver truth — the record's
-  // `nameservers` are simulated placeholders. The real, peer-attested
-  // platform set comes from the roster endpoint.
   useEffect(() => {
     if (attached) fetchNsRoster().then(setRoster).catch(() => setRoster(null));
   }, [attached]);

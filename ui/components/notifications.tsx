@@ -19,17 +19,6 @@ export function NotificationBell() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    // window.Notification.permission (granted/denied/default) is the browser's
-    // OWN persisted record of whether push is already enabled -- it survives
-    // across sessions on its own, independent of our localStorage flag. Treat
-    // it as authoritative: once the user has actually granted (or denied) the
-    // OS-level permission, never show the "Enable push" banner again, even if
-    // oe_push_dismissed itself got cleared (e.g. by topnav.tsx's account-switch
-    // reset). Previously oe_push_dismissed was the ONLY signal, so any path
-    // that cleared it (intentional or not) resurrected the banner and made the
-    // user re-click "Enable" despite already having granted permission --
-    // requestPermission() on an already-decided permission just re-resolves
-    // instantly with no OS prompt, so this read as "it keeps prompting me."
     const alreadyDecided = "Notification" in window && window.Notification.permission !== "default";
     // eslint-disable-next-line react-hooks/set-state-in-effect -- reads browser-only Notification.permission/localStorage, not available at SSR so can't be a lazy initializer
     setPushDismissed(alreadyDecided || localStorage.getItem("oe_push_dismissed") === "1");
@@ -50,7 +39,6 @@ export function NotificationBell() {
   async function openPanel() {
     const next = !open;
     setOpen(next);
-    // Opening the inbox marks everything read (like Vercel).
     if (next && unread > 0) {
       await apiSend("POST", "/v1/notifications/read").catch(() => {});
       refresh();
@@ -65,13 +53,6 @@ export function NotificationBell() {
     refresh();
   }
   async function enablePush() {
-    // Full Web Push enrollment (permission → SW subscription → backend
-    // registration under the current tenant) — shared with the settings page
-    // via lib/push. Only a SUCCESSFUL registration dismisses the banner; a
-    // transient failure (VAPID fetch, subscribe, backend upsert) keeps it
-    // visible so the user can retry, while an explicit permission denial keeps
-    // the existing dismissed-forever behavior (the mount effect treats a
-    // decided Notification.permission as authoritative anyway).
     try {
       await subscribePush();
       dismissPush();
@@ -107,7 +88,6 @@ export function NotificationBell() {
 
       {open && (
         <div className="absolute right-0 top-full z-50 mt-2 flex max-h-[560px] w-[380px] flex-col overflow-hidden rounded-xl border border-border bg-card shadow-pop">
-          {/* Tabs */}
           <div className="flex items-center gap-4 border-b border-border px-4">
             <TabBtn active={tab === "inbox"} onClick={() => setTab("inbox")}>
               Inbox
@@ -124,7 +104,6 @@ export function NotificationBell() {
             </a>
           </div>
 
-          {/* List */}
           <div className="flex-1 overflow-y-auto">
             {shown.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-2 px-6 py-14 text-center">
@@ -138,7 +117,6 @@ export function NotificationBell() {
             )}
           </div>
 
-          {/* Enable push banner */}
           {tab === "inbox" && !pushDismissed && (
             <div className="border-t border-border bg-subtle/60 p-3">
               <div className="mb-2 flex items-start gap-2 text-sm">
@@ -152,7 +130,6 @@ export function NotificationBell() {
             </div>
           )}
 
-          {/* Archive all */}
           {tab === "inbox" && inbox.length > 0 && (
             <button onClick={archiveAll} className="border-t border-border py-2.5 text-center text-sm font-medium text-secondary hover:bg-subtle hover:text-fg">
               Archive All
@@ -201,7 +178,6 @@ function richMessage(n: Notification) {
   let rest = n.message;
   const bolds = [n.project, n.environment].filter(Boolean);
   let key = 0;
-  // Greedily bold known tokens wherever they appear.
   const tokenRe = new RegExp(`(${bolds.map((b) => b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "g");
   if (!bolds.length) return rest;
   rest.split(tokenRe).forEach((seg) => {

@@ -14,13 +14,8 @@ function slug(s: string) {
 }
 const MAX_ZIP = 10 * 1024 * 1024;
 
-/**
- * Dedicated "create project from a .zip" view — the no-Git alternative linked from
- * /new. Drag-drop or browse a source archive, name it, set env, Create. The archive
- * POSTs to /v1/deploy/zip (the `/cloud` rewrite streams it to the admin); on success
- * we jump straight to the build logs (no git "Preparing" animation, since there's no
- * repo to clone).
- */
+/** The "create project from a .zip" view, the no-Git alternative linked from /new: drag-drop or browse a source archive, name it, set env, Create. The archive
+ *  POSTs to `/v1/deploy/zip` (the `/cloud` rewrite streams it to the admin) and on success jumps to the build logs (no git "Preparing" animation: there is no repo). */
 export default function UploadProjectPage() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
@@ -76,20 +71,10 @@ export default function UploadProjectPage() {
     setUploading(true);
     try {
       const proj = name || slug(file.name.replace(/\.zip$/i, "")) || "project";
-      // Scope the new project to the chosen team. Await switchTeam (re-mints
-      // the hive_jwt cookie) BEFORE the upload fires — the backend derives the
-      // tenant from the cookie under JWT enforcement, so a raw localStorage
-      // write here let the upload land under whatever tenant the OLD cookie
-      // still claimed while the view had already moved on (matches the New
-      // Project flow's fix).
       if (typeof window !== "undefined") {
         await switchTeam(team === "personal" ? "__personal__" : team);
       }
       const e = env();
-      // redeploy: true — a same-named upload to a project the SAME tenant owns
-      // is a redeploy, not a name grab (previously always 409: zip has no git
-      // index so the same_repo exemption could never fire). A name owned by a
-      // DIFFERENT tenant still 409s, which is the guard's real job.
       const meta = { project: proj, filename: file.name, env: Object.keys(e).length ? e : undefined, production: true, redeploy: true };
       const metaB64 = btoa(unescape(encodeURIComponent(JSON.stringify(meta))));
       const res = await fetch("/cloud/v1/deploy/zip", {
@@ -99,12 +84,6 @@ export default function UploadProjectPage() {
       });
       if (!res.ok) throw new Error((await res.text().catch(() => "")) || `Upload failed (${res.status})`);
       const { build_id } = (await res.json()) as { build_id: string };
-      // This zip upload is a raw multipart fetch (can't go through apiSend, which
-      // only handles JSON bodies) but it creates a brand-new project + deployment —
-      // the same mutation class as a git-URL deploy or registry-image deploy, both
-      // of which trigger an immediate gitops sync via apiSend/apiDeployViaServerRoute.
-      // Fire the equivalent manual calls here so this path isn't a silent gitops-sync
-      // bypass (previously only the 45s background interval would ever pick it up).
       invalidateApiCache();
       if (typeof window !== "undefined") window.dispatchEvent(new Event("gitops-sync"));
       router.push(`/deploy/${build_id}`);

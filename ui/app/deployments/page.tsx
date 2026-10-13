@@ -14,14 +14,8 @@ import { RedeployModal } from "@/components/redeploy-modal";
 export default function DeploymentsPage() {
   const router = useRouter();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
-  // In-flight builds from the persistent store — survive navigation/reload. MERGED
-  // with the real records rather than replaced by them: a pending row is dropped
-  // only once a deployment record it corresponds to is actually visible here, which
-  // is what keeps the row on screen for the deploy's whole lifecycle instead of
-  // blinking out during the build->record handover.
   const pending = mergePending(usePendingBuilds(), deps);
   const [busy, setBusy] = useState<string>("");
-  // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
 
   async function promote(d: Deployment) {
@@ -39,16 +33,13 @@ export default function DeploymentsPage() {
       await refresh();
     } catch (e) { alert(String(e)); } finally { setBusy(""); }
   }
-  // Stops the ACTUAL server-side build process (git clone / npm install /
-  // build command), not just a client-side no-op — see `POST
-  // /v1/builds/:id/cancel`. `p.id` IS the build id (see `PendingBuild`'s doc).
   async function cancelPending(buildId: string) {
     setBusy(buildId);
     try {
       await cancelBuild(buildId);
-      removePendingBuild(buildId); // now terminal — drop the pulsing row
+      removePendingBuild(buildId);
     } catch (e) {
-      alert(String(e)); // request itself failed — keep the row, let the user retry
+      alert(String(e));
     } finally {
       setBusy("");
     }
@@ -64,7 +55,6 @@ export default function DeploymentsPage() {
       <Table>
         <thead><tr><Th>Project</Th><Th className="hidden lg:table-cell">Deployment</Th><Th>Status</Th><Th>URL</Th><Th className="hidden md:table-cell">Source</Th><Th className="hidden sm:table-cell">Created</Th><Th></Th></tr></thead>
         <tbody>
-          {/* Persistent optimistic rows for in-flight builds (survive navigation). */}
           {pending.map((p) => {
             const cancelling = busy === p.id;
             return (
@@ -109,8 +99,6 @@ export default function DeploymentsPage() {
                 <Td className="font-medium">{d.project}</Td>
                 <Td className="font-mono text-xs text-muted hidden lg:table-cell">{d.id}</Td>
                 <Td>
-                  {/* Environment is the immutable build target; the green dot marks
-                      the deployment currently promoted to the production domain. */}
                   {(() => {
                     const env = d.target || (d.production ? "production" : "preview");
                     return (
@@ -121,15 +109,7 @@ export default function DeploymentsPage() {
                     );
                   })()}
                 </Td>
-                {/* The row currently promoted to production links via the project
-                    production alias (e.g. my-app.<domain>), so production opens at
-                    its real production URL. Every other row links to its OWN
-                    immutable URL (the per-deployment id, or commit URL), so a
-                    preview opens that preview — not production. */}
                 <Td className="font-mono text-xs">
-                  {/* Prefer the SHARED, mesh-routable commit alias for previews; the
-                      per-node id alias (dpl-<id>) only resolves on its own host node
-                      under multi-region fanout, so it 404s through the pooled ingress. */}
                   {(() => { const self = deploymentSelfAlias(d);
                     return self
                       ? <a className="text-link hover:underline" href={deploymentUrl(self, d.region_code)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{deploymentHost(self, d.region_code)}</a>

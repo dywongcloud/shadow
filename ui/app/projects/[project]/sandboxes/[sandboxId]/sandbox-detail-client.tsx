@@ -42,9 +42,8 @@ export function SandboxDetail({ paramsPromise }: { paramsPromise: Promise<{ proj
     await apiSend("POST", `${base}/stop`);
     refresh();
   }
-  // Restart tears the cell down and provisions a fresh one — the fix for a
-  // running sandbox whose guest has wedged, which `start` cannot do (start is
-  // a no-op refresh while the sandbox is already running).
+  /** Tears the cell down and provisions a fresh one: the fix for a running sandbox whose guest has wedged, which `start` cannot do (it is a no-op
+   *  refresh while the sandbox is already running). */
   async function restart() {
     await apiSend("POST", `${base}/restart`);
     refresh();
@@ -116,9 +115,6 @@ export function SandboxDetail({ paramsPromise }: { paramsPromise: Promise<{ proj
   );
 }
 
-// ---------------------------------------------------------------------------
-// Summary cards
-// ---------------------------------------------------------------------------
 function Mini({ label, value }: { label: string; value: string }) {
   return (
     <Card className="flex flex-col gap-1">
@@ -129,10 +125,6 @@ function Mini({ label, value }: { label: string; value: string }) {
 }
 
 function StatusCard({ sandbox }: { sandbox: SandboxRecord }) {
-  // Date.now() read directly during render is flagged as impure, but this is
-  // a countdown display that already re-renders every 3s from the parent's
-  // usePoll — approximately fresh is the intended behavior, and a real
-  // ticking-clock state would change behavior beyond this display.
   // eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate countdown display; already re-renders every 3s via the parent's usePoll
   const remaining = sandbox.timeout_expires_at ? Math.max(0, sandbox.timeout_expires_at - Date.now()) : 0;
   const mins = Math.floor(remaining / 60000);
@@ -148,9 +140,6 @@ function UsageCard({ sandbox }: { sandbox: SandboxRecord }) {
   return <Mini label="Total duration" value={`${Math.round(sandbox.total_duration_ms / 1000)}s`} />;
 }
 
-// ---------------------------------------------------------------------------
-// Run Command panel
-// ---------------------------------------------------------------------------
 function RunCommandPanel({ project, sandboxId }: { project: string; sandboxId: string }) {
   const [cmd, setCmd] = useState("");
   const [args, setArgs] = useState("");
@@ -182,9 +171,7 @@ function RunCommandPanel({ project, sandboxId }: { project: string; sandboxId: s
         stopPolling();
         setRunning(false);
       }
-    } catch {
-      /* keep last known state */
-    }
+    } catch {}
   }
 
   async function run() {
@@ -289,9 +276,6 @@ function RunCommandPanel({ project, sandboxId }: { project: string; sandboxId: s
   );
 }
 
-// ---------------------------------------------------------------------------
-// Files panel
-// ---------------------------------------------------------------------------
 function FilesPanel({ project, sandboxId }: { project: string; sandboxId: string }) {
   const [path, setPath] = useState("/build/hello.txt");
   const [content, setContent] = useState("");
@@ -375,9 +359,6 @@ function FilesPanel({ project, sandboxId }: { project: string; sandboxId: string
   );
 }
 
-// ---------------------------------------------------------------------------
-// Ports / preview URLs
-// ---------------------------------------------------------------------------
 function PortsCard({ project, sandbox }: { project: string; sandbox: SandboxRecord }) {
   const [urls, setUrls] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState<number | null>(null);
@@ -426,9 +407,6 @@ function PortsCard({ project, sandbox }: { project: string; sandbox: SandboxReco
   );
 }
 
-// ---------------------------------------------------------------------------
-// Snapshots panel
-// ---------------------------------------------------------------------------
 function SnapshotsPanel({ project, sandboxId, onChanged }: { project: string; sandboxId: string; onChanged: () => void }) {
   const base = `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandboxId}`;
   const { data, refresh } = usePoll<{ snapshots: SandboxSnapshotRecord[] }>(`${base}/snapshots`, 5000);
@@ -480,9 +458,6 @@ function SnapshotsPanel({ project, sandboxId, onChanged }: { project: string; sa
   );
 }
 
-// ---------------------------------------------------------------------------
-// Storage / Mounts panel
-// ---------------------------------------------------------------------------
 function MountsPanel({ project, sandboxId }: { project: string; sandboxId: string }) {
   const base = `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandboxId}`;
   const { data, refresh } = usePoll<{ mounts: SandboxMountRecord[] }>(`${base}/mounts`, 5000);
@@ -613,9 +588,6 @@ function MountsPanel({ project, sandboxId }: { project: string; sandboxId: strin
   );
 }
 
-// ---------------------------------------------------------------------------
-// Network policy panel
-// ---------------------------------------------------------------------------
 function NetworkPolicyPanel({ project, sandboxId, sandbox, onChanged }: { project: string; sandboxId: string; sandbox: SandboxRecord; onChanged: () => void }) {
   const base = `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandboxId}`;
   const [mode, setMode] = useState<NetworkPolicy["mode"]>(sandbox.network_policy.mode);

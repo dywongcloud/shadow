@@ -76,8 +76,6 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
   const [retrying, setRetrying] = useState(false);
   const [retryMsg, setRetryMsg] = useState("");
 
-  // ---- "Connect a Git Repository" picker (only relevant when there's no git
-  // source yet — a project created via zip-upload or a registry image). ----
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   const [ghCta, setGhCta] = useState<{ text: string; approveUrl?: string } | null>(null);
@@ -104,16 +102,12 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
   }, [project]);
 
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal awaits resolve, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after internal awaits, not synchronously
     load();
   }, [load]);
 
   const hasGit = !!dep?.git;
 
-  // Populate the repo picker only once we know the project has no git source —
-  // avoids an unnecessary GitHub round trip for the (common) already-connected case.
   useEffect(() => {
     if (!loaded || hasGit) return;
     cachedJson<GhDetail>("/api/github/status", 30_000)
@@ -125,8 +119,6 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
           .catch(() => [] as GhRepo[]);
         const merged: GhRepo[] = [...personal];
         const seen = new Set(personal.map((r) => r.full_name));
-        // Only merge org repos when we can enumerate them (read:org) — mirrors
-        // the same non-disruptive policy as the New Project import screen.
         if (s.hasOrgScope) {
           const orgs = await cachedJson<{ orgs: { login: string }[] }>("/api/github/orgs", 5 * 60_000)
             .then((d) => d.orgs || [])
@@ -175,12 +167,6 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
     await connectGithub();
   }
 
-  // The SAME install logic the "New Project" git-import flow fires right after
-  // create (see app/new/page.tsx's deploy()) — reused verbatim here as a
-  // standalone, idempotent call: /api/gitops/project-ci already takes just
-  // `{ repo }` and returns a fresh outcome every time (GitHub itself no-ops a
-  // duplicate webhook rather than creating a second one), so calling it again
-  // on an existing project is a safe manual retry, not a first-time-only step.
   async function installCi(repoUrl: string): Promise<CiInstallResult> {
     const j: CiInstallResult = await fetch("/api/gitops/project-ci", {
       method: "POST",
@@ -228,22 +214,15 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
     setConnectError("");
     try {
       const ref = branch.trim() || pickedRepo.default_branch;
-      // Via the server route so a PRIVATE repo gets the user's GitHub token
-      // attached server-side for the clone (never in the browser).
       const res = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url: pickedRepo.clone_url,
         branch: ref,
         project,
         target: "production",
         production: true,
-        // This project already exists (created via zip/image) — reuse its name
-        // verbatim instead of treating this as a colliding new-project create.
         redeploy: true,
       });
       addPendingBuild({ id: res.build_id, project, team: currentTeam(), env: "production" });
-      // Awaited (unlike the fire-and-forget on the New Project screen) since the
-      // user stays on this settings page rather than navigating to build logs —
-      // the status card below should already be right by the time they see it.
       await installCi(pickedRepo.clone_url);
       toast("Repository connected — deploying…");
       router.push(`/deploy/${res.build_id}`);

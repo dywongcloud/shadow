@@ -10,14 +10,9 @@ import { addPendingBuild } from "@/lib/pending-builds";
 
 type Env = "production" | "preview";
 
-/**
- * Vercel-style "Create Deployment" modal for a project's Deployments tab. Lets
- * the user create a fresh deployment from a branch / commit / URL (defaulting to
- * the project's connected repo) plus optional environment variables, instead of
- * being bounced to the new-project import screen. Submits to the same
- * `/v1/git/deploy` endpoint with the project name pinned, so it lands as a new
- * deployment of THIS project.
- */
+/** The "Create Deployment" modal for a project's Deployments tab: a fresh deployment from a branch, commit or URL (defaulting to the project's connected
+ *  repo) plus optional environment variables, instead of bouncing to the new-project import screen. It submits to `/v1/git/deploy` with the project name
+ *  pinned, so it lands as a new deployment of THIS project. */
 export function CreateDeploymentModal({
   project,
   repoUrl,
@@ -34,7 +29,6 @@ export function CreateDeploymentModal({
   /** Called once the build has started, with its build id + chosen environment. */
   onDone?: (buildId: string, env: Env) => void;
 }) {
-  // Source defaults to the connected repo; the user can paste a branch/commit/URL.
   const [source, setSource] = useState(repoUrl || "");
   const [envOpen, setEnvOpen] = useState(false);
   const [rows, setRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
@@ -47,7 +41,6 @@ export function CreateDeploymentModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, onClose]);
 
-  // Expand a pasted `.env` blob (KEY=VALUE lines) into rows.
   function onPaste(e: React.ClipboardEvent, idx: number) {
     const text = e.clipboardData.getData("text");
     if (!text.includes("\n") && !text.includes("=")) return;
@@ -78,24 +71,11 @@ export function CreateDeploymentModal({
     setBusy(true);
     setError("");
     try {
-      // A pasted full git URL overrides the source repo; otherwise treat the
-      // field as a branch/commit ref against the connected repo.
       const isUrl = /^(https?:\/\/|git@)/.test(source.trim());
       const repo_url = isUrl ? source.trim() : repoUrl;
       const ref = isUrl ? branch : source.trim();
-      // A pasted full (40-hex) or short (7-40-hex) commit SHA must go through
-      // the backend's `commit` field (GitDeployRequest.commit), NOT `branch` —
-      // sending it as `branch` fed `git clone --branch <sha>`, which fails for
-      // a bare commit hash (a shallow clone's `--branch` needs an advertised
-      // ref, not an arbitrary commit) and silently fell back to the connected
-      // repo's default branch tip instead of the requested exact commit. A
-      // short SHA (<40 hex) is excluded from the "full SHA" branch label below
-      // only in the sense that both send through `commit` identically here;
-      // the length distinction only matters for display, not for this request.
       const isSha = /^[0-9a-f]{7,40}$/i.test(ref || "");
       const env = buildEnv();
-      // Via the server route so a PRIVATE github repo gets the user's GitHub token
-      // attached server-side (never in the browser) for the clone.
       const r = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url,
         branch: isSha ? undefined : ref || undefined,
@@ -104,11 +84,8 @@ export function CreateDeploymentModal({
         target,
         production: target === "production",
         env: Object.keys(env).length ? env : undefined,
-        // This is a new deployment of an EXISTING project (we're on its page), not
-        // a new-project create — keep the name verbatim, never 409 / suffix.
         redeploy: true,
       });
-      // Persist the in-flight build so its "Building" row survives navigation/reload.
       addPendingBuild({ id: r.build_id, project, team: currentTeam(), env: target });
       toast("New Deployment Created");
       onDone?.(r.build_id, target);
@@ -130,7 +107,6 @@ export function CreateDeploymentModal({
         <div className="p-6 sm:p-7">
           <h2 className="text-xl font-semibold tracking-tight">Create Deployment</h2>
 
-          {/* Connected repo */}
           <div className="mt-5 flex items-center gap-3">
             <Github className="h-7 w-7 text-secondary" />
             <div className="min-w-0">
@@ -151,7 +127,6 @@ export function CreateDeploymentModal({
             </div>
           )}
 
-          {/* Environment variables (collapsible) */}
           <button
             type="button"
             onClick={() => setEnvOpen((o) => !o)}

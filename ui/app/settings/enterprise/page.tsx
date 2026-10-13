@@ -16,12 +16,8 @@ import {
 import { Card, PageHeader, Badge, Button, Input, Switch } from "@/components/ui";
 import { apiGet, apiSend, currentTeam } from "@/lib/api";
 
-/* --------------------------------------------------------------------------
- * Enterprise settings — one consolidated surface for the enterprise feature
- * suite. Every section is team-scoped and plan-gated server-side (the API
- * returns 403 when the team isn't on the required plan); the UI surfaces those
- * errors inline rather than hiding the controls.
- * ------------------------------------------------------------------------ */
+// Enterprise settings: one consolidated surface for the enterprise suite. Every section is team-scoped and plan-gated server-side (the API answers 403 when the
+// team is not on the required plan); the UI surfaces those errors inline instead of hiding the controls.
 
 function Section({
   icon,
@@ -84,8 +80,6 @@ export default function EnterprisePage() {
   );
 }
 
-/* ============================ IP blocking ============================ */
-
 interface IpBlock {
   id: string;
   prefix: string;
@@ -109,8 +103,6 @@ function IpBlocking() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -167,8 +159,6 @@ function IpBlocking() {
   );
 }
 
-/* ============================ SAML SSO ============================ */
-
 interface SamlView {
   idp_entity_id: string;
   sso_url: string;
@@ -203,8 +193,6 @@ function SamlSso() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -281,8 +269,6 @@ function SamlSso() {
   );
 }
 
-/* ============================ SCIM ============================ */
-
 interface ScimUser {
   id: string;
   user_name: string;
@@ -310,8 +296,6 @@ function ScimSync() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -394,8 +378,6 @@ function ScimSync() {
   );
 }
 
-/* ============================ SIEM ============================ */
-
 interface SiemView {
   format: string;
   endpoint: string;
@@ -426,8 +408,6 @@ function SiemStreaming() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -502,8 +482,6 @@ function SiemStreaming() {
   );
 }
 
-/* ============================ Microfrontends ============================ */
-
 interface MfeChild {
   project: string;
   path_prefix: string;
@@ -534,8 +512,6 @@ function Microfrontends() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -618,8 +594,6 @@ function Microfrontends() {
     </Section>
   );
 }
-
-/* ============================ Conformance ============================ */
 
 interface ConfResult {
   rule: string;

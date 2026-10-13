@@ -21,9 +21,8 @@ function fmtTime(ms: number) {
   return `${d.toLocaleString("en-US", { month: "short", day: "2-digit" }).toUpperCase()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 2).slice(0, 2)}`;
 }
 
-/** Timeline windows the server supports (see `admin::logs_range_ms`). `pro: true`
- * marks a window the API refuses on the hobby plan — it is still offered so the
- * refusal is legible, not a silently-empty table. */
+/** Timeline windows the server supports (`admin::logs_range_ms`); `pro: true` marks a window the API refuses on the hobby plan, still offered
+ *  so the refusal is legible instead of a silently empty table. */
 const RANGES: { value: string; label: string; pro?: boolean }[] = [
   { value: "30m", label: "Last 30 minutes" },
   { value: "1h", label: "Last hour" },
@@ -37,11 +36,11 @@ const CACHES = ["hit", "miss", "stale", "store", "revalidate"];
 const ENVS = ["production", "preview"];
 const RESOURCES = ["static", "function", "fullstack"];
 const PAGE_SIZES = [100, 300, 1000];
-/** The server clamps `offset` to `LOGS_LIMIT_MAX - limit` so each node's scan
- * stays bounded (see `admin::logs`). Asking for a larger offset is silently
- * reduced, i.e. "Next" would re-return the rows already on screen — so the UI
- * must stop at the same bound instead of offering a control that does nothing. */
+/** The server clamps `offset` to `LOGS_LIMIT_MAX - limit` (`admin::logs`), so a larger offset is silently reduced and "Next" would re-return the
+ *  rows on screen: the UI stops at the same bound. */
 const LOGS_LIMIT_MAX = 1000;
+const LIVE_TAIL_POLL_MS = 1500;
+const HISTORY_POLL_MS = 5000;
 
 /** Union of the server's vocabulary and the values actually present in the
  * current rows, so a dropdown always offers the enum AND only real values. */
@@ -56,19 +55,11 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
   const project = decodeURIComponent(params.project);
   const searchParams = useSearchParams();
   const [events, setEvents] = useState<Event[]>([]);
-  // Seeded once from `?q=` (e.g. a deep link from a project's Cron Jobs
-  // settings page's "View Logs" button, filtered to that job's path) — the
-  // user can still edit the filter freely afterward.
   const [q, setQ] = useState(() => searchParams.get("q") ?? "");
   const [live, setLive] = useState(true);
   const [sel, setSel] = useState<Event | null>(null);
-  // Synthetic display-only "Request ID" suffix, generated once at selection
-  // time (an event handler, not render) so it stays stable for as long as
-  // that event is selected instead of rerolling on every re-render.
   const [selRequestId, setSelRequestId] = useState("");
 
-  // Timeline — actually sent to the API now (it used to be written to state
-  // and never read by anything, so "Last hour" changed nothing).
   const [range, setRange] = useState("30m");
   const [levels, setLevels] = useState<string[]>([]);
   const [fResource, setFResource] = useState("");
@@ -93,7 +84,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
 
   const levelKey = levels.slice().sort().join(",");
   const offset = page * pageSize;
-  // Deepest offset the server will honour for this page size.
   const maxOffset = Math.max(0, LOGS_LIMIT_MAX - pageSize);
   const nextOffset = (page + 1) * pageSize;
   const canNext = hasMore && nextOffset <= maxOffset;
@@ -121,19 +111,14 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
       setOldestMs(page0.oldestMs);
       setErr(null);
     } catch (e) {
-      // Never a bare `catch {}`: a refusal here is the answer to the user's
-      // query (plan gate, bad range), and swallowing it renders "no logs".
       setErr(e instanceof ApiError ? e : new ApiError(0, String((e as Error)?.message || e)));
     }
   }, [project, q, range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, pageSize, offset]);
 
-  // Wider windows are history reads, not a live tail — polling them every
-  // 1.5 s would re-scan day-files for rows that cannot have changed.
-  const pollMs = range === "30m" || range === "1h" ? 1500 : 5000;
+  const isLiveTailWindow = range === "30m" || range === "1h";
+  const pollMs = isLiveTailWindow ? LIVE_TAIL_POLL_MS : HISTORY_POLL_MS;
 
   useEffect(() => {
-    // Fetch-on-mount + poll: load() sets state only after its internal await
-    // resolves, syncing external (server) log data into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount/poll; state is set only after an internal await, not synchronously
     load();
     if (!live) return;
@@ -141,12 +126,10 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
     return () => clearInterval(id);
   }, [load, live, pollMs]);
 
-  // Changing any filter invalidates the current page offset.
   useEffect(() => {
     setPage(0);
   }, [range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, q, pageSize]);
 
-  // Counts come from the server's derived `level`, not a client-side re-guess.
   const counts = useMemo(() => {
     const c: Record<string, number> = { info: 0, warning: 0, error: 0, fatal: 0 };
     for (const e of events) if (e.level) c[e.level] = (c[e.level] || 0) + 1;
@@ -170,8 +153,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
       if (e.resource) resources.add(e.resource);
       if (e.cache) caches.add(e.cache);
     }
-    // Status classes are always offered: "5xx" is the useful one and no
-    // single row of the current page necessarily contains one.
     for (const cls of ["2xx", "3xx", "4xx", "5xx"]) statuses.add(cls);
     return {
       hosts: [...hosts].sort(),
@@ -188,7 +169,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
 
   return (
     <div>
-      {/* project header */}
       <div className="mb-4 flex items-center gap-3">
         <Triangle />
         <div className="flex items-center gap-2">
@@ -198,7 +178,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
           <span className="text-lg font-semibold">Logs</span>
         </div>
       </div>
-      {/* Project sub-tabs now live in the top nav (breadcrumb-tabs model). */}
 
       {err && (
         <div className={cn("mb-3 rounded-lg border px-3 py-2 text-sm", upgrade ? "border-amber-500/40 bg-amber-500/10 text-amber-600" : "border-red-500/40 bg-red-500/10 text-red-500")}>
@@ -208,7 +187,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
       )}
 
       <div className="grid grid-cols-1 gap-0 overflow-hidden rounded-xl border border-border lg:grid-cols-[220px_1fr]">
-        {/* Filters sidebar */}
         <aside className="border-b border-border bg-subtle/40 p-4 lg:border-b-0 lg:border-r">
           <div className="mb-3 flex items-center justify-between">
             <span className="text-sm font-semibold">Filters</span>
@@ -271,9 +249,7 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
           </div>
         </aside>
 
-        {/* Main */}
         <div className="min-w-0">
-          {/* toolbar */}
           <div className="flex items-center gap-2 border-b border-border p-3">
             <div className="relative flex-1">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
@@ -286,7 +262,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
           </div>
 
           <div className="flex">
-            {/* table */}
             <div className="min-w-0 flex-1 overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -311,9 +286,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
               </table>
               <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-xs text-secondary">
                 <span>
-                  {/* `total` is capped by the server's per-query fetch budget,
-                      so a trailing "+" is the honest reading: it is a lower
-                      bound whenever more rows exist. */}
                   {events.length
                     ? `${offset + 1}–${offset + events.length} of ${total}${hasMore ? "+" : ""}`
                     : `0 of ${total || 0}`}{" "}
@@ -344,7 +316,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
               </div>
             </div>
 
-            {/* detail panel */}
             {sel && (
               <div className="w-80 shrink-0 border-l border-border p-4">
                 <div className="mb-3 flex items-center justify-between">
@@ -374,9 +345,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                 <div className="mt-3 text-xs text-secondary">
                   <div className="mb-1 font-medium text-fg">Deployment Information</div>
                   <Field label="Project" value={project} />
-                  {/* Both are DERIVED from the deployment this request aliased
-                      to — never recorded on the event — so "unknown" is a real
-                      answer, not a placeholder. */}
                   <Field label="Environment" value={sel.env || "unknown"} />
                   <Field label="Resource" value={sel.resource || "unknown"} />
                   {sel.deployment ? <Field label="Deployment" value={sel.deployment} mono /> : null}

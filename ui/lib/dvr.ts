@@ -1,19 +1,9 @@
 "use client";
 
-// Virtual DVR — the recording engine behind the Time-Warner-style deck.
-//
-// The tenant's OWN browser and bandwidth do the work: the same <video> element
-// already playing the stream is captured with captureStream() + MediaRecorder,
-// so no fleet node ever proxies, transcodes or stores the feed mid-flight. The
-// finished recording is uploaded to that project's Drive under `tv/` through
-// the ordinary authenticated Drive API (PUT /v1/drive/:project/file), which
-// means quota, sharing, WebDAV and deletion all work on a recording exactly
-// like any other file the tenant owns.
-//
-// Scheduling is a real DVR's: a recording has a start (now, or a future clock
-// time) and a duration, it survives channel-surfing within the session, and it
-// stops itself on time. It does NOT survive a page close — an honest limit of
-// browser-side capture, stated in the UI rather than papered over.
+// Virtual DVR, the recording engine behind the deck: the tenant's OWN browser does the work (the playing <video> is captured with captureStream() +
+// MediaRecorder, so no fleet node proxies, transcodes or stores the feed) and the finished recording is uploaded to the project's Drive under `tv/` through the
+// ordinary authenticated Drive API, so quota, sharing, WebDAV and deletion work as for any file. A recording has a start (now or a future clock time) and a
+// duration and stops itself on time; it does NOT survive a page close, an honest limit of browser-side capture.
 
 import { apiPutBytes } from "@/lib/api";
 
@@ -36,6 +26,9 @@ export interface DvrRecording {
   error?: string;
 }
 
+const RECORDER_TIMESLICE_MS = 1000;
+const MIN_RECORDING_MS = 1000;
+
 const MIME_CANDIDATES = [
   'video/webm;codecs="vp9,opus"',
   'video/webm;codecs="vp8,opus"',
@@ -49,9 +42,7 @@ export function pickMime(): string | null {
   for (const m of MIME_CANDIDATES) {
     try {
       if (MediaRecorder.isTypeSupported(m)) return m;
-    } catch {
-      /* older browsers throw instead of returning false */
-    }
+    } catch {}
   }
   return null;
 }
@@ -81,12 +72,8 @@ export interface RecordHandle {
   stop: () => void;
 }
 
-/**
- * Capture `video` for `durationMs`, then upload to the project's Drive.
- * `onUpdate` is called on every state/byte change so the deck can render a
- * live progress bar. Returns a handle whose `stop()` ends the recording early
- * (the partial recording is still saved — a real DVR keeps what it got).
- */
+/** Captures `video` for `durationMs`, then uploads to the project's Drive; `onUpdate` fires on every state/byte change for a live progress bar, and the
+ *  returned handle's `stop()` ends the recording early (the partial recording is still saved). */
 export function startRecording(opts: {
   video: HTMLVideoElement;
   rec: DvrRecording;
@@ -98,9 +85,6 @@ export function startRecording(opts: {
     onUpdate({ state: "failed", error: "This browser cannot record video (no MediaRecorder support)." });
     return { stop: () => {} };
   }
-  // captureStream is the whole trick: it taps the DECODED frames of the element
-  // already playing, so the recording follows exactly what the viewer sees and
-  // costs one extra encode — no second fetch of the upstream feed.
   const capture = (video as HTMLVideoElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream });
   const stream = capture.captureStream?.() ?? capture.mozCaptureStream?.();
   if (!stream) {
@@ -144,13 +128,12 @@ export function startRecording(opts: {
     }
   };
 
-  // 1s timeslices so `bytes` ticks up live (and a crash keeps most of it).
-  recorder.start(1000);
+  recorder.start(RECORDER_TIMESLICE_MS);
   onUpdate({ state: "recording", bytes: 0 });
 
   const timer = window.setTimeout(() => {
     if (recorder.state !== "inactive") recorder.stop();
-  }, Math.max(1000, rec.durationMs));
+  }, Math.max(MIN_RECORDING_MS, rec.durationMs));
 
   return {
     stop: () => {

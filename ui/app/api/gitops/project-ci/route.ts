@@ -13,20 +13,11 @@ function parseRepo(input: string): { owner: string; repo: string } | null {
   return null;
 }
 
-/**
- * Install the OpenEdge deploy workflow + the OPENEDGE_WEBHOOK_URL Actions variable
- * into a PROJECT's source repo, so pushes to it auto-trigger build+deploy. Called
- * after a Git import. No-ops gracefully ONLY when GitHub genuinely isn't part of
- * this deployment (not configured / unparseable repo).
- *
- * Body: { repo: string }  // clone URL or "owner/repo"
- *
- * Failure honesty: "GitHub not connected" is a 502 with `reason` preserved (a
- * connected-looking deployment that can't write is a broken integration, never
- * a benign skip), and an install attempt where neither the webhook nor the
- * workflow landed returns 502 with the underlying GitHub errors in `error` —
- * callers persist/show that instead of a bare silent `ok:false`.
- */
+/** Installs the OpenEdge deploy workflow and the OPENEDGE_WEBHOOK_URL Actions variable into a PROJECT's source repo so pushes auto-trigger build + deploy; body
+ *  `{ repo }` (a clone URL or "owner/repo"). A real repo webhook is primary (the node's `/v1/git/webhook` makes a production deploy for the prod branch and a
+ *  preview for every other branch and PR); the Actions workflow (push-to-main only) is installed ONLY when the webhook could not be, never both (it would
+ *  double-fire). A no-op only when GitHub is genuinely not part of this deployment: "not connected" and an install where neither landed are 502s that keep
+ *  the underlying `reason`/`error`, never a silent skip. */
 export async function POST(req: NextRequest) {
   if (!githubConfigured()) return NextResponse.json({ skipped: true, reason: "github-not-configured" });
   const body = await req.json().catch(() => ({} as any));
@@ -46,10 +37,6 @@ export async function POST(req: NextRequest) {
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
   const secret = process.env.GITHUB_WEBHOOK_SECRET || undefined;
 
-  // Primary mechanism: a real repo webhook (push + pull_request) → the node's
-  // /v1/git/webhook, which creates a PRODUCTION deploy for the prod branch and a
-  // PREVIEW deploy for every other branch + PR. Covers all branches + PRs, unlike
-  // the Actions workflow (push-to-main only).
   let webhookInstalled = false;
   let webhookError: string | undefined;
   if (webhookUrl) {
@@ -58,9 +45,6 @@ export async function POST(req: NextRequest) {
     if (!hook.ok) webhookError = hook.error;
   }
 
-  // Fallback ONLY when the real webhook couldn't be installed (e.g. no public URL):
-  // install the Actions workflow (push-to-main) so production deploys still trigger.
-  // We never install both — that would double-fire on push-to-main.
   let workflowInstalled = false;
   let variableSet = false;
   const writeErrors: string[] = webhookError ? [`webhook: ${webhookError}`] : [];
@@ -81,8 +65,6 @@ export async function POST(req: NextRequest) {
   }
 
   if (!webhookInstalled && !workflowInstalled) {
-    // NEITHER write landed — a silent 200 here is how pushes used to stop
-    // deploying with zero visible error. Fail loudly with the real reasons.
     return NextResponse.json(
       {
         ok: false,

@@ -3,17 +3,13 @@ import { PageSkeleton } from "@/components/page-skeleton";
 import { resolveTeam, fetchMetricsSummary, fetchSpeedInsightsSummary } from "@/lib/observability-data";
 import { ObservabilityClient } from "./observability-client";
 
-// Server shell, mirroring app/admin/page.tsx's precedent: renders instantly,
-// while the actual observability data streams in via the Suspense boundary
-// below -- the old pure-client page was "use client" from line 1 with no
-// server prefetch at all, so first paint was always a blank shell until the
-// client's own poll landed.
-//
-// This one additionally needs `searchParams` (Next 16: a Promise) to decide
-// which tab is active BEFORE rendering, so the correct tab's data — and only
-// that tab's — is prefetched. Deciding the tab here (not inside the client
-// component from `window.location`) is also what fixes a real hydration bug:
-// see observability-client.tsx's comment on the old useState initializer.
+const SEEDED_METRICS_MINUTES = 720;
+const SEEDED_SPEED_MINUTES = 10_080;
+const SEEDED_SPEED_DEVICE = "desktop";
+
+// Server shell (mirroring app/admin/page.tsx): it renders at once while the data streams in through the Suspense boundary below, and it decides the active tab
+// from `searchParams` (a Promise in Next 16) BEFORE rendering so only that tab's data is prefetched, seeded with the client's default window; deciding it here
+// rather than from `window.location` inside the client component is also what avoids the hydration mismatch.
 export default async function ObservabilityPage({
   searchParams,
 }: {
@@ -30,23 +26,10 @@ export default async function ObservabilityPage({
 
 async function ObservabilityData({ initialTab }: { initialTab: "overview" | "speed" }) {
   const team = await resolveTeam(null);
-  // DEFAULT_RANGE_MINUTES=720 here MUST match observability-client.tsx's
-  // useState(DEFAULT_RANGE_MINUTES); DEFAULT_SPEED_MINUTES=10_080 + device=
-  // "desktop" here MUST match speed-insights.tsx's useState("Last 7
-  // Days")/useState("Desktop") defaults. A mismatch would not break anything
-  // (usePoll's own tick would just fetch a different window a moment later
-  // and replace the seed) but would defeat the point of seeding — first paint
-  // would show data for a window the UI doesn't claim to be showing.
-  //
-  // Only the ACTIVE tab is prefetched — a deliberate scope decision extending
-  // the existing lazy-loading discipline (next/dynamic already defers each
-  // tab's chart bundle) from code to data: the inactive tab's fleet-fanned-out
-  // query stays deferred until the user actually switches to it, exactly like
-  // its JS chunk already was.
   const [metrics, speed] = await Promise.all([
-    initialTab === "overview" ? fetchMetricsSummary(team, 720).catch(() => null) : Promise.resolve(null),
+    initialTab === "overview" ? fetchMetricsSummary(team, SEEDED_METRICS_MINUTES).catch(() => null) : Promise.resolve(null),
     initialTab === "speed"
-      ? fetchSpeedInsightsSummary(team, 10_080, "desktop").catch(() => null)
+      ? fetchSpeedInsightsSummary(team, SEEDED_SPEED_MINUTES, SEEDED_SPEED_DEVICE).catch(() => null)
       : Promise.resolve(null),
   ]);
   return <ObservabilityClient initialTab={initialTab} initialMetrics={metrics} initialSpeedInsights={speed} />;

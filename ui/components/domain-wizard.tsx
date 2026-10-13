@@ -11,29 +11,16 @@ import {
 } from "@/lib/api";
 import { deploymentHost } from "@/lib/deploy-url";
 
-/**
- * The custom-domain migration wizard — a guided, step-by-step flow for
- * attaching a tenant-owned domain to a project and (optionally) migrating it
- * off another registrar's DNS. The flow is deliberately honest about the
- * three genuinely different moves, which every registrar doc names but
- * users conflate constantly:
- *   A. POINT RECORDS — the domain keeps its current DNS; the user adds
- *      ONE record (ALIAS/ANAME at apex where the provider supports it,
- *      CNAME for subdomains — it follows the deployment, so there are no
- *      edge IP addresses to maintain; per-IP A records only as a fallback)
- *      plus our ownership TXT.
- *   B. DELEGATE DNS — the user changes nameservers to ours; we serve the
- *      zone (record import offered first), manage certs, verify via TXT.
- *   C. TRANSFER REGISTRATION — billing/renewal moves registrars (5–7 days,
- *      60-day ICANN rules). We are not a registrar: this step is guidance,
- *      never a promise we execute it.
- */
+/** The custom-domain wizard: three genuinely different moves that registrar docs name and users conflate. POINT RECORDS (keep the current DNS; one ALIAS/ANAME
+ *  at the apex where supported, else a CNAME for subdomains, plus our ownership TXT), DELEGATE DNS (change nameservers to ours: we serve the zone, manage
+ *  certs and verify via TXT) and TRANSFER REGISTRATION (a registrar move, 5-7 days; guidance only, we are not a registrar). */
 
 type Path = "records" | "delegate" | "transfer";
 type Step = "domain" | "path" | "preflight" | "registrar" | "verify" | "done";
 
 const REGISTRARS = ["Namecheap", "GoDaddy", "Route 53", "Vercel Domains", "Other"] as const;
 type Registrar = (typeof REGISTRARS)[number];
+const REGISTRARS_WITHOUT_APEX_ALIAS: readonly Registrar[] = ["GoDaddy", "Route 53", "Vercel Domains"];
 
 interface ScanRecord { name: string; type: string; value: string; ttl: number; priority: number | null }
 
@@ -98,8 +85,6 @@ export function DomainWizard({
     fetchNsRoster().then(setRoster).catch(() => setRoster(null));
   }, []);
 
-  // The domain detail is only worth fetching during the verify step, so gate
-  // it client-side — no placeholder request ever fires for a junk name.
   const [detail, setDetail] = useState<DomainDetail | null>(null);
   function refreshDetail() {
     if (!clean) return;
@@ -181,11 +166,7 @@ export function DomainWizard({
   const edgeV4 = roster?.edge_ipv4 ?? [];
   const edgeV6 = roster?.edge_ipv6 ?? [];
   const verify = detail?.domain?.verify ?? attach?.verify;
-  // Never print nameserver hostnames until the roster says the set has
-  // converged — anything earlier would be a guess presented as fact.
   const nsReady = roster?.delegation_ready === true && ns.length > 0;
-  // The CNAME target is the project's real deployment host on the apps
-  // domain, resolved per-session — never a hardcoded domain string.
   const cnameTarget = project ? deploymentHost(`${project}.localhost`) : "";
 
   return (
@@ -324,11 +305,7 @@ export function DomainWizard({
                         onCopy={() => copy("ALIAS record", cnameTarget)}
                         copied={copied === "ALIAS record"}
                       />
-                      {/* GoDaddy / Route 53 / Vercel DNS have no apex ALIAS/ANAME we
-                          can point at a platform hostname (Route 53 aliases only target
-                          AWS resources) — for those, delegation or the A-record set is
-                          the honest fallback. */}
-                      {registrar === "GoDaddy" || registrar === "Route 53" || registrar === "Vercel Domains" ? (
+                      {REGISTRARS_WITHOUT_APEX_ALIAS.includes(registrar) ? (
                         <>
                           <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-secondary">
                             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
@@ -463,7 +440,6 @@ export function DomainWizard({
           )}
         </div>
 
-        {/* Footer nav */}
         {step !== "done" && (
           <div className="flex items-center justify-between border-t border-border px-5 py-3">
             <Button

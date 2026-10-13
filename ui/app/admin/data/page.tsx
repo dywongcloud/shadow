@@ -11,10 +11,6 @@ interface RowsResp { collection: string; total: number; matched: number; rows: a
 
 type BrowserView = "documents" | "tables";
 
-// The "Tables (PostgreSQL)" view (its own state/effects/SQL client) is lazy
-// loaded -- most Data Browser visits stay on the default Documents view, so
-// this chunk (and its bundled query/results UI) is only fetched when a user
-// actually switches to it.
 const SqlTablesView = dynamic(() => import("./sql-tables-view"), {
   ssr: false,
   loading: () => <div className="py-10 text-center text-sm text-secondary">Loading…</div>,
@@ -52,22 +48,16 @@ export default function DataBrowserPage() {
   const [newOpen, setNewOpen] = useState(false);
   const [newCollection, setNewCollection] = useState("documents");
   const [newBody, setNewBody] = useState('{\n  "name": "",\n  "value": ""\n}');
-  // Inline cell editing (editable collections only).
   const [editCell, setEditCell] = useState<{ id: string; col: string } | null>(null);
   const [cellDraft, setCellDraft] = useState("");
-  // "Edit mode": all editable fields become inputs at once, saved together.
   const [editMode, setEditMode] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
 
-  // Documents vs. Tables (PostgreSQL) — the Tables view's own state/effects
-  // now live entirely in the lazy-loaded SqlTablesView component.
   const [view, setView] = useState<BrowserView>("documents");
 
   const editable = !!rows?.editable;
   const deletable = editable || DELETABLE_TYPED.has(active);
 
-  // System/metadata fields are never user-editable (the docstore ignores id /
-  // collection / created_ms on patch; tenant + updated_ms are managed too).
   const SYS_FIELDS = new Set(["id", "collection", "tenant", "created_ms", "updated_ms"]);
 
   function isScalar(v: any): boolean {
@@ -97,7 +87,6 @@ export default function DataBrowserPage() {
     setBusy(true);
     setErr("");
     try {
-      // data_patch MERGES, so sending just this field is non-destructive.
       await opsSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(editCell.id)}`, {
         [editCell.col]: coerce(cellDraft),
       });
@@ -124,10 +113,6 @@ export default function DataBrowserPage() {
       .catch(() => setRows({ collection: col, total: 0, matched: 0, rows: [] }))
       .finally(() => setLoading(false));
   }
-  // Local editing state (search query, edit mode, drafts, cell selection)
-  // resets whenever the collection changes -- but that's a response to the
-  // user's OWN table-switch actions (both setActive call sites below), so it
-  // belongs at those event sites, not synced from an effect keyed on `active`.
   useEffect(() => { loadRows(active, ""); }, [active]);
   function switchActive(name: string) {
     setQ("");
@@ -156,7 +141,6 @@ export default function DataBrowserPage() {
   function cancelEdit() { setDrafts({}); setEditMode(false); }
   const draftCount = Object.values(drafts).reduce((n, m) => n + Object.keys(m).length, 0);
 
-  // Derive table columns from the union of keys across rows (scalars first).
   const columns = useMemo(() => {
     const r = rows?.rows ?? [];
     const keys = new Set<string>();
@@ -164,8 +148,6 @@ export default function DataBrowserPage() {
       if (row && typeof row === "object") Object.keys(row).forEach((k) => keys.add(k));
     }
     const all = Array.from(keys);
-    // Identity fields first, then real data fields, then doc metadata last — so
-    // user data (e.g. `value`) is never crowded out by created_ms/tenant/etc.
     const pri = ["id", "name", "project", "slug", "team", "kind", "status", "state"];
     const sys = ["collection", "tenant", "created_ms", "updated_ms"];
     const rank = (k: string) => {
@@ -269,7 +251,6 @@ export default function DataBrowserPage() {
         </div>
       </div>
 
-      {/* Tenant namespaces — the multi-tenant partition of the store. */}
       {view === "documents" && namespaces.length > 0 && (
         <div className="mb-5">
           <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">Tenant namespaces ({namespaces.length})</div>
@@ -288,7 +269,6 @@ export default function DataBrowserPage() {
         <SqlTablesView />
       ) : (
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[220px_1fr]">
-        {/* Collections list */}
         <aside className="flex flex-col gap-1">
           {(meta?.collections ?? []).map((c) => (
             <button
@@ -309,7 +289,6 @@ export default function DataBrowserPage() {
           </button>
         </aside>
 
-        {/* Rows */}
         <div className="min-w-0">
           <form
             onSubmit={(e) => { e.preventDefault(); loadRows(active, q); }}
@@ -377,7 +356,6 @@ export default function DataBrowserPage() {
                     {columns.map((c) => {
                       const isEditing = editable && editCell?.id === row?.id && editCell?.col === c;
                       const canInline = editable && !SYS_FIELDS.has(c) && isScalar(row?.[c]);
-                      // In edit mode, every editable cell is an input bound to drafts.
                       if (editMode && canInline && row?.id) {
                         const cur = drafts[row.id]?.[c];
                         return (
@@ -447,7 +425,6 @@ export default function DataBrowserPage() {
       </div>
       )}
 
-      {/* Row detail / edit drawer */}
       {selected && (
         <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={() => setSelected(null)}>
           <div className="flex h-full w-[560px] max-w-[92vw] flex-col border-l border-border bg-card p-5" onClick={(e) => e.stopPropagation()}>
@@ -482,7 +459,6 @@ export default function DataBrowserPage() {
         </div>
       )}
 
-      {/* Create document modal */}
       {newOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setNewOpen(false)}>
           <div className="w-full max-w-lg rounded-xl border border-border bg-card p-5" onClick={(e) => e.stopPropagation()}>

@@ -25,26 +25,13 @@ interface NetworkPutResp {
 
 const PROTOCOLS = ["http", "tcp", "udp", "grpc"] as const;
 
-/**
- * Network settings for a project: the production HTTP domain plus an EDITABLE
- * exposed-ports list for raw-protocol services (Postgres, Minecraft, gRPC —
- * anything with no Host header to route on). Saving PUTs
- * `/v1/projects/:project/network`, which rewrites the current production
- * deployment's port specs IN PLACE and allocates a public port per raw spec —
- * no redeploy: the raw proxy / UDP relay pick the new binding up from the
- * updated record within seconds. The allocated `host:port` connection
- * addresses render below the editor (same `RawPortConnections` block the
- * deployment-detail page uses).
- */
+/** Network settings for a project: the production HTTP domain plus an EDITABLE exposed-ports list for raw-protocol services (anything with no Host
+ *  header to route on). Saving PUTs `/v1/projects/:project/network`, which rewrites the current production deployment's port specs IN PLACE and
+ *  allocates a public port per raw spec, with no redeploy (the raw proxy / UDP relay pick the binding up within seconds). */
 export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
   const project = decodeURIComponent(params.project);
   const { data: deps } = usePoll<Deployment[]>("/deployments", 5000);
-  // The purchase record (survives across redeploys) — separate from the
-  // deployment-stamped `dedicated_ipv4` below, which only appears once a
-  // deploy AFTER purchase actually attaches the address. Polled so a return
-  // from Stripe checkout (or the webhook completing) reflects here with no
-  // manual refresh.
   const { data: pSettings, refresh: refreshSettings } = usePoll<ProjectSettings>(
     `/v1/projects/${encodeURIComponent(project)}/settings`,
     5000
@@ -56,23 +43,14 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   }, [deps, project]);
 
   const [rows, setRows] = useState<PortRow[]>([]);
-  // Which deployment the rows were seeded from — reseed only when it changes
-  // (or after a save), never on a background poll tick mid-edit.
   const [seededFor, setSeededFor] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
-  // Bindings straight from the save response, so the allocated public port
-  // shows immediately instead of waiting for the next /deployments poll.
   const [savedBindings, setSavedBindings] = useState<RawPortBinding[] | null>(null);
 
   useEffect(() => {
     if (!dep || dep.id === seededFor || dirty) return;
-    // Seed the editor from the stamped raw bindings (the only per-port shape
-    // the deployment list carries). An HTTP-only deployment starts empty.
-    // Subscription-sync: re-seeds local editable state from the polled
-    // `deps` external source, gated on identity + dirty so it never clobbers
-    // an in-progress edit — the legitimate "sync from external system" case.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription-sync from usePoll, gated on identity+dirty to never clobber in-progress edits
     setRows(
       (dep.raw_ports ?? []).map((b) => ({
@@ -88,14 +66,6 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const displayDep = dep ? { ...dep, raw_ports: savedBindings ?? dep.raw_ports } : null;
   const hasRawPorts = !!displayDep?.raw_ports?.length;
 
-  // Dedicated IPv4: two independent signals, deliberately not collapsed into
-  // one. `purchasedIp` is the durable purchase record (ProjectSettings —
-  // survives redeploys); `activeIp` is what's actually stamped onto the
-  // CURRENT deployment (only true once a deploy after purchase attaches it).
-  // Purchased-but-not-yet-attached is a real, honest "Pending" state, never
-  // shown as either "none" or "active".
-  // Can the FLEET actually sell this? A capability the platform cannot perform
-  // must say so before the click, not answer with an HTTP error after it.
   const { data: addons } = usePoll<{
     addons: { sku: string; available: boolean; unavailable_reason: string }[];
   }>("/v1/billing/addons", 60000);
@@ -111,10 +81,6 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
     setIpErr("");
     setIpBusy(true);
     try {
-      // Mirrors billing/page.tsx's checkout() exactly — same endpoint, same
-      // response shape, same applied/url branching (an addon's price is
-      // never zero, but the "applied" case is handled anyway rather than
-      // assumed away).
       const r = await apiSend<{ url: string; mock: boolean; applied?: boolean }>(
         "POST",
         "/v1/billing/checkout",
@@ -160,7 +126,6 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
     try {
       const resp = await apiSend<NetworkPutResp>("PUT", `/v1/projects/${encodeURIComponent(project)}/network`, { ports });
       setSavedBindings(resp.raw_ports ?? []);
-      // Reseed from the server's answer (it carries http rows + stamped ports).
       setRows(
         (resp.ports ?? []).map((s) => ({
           container_port: String(s.container_port),
@@ -285,7 +250,6 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
                       {p}
                     </option>
                   ))}
-                  {/* Preserve a protocol outside the editable set (ws/wss/json-rpc from a config file). */}
                   {!PROTOCOLS.includes(r.protocol as (typeof PROTOCOLS)[number]) && <option value={r.protocol}>{r.protocol}</option>}
                 </select>
                 <input
