@@ -7,11 +7,8 @@ import { MoreHorizontal, ExternalLink, Settings, Trash2, Loader2 } from "lucide-
 import { apiSend } from "@/lib/api";
 import { deploymentUrl } from "@/lib/deploy-url";
 
-/** The "⋯" menu on a project card/row — Visit / Settings / Delete Project.
- *
- *  The menu is rendered in a PORTAL (fixed-positioned at the trigger) so it
- *  overlays everything and is never clipped by an ancestor's `overflow-hidden`
- *  (which is what made it appear inline inside the list row). */
+/** The "⋯" menu on a project card/row (Visit / Settings / Delete Project), portaled and fixed-positioned at the trigger so it overlays everything and an ancestor's
+ *  `overflow-hidden` never clips it. */
 export function ProjectMenu({
   project,
   alias,
@@ -28,8 +25,6 @@ export function ProjectMenu({
   const menuRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
 
-  // Close on outside click (accounting for the portaled menu, which is NOT a DOM
-  // descendant of the trigger).
   useEffect(() => {
     const f = (e: MouseEvent) => {
       const t = e.target as Node;
@@ -40,7 +35,6 @@ export function ProjectMenu({
     return () => document.removeEventListener("mousedown", f);
   }, []);
 
-  // Position the portaled menu under the trigger; keep it pinned on scroll/resize.
   useEffect(() => {
     if (!open) return;
     const place = () => {

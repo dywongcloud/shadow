@@ -10,10 +10,6 @@ import {
 import { loadProjectNames } from "@/lib/projects";
 import { useIsPlatformOwner } from "@/lib/owner";
 
-/* The platform command bar (⌘K / Ctrl-K). Opens from the global shortcut or via
- * the `open-command-bar` window event (dispatched by the Projects search bar).
- * Navigates pages, runs quick actions, and jumps to a project. Theme-aware. */
-
 interface Cmd {
   id: string;
   label: string;
@@ -26,6 +22,7 @@ interface Cmd {
 
 const ic = "h-4 w-4";
 
+/** The platform command bar (⌘K / Ctrl-K), also opened by the `open-command-bar` window event (dispatched by the Projects search bar): navigates pages, runs quick actions and jumps to a project. */
 export function CommandBar() {
   const router = useRouter();
   const isOwner = useIsPlatformOwner();
@@ -37,7 +34,6 @@ export function CommandBar() {
   const listRef = useRef<HTMLDivElement>(null);
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 
-  // Open via ⌘K / Ctrl-K, the projects search bar event, and close via Esc.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -56,7 +52,6 @@ export function CommandBar() {
     };
   }, []);
 
-  // On open: reset, focus, and load projects for jump-to.
   useEffect(() => {
     if (!open) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- resets dialog-local state each time `open` flips true, not derivable at mount since the same component re-opens repeatedly
@@ -91,7 +86,6 @@ export function CommandBar() {
     const actions: Cmd[] = [
       { id: "new", label: "New Project", group: "Actions", hint: "Deploy", icon: <Plus className={ic} />, keywords: "create deploy import", run: go("/new") },
       { id: "docs", label: "Documentation", group: "Actions", icon: <BookOpen className={ic} />, keywords: "docs api guide help", run: go("/docs") },
-      // Ops entry — platform owner only (middleware enforces; this just hides it).
       ...(isOwner
         ? [{ id: "ops", label: "Operations Console", group: "Actions", icon: <ShieldHalf className={ic} />, keywords: "admin ops", run: go("/admin") } as Cmd]
         : []),
@@ -133,7 +127,6 @@ export function CommandBar() {
     else if (e.key === "Enter") { e.preventDefault(); run(filtered[idx]); }
   };
 
-  // Group while preserving order, tracking a flat index for highlight/scroll.
   const groups: { name: string; items: { c: Cmd; i: number }[] }[] = [];
   filtered.forEach((c, i) => {
     let g = groups.find((x) => x.name === c.group);

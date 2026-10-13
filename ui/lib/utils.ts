@@ -5,9 +5,7 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-/** A relative timestamp that already ends in "ago" ("5m ago", "just now") —
- *  callers never append their own "ago" (22 call sites rendered "5m ago ago"
- *  on 2026-10-01). */
+/** A relative timestamp that already ends in "ago" ("5m ago", "just now"): callers never append their own. */
 export function timeAgo(ms: number): string {
   const d = Date.now() - ms;
   if (d < 1000) return "just now";
@@ -16,21 +14,14 @@ export function timeAgo(ms: number): string {
   return `${Math.floor(d / 3_600_000)}h ago`;
 }
 
-/**
- * Copy `text` to the clipboard, resolving `true` on success. The async Clipboard
- * API only works in a SECURE context with permission; when it's unavailable or
- * rejects (some embedded/tunnel contexts, older browsers), fall back to a hidden
- * textarea + `execCommand("copy")` so the button still works instead of silently
- * failing. Never throws — callers branch on the boolean.
- */
+/** Copy `text` to the clipboard, resolving `true` on success. When the async Clipboard API is unavailable or rejects (insecure, embedded or tunnel contexts, older browsers) it
+ *  falls back to a hidden textarea + `execCommand("copy")`. Never throws: callers branch on the boolean. */
 export async function copyText(text: string): Promise<boolean> {
   if (typeof navigator !== "undefined" && navigator.clipboard && window.isSecureContext) {
     try {
       await navigator.clipboard.writeText(text);
       return true;
-    } catch {
-      /* fall through to the execCommand path */
-    }
+    } catch {}
   }
   if (typeof document === "undefined") return false;
   try {

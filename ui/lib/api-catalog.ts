@@ -1,6 +1,5 @@
-// The shadw REST API catalog — the single source of truth for the API Reference
-// docs: the left-sidebar tree, the Endpoints overview grid, and every generated
-// per-method page. Mirrors the real node admin API (see crates/hive-cloud).
+/** The shadw REST API catalog, the single source of truth for the API Reference docs (sidebar tree, Endpoints overview grid and every generated per-method page); it mirrors the
+ *  node admin API (crates/hive-cloud). */
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -536,8 +535,6 @@ export const API_CATEGORIES: ApiCategory[] = [
   },
 ];
 
-// ---- helpers ----
-
 export const METHOD_LABEL: Record<HttpMethod, string> = {
   GET: "GET",
   POST: "POST",
@@ -572,10 +569,8 @@ export function endpointUrl(ep: ApiEndpoint): string {
   return `${API_BASE}${ep.path}`;
 }
 
-/** Generate the TypeScript / Next.js / cURL request snippets for the code panel.
- * Examples authenticate with a platform API key (`hive_…`, created under
- * Settings → API Keys or via POST /v1/apikeys); a short-lived JWT from
- * POST /v1/token works in the same header. */
+/** TypeScript / Next.js / cURL request snippets for the code panel. They authenticate with a platform API key (`hive_…`, Settings → API Keys or POST /v1/apikeys); a short-lived
+ *  JWT from POST /v1/token works in the same header. */
 export function codeExamples(ep: ApiEndpoint): { typescript: string; nextjs: string; curl: string } {
   const url = endpointUrl(ep);
   const hasBody = !!ep.bodyParams?.length;

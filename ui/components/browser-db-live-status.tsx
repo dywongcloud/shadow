@@ -5,17 +5,9 @@ import { ExternalLink, Radio } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
 import { dbLaneStateLabel, type DbLaneStatus, type RunNodeStatus } from "@/lib/run-node-status";
 
-/**
- * bn-storages-page-browser-db-wiring: the SAME db-lane status the /run-node
- * page renders (`dbStatus`, `DbLaneStatus`), relocated to the Storages page
- * context — read-only, exactly like `RunNodeControl`'s navbar precedent
- * (`components/run-node-control.tsx`): this component never starts/stops
- * anything itself, it just attaches to the one per-origin SharedWorker (if
- * this browser is already running one) and shows what it's doing for THIS
- * project. Starting/stopping a node — the consent flow, target picker,
- * geolocation — stays on the dedicated /run-node page; duplicating that flow
- * here would fork the one place it was carefully made hydration-safe.
- */
+/** The same db-lane status the /run-node page renders (`dbStatus`, `DbLaneStatus`), shown read-only on the Storage page for THIS project: it attaches to the per-origin
+ *  SharedWorker when this browser already runs one and never starts or stops a node (the consent flow, target picker and geolocation stay on /run-node, which was made
+ *  hydration-safe once). */
 export function BrowserDbLiveStatus({ project }: { project: string }) {
   const { status, supported } = useRunNode();
   const db = (status as RunNodeStatus & { db?: DbLaneStatus | null }).db ?? null;

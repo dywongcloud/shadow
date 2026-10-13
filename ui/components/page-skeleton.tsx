@@ -1,12 +1,5 @@
-/**
- * Generic responsive route skeleton, rendered by each route's `loading.tsx`
- * during navigation / data-segment loading (Next.js Suspense boundary). It gives
- * an instant, layout-stable placeholder on EVERY device — a title + subtitle bar
- * over a responsive card grid (1 col on phones, 2 on tablets, 3 on desktop) — so
- * route transitions never show a blank frame on mobile. Purely presentational
- * (aria-hidden, no data), and sized to roughly the real content box so swapping
- * the page in causes minimal layout shift.
- */
+/** Generic responsive route skeleton for each route's `loading.tsx`: a title and subtitle bar over a card grid (1/2/3 columns on phone/tablet/desktop), aria-hidden and sized
+ *  to the real content box so swapping the page in shifts the layout as little as possible. */
 export function PageSkeleton() {
   return (
     <div className="animate-pulse space-y-6" aria-hidden="true">

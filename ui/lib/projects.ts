@@ -1,11 +1,5 @@
 "use client";
 
-// One project list for every surface that used to derive projects from
-// `/deployments` alone: that view omits a project whose builds never produced
-// a deployment (a failed first build), so the project was invisible while its
-// name stayed reserved. The backend's inventory view lists every row the
-// tenant owns; this hook merges the two, deployment first.
-
 import { useCallback, useMemo } from "react";
 import { apiGet, usePoll, type Deployment } from "@/lib/api";
 
@@ -52,9 +46,8 @@ export interface ProjectEntry {
 
 export const SUMMARY_PATH = "/v1/gitops/projects?view=summary";
 
-/** Deployment-first merge: a summary row only adds a project the deployment
- *  list does not already show, and never while the backend counts a
- *  deployment this poll happened to miss (the two reads are independent). */
+/** Deployment-first merge: a summary row only adds a project the deployment list does not already show, and never while the backend counts a deployment this poll happened to
+ *  miss (the two reads are independent). */
 export function mergeProjects(deps: Deployment[] | null, rows: ProjectSummary[] | null): ProjectEntry[] {
   const byProject = new Map<string, ProjectEntry>();
   for (const d of deps ?? []) {
@@ -98,10 +91,11 @@ export async function loadProjectNames(): Promise<string[]> {
   return mergeProjects(deployments, rows).map((p) => p.project);
 }
 
+/** The one project list for every surface: `/deployments` alone omits a project whose builds never produced a deployment (a failed first build), which then stayed invisible while its
+ *  name stayed reserved, so this merges it with the backend's inventory view (every row the tenant owns), deployment first. The summary poll is independent of the deployment poll: an
+ *  older backend answers 404 and the dashboard keeps working on deployments alone. */
 export function useProjects(intervalMs = 15000) {
   const deployments = usePoll<Deployment[]>("/deployments", intervalMs);
-  // Independent of the deployment list: an older backend answers 404 here and
-  // the dashboard keeps working on deployments alone.
   const summary = usePoll<ProjectSummary[]>(SUMMARY_PATH, intervalMs);
   const projects = useMemo(
     () => mergeProjects(deployments.data, summary.error ? null : summary.data),
