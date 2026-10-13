@@ -1,20 +1,17 @@
-//! **Seer (Plane A, client→node): the platform's authoritative DNS.** Answers queries
-//! over UDP **and** TCP. Two kinds of answer:
-//!   * **Static** records from the dashboard-managed `dns::DomainStore` (A, AAAA,
-//!     CNAME, TXT) — apex, `www`, custom domains, CAA/TXT.
-//!   * **Dynamic, health-aware** A/AAAA for the deploy wildcard zone `HIVE_DEPLOY_ZONE`
-//!     (e.g. `*.deploy.shadw.app`): returns the **public IPs of healthy nodes** so a
-//!     browser connects straight to a reachable node — the piece that replaces ngrok as
-//!     ingress. NAT'd / unhealthy nodes are excluded (a client must only get a node it
-//!     can actually reach over HTTPS). It's a **local read** of the gossiped registry —
-//!     no per-query network/DHT lookup (discovery stays off the hot path).
+//! **Seer (Plane A, client to node): the platform's authoritative DNS**, over UDP **and** TCP. It
+//! answers static records from the dashboard-managed `dns::DomainStore` (A, AAAA, CNAME, TXT; apex,
+//! `www`, custom domains, CAA/TXT) and **dynamic, health-aware** A/AAAA for the deploy wildcard
+//! zone `HIVE_DEPLOY_ZONE` (e.g. `*.deploy.shadw.app`): the **public IPs of healthy nodes**, so a
+//! browser connects straight to a reachable node (the piece that replaced ngrok as ingress). NAT'd
+//! or unhealthy nodes are excluded (a client must only get a node it can reach over HTTPS); it is a
+//! **local read** of the gossiped registry, with no per-query network/DHT lookup (discovery stays
+//! off the hot path).
 //!
-//! NOTE: distinct from `discovery.rs` (Plane B, node↔node pkarr relay for iroh daemons).
-//! Different protocol, consumer, job — the names once collided; keep them apart.
-//!
-//! Binds a non-privileged port by default (`HIVE_DNS_ADDR`, default 127.0.0.1:5354) so
-//! it runs without root; set `HIVE_DNS_ADDR=0.0.0.0:53` in prod and delegate the zone's
-//! NS here. Focused wire-format impl — no heavy dependency.
+//! Distinct from `discovery.rs` (Plane B, node-to-node pkarr relay for iroh daemons): different
+//! protocol, consumer and job; the names once collided, keep them apart. Binds a non-privileged
+//! port by default (`HIVE_DNS_ADDR`, 127.0.0.1:5354) so it runs without root; set
+//! `HIVE_DNS_ADDR=0.0.0.0:53` in prod and delegate the zone's NS here. A focused wire-format
+//! implementation, no heavy dependency.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,14 +22,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use crate::state::CloudState;
 use hive_edge::NodeInfo;
 
-/// The deploy wildcard zone whose A/AAAA are answered dynamically (healthy node IPs).
-/// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadw.app` → `deploy.shadw.app` + `*.deploy.shadw.app`.
-/// Cached: a per-query env read would be a syscall on the hot path. Lowercased, dot-trimmed.
-/// Live Seer query counters — geo-DNS is otherwise invisible: without these
-/// there is no way to tell a working proximity path from a silently generic
-/// one except by hand-digging from several vantages. Surfaced by
-/// `GET /v1/dns/stats` alongside the GeoCache's own hit/pending/unlocatable
-/// counts.
+/// Live Seer query counters: geo-DNS is otherwise invisible, with no way to tell a working
+/// proximity path from a silently generic one except by hand-digging from several vantages.
+/// Surfaced by `GET /v1/dns/stats` beside the GeoCache's own hit/pending/unlocatable counts.
 pub struct DnsStats {
     pub queries: AtomicU64,
     pub queries_a: AtomicU64,
@@ -90,11 +82,10 @@ fn serve_apps_zone() -> bool {
         .unwrap_or(false)
 }
 
-/// The node currently serving `label` in the apps zone, if any — local aliases
-/// first (authoritative for what THIS node serves), then the gossiped peer
-/// route table with the lowest-latency healthy route winning. Same ownership
-/// rule the DNS reconciler's affinity records already encode, so the two paths
-/// cannot disagree about who owns a host.
+/// The node currently serving `label` in the apps zone, if any: local aliases first (authoritative
+/// for what THIS node serves), then the gossiped peer route table with the lowest-latency healthy
+/// route winning. The same ownership rule the DNS reconciler's affinity records encode, so the two
+/// paths cannot disagree about who owns a host.
 fn apps_host_owner(cloud: &Arc<CloudState>, label: &str) -> Option<String> {
     if label.is_empty() {
         return None;
@@ -154,6 +145,9 @@ fn node_addr_rrs(n: &NodeInfo, qtype: u16) -> Vec<(u16, u32, Vec<u8>)> {
     out
 }
 
+/// The deploy wildcard zone whose A/AAAA are answered dynamically (healthy node IPs):
+/// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadw.app` serves `deploy.shadw.app` and `*.deploy.shadw.app`.
+/// Cached (a per-query env read would be a syscall on the hot path), lowercased and dot-trimmed.
 pub(crate) fn deploy_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
     Z.get_or_init(|| {
@@ -165,12 +159,11 @@ pub(crate) fn deploy_zone() -> Option<&'static str> {
     .as_deref()
 }
 
-/// The platform API zone (`api.{platform_domain}`) — served health-aware and
-/// proximity-ordered exactly like the deploy zone, replacing the static
-/// round-robin A set the Vercel reconciler used to publish for `api`. Derived
-/// from `HIVE_PLATFORM_DOMAIN` (no extra env: serving a zone nobody has
-/// delegated yet is harmless, and the delegation side is gated separately on
-/// the gossiped `dns_api` capability).
+/// The platform API zone (`api.{platform_domain}`), served health-aware and proximity-ordered like
+/// the deploy zone, replacing the static round-robin A set the Vercel reconciler used to publish
+/// for `api`. Derived from `HIVE_PLATFORM_DOMAIN` (no extra env: serving a zone nobody has
+/// delegated yet is harmless, and the delegation side is gated separately on the gossiped `dns_api`
+/// capability).
 pub(crate) fn api_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
     Z.get_or_init(|| {
@@ -187,10 +180,11 @@ pub(crate) fn api_zone() -> Option<&'static str> {
 /// from resolver caches quickly when it's dropped from the registry.
 const DEPLOY_TTL: u32 = 60;
 
+/// Serves UDP and, best effort, TCP on the same address: resolvers retry over TCP on truncation and
+/// some validators always do, so a real authoritative server answers both (a failed TCP bind leaves
+/// UDP serving, the hot path).
 pub async fn serve(cloud: Arc<CloudState>, addr: SocketAddr) -> std::io::Result<()> {
     let sock = UdpSocket::bind(addr).await?;
-    // TCP on the same addr: resolvers retry over TCP (truncation, some validators always
-    // do); a real authoritative server must answer both. Best-effort — UDP is the hot path.
     match TcpListener::bind(addr).await {
         Ok(tcp) => {
             let c = cloud.clone();
@@ -220,7 +214,6 @@ async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
         };
         let cloud = cloud.clone();
         tokio::spawn(async move {
-            // One query per accept is sufficient for our resolvers; keep it simple.
             let mut len = [0u8; 2];
             if stream.read_exact(&mut len).await.is_err() {
                 return;
@@ -244,23 +237,30 @@ async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
 }
 
 /// Parse a DNS query and build a response from the platform's records.
+///
+/// The OPT RR is echoed only when the client sent one (RFC 6891: never add EDNS to a response the
+/// requester did not opt into), with SCOPE PREFIX-LENGTH the asker's prefix when the answer really
+/// is client-specific, else 0 so a resolver may share the generic answer. Flags are QR=1, AA=1, RD
+/// echoed, RA=0, with rcode NOERROR or NXDOMAIN. A malformed OPT yields a generic answer and never
+/// rejects the query (an unfamiliar resolver must not become an outage). AUTHORITY records are
+/// owned by the zone APEX, so they encode their owner explicitly instead of riding the
+/// question-name compression pointer. A compressed name in the question is unsupported (rare).
 fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Option<Vec<u8>> {
     if q.len() < 12 {
         return None;
     }
     let id = [q[0], q[1]];
-    let rd = q[2] & 0x01; // recursion-desired bit, echoed back
+    let rd = q[2] & 0x01;
     let qdcount = u16::from_be_bytes([q[4], q[5]]);
     if qdcount < 1 {
         return None;
     }
     let counts = (
-        u16::from_be_bytes([q[6], q[7]]),   // ANCOUNT
-        u16::from_be_bytes([q[8], q[9]]),   // NSCOUNT
-        u16::from_be_bytes([q[10], q[11]]), // ARCOUNT
+        u16::from_be_bytes([q[6], q[7]]),
+        u16::from_be_bytes([q[8], q[9]]),
+        u16::from_be_bytes([q[10], q[11]]),
     );
 
-    // ---- parse the (first) question ----
     let mut off = 12usize;
     let mut labels = Vec::new();
     loop {
@@ -273,7 +273,7 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
             break;
         }
         if len & 0xC0 != 0 {
-            return None; // compression in question — unsupported (rare)
+            return None;
         }
         off += 1;
         if off + len > q.len() {
@@ -287,19 +287,15 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     }
     let qname = labels.join(".");
     let qtype = u16::from_be_bytes([q[off], q[off + 1]]);
-    let q_end = off + 4; // include qtype(2)+qclass(2)
+    let q_end = off + 4;
     let question = &q[12..q_end];
 
-    // ---- who is asking (EDNS Client Subnet, else the query source) ----
-    // A malformed OPT yields `None` and a generic answer; it never rejects the
-    // query, since an unfamiliar resolver must not become an outage.
     let asker = crate::dns_geo::Asker {
         source: src,
         subnet: crate::dns_geo::parse_client_subnet(q, q_end, counts),
     };
     let client_had_ecs = asker.subnet.is_some();
 
-    // ---- look up matching records ----
     let (answers, authority, found_domain, proximity) = lookup(cloud, &qname, qtype, &asker);
 
     DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
@@ -325,11 +321,6 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
         }
     }
 
-    // ---- build response ----
-    // The OPT RR is echoed only when the client sent one (RFC 6891: never add
-    // EDNS to a response the requester didn't opt into). SCOPE PREFIX-LENGTH is
-    // the asker's prefix when the answer really is client-specific, else 0 so a
-    // resolver may share the generic answer with everyone behind it.
     let opt_rr = client_had_ecs.then(|| {
         crate::dns_geo::encode_opt_rr(
             asker.subnet,
@@ -340,66 +331,88 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
 
     let mut resp = Vec::with_capacity(64);
     resp.extend_from_slice(&id);
-    // flags: QR=1, AA=1, RD echoed, RA=0; rcode 0 (NOERROR) or 3 (NXDOMAIN)
     let rcode: u8 = if !found_domain { 3 } else { 0 };
     let flags: u16 = 0x8000 | 0x0400 | ((rd as u16) << 8) | rcode as u16;
     resp.extend_from_slice(&flags.to_be_bytes());
-    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    resp.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
-    resp.extend_from_slice(&(authority.len() as u16).to_be_bytes()); // NSCOUNT
-    resp.extend_from_slice(&arcount.to_be_bytes()); // ARCOUNT (the OPT RR, if any)
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&(authority.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&arcount.to_be_bytes());
     resp.extend_from_slice(question);
     for (atype, ttl, rdata) in &answers {
-        resp.extend_from_slice(&[0xC0, 0x0C]); // NAME → pointer to question (offset 12)
+        resp.extend_from_slice(&[0xC0, 0x0C]);
         resp.extend_from_slice(&atype.to_be_bytes());
-        resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        resp.extend_from_slice(&1u16.to_be_bytes());
         resp.extend_from_slice(&ttl.to_be_bytes());
         resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         resp.extend_from_slice(rdata);
     }
-    // AUTHORITY section (RFC 2308 negative caching): the owner is the ZONE
-    // APEX, not the qname — a compression pointer to the question would name
-    // the wrong owner, so the name is encoded explicitly.
     for (owner, atype, ttl, rdata) in &authority {
         resp.extend_from_slice(&encode_name(owner));
         resp.extend_from_slice(&atype.to_be_bytes());
-        resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        resp.extend_from_slice(&1u16.to_be_bytes());
         resp.extend_from_slice(&ttl.to_be_bytes());
         resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         resp.extend_from_slice(rdata);
     }
-    // ADDITIONAL section last, so the OPT RR follows the answers.
     if let Some(rr) = opt_rr {
         resp.extend_from_slice(&rr);
     }
-    // UDP amplification guard: never emit a datagram past the practical DNS
-    // payload — a tenant-programmed record set (an uncapped TXT, a huge RR
-    // set at one name) must not turn every fleet node into a reflector for
-    // spoofed-source queries (adversarial finding). TC=1 is the standards
-    // answer: the resolver retries over TCP, which this server also runs.
+    /// UDP amplification guard: never emit a datagram past the practical DNS payload. A
+    /// tenant-programmed record set (an uncapped TXT, a huge RRset at one name) must not turn every
+    /// fleet node into a reflector for spoofed-source queries; TC=1 is the standards answer, and
+    /// the resolver retries over TCP, which this server also runs.
     const MAX_UDP_RESPONSE: usize = 1232;
     if resp.len() > MAX_UDP_RESPONSE {
         let mut t = Vec::with_capacity(64);
         t.extend_from_slice(&id);
         let tflags: u16 = 0x8000 | 0x0400 | 0x0200 | ((rd as u16) << 8) | rcode as u16;
         t.extend_from_slice(&tflags.to_be_bytes());
-        t.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-        t.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
-        t.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-        t.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        t.extend_from_slice(&1u16.to_be_bytes());
+        t.extend_from_slice(&0u16.to_be_bytes());
+        t.extend_from_slice(&0u16.to_be_bytes());
+        t.extend_from_slice(&0u16.to_be_bytes());
         t.extend_from_slice(question);
         return Some(t);
     }
     Some(resp)
 }
 
-/// Returns (answer RRs, AUTHORITY RRs, whether the zone/domain is
-/// authoritative here, whether the answer was tailored to THIS client's
-/// location). The AUTHORITY slot carries `(owner name, type, ttl, rdata)` —
-/// unlike answers it cannot ride the question-name compression pointer,
-/// because a NODATA answer's SOA is owned by the zone APEX, not the qname
-/// (RFC 2308). The last value decides the ECS scope the caller echoes: a
-/// tailored answer must not be cached for clients it wasn't computed for.
+/// Returns (answer RRs, AUTHORITY RRs, whether the zone/domain is authoritative here, whether the
+/// answer was tailored to THIS client's location). The AUTHORITY slot carries `(owner name, type,
+/// ttl, rdata)`: unlike answers it cannot ride the question-name compression pointer, because a
+/// NODATA answer's SOA is owned by the zone APEX, not the qname (RFC 2308). The last value decides
+/// the ECS scope the caller echoes: a tailored answer must not be cached for clients it was not
+/// computed for.
+///
+/// Zones are tried in order. Each served zone is authoritative for the WHOLE zone (NOERROR, never
+/// NXDOMAIN): TXT for `_acme-challenge.*` comes from the replicated challenge store (the leader's
+/// acme.rs writes it and Let's Encrypt may ask ANY advertised nameserver) and everything else is
+/// NODATA with the zone's SOA in AUTHORITY, without which a resolver cannot negative-cache and
+/// every miss returns to us for its full lifetime (RFC 2308).
+///
+/// - The deploy zone (`HIVE_DEPLOY_ZONE`): AFFINITY first (a label the fleet can attribute to the
+/// node hosting it resolves to that node, so the client never pays a cross-node forward), computed
+/// per query from the route table and never published as a record (the Vercel-hosted apps zone
+/// needed one API-created record per label), then the proximity-ordered healthy set. The zone's own
+/// apex NS/SOA are answered AT the apex only: a delegation serving neither is half-configured
+/// (without the SOA nonexistent names return forever, and validators flag a child missing the NS
+/// RRset its parent publishes).
+/// - The API zone (`api.{platform}`): the same health-before-proximity set, replacing the flat
+/// Vercel round-robin where an unhealthy node stayed in the answer for the record's full TTL. The
+/// parent-side NS delegation is published only with at least two `dns_api`-capable nameservers
+/// (`vercel_dns::desired_api_delegation`), so until then this branch answers queries nobody routes
+/// here; its ACME TXT path keeps the `api.{platform}` SAN renewable once the NS moves to Seer.
+/// - The apps zone (`HIVE_APPS_DOMAIN`), opt-in via `HIVE_DNS_SERVE_APPS` (meaningful only once
+/// delegated here): a host attributable to a node resolves to THAT node (anywhere else just buys a
+/// cross-node forward), and the wildcard case gets the proximity-ordered healthy set.
+/// - Tenant zones (`dns::DomainStore`): longest-suffix zone match; apex NS/SOA at the child;
+/// platform-managed names answered from the platform's own stores and never from zone records,
+/// which keeps the proof channel unforgeable (`_acme-challenge` from the LE store, `_hive-verify`
+/// from the attachment's challenge, served only while PENDING so yesterday's proof is not
+/// replayable); wildcards per RFC 1034/4592 (`*` synthesizes only for names that do not otherwise
+/// exist, never the apex, and an exact or platform-reserved name shadows it); a CNAME answers an
+/// A/AAAA query; an empty answer carries the zone's SOA.
 #[allow(clippy::type_complexity)]
 fn lookup(
     cloud: &Arc<CloudState>,
@@ -412,25 +425,10 @@ fn lookup(
     bool,
     bool,
 ) {
-    // ---- Plane A: dynamic, health-aware deploy zone (the Seer load balancer) ----
-    // For any name in HIVE_DEPLOY_ZONE (apex or wildcard subdomain), A/AAAA resolve to
-    // the public IPs of healthy nodes — bypassing static records entirely. We're
-    // authoritative for the whole zone (NOERROR, never NXDOMAIN); ACME DNS-01 TXT is
-    // answered from the replicated challenge store, everything else is no-data.
     if let Some(zone) = deploy_zone() {
         if qname == zone || qname.ends_with(&format!(".{zone}")) {
             match qtype {
                 1 | 28 => {
-                    // Affinity FIRST, exactly as the apps zone below: a label
-                    // this fleet can attribute to the node that actually
-                    // hosts it resolves to that node, so the client never pays
-                    // a cross-node forward. This is what lets every preview
-                    // and deployment label live under the fleet's own
-                    // nameservers at any scale -- the answer is computed per
-                    // query from the route table, never published as a
-                    // record anywhere (the Vercel-hosted apps zone needed one
-                    // API-created A record per label: 578 of them on
-                    // 2026-10-01, listed six pages per 30 s pass).
                     let nodes = cloud.registry.nodes();
                     if qname != zone {
                         let label = qname
@@ -449,30 +447,12 @@ fn lookup(
                             }
                         }
                     }
-                    // Resolve the asker's location HERE (never blocking: an
-                    // unknown subnet is queued for background lookup and
-                    // reported unknown for now), then let `lb_records` stay pure.
                     let client = cloud.dns_geo.locate(asker.locate_addr());
                     let (rrs, tailored) = lb_records(&nodes, qtype, client);
                     return (rrs, Vec::new(), true, tailored);
                 }
-                // The zone's OWN apex records. An authoritative server that
-                // serves neither its SOA nor its NS is a half-configured
-                // delegation: without the SOA a resolver cannot negative-cache
-                // (RFC 2308), so every query for a nonexistent name under the
-                // zone returns to us forever — a real amplification surface on
-                // a public nameserver — and a child whose NS RRset is missing
-                // while the parent publishes one is flagged by validators.
-                // Only answered AT the apex; a subdomain keeps the no-data
-                // behavior below.
                 2 if qname == zone => return (apex_ns_rrs(cloud, false), Vec::new(), true, false),
                 6 if qname == zone => return (apex_soa_rrs(cloud, false), Vec::new(), true, false),
-                // ACME DNS-01: TXT for `_acme-challenge.*` comes from the
-                // replicated challenge store (the leader's acme.rs writes it;
-                // Let's Encrypt may ask ANY advertised nameserver). Unknown or
-                // expired names keep the authoritative no-data answer, now
-                // with the negative-caching SOA. CAA remains on the
-                // fall-through (forward-compat).
                 16 if qname.starts_with("_acme-challenge.") => {
                     let rrs = acme_txt_rrs(cloud, qname);
                     let auth = if rrs.is_empty() {
@@ -482,24 +462,11 @@ fn lookup(
                     };
                     return (rrs, auth, true, false);
                 }
-                // Authoritative NODATA — with the zone's SOA in AUTHORITY so
-                // resolvers can negative-cache (RFC 2308); without it every
-                // miss returns to us for its full lifetime.
                 _ => return (Vec::new(), negative_soa(cloud, zone, false), true, false),
             }
         }
     }
 
-    // ---- Plane A: the platform API zone (`api.{platform}`) ----
-    // Same health-before-proximity answer set as the deploy zone: the API host
-    // was a flat Vercel round-robin over the whole fleet, so a client in
-    // Bangkok was as likely to land on Virginia as on its own region and an
-    // unhealthy node stayed in the answer for the record's full TTL. Serving
-    // it here gives health-damped, ECS/geo-tailored answers with the same
-    // ordering rule; the parent-side NS delegation for `api` is published only
-    // when >=2 `dns_api`-capable nameservers exist (see
-    // `vercel_dns::desired_api_delegation`), so until then this branch simply
-    // answers queries nobody routes here — witnessable, zero live effect.
     if let Some(zone) = api_zone() {
         if qname == zone || qname.ends_with(&format!(".{zone}")) {
             match qtype {
@@ -510,9 +477,6 @@ fn lookup(
                 }
                 2 if qname == zone => return (apex_ns_rrs(cloud, true), Vec::new(), true, false),
                 6 if qname == zone => return (apex_soa_rrs(cloud, true), Vec::new(), true, false),
-                // Same ACME DNS-01 TXT path as the deploy zone above — this is
-                // what keeps the platform bundle's `api.{platform}` SAN
-                // renewable once the zone's NS moves off Vercel onto Seer.
                 16 if qname.starts_with("_acme-challenge.") => {
                     let rrs = acme_txt_rrs(cloud, qname);
                     let auth = if rrs.is_empty() {
@@ -522,25 +486,11 @@ fn lookup(
                     };
                     return (rrs, auth, true, false);
                 }
-                // NODATA with the negative-caching SOA, as in the deploy zone.
                 _ => return (Vec::new(), negative_soa(cloud, zone, true), true, false),
             }
         }
     }
 
-    // ---- Plane A, apps zone: affinity FIRST, then proximity ----
-    // The customer-facing zone (`HIVE_APPS_DOMAIN`) is answered here with the
-    // same two-tier rule the Vercel-published records encode, so this server is
-    // a drop-in authority for it: a host we can attribute to a specific node
-    // (the deployment actually runs there) resolves to THAT node — sending the
-    // client anywhere else just buys a cross-node forward, which proximity
-    // cannot make up for — and everything else (the wildcard case) gets the
-    // proximity-ordered healthy set instead of Vercel's flat all-nodes list.
-    //
-    // Serving is opt-in via `HIVE_DNS_SERVE_APPS`, because turning it on is
-    // only meaningful once the zone is actually delegated here; until then the
-    // capability is real and directly witnessable by querying this server, with
-    // zero effect on the live Vercel-served path.
     if serve_apps_zone() {
         let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
         if !apps.is_empty() && (qname == apps || qname.ends_with(&format!(".{apps}"))) {
@@ -566,8 +516,6 @@ fn lookup(
                     let (rrs, tailored) = lb_records(&nodes, qtype, client);
                     return (rrs, Vec::new(), true, tailored);
                 }
-                // Same ACME DNS-01 TXT path as the delegated zones above, for
-                // when the apps zone itself is delegated here.
                 16 if qname.starts_with("_acme-challenge.") => {
                     return (acme_txt_rrs(cloud, qname), Vec::new(), true, false)
                 }
@@ -577,7 +525,6 @@ fn lookup(
     }
 
     let domains = cloud.domains.snapshot();
-    // Longest-suffix match → the authoritative zone for this query.
     let Some(zone) = domains
         .into_iter()
         .filter(|d| qname == d.domain || qname.ends_with(&format!(".{}", d.domain)))
@@ -586,7 +533,6 @@ fn lookup(
         return (Vec::new(), Vec::new(), false, false);
     };
 
-    // The record name within the zone ("" = apex).
     let rec_name = if qname == zone.domain {
         String::new()
     } else {
@@ -595,8 +541,6 @@ fn lookup(
             .to_string()
     };
 
-    // Apex authority answers first: a delegated tenant zone is only real if
-    // its NS/SOA exist at the child (validators and resolvers both look).
     if rec_name.is_empty() && qtype == 2 {
         let rrs = apex_ns_rrs(cloud, false);
         return (rrs, Vec::new(), true, false);
@@ -620,21 +564,10 @@ fn lookup(
     };
 
     let mut out = Vec::new();
-    // Platform-managed names are answered from the platform's own stores,
-    // never from zone records (the reservation that makes the proof channel
-    // unforgeable): `_acme-challenge` from the LE challenge store, and
-    // `_hive-verify` from the attachment's own verification challenge — so a
-    // tenant who delegates DNS FIRST can still complete ownership proof
-    // without hand-creating anything (path B of the wizard).
     if want == "TXT" && rec_name.eq_ignore_ascii_case("_acme-challenge") {
         out.extend(acme_txt_rrs(cloud, qname));
     }
     if want == "TXT" && rec_name.eq_ignore_ascii_case("_hive-verify") {
-        // Served only while the challenge is PENDING: once verification
-        // completes, the proof value must stop being publicly answerable —
-        // otherwise yesterday's proof is replayable by anyone who can reach
-        // an activation path (adversarial finding), and a detached domain's
-        // stale challenge keeps matching forever.
         if let Some(v) = &zone.verify {
             if v.status == "pending" {
                 if let Some(rd) = encode_rdata("TXT", &v.txt_value) {
@@ -643,12 +576,6 @@ fn lookup(
             }
         }
     }
-    // Wildcard semantics (RFC 1034/4592): `*` synthesizes answers ONLY for
-    // names that do not otherwise exist — an exact-name record, or a
-    // platform-reserved name answered from platform stores above, shadows the
-    // wildcard. The old unconditional `|| r.name == "*"` let one `*` record
-    // answer EVERY name in the zone alongside (and contrary to) the exact
-    // records, and it also matched the apex, which a wildcard never covers.
     let exact_exists = zone
         .records
         .iter()
@@ -661,7 +588,6 @@ fn lookup(
         if !name_match {
             continue;
         }
-        // For an A/AAAA query, a CNAME is a valid (and conventional) answer.
         let kind = r.kind.to_uppercase();
         let serve_as_cname = matches!(qtype, 1 | 28) && kind == "CNAME";
         if kind != want && !serve_as_cname {
@@ -683,46 +609,35 @@ fn lookup(
             out.push((atype, r.ttl, rd));
         }
     }
-    // An authoritative empty answer MUST carry the zone's SOA in AUTHORITY
-    // (RFC 2308) or resolvers can never negative-cache — every miss under the
-    // zone would come back to us for its full lifetime.
     if out.is_empty() {
         return (out, negative_soa(cloud, &zone.domain, false), true, false);
     }
     (out, Vec::new(), true, false)
 }
 
-/// Build the dynamic A (qtype 1) or AAAA (qtype 28) answer set for the deploy zone:
-/// the public IP of every node that is **both** `healthy` **and** has a public IP of the
-/// requested family. NAT'd (no public IP) and unhealthy nodes are excluded — a browser
-/// must only ever receive a node it can actually reach over HTTPS. Ordered lowest-latency
-/// first (self = 0) for a sensible default; resolvers round-robin the set. Capped so the
-/// answer comfortably fits a 512-byte UDP datagram.
-/// `client` is the asker's location when already known — resolved by the CALLER
-/// so this stays a pure function of (registry, qtype, client location) and can be
-/// exercised directly without a `CloudState`.
+/// Builds the dynamic A (qtype 1) or AAAA (qtype 28) answer set: the public IP of every node that
+/// is both `healthy` and has a public IP of the requested family (NAT'd and unhealthy nodes are
+/// excluded: a browser must only receive a node it can reach over HTTPS). Both filters run BEFORE
+/// proximity ordering, because proximity truncates to the nearest N: a nearby node with no public
+/// address would consume a slot and vanish when the answer is built, an EMPTY response for exactly
+/// the clients closest to it (seen: a San Jose client got 0 answers because its two nearest nodes
+/// were NAT'd Macs with coordinates but no public IP). Ordering by the SERVING node's own latency
+/// (self = 0) is only the fallback for an unknown client location, since that number describes us,
+/// not the client; resolvers round-robin the set, which is capped to fit a 512-byte datagram.
+///
+/// `client` is resolved by the CALLER (never blocking: an unknown subnet is queued for a background
+/// lookup), so this stays a pure function of (registry, qtype, client location) and can be
+/// exercised without a `CloudState`. The answer counts as `tailored` only if proximity shaped it
+/// AND survived the address-family filter: an empty set is not client-specific.
 fn lb_records(
     nodes: &[NodeInfo],
     qtype: u16,
     client: Option<(f64, f64)>,
 ) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
-    // Serveable = healthy AND actually reachable in the requested address
-    // family. Both filters must run BEFORE proximity ordering, not after:
-    // proximity truncates to the nearest N, so a nearby node with no public
-    // address consumes a slot and then vanishes when the answer is built,
-    // yielding an EMPTY response — a total outage for exactly the clients
-    // closest to it. Live-witnessed: a San-Jose-area client got 0 answers
-    // (tcpdump on the server showed the query arriving and a 0/0/0 reply)
-    // because the two nearest nodes were NAT'd Macs carrying real
-    // coordinates but no public IP, while distant clients were served
-    // normally.
     let mut healthy: Vec<&NodeInfo> = nodes
         .iter()
         .filter(|n| n.healthy && node_addr_rrs(n, qtype).len() == 1)
         .collect();
-    // Health-ordered by the SERVING node's own latency is the fallback, not the
-    // goal: that number describes us, not the client. It only decides the order
-    // when the client's location is unknown.
     healthy.sort_by_key(|n| n.latency_ms);
     let mut tailored = false;
     if let Some(near) = crate::dns_geo::nearest_first(&healthy, client) {
@@ -758,20 +673,17 @@ fn lb_records(
         }
     }
     out.truncate(8);
-    // `tailored` only holds if proximity actually shaped the answer AND survived
-    // the address-family filter above — an empty set is not client-specific.
     let tailored = tailored && !out.is_empty();
     (out, tailored)
 }
 
-/// TTL for ACME DNS-01 TXT answers — mirrors the 60s TTL acme.rs asks Vercel
-/// for on the same records, and short like `DEPLOY_TTL` so a finished
-/// challenge drains from resolver caches quickly.
+/// TTL for ACME DNS-01 TXT answers: mirrors the 60 s acme.rs asks Vercel for on the same records,
+/// short like `DEPLOY_TTL` so a finished challenge drains from resolver caches quickly.
 const ACME_TXT_TTL: u32 = 60;
 
-/// TXT answer RRs for a `_acme-challenge.*` qname in a Seer-answered zone,
-/// straight from the replicated challenge store. Reuses the static-record TXT
-/// encoder — one wire encoding, never two.
+/// TXT answer RRs for a `_acme-challenge.*` qname in a Seer-answered zone, straight from the
+/// replicated challenge store, through the static-record TXT encoder (one wire encoding, never
+/// two).
 fn acme_txt_rrs(cloud: &Arc<CloudState>, qname: &str) -> Vec<(u16, u32, Vec<u8>)> {
     cloud
         .acme_challenges
@@ -785,11 +697,13 @@ fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
     encode_rdata_typed(kind, value, None)
 }
 
-/// Typed record-data encoder for the static (tenant-zone) arm. MX/SRV carry
-/// their numeric fields from the record's `priority` (SRV additionally parses
-/// `<weight> <port> <target>` from the value — the one shape the record model
-/// holds); CAA parses `<flags> <tag> "<value>"`; anything unparseable is
-/// skipped, never encoded wrong.
+/// Typed record-data encoder for the static (tenant-zone) arm: MX/SRV take their numeric fields
+/// from the record's `priority` (SRV also parses `<weight> <port> <target>` from the value, the one
+/// shape the record model holds); CAA parses `<flags> <tag> "<value>"` (quotes optional); anything
+/// unparseable is skipped, never encoded wrong. TXT RDATA is one or more `<length><bytes>`
+/// character-strings of at most 255 bytes (RFC 1035): long values (DKIM keys) split into
+/// consecutive strings that resolvers re-concatenate and are never dropped (they once silently
+/// vanished from the zone); an empty value is one zero-length string.
 fn encode_rdata_typed(kind: &str, value: &str, priority: Option<u32>) -> Option<Vec<u8>> {
     match kind {
         "A" => value
@@ -802,12 +716,6 @@ fn encode_rdata_typed(kind: &str, value: &str, priority: Option<u32>) -> Option<
             .map(|ip| ip.octets().to_vec()),
         "CNAME" | "NS" | "PTR" => Some(encode_name(value)),
         "TXT" => {
-            // RFC 1035: TXT RDATA is one or more <length><bytes>
-            // character-strings, each at most 255 bytes. Long values (DKIM
-            // keys are the common one) MUST split into consecutive strings —
-            // resolvers re-concatenate them — never be dropped (the old
-            // behavior, which made any >255-byte TXT silently vanish from
-            // the zone). An empty value is one zero-length string.
             let bytes = value.as_bytes();
             let mut v = Vec::with_capacity(bytes.len() + bytes.len() / 255 + 1);
             for chunk in bytes.chunks(255) {
@@ -836,7 +744,6 @@ fn encode_rdata_typed(kind: &str, value: &str, priority: Option<u32>) -> Option<
             Some(v)
         }
         "CAA" => {
-            // Stored shape: `<flags> <tag> "<value>"` (quotes optional).
             let mut it = value.splitn(3, char::is_whitespace);
             let flags = it.next()?.parse::<u8>().ok()?;
             let tag = it.next()?;
@@ -853,24 +760,20 @@ fn encode_rdata_typed(kind: &str, value: &str, priority: Option<u32>) -> Option<
     }
 }
 
-/// TTL for the zone's own apex records. Longer than the health-driven address
-/// TTL: the NS/SOA set changes only when the nameserver roster does, and a
-/// short TTL here just multiplies apex queries.
+/// TTL for the zone's own apex records: longer than the health-driven address TTL, since the NS/SOA
+/// set changes only when the nameserver roster does and a short TTL just multiplies apex queries.
 const APEX_TTL: u32 = 300;
 
-/// Negative-cache TTL published in the SOA MINIMUM field — how long a resolver
-/// may remember "this name does not exist" (RFC 2308). Deliberately modest so
-/// a freshly-created deployment name is not shadowed by a stale negative.
+/// Negative-cache TTL published in the SOA MINIMUM: how long a resolver may remember that a name
+/// does not exist (RFC 2308), modest so a freshly created deployment name is not shadowed by a
+/// stale negative.
 const NEGATIVE_TTL: u32 = 60;
 
-/// The nameserver hostnames this zone is served by, derived from the SAME
-/// eligible-node rule the DNS reconciler uses to publish NS at the parent, so
-/// parent and child cannot disagree about the zone's NS RRset.
-///
-/// `require_api`: the API zone's NS set additionally demands the gossiped
-/// `dns_api` capability — an older binary's Seer answers the deploy zone fine
-/// but would NXDOMAIN `api.{platform}`, so it must never be named there. The
-/// reconciler's `desired_api_delegation` applies the identical filter.
+/// The nameserver hostnames this zone is served by, from the SAME eligible-node rule the DNS
+/// reconciler uses to publish NS at the parent, so parent and child cannot disagree about the
+/// zone's NS RRset. `require_api`: the API zone's NS set also demands the gossiped `dns_api`
+/// capability (an older binary's Seer answers the deploy zone but would NXDOMAIN `api.{platform}`,
+/// so it must never be named there); `desired_api_delegation` applies the identical filter.
 fn apex_ns_names(cloud: &Arc<CloudState>, require_api: bool) -> Vec<String> {
     let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
     let mut names: Vec<String> = cloud
@@ -901,19 +804,17 @@ fn apex_ns_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec
         .collect()
 }
 
-/// The healthy+public address record set the apps/deploy answers are built
-/// from (`lb_records`' own filter), shared so the tenant-facing roster
-/// endpoint returns byte-identical guidance to what the wire would answer
-/// for the wildcard — never a separate computation of "the same set".
+/// The healthy+public address record set the apps/deploy answers are built from (`lb_records`' own
+/// filter), shared so the tenant-facing roster endpoint returns byte-identical guidance to what the
+/// wire would answer for the wildcard, never a separate computation of the same set.
 pub fn lb_records_pub(nodes: &[NodeInfo], qtype: u16) -> (Vec<Vec<u8>>, bool) {
     let (rrs, capped) = lb_records(nodes, qtype, None);
     (rrs.into_iter().map(|(_, _, rd)| rd).collect(), capped)
 }
 
-/// The same healthy edge set as display strings (dotted-quad / compressed
-/// v6), decoded straight from `lb_records_pub`'s wire rdata so the delegated
-/// zone's system records and the roster endpoint can never render a
-/// different set than the dynamic arm answers.
+/// The same healthy edge set as display strings (dotted-quad / compressed v6), decoded from
+/// `lb_records_pub`'s wire rdata so the delegated zone's system records and the roster endpoint can
+/// never render a different set than the dynamic arm answers.
 pub fn lb_records_strings(nodes: &[NodeInfo], qtype: u16) -> Vec<String> {
     let (rrs, _) = lb_records_pub(nodes, qtype);
     rrs.iter()
@@ -929,10 +830,9 @@ pub fn lb_records_strings(nodes: &[NodeInfo], qtype: u16) -> Vec<String> {
         .collect()
 }
 
-/// The zone's SOA. MNAME is the lexically-first nameserver (stable across
-/// nodes, so every server in the zone reports the same primary); SERIAL is
-/// derived from the node roster so it advances when the zone's own NS set
-/// really changes rather than on every restart.
+/// The zone's SOA: MNAME is the lexically-first nameserver (stable across nodes, so every server
+/// reports the same primary), and SERIAL derives from the node roster, advancing when the zone's
+/// own NS set really changes rather than on every restart.
 fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec<u8>)> {
     let names = apex_ns_names(cloud, require_api);
     let Some(primary) = names.first() else {
@@ -951,14 +851,12 @@ fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Ve
     vec![(6u16, APEX_TTL, rdata)]
 }
 
-/// AUTHORITY-section SOA for an authoritative empty (NODATA) answer, per RFC
-/// 2308 — without it a resolver cannot negative-cache and every miss under
-/// the zone comes back to us for its full lifetime. Owner = the zone apex
-/// (why the AUTHORITY slot carries an explicit name). The record's TTL is
-/// published as the negative-cache TTL directly: RFC 2308 §5 defines the
-/// negTTL as min(SOA's own TTL, its MINIMUM field), and `NEGATIVE_TTL` is
-/// already the smaller. Empty when no eligible nameserver exists (same
-/// degenerate roster state in which the apex SOA itself is unanswerable).
+/// AUTHORITY-section SOA for an authoritative empty (NODATA) answer (RFC 2308): without it a
+/// resolver cannot negative-cache and every miss returns to us for its full lifetime. Owner = the
+/// zone apex (why the AUTHORITY slot carries an explicit name). The record's TTL is published as
+/// the negative-cache TTL directly: RFC 2308 §5 defines negTTL as min(SOA's own TTL, its MINIMUM),
+/// and `NEGATIVE_TTL` is already the smaller. Empty when no eligible nameserver exists (the
+/// degenerate roster state in which the apex SOA is unanswerable too).
 fn negative_soa(
     cloud: &Arc<CloudState>,
     zone: &str,

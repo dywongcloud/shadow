@@ -1,73 +1,39 @@
-//! Public-port allocation for raw TCP/UDP/gRPC deployments.
+//! Public-port allocation for raw TCP/UDP/gRPC deployments. HTTP-family services ride the shared
+//! 80/443 gateway (Host routing); a service speaking a raw protocol (Postgres wire, Minecraft,
+//! gRPC) has no Host header, so each needs its OWN public port, and this module owns that port
+//! space. The LISTENER on an allocated port is `crate::raw_proxy`'s job: this is pure allocation
+//! and persistence.
 //!
-//! HTTP-family services are reached through the shared 80/443 gateway (Host
-//! routing); before this module the ONLY raw public ports the platform bound
-//! were the two hardcoded DB-gateway listeners (`db_gateway.rs`, :5432/:6379).
-//! A deployment speaking a raw protocol (Postgres wire, Minecraft, gRPC) has no
-//! Host header to route on — each such service needs its OWN public port a
-//! client can connect to. This module owns that port space:
+//! - **Range**: `HIVE_RAW_PORT_RANGE` (default `20000-29999`), reserved for the platform on every
+//! node (the firewall/lockdown scripts open it); a port something else DOES hold is skipped by a
+//! bind probe before claiming.
+//! - **Unit**: one public port per raw-protocol [`PortSpec`] a deployment declares
+//! (`FunctionConfig::ports`), so a multi-port service gets one per spec. An EMPTY `ports` list gets
+//! nothing even when the protocol is raw: an un-exposed compose sidecar (private Postgres)
+//! deliberately has no spec (`build_compose_manifest`'s `x-shadw-expose` opt-in), while
+//! single-container paths always bridge their real port into `ports`
+//! (`PortSpec::from_legacy_port`).
+//! - **Stable across redeploys**: the claim is keyed by (project, function, container_port,
+//! protocol), NOT deployment id, so a redeploy is re-stamped with the SAME public port.
+//! - **Race safety, FLEET-wide**: the port space is fleet-global (every node binds every
+//! allocation), so a node-local claim is not enough: two first-deploys on DIFFERENT nodes could
+//! both claim the same low port for two tenants. The claim DECISION is therefore
+//! leader-coordinated: [`allocate_raw_ports_coordinated`] claims locally only on the control-plane
+//! leader, otherwise forwards the manifest over the mesh (`POST /v1/raw-ports/allocate`) and adopts
+//! the leader's answer as a read cache, the same single-writer pattern as `admin_ingress`, billing
+//! metering and ACME/DNS. [`allocate_raw_ports`] is the primitive FOR the leader (see `claim_local`
+//! for its atomicity); the stamped [`PortSpec::public_port`] on the deployment record is a second
+//! durable copy that [`adopt_record`] re-adopts at boot, so a lost registry file self-heals.
+//! - **Permanent retirement**: [`release_raw_ports`] removes a project's live claim but QUARANTINES
+//! every former number forever (a stale entry node can retain old routes, and re-granting the
+//! number to another tenant would turn them into a cross-tenant splice), leader-coordinated through
+//! [`release_raw_ports_coordinated`]. Relocation does NOT retire the stable project claim: it uses
+//! the scoped `/reap-deployments` arm.
 //!
-//! * **Range** — `HIVE_RAW_PORT_RANGE` (default `20000-29999`). The range
-//!   should be reserved for the platform on every node (firewall/lockdown
-//!   scripts open it, nothing else binds inside it); a port that something
-//!   else DOES hold is defensively skipped by a bind probe before claiming.
-//! * **Unit of allocation** — one public port per raw-protocol [`PortSpec`] a
-//!   deployment declares (`FunctionConfig::ports`), so a multi-port service
-//!   (Minecraft game+rcon+query) gets one public port per spec. A function
-//!   with an EMPTY `ports` list gets nothing even when its own protocol is
-//!   raw: an un-exposed compose sidecar (private Postgres) deliberately has no
-//!   spec (see `build_compose_manifest`'s `x-shadw-expose` opt-in), while the
-//!   single-container paths always bridge their real port into `ports`
-//!   (`container_manifest` via `PortSpec::from_legacy_port`).
-//! * **Stability across redeploys** — the claim is keyed by (project,
-//!   function, container_port, protocol), NOT by deployment id, so a redeploy
-//!   (a NEW deployment record of the same project/service) is re-stamped with
-//!   the SAME public port — mirroring how the redeploy path already preserves
-//!   the port/protocol spec itself (`image_port_spec_for_project_fleet`).
-//! * **Race safety, FLEET-wide** — the mutex below only makes ONE node's
-//!   claims atomic against itself; the port space is fleet-global (every
-//!   node binds every allocation, `raw_proxy`/`udp_relay`), so a node-local
-//!   claim alone is not enough — two parallel first-deploys landing on
-//!   DIFFERENT nodes both scanning from an empty local registry could both
-//!   claim the same low port for two different tenants. The actual claim
-//!   DECISION is therefore leader-coordinated: [`allocate_raw_ports_coordinated`]
-//!   (the deploy-time entry point every call site uses) runs the claim
-//!   locally only when this node IS the control-plane leader
-//!   (`CloudState::is_control_plane_leader`); otherwise it forwards the
-//!   manifest to the leader over the mesh (`POST /v1/raw-ports/allocate`,
-//!   `gossip::dispatch`) and adopts the leader's answer into this node's
-//!   registry as a read cache. This mirrors the SAME single-writer-forward
-//!   pattern `admin_ingress` already uses for admin mutations, billing
-//!   metering and ACME/DNS — one designated writer, every other node a
-//!   cache. The single-node local claim path ([`allocate_raw_ports`]) stays
-//!   the correct primitive FOR the leader (and for the RPC handler that runs
-//!   on it): every new claim in a batch is inserted under ONE lock hold and
-//!   durably saved before any port escapes (no check-then-allocate TOCTOU
-//!   window on that one writer), and a node restart restores every claim.
-//!   The stamped [`PortSpec::public_port`] on the deployment record is a
-//!   second durable copy — boot restore re-adopts those stamps
-//!   ([`adopt_record`]) so a lost registry file self-heals from the records.
-//! * **Permanent retirement** — [`release_raw_ports`] removes a project's live
-//!   claim but QUARANTINES every former number forever. Entry nodes can retain
-//!   stale deployment/routes across missed cascades and restarts; re-granting
-//!   such a number to another tenant would turn that stale route into a
-//!   cross-tenant splice. Retirement is therefore leader-coordinated through
-//!   [`release_raw_ports_coordinated`] (the wire path keeps its historical
-//!   `/release` name for rolling compatibility). A non-leader retires its local
-//!   cache first, then forwards the same operation to the authoritative leader.
-//!   Relocation does NOT retire the stable project claim: it uses the separate
-//!   scoped `/reap-deployments` arm, which removes only superseded production
-//!   records and preserves ProjectSettings, resources, and raw-port bindings.
-//!
-//! The LISTENER on an allocated port is the generic raw proxy's job
-//! (`crate::raw_proxy`), not this module's — this is pure allocation/
-//! persistence. Consumers: [`allocate_raw_ports`] (deploy time),
-//! [`release_raw_ports`] (deletion), [`lookup`] (the proxy layer's
-//! most-authoritative port→allocation source); the fleet-wide read side is
-//! the stamped bindings themselves, surfaced as
-//! `fluid_core::DeploymentInfo::raw_ports` via
-//! `fluid_core::Manifest::raw_port_bindings` and gossiped with the
-//! deployment list.
+//! Consumers: [`allocate_raw_ports`] (deploy), [`release_raw_ports`] (deletion) and [`lookup`] (the
+//! proxy layer's most-authoritative port-to-allocation source); the fleet-wide read side is the
+//! stamped bindings themselves (`fluid_core::DeploymentInfo::raw_ports` via
+//! `Manifest::raw_port_bindings`), gossiped with the deployment list.
 
 use fluid_core::Manifest;
 use fluid_core::ServiceProtocol;
@@ -82,9 +48,8 @@ use crate::state::CloudState;
 /// 30000+ NodePort-style space, and the ephemeral range on most kernels.
 const DEFAULT_RANGE: (u16, u16) = (20_000, 29_999);
 
-/// One durable public-port claim. `protocol` serializes as its kebab-case wire
-/// string ("tcp"/"udp"/"grpc") — same lenient-on-read semantics as everywhere
-/// else the enum is stored.
+/// One durable public-port claim; `protocol` serializes as its kebab-case wire string
+/// ("tcp"/"udp"/"grpc"), with the lenient-on-read semantics of everywhere the enum is stored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawPortAllocation {
     pub project: String,
@@ -116,18 +81,18 @@ struct Registry {
     /// Every public port currently claimed OR quarantined — the O(log n)
     /// membership set the claim scan checks.
     in_use: BTreeSet<u16>,
-    /// Durable non-reuse set. A deleted or migrated binding moves here before
-    /// its key disappears, so a stale node can never route this number for one
-    /// tenant after the leader has granted it to another.
+    /// Durable non-reuse set: a deleted or migrated binding moves here before its key disappears,
+    /// so a stale node can never route this number for one tenant after the leader granted it to
+    /// another.
     quarantined: BTreeSet<u16>,
     /// Rotating scan offset into the range so successive claims don't all
     /// re-probe from the bottom.
     cursor: u32,
 }
 
-/// The stable claim identity: same key ⇒ same public port, across redeploys.
-/// `\u{1f}` (ASCII unit separator) cannot appear in project/function names, so
-/// the key is collision-free without escaping.
+/// The stable claim identity: same key means same public port across redeploys. `\u{1f}` (ASCII
+/// unit separator) cannot appear in project/function names, so the key is collision-free without
+/// escaping.
 fn alloc_key(
     project: &str,
     function: &str,
@@ -144,9 +109,10 @@ fn file_path() -> PathBuf {
     crate::persist::data_dir().join("raw_ports.json")
 }
 
-/// The configured public range (inclusive), from `HIVE_RAW_PORT_RANGE`
-/// ("lo-hi"), defaulting to 20000-29999. A malformed value warns and defaults
-/// rather than silently disabling raw ingress.
+/// The configured public range (inclusive) from `HIVE_RAW_PORT_RANGE` ("lo-hi"), default
+/// 20000-29999. A malformed value, or one that reaches port 0 ("kernel picks") or the privileged
+/// 1-1023, is not a sane raw-ingress range: it warns and defaults rather than silently disabling
+/// raw ingress.
 fn port_range() -> (u16, u16) {
     match std::env::var("HIVE_RAW_PORT_RANGE") {
         Ok(raw) if !raw.trim().is_empty() => parse_range(&raw).unwrap_or_else(|| {
@@ -166,8 +132,6 @@ fn parse_range(s: &str) -> Option<(u16, u16)> {
     let (a, b) = s.trim().split_once('-')?;
     let lo: u16 = a.trim().parse().ok()?;
     let hi: u16 = b.trim().parse().ok()?;
-    // Port 0 is "kernel picks" and 1-1023 are privileged/well-known — neither
-    // is a sane raw-ingress range; reject so the default kicks in loudly.
     if lo < 1024 || hi < lo {
         return None;
     }
@@ -176,6 +140,11 @@ fn parse_range(s: &str) -> Option<(u16, u16)> {
 
 /// The process-wide registry, loaded from disk exactly once. All mutation goes
 /// through this single mutex — that lock IS the atomic-claim mechanism.
+///
+/// A (corrupt) duplicate or quarantined port never loads as a live claim (the first durable state
+/// wins and the rejected record re-allocates on its next deploy); an unreadable file starts empty,
+/// since the stamped deployment records re-adopt their claims at restore (`adopt_record`) and
+/// established services keep their ports.
 fn registry() -> &'static Mutex<Registry> {
     static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
     REG.get_or_init(|| {
@@ -189,9 +158,6 @@ fn registry() -> &'static Mutex<Registry> {
                     in_use.extend(quarantined.iter().copied());
                     for a in f.allocs {
                         let key = alloc_key(&a.project, &a.function, a.container_port, a.protocol);
-                        // A (corrupt) duplicate or quarantined port must never
-                        // load as a live claim — first durable state wins, the
-                        // rejected record re-allocates on its next deploy.
                         if in_use.insert(a.public_port) {
                             by_key.insert(key, a);
                         } else {
@@ -200,13 +166,10 @@ fn registry() -> &'static Mutex<Registry> {
                     }
                 }
                 Err(e) => {
-                    // Unreadable file ⇒ start empty; the stamped deployment
-                    // records re-adopt their claims at restore (`adopt_record`),
-                    // so established services keep their ports.
                     tracing::warn!(error = %e, "raw-port registry unreadable; starting empty (deployment-record stamps re-adopt at restore)");
                 }
             },
-            Err(_) => {} // no file yet — first boot
+            Err(_) => {}
         }
         Mutex::new(Registry {
             by_key,
@@ -217,17 +180,14 @@ fn registry() -> &'static Mutex<Registry> {
     })
 }
 
+/// Locks the registry, recovering from poison: a panic mid-claim leaves the plain map + set never
+/// half-updated (claims roll back on error), and wedging every future deploy would be worse.
 fn lock() -> MutexGuard<'static, Registry> {
-    // A poisoned lock only means another thread panicked mid-claim; the data
-    // is a plain map + set that is never left half-updated across an unwind
-    // point we control (claims roll back on error) — recover rather than
-    // wedging every future deploy.
     registry().lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Durably write the registry (temp + fsync + rename, mirroring
-/// `persist::save`'s discipline). Called while the claim lock is held so the
-/// on-disk set can never lag behind a port that has already escaped.
+/// Durably writes the registry (temp + fsync + rename, mirroring `persist::save`). Called while the
+/// claim lock is held, so the on-disk set can never lag behind a port that has already escaped.
 fn save(reg: &Registry) -> std::io::Result<()> {
     let dir = crate::persist::data_dir();
     std::fs::create_dir_all(&dir)?;
@@ -248,34 +208,43 @@ fn save(reg: &Registry) -> std::io::Result<()> {
     std::fs::rename(&tmp, file_path())
 }
 
-/// Public ports the platform itself (or the host OS) owns on fleet nodes — a
-/// tenant's publish request may never take one, no matter what their compose
-/// file says. Everything below 1024 is refused wholesale: 22/53/80/443 live
-/// there, binding them needs root everywhere, and hijacking a well-known port
-/// is never what a tenant legitimately wants from `ports:`.
+/// Fixed public ports the platform or the host OS owns on fleet nodes, with the owner of each.
+const RESERVED_PORTS: &[(u16, &str)] = &[
+    (3000, "hive-ui dashboard"),
+    (3340, "embedded iroh relay (plaintext captive-portal + tls)"),
+    (3343, "embedded iroh relay (plaintext captive-portal + tls)"),
+    (3350, "discovery DNS (pkarr relay)"),
+    (5432, "db-gateway Postgres listener"),
+    (6379, "db-gateway Redis listener"),
+    (8786, "node admin / gateway HTTP"),
+    (8787, "node admin / gateway HTTP"),
+    (50052, "llama.cpp rpc-server (GPU pooling)"),
+    (9090, "relay metrics (hive-lockdown LOCKED_PORTS)"),
+];
+
+/// Reserved public port ranges, with the owner of each.
+const RESERVED_PORT_RANGES: &[(std::ops::RangeInclusive<u16>, &str)] = &[
+    (7799..=7804, "hive-rt-node workers (no-auth, 0.0.0.0)"),
+    (50_100..=50_999, "managed-inference llama-server range"),
+];
+
+/// Public ports the platform itself (or the host OS) owns on fleet nodes: a tenant's publish
+/// request may never take one, whatever their compose file says. Everything below 1024 is refused
+/// wholesale (22/53/80/443 live there, binding them needs root, and hijacking a well-known port is
+/// never what a tenant legitimately wants from `ports:`).
 fn reserved_public_port(p: u16) -> bool {
     p < 1024
-        || matches!(
-            p,
-            3000            // hive-ui dashboard
-            | 3340 | 3343   // embedded iroh relay (plaintext captive-portal + tls)
-            | 3350          // discovery DNS (pkarr relay)
-            | 5432 | 6379   // db-gateway Postgres/Redis listeners
-            | 8786 | 8787   // node admin / gateway HTTP
-            | 50052         // llama.cpp rpc-server (GPU pooling)
-            | 9090          // relay metrics (hive-lockdown LOCKED_PORTS)
-        )
-        || (7799..=7804).contains(&p) // hive-rt-node workers (no-auth, 0.0.0.0)
-        || (50_100..=50_999).contains(&p) // managed-inference llama-server range
+        || RESERVED_PORTS.iter().any(|(port, _)| *port == p)
+        || RESERVED_PORT_RANGES
+            .iter()
+            .any(|(range, _)| range.contains(&p))
 }
 
-/// Defensive probe: can THIS node still bind the candidate on both families?
-/// The range is supposed to be reserved, but anything squatting a port
-/// (leftover process, manual admin binding) must be skipped rather than handed
-/// to a deployment whose proxy listener would then fail. Probing both TCP and
-/// UDP keeps the claim protocol-agnostic (the same port number is claimed for
-/// whichever family the spec speaks; the pool is one shared number space).
-/// The probe sockets drop immediately — the real listener is the raw proxy's.
+/// Defensive probe: can THIS node still bind the candidate on both TCP and UDP? The range is meant
+/// to be reserved, but anything squatting a port (a leftover process, a manual binding) must be
+/// skipped rather than handed to a deployment whose proxy listener would then fail. Probing both
+/// families keeps the claim protocol-agnostic (one shared number space); the probe sockets drop at
+/// once, the real listener is the raw proxy's.
 fn probe_bindable(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
         && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok()
@@ -304,14 +273,16 @@ fn next_free(reg: &mut Registry) -> anyhow::Result<u16> {
     )
 }
 
-/// (function idx, port idx) of every spec in `manifest` that needs public raw
-/// ingress, in manifest order. Pure and deterministic over `manifest`'s
-/// content alone — the SAME computation run independently on the calling
-/// node (to know whether an RPC is even needed) and on the control-plane
-/// leader (inside the RPC handler) always agrees on target count and order,
-/// which is what lets [`allocate_raw_ports_coordinated`] line up the
-/// leader's per-target response against its own `manifest` without shipping
-/// the whole mutated manifest back over the wire.
+/// (function idx, port idx) of every spec in `manifest` that needs public raw ingress, in manifest
+/// order. Pure and deterministic over the manifest's content alone, so the calling node (to know
+/// whether an RPC is needed) and the leader (inside the RPC handler) always agree on target count
+/// and order, which lets [`allocate_raw_ports_coordinated`] line up the leader's per-target
+/// response against its own manifest without shipping the mutated manifest back. A compose PUBLISH
+/// request (`preferred_public_port`) makes even an Http-protocol spec a raw target (a published
+/// port is reachable on the host and the raw proxy serves it as a plain-TCP passthrough); the
+/// purity holds only when both sides run a binary with that field: a pre-upgrade leader computes
+/// fewer targets and the caller's response-length check fails the allocation LOUDLY (never a silent
+/// partial grant), and the deploy retries once the leader is upgraded.
 fn raw_targets(manifest: &Manifest) -> Vec<(usize, usize)> {
     manifest
         .functions
@@ -322,17 +293,6 @@ fn raw_targets(manifest: &Manifest) -> Vec<(usize, usize)> {
                 .iter()
                 .enumerate()
                 .filter(|(_, spec)| {
-                    // A compose PUBLISH request (`ports: ["9000:9000"]` →
-                    // `preferred_public_port`) makes even an Http-protocol spec
-                    // a raw target: docker-compose's own semantics are that a
-                    // published port is reachable on the host, and the raw
-                    // proxy serves it as a plain-TCP passthrough. Purity note
-                    // (see fn doc): this predicate reads only the manifest, so
-                    // caller and leader still agree — but ONLY when both run a
-                    // binary that has this field. A pre-upgrade leader computes
-                    // fewer targets and the caller's response-length check
-                    // fails the allocation LOUDLY (never a silent partial
-                    // grant); the deploy retries once the leader is upgraded.
                     spec.protocol.needs_raw_proxy() || spec.preferred_public_port.is_some()
                 })
                 .map(move |(pi, _)| (fi, pi))
@@ -341,19 +301,33 @@ fn raw_targets(manifest: &Manifest) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Claim/reuse a public port for every `targets` entry against THIS node's
-/// LOCAL registry, durably saved before returning. Only correct to call on a
-/// node acting as the allocation's single writer (the control-plane leader,
-/// via [`allocate_raw_ports_coordinated`], or the RPC handler running on it)
-/// — calling this on a non-leader races that peer's own local registry
-/// against every OTHER node doing the same, which is exactly the fleet-global
-/// race [`allocate_raw_ports_coordinated`] exists to prevent.
+/// Claims/reuses a public port for every `targets` entry against THIS node's LOCAL registry,
+/// durably saved before returning. Only correct on the allocation's single writer (the leader, via
+/// [`allocate_raw_ports_coordinated`], or the RPC handler on it): on a non-leader it races that
+/// node's own registry against every other's, the fleet-global race the coordinated path prevents.
 ///
-/// Atomic per call: every new claim in the batch is inserted under ONE lock
-/// hold and durably saved before any port escapes; if the range exhausts or
-/// the save fails mid-batch, every claim made by THIS call is rolled back and
-/// an error is returned — no partial multi-port deployment, no unclaimed port
-/// ever handed out.
+/// Atomic per call: every new claim is inserted under ONE lock hold and durably saved before any
+/// port escapes (a claim not on disk could be re-handed to a parallel deploy after a crash); if the
+/// range exhausts or the save fails mid-batch, every claim of THIS call is rolled back LIFO,
+/// restoring any allocation a migration displaced and un-retiring its number, so memory never
+/// diverges from what a reload of the still-current file would produce.
+///
+/// A compose publish request names its exact public port (`ports: ["9000:9000"]`): claimable only
+/// if not platform-reserved, not granted to someone else and still bindable here (the caller logs
+/// grant vs preference in the BUILD LOG, so a fallback is never silent). `in_use` is checked before
+/// the bind probe (probing a port our OWN proxy listens on fails and would wrongly reject a
+/// re-grant), and the probe runs EXACTLY ONCE per target before the branch decision (probing in a
+/// match guard and again in the arm let the OS change the answer between them). A redeploy keeps
+/// the SAME public port without a probe (its own live listener holds it) unless the author CHANGED
+/// the published host port to a claimable number (the compose file is the source of truth).
+///
+/// A migration QUARANTINES the old number instead of freeing it: every node adopted the old claim
+/// into its read cache and nothing invalidates those, so re-granting it to a DIFFERENT tenant would
+/// route that tenant's public port to the OLD project on stale entry nodes (a cross-tenant misroute
+/// surviving reboots). The number stays in `in_use` ownerless, persisted in the same atomic file as
+/// the replacement claim (held only in `in_use` it lost the quarantine on restart): one number out
+/// of a 10k range per migration, the safe direction. Consequence: a port SWAP (A:9000 to 9001 while
+/// B:9001 to 9000) cannot converge, and a migration back to a quarantined number is refused.
 fn claim_local(
     project: &str,
     manifest: &Manifest,
@@ -361,23 +335,12 @@ fn claim_local(
 ) -> anyhow::Result<Vec<RawPortAllocation>> {
     let mut allocs: Vec<RawPortAllocation> = Vec::with_capacity(targets.len());
     let mut reg = lock();
-    // Claims inserted by THIS call — the rollback set on any failure. The third
-    // slot carries the allocation a preference-change MIGRATION displaced, so a
-    // failed batch restores the old grant instead of losing it: the durable
-    // file still holds the old allocation until `save` succeeds, and the
-    // in-memory map must never diverge from what a reload would produce.
     let mut newly: Vec<(String, u16, Option<RawPortAllocation>)> = Vec::new();
     let rollback = |reg: &mut Registry, newly: &[(String, u16, Option<RawPortAllocation>)]| {
-        // LIFO: undo in reverse claim order so a later claim that (somehow)
-        // interacted with an earlier migration's ports is unwound before the
-        // earlier state is restored.
         for (k, p, displaced) in newly.iter().rev() {
             reg.by_key.remove(k);
             reg.in_use.remove(p);
             if let Some(old) = displaced {
-                // A successful migration retires the displaced number. Undo
-                // that retirement when the whole batch fails, then restore the
-                // exact live mapping that the still-current disk file contains.
                 reg.quarantined.remove(&old.public_port);
                 reg.in_use.insert(old.public_port);
                 reg.by_key.insert(k.clone(), old.clone());
@@ -388,29 +351,11 @@ fn claim_local(
         let f = &manifest.functions[fi];
         let spec = &f.ports[pi];
         let key = alloc_key(project, &f.name, spec.container_port, spec.protocol);
-        // A compose publish request names the exact public port it wants
-        // (`ports: ["9000:9000"]` → 9000). Claimable only when it is not
-        // platform-reserved, not already granted to someone else, and still
-        // bindable on this node — the caller compares grant to preference and
-        // logs the outcome in the BUILD LOG either way, so a fallback is never
-        // silent. (`in_use` check first: probing a port our OWN proxy already
-        // listens on would fail the bind probe and wrongly reject a re-grant.)
-        // Probed EXACTLY ONCE per target, before the branch decision: probing
-        // in a match guard and again in the arm gave the OS a window to change
-        // the answer between the two, sending a migration to a random
-        // range-allocated port that is neither the standing grant nor the
-        // preference.
         let preferred_ok = spec
             .preferred_public_port
             .filter(|&p| !reserved_public_port(p))
             .filter(|&p| !reg.in_use.contains(&p) && probe_bindable(p));
         let alloc = match reg.by_key.get(&key).cloned() {
-            // Redeploy of a known service: the SAME public port, no probe —
-            // the service's own live listener legitimately holds it. One
-            // exception: the compose author CHANGED the published host port
-            // and the new number is claimable — honoring it is what "the
-            // compose file is the source of truth" means; when it is not
-            // claimable the standing grant stays and the caller logs it.
             Some(existing)
                 if preferred_ok.is_none() || preferred_ok == Some(existing.public_port) =>
             {
@@ -427,25 +372,7 @@ fn claim_local(
                         }
                     },
                 };
-                // Migration QUARANTINES the old number instead of freeing it:
-                // every node adopted the old claim into its local read cache
-                // (`adopt_allocations`/`adopt_record`/its own raw_ports.json)
-                // and nothing invalidates those on a migration — re-granting
-                // the number to a DIFFERENT tenant would make stale entry
-                // nodes route that tenant's public port to the OLD project
-                // (cross-tenant misroute, surviving reboots). Leaving it in
-                // `in_use` (without a by_key owner) makes it un-grantable for
-                // the registry's lifetime; the project's eventual release
-                // clears its live claims and the quarantined number stays
-                // burned — one number out of a 10k range per migration, the
-                // safe direction. Consequence, documented: a port SWAP
-                // (A:9000→9001 while B:9001→9000) cannot converge, and a
-                // migration back to a previously-quarantined number is
-                // refused.
                 if let Some(old) = &prior {
-                    // Persist the non-reuse decision in the same atomic file as
-                    // the replacement claim. Keeping the number only in
-                    // `in_use` lost the quarantine on every process restart.
                     reg.quarantined.insert(old.public_port);
                     tracing::info!(
                         project,
@@ -473,8 +400,6 @@ fn claim_local(
         };
         allocs.push(alloc);
     }
-    // Durability BEFORE any new port escapes this function: a claim that
-    // isn't on disk could be re-handed to a parallel deploy after a crash.
     if !newly.is_empty() {
         if let Err(e) = save(&reg) {
             rollback(&mut reg, &newly);
@@ -484,30 +409,21 @@ fn claim_local(
     Ok(allocs)
 }
 
-/// Stamp `targets[n]`'s `public_port` from `allocs[n]` — the two slices must
-/// be the same length and in the same order (always true: both are produced
-/// from the same [`raw_targets`] computation).
+/// Stamps `targets[n]`'s `public_port` from `allocs[n]`: the slices are the same length and order
+/// (both come from the same [`raw_targets`] computation).
 fn stamp(manifest: &mut Manifest, targets: &[(usize, usize)], allocs: &[RawPortAllocation]) {
     for (n, &(fi, pi)) in targets.iter().enumerate() {
         manifest.functions[fi].ports[pi].public_port = Some(allocs[n].public_port);
     }
 }
 
-/// Deploy-time entry point (LEADER-COORDINATED): the actual claim decision
-/// always runs on the control-plane leader, closing the fleet-global port
-/// race a node-local claim can't see (two different nodes' local registries
-/// both starting empty at the range floor for two different tenants' first
-/// deploys). This node's own registry is then updated as a READ CACHE from
-/// the leader's answer ([`adopt_allocations`]) so `lookup`/`udp_allocations`
-/// on THIS node see the claim immediately, without waiting for the next
-/// gossiped deployment-list round. Mirrors the `admin_ingress` forward
-/// pattern already used for admin mutations/billing/ACME/DNS: one designated
-/// writer, every other node a cache.
-///
-/// A deployment relocating to a different node re-resolves the SAME
-/// coordinated port (the leader's registry hit on the stable `alloc_key`),
-/// instead of a fresh local allocation — the host-move port-instability this
-/// fixes as a side effect of fixing the race (see module doc).
+/// Deploy-time entry point (LEADER-COORDINATED): the claim decision always runs on the
+/// control-plane leader, closing the fleet-global port race a node-local claim cannot see. This
+/// node's registry is then updated as a READ CACHE from the leader's answer
+/// ([`adopt_allocations`]), so `lookup`/`udp_allocations` here see the claim at once instead of
+/// after the next gossiped deployment-list round. A deployment relocating to another node
+/// re-resolves the SAME coordinated port (the leader's registry hit on the stable `alloc_key`),
+/// fixing host-move port instability as a side effect (see the module doc).
 pub async fn allocate_raw_ports_coordinated(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -581,16 +497,12 @@ pub async fn allocate_raw_ports_coordinated(
     Ok(ports)
 }
 
-/// Leader-side RPC handler entry point (`gossip::dispatch`'s
-/// `/v1/raw-ports/allocate` arm): claim/reuse a public port for every raw
-/// spec in `manifest` against THIS node's registry (only correct to call
-/// when this node IS the leader — the RPC arm checks that first) and return
-/// the full [`RawPortAllocation`] records (not just bare port numbers) so the
-/// requesting node can populate its own local cache ([`adopt_allocations`])
-/// without a second round trip. Does NOT stamp `manifest` — the caller (on a
-/// DIFFERENT node, working from its own copy) does that itself with the
-/// returned records, mirroring [`allocate_raw_ports_coordinated`]'s local
-/// (already-leader) branch.
+/// Leader-side RPC entry point (`gossip::dispatch`'s `/v1/raw-ports/allocate` arm): claims/reuses a
+/// public port for every raw spec in `manifest` against THIS node's registry (only correct on the
+/// leader, which the arm checks first) and returns the full [`RawPortAllocation`] records, not bare
+/// numbers, so the requester can populate its cache ([`adopt_allocations`]) without a second round
+/// trip. Does NOT stamp `manifest`: the caller, working from its own copy, does that with the
+/// returned records.
 pub fn allocate_raw_ports_records(
     project: &str,
     manifest: &Manifest,
@@ -602,15 +514,13 @@ pub fn allocate_raw_ports_records(
     claim_local(project, manifest, &targets)
 }
 
-/// Project-deletion entry point (LEADER-COORDINATED): the mirror of
-/// [`allocate_raw_ports_coordinated`] for permanent retirement. The function
-/// name and `/release` wire path are retained for compatibility, but no number
-/// returns to the pool. Always retires THIS node's local claim first, so
-/// `lookup`/`udp_allocations` here never serve it; when this node is NOT the
-/// leader, also forwards retirement to the authoritative registry. Best-effort
-/// on the forward: failure leaves the leader's live claim unavailable (the safe
-/// direction) and deletion reconciliation retries the operation from its
-/// durable project tombstone.
+/// Project-deletion entry point (LEADER-COORDINATED), the mirror of
+/// [`allocate_raw_ports_coordinated`] for permanent retirement: the name and `/release` wire path
+/// are kept for compatibility, but no number returns to the pool. Always retires THIS node's local
+/// claim first, so `lookup`/`udp_allocations` here never serve it, and when this node is not the
+/// leader also forwards to the authoritative registry. The forward is best-effort: a failure leaves
+/// the leader's live claim unavailable (the safe direction) and deletion reconciliation retries
+/// from its durable project tombstone.
 pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &str) -> Vec<u16> {
     let retired = release_raw_ports(project);
     if cloud.is_control_plane_leader() {
@@ -659,14 +569,14 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
     retired
 }
 
-/// Remove every live allocation for `project` while permanently quarantining
-/// each public number. Returns the retired ports (empty when the project held
-/// none). Hooked into project/last-deployment deletion; idempotent.
-///
-/// A stale entry node can retain the old deployment record and route for an
-/// unbounded time. Reusing its number for another tenant would turn that stale
-/// route into a cross-tenant splice, so deletion retires the number rather than
-/// returning it to the allocator.
+/// Removes every live allocation for `project` while permanently quarantining each public number;
+/// returns the retired ports (empty when the project held none). Hooked into
+/// project/last-deployment deletion; idempotent. A stale entry node can retain the old deployment
+/// record and route indefinitely, so reusing its number for another tenant would turn that route
+/// into a cross-tenant splice. The quarantined numbers stay in `in_use`, unavailable to `next_free`
+/// and preferred-port claims forever; the save is best-effort (on failure the FILE still carries
+/// the former live claim, equally unavailable, and any later successful save persists the
+/// quarantine).
 pub fn release_raw_ports(project: &str) -> Vec<u16> {
     let mut reg = lock();
     let doomed: Vec<String> = reg
@@ -681,33 +591,25 @@ pub fn release_raw_ports(project: &str) -> Vec<u16> {
     let mut retired = Vec::with_capacity(doomed.len());
     for k in &doomed {
         if let Some(a) = reg.by_key.remove(k) {
-            // Keep `in_use`: quarantined numbers are deliberately unavailable
-            // to `next_free` and preferred-port claims forever.
             reg.quarantined.insert(a.public_port);
             reg.in_use.insert(a.public_port);
             retired.push(a.public_port);
         }
     }
-    // Best-effort save: on failure the FILE still carries the former live
-    // claim, which remains unavailable to reallocation (safe failure
-    // direction). This process has already stopped routing it, and any later
-    // successful registry save persists the quarantine.
     if let Err(e) = save(&reg) {
         tracing::warn!(project, error = %e, "raw-port quarantine not persisted (ports remain claimed on disk until the next save)");
     }
     retired
 }
 
-/// Shared dedup core for adopting an externally-sourced allocation into the
-/// local registry (never the allocation DECISION — only bookkeeping so this
-/// node's own `lookup`/`udp_allocations` see a claim made elsewhere): skips a
-/// key the registry already holds (registry claim wins) and refuses to adopt
-/// a second claim onto a port another key already occupies. Returns whether
-/// it actually inserted anything.
+/// Shared dedup core for adopting an externally sourced allocation into the local registry (never
+/// the allocation DECISION, only bookkeeping so this node's `lookup`/`udp_allocations` see a claim
+/// made elsewhere): skips a key the registry already holds (the registry claim wins), refuses a
+/// second claim onto a port another key occupies, and returns whether it inserted anything.
 fn adopt_one(reg: &mut Registry, a: &RawPortAllocation) -> bool {
     let key = alloc_key(&a.project, &a.function, a.container_port, a.protocol);
     if reg.by_key.contains_key(&key) {
-        return false; // registry claim wins
+        return false;
     }
     if reg.quarantined.contains(&a.public_port) {
         tracing::warn!(project = %a.project, function = %a.function, port = a.public_port, "raw-port registry: not adopting stale record — port is permanently quarantined");
@@ -722,11 +624,10 @@ fn adopt_one(reg: &mut Registry, a: &RawPortAllocation) -> bool {
     true
 }
 
-/// Boot-restore self-heal: re-adopt the public-port stamps a persisted
-/// deployment record carries into the registry, so an allocation survives even
-/// a lost/corrupt `raw_ports.json` (the record and the registry are two
-/// durable copies of the same claim; the registry wins on conflict since it is
-/// the set claims are checked against).
+/// Boot-restore self-heal: re-adopts the public-port stamps a persisted deployment record carries,
+/// so an allocation survives even a lost or corrupt `raw_ports.json` (the record and the registry
+/// are two durable copies of one claim; the registry wins on conflict, being the set claims are
+/// checked against).
 pub fn adopt_record(rec: &fluid_core::DeployRecord) {
     let allocs: Vec<RawPortAllocation> = rec
         .manifest
@@ -750,12 +651,10 @@ pub fn adopt_record(rec: &fluid_core::DeployRecord) {
     adopt_allocations(&allocs);
 }
 
-/// Merge externally-sourced allocations (the leader-coordinated RPC's
-/// response) into this node's LOCAL registry as a read cache — see
-/// [`adopt_one`]. Persists once for the whole batch when anything actually
-/// changed; a save failure is logged, not surfaced, since the caller already
-/// has its answer (the manifest is stamped either way) and the next boot's
-/// `adopt_record` self-heals from the deployment record's own stamps.
+/// Merges externally sourced allocations (the coordinated RPC's response) into this node's LOCAL
+/// registry as a read cache ([`adopt_one`]); persists once per batch when anything changed. A save
+/// failure is logged, not surfaced: the caller already has its answer (the manifest is stamped
+/// either way) and the next boot's `adopt_record` self-heals from the record stamps.
 fn adopt_allocations(allocs: &[RawPortAllocation]) {
     let mut reg = lock();
     let mut changed = false;
@@ -782,10 +681,9 @@ pub fn lookup(public_port: u16) -> Option<RawPortAllocation> {
         .cloned()
 }
 
-/// Every UDP claim in this node's durable registry — the UDP relay's
-/// most-authoritative desired-listener source (`crate::udp_relay`): the
-/// allocator node knows a claim the moment it is made, before the stamped
-/// deployment record is Ready or has gossiped fleet-wide.
+/// Every UDP claim in this node's durable registry, the UDP relay's most-authoritative
+/// desired-listener source (`crate::udp_relay`): the allocator node knows a claim the moment it is
+/// made, before the stamped deployment record is Ready or has gossiped.
 pub fn udp_allocations() -> Vec<RawPortAllocation> {
     lock()
         .by_key

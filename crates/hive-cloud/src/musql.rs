@@ -1,85 +1,41 @@
-//! musql: the managed-SQLite storage engine, reached as a loopback Hrana
-//! sidecar behind Hive's own Hrana handler.
+//! musql: the managed-SQLite storage engine, reached as a loopback Hrana sidecar behind Hive's own
+//! Hrana handler.
 //!
-//! # Why a sidecar and not a crate
+//! **Why a sidecar.** musql is Go (no C ABI, no Rust crate, a `GOOS=js` wasm that needs a JS host),
+//! so it cannot be linked into this workspace or run under wasmtime. Tenants still talk only to
+//! Hive's Rust Hrana handler, with `musqld` the engine behind it, on loopback, never exposed.
 //!
-//! musql is Go. It has no C ABI, no Rust crate, and its `GOOS=js` wasm needs a
-//! JS host, so it cannot be linked into this workspace and cannot run under
-//! wasmtime. The only shape that works is the one here: **tenants still talk
-//! only to Hive's Rust Hrana handler, and `musqld` is the storage engine behind
-//! it**, on loopback, never exposed.
+//! **Not musql's job.** musqld has ONE global `-auth-token` and no per-database concept, so
+//! per-database auth stays in Rust (`db_rest::credential_matches`) and NO `-auth-token` is passed:
+//! a token that cannot express the scope we enforce looks like a second boundary while enforcing a
+//! weaker one. Owner routing, the owner bearer re-check, the honest 421, batons, the 4 MiB body cap
+//! and the wire codec stay in Rust; musqld answers one database at a time, selected by `Host`.
 //!
-//! # What is deliberately NOT musql's job
+//! **Two rules proved by measurement.** Never run with `-create`: an unknown name would silently
+//! create a 147-byte empty database and serve it, the divergence the SQLite lane's owner routing
+//! exists to prevent, whereas without it a missing file is a clean 404 that this module maps onto
+//! Hive's own byte-identical "no such database". And ONE writer per file: two musqld instances on
+//! one `.musq` both bound and answered 200 (upstream disclaims even a mixed C/musql pair), so this
+//! supervisor is the only process that may start musqld and `crate::musql_migrate` quiesces the
+//! file before converting.
 //!
-//! musqld has exactly ONE global `-auth-token` and no per-database concept, so
-//! per-database auth stays in Rust (`db_rest::credential_matches`), and no
-//! `-auth-token` is passed at all — a token that cannot express the scope we
-//! enforce is worse than no token, because it looks like a second boundary
-//! while enforcing a weaker one. Owner routing, the owner bearer re-check, the
-//! honest 421, batons, the 4 MiB body cap and the whole wire codec likewise
-//! stay in Rust; musqld answers one database at a time, selected by `Host`.
+//! **Envelope discipline.** musqld's JSON never reaches a client: its error codes are normalised to
+//! `SQLITE_ERROR`, its `base_url` is dropped, its `baton` stays internal (a fresh one per response
+//! would cost every client a round trip) and its constant `rows_read: 0` is replaced with the rows
+//! actually stepped (see [`MusqlEngine::run`]).
 //!
-//! # Two rules proved by measurement, not by reading docs
-//!
-//! * **Never run with `-create`.** With it, an unknown name silently creates a
-//!   147-byte empty database and serves it — a missing file becoming an empty
-//!   database is exactly the divergence the SQLite lane's owner-routing was
-//!   written to prevent. Without it, a missing file is a clean 404
-//!   `{"message":"no such database"}`, which this module maps onto Hive's own
-//!   byte-identical answer.
-//! * **One writer per file.** Two musqld instances on the same `.musq` both
-//!   bound and both answered 200 in testing; upstream disclaims even a mixed
-//!   C/musql pair. This supervisor is therefore the only process that may start
-//!   musqld, and `crate::musql_migrate` quiesces the file before converting.
-//!
-//! # Envelope discipline
-//!
-//! musqld's JSON never reaches a client. Its error codes
-//! (`SQLITE_CONSTRAINT_UNIQUE`, `HRANA_PROTO_ERROR`, …) are normalised to
-//! `SQLITE_ERROR`, its `base_url` is dropped, its `baton` is kept internal (it
-//! hands out a fresh one on EVERY response, which would cost every client an
-//! extra round trip), and its constant `rows_read: 0` is replaced with the rows
-//! actually stepped — which is why the engine is asked for rows even when the
-//! caller did not want them. That count is the LENGTH of the returned array,
-//! read before a single row is decoded, so a discarded result set costs no
-//! decode at all (see [`MusqlEngine::run`]).
-//!
-//! # Four measured divergences from SQLite, and what was decided about each
-//!
-//! * **`rows_read` with `want_rows: false`.** musqld returns no row bodies, so
-//!   counting what came back reported 0 for a SELECT that stepped rows. Fixed:
-//!   the engine is always asked for rows and `rows_read` is the length of that
-//!   array, never a count of decoded values — so it agrees with the rusqlite
-//!   engine's step count for every statement, over the row ceiling included.
-//!   An earlier form of this fix decoded the rows in order to count them and
-//!   then enforced `MAX_ROWS` on the set it discarded; that disagreed with
-//!   rusqlite (which counts and keeps nothing, and budgets only what it keeps)
-//!   and paid a full 20 000-row / 32 MiB decode for a number it threw away.
-//! * **A non-finite REAL.** musqld's row encoder has no representation for
-//!   `Inf`/`-Inf`/`NaN` and emits `{"type":"null"}`, indistinguishable from a
-//!   real NULL — yet `SELECT 1e308*10 IS NULL` answers 0 and
-//!   `CAST(1e308*10 AS TEXT)` answers `Inf`, so the engine still knows. Fixed:
-//!   a NULL in a REAL-capable column is re-checked against the engine and
-//!   turned into the same loud error `hrana_proto::encode_value` raises, rather
-//!   than handed to a client as a NULL it never wrote.
-//! * **Negative zero.** musqld normalises a STORED `-0.0` to `0.0` (measured on
-//!   the live sidecar: `INSERT INTO t VALUES(-0.0)` then `SELECT x` answers
-//!   `{"type":"float","value":0}`; a literal `SELECT -0.0` is preserved).
-//!   ACCEPTED, NOT FIXED: `-0.0 = 0.0` is true in SQL, the two sort, compare
-//!   and sum identically, and the only observable difference is their TEXT
-//!   rendering (`CAST(x AS TEXT)`), which nothing in this lane reads. Closing
-//!   it would mean re-encoding every REAL on the way in and out.
-//! * **Error message text.** `SELECT FROM` is `near "FROM": syntax error` on
-//!   SQLite and `no such column: FROM` on musqld; both are `SQLITE_ERROR`.
-//!   Decided: message text is NOT part of the wire contract (clients match on
-//!   the code and the envelope, and `hrana_proto` re-tags every code to
-//!   `SQLITE_ERROR` regardless), so musqld's more specific text is passed
-//!   through unchanged instead of being rewritten to imitate SQLite's parser.
+//! **Measured divergences from SQLite.** `rows_read` is the length of the returned rows array (see
+//! `run`), and a NULL in a REAL-capable column is re-checked against the engine because musqld's
+//! encoder emits `{"type":"null"}` for `Inf`/`-Inf`/`NaN` (see `non_finite_probe`). Two are
+//! ACCEPTED: musqld normalises a STORED `-0.0` to `0.0` (`-0.0 = 0.0` in SQL and they sort, compare
+//! and sum identically; only their TEXT rendering differs, which nothing here reads, and closing it
+//! would mean re-encoding every REAL both ways), and error message text differs (`SELECT FROM` is
+//! `near "FROM": syntax error` on SQLite and `no such column: FROM` on musqld; message text is not
+//! part of the wire contract, clients match the code and the envelope, so musqld's more specific
+//! text passes through).
 
 use crate::sqlite_engine::{Budget, Col, DescribeResult, NamedArg, RunResult, SqlEngine, SqlValue};
 use async_trait::async_trait;
-// `as _`: this module defines its own `Engine` enum; only the trait's
-// methods are needed here.
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -87,11 +43,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-// ---- Configuration ---------------------------------------------------------
-
-/// The engine used for managed SQLite databases. Default `rusqlite`, so a roll
-/// of this code changes nothing until an operator says so — see
-/// [`engine_for_db`].
+/// The engine used for managed SQLite databases. Default `rusqlite`, so a roll of this code changes
+/// nothing until an operator says so (see [`engine_for_db`]).
 pub fn default_engine() -> Engine {
     match std::env::var("HIVE_SQLITE_ENGINE")
         .ok()
@@ -121,28 +74,19 @@ impl Engine {
     }
 }
 
-/// Per-database override, read from the `engine` key the provisioner writes into
-/// the database record's `connection` map.
-///
-/// **Every value other than `musql` resolves to [`Engine::Rusqlite`], never to
-/// [`default_engine`].** That is the whole point of this function and it is a
-/// correctness property, not a style choice: the pre-change provisioner wrote
-/// `engine: "sqlite"`, so a `_ => default_engine()` arm silently re-routed
-/// EVERY existing database — a `.db` file, never converted, never verified —
-/// onto musql the moment an operator set `HIVE_SQLITE_ENGINE=musql`, and where
-/// no `.musq` existed the database answered "no such database" instead of its
-/// data. An unverified record must not be able to become musql by env var
-/// alone; the only thing that makes a database musql is the explicit,
-/// verified-after-the-fact flip in `musql_migrate`.
+/// Per-database override, read from the `engine` key the provisioner writes into the record's
+/// `connection` map. **Every value other than `musql` resolves to [`Engine::Rusqlite`], never to
+/// [`default_engine`]**: the pre-change provisioner wrote `engine: "sqlite"`, so a `_ =>
+/// default_engine()` arm silently re-routed EVERY existing database (a never-converted,
+/// never-verified `.db` file) onto musql the moment an operator set `HIVE_SQLITE_ENGINE=musql`, and
+/// where no `.musq` existed the database answered "no such database" instead of its data. Only the
+/// explicit, verified-after-the-fact flip in `musql_migrate` makes a database musql.
 pub fn engine_for_db(connection: &HashMap<String, String>) -> Engine {
     let v = connection
         .get("engine")
         .map(|s| s.trim().to_ascii_lowercase());
     match v.as_deref() {
         Some("musql") => Engine::Musql,
-        // "rusqlite", the legacy "sqlite", a record with no `engine` key at
-        // all, and every unknown spelling: a rusqlite file by construction, and
-        // it stays one until it is converted and proven.
         _ => Engine::Rusqlite,
     }
 }
@@ -155,16 +99,16 @@ fn env_str(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Where the sidecar listens. Loopback only — this is an engine, not a service,
-/// and AGENTS.md's "do not open new inbound ports" applies to the world, not to
-/// a process talking to itself on 127.0.0.1.
+/// Where the sidecar listens: loopback only. This is an engine, not a service, and AGENTS.md's "do
+/// not open new inbound ports" applies to the world, not to a process talking to itself on
+/// 127.0.0.1.
 fn listen_addr() -> String {
     env_str("HIVE_MUSQL_LISTEN", "127.0.0.1:8099")
 }
 
-/// musqld's stream idle timeout. MUST exceed Hive's own `HIVE_SQLITE_STREAM_IDLE_MS`
-/// (up to 600 s) or an interactive transaction is killed mid-stream by the
-/// engine while Hive still believes the stream is live.
+/// musqld's stream idle timeout. MUST exceed Hive's own `HIVE_SQLITE_STREAM_IDLE_MS` (up to 600 s),
+/// or the engine kills an interactive transaction mid-stream while Hive still believes the stream
+/// is live.
 fn idle_timeout() -> String {
     env_str("HIVE_MUSQL_IDLE_TIMEOUT", "900s")
 }
@@ -173,11 +117,9 @@ pub fn musqld_bin() -> String {
     env_str("HIVE_MUSQLD_BIN", "musqld")
 }
 
-/// Concurrent musql streams per database. A musqld stream is the analogue of a
-/// pooled SQLite connection, so it gets the same bound for the same reason:
-/// without one, every Hrana request would open an unbounded number of engine
-/// streams and a slow query would be able to multiply without limit. It is
-/// per-DATABASE, exactly like `sqlite_pool`'s semaphore.
+/// Concurrent musql streams per database: a musqld stream is the analogue of a pooled SQLite
+/// connection, so it gets the same per-DATABASE bound as `sqlite_pool`'s semaphore (without one,
+/// every Hrana request would open an unbounded number of engine streams).
 fn max_streams() -> usize {
     std::env::var("HIVE_SQLITE_POOL_MAX")
         .ok()
@@ -198,26 +140,19 @@ pub fn convert_bin() -> String {
     env_str("HIVE_MUSQL_CONVERT_BIN", "musql-convert")
 }
 
-// ---- Capability probe ------------------------------------------------------
-
-/// Probed, never assumed: does this host actually have a usable musqld? Run at
-/// boot and advertised on `NodeInfo` like `wasm_runtime`/`bun_runtime`, so
-/// placement and the migration planner can see it without an operator SSHing in.
-/// `None` here means NOT REPORTED, which this lane treats as NOT CAPABLE — the
-/// same asymmetry `wasm_runtime` uses, and for the same reason: a node that
-/// cannot run the engine must never be handed a `musql` database.
+/// Probed, never assumed: does this host have a usable musqld? Run at boot and advertised on
+/// `NodeInfo` like `wasm_runtime`/`bun_runtime`, so placement and the migration planner see it.
+/// `None` means NOT REPORTED, which this lane treats as NOT CAPABLE (the `wasm_runtime` asymmetry):
+/// a node that cannot run the engine must never be handed a `musql` database. `-h` prints the flag
+/// list and exits 0, and the marker that this really is musqld (not some other `musqld` on PATH) is
+/// `-dir`, the mode this lane depends on.
 pub fn probe() -> Option<bool> {
     let bin = musqld_bin();
     let out = std::process::Command::new(&bin).arg("-h").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_string()
         + &String::from_utf8_lossy(&out.stderr);
-    // `-h` prints the flag list to stderr and exits 0; the marker that this is
-    // really musqld (and not some other `musqld` on PATH) is `-dir`, which is
-    // the mode this lane depends on.
     Some(text.contains("-dir") && text.contains("-idle-timeout"))
 }
-
-// ---- Sidecar ---------------------------------------------------------------
 
 pub struct Sidecar {
     pub base: String,
@@ -263,9 +198,18 @@ pub fn spawn() -> bool {
     true
 }
 
-/// One supervised musqld: run it, mark it ready once it answers, and restart it
-/// with backoff if it ever exits. A sidecar that dies silently would turn every
-/// `musql` database into a 500 with no operator-visible cause.
+/// One supervised musqld: run it, mark it ready once it answers, and restart it with backoff if it
+/// exits. A sidecar that dies silently would turn every `musql` database into a 500 with no
+/// operator-visible cause.
+///
+/// Readiness is gated on OUR child still being alive when the probe succeeded: the probe proves
+/// only that SOMETHING answered on the port, and an ORPHANED musqld from a previous boot answers
+/// identically (one survived its parent's shutdown, held 127.0.0.1:8099 and every supervised child
+/// then died on `bind: address already in use` while the probe still saw 404s and reported ready).
+/// Serving through it would hand tenant databases to a writer this node does not supervise,
+/// breaking one writer per file. Another process owning the port (or musqld dying at startup) stays
+/// NOT ready: an honest 503 beats serving a foreign writer, and the restart counter makes it
+/// operator-visible.
 async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr: String) {
     let idle = idle_timeout();
     let mut backoff = Duration::from_millis(500);
@@ -278,8 +222,6 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
             .arg(&addr)
             .arg("-idle-timeout")
             .arg(&idle)
-            // NO `-create`: an unknown name must 404, never become an empty
-            // database. Provisioning creates the file on purpose instead.
             .kill_on_drop(true)
             .spawn();
         let mut child = match child {
@@ -292,16 +234,6 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
             }
         };
         if wait_ready(&sc.base).await {
-            // The probe proves only that SOMETHING answered on the port — an
-            // ORPHANED musqld from a previous boot answers it identically, and
-            // one was witnessed live: it survived its parent's shutdown, kept
-            // holding 127.0.0.1:8099, and every supervised child afterwards
-            // died on `bind: address already in use` while the readiness probe
-            // still saw 404s and reported ready. Serving tenant databases
-            // through that process would hand them to a writer this node does
-            // not supervise — exactly the "one writer per file" property the
-            // module doc stakes out. So readiness is gated on OUR child still
-            // being alive at the moment the probe succeeded.
             match child.try_wait() {
                 Ok(None) => {
                     sc.ready.store(true, Ordering::SeqCst);
@@ -309,9 +241,6 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
                     tracing::info!(addr = %addr, dir = %dir.display(), "musqld sidecar ready");
                 }
                 other => {
-                    // Another process owns the port (or musqld died on startup).
-                    // Stay NOT ready: an honest 503 beats serving a foreign
-                    // writer, and the restart counter makes it operator-visible.
                     tracing::error!(
                         addr = %addr,
                         status = ?other,
@@ -336,13 +265,11 @@ async fn supervise(sc: Arc<Sidecar>, bin: String, dir: std::path::PathBuf, addr:
     }
 }
 
-/// Readiness = the port answers AND speaks musqld's error shape. A bare TCP
-/// connect would also succeed against anything else that grabbed the port, and
-/// the whole point of the probe is to know the ENGINE is there.
-///
-/// It proves that for SOME process, not for the one this supervisor spawned —
-/// the caller must additionally confirm its own child is alive (see
-/// `supervise`), because an orphaned musqld answers this probe identically.
+/// Readiness = the port answers AND speaks musqld's error shape: a bare TCP connect would also
+/// succeed against anything else that grabbed the port. It proves that for SOME process, not the
+/// one this supervisor spawned, so the caller must also confirm its own child is alive (see
+/// `supervise`). The probe asks for an unknown database (no `-create`), the one request that cannot
+/// touch tenant data and provably reached musqld's router.
 async fn wait_ready(base: &str) -> bool {
     let client = match reqwest::Client::builder()
         .no_proxy()
@@ -353,8 +280,6 @@ async fn wait_ready(base: &str) -> bool {
         Err(_) => return false,
     };
     for _ in 0..40 {
-        // An unknown database with no `-create` is the one request that cannot
-        // touch tenant data and provably reached musqld's router.
         let r = client
             .post(format!("{base}/v2/pipeline"))
             .header("host", "hive-readiness-probe.localhost")
@@ -372,10 +297,9 @@ async fn wait_ready(base: &str) -> bool {
     false
 }
 
-/// True once the sidecar has answered its readiness probe. Anything that is
-/// about to hand a request to the engine waits on this rather than on the
-/// process having been spawned: a spawned-but-not-listening musqld is exactly
-/// the window that would otherwise turn into a 500 for a real tenant.
+/// True once the sidecar answered its readiness probe. Anything about to hand a request to the
+/// engine waits on this, not on the process having been spawned: a spawned-but-not-listening musqld
+/// is the window that would otherwise become a 500 for a real tenant.
 pub fn ready() -> bool {
     sidecar()
         .map(|s| s.ready.load(Ordering::SeqCst))
@@ -398,8 +322,6 @@ pub fn status_json() -> Value {
     }
 }
 
-// ---- Engine ----------------------------------------------------------------
-
 /// Per-database admission for musql streams, the musql arm's equivalent of
 /// `sqlite_pool`'s semaphore. Keyed by database id so one busy database cannot
 /// starve another.
@@ -419,19 +341,17 @@ pub struct MusqlEngine {
     base: String,
     /// Host header for this database: `hive-sqlite-<sanitize_tag(db_id)>.localhost`.
     db: String,
-    /// Released in `Drop`, never on an error branch — axum drops the request
-    /// future when a client goes away, and a dropped future never returns
-    /// `Err`. Same rule as `sqlite_pool::PooledConn`.
+    /// Released in `Drop`, never on an error branch: axum drops the request future when a client
+    /// goes away, and a dropped future never returns `Err` (same rule as
+    /// `sqlite_pool::PooledConn`).
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// musqld's stream handle. It mints a fresh one on EVERY response, so this
     /// is updated after each call and never handed to a client.
     baton: Option<String>,
-    /// The connection's last inserted rowid, tracked here because musqld reports
-    /// a PER-STATEMENT rowid (0 for UPDATE/DELETE) while SQLite — and therefore
-    /// Hive's rusqlite path — reports the CONNECTION's, which is what an UPDATE
-    /// after an INSERT echoes. Without this the two engines disagree on
-    /// `last_insert_rowid` for every non-INSERT write, which is a client-visible
-    /// difference on a pooled connection.
+    /// The connection's last inserted rowid, tracked here because musqld reports a PER-STATEMENT
+    /// rowid (0 for UPDATE/DELETE) while SQLite, and so Hive's rusqlite path, reports the
+    /// CONNECTION's (what an UPDATE after an INSERT echoes); without it the engines disagree on
+    /// `last_insert_rowid` for every non-INSERT write on a pooled connection.
     last_rowid: i64,
 }
 
@@ -480,6 +400,10 @@ impl MusqlEngine {
 
     /// Post one pipeline and return its `results` array. Everything musql-shaped
     /// is normalised here so no caller downstream has to know it exists.
+    /// An unknown or expired baton answers 400 `HRANA_PROTO_ERROR`; one retry with a fresh stream
+    /// is correct, since Hive's own stream is still live and only the engine's copy lapsed. A 404
+    /// maps to the byte-identical `no such database`, so a musql database whose file is absent
+    /// looks like any other missing database.
     async fn post(&mut self, requests: Vec<Value>) -> Result<Vec<Value>, String> {
         let body = json!({ "baton": self.baton.clone(), "requests": requests });
         let resp = self
@@ -499,9 +423,6 @@ impl MusqlEngine {
             .map_err(|e| format!("musql sidecar returned an unreadable body: {e}"))?;
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
-        // An unknown/expired baton: musqld answers 400. Retrying once with a
-        // fresh stream is correct — Hive's own stream is still live, only the
-        // engine's copy of it lapsed.
         if status == reqwest::StatusCode::BAD_REQUEST
             && v.get("code").and_then(|c| c.as_str()) == Some("HRANA_PROTO_ERROR")
             && self.baton.is_some()
@@ -510,9 +431,6 @@ impl MusqlEngine {
             return Box::pin(self.post(requests)).await;
         }
         if status == reqwest::StatusCode::NOT_FOUND {
-            // Byte-identical to Hive's own "no such database": a musql database
-            // whose file is absent must not look different from any other
-            // missing database.
             return Err("no such database".to_string());
         }
         if !status.is_success() {
@@ -531,20 +449,12 @@ impl MusqlEngine {
             .unwrap_or_default())
     }
 
-    /// Unwrap one result envelope: `Ok(response)` or the engine's error. musqld
-    /// names errors with codes Hive has never emitted
-    /// (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_CONSTRAINT_FOREIGNKEY`, …);
-    /// `crate::hrana_proto` re-tags everything `SQLITE_ERROR` on the way out, so
-    /// the client-visible code is unchanged and only the message (which is
-    /// genuinely more specific) moves.
-    ///
-    /// That message text is DECISION, not accident: it differs from SQLite's
-    /// (`SELECT FROM` is `near "FROM": syntax error` there, `no such column:
-    /// FROM` here) and it is deliberately NOT rewritten to imitate it. Message
-    /// text is not part of the Hrana wire contract — clients branch on the code
-    /// and the envelope, both of which are identical — and musqld's text is
-    /// more specific than SQLite's parser's, so normalising it would trade real
-    /// information for cosmetic agreement.
+    /// Unwraps one result envelope: `Ok(response)` or the engine's error. musqld names errors with
+    /// codes Hive never emitted (`SQLITE_CONSTRAINT_UNIQUE`, ...); `crate::hrana_proto` re-tags
+    /// everything `SQLITE_ERROR` on the way out, so the client-visible code is unchanged and only
+    /// the message (genuinely more specific than SQLite's) moves. That message text is a DECISION:
+    /// it is deliberately NOT rewritten to imitate SQLite's, since text is not part of the Hrana
+    /// wire contract (clients branch on the code and the envelope, both identical).
     fn unwrap(result: &Value) -> Result<Value, String> {
         match result.get("type").and_then(|t| t.as_str()) {
             Some("ok") => Ok(result.get("response").cloned().unwrap_or(Value::Null)),
@@ -557,10 +467,9 @@ impl MusqlEngine {
         }
     }
 
-    /// The one place musqld's value encoding is trusted. It is identical to
-    /// Hive's (measured: `integer` as a string, `float` as a number, `blob`
-    /// under `base64`), and an unrecognised shape is an error rather than a
-    /// guess that would silently mangle a row.
+    /// The one place musqld's value encoding is trusted: identical to Hive's (measured: `integer`
+    /// as a string, `float` as a number, `blob` under `base64`), with an unrecognised shape an
+    /// error rather than a guess that would silently mangle a row.
     fn decode(v: &Value) -> Result<SqlValue, String> {
         let ty = v
             .get("type")
@@ -627,12 +536,10 @@ impl MusqlEngine {
             .unwrap_or_default()
     }
 
-    /// Whether a NULL rendered by musqld in this column could be a non-finite
-    /// REAL rather than a NULL. Only a column the engine declares REAL (or does
-    /// not declare at all — every computed expression, including `SELECT
-    /// 1e308*10`) can hold one, so a NULL in an INTEGER or TEXT column is never
-    /// probed. SQLite's affinity rules: a declared type containing REAL, FLOA
-    /// or DOUB takes REAL affinity.
+    /// Whether a NULL musqld rendered in this column could be a non-finite REAL. Only a column the
+    /// engine declares REAL (or does not declare at all: every computed expression, including
+    /// `SELECT 1e308*10`) can hold one, so a NULL in an INTEGER or TEXT column is never probed
+    /// (SQLite affinity: a declared type containing REAL, FLOA or DOUB takes REAL affinity).
     fn could_be_non_finite(col: Option<&Col>) -> bool {
         match col.and_then(|c| c.decltype.as_deref()) {
             None => true,
@@ -643,36 +550,28 @@ impl MusqlEngine {
         }
     }
 
-    /// Decide whether a NULL musqld rendered is a non-finite REAL.
+    /// Decides whether a NULL musqld rendered is a non-finite REAL. The encoder emits
+    /// `{"type":"null"}` for `Inf`/`-Inf`/`NaN`, byte-identical to a real NULL, but the ENGINE can
+    /// still tell (`SELECT 1e308*10 IS NULL` answers 0 and `CAST(1e308*10 AS TEXT)` answers `Inf`),
+    /// so the statement is re-run wrapped in a subquery that projects, per suspect column, the text
+    /// rendering musqld itself would use.
     ///
-    /// musqld's row encoder has no representation for `Inf`/`-Inf`/`NaN` and
-    /// emits `{"type":"null"}` — byte-identical to a real NULL, so the rendered
-    /// row alone cannot tell them apart. The ENGINE still can, measured against
-    /// the live sidecar: `SELECT 1e308*10 IS NULL` answers 0 and
-    /// `CAST(1e308*10 AS TEXT)` answers `Inf`. So ask it: re-run the statement
-    /// wrapped in a subquery and project, per suspect column, the text
-    /// rendering musqld itself would have used.
-    ///
-    /// Three gates keep that safe and bounded:
-    /// * only for a statement the engine itself reports read-only — re-running a
-    ///   write would apply it twice;
-    /// * only when the first pass actually rendered a NULL, and only in a column
-    ///   that can hold a REAL (`could_be_non_finite`);
-    /// * one probe statement covering every suspect column at once, so the cost
-    ///   is one extra execution of the statement, never one per column.
-    ///
-    /// That cost is accepted: a non-finite handed to a client as a NULL it never
-    /// wrote is the one divergence this lane raises a loud error for everywhere
-    /// else (`hrana_proto::encode_value` refuses to encode one), and a silent
-    /// wrong value is worse than a second read.
+    /// Three gates keep that safe and bounded: only for a statement the engine itself reports
+    /// read-only (re-running a write would apply it twice; a statement it will not vouch for is not
+    /// re-run and the NULL stays a NULL); only when the first pass rendered a NULL in a column that
+    /// can hold a REAL; and one probe statement covering every suspect column, so the cost is one
+    /// extra execution, never one per column (an unnamed column cannot be addressed from the
+    /// wrapper, so it stays unchecked). The cost is accepted: a non-finite handed to a client as a
+    /// NULL it never wrote is the divergence this lane raises a loud error for everywhere else
+    /// (`hrana_proto::encode_value` refuses to encode one), and a silent wrong value is worse than
+    /// a second read. The probe posts directly, never through `run`, which would probe its own
+    /// probe.
     async fn non_finite_probe(
         &mut self,
         sql: &str,
         cols: &[Col],
         idxs: &[usize],
     ) -> Option<(String, f64)> {
-        // Read-only is the engine's own verdict; a statement it will not vouch
-        // for is not re-run, and the NULL is left as a NULL.
         if !self.describe(sql).await.ok()?.is_readonly {
             return None;
         }
@@ -684,9 +583,6 @@ impl MusqlEngine {
         let mut names: Vec<String> = Vec::new();
         for i in idxs {
             let name = cols.get(*i)?.name.as_str();
-            // An unnamed column cannot be addressed from the wrapper; musqld
-            // answers "no such column" for `t.""`. Skipping is honest — it
-            // leaves that one column unchecked.
             if name.is_empty() {
                 continue;
             }
@@ -700,7 +596,6 @@ impl MusqlEngine {
         if guards.is_empty() {
             return None;
         }
-        // `post` directly, never `run`: `run` would probe its own probe.
         let results = self
             .post(vec![json!({
                 "type": "execute",
@@ -741,6 +636,20 @@ pub fn host_label(db_id: &str) -> String {
 
 #[async_trait]
 impl SqlEngine for MusqlEngine {
+    /// Runs one statement. The engine is asked for rows UNCONDITIONALLY: musqld answers `rows_read:
+    /// 0` for every statement and with `want_rows: false` returns no row bodies, so the only honest
+    /// step count is the length of the returned `rows` array, read before a single row is decoded
+    /// (the reply is ONE JSON document, so the count is free). The rusqlite engine counts every
+    /// stepped row before looking at `want_rows` and applies the row/byte budget only to rows it
+    /// KEEPS, so a 25 000-row SELECT with `want_rows: false` answers `rows_read: 25000`, no rows
+    /// and no error; enforcing the budget on a set about to be discarded would be a divergent
+    /// envelope plus a 32 MiB decode thrown away. Nothing is decoded when the caller did not ask
+    /// for rows (the non-finite re-check is skipped with them: it stops a lossy NULL reaching a
+    /// client, and no row does), and over the ceiling the COUNT refuses before any decode (a result
+    /// one row over must not cost 20 001 decodes to be told it is too large). `last_insert_rowid`
+    /// tracks the connection's value like SQLite, gated on `rows_written` the way the rusqlite
+    /// engine gates it on `changes`; a NULL in a REAL-capable column is re-checked against the
+    /// engine before the row is handed out (see `non_finite_probe`).
     async fn run(
         &mut self,
         sql: &str,
@@ -749,15 +658,6 @@ impl SqlEngine for MusqlEngine {
         named: &[NamedArg],
         budget: Budget,
     ) -> Result<RunResult, String> {
-        // The engine is asked for rows UNCONDITIONALLY. musqld answers
-        // `rows_read: 0` for every statement, so the step count is the only
-        // honest source for the number the wire publishes — and with
-        // `want_rows: false` musqld returns no row bodies at all, which would
-        // report 0 for a `SELECT` that stepped rows. The rusqlite engine counts
-        // every stepped row BEFORE it looks at `want_rows`, and that is what
-        // clients see today, so that is the contract. The count is the length of
-        // the returned array, so nothing is decoded when the caller did not ask
-        // for the rows.
         let mut stmt = json!({ "sql": sql, "want_rows": true });
         if !args.is_empty() {
             stmt["args"] = Value::Array(args.iter().map(Self::encode).collect());
@@ -782,11 +682,6 @@ impl SqlEngine for MusqlEngine {
             .get("affected_row_count")
             .and_then(|n| n.as_u64())
             .unwrap_or(0);
-        // musqld reports a per-statement rowid (0 for UPDATE/DELETE); SQLite
-        // reports the connection's, which is the value an UPDATE after an
-        // INSERT echoes and the value Hive has always published. Track it here
-        // so both engines answer identically, and gate it on `rows_written`
-        // exactly the way the rusqlite engine gates it on `changes`.
         let reported = result
             .get("last_insert_rowid")
             .and_then(|v| v.as_str())
@@ -798,26 +693,9 @@ impl SqlEngine for MusqlEngine {
         let last_insert_rowid =
             if rows_written > 0 { (self.last_rowid != 0).then_some(self.last_rowid) } else { None };
 
-        // musqld reports `rows_read: 0` for every statement, so the honest
-        // substitute is what this statement stepped — and its reply is ONE JSON
-        // document, which makes that count free: it is the length of the rows
-        // array, readable before a single row is decoded.
-        //
-        // Reading it first is what keeps `want_rows: false` cheap AND what makes
-        // the two engines agree above the row ceiling. The rusqlite engine steps
-        // and counts a row it was told not to return, and applies the row/byte
-        // budget only to the rows it KEEPS, so a 25 000-row `SELECT` with
-        // `want_rows: false` answers `rows_read: 25000`, no rows and no error.
-        // Enforcing the budget on a set that is about to be discarded is both a
-        // divergent envelope and a 32 MiB decode whose result is thrown away.
         let returned = result.get("rows").and_then(|r| r.as_array());
         let rows_read = returned.map(|a| a.len() as u64).unwrap_or(0);
         if !want_rows {
-            // Nothing is decoded, so the discarded bodies never become a second
-            // allocation, and the non-finite re-check below is skipped with
-            // them: it exists to stop a lossy NULL reaching a client, and no
-            // row reaches a client here (the rusqlite engine's equivalent check
-            // is `hrana_proto::encode_value`, which also only sees kept rows).
             return Ok(RunResult {
                 cols,
                 rows: Vec::new(),
@@ -826,8 +704,6 @@ impl SqlEngine for MusqlEngine {
                 last_insert_rowid,
             });
         }
-        // Refuse on the COUNT, before any row is decoded: a result one row over
-        // the ceiling must not cost 20 001 decodes to be told it is too large.
         if rows_read > budget.max_rows as u64 {
             return Err(format!(
                 "result set exceeds {} rows over the pipeline endpoint — paginate with \
@@ -861,9 +737,6 @@ impl SqlEngine for MusqlEngine {
                 ));
             }
         }
-        // A NULL in a REAL-capable column is the one place musqld's encoder is
-        // lossy, so it is re-checked against the engine before the row is
-        // handed out. See `non_finite_probe`.
         if !realish_nulls.is_empty() {
             if let Some((col, value)) = self.non_finite_probe(sql, &cols, &realish_nulls).await {
                 return Err(crate::hrana_proto::non_finite_message(&col, value));
@@ -916,13 +789,8 @@ impl SqlEngine for MusqlEngine {
     }
 
     async fn is_autocommit(&mut self) -> bool {
-        // v3 only — the sidecar speaks v3 internally regardless of the client's
-        // version, and `get_autocommit` is gated on the CLIENT's version by
-        // `hrana_proto` before it ever reaches this.
         match self.post(vec![json!({ "type": "get_autocommit" })]).await {
             Ok(results) => {
-                // Bind first: `into_iter().next()` yields an owned Value, and
-                // chaining `.get()` off it would borrow a temporary.
                 let first = results.into_iter().next();
                 first
                     .as_ref()

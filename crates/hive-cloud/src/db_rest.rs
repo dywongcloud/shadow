@@ -1,23 +1,19 @@
-//! HTTP REST surface of the per-tenant DB gateway — the third protocol next to
-//! the Postgres/Redis wire proxies in [`crate::db_gateway`].
+//! HTTP REST surface of the per-tenant DB gateway, the third protocol next to the Postgres/Redis
+//! wire proxies in [`crate::db_gateway`], served on the SAME public HTTPS listener as tenant apps:
+//! the edge pipeline branches here for any `Host: <slug>.{db_domain}` (the `*.{db_domain}` wildcard
+//! cert is already in the shared SNI resolver). Two dialects:
 //!
-//! Served on the SAME public HTTPS listener as tenant apps: the edge pipeline
-//! branches here for any `Host: <slug>.{db_domain}` request (the `*.{db_domain}`
-//! wildcard cert is already in the shared SNI resolver). Two dialects:
-//!   * Redis kinds — Upstash-compatible: `POST /` with `["SET","k","v"]`,
-//!     `POST /pipeline` with `[[...],[...]]`, or `GET /<CMD>/<arg>/<arg>`;
-//!     replies `{"result": ...}` / `[{"result": ...}, ...]`.
-//!   * Postgres kinds — SQL-over-HTTP (Neon-style): `POST /sql` with
-//!     `{"query": "select $1::int + 1", "params": ["41"]}`; replies
-//!     `{"fields": [...], "rows": [...], "rowCount": n}`.
+//! - Redis kinds, Upstash-compatible: `POST /` with `["SET","k","v"]`, `POST /pipeline` with
+//! `[[...],[...]]`, or `GET /<CMD>/<arg>/<arg>` (path segments are the URL-decoded command);
+//! replies `{"result": ...}` / `[{"result": ...}, ...]`.
+//! - Postgres kinds, SQL-over-HTTP (Neon-style): `POST /sql` with `{"query": "select $1::int + 1",
+//! "params": ["41"]}`; replies `{"fields": [...], "rows": [...], "rowCount": n}`.
 //!
-//! SECURITY (ZeroTrust): every request must present `Authorization: Bearer`
-//! matching THIS database's own credential (Redis: its REST token or password;
-//! Postgres: its password) — compared constant-time. The bearer scopes to exactly
-//! one DB: there is no cross-DB or team-wide token here. Queries use REAL
-//! parameter binding (extended protocol, params typed `unknown` so Postgres
-//! infers like literals) — never string interpolation. The engine itself is only
-//! reachable on the host node's loopback; this handler runs on that node because
+//! SECURITY (ZeroTrust): every request must present `Authorization: Bearer` matching THIS
+//! database's own credential (Redis: its REST token or password; Postgres: its password), compared
+//! constant-time; the bearer scopes to exactly one DB. Queries use REAL parameter binding (extended
+//! protocol, params typed `unknown` so Postgres infers like literals), never string interpolation.
+//! The engine is reachable only on the host node's loopback, and this handler runs there because
 //! per-DB DNS (`vercel_dns`) points `<slug>` at it.
 
 use crate::databases::{Database, DbKind};
@@ -30,19 +26,31 @@ use std::sync::Arc;
 
 /// Max request-body bytes (SQL text / redis command JSON).
 const BODY_CAP: usize = 4 * 1024 * 1024;
-/// Max cumulative RESPONSE bytes buffered for one request (redis pipeline reply
-/// set, or SQL result rows) — bounds a bounded-request-to-unbounded-response
-/// memory amplification (e.g. 1000x GET on large stored values) regardless of
-/// per-item/per-row caps.
+/// Max cumulative RESPONSE bytes buffered for one request (a redis pipeline's replies, or SQL
+/// result rows): bounds a bounded-request-to-unbounded-response amplification (1000x GET on large
+/// values) regardless of per-item/per-row caps.
 const REPLY_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 /// Whole-request budget against the backing engine.
 const ENGINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Entry point from the edge pipeline. `host` is the port-stripped lowercased
 /// Host header, already verified to end with `.{db_domain}`.
+///
+/// The order is the design. CORS preflight answers first (browsers call this surface, Upstash
+/// parity; auth still applies to the real request). The DB is resolved FIRST so auth compares
+/// against per-DB credentials, and an unknown slug is a 404 that leaks nothing (the wildcard DNS
+/// makes every label resolvable). A Supabase database is its Studio dashboard, gated by HTTP BASIC
+/// auth in its own arm BEFORE the bearer check (Studio speaks basic-auth, not the REST bearer): its
+/// GET/HEAD are proven bodyless before any cache lookup or owner hop (HTTP/2 DATA needs no
+/// Content-Length), the pinned shell and immutable assets come from a node-local cache, and
+/// everything else takes the owner route. Then the constant-time bearer check. SQLite is Hrana with
+/// its own owner routing (its engine is a FILE on `Database::host_node`, so no `local_port`, and
+/// routing beats opening a second, empty file). A missing `local_port` is an honest 421 (stale
+/// DNS), not a 500. A per-database cap on concurrent REST engine connections follows (every call
+/// opens a fresh connection, so a burst could exhaust the container's `max_connections` and starve
+/// the app's own `DATABASE_URL` clients; it reserves headroom, it is not a pool). Last, dispatch by
+/// kind; native HTTP kinds answer 501 because their REST surface is the team-scoped platform API.
 pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> Response {
-    // CORS preflight: the REST surface is meant to be callable from browsers
-    // (Upstash parity). Auth still applies to the actual request.
     if req.method() == Method::OPTIONS {
         return with_cors(StatusCode::NO_CONTENT.into_response());
     }
@@ -51,33 +59,17 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
 
-    // Resolve the DB FIRST so auth compares against per-DB credentials. Unknown
-    // slug = 404 (leaks nothing: the wildcard DNS makes every label resolvable).
     let Some(db) = cloud.databases.by_db_host(&host) else {
         return with_cors(err(StatusCode::NOT_FOUND, "no database at this hostname"));
     };
 
-    // Supabase Studio: this database's whole hostname is the Studio dashboard,
-    // gated by HTTP BASIC auth (the DASHBOARD_USERNAME/DASHBOARD_PASSWORD
-    // mechanism the upstream stack's Kong enforces on its `/` catch-all —
-    // here enforced by this arm instead of a Kong container) and reverse-
-    // proxied to the studio container's loopback port. Branch BEFORE the
-    // bearer check: Studio speaks basic-auth, not the DB REST bearer.
     if db.kind == DbKind::Supabase {
-        // HTTP/2 DATA does not need Content-Length or Transfer-Encoding. Prove
-        // every Studio/data-plane GET and HEAD is actually bodyless before any
-        // cache lookup or owner hop, rather than trusting transport headers.
         if matches!(*req.method(), Method::GET | Method::HEAD) {
             req = match studio_require_empty_body(req).await {
                 Ok(req) => req,
                 Err(response) => return response,
             };
         }
-        // The pinned Studio shell and immutable static assets are safe to cache
-        // node-locally after this edge repeats the ordinary Studio auth gate.
-        // Everything else — login exchange, APIs, mutations and unknown paths —
-        // keeps the existing owner route. This cache is deliberately before the
-        // owner hop and deliberately is not a CCN lookup.
         if let Some(kind) = studio_cache_candidate(&req) {
             return studio_cached_route(&cloud, &db, req, kind).await;
         }
@@ -93,15 +85,12 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
         return supabase_studio_proxy(&cloud, &db, req).await;
     }
 
-    // The engine lives on the host node's loopback. If per-DB DNS routed the
-    // client elsewhere (stale record), say so honestly instead of a generic 500.
     let local = db
         .connection
         .get("local_port")
         .filter(|p| !p.is_empty())
         .and_then(|p| p.parse::<u16>().ok());
 
-    // ---- AuthZ: bearer must match THIS DB's credential (constant-time) --------
     let bearer = bearer_token(&headers).unwrap_or_default();
     if bearer.is_empty() || !credential_matches(&db, &bearer) {
         let mut resp = err(
@@ -115,11 +104,6 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
         return with_cors(resp);
     }
 
-    // SQLite speaks libsql/Hrana, not a wire protocol on a published port: its
-    // engine is a FILE on `Database::host_node`, so it has no `local_port` and
-    // its handler does its own owner routing (proxying to that node rather than
-    // opening a second, empty file here). Branch BEFORE the `local_port`
-    // requirement below, which is a Postgres/Redis concept.
     if db.kind == DbKind::Sqlite {
         let (_parts, body) = req.into_parts();
         let bytes = match axum::body::to_bytes(body, BODY_CAP).await {
@@ -138,12 +122,6 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
         ));
     };
 
-    // Cap concurrent REST-originated engine connections PER DB. Every call opens
-    // a fresh connection (no pool — see resp.rs/run_sql doc comments); without a
-    // cap, a burst of REST callers could exhaust the container's own
-    // max_connections (Postgres default 100) and starve the app's OWN
-    // DATABASE_URL clients on the same engine. Reserves headroom rather than
-    // eliminating the risk entirely (still correct-first, not a real pool).
     let Some(_permit) = rest_conn_permit(&db.id) else {
         return with_cors(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -151,13 +129,9 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
         ));
     };
 
-    // ---- Dispatch by engine kind ----------------------------------------------
     let out = match db.kind {
         DbKind::Redis => redis_rest(&db, local_port, &method, &path, req).await,
         DbKind::Postgres => postgres_rest(&db, local_port, &method, &path, req).await,
-        // Native HTTP kinds already have their REST surface on the platform API
-        // (team-scoped, JWT/API-key auth). Point there rather than duplicating a
-        // second, differently-authenticated copy of those routes here.
         _ => err(
             StatusCode::NOT_IMPLEMENTED,
             &format!(
@@ -192,8 +166,6 @@ fn rest_conn_permit(db_id: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
     sem.try_acquire_owned().ok()
 }
 
-// ---- Redis: Upstash-compatible ------------------------------------------------
-
 async fn redis_rest(
     db: &Database,
     port: u16,
@@ -202,15 +174,6 @@ async fn redis_rest(
     req: Request,
 ) -> Response {
     let password = db.connection.get("password").cloned().unwrap_or_default();
-    // `Upstash-Encoding: base64` (sent BY DEFAULT by @upstash/redis >=1.x):
-    // the client base64-DECODES every string result (except the literal "OK")
-    // after parsing the JSON. Ignoring the header corrupts every read for
-    // those clients — a stored value that happens to be base64-alphabet text
-    // decodes into garbage ("flow" → "~Z0" was the live fingerprint: a
-    // workflow app's queue route double-decoded into a 404 URL and every CBOR
-    // blob into "Unexpected end of CBOR data", stalling all its runs). Honor
-    // it: base64-encode string results server-side so the client's decode is
-    // a clean round-trip.
     let b64 = req
         .headers()
         .get("upstash-encoding")
@@ -218,7 +181,6 @@ async fn redis_rest(
         .map(|v| v.eq_ignore_ascii_case("base64"))
         .unwrap_or(false);
 
-    // GET /<CMD>/<arg>/<arg>: path segments are the command, URL-decoded.
     if method == Method::GET && path != "/" && !path.is_empty() {
         let parts: Vec<String> = path
             .trim_matches('/')
@@ -249,7 +211,6 @@ async fn redis_rest(
         return err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     };
 
-    // POST /pipeline: [["SET","a","1"],["GET","a"]] → one reply object per command.
     if path == "/pipeline" {
         let cmds: Vec<Vec<String>> = match serde_json::from_slice::<Vec<Vec<Value>>>(&body) {
             Ok(c) if !c.is_empty() => c
@@ -302,7 +263,6 @@ async fn redis_rest(
         };
     }
 
-    // POST /: single command array ["SET","k","v"].
     let parts: Vec<String> = match serde_json::from_slice::<Vec<Value>>(&body) {
         Ok(p) if !p.is_empty() => p.into_iter().map(json_arg).collect(),
         Ok(_) => return err(StatusCode::BAD_REQUEST, "command array must be non-empty"),
@@ -319,12 +279,13 @@ async fn redis_rest(
     run_redis(port, &password, &parts, b64).await
 }
 
-/// Mirror of the @upstash/redis client's response decode, applied in the
-/// ENCODE direction (its `decode()` is: number/undefined unchanged; array →
-/// per-element string-decode with recursion into nested arrays; string → "OK"
-/// passthrough else base64decode). Encoding every non-"OK" string — including
-/// numeric-looking ones — is the correct round-trip: the client decodes them
-/// back verbatim.
+/// Mirror of the @upstash/redis client's response decode, in the ENCODE direction (its `decode()`:
+/// numbers/undefined unchanged, arrays decoded per element recursively, strings "OK" passthrough
+/// else base64-decoded). `Upstash-Encoding: base64` is sent BY DEFAULT by @upstash/redis >=1.x, so
+/// ignoring it corrupts every read for those clients (a stored value that happens to be
+/// base64-alphabet text decodes to garbage, e.g. "flow" to "~Z0", which broke a workflow app's
+/// queue route and every CBOR blob); encoding every non-"OK" string, numeric-looking ones included,
+/// is the correct round-trip.
 fn maybe_b64(v: Value, on: bool) -> Value {
     use base64::Engine as _;
     if !on {
@@ -357,15 +318,12 @@ async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Re
     }
 }
 
-/// Commands that reconfigure/kill the engine or leak host state are refused —
-/// the REST bearer proves access to the DATA, not to engine administration.
-/// (Upstash blocks the same class.) ALSO denied: server-side scripting/functions
-/// (EVAL/FUNCTION LOAD can persist and run arbitrary Lua, and EVAL can reach
-/// non-noscript commands like MIGRATE even though MIGRATE itself is denied —
-/// scripting is a real bypass of this list, not just an admin convenience) and
-/// the SUBSCRIBE family (RESP2 emits >1 reply frame per command / unsolicited
-/// pushes once subscribed, which desyncs `run_pipeline`'s one-reply-per-command
-/// assumption and silently misattributes later replies to the wrong command).
+/// Commands that reconfigure/kill the engine or leak host state are refused: the REST bearer proves
+/// access to the DATA, not engine administration (Upstash blocks the same class). Also denied:
+/// server-side scripting (EVAL/FUNCTION LOAD persist and run arbitrary Lua, and EVAL can reach
+/// commands like MIGRATE even though MIGRATE itself is denied: a real bypass of this list) and the
+/// SUBSCRIBE family (RESP2 emits more than one reply frame per command, which desyncs
+/// `run_pipeline`'s one-reply-per-command assumption and misattributes later replies).
 fn command_denied(cmd: &str) -> Option<Response> {
     const DENY: &[&str] = &[
         "shutdown",
@@ -427,8 +385,6 @@ fn json_arg(v: Value) -> String {
     }
 }
 
-// ---- Postgres: SQL over HTTP ----------------------------------------------------
-
 #[derive(serde::Deserialize)]
 struct SqlReq {
     query: String,
@@ -436,6 +392,8 @@ struct SqlReq {
     params: Vec<Value>,
 }
 
+/// SQL over HTTP (`POST /sql`): the caller's own failing query (syntax, constraint, type) surfaces
+/// verbatim as a 400, an unreachable engine is a 502 and a query past `ENGINE_TIMEOUT` a 504.
 async fn postgres_rest(
     db: &Database,
     port: u16,
@@ -473,8 +431,6 @@ async fn postgres_rest(
     {
         Ok(Ok(v)) => ok_json(v),
         Ok(Err(e)) => {
-            // Surface the real Postgres error (it's the caller's own query failing —
-            // syntax, constraint, type). Engine-unreachable stays a 502.
             let msg = e.to_string();
             if msg.contains("unreachable") || msg.contains("connect") {
                 err(
@@ -489,17 +445,14 @@ async fn postgres_rest(
     }
 }
 
-/// A parameter bound in Postgres TEXT wire format, whatever type the server
-/// inferred for it. `prepare_typed` declares every param `UNKNOWN`, so the
-/// server resolves each to its real context type (e.g. `$1::int`, `where id =
-/// $1`) and reports THAT resolved type back — `Option<String>`'s `ToSql::accepts`
-/// only matches text-ish types, so binding a resolved `int4`/`bool`/`jsonb`/...
-/// param as a plain string FAILS ("error serializing parameter"), even though
-/// the exact same text would work as a quoted SQL literal. `accepts` here
-/// unconditionally returns true and `encode_format` forces `Format::Text`, so
-/// the server parses the raw bytes with that type's own text input function —
-/// i.e. behaves exactly like a literal, for every type, while keeping the bind
-/// REAL (no string interpolation into the query text).
+/// A parameter bound in Postgres TEXT wire format, whatever type the server inferred for it.
+/// `prepare_typed` declares every param `UNKNOWN`, so the server resolves each to its real context
+/// type (`$1::int`, `where id = $1`) and reports THAT type back; `Option<String>`'s
+/// `ToSql::accepts` only matches text-ish types, so binding a resolved `int4`/`bool`/`jsonb` param
+/// as a plain string FAILS even though the same text works as a quoted literal. `accepts` here
+/// always returns true and `encode_format` forces `Format::Text`, so the server parses the raw
+/// bytes with that type's own text input function: it behaves exactly like a literal for every type
+/// while the bind stays REAL (no interpolation into the query text).
 #[derive(Debug)]
 struct TextParam(Option<String>);
 
@@ -547,14 +500,10 @@ async fn run_sql(
         .connect(tokio_postgres::NoTls)
         .await
         .map_err(|e| anyhow::anyhow!("engine unreachable: {e}"))?;
-    // Drive the connection; it ends when client drops.
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
 
-    // Params are declared `unknown` so Postgres infers each from query context —
-    // exactly like a quoted literal ('42' works where an int is expected). This
-    // keeps binding REAL (no interpolation) while accepting JSON scalars as text.
     let param_types = vec![Type::UNKNOWN; r.params.len()];
     let stmt = client.prepare_typed(&r.query, &param_types).await?;
     let params: Vec<TextParam> = r
@@ -566,7 +515,7 @@ async fn run_sql(
                 Value::String(s) => Some(s.clone()),
                 Value::Number(n) => Some(n.to_string()),
                 Value::Bool(b) => Some(b.to_string()),
-                other => Some(other.to_string()), // arrays/objects → JSON text (for json/jsonb params)
+                other => Some(other.to_string()),
             })
         })
         .collect();
@@ -598,8 +547,6 @@ async fn run_sql(
             );
         }
     }
-    // For INSERT/UPDATE/DELETE without RETURNING the row stream is empty but the
-    // affected-count is real signal.
     let affected = stream.rows_affected().unwrap_or(rows_json.len() as u64);
     let fields: Vec<Value> = stmt
         .columns()
@@ -612,12 +559,10 @@ async fn run_sql(
     Ok(json!({ "fields": fields, "rows": rows_json, "rowCount": affected }))
 }
 
-/// A permissive text decode used ONLY for types whose binary wire format is
-/// known to be exactly UTF-8 bytes (enum labels — verified: Postgres encodes an
-/// enum value's binary representation as its label text, same as the text
-/// format). Do NOT reuse this for arbitrary unknown types: most binary formats
-/// (interval, money, inet, time, composite...) are NOT text, and mis-decoding
-/// them as UTF-8 would silently return garbled data — worse than an error.
+/// A permissive text decode used ONLY for types whose binary wire format is exactly UTF-8 bytes
+/// (enum labels: Postgres encodes an enum's binary form as its label text). Never reuse it for
+/// arbitrary unknown types: most binary formats (interval, money, inet, time, composite...) are NOT
+/// text, and decoding them as UTF-8 would silently return garbled data, worse than an error.
 struct AnyUtf8(String);
 impl<'a> tokio_postgres::types::FromSql<'a> for AnyUtf8 {
     fn from_sql(
@@ -631,12 +576,13 @@ impl<'a> tokio_postgres::types::FromSql<'a> for AnyUtf8 {
     }
 }
 
-/// Decode one column to JSON by its Postgres type. A real SQL NULL decodes as
-/// `Value::Null`; a type this gateway genuinely can't decode (arrays, ranges,
-/// composites, money/inet/interval/time/oid, ...) FAILS LOUD with the column
-/// name + Postgres type name in the error (visible in the HTTP response) rather
-/// than silently returning null indistinguishable from a real NULL — cast it in
-/// the query (e.g. `::text`, `::float8`) to bridge.
+/// Decodes one column to JSON by its Postgres type. A real SQL NULL is `Value::Null`; a type this
+/// gateway cannot decode (arrays, ranges, composites, money/inet/interval/time/oid, ...) FAILS LOUD
+/// with the column name and type name in the HTTP response rather than returning a null
+/// indistinguishable from a real NULL: cast it in the query (`::text`, `::float8`) to bridge. Enum
+/// labels are UTF-8 on the wire whatever the enum's OID, so `Kind` is checked before the static
+/// type match; NUMERIC is serialized as a STRING, since it routinely exceeds f64 precision (as
+/// Neon/Upstash-style APIs do).
 fn col_to_json(
     row: &tokio_postgres::Row,
     i: usize,
@@ -647,8 +593,6 @@ fn col_to_json(
     let wrong_type = |e: tokio_postgres::Error| {
         anyhow::anyhow!("column \"{name}\" has unsupported type \"{}\" over REST ({e}) — cast it in the query (e.g. ::text, ::float8)", ty.name())
     };
-    // Enum labels are UTF-8 text on the wire regardless of the specific enum
-    // type's OID, so check Kind before the static-Type match below.
     if matches!(ty.kind(), Kind::Enum(_)) {
         return match row.try_get::<_, Option<AnyUtf8>>(i) {
             Ok(v) => Ok(v.map(|s| Value::String(s.0)).unwrap_or(Value::Null)),
@@ -680,9 +624,6 @@ fn col_to_json(
             .try_get::<_, Option<f64>>(i)
             .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
             .map_err(wrong_type),
-        // Serialized as a STRING (not f64): NUMERIC routinely exceeds f64
-        // precision (money/quantities), and Neon/Upstash-style REST APIs do the
-        // same to avoid silent precision loss.
         Type::NUMERIC => row
             .try_get::<_, Option<rust_decimal::Decimal>>(i)
             .map(|v| {
@@ -732,9 +673,6 @@ fn col_to_json(
                 .unwrap_or(Value::Null)
             })
             .map_err(wrong_type),
-        // TEXT/VARCHAR/NAME/BPCHAR (+ citext/ltree family) decode as text; any
-        // other type falls through to the same call, which fails loud via
-        // `wrong_type` rather than swallowing the error as null.
         _ => row
             .try_get::<_, Option<String>>(i)
             .map(|v| v.map(Value::String).unwrap_or(Value::Null))
@@ -742,15 +680,11 @@ fn col_to_json(
     }
 }
 
-// ---- Shared plumbing -------------------------------------------------------------
-
-/// Which of this DB's credentials the REST bearer may match. When a DEDICATED,
-/// independently-revocable REST token exists (`UPSTASH_REDIS_REST_TOKEN` for
-/// redis, `DB_REST_TOKEN` for postgres) ONLY that token authorizes REST — the
-/// raw engine `password` is NOT accepted, so REST access is separated from and
-/// revocable without the engine credential. The `password` fallback applies
-/// only to legacy databases provisioned before dedicated tokens existed.
-/// Constant-time comparison throughout.
+/// Which of this DB's credentials the REST bearer may match: when a DEDICATED, independently
+/// revocable REST token exists (`UPSTASH_REDIS_REST_TOKEN` for redis, `DB_REST_TOKEN` for postgres)
+/// ONLY that token authorizes REST, never the raw engine `password`, so REST access is separate
+/// from and revocable without the engine credential. The `password` fallback is for legacy
+/// databases provisioned before dedicated tokens. Constant-time comparison throughout.
 pub(crate) fn credential_matches(db: &Database, bearer: &str) -> bool {
     let dedicated: Vec<&String> = ["UPSTASH_REDIS_REST_TOKEN", "DB_REST_TOKEN"]
         .iter()
@@ -762,7 +696,6 @@ pub(crate) fn credential_matches(db: &Database, bearer: &str) -> bool {
             .iter()
             .any(|v| ct_eq(v.as_bytes(), bearer.as_bytes()));
     }
-    // Legacy DB with no dedicated REST token: fall back to the engine password.
     match db.connection.get("password") {
         Some(v) if !v.is_empty() => ct_eq(v.as_bytes(), bearer.as_bytes()),
         _ => false,
@@ -777,13 +710,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-// ---------------------------------------------------------------------------
-// Pinned Supabase Studio edge cache
-// ---------------------------------------------------------------------------
-
-/// This is the exact image provisioned by `databases::supabase_stack_args`.
-/// It is part of the cache identity: changing the pin in that builder requires
-/// changing this discriminator, and a process restart starts with an empty map.
+/// The exact image provisioned by `databases::supabase_stack_args`, and part of the cache identity:
+/// changing the pin there requires changing this discriminator (a restart starts with an empty
+/// map).
 const STUDIO_IMAGE_PIN: &str = "2026.02.16-sha-26c615c";
 const STUDIO_EDGE_CACHE_MAX_ENTRIES: usize = 512;
 const STUDIO_EDGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -834,9 +763,9 @@ static STUDIO_EDGE_CACHE: std::sync::OnceLock<parking_lot::Mutex<StudioEdgeCache
 static STUDIO_EDGE_FILL_LOCKS: std::sync::OnceLock<[tokio::sync::Mutex<()>; 64]> =
     std::sync::OnceLock::new();
 
-/// Percent escapes are deliberately refused: reqwest's URL parser can normalize
-/// encoded dot-segments after this edge has classified the original path, which
-/// must never turn a public favicon route into a different upstream route.
+/// Percent escapes are refused: reqwest's URL parser can normalize encoded dot-segments after this
+/// edge classified the original path, which must never turn a public favicon route into a different
+/// upstream route.
 fn studio_safe_asset_path(path: &str) -> bool {
     path.len() <= 512
         && !path.split('/').any(|segment| segment == "..")
@@ -845,9 +774,11 @@ fn studio_safe_asset_path(path: &str) -> bool {
         })
 }
 
-/// Positive allowlist derived from the pinned image's Next.js build and public
-/// tree. `/api`, `/_next/data`, the login exchange, mutations and every unknown
-/// route never enter this lane and retain ordinary owner routing.
+/// Positive allowlist derived from the pinned image's Next.js build and public tree: `/api`,
+/// `/_next/data`, the login exchange, mutations and every unknown route never enter this lane and
+/// keep ordinary owner routing. The shell and immutable assets are cached node-locally only after
+/// this edge repeats the ordinary Studio auth gate, before the owner hop and deliberately not as a
+/// CCN lookup.
 fn studio_cache_candidate(req: &Request) -> Option<StudioCacheKind> {
     if !matches!(*req.method(), Method::GET | Method::HEAD)
         || req.uri().query().is_some()
@@ -937,9 +868,9 @@ fn studio_unauthorized() -> Response {
     response
 }
 
-/// A Studio-owned cookie may affect its representation. Only requests carrying
-/// no cookies, or solely this edge's stripped-before-upstream session cookie,
-/// are eligible for a shared per-database cache entry.
+/// A Studio-owned cookie may affect the representation: only requests with no cookies, or solely
+/// this edge's session cookie (stripped before upstream), are eligible for a shared per-database
+/// cache entry.
 fn studio_has_upstream_cookie(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::COOKIE)
@@ -955,9 +886,9 @@ fn studio_has_upstream_cookie(headers: &HeaderMap) -> bool {
         })
 }
 
-/// Collapse arbitrary Accept-Encoding syntax to the one encoding this edge will
-/// actually offer upstream. The cache therefore has exactly four representation
-/// variants instead of one attacker-controlled variant per raw header spelling.
+/// Collapses arbitrary Accept-Encoding syntax to the one encoding this edge offers upstream, so the
+/// cache has exactly four representation variants instead of one attacker-controlled variant per
+/// raw header spelling.
 fn studio_encoding_variant(headers: &HeaderMap) -> Option<&'static str> {
     const SUPPORTED: [&str; 4] = ["br", "gzip", "deflate", "identity"];
     let mut quality = [None; 4];
@@ -1024,6 +955,8 @@ fn studio_cache_get(key: &str) -> Option<Arc<StudioCachedResponse>> {
     Some(entry.response.clone())
 }
 
+/// Per-database pressure evicts only that database; global favicon pressure evicts only public
+/// favicon entries, never another database's authenticated shells or assets.
 fn studio_cache_insert(key: String, db_id: &str, response: StudioCachedResponse) {
     let size = response.body.len();
     if size > STUDIO_EDGE_CACHE_MAX_ENTRY_BYTES {
@@ -1067,9 +1000,6 @@ fn studio_cache_insert(key: String, db_id: &str, response: StudioCachedResponse)
         if !over_db && !over_class {
             break;
         }
-        // Per-database pressure can evict only that database. Global favicon
-        // pressure can evict only public favicon entries, never authenticated
-        // shells/assets belonging to another database.
         let victim_db = over_db.then_some(db_id);
         let Some(oldest) = cache
             .entries
@@ -1103,10 +1033,10 @@ fn studio_cache_insert(key: String, db_id: &str, response: StudioCachedResponse)
     );
 }
 
+/// The shell URL is stable rather than content-addressed: it is cached at the edge under the image
+/// pin, but browsers must revalidate promptly.
 fn studio_cache_control(kind: StudioCacheKind) -> &'static str {
     match kind {
-        // The shell URL is stable rather than content-addressed: cache it at the
-        // edge under the image pin, but make browsers revalidate promptly.
         StudioCacheKind::Shell => "private, max-age=60, must-revalidate",
         StudioCacheKind::NextStatic => "private, max-age=31536000, immutable",
         StudioCacheKind::Image => "private, max-age=2592000",
@@ -1241,9 +1171,9 @@ async fn studio_require_empty_body(req: Request) -> Result<Request, Response> {
     }
 }
 
-/// Buffer a cache candidate only while it fits. Once the cap is crossed, replay
-/// the already-read prefix and stream the untouched remainder to the client;
-/// cache admission must never turn a valid large Studio asset into a 502.
+/// Buffers a cache candidate only while it fits; once the cap is crossed the already-read prefix is
+/// replayed and the untouched remainder streamed to the client, so cache admission never turns a
+/// valid large Studio asset into a 502.
 async fn studio_buffer_cache_candidate(response: Response) -> Result<axum::body::Bytes, Response> {
     use futures::StreamExt;
 
@@ -1276,6 +1206,10 @@ async fn studio_buffer_cache_candidate(response: Response) -> Result<axum::body:
     Ok(axum::body::Bytes::from(body))
 }
 
+/// A HEAD miss cannot populate a GET representation and keeps the owner's original status and
+/// validators. A fill forces the representation promised by the bounded cache key and suppresses
+/// client validators only for the fill: the client's own conditions are evaluated against the
+/// completed representation.
 async fn studio_cached_route(
     cloud: &Arc<CloudState>,
     db: &Database,
@@ -1298,8 +1232,6 @@ async fn studio_cached_route(
     if let Some(cached) = studio_cache_get(&key) {
         return studio_cached_response(&cached, &method, &request_headers);
     }
-    // A HEAD miss cannot populate a GET representation; preserve the owner's
-    // original status and validators rather than synthesizing either.
     if method == Method::HEAD {
         req.headers_mut().insert(
             header::ACCEPT_ENCODING,
@@ -1318,9 +1250,6 @@ async fn studio_cached_route(
         return studio_cached_response(&cached, &method, &request_headers);
     }
 
-    // Force the representation promised by the bounded cache key and suppress
-    // client validators only for the fill. The client's original conditions are
-    // evaluated against the completed representation below.
     req.headers_mut().insert(
         header::ACCEPT_ENCODING,
         header::HeaderValue::from_static(encoding),
@@ -1355,13 +1284,9 @@ async fn studio_cached_route(
     studio_rebuild_response(status, &headers, body)
 }
 
-// ---------------------------------------------------------------------------
-// Supabase Studio edge arm (DbKind::Supabase)
-// ---------------------------------------------------------------------------
-
-/// HMAC-SHA256 over length-delimited ticket/session fields, keyed with this
-/// database's generated STUDIO_PASSWORD. Tickets additionally bind a CSPRNG
-/// nonce; sessions deliberately use a separate domain and no replay state.
+/// HMAC-SHA256 over length-delimited ticket/session fields, keyed with this database's generated
+/// STUDIO_PASSWORD. Tickets also bind a CSPRNG nonce; sessions use a separate domain and carry no
+/// replay state.
 fn studio_mac(
     studio_password: &str,
     domain: &str,
@@ -1397,9 +1322,8 @@ fn lowercase_hex(value: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
-/// Mint a nonce-bearing one-use ticket bound to the exact node that must
-/// durably consume it. `Uuid::new_v4` uses the OS CSPRNG and is already the
-/// repository's credential/token nonce source.
+/// Mints a nonce-bearing one-use ticket bound to the exact node that must durably consume it
+/// (`Uuid::new_v4` is the OS CSPRNG, the repository's credential/token nonce source).
 pub(crate) fn mint_studio_ticket(
     studio_password: &str,
     db_id: &str,
@@ -1437,9 +1361,9 @@ fn mint_studio_session(studio_password: &str, db_id: &str) -> String {
     )
 }
 
-/// Strictly parse and authenticate a versioned, issuer-bound ticket. Legacy
-/// tickets fail closed: without a signed authority there is no linearizable
-/// node to consult during a control-leader flap.
+/// Strictly parses and authenticates a versioned, issuer-bound ticket. Legacy tickets fail closed:
+/// without a signed authority there is no linearizable node to consult during a control-leader
+/// flap.
 fn verify_studio_ticket(
     studio_password: &str,
     db_id: &str,
@@ -1567,10 +1491,9 @@ fn studio_replay_accepted(envelope: &Value) -> Option<bool> {
         .as_bool()
 }
 
-/// Studio envelopes can carry Basic credentials, session cookies, or a replay
-/// decision. Never put those on a plaintext cross-node admin hop or allow an
-/// HTTPS endpoint to redirect the envelope to one; iroh is E2E encrypted, while
-/// a non-redirecting HTTPS admin URL remains an authenticated fallback.
+/// Studio envelopes can carry Basic credentials, session cookies or a replay decision, so they
+/// never ride a plaintext cross-node admin hop nor an HTTPS endpoint that may redirect them to one;
+/// iroh is E2E encrypted, and a non-redirecting HTTPS admin URL remains an authenticated fallback.
 fn studio_secure_admin_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .ok()
@@ -1589,6 +1512,9 @@ fn studio_admin_http() -> &'static reqwest::Client {
 
 /// Consume at the immutable authority signed into the ticket. Recomputing the
 /// control leader here would create overlapping writers during a leader flap.
+/// A success header means the immutable authority may already have durably consumed the nonce, so a
+/// missing or malformed body is ambiguous and fails closed: the write is never retried over the
+/// second transport.
 async fn consume_studio_ticket_nonce(
     cloud: &Arc<CloudState>,
     db_id: &str,
@@ -1642,10 +1568,6 @@ async fn consume_studio_ticket_nonce(
         }
         if let Ok(response) = request.send().await {
             if response.status().is_success() {
-                // A success header means the immutable authority may already have
-                // durably consumed the nonce. Any missing/malformed body is
-                // therefore ambiguous and must fail closed, never retry the write
-                // over the second transport.
                 return studio_read_http_envelope(response)
                     .await
                     .ok()
@@ -1696,10 +1618,9 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 
-/// Public, credential-free receiver for the dashboard's cross-origin
-/// `postMessage`. The ticket stays out of every URL and only this same-origin
-/// page creates the POST form, so the dashboard's `form-action 'self'` CSP does
-/// not block the exchange.
+/// Public, credential-free receiver for the dashboard's cross-origin `postMessage`: the ticket
+/// stays out of every URL and only this same-origin page creates the POST form, so the dashboard's
+/// `form-action 'self'` CSP does not block the exchange.
 fn studio_login_bootstrap(head: bool) -> Response {
     const HTML: &str = r#"<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Opening Supabase Studio…</title><style>body{font:14px system-ui;margin:32px;color:#555}</style><p id="status">Opening Supabase Studio…</p><script>(()=>{let used=false;addEventListener("message",event=>{const data=event.data;if(used||!data||data.type!=="hive-studio-login-ticket"||typeof data.ticket!=="string")return;used=true;try{event.source.postMessage({type:"hive-studio-login-received"},event.origin)}catch{}const form=document.createElement("form");form.method="POST";form.action=location.pathname;form.enctype="application/x-www-form-urlencoded";const ticket=document.createElement("input");ticket.type="hidden";ticket.name="ticket";ticket.value=data.ticket;form.appendChild(ticket);document.body.replaceChildren(form);form.submit()})})()</script>"#;
     Response::builder()
@@ -1731,34 +1652,33 @@ const STUDIO_TICKET_MAX_BYTES: usize = 320;
 const STUDIO_SESSION_MAX_BYTES: usize = 96;
 const STUDIO_LOGIN_BODY_CAP: usize = STUDIO_TICKET_MAX_BYTES + "ticket=".len();
 
-/// The whole `<slug>.{db_domain}` hostname of a Supabase database IS the
-/// Studio dashboard: basic-auth gate (the generated STUDIO_USERNAME /
-/// STUDIO_PASSWORD — the `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` mechanism
-/// the upstream stack's Kong enforces on its `/` catch-all, `hide_credentials`
-/// included: the Authorization header is checked here and never forwarded),
-/// then a streaming reverse proxy to the studio container's loopback port.
+/// The whole `<slug>.{db_domain}` hostname of a Supabase database IS the Studio dashboard: a
+/// basic-auth gate (the generated STUDIO_USERNAME/STUDIO_PASSWORD, the upstream Kong's
+/// `DASHBOARD_*` mechanism with `hide_credentials`: the Authorization header is checked here and
+/// never forwarded), then a streaming reverse proxy to the studio container's loopback port. It
+/// runs on the database's host node (the per-database DNS record is owner-affine); a request
+/// landing on any OTHER node is forwarded to `Database::host_node` by `studio_forward_to_owner` as
+/// a bounded base64 JSON envelope of the whole exchange, and the owner re-runs the same Basic-auth
+/// check against its own credentials: an edge forwards bytes, it never authenticates on the
+/// tenant's behalf.
 ///
-/// Runs on the database's host node on the normal path: the per-database DNS
-/// record is owner-affine. A request landing on any OTHER node — stale client
-/// DNS after an owner move, or the healthy-wildcard fallback while no owner
-/// record is publishable — is forwarded to `Database::host_node` by
-/// `studio_forward_to_owner` below. That wraps the whole HTTP exchange
-/// (method/path/headers/body, then status/headers/body back) in a bounded
-/// base64 JSON envelope over the SAME dual-transport shape used by
-/// `hrana::forward_to_owner` — authenticated HTTPS admin when configured,
-/// otherwise the E2E-encrypted gossip mesh. The owner still runs this exact
-/// same Basic-auth check against its own generated credentials, so the
-/// security boundary is unchanged: an edge forwards bytes, it never
-/// authenticates on the tenant's behalf.
+/// The platform edge IS this stack's Kong: `/auth/v1`, `/rest/v1`, `/storage/v1` and `/graphql/v1`
+/// (mapped to PostgREST's `/rpc/graphql`) route to the sidecars' loopback ports with the prefix
+/// STRIPPED, authenticated by the services' own apikey/JWT (the public data-plane model of hosted
+/// Supabase), so the Studio Basic gate does not apply there and the Authorization header is
+/// stripped ONLY on the Studio plane (stripping it on the data plane would 401 every authenticated
+/// call). `/favicon/` PWA assets are served ungated (Chrome fetches them WITHOUT credentials by
+/// spec, so they could never pass Basic; they are static image bytes disclosing nothing the 401's
+/// realm does not). The one-time login exchange is intercepted at its reserved path for every
+/// method, so neither a token nor a malformed exchange reaches Studio, and the edge session cookie
+/// authenticates only this proxy (never leaked upstream; Studio-owned cookies pass verbatim).
+///
+/// The request body is buffered to a Studio-appropriate cap (SQL/CSV imports) while the response is
+/// streamed (multi-MB bundles). A reverse proxy must RELAY redirects, never follow them: reqwest's
+/// default policy swallowed Studio's own `GET / -> 307 /project/default`, so Next.js hydration
+/// threw before first paint (hence the `NO_REDIRECT` client), and a `Location` is rewritten so the
+/// browser is never sent to an internal origin.
 async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Request) -> Response {
-    // ---- Data plane (/auth/v1, /rest/v1, /storage/v1, /graphql/v1) ---------
-    // The platform edge IS this stack's Kong: these prefixes route to the
-    // GoTrue/PostgREST/storage-api sidecars' loopback ports with the prefix
-    // STRIPPED (upstream kong.yml's strip_path semantics; /graphql/v1 maps to
-    // PostgREST's /rpc/graphql exactly as upstream routes it). AuthN here is
-    // the services' own apikey/JWT validation — the same public data-plane
-    // model as hosted Supabase — so the Studio Basic gate deliberately does
-    // not apply; it keeps guarding everything else (the dashboard).
     let raw_path = req.uri().path().to_string();
     let raw_q = req
         .uri()
@@ -1781,21 +1701,11 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         && studio_safe_asset_path(&raw_path)
         && (req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD)
     {
-        // PWA branding assets: Chrome fetches `<link rel="manifest">`
-        // (and the icons it names, all under /favicon/) WITHOUT
-        // credentials by spec, so they can never pass the Basic gate —
-        // every page load logged a 401 console error. They are static
-        // Studio-image bytes ("Supabase Studio" + icons), disclosing
-        // nothing the 401's own realm string didn't already.
         Some(("studio_port", format!("{raw_path}{raw_q}")))
     } else {
         None
     };
 
-    // ---- One-time login exchange (never forwarded upstream) -----------------
-    // The tenant-authorized API returns the ticket in JSON; the dashboard POSTs
-    // it here as a small form body. Intercept every method at this reserved path
-    // so neither a token nor a malformed exchange can reach Studio.
     let studio_password = db
         .connection
         .get("STUDIO_PASSWORD")
@@ -1878,7 +1788,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         return response;
     }
 
-    // ---- AuthN: same edge session / constant-time Basic gate on every lane ---
     let ok = data_plane.is_some()
         || studio_session_ok(db, req.headers())
         || studio_basic_ok(db, req.headers());
@@ -1886,7 +1795,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         return studio_unauthorized();
     }
 
-    // ---- Proxy target: the member's loopback port on this node --------------
     let port_key = data_plane
         .as_ref()
         .map(|(k, _)| *k)
@@ -1898,8 +1806,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         .and_then(|p| p.parse::<u16>().ok())
     else {
         if data_plane.is_some() {
-            // Pre-sidecar record still awaiting the db-reconcile upgrade
-            // (`supa_backfill_sidecar_upgrade`) — honest and temporary.
             return err(
                 StatusCode::NOT_IMPLEMENTED,
                 "this Supabase stack's API sidecars are still being provisioned — retry shortly",
@@ -1930,11 +1836,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         .iter()
         .filter_map(|(k, v)| {
             let name = k.as_str().to_lowercase();
-            // Hop-by-hop + the gate itself: Kong's hide_credentials
-            // equivalent. The Basic gate's Authorization header is stripped
-            // ONLY on the Studio plane — data-plane requests carry the
-            // Bearer JWT the sidecar services themselves validate, and
-            // stripping it would 401 every authenticated REST/Storage call.
             if matches!(
                 name.as_str(),
                 "host"
@@ -1951,8 +1852,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
             }
             let value = v.to_str().ok()?;
             if name == "cookie" {
-                // The edge session authenticates only this proxy. Never leak it
-                // upstream, but preserve every Studio-owned cookie verbatim.
                 let kept = value
                     .split(';')
                     .filter(|cookie| {
@@ -1971,8 +1870,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
             Some((name, value.to_string()))
         })
         .collect();
-    // Buffered with a Studio-appropriate cap (SQL/CSV imports ride this body);
-    // the RESPONSE is streamed (Next.js asset bundles are multi-MB).
     const STUDIO_BODY_CAP: usize = 64 * 1024 * 1024;
     let body = match axum::body::to_bytes(req.into_body(), STUDIO_BODY_CAP).await {
         Ok(b) => b,
@@ -1980,14 +1877,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
     };
 
     let url = format!("http://127.0.0.1:{port}{path_q}");
-    // A reverse proxy must RELAY redirects, never follow them. `cloud.http`
-    // (reqwest's default policy) follows up to 10 server-side, so Studio's
-    // own `GET / -> 307 /project/default` was swallowed and the browser
-    // received the project page's static-export HTML at URL `/` — Next.js
-    // hydration then calls router.replace("/project/[ref]", "/"), which
-    // throws `incompatible href/as` before first paint and the app never
-    // renders (live-witnessed; the Location-rewrite arm below existed for
-    // exactly these redirects but never saw one).
     static NO_REDIRECT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let http = NO_REDIRECT.get_or_init(|| {
         reqwest::Client::builder()
@@ -2018,7 +1907,6 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
                 ) {
                     continue;
                 }
-                // Studio must never navigate the browser to an internal origin.
                 if lk == "location" {
                     if let Ok(loc) = v.to_str() {
                         let rewritten = loc
@@ -2054,12 +1942,9 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
     }
 }
 
-// ---- Studio owner proxy (mirrors hrana::forward_to_owner) -----------------
-
-/// Cap on the buffered body in either direction of a mesh-relayed Studio
-/// exchange — the mesh envelope can't stream, so both the forwarded request
-/// body and the owner's response are fully buffered; matches the existing
-/// `STUDIO_BODY_CAP` request-side cap used on the direct-serve path.
+/// Cap on the buffered body in either direction of a mesh-relayed Studio exchange (the mesh
+/// envelope cannot stream: the forwarded request and the owner's response are fully buffered);
+/// matches `STUDIO_BODY_CAP` on the direct-serve path.
 const STUDIO_MESH_BODY_CAP: usize = 64 * 1024 * 1024;
 const STUDIO_MESH_BODY_B64_CAP: usize = 4 * STUDIO_MESH_BODY_CAP.div_ceil(3);
 /// A 64 MiB body expands to ~85.4 MiB in the JSON base64 envelope. Keep the
@@ -2117,6 +2002,12 @@ impl StudioEnvelopeReadError {
     }
 }
 
+/// Forwards a Studio exchange to its owner: HTTPS admin first when configured (never plain HTTP:
+/// the envelope carries Basic/session credentials), then the E2E-encrypted iroh mesh, the real path
+/// on this fleet (loopback-only admin ports). An outcome that may already have executed a mutation
+/// (the owner sent success headers, then the envelope failed or was oversized) is answered with an
+/// honest typed 502 and NEVER replayed over the mesh; only reads, and statuses emitted before the
+/// owner's Studio handler, may fall through to the second transport.
 async fn studio_forward_to_owner(
     cloud: &Arc<CloudState>,
     db: &Database,
@@ -2157,9 +2048,6 @@ async fn studio_forward_to_owner(
     });
     let route = format!("/v1/databases/{}/studio-mesh", db.id);
 
-    // HTTPS admin first when one is configured. Plain HTTP is deliberately
-    // skipped because this envelope carries Basic/session credentials; the
-    // ordinary fleet path is the E2E-encrypted iroh mesh below.
     let admin = cloud
         .node_admins
         .read()
@@ -2184,10 +2072,6 @@ async fn studio_forward_to_owner(
         }
         match rb.send().await {
             Ok(r) if r.status().is_success() => {
-                // The owner may already have executed a mutation once it sends
-                // success headers. A failed/oversized envelope is an ambiguous
-                // outcome: return an honest typed 502 and never replay it over
-                // iroh.
                 return Some(
                     match studio_read_http_envelope(r).await.and_then(|v| {
                         studio_decode_envelope(&v).ok_or(StudioEnvelopeReadError::BodyRead)
@@ -2205,22 +2089,15 @@ async fn studio_forward_to_owner(
                         | StatusCode::NOT_FOUND
                         | StatusCode::METHOD_NOT_ALLOWED
                         | StatusCode::PAYLOAD_TOO_LARGE
-                ) =>
-            {
-                // These statuses are emitted before the Studio owner handler;
-                // falling through to the authenticated mesh does not replay it.
-            }
+                ) => {}
             Ok(_) => return Some(StudioEnvelopeReadError::TransportAmbiguous.response()),
             Err(_)
-                if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS =>
-            {
-                // Reads are replay-safe and may use the second transport.
+                if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS => {
             }
             Err(_) => return Some(StudioEnvelopeReadError::TransportAmbiguous.response()),
         }
     }
 
-    // Mesh fallback: the real path on this fleet (loopback-only admin ports).
     let target = cloud
         .registry
         .nodes()
@@ -2311,10 +2188,9 @@ fn studio_decode_envelope(v: &Value) -> Option<Response> {
     builder.body(axum::body::Body::from(body)).ok()
 }
 
-/// Owner-side handler for a forwarded Studio exchange (mesh + HTTP-admin
-/// entry points both call this). Re-validates that THIS node is still the
-/// owner before touching the container — a stale caller-side record must
-/// never cause a second node to answer for a database it doesn't host.
+/// Owner-side handler for a forwarded Studio exchange (the mesh and HTTP-admin entry points both
+/// call it): re-validates that THIS node is still the owner before touching the container, since a
+/// stale caller-side record must never make a second node answer for a database it does not host.
 pub(crate) async fn studio_mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value {
     use base64::Engine;
     let Some(db) = cloud.databases.get_raw(id) else {
@@ -2484,9 +2360,9 @@ async fn studio_mesh_route(
     axum::Json(studio_mesh_serve(&cloud, &id, &env).await)
 }
 
-/// `/v1/databases/:id/studio-mesh` — the owner-proxy mount, mirroring
-/// `hrana::routes()`'s `/hrana-mesh` mount exactly (same `owner_routed`
-/// exemption in `main.rs`, same gossip dispatch-arm shape in `gossip.rs`).
+/// `/v1/databases/:id/studio-mesh`, the owner-proxy mount mirroring `hrana::routes()`'s
+/// `/hrana-mesh` (same `owner_routed` exemption in `main.rs`, same gossip dispatch-arm shape in
+/// `gossip.rs`).
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     axum::Router::new().route(
         "/v1/databases/:id/studio-mesh",

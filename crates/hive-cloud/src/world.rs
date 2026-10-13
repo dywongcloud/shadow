@@ -1,26 +1,18 @@
-//! Read workflow RUN observability from an app's Vercel-WDK "world" store.
+//! Reads (and writes) workflow RUN state from an app's Vercel-WDK "world" store.
 //!
-//! Apps that use the WDK keep run/step/event state in a pluggable "world". The
-//! common self-host adapter is `@open-workflow/world-redis`, which stores entities
-//! in (Upstash) Redis as base64(CBOR(entity)) under a key prefix (default `owf`):
-//!   * ZSET `<p>:runs`            score=createdAt, member=runId
-//!   * STR  `<p>:run:<runId>`     base64(CBOR(WorkflowRun))
-//!   * ZSET `<p>:steps:<runId>`   member=stepId
-//!   * STR  `<p>:step:<runId>:<stepId>`  base64(CBOR(Step))
-//!   * LIST `<p>:events:<runId>` + HASH `<p>:eventdata:<runId>` eventId->base64(CBOR)
+//! Apps using the WDK keep run/step/event state in a pluggable "world"; the common self-host
+//! adapter is `@open-workflow/world-redis`, which stores entities in (Upstash) Redis as
+//! base64(CBOR(entity)) under a key prefix (default `owf`): ZSET `<p>:runs` (score createdAt,
+//! member runId), STR `<p>:run:<runId>`, ZSET `<p>:steps:<runId>`, STR `<p>:step:<runId>:<stepId>`,
+//! LIST `<p>:events:<runId>` + HASH `<p>:eventdata:<runId>`.
 //!
-//! We read it directly over the Upstash REST API using the project's own env
-//! (`WORKFLOW_REDIS_REST_URL`/`_TOKEN`, falling back to `UPSTASH_REDIS_REST_*`),
-//! which the platform stores per-project. This MUST run on the node that holds
-//! the project's decrypted env (its host) — `env_map` only decrypts locally — so
-//! the coordinator proxies these reads to the hosting node (cross-region aware).
+//! The project's own env (`WORKFLOW_REDIS_REST_URL`/`_TOKEN`, else `UPSTASH_REDIS_REST_*`) is read
+//! over the Upstash REST API, which MUST run on the node holding the project's decrypted env (its
+//! host: `env_map` only decrypts locally), so the coordinator proxies these reads and the writes
+//! below to the hosting node over the mesh.
 //!
-//! ## Managed-world conformance (`@workflow/world` / world-vercel)
-//!
-//! Beyond reads, the lower half of this module is a WRITE layer that conforms to
-//! the Vercel WDK `@workflow/world` contract at the interface + store-schema
-//! level (the same level `world-redis`/`world-vercel`/`world-local` conform),
-//! adapted to hive's iroh p2p multi-region infrastructure:
+//! The lower half is a WRITE layer conforming to the `@workflow/world` contract at the interface +
+//! store-schema level:
 //!
 //! | @workflow/world concept        | hive mapping                                   |
 //! |--------------------------------|------------------------------------------------|
@@ -37,15 +29,14 @@
 //! | status union / EventType enum  | upstream vocab (pending/running/completed/…)   |
 //! | multi-region write routing     | host-routed over iroh, exactly like reads      |
 //!
-//! Storage lives in the PROJECT'S OWN world-redis store (the `owf:*` keys the
-//! app runtime replays from), never a hive-private store — so a hive-issued
-//! cancel/replay and the app's own runtime share one world state. The queue
-//! trigger uses the app's own `owf:job`/`owf:sched` schema, which the app's
-//! in-process world-redis dispatcher (50ms poll) delivers to
-//! `/.well-known/workflow/v1/flow`, so a resumed run actually EXECUTES. What is
-//! deliberately NOT reimplemented (Vercel-transport specifics, not part of the
-//! World contract): the v4 frame protocol, OIDC auth, s3rf:/kvrf: ref
-//! offloading, region-tagged ULIDs, VQS regional routing.
+//! Storage is the PROJECT'S OWN world-redis store (the `owf:*` keys the app runtime replays from),
+//! never a hive-private one, so a hive-issued cancel/replay and the app's runtime share one world
+//! state, and the queue trigger uses the app's own `owf:job`/`owf:sched` schema, which its
+//! in-process dispatcher (50 ms poll) delivers to `/.well-known/workflow/v1/flow`, so a resumed run
+//! actually EXECUTES. Every write takes the per-run lock `<p>:lock:run:<runId>` so it never
+//! interleaves with the app runtime's own writes. NOT reimplemented (Vercel-transport specifics
+//! outside the World contract): the v4 frame protocol, OIDC auth, s3rf:/kvrf: ref offloading,
+//! region-tagged ULIDs and VQS regional routing.
 
 use std::sync::Arc;
 
@@ -118,18 +109,12 @@ async fn pipeline(
         .unwrap_or_default()
 }
 
-/// Decode a base64(CBOR) blob into JSON (unwrapping cbor-x tags like Date).
-///
-/// Every failure path logs instead of silently returning `None` — the real
-/// `@workflow/world` spec has `SPEC_VERSION_SUPPORTS_COMPRESSION` (a
-/// gzip/zstd wrapper this fn has zero awareness of), so a future dispatcher
-/// version writing compressed payloads would otherwise make every read
-/// through here silently vanish rather than surface as a diagnosable error —
-/// the exact "decrypt returns ciphertext instead of failing" shape that cost
-/// real debugging time elsewhere in this codebase (see the at-rest-secret
-/// supersession incident). Distinguishes "this looks like a known
-/// compression format we don't handle" from genuine corruption so the two
-/// don't get confused when triaging a future occurrence.
+/// Decodes a base64(CBOR) blob into JSON (unwrapping cbor-x tags like Date). Every failure path
+/// logs instead of silently returning `None`: the real spec has `SPEC_VERSION_SUPPORTS_COMPRESSION`
+/// (a gzip/zstd wrapper this fn knows nothing of), so a future dispatcher writing compressed
+/// payloads would otherwise make every read vanish silently instead of surfacing as a diagnosable
+/// error (the "decrypt returns ciphertext instead of failing" shape). It distinguishes a known
+/// compression format we do not handle from genuine corruption.
 fn decode_blob(v: &Value) -> Option<Value> {
     let b64 = v.as_str().or_else(|| {
         tracing::warn!(value = %v, "decode_blob: stored value is not a string (expected base64)");
@@ -225,10 +210,10 @@ pub async fn list_runs(cloud: &Arc<CloudState>, project: &str, limit: usize) -> 
     Some(out)
 }
 
-/// Add the platform's internal WorkflowRun fields (id/name/status/started_ms/…)
-/// ALONGSIDE the native WDK fields (runId/workflowName/startedAt/…). This keeps
-/// the runs API backward-compatible: older dashboards read the internal shape,
-/// the new runs/Gantt UI reads the WDK shape — neither crashes on a missing field.
+/// Adds the platform's internal WorkflowRun fields (id/name/status/started_ms/...) ALONGSIDE the
+/// native WDK fields (runId/workflowName/startedAt/...), so the runs API stays backward-compatible:
+/// older dashboards read the internal shape, the runs/Gantt UI the WDK shape, and neither crashes
+/// on a missing field.
 fn enrich_run(run: &mut Value, project: &str) {
     let Some(o) = run.as_object_mut() else { return };
     let wf = o
@@ -296,7 +281,6 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
     let run = cmd(cloud, &url, &token, &["GET", &format!("{p}:run:{run_id}")])
         .await
         .and_then(|v| decode_blob(&v));
-    // Steps (ordered by the index ZSET).
     let step_ids = cmd(
         cloud,
         &url,
@@ -325,7 +309,6 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
             }
         }
     }
-    // Events (append-ordered list + hash of payloads).
     let ev_ids = cmd(
         cloud,
         &url,
@@ -361,52 +344,28 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
     Some(json!({ "run": run, "steps": steps, "events": events, "project": project }))
 }
 
-// ===========================================================================
-// Managed-world WRITE layer — conformant with @workflow/world (Vercel WDK).
-//
-// The console's run operations (the upstream 3-dots menu: Cancel, Replay,
-// Re-enqueue, Cancel-Active-Sleeps/Wake) mutate world state. Because an app's
-// runtime replays EXCLUSIVELY from its own world (the `owf:*` keys in the
-// project's Upstash store), hive writes the SAME records/events the app reads —
-// the identical shapes `@open-workflow/world-redis` produces — rather than a
-// hive-private store. Effects mirror `@workflow/core` runtime/runs.ts:
-//   * cancelRun          → run_cancelled event + run.status=cancelled (+cleanup)
-//   * reenqueueRun       → enqueue {runId} on __wkf_workflow_<name> (no writes)
-//   * wakeUpRun          → complete pending waits (wait_completed events) + enqueue
-//   * recreateRun/replay → new run cloned from input + run_created + enqueue
-// Enqueue = the app's own world-redis queue schema (owf:job:<id> + owf:sched
-// ZSET), which the app's in-process dispatcher (50ms poll) delivers to its
-// /.well-known/workflow/v1/flow endpoint — so a resumed run actually EXECUTES.
-// All writes take the per-run lock `<p>:lock:run:<runId>` (SET NX PX + Lua
-// compare-delete) so they never interleave with the app runtime's own writes.
-// Every op runs on the project's HOST node (env decrypts locally); the
-// coordinator routes ops over the iroh mesh exactly like world reads.
-// ===========================================================================
-
-/// base64(CBOR(value)) — the on-wire encoding every `owf:*` entity/event uses
-/// (cbor-x on the app side round-trips it; serde_cbor encodes JSON numbers/
-/// strings/maps identically, and `z.coerce.date()` on the app accepts our
-/// epoch-ms number timestamps).
+/// base64(CBOR(value)), the on-wire encoding every `owf:*` entity/event uses (cbor-x on the app
+/// side round-trips it; serde_cbor encodes JSON numbers/strings/maps identically, and the app's
+/// `z.coerce.date()` accepts our epoch-ms timestamps).
 fn encode_blob(v: &Value) -> String {
     let bytes = serde_cbor::to_vec(v).unwrap_or_default();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// A Crockford-base32 ULID (26 chars): 48-bit big-endian ms timestamp + 80 bits
-/// of randomness. The app validates recreated run ids as real ULIDs whose
-/// embedded timestamp is within [-24h, +5min], so replay MUST mint a genuine
-/// ULID (a uuid would be rejected).
+/// A Crockford-base32 ULID (26 chars of 5 bits, most significant first; the top char carries only 3
+/// significant bits): 48-bit big-endian ms timestamp + 80 bits of randomness. The app validates
+/// recreated run ids as real ULIDs with a timestamp within [-24h, +5min], so replay MUST mint a
+/// genuine ULID (a uuid is rejected). If the OS RNG fails it falls back to time-derived bytes
+/// rather than panic.
 fn ulid() -> String {
     const ENC: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let ts = hive_core::now_ms();
     let mut rnd = [0u8; 10];
     let _ = ring::rand::SystemRandom::new().fill(&mut rnd).map_err(|_| {
-        // extremely unlikely; fall back to time-derived bytes so we never panic
         for (i, b) in rnd.iter_mut().enumerate() {
             *b = ((ts >> (i * 5)) & 0xff) as u8;
         }
     });
-    // 128-bit value: [48-bit ts][80-bit random]
     let mut bytes = [0u8; 16];
     bytes[0] = ((ts >> 40) & 0xff) as u8;
     bytes[1] = ((ts >> 32) & 0xff) as u8;
@@ -415,8 +374,6 @@ fn ulid() -> String {
     bytes[4] = ((ts >> 8) & 0xff) as u8;
     bytes[5] = (ts & 0xff) as u8;
     bytes[6..16].copy_from_slice(&rnd);
-    // 128 bits -> 26 base32 chars, MSB-first (5 bits each; the top char only
-    // has 3 significant bits since 26*5 = 130 > 128).
     let val = u128::from_be_bytes(bytes);
     let mut out = [0u8; 26];
     for (oi, i) in (0..26).rev().enumerate() {
@@ -427,9 +384,9 @@ fn ulid() -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// Acquire the app's per-run lock (`SET <p>:lock:run:<id> <tok> NX PX 15000`).
-/// Returns the token to release with, or None if held (contention with the
-/// app runtime — the caller retries a few times).
+/// Acquires the app's per-run lock (`SET <p>:lock:run:<id> <tok> NX PX 15000`); returns the release
+/// token, or `None` if held (contention with the app runtime: the caller retries a few times).
+/// Upstash answers "OK" on success and null when NX fails.
 async fn world_lock(
     cloud: &Arc<CloudState>,
     url: &str,
@@ -446,7 +403,6 @@ async fn world_lock(
         &["SET", &key, &lock_tok, "NX", "PX", "15000"],
     )
     .await?;
-    // Upstash returns "OK" on success, null when NX fails.
     if res.as_str() == Some("OK") {
         Some(lock_tok)
     } else {
@@ -486,9 +442,8 @@ async fn with_run_lock(
     None
 }
 
-/// Append one event: HSET the payload + RPUSH the id onto the run's event list
-/// + RPUSH the correlation index (exactly `@open-workflow/world-redis`
-/// `entities.js` appendEvent).
+/// Appends one event: HSET the payload, RPUSH the id onto the run's event list and the correlation
+/// index (exactly `@open-workflow/world-redis` `entities.js` appendEvent).
 async fn append_event(
     cloud: &Arc<CloudState>,
     url: &str,
@@ -635,30 +590,18 @@ async fn put_run(
     }
 }
 
-/// Enqueue `{runId}` on the app's own world-redis queue (job HASH + sched ZSET)
-/// so the app's in-process dispatcher delivers it to `/.well-known/workflow/v1/
-/// flow` and the run resumes/executes — the storage-level trigger of
-/// conformance-spec §4.3. `route` = "flow" for workflow topics.
+/// Enqueues `{runId}` on the app's own world-redis queue (job HASH `owf:job:<id>` {queueName, body
+/// (base64 CBOR), attempt, route} + sched ZSET `owf:sched`, score = runAt) so the app's in-process
+/// dispatcher delivers it to `/.well-known/workflow/v1/flow` and the run resumes: the storage-level
+/// trigger of conformance-spec §4.3 (`route` = "flow" for workflow topics).
 ///
-/// The stored `body` shape is dictated by the REAL consumer, not us: the real
-/// `@open-workflow/world-redis` dispatcher's HTTP handler ignores the request
-/// body entirely (`dispatchOne` POSTs an EMPTY body — the `?msg=` query param
-/// is the lookup key) and reads the job it stores server-side via
-/// `readJob(msgId)`, then `decodeBlob(job.body)`, then reads `message.runId`
-/// DIRECTLY off the decoded value — see the vendored 0.1.2 source,
-/// `createQueueHandler`: `const message = decodeBlob(job.body); const runId =
-/// message?.runId ?? message?.workflowRunId;`. That flows straight into
-/// `@workflow/core`'s runtime, which parses it against
-/// `WorkflowInvokePayloadSchema = z.object({ runId: z.string(), ... })` — a
-/// FLAT top-level `runId`, never `{payload:{runId}}`. Live-witnessed the exact
-/// failure this produces: a manually delivered job with the old nested shape
-/// hit a real app-level 500, `Zod: "runId" expected string, received
-/// undefined` — the request reached the app fine (proving the gateway/tunnel
-/// layer, fixed earlier this session via the iroh_addr staleness fix, was
-/// never the remaining problem); the STORED MESSAGE SHAPE was wrong the whole
-/// time, so no run could ever have progressed past this call even on a
-/// perfectly healthy tunnel — which is the real, deeper root cause of
-/// [`reconcile_orphan_jobs`]'s endless orphan/reschedule/poison churn.
+/// The stored `body` shape is dictated by the REAL consumer: `@open-workflow/world-redis` 0.1.2's
+/// `dispatchOne` POSTs an EMPTY body (the `?msg=` query param is the lookup key), reads the job
+/// server-side, decodes `job.body` and reads `message.runId` DIRECTLY off it, which
+/// `@workflow/core` then parses against `WorkflowInvokePayloadSchema = z.object({ runId:
+/// z.string(), ... })`: a FLAT top-level `runId`, never `{payload:{runId}}`. The old nested shape
+/// hit an app-level 500 (`Zod: "runId" expected string, received undefined`) and was the root cause
+/// of [`reconcile_orphan_jobs`]'s endless orphan/reschedule/poison churn.
 async fn enqueue_run(
     cloud: &Arc<CloudState>,
     url: &str,
@@ -671,7 +614,6 @@ async fn enqueue_run(
     let msg_id = format!("msg_{}", ulid());
     let body = json!({ "runId": run_id });
     let body_b64 = encode_blob(&body);
-    // owf:job:<id> HASH { queueName, body(base64 CBOR), attempt, route }
     let _ = cmd(
         cloud,
         url,
@@ -690,7 +632,6 @@ async fn enqueue_run(
         ],
     )
     .await;
-    // owf:sched ZSET score=runAt(now) member=msgId
     let now = format!("{}", hive_core::now_ms());
     let _ = cmd(
         cloud,
@@ -780,7 +721,6 @@ pub async fn run_op(
             Ok(json!({ "runId": run_id, "op": "wakeup", "stoppedCount": stopped }))
         }
         "replay" => {
-            // Clone the run from its ORIGINAL input bytes into a brand-new run.
             let input = run.get("input").cloned().unwrap_or(Value::Null);
             let deployment_id = run
                 .get("deploymentId")
@@ -820,16 +760,11 @@ pub async fn run_op(
     }
 }
 
-/// Append an arbitrary event to a run's event log — the generic entry point
-/// the real `@workflow/world` spec exposes as `events.create(runId, data,
-/// params)`. Everything above (`cancel`/`replay`/`wakeup`) already calls the
-/// same underlying [`append_event`] primitive, just hardcoded to one
-/// `event_type` each (`run_cancelled`/`run_created`/`wait_completed`); this is
-/// the un-hardcoded version, for operator-driven incident annotation (e.g.
-/// recording what a human did to unstick a run) without a new bespoke code
-/// path per event type. Takes the same per-run lock cancel/wakeup do so this
-/// never interleaves with the app runtime's own event writes; does NOT touch
-/// run status — a pure event-log append.
+/// Appends an arbitrary event to a run's event log, the generic `events.create(runId, data,
+/// params)` of the real spec: the un-hardcoded form of what cancel/replay/wakeup each do with one
+/// `event_type`, for operator-driven incident annotation without a bespoke code path per type.
+/// Takes the same per-run lock, so it never interleaves with the app runtime's own event writes;
+/// does NOT touch run status.
 pub async fn append_run_event(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -858,15 +793,10 @@ pub async fn append_run_event(
     Ok(json!({ "runId": run_id, "eventId": event_id, "eventType": event_type, "op": "event" }))
 }
 
-/// Merge a JSON object into a run's stored `attributes` field — the write
-/// counterpart of the real `@workflow/world` spec's
-/// `experimentalSetAttributes(runId, changes, options)`, which had no
-/// equivalent anywhere in this module: `replay` seeds a fresh `attributes: {}`
-/// on the new run, but nothing afterward ever let attributes be SET from
-/// outside. Read-modify-write under `with_run_lock`, the exact same pattern
-/// `cancel`/`replay` already prove via their own `put_run` calls. Top-level
-/// key merge (`changes`' keys overwrite, every other existing key is left
-/// alone) — matching the spec's shape, never a deep merge.
+/// Merges a JSON object into a run's stored `attributes`, the write counterpart of the spec's
+/// `experimentalSetAttributes(runId, changes, options)` (`replay` seeds `attributes: {}` but
+/// nothing let them be SET from outside). Read-modify-write under `with_run_lock`; a top-level key
+/// merge (`changes`' keys overwrite, other keys stay), never a deep merge.
 pub async fn merge_run_attributes(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -910,10 +840,10 @@ pub async fn merge_run_attributes(
     )
 }
 
-/// Complete every pending wait (a `wait_created` with no matching
-/// `wait_completed` by correlationId) — the "cancel active sleeps" effect. Reads
-/// the event log, writes a `wait_completed` per pending wait + flips the wait
-/// entity to completed. Returns how many were stopped.
+/// Completes every pending wait (a `wait_created` with no matching `wait_completed` by
+/// correlationId), the "cancel active sleeps" effect: writes a `wait_completed` per pending wait
+/// and flips the wait entity to completed (best-effort: the event is the source of truth for
+/// replay). Returns how many were stopped.
 async fn complete_pending_waits(
     cloud: &Arc<CloudState>,
     url: &str,
@@ -998,7 +928,6 @@ async fn complete_pending_waits(
             ),
         )
         .await;
-        // Flip the wait entity to completed (best-effort; the event is the source of truth for replay).
         if let Some(w) = cmd(
             cloud,
             url,
@@ -1034,7 +963,6 @@ async fn complete_pending_waits(
 /// Terminal cleanup on cancel: drop the run's hooks (+ token claims) and waits,
 /// matching world-redis `terminalCleanup`. Best-effort.
 async fn terminal_cleanup(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) {
-    // hooks for this run
     if let Some(ids) = cmd(
         cloud,
         url,
@@ -1068,7 +996,6 @@ async fn terminal_cleanup(cloud: &Arc<CloudState>, url: &str, token: &str, p: &s
         )
         .await;
     }
-    // waits for this run
     if let Some(ids) = cmd(
         cloud,
         url,
@@ -1100,14 +1027,13 @@ fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// List workflow "hooks" for a project (newest first), each tagged with `project`.
-///
-/// A hook is a `hook_created` event; its live invocation count is the number of
-/// `hook_received` events in the SAME run whose `correlationId` matches the hook.
-/// When `run_id` is Some we scan only that run's events; otherwise we scan the
-/// most recent `limit` runs (capped to bound the per-run event fan-out). Reads use
-/// the same LIST-index + HASH-payload pattern as [`run_detail`]. Returns None when
-/// no world is configured; Some(empty) when a world exists but has no hooks.
+/// Lists workflow "hooks" for a project (newest first), each tagged with `project`. A hook is a
+/// `hook_created` event; its live invocation count is the number of `hook_received` events in the
+/// SAME run with a matching `correlationId`, and later `hook_disposed`/`hook_conflict` events fold
+/// in as lifecycle state. With `run_id` only that run's events are scanned, else the most recent
+/// `limit` runs (capped near 50 to bound the per-run event fan-out). Reads use the LIST-index +
+/// HASH-payload pattern of [`run_detail`]. `None` when no world is configured; `Some(empty)` when a
+/// world exists but has no hooks.
 pub async fn list_hooks(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -1115,8 +1041,6 @@ pub async fn list_hooks(
     limit: usize,
 ) -> Option<Vec<Value>> {
     let (url, token, p) = world_config(cloud, project)?;
-    // Which runs to scan: the explicit one, else the most recent `limit` (bounded
-    // to ~50 so a project with thousands of runs can't trigger a huge fan-out).
     let run_ids: Vec<String> = if let Some(rid) = run_id {
         vec![rid.to_string()]
     } else {
@@ -1136,7 +1060,6 @@ pub async fn list_hooks(
     };
     let mut out: Vec<Value> = Vec::new();
     for rid in run_ids {
-        // Events for this run (append-ordered LIST + HASH of payloads) — mirror `run_detail`.
         let ev_ids = cmd(
             cloud,
             &url,
@@ -1185,7 +1108,6 @@ pub async fn list_hooks(
                 .unwrap_or("")
                 .to_string()
         };
-        // Count invocations (`hook_received`) per hookId within this run.
         let mut invocations: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         for ev in &events {
@@ -1196,7 +1118,6 @@ pub async fn list_hooks(
                 }
             }
         }
-        // One hook row per `hook_created` event; fold in dispose/conflict lifecycle.
         for ev in &events {
             if etype(ev) != "hook_created" {
                 continue;
@@ -1224,7 +1145,6 @@ pub async fn list_hooks(
             let created_at = ev.get("createdAt").cloned().unwrap_or(Value::Null);
             let created_ms = secs_to_ms(ev.get("createdAt")).unwrap_or(0);
             let inv_count = invocations.get(&hook_id).copied().unwrap_or(0);
-            // Optional lifecycle state from later `hook_disposed` / `hook_conflict`.
             let matches_hook = |e: &Value| !hook_id.is_empty() && corr(e) == hook_id;
             let disposed = events
                 .iter()
@@ -1253,7 +1173,6 @@ pub async fn list_hooks(
             }));
         }
     }
-    // Newest-first by created_ms.
     out.sort_by(|a, b| {
         let am = a.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let bm = b.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1262,44 +1181,27 @@ pub async fn list_hooks(
     Some(out)
 }
 
-/// Reschedule ORPHANED queue jobs: an `<p>:job:<msgId>` hash whose id is
-/// absent from the `<p>:sched` ZSET is a job some dispatcher CLAIMED (ZREM)
-/// and then failed to deliver without rescheduling — witnessed live when a
-/// client-side response-encoding mismatch 404'd every delivery and
-/// `@open-workflow/world-redis` 0.1.2's dispatchOne dropped the claim on any
-/// non-OK response (its comment assumes the handler wrapper reschedules, but
-/// the wrapper never RAN on a 404). The stranded run then sits `pending`
-/// forever. Delivery is idempotent (the handler treats a missing/terminal job
-/// as a no-op and caps attempts), so blanket rescheduling is safe. Jobs
-/// younger than the grace window are skipped: a just-claimed job legitimately
-/// lives outside the ZSET for the duration of its 307 trampoline chain.
-/// Deliver an orphaned workflow queue job to the app's `flow` endpoint FROM THE
-/// HOST NODE, bypassing the app's own in-cell dispatcher.
+/// Delivers an orphaned workflow queue job to the app's `flow` endpoint FROM THE HOST NODE,
+/// bypassing the app's own in-cell dispatcher. The `@open-workflow/world-redis` dispatcher runs
+/// INSIDE the cell and POSTs to the app's own PUBLIC url; a cell cannot reliably reach its own
+/// public host (the per-cell NAT hairpin to the node's own public IP is dropped), so that POST
+/// fails `RUNTIME_TUNNEL_FAILED`/`NOT_RETRYABLE`, the dispatcher drops the job and the run stalls
+/// forever (seen as 0x200/Nx502 from inside the cell while the same POST from a host node returns
+/// 200). A host-origin POST reaches the local edge without the hairpin.
 ///
-/// WHY this exists: the `@open-workflow/world-redis` dispatcher runs INSIDE the
-/// app cell and delivers each job by POSTing to the app's own PUBLIC url
-/// (`https://<app>/.well-known/workflow/v1/flow`). A cell cannot reliably reach
-/// its own public host — the per-cell NAT hairpin (cell → node's own public IP)
-/// is dropped — so that in-cell POST fails `RUNTIME_TUNNEL_FAILED`/`NOT_RETRYABLE`,
-/// the dispatcher drops the job, and the run stalls forever (witnessed live on
-/// shoomoo: 0×200 / N×502 from inside the cell while the SAME POST from a host
-/// node returns 200). A host-origin POST reaches the local edge without the
-/// hairpin, so the host CAN deliver what the cell can't. Delivery is idempotent
-/// (the flow handler keys on the msg id), so this racing a lucky in-cell attempt
-/// is safe. Returns true only on a 2xx ack. Single bounded attempt — the 60s
-/// reconcile cycle IS the retry cadence, so one slow/dead cell can't wedge the
-/// pass.
+/// Delivery is idempotent (the flow handler keys on the msg id), so racing a lucky in-cell attempt
+/// is safe. It makes up to three spaced attempts (a single app can spread across cells that
+/// cold-start under load and transiently 502 while a sibling warms) with an EMPTY body exactly like
+/// the real dispatcher's `dispatchOne` (`?msg=` is the lookup key and the handler reads the job
+/// server-side); a 404 means the app has no such job to run (consumed, or its run is gone) and is
+/// not retried. Returns true only on a 2xx ack; the 60 s reconcile cycle is the outer retry
+/// cadence, so one slow or dead cell cannot wedge the pass.
 async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str) -> bool {
     let domain = cloud.apps_domain.trim().trim_start_matches('.');
     if domain.is_empty() {
         return false;
     }
     let url = format!("https://{project}.{domain}/.well-known/workflow/v1/flow?msg={msg_id}");
-    // A single app can spread across several cells that cold-start under load, so
-    // any one delivery attempt can transiently 502 (RUNTIME_TUNNEL_FAILED) while
-    // a sibling instance is warming — the SAME endpoint returns 200 moments later.
-    // A few spaced attempts catch a warm instance within that flap window instead
-    // of dropping the job back to the (broken) in-cell dispatcher for another 60s.
     for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1200 * attempt as u64)).await;
@@ -1307,11 +1209,6 @@ async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str
         match cloud
             .http
             .post(&url)
-            // Matches the real dispatcher's own request exactly (world-redis
-            // 0.1.2 `dispatchOne`): `?msg=` present means the handler looks the
-            // job up server-side via `readJob(msgId)` and never reads the
-            // request body at all, so an empty body is correct, not a
-            // placeholder — sending `{}` worked identically only by accident.
             .header("content-type", "application/json")
             .body("")
             .timeout(std::time::Duration::from_secs(12))
@@ -1319,8 +1216,6 @@ async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str
             .await
         {
             Ok(r) if r.status().is_success() => return true,
-            // A 404 means the app has no such job to run (already consumed, or its
-            // run is gone) — not deliverable, and retrying won't change that.
             Ok(r) if r.status().as_u16() == 404 => return false,
             _ => continue,
         }
@@ -1328,17 +1223,26 @@ async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str
     false
 }
 
+/// Reschedules ORPHANED queue jobs: an `<p>:job:<msgId>` hash whose id is absent from the
+/// `<p>:sched` ZSET is a job some dispatcher CLAIMED (ZREM) and failed to deliver without
+/// rescheduling (seen when a response-encoding mismatch 404'd every delivery and world-redis
+/// 0.1.2's `dispatchOne` dropped the claim on any non-OK response, assuming the handler wrapper
+/// reschedules, which never RAN on a 404), so the run sits `pending` forever. Delivery is
+/// idempotent (the handler treats a missing/terminal job as a no-op and caps attempts), so blanket
+/// rescheduling is safe, behind these guards: only the project's HOST node reconciles (every node
+/// CAN read the world, but one writer keeps the log attributable and halves REST load); an id must
+/// be orphaned on TWO consecutive passes (>= 60 s apart), because a job legitimately leaves the
+/// ZSET while a delivery is IN FLIGHT and a single-pass check double-fired deliveries (the same msg
+/// ids "rescheduled" 17-18x in 20 min); jobs younger than the grace window are skipped (the ULID in
+/// `msg_<ULID>` carries the creation time, and a just-claimed job lives outside the ZSET for its
+/// 307 trampoline chain); and only real queue jobs (`msg_*`) are touched (`<p>:job:idem:*` are
+/// idempotency markers). A job whose run already finished is deleted instead (a delivery never
+/// consumes it), the host delivers FIRST (the in-cell dispatcher cannot reach its own public url)
+/// and a job rescued more than `MAX_RECONCILES` times is GC'd as poison.
 pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
     const GRACE_MS: u64 = 120_000;
     /// Reschedules before a persistently-undeliverable job is GC'd as poison.
     const MAX_RECONCILES: i64 = 5;
-    // Ids seen orphaned on the PREVIOUS pass, per project. A job legitimately
-    // leaves the sched ZSET for the whole time a delivery is IN FLIGHT
-    // (dispatchOne ZREM-claims, then the handler wrapper re-schedules or
-    // deletes) — a single-pass check re-added those claims and DOUBLE-fired
-    // deliveries (witnessed: the same msg ids "rescheduled" 17-18x/20min).
-    // Only an id orphaned on TWO consecutive passes (>=60s apart) is treated
-    // as genuinely dropped.
     static PREV_ORPHANS: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     > = std::sync::OnceLock::new();
@@ -1356,9 +1260,6 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
         let Some((url, token, p)) = world_config(cloud, &project) else {
             continue;
         };
-        // Only the project's HOST node reconciles: every node CAN read the
-        // world (env is gossiped), and duplicate ZADDs are idempotent, but one
-        // writer keeps the reconcile log attributable and halves REST load.
         if cloud.gw.git_for_project(&project).is_none() {
             continue;
         }
@@ -1374,7 +1275,7 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                 .into_iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect(),
-            _ => continue, // world unreachable — do not guess
+            _ => continue,
         };
         let keys = match cmd(
             cloud,
@@ -1404,16 +1305,12 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                 let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else {
                     continue;
                 };
-                // Real queue jobs only: `<p>:job:idem:*` are plain-string
-                // idempotency markers, not job hashes — never schedulable.
                 if !msg_id.starts_with("msg_") {
                     continue;
                 }
                 if sched.contains(msg_id) {
                     continue;
                 }
-                // msg_<ULID>: the ULID's leading 10 chars carry the creation
-                // time — skip fresh jobs still inside a redirect-chain claim.
                 if let Some(ts) = ulid_ms(msg_id.trim_start_matches("msg_")) {
                     if now.saturating_sub(ts) < GRACE_MS {
                         continue;
@@ -1427,9 +1324,6 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             prev_map.lock().insert(project.clone(), cur);
         }
         for msg_id in confirmed {
-            // Terminal-run GC: a job whose run already finished will never be
-            // consumed by a delivery (the handler no-ops without deleting) —
-            // delete it instead of rescheduling forever.
             if let Some(body) = cmd(
                 cloud,
                 &url,
@@ -1462,20 +1356,11 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                     }
                 }
             }
-            // HOST-DELIVER FIRST: the app's in-cell dispatcher can't reach its
-            // own public url (NAT hairpin), so deliver the job from here — the
-            // host CAN reach the flow endpoint. On success the flow handler
-            // consumes the job; nothing to reschedule. Only if the host can't
-            // deliver either (cell genuinely down) do we fall through to the
-            // reschedule/poison path so the app dispatcher still gets a shot and
-            // a permanently-dead job still gets GC'd.
             if deliver_orphan_job(cloud, &project, &msg_id).await {
                 delivered += 1;
                 tracing::info!(project = %project, msg_id = %msg_id, "world reconcile: delivered orphaned queue job from host (bypassing broken in-cell dispatch)");
                 continue;
             }
-            // Poison cap: a job this loop keeps having to rescue is not being
-            // consumed by deliveries at all — stop churning it.
             let n = match cmd(
                 cloud,
                 &url,
@@ -1523,15 +1408,14 @@ fn ulid_ms(ulid: &str) -> Option<u64> {
     Some(v)
 }
 
-/// 60s background loop around [`reconcile_orphan_jobs`]. Supervised: this loop
-/// is the one whose silent death was indistinguishable from "queue is clean"
-/// (it logs only when it fixes something), which is exactly what supervision's
-/// heartbeat + restart visibility exists to disambiguate.
+/// 60 s background loop around [`reconcile_orphan_jobs`], supervised: this is the loop whose silent
+/// death was indistinguishable from "queue is clean" (it logs only when it fixes something),
+/// exactly what supervision's heartbeat and restart visibility disambiguate. The first pass waits
+/// 30 s for gossip/env to settle after boot.
 pub fn spawn_world_reconcile(cloud: Arc<CloudState>) {
     crate::supervise::spawn_supervised("world-reconcile", move || {
         let cloud = cloud.clone();
         async move {
-            // Let gossip/env settle after boot before the first pass.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
                 crate::supervise::beat("world-reconcile");
