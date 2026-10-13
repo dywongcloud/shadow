@@ -32,6 +32,8 @@ const ADMIN_REQUESTS_PER_WINDOW: u32 = 600;
 const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 const MINTED_TOKEN_TTL_SECS: i64 = 60 * 60;
 const DOMAIN_VERIFY_DEFAULT_SECS: u64 = 45;
+const MESH_FORWARD_TIMEOUT_SECS: u64 = 20;
+const PROJECT_DELETE_QUICK_PASS_PEER_BUDGET: Duration = Duration::from_secs(28);
 const FRAMEWORK_OUTPUT_DIRS: [&str; 6] = [
     ".vercel/output/static",
     ".next/static",
@@ -784,12 +786,9 @@ pub(crate) struct NetworkPutBody {
     ports: Vec<NetworkPortIn>,
 }
 
-/// Edits a project's exposed ports/protocol without a redeploy: rewrites the PRIMARY (first)
-/// function's `ports` on the production (else newest Ready) record in place
-/// (`Gateway::update_manifest`) and stamps raw ports through the leader allocator. Claims are
-/// released only when the edit leaves NO ports declared and NO stamped binding on any function; a
-/// project hosted on a peer has no local record, so the validated edit is FORWARDED to its host
-/// (`put_to_host`, `gossip::dispatch`).
+/// A Settings->Network save rebuilds the specs from a form that has no notion of compose publish
+/// requests, so `preferred_public_port` is carried over from the current record's matching spec;
+/// otherwise every compose-published port is unpublished fleet-wide.
 fn carry_over_compose_publish_requests(
     specs: &mut [fluid_core::PortSpec],
     recs: &[fluid_core::DeployRecord],
@@ -812,6 +811,12 @@ fn carry_over_compose_publish_requests(
     }
 }
 
+/// Edits a project's exposed ports/protocol without a redeploy: rewrites the PRIMARY (first)
+/// function's `ports` on the production (else newest Ready) record in place
+/// (`Gateway::update_manifest`) and stamps raw ports through the leader allocator. Claims are
+/// released only when the edit leaves NO ports declared and NO stamped binding on any function; a
+/// project hosted on a peer has no local record, so the validated edit is FORWARDED to its host
+/// (`put_to_host`, `gossip::dispatch`).
 pub(crate) async fn project_network_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1098,14 +1103,15 @@ async fn doh_txt_match(c: &Arc<CloudState>, qname: &str, want: &str) -> (bool, S
     (false, "TXT present but value does not match".into())
 }
 
-/// Pins a delegated zone's apex to the CURRENT healthy edge set; true when the set changed
-/// (`set_system_address_records` damps no-op refreshes).
-/// Runs the custom-cert pass now (internally leader-gated) so TLS lands within seconds, not at the next loop tick.
+/// Runs the custom-cert pass now (internally leader-gated), so TLS lands within seconds rather than
+/// at the next loop tick.
 fn kick_custom_cert_pass(c: &Arc<CloudState>) {
     let kick = c.clone();
     tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
 }
 
+/// Pins a delegated zone's apex to the CURRENT healthy edge set; true when the set changed
+/// (`set_system_address_records` damps no-op refreshes).
 fn pin_zone_addresses(c: &Arc<CloudState>, domain: &str) -> bool {
     let nodes = c.registry.nodes();
     c.domains.set_system_address_records(
@@ -3071,22 +3077,21 @@ pub(crate) async fn serve_hosts(
     Json(serve_hosts_with(&c, q.and_then(|q| q.0.since)))
 }
 
+fn digest_of_sorted_hosts(hosts: &[String]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in hosts {
+        h.write(s.as_bytes());
+        h.write_u8(0xff);
+    }
+    h.finish()
+}
+
 /// This node's served hosts, or just its generation when the caller already holds `since`, so
 /// steady-state gossip costs O(changes) instead of O(hosts ever deployed): any change to the host
 /// set bumps `gen` and the next caller gets the full list once.
 ///
 /// `containers` is always sent: it is tiny and drives lease election.
-fn digest_of_sorted_hosts(sorted_hosts: &[String]) -> u64 {
-    use std::hash::Hasher;
-    const HOST_SEPARATOR: u8 = 0xff;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for host in sorted_hosts {
-        hasher.write(host.as_bytes());
-        hasher.write_u8(HOST_SEPARATOR);
-    }
-    hasher.finish()
-}
-
 pub(crate) fn serve_hosts_with(c: &Arc<CloudState>, since: Option<u64>) -> Value {
     let mut hosts = c.gw.served_hosts();
     hosts.sort();
@@ -3195,8 +3200,8 @@ async fn buildcache_get(
     if require_fleet_read(claims.as_ref().map(|e| &e.0)).is_err() {
         return Err(StatusCode::FORBIDDEN);
     }
-    let is_hex_content_hash = !key.is_empty() && key.chars().all(|c| c.is_ascii_hexdigit());
-    if !is_hex_content_hash {
+    let is_not_hex_content_hash = key.is_empty() || !key.chars().all(|c| c.is_ascii_hexdigit());
+    if is_not_hex_content_hash {
         return Err(StatusCode::BAD_REQUEST);
     }
     let path = crate::git::cache_root().join(format!("{key}.tar"));
@@ -3353,7 +3358,8 @@ fn renamed_away_refusal(name: &str, renamed_to: &str) -> (StatusCode, String) {
     (
         StatusCode::CONFLICT,
         format!(
-            "The name \"{name}\" is permanently reserved: a project was renamed from it to \"{renamed_to}\". Choose a different name."
+            "The name \"{}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+            name, renamed_to
         ),
     )
 }
@@ -3706,18 +3712,11 @@ async fn dep_list(
             .or_default()
             .insert(c.region.clone());
     }
-    // Merge in deployments the placement scheduler placed on OTHER mesh nodes, and
-    // record each one's actual host region(s). Collect regions from EVERY peer that
-    // hosts it (multi-region); push to the list only once (dedup by id).
     let mut seen: std::collections::HashSet<String> =
         list.iter().map(|d| d.id.to_string()).collect();
     for (node, deps) in c.peer_deployments.read().iter() {
         let nr = node_region.get(node);
         for d in deps {
-            // Fail CLOSED on a lost/never-set gossiped tag: `record_tenant`
-            // resolves empty to `UNTAGGED_TENANT`, which can never equal a real
-            // tenant slug — unlike `norm`, which would collapse it into the
-            // owner's literal "personal" namespace (the leak).
             if record_tenant(&d.tenant) != t {
                 continue;
             }
@@ -3733,12 +3732,6 @@ async fn dep_list(
         }
     }
     list.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
-    // Enrich each with its region + public ingress code for the region-encoded URL
-    // (`<dep>.<code>.ngrok.pizza`). Use the region the deployment ACTUALLY runs in —
-    // NOT the project's configured region, which can drift across nodes or be stale
-    // until a redeploy (that mislabels the URL and makes the region ingress cross-hop).
-    // Prefer the configured region only when the deployment genuinely runs there
-    // (honors intent for multi-region); else any real host; else config, else default.
     let out: Vec<Value> = list
         .into_iter()
         .map(|d| {
@@ -3783,32 +3776,11 @@ async fn dep_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<fluid_core::DeployRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Tag the deployment (and the cells it spawns) with the caller's tenant so
-    // compute is partitioned per team — mirrors gw.deploy()'s defaults otherwise.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Honor the request's environment + git metadata (previously both were forced —
-    // `production=true`, `git=None` — which made preview deployments and
-    // commit-scoped routing, e.g. microfrontend fallback resolution, unreachable via
-    // this route). A project's first deploy still claims the production alias inside
-    // `deploy_full` even when `production=false`, so URLs resolve.
     let creator = req.creator.clone().unwrap_or_else(|| "you".into());
-    // Public raw-port allocation: same stable-keyed allocator the git build
-    // path uses (`raw_ports::allocate_raw_ports`) — a direct-API deployment
-    // declaring raw-protocol PortSpecs gets its public ports stamped before
-    // the record is registered/persisted. No-op for HTTP-only manifests.
     let mut manifest = req.manifest;
     let project = manifest.project.clone();
-    // Same per-project lifecycle writer gate `run_build`'s finalization
-    // section holds (`project_settings::lifecycle_write`) — this is also a
-    // "final production/preview deployment-registration path", and without
-    // this it could interleave with a concurrent `delete_project_local`
-    // exactly like the git-build race the gate exists to close. Held for the
-    // rest of this handler so registration below cannot straddle a delete's
-    // tombstone application.
     let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
-    // `DeployRequest.project_incarnation` is rollout metadata exposed on a
-    // public schema, never authority. Resolve or mint the identity exclusively
-    // from the server-owned ProjectStore while the lifecycle writer is held.
     let row = c.projects.get_if_set(&project);
     let seen_deployment =
         c.gw.list()
@@ -3857,14 +3829,6 @@ async fn dep_create(
         adopt_authorized_legacy_deployments(&c, &project, incarnation, legacy_ids)
             .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     }
-    // Browser-function contract enforcement (bn-launch-blocked-assets-never-deployed):
-    // this route runs NO bundle/persist step, so a manifest carrying a browser
-    // policy would present as loudly-ineligible forever, and a client-supplied
-    // `browser_artifact` descriptor would admit donors whose artifact fetch
-    // then 404s on every node. Mirror the git path's rule — an opt-in that
-    // cannot produce real bytes fails loudly — by rejecting browser policies
-    // here and stripping any descriptor: the ONLY legitimate descriptor
-    // source is the git build pipeline.
     for f in &mut manifest.functions {
         if f.browser.is_some() {
             return Err((
@@ -3914,32 +3878,17 @@ async fn dep_create(
         t,
         incarnation,
     );
-    // Persist so the deployment survives a node restart (without this it lived
-    // only in memory and was lost on reboot).
     causal_stamp_new_deployment(&c, &project, &info.id.0);
     crate::persist::persist(&c);
     Ok(Json(json!(info)))
 }
 
-/// Whether a just-registered deployment record is still authorized to exist.
-/// A captured incarnation is real proof and must still match the project's
-/// CURRENT active one (mirrors `persist::restore`'s own `Some` arm exactly).
-/// The legacy `None` case has no captured fact to re-check — LIVE-witnessed
-/// 2026-08-22: mirroring `persist::restore`'s `None` arm exactly (reject
-/// whenever the project was EVER tombstoned and no settings row has since
-/// been re-touched) false-positive-rejected an ordinary same-request redeploy
-/// of a just-deleted project name, because `dep_create` never happens to
-/// touch `ProjectSettings` — ordinary git builds usually do (via
-/// `set_production_branch`/`set_build`/etc.), so the boot-restore version of
-/// this bug is rare, but on the live path it fires on literally the very
-/// next request. So `None` is authorized UNLESS the current row proves a
-/// DIFFERENT, REAL incarnation is now active — i.e. a genuine
-/// incarnation-tracked recreation already exists and this legacy record
-/// would collide with it. Mere past deletion, or a row with no incarnation
-/// of its own, is never by itself proof of staleness for this case;
-/// preventing the actual interleaving race is `project_settings::
-/// lifecycle_write`'s job (held across `delete_project_local` and every
-/// gated registration path), not this heuristic's.
+/// Whether a just-registered deployment record is still authorized to exist. A captured incarnation
+/// must still match the project's CURRENT active one (as `persist::restore`'s `Some` arm does); the
+/// legacy `None` case has no captured fact to re-check, so it is authorized UNLESS the current row
+/// proves a DIFFERENT, REAL incarnation is active (mere past deletion, or a row with no
+/// incarnation, is never proof of staleness: preventing the interleaving race is
+/// `lifecycle_write`'s job, not this heuristic's).
 fn deployment_authorized(
     c: &Arc<CloudState>,
     project: &str,
@@ -3958,37 +3907,14 @@ fn deployment_authorized(
     }
 }
 
-/// Floor a fresh deployment's causal stamp at the project tombstone +1 (see
-/// `ProjectStore::tombstone_of`) — but only once the record has proven it is
-/// still authorized to exist. Every registration path (direct
-/// `POST /deployments`, git.rs's `run_build`, the first-deploy "Building…"
-/// placeholder) calls this immediately after `gw.deploy_full[_with_runtime]`,
-/// which makes it the ONE chokepoint every registration funnels through —
-/// deliberately kept a plain sync `fn` with this exact 3-arg signature so
-/// git.rs's existing call sites need no edit.
-///
-/// The race this closes (adversarial finding 2026-08-22): `run_build`'s own
-/// "still current" check can pass BEFORE a concurrent `delete_project_local`
-/// tombstones the project, and the build can still finish and register
-/// AFTER — `run_build` never re-reads the project's incarnation at that
-/// point, so without this check the registration got floored above the
-/// tombstone exactly like a genuine post-delete redeploy, resurrecting a
-/// project whose databases/volumes/source may already be purged underneath
-/// it. Rejected here means torn back down completely, detached (this fn
-/// cannot become `async` without editing every caller): no deployment, no
-/// alias, no causal stamp survives a delete the registration lost its race
-/// against.
+/// Ids of the legacy (incarnation-less) deployment records of `project` that `team` owns or that
+/// carry no tenant tag, from the local gateway and the gossiped peer copies; sorted and deduped.
 pub(crate) fn legacy_deployment_ids_for_owner(
     c: &Arc<CloudState>,
     project: &str,
     team: &str,
 ) -> Vec<String> {
     let team = norm(team).to_string();
-    // Local records (`DeployRecord`) and gossiped-peer records
-    // (`DeploymentInfo`) are different types with different `id` shapes
-    // (`String` vs `DeploymentId`) — map both onto one common
-    // (id, project, incarnation, tenant) tuple before chaining, rather than
-    // trying to chain incompatible iterator item types directly.
     let local = c.gw.deployment_records().into_iter().map(|record| {
         (
             record.id,
@@ -4032,10 +3958,9 @@ pub(crate) fn legacy_deployment_ids_for_owner(
     ids
 }
 
-/// Persist and apply the exact-id migration authority for records observed
-/// before a live legacy settings row acquired its first incarnation. The caller
-/// holds the project's lifecycle writer. A fresh or tombstone-ambiguous row
-/// returns an empty allow-set and therefore adopts nothing.
+/// Persists and applies the exact-id migration authority for records observed before a live legacy
+/// settings row acquired its first incarnation; the caller holds the project's lifecycle writer,
+/// and a fresh or tombstone-ambiguous row yields an empty allow-set that adopts nothing.
 pub(crate) fn adopt_authorized_legacy_deployments(
     c: &Arc<CloudState>,
     project: &str,
@@ -4096,6 +4021,14 @@ fn authorize_local_deployment_incarnation(
         .ok_or(StatusCode::CONFLICT)
 }
 
+/// Floors a fresh deployment's causal stamp at the project tombstone + 1
+/// (`ProjectStore::tombstone_of`), but only once the record has proven it is still authorized to
+/// exist. The ONE chokepoint every registration path (`POST /deployments`, `run_build`, the
+/// first-deploy "Building…" placeholder) calls right after `gw.deploy_full[_with_runtime]`, a plain
+/// sync `fn` so its callers need no edit. It closes the race where `run_build`'s "still current"
+/// check passes BEFORE a concurrent `delete_project_local` tombstones the project and the build
+/// then registers AFTER: a rejected registration is torn down completely, detached (no deployment,
+/// alias or causal stamp survives a delete it lost the race against).
 pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id: &str) {
     let incarnation =
         c.gw.list()
@@ -4111,11 +4044,6 @@ pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id
                 Some(expected) => match c2.projects.get_exact(&project2, expected) {
                     Err(_) => c2.gw.remove_exact(&id2, expected).await,
                     Ok(_) => {
-                        // Authority recovered before this serialized callback ran.
-                        // Apply the same causal floor the synchronous fast path
-                        // would have applied; retaining an authorized record
-                        // without restamping it lets an older project tombstone
-                        // erase a genuine recreation on the next merge/restart.
                         if let Some(tombstone) = c2.projects.tombstone_of(&project2) {
                             c2.gw.restamp_created(&id2, tombstone.saturating_add(1));
                         }
@@ -4155,15 +4083,8 @@ pub(crate) async fn dep_promote(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Ownership check BEFORE the local-success path — this used to only be
-    // resolved for the cross-node proxy fallback below, so any caller with a
-    // valid JWT for ANY tenant could instantly repoint a DIFFERENT tenant's
-    // production alias to an arbitrary deployment id hosted on this node.
     let t0 = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        // Judge ownership from the record's OWN tenant tag (authoritative +
-        // present), falling back to the fleet-aware project predicate — the
-        // node-local project row is UNTAGGED on nodes that never ran the deploy.
         if record_tenant(&d.tenant) != t0 && !project_owned_by(&c, &d.project, &t0) {
             return Err(StatusCode::NOT_FOUND);
         }
@@ -4203,25 +4124,10 @@ pub(crate) async fn dep_promote(
         );
         return Ok(Json(json!(info)));
     }
-    // Not hosted locally — the placement scheduler put this deployment on a peer.
-    // Proxy the promote to its host NODE over iroh (FC nodes have no HTTP admin) so
-    // instant rollback works cross-node.
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) =
             post_to_host(&c, &node, &format!("/v1/deployments/{id}/promote"), &t0).await
         {
-            // The host node updated its alias, but THIS node (the leader) still
-            // holds the old project→deployment alias in its LOCAL gateway state.
-            // Without this local update, the leader serves the previous deployment
-            // for the project hostname forever, and every other node that round-
-            // robins the project hostname locally does the same — the promote only
-            // landed on one node. Update the local alias here so the leader and
-            // any node that proxies through it also route correctly.
-            //
-            // The host node already owns the deployment record; this node only
-            // needs the alias to point at it so mesh routing can forward requests
-            // to the host. The deployment record itself is gossiped fleet-wide via
-            // peer_deployments, so the alias is the only missing piece.
             if let Some(project) = v.get("project").and_then(|p| p.as_str()) {
                 c.gw.set_project_alias(project, &id);
                 crate::persist::persist(&c);
@@ -4232,9 +4138,9 @@ pub(crate) async fn dep_promote(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// POST to a host node by NAME (no body): HTTP admin if we know its URL, else over
-/// the iroh mesh. The mutation counterpart of `fetch_from_host` — proxies an action
-/// (e.g. instant-rollback) to an FC-hosted deployment's node. Returns the response.
+/// POST (no body) to a host node by NAME: HTTP admin when its URL is known, else the iroh mesh; the
+/// mutation counterpart of `fetch_from_host`, used to proxy an action (e.g. instant rollback) to a
+/// deployment's hosting node.
 async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
@@ -4262,10 +4168,16 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        // See `fetch_from_host`: bumped from 15s to give the discovery fallback in
-        // `PeerPool::acquire` room to complete instead of being cut off here.
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -4273,14 +4185,10 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     None
 }
 
-/// DELETE (no body) to a host node by NAME — same two-tier HTTP-then-mesh
-/// shape as `post_to_host`. `hive_p2p` defines only GOSSIP_GET/GOSSIP_POST
-/// (no delete-shaped verb), so the mesh fallback rides GOSSIP_POST like every
-/// other delete-shaped mutation already dispatched over the mesh (e.g. the
-/// `/v1/projects/*/delete` arm in `gossip::dispatch`) — the receiving arm
-/// tells create from delete by PATH SHAPE (a trailing snapshot-id segment),
-/// not by verb. Used by `storage_api`'s snapshot delete to reach a
-/// deployment's actual hosting node.
+/// DELETE (no body) to a host node by NAME, the same HTTP-then-mesh shape as `post_to_host`.
+/// `hive_p2p` has only GOSSIP_GET/GOSSIP_POST, so the mesh fallback rides GOSSIP_POST like every
+/// delete-shaped mutation (the receiving arm tells create from delete by PATH SHAPE, a trailing
+/// snapshot-id segment, not by verb); used by `storage_api`'s snapshot delete.
 pub(crate) async fn delete_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -4313,8 +4221,16 @@ pub(crate) async fn delete_to_host(
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -4322,15 +4238,11 @@ pub(crate) async fn delete_to_host(
     None
 }
 
-/// PUT (with a JSON body) to a host node by NAME: HTTP admin PUT if we know
-/// its URL — matching the real route's registered verb, since unlike
-/// `/promote` the `/network` route is only registered as `put(...)` and a
-/// `.post()` there would 405 — else over the iroh mesh (dispatched there as
-/// `GOSSIP_POST`; the mesh transport has no HTTP-verb distinction, only
-/// path/body — see the matching `/network` arm in `gossip::dispatch`). The
-/// body-carrying counterpart of `post_to_host`, used to forward
-/// `PUT /v1/projects/:project/network` to a project's actual hosting node
-/// when the record isn't local (see `project_network_put`).
+/// PUT (JSON body) to a host node by NAME: HTTP admin PUT when its URL is known (the `/network`
+/// route is registered only as `put(...)`, a `.post()` there would 405), else over the iroh mesh as
+/// `GOSSIP_POST` (the mesh has no HTTP verb, only path and body; see the `/network` arm in
+/// `gossip::dispatch`). The body-carrying counterpart of `post_to_host`, used to forward
+/// `PUT /v1/projects/:project/network` when the record is not local.
 pub(crate) async fn put_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -4394,10 +4306,10 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
     });
 }
 
-/// Delete a single deployment under the same project lifecycle writer used by
-/// build finalization, promotion, and full project deletion. The owned guard is
-/// moved into a task before the first cancellable await: dropping the HTTP
-/// request drops only the waiter, never the serialized deletion itself.
+/// Deletes a single deployment under the same project lifecycle writer as build finalization,
+/// promotion and full project deletion; the owned guard moves into a task before the first
+/// cancellable await, so dropping the HTTP request drops only the waiter, never the serialized
+/// deletion.
 async fn dep_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -4567,10 +4479,6 @@ fn project_delete_inventory(
     let project_tag = crate::git::sanitize_tag(project);
     let legacy_base = format!("hive-vol-{project_tag}");
 
-    // Grow-only settings claims are server-derived exact facts for volumes whose
-    // deployment record may already have been reaped. Add the exact names parsed
-    // from every still-live run configuration, but never invent a current base or
-    // service suffix from a project/function prefix.
     let mut current_volumes: std::collections::BTreeSet<String> =
         settings.owned_volume_names.iter().cloned().collect();
     let mut volume_residuals = Vec::new();
@@ -4594,9 +4502,6 @@ fn project_delete_inventory(
         }
     }
 
-    // Legacy names carry no incarnation and are never deletion authority. Exact
-    // candidates are retained and reported if present so a prefix-sharing tenant
-    // survives byte-identically while an operator can resolve the residue.
     let mut legacy_volumes = std::collections::BTreeSet::from([legacy_base.clone()]);
     for service in &services {
         legacy_volumes.insert(format!(
@@ -4609,11 +4514,6 @@ fn project_delete_inventory(
         .filter_map(|deployment| deployment.manifest.image.clone())
         .collect();
 
-    // Database catalog rows predate an incarnation field. Admission now records
-    // every newly minted platform id in the incarnation's grow-only settings
-    // lineage while holding the lifecycle writer. Only that exact id set is
-    // deletion authority; legacy/unclaimed rows are retained rather than guessed
-    // from names, teams, or timestamps.
     let owned_database_ids: std::collections::HashSet<&str> = settings
         .owned_database_ids
         .iter()
@@ -4642,9 +4542,9 @@ fn project_delete_inventory(
     }
 }
 
-/// Run one destructive container/volume command with a hard per-attempt budget.
-/// `kill_on_drop` makes a timeout real: no child survives to mutate the host
-/// after the lifecycle writer has returned an incomplete-cleanup result.
+/// Runs one destructive container/volume command under a hard per-attempt budget; `kill_on_drop`
+/// makes a timeout real, so no child survives to mutate the host after the lifecycle writer has
+/// returned an incomplete-cleanup result.
 async fn run_cleanup_command(bin: &str, args: Vec<String>, path_env: &str) -> Result<(), String> {
     const ATTEMPTS: u32 = 3;
     for attempt in 1..=ATTEMPTS {
@@ -4674,10 +4574,9 @@ async fn run_cleanup_command(bin: &str, args: Vec<String>, path_env: &str) -> Re
     unreachable!("bounded cleanup-command loop always returns")
 }
 
-/// Reclaim only the immutable inventory captured for one exact incarnation.
-/// The caller owns the project lifecycle writer for this whole await chain, so
-/// database creation and deployment registration cannot enter a new lifetime
-/// between proof and removal.
+/// Reclaims only the immutable inventory captured for one exact incarnation; the caller owns the
+/// project lifecycle writer across the whole await chain, so database creation and deployment
+/// registration cannot enter a new lifetime between proof and removal.
 async fn purge_project_resources(
     c: &Arc<CloudState>,
     project: &str,
@@ -4813,11 +4712,6 @@ async fn purge_project_resources(
 
     for image in &inventory.images {
         if !c.gw.image_is_referenced(image) && c.gw.backend_name() == "litebox" {
-            // The authoritative last-reference proof is here. The concrete
-            // backend is trait-erased behind `Fluid`, and the released
-            // lifecycle surfaces expose no safe downcast/forwarding seam; do
-            // not emulate `LiteboxBackend::retire_image_reference` with direct
-            // filesystem deletion. Surface the unresolved retirement instead.
             residuals.push(ProjectCleanupResidual::new(
                 "litebox_image_reference",
                 image,
@@ -4830,10 +4724,10 @@ async fn purge_project_resources(
     residuals
 }
 
-/// Enumerate a backend first, then remove only incarnation-qualified names that
-/// are actually present. Legacy names are byte-ambiguous (`app` service `v2`
-/// and project `app-v2` base both map to `hive-vol-app-v2`), so a present legacy
-/// candidate is retained and returned as an observable residual.
+/// Enumerates a backend first, then removes only incarnation-qualified names that are present;
+/// legacy names are byte-ambiguous (service `v2` of `app` and project `app-v2` both map to
+/// `hive-vol-app-v2`), so a present legacy candidate is retained and returned as an observable
+/// residual.
 async fn purge_project_podman_volumes(
     current: &std::collections::BTreeSet<String>,
     legacy: &std::collections::BTreeSet<String>,
@@ -4929,9 +4823,9 @@ fn is_platform_build_id(id: &str) -> bool {
     })
 }
 
-/// Parse one current/legacy checkout, placeholder, or retained-source name.
-/// Syntax only identifies the embedded build id; deletion additionally checks
-/// that id against the immutable incarnation lineage.
+/// Parses one current/legacy checkout, placeholder or retained-source name: syntax only identifies
+/// the embedded build id, deletion additionally checks it against the immutable incarnation
+/// lineage.
 fn deploy_entry_build_id<'a>(prefix: &str, name: &'a str) -> Option<&'a str> {
     let rest = name.strip_prefix(prefix)?;
     if let Some(build_id) = rest.strip_suffix(".src.zip") {
@@ -4953,10 +4847,9 @@ fn owned_deploy_entry(
     deploy_entry_build_id(prefix, name).is_some_and(|build_id| build_ids.contains(build_id))
 }
 
-/// Re-stat with `symlink_metadata` on every bounded attempt so a symlink is
-/// unlinked rather than traversed. Files and symlinks use `remove_file`, real
-/// directories use `remove_dir_all`, and unsupported special files are kept
-/// and reported.
+/// Re-stats with `symlink_metadata` on every bounded attempt so a symlink is unlinked, never
+/// traversed: files and symlinks use `remove_file`, real directories `remove_dir_all`, unsupported
+/// special files are kept and reported.
 async fn remove_owned_deploy_entry(path: &std::path::Path) -> Option<ProjectCleanupResidual> {
     const ATTEMPTS: u32 = 3;
     for attempt in 1..=ATTEMPTS {
@@ -5050,17 +4943,13 @@ async fn enumerate_owned_deploy_entries(
     Err(format!("{last_reason} after {ATTEMPTS} attempts"))
 }
 
-/// Remove only current/legacy source entries whose platform-issued build id is
-/// in the exact deleted-incarnation lineage. Enumeration, metadata, special
-/// types, and removal failures remain observable in the returned residual set.
+/// Removes only current/legacy source entries whose platform-issued build id is in the exact
+/// deleted-incarnation lineage; enumeration, metadata, special-type and removal failures stay
+/// observable in the returned residual set.
 async fn purge_project_source_dirs(
     project: &str,
     build_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<ProjectCleanupResidual> {
-    // Prefixes of the CURRENT name plus every name this project was renamed
-    // FROM: pre-rename checkouts keep their old dir names (a rename never
-    // renames a checkout in place), so matching only the current name would
-    // strand them -- invisible to this purge and leaking forever.
     let prefixes = crate::project_settings::checkout_prefixes_including_previous(project);
     let mut residuals = Vec::new();
     for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
@@ -5084,11 +4973,11 @@ async fn purge_project_source_dirs(
     residuals
 }
 
-/// Whether a `project_delete` caller has asserted SOME identity at all —
-/// verified claims (JWT or platform API key), or an explicit `x-hive-team`
-/// header. Pure core of the identity gate below, unit-testable without a
-/// `HeaderMap`/`CloudState`. A blank/whitespace-only team header counts as no
-/// identity (matches `resolve_tenant`'s own header-trimming behavior).
+/// Whether a `project_delete`/rename caller asserted SOME identity at all: verified claims (JWT or
+/// platform API key) or an explicit `x-hive-team` header (a blank one counts as none, as in
+/// `resolve_tenant`). `resolve_tenant`'s dev-mode "personal" default owns every project, so it must
+/// never authorize a destructive fleet-cascading operation; this is the pure core of that gate,
+/// unit-testable without a `HeaderMap`/`CloudState`.
 fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>) -> bool {
     claims_present || team_header.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
@@ -5107,9 +4996,9 @@ fn delete_forward_is_internal(headers: &HeaderMap, claims: Option<&crate::auth::
     service_claim || shared_secret
 }
 
-/// A delete generation may lead the receiver's clock only by the skew the
-/// origin intentionally adds plus the opposite-direction skew of this receiver.
-/// Older generations remain valid forever for idempotent retries.
+/// A delete generation may lead the receiver's clock only by the skew the origin intentionally adds
+/// plus this receiver's opposite-direction skew; older generations stay valid forever for
+/// idempotent retries.
 pub(crate) const MAX_DELETE_GENERATION_FUTURE_MS: u64 =
     hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2;
 
@@ -5117,9 +5006,9 @@ pub(crate) fn valid_delete_generation(delete_ms: u64) -> bool {
     delete_ms > 0 && delete_ms <= now_ms().saturating_add(MAX_DELETE_GENERATION_FUTURE_MS)
 }
 
-/// Newest causal version this coordinator can see for `project`. A fresh
-/// deletion generation is issued strictly above this floor so it dominates
-/// settings and deployment records already visible anywhere in the fleet.
+/// Newest causal version this coordinator can see for `project`: a fresh deletion generation is
+/// issued strictly above it, so it dominates settings and deployment records already visible
+/// anywhere in the fleet.
 fn observed_project_version_ms(c: &Arc<CloudState>, project: &str) -> u64 {
     let settings_ms = c
         .projects
@@ -5161,10 +5050,9 @@ async fn project_delete_capabilities() -> Json<Value> {
     Json(json!({ "delete_generation": "v1" }))
 }
 
-/// Delete an entire project: all its deployments + settings. By default this
-/// cascades across the mesh. `?cascade=false` is the internal single-hop form
-/// used by a cascade receiver; relocation uses the separate, narrowly-scoped
-/// `/reap-deployments` arm and never calls project deletion.
+/// Deletes an entire project (deployments + settings), cascading across the mesh by default;
+/// `?cascade=false` is the internal single-hop form used by a cascade receiver. Relocation uses the
+/// separate, narrowly scoped `/reap-deployments` arm and never calls project deletion.
 async fn project_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -5172,17 +5060,6 @@ async fn project_delete(
     Path(project): Path<String>,
     Query(q): Query<CascadeQ>,
 ) -> Result<Json<Value>, StatusCode> {
-    // A destructive, fleet-cascading operation must never authorize purely off
-    // resolve_tenant's dev-mode "personal" default: on an unenforced node, a
-    // caller presenting NO credential at all (no JWT, no API key, no explicit
-    // x-hive-team header) still resolves to team "personal" — the platform
-    // owner's own namespace on a single-tenant deployment — which trivially
-    // "owns" every project. That turns every unenforced node's admin port into
-    // an anonymous delete-any-project-by-name endpoint. Require the caller to
-    // have asserted SOME identity (verified claims, or an explicit team header)
-    // before even resolving a tenant to check ownership against — this is the
-    // one endpoint on this router where the implicit personal-mode default is
-    // not an acceptable substitute for real authorization.
     if !has_explicit_caller_identity(
         claims.is_some(),
         headers.get("x-hive-team").and_then(|v| v.to_str().ok()),
@@ -5200,57 +5077,29 @@ async fn project_delete(
         return Err(StatusCode::BAD_REQUEST);
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Authorize against the local store if we have it, else against the gossiped
-    // fleet — a project placed by the scheduler may live ONLY on a peer, so it's
-    // absent from this node's project store (team_of would default to "personal"
-    // and wrongly 404). Allow the delete if the requester's tenant owns the
-    // project anywhere in the mesh.
-    let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
-        // a deployment of this project hosted locally under the requester's tenant
-        || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        // …or hosted on a peer (project lives only on a scheduler-placed node)
-        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        // …or known ONLY to the fleet-replicated relational mirror. This tier
-        // exists in the LISTING (`projects`' third fallback, added for a project
-        // created but never successfully deployed) and had no counterpart here,
-        // so a project the dashboard happily showed could never be authorized
-        // for deletion: every delete fell to the not-hosted-here branch, no peer
-        // could accept a cascade for a project none of them held either, and the
-        // handler answered 502 forever. Live-witnessed on `gpu-smoke` — zero
-        // deployments and zero settings rows fleet-wide, one `project_teams`
-        // row, undeletable from both the dashboard home and its own page.
-        // Anything we are willing to LIST for a tenant must be deletable by it.
-        || crate::relational::projects_for_team(&t).await.iter().any(|p| p == &project);
-    // Not locally verifiable ≠ deniable: after a partial delete (or right after a
-    // restart) this node may hold NO trace of a project that still serves on a
-    // peer, and the gossip view can be sparse — a hard 404 here left ORPHANS
-    // undeletable. Every receiving node re-checks ownership against ITS OWN store
-    // before acting, so the safe behavior is: skip local teardown, but still
-    // broadcast the single-hop cascade and let owners tear down their copies.
+    let authorized = c
+        .projects
+        .get_if_set(&project)
+        .map(|s| norm(&s.team) == t)
+        .unwrap_or(false)
+        || c.gw
+            .list()
+            .iter()
+            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || c.peer_deployments
+            .read()
+            .values()
+            .flatten()
+            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || crate::relational::projects_for_team(&t)
+            .await
+            .iter()
+            .any(|p| p == &project);
     if !authorized {
         if cascade {
-            // The coordinator cannot create a project-name tombstone until an
-            // owner has authenticated the tenant: on a sparse observer, doing
-            // so before one peer accepts could poison another tenant's project
-            // with the same name. Issue a candidate generation, let every
-            // receiver authorize locally, then retain it here only after the
-            // first confirmed acceptance. The small future allowance dominates
-            // an ordinary in-flight write on a peer whose clock is a few seconds
-            // ahead without letting retries ratchet the generation forever.
             let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
                 now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
             });
-            // AWAIT the broadcast rather than spawning it and answering 200. This node
-            // holds no copy of the project, so a 200 here asserted a deletion it never
-            // performed and never observed anyone else perform — and the dashboard,
-            // which treats any 2xx as success, showed the user nothing at all while the
-            // project kept serving. That is the "deleting a project does nothing" bug.
-            // Deletes are rare and each hop is small, so paying the round trip to be
-            // able to tell the truth is the right trade.
-            //
-            // Broadcast to EVERY peer, not just healthy ones: health is a per-observer
-            // verdict, and a peer this node currently calls unhealthy is exactly the one
-            // most likely to still be serving the copy nobody could reach.
             let peers: Vec<String> = c
                 .registry
                 .nodes()
@@ -5259,31 +5108,13 @@ async fn project_delete(
                 .map(|n| n.name)
                 .collect();
             let n_peers = peers.len();
-            // Quick single-attempt pass, hard-capped per peer: the user is waiting,
-            // and the leader-forward client that proxied this request times out at
-            // 30s — an answer slower than that reads as failure even when the
-            // cascade later succeeds. Peers the quick pass could not reach get the
-            // full retry budget DETACHED below.
-            //
-            // 28s, not the old 20s: `dispatch_project_delete_with`'s own worst
-            // case chains HTTP-capabilities + HTTP-delete + mesh-capabilities +
-            // mesh-delete (the last kept intentionally generous for discovery
-            // fallback, see its own comment) — even after trimming the other
-            // three legs, that sum is ~31s, so a 20s outer cap could kill the
-            // future before it ever reached the mesh fallback it exists to
-            // provide. Witnessed live: a real project delete failed with
-            // "accepted == 0 across all 23 peers" on every attempt, because
-            // every peer with real-but-imperfect HTTP admin connectivity spent
-            // its entire budget stuck on the HTTP leg. 28s stays under the 30s
-            // proxy ceiling with 2s of margin for the response to actually
-            // return.
             let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
                 let c = c.clone();
                 let project = project.clone();
                 let t = t.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(28),
+                        PROJECT_DELETE_QUICK_PASS_PEER_BUDGET,
                         dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
@@ -5299,21 +5130,12 @@ async fn project_delete(
                 .map(|(n, _)| n.clone())
                 .collect();
             if accepted == 0 {
-                // Nobody confirmed. Either the project does not exist under this tenant,
-                // or every node that could own it is unreachable. Both are honest
-                // failures the user must see; neither is a deletion. Crucially, do
-                // not leave detached retries running after this 502: a later success
-                // would perform a deletion the coordinator never recorded.
                 tracing::warn!(
                     project, tenant = %t, peers = n_peers,
                     "project delete: not hosted locally and no peer accepted the cascade"
                 );
                 return Err(StatusCode::BAD_GATEWAY);
             }
-            // Authorization is now witnessed by at least one owner. Persist the
-            // same generation locally BEFORE scheduling slower retries, so every
-            // later acceptance is tracked by a durable tombstone on this
-            // coordinator even if the original HTTP request disappears.
             c.projects.apply_delete(&project, delete_ms);
             c.git_index.remove_project(&project);
             crate::persist::persist(&c);
@@ -5343,10 +5165,6 @@ async fn project_delete(
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    // The exact local lifecycle owner issues a fresh generation for a user
-    // request, or applies the immutable supplied generation on an internal
-    // single-hop retry. It retains the owned writer until bounded physical
-    // cleanup has either completed or produced explicit residuals.
     let outcome = delete_project_local_requested(&c, &project, &t, supplied_delete_ms).await;
     if !outcome.logical_deleted && !outcome.recreated {
         tracing::warn!(project, residuals = ?outcome.cleanup_residuals, "project delete refused before logical tombstoning");
@@ -5369,22 +5187,11 @@ async fn project_delete(
         );
     }
 
-    // Background cascade (cascade=false → single hop, no loops): BROADCAST the
-    // delete to EVERY peer instead of a gossip-derived "hosting" set —
-    // peer_deployments/peer_routes can be sparse right after restarts, which made
-    // the cascade silently dispatch to NOBODY and leave remote copies serving.
-    // The receiving arm is team-checked and idempotent, and retries carry this
-    // exact generation so they can never erase a causal recreation.
     if cascade {
         let c2 = c.clone();
         let project2 = project.clone();
         let team2 = t.clone();
         tokio::spawn(async move {
-            // Every peer, not only the ones this node currently calls healthy: health is
-            // a per-OBSERVER verdict, so an "unhealthy" peer is precisely the one most
-            // likely to still be serving a copy nobody could reach — and a delete it
-            // never receives is a project that serves forever. Concurrently, so one slow
-            // peer cannot delay the rest.
             let peers: Vec<String> = c2
                 .registry
                 .nodes()
@@ -5412,15 +5219,12 @@ async fn project_delete(
     })))
 }
 
-/// LOCAL-ONLY relocation reap (the receiving side of
-/// [`dispatch_deployments_reap`]): remove THIS node's production-lane
-/// deployment records for the project and nothing else — previews stay,
-/// ProjectSettings stay (team tag, production_branch, env), the relational row
-/// stays, no resource purge. The full-teardown primitive
-/// ([`delete_project_local`]) was reused for relocation reaping and its
-/// settings wipe is what made projects vanish from accounts (the team tag is
-/// how every listing filter finds them) and made push-classified builds treat
-/// preview branches as production (production_branch erased).
+/// LOCAL-ONLY relocation reap (receiving side of [`dispatch_deployments_reap`]): removes THIS
+/// node's production-lane deployment records for the project and nothing else (previews,
+/// ProjectSettings incl. team tag, production_branch and env, the relational row and resources all
+/// stay). The full-teardown [`delete_project_local`] must never be reused for relocation: its
+/// settings wipe made projects vanish from accounts and made push-classified builds treat previews
+/// as production.
 pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -> usize {
     let ids = c.gw.remove_project_superseded(project).await;
     if !ids.is_empty() {
@@ -5438,11 +5242,10 @@ pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -
     ids.len()
 }
 
-/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW
-/// arm rather than a parameter on the delete arm: a pre-upgrade peer answers
-/// NO_HANDLER (a safe no-op — its stale copies linger until it upgrades)
-/// instead of an old binary ignoring the scope parameter and running the FULL
-/// teardown, which is the destroy-by-omission this replaces.
+/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW arm, not a parameter
+/// on the delete arm: a pre-upgrade peer answers NO_HANDLER (a safe no-op, its stale copies linger
+/// until it upgrades) instead of an old binary ignoring the scope parameter and running the FULL
+/// teardown.
 pub(crate) async fn dispatch_deployments_reap(
     c: &Arc<CloudState>,
     node: &str,
@@ -5469,8 +5272,16 @@ pub(crate) async fn dispatch_deployments_reap(
             "/v1/projects/{project}/reap-deployments?{}",
             mesh_team_qs(team)
         );
-        if let Some(body) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+        if let Some(body) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &path,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
             if v.as_ref()
@@ -5479,22 +5290,17 @@ pub(crate) async fn dispatch_deployments_reap(
             {
                 return true;
             }
-            // NO_HANDLER (pre-upgrade peer) or a refusal — both terminal.
             return false;
         }
     }
     false
 }
 
-/// Tear down a project on ONE peer node, over whatever control-plane transport
-/// reaches it: the HTTP admin URL when known (local tunnel peers), else the iroh
-/// mesh (Firecracker fleet nodes — `node_admins` is EMPTY for them since the SSH
-/// tunnels were cut, which is exactly why HTTP-only cascade deletes silently
-/// never reached the hosting nodes and "deleting a project didn't work").
-/// `cascade=false` semantics on the receiving side: single hop, no loops.
-/// Returns `true` when a peer ACCEPTED the delete over some transport. The caller
-/// on the not-hosted-here path reports that outcome to the user instead of
-/// claiming success it never observed.
+/// Tears down a project on ONE peer over whatever control-plane transport reaches it: the HTTP
+/// admin URL when known, else the iroh mesh (`node_admins` is EMPTY for Firecracker fleet nodes,
+/// which is why HTTP-only cascades never reached them). Single hop, no loops on the receiving side
+/// (`cascade=false`); returns `true` when a peer ACCEPTED the delete over some transport, so the
+/// caller reports what it actually observed.
 pub(crate) async fn dispatch_project_delete(
     c: &Arc<CloudState>,
     node: &str,
@@ -5505,13 +5311,10 @@ pub(crate) async fn dispatch_project_delete(
     dispatch_project_delete_with(c, node, project, team, delete_ms, 3).await
 }
 
-/// [`dispatch_project_delete`] with an explicit retry budget. The AWAITED
-/// cascade (the not-hosted-here delete path) uses `attempts = 1`: with the full
-/// 3-attempt budget a single dead peer holds the user's request for over a
-/// minute — longer than the leader-forward client's own 30s timeout, so the
-/// user would be told the delete failed while it went on to succeed. Reliability
-/// is not lost: the caller spawns the full-budget variant DETACHED for any peer
-/// the quick pass could not reach.
+/// [`dispatch_project_delete`] with an explicit retry budget: the AWAITED cascade (the
+/// not-hosted-here path) uses `attempts = 1`, since the full 3-attempt budget lets one dead peer
+/// hold the user's request past the leader-forward client's 30 s timeout; the caller spawns the
+/// full-budget variant DETACHED for the peers the quick pass could not reach.
 pub(crate) async fn dispatch_project_delete_with(
     c: &Arc<CloudState>,
     node: &str,
@@ -5521,39 +5324,16 @@ pub(crate) async fn dispatch_project_delete_with(
     attempts: u32,
 ) -> bool {
     if node == c.node_name {
-        return true; // local copy already handled by the caller
+        return true;
     }
-    // A delete is a ONE-SHOT broadcast — unlike a database write mirror
-    // (`db_replicate::send_mirrored`), there is no "next delete" to naturally
-    // retry a dropped attempt, so a single failed hop here left the peer
-    // serving the deleted project FOREVER. Try HTTP admin first (when known),
-    // fall back to the iroh mesh on failure instead of the two being mutually
-    // exclusive by transport availability, and retry the whole pair a few
-    // times with backoff so one transient blip on both transports in the same
-    // instant doesn't strand the peer either.
     let mut http_generation_v1 = false;
     let mut mesh_generation_v1 = false;
     for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
         }
-        // Bind out of the lock FIRST so no parking_lot guard is held across the
-        // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
-            // Budgeted, not the old flat 5s/15s/10s/20s: this whole function
-            // runs inside the caller's own 20s-per-peer timeout (team_delete's
-            // quick pass), and unlike a single-shot call this one chains FOUR
-            // network round trips in the worst case (HTTP capabilities, HTTP
-            // delete, mesh capabilities, mesh delete) when the HTTP path is
-            // slow-but-not-dead rather than cleanly absent. The old
-            // 5+15+10+20=50s sum could never fit the 20s budget, so a peer
-            // with imperfect-but-real HTTP admin connectivity burned its
-            // ENTIRE budget on the HTTP leg and never reached the mesh
-            // fallback the function is written to fall back to — exactly the
-            // "accepted == 0 across all peers" failure witnessed live deleting
-            // a real project. Shrunk so the four-hop worst case (3+5+3+6=17s)
-            // leaves headroom inside the 20s cap.
             if !http_generation_v1 {
                 http_generation_v1 = match c
                     .http
@@ -5577,9 +5357,6 @@ pub(crate) async fn dispatch_project_delete_with(
                     _ => false,
                 };
             }
-            // Never send a generation-bearing delete to a pre-upgrade HTTP
-            // receiver. An old handler ignores `delete_ms` and can erase a
-            // causal recreation before its ambiguous legacy response is rejected.
             let accepted = if http_generation_v1 {
                 let mut request = c
                     .http
@@ -5624,10 +5401,6 @@ pub(crate) async fn dispatch_project_delete_with(
                 return true;
             }
         }
-        // iroh mesh path: resolve the peer's cryptographic identity + address from
-        // the registry and dispatch the delete as a gossip POST (team rides as
-        // `?team=`). Tried even when an admin URL exists — a node reachable over
-        // one transport but not the other should not be abandoned.
         let target = c
             .registry
             .nodes()
@@ -5636,16 +5409,6 @@ pub(crate) async fn dispatch_project_delete_with(
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
             if !mesh_generation_v1 {
-                // 6s, not the 10s original NOR the over-corrected 3s: this is
-                // the ONLY transport ever exercised on a Firecracker fleet
-                // (`node_admins` is empty there, so the HTTP leg above never
-                // runs at all — its own timeouts cost nothing real here).
-                // Measured cross-continent mesh dial latency on this fleet
-                // reaches ~4.3s (lax) on a cold connection, so 3s risked
-                // failing the capabilities probe on real, healthy links
-                // rather than fixing anything — the actual bottleneck this
-                // whole change targets is the DELETE call below, which stays
-                // at its original, deliberately generous timeout.
                 mesh_generation_v1 = crate::gossip::request_to(
                     c,
                     &id,
@@ -5672,20 +5435,17 @@ pub(crate) async fn dispatch_project_delete_with(
                 "/v1/projects/{project}/delete?{}&delete_ms={delete_ms}",
                 mesh_team_qs(team)
             );
-            // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
-            if let Some(body) =
-                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-                    .await
+            if let Some(body) = crate::gossip::request_to(
+                c,
+                &id,
+                &addr,
+                hive_p2p::GOSSIP_POST,
+                &path,
+                &[],
+                MESH_FORWARD_TIMEOUT_SECS,
+            )
+            .await
             {
-                // The mesh protocol carries no status code, so a peer's REFUSAL
-                // ("not owner") arrives as a perfectly well-delivered body.
-                // Treating any reply as acceptance fabricated `accepted_by`
-                // counts for projects that exist nowhere — on the fleet, where
-                // `node_admins` is empty and iroh is the only transport, EVERY
-                // peer's refusal was counted as a confirmed deletion. Accepted
-                // means the arm actually ran `delete_project_local` (it answers
-                // `{"removed": n}`); an `error` body is an authoritative no, so
-                // further transports/retries are pointless for this peer.
                 let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
                 let accepted = v
                     .as_ref()
@@ -5701,7 +5461,6 @@ pub(crate) async fn dispatch_project_delete_with(
                 if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
                     return false;
                 }
-                // Unparseable reply: fall through to the retry loop.
             }
         } else if admin.is_none() {
             tracing::warn!(
@@ -5709,7 +5468,7 @@ pub(crate) async fn dispatch_project_delete_with(
                 project,
                 "project delete: no route to hosting node (no admin URL, no iroh identity)"
             );
-            return false; // no route exists at all; retrying won't help until routes change
+            return false;
         }
     }
     tracing::warn!(
@@ -5722,29 +5481,14 @@ pub(crate) async fn dispatch_project_delete_with(
     false
 }
 
-// ---------------------------------------------------------------------------
-// Project rename
-//
-// A project's name is the platform's routing identity, not a settings field:
-// it is the first DNS label every deployment is served on, the podman volume
-// name, the checkout dir and the browserdb filename. Renaming therefore has to
-// move EVERY tree that keys on it (see `rename_project_owned`) and keep the old
-// name reserved forever, or a later project could claim it and inherit its
-// traffic. It is modelled on `project_delete` — same identity gate, same four
-// authorization tiers, same fleet cascade shape — because it is the same class
-// of fleet-mutating operation.
-// ---------------------------------------------------------------------------
-
-/// A project name is tenant-chosen text that becomes a real identifier
-/// downstream, so it is bounded and its sanitized form must equal the name
-/// itself: a name that sanitized differently would produce a volume/checkout
-/// path that does not match its own lookup prefix.
+/// Project names become real identifiers downstream, so they are bounded and their sanitized form
+/// must equal the name itself (a name that sanitized differently would give a volume/checkout path
+/// that does not match its own lookup prefix).
 const MAX_PROJECT_NAME_LEN: usize = 64;
 
-/// Query for `POST /v1/projects/:project/rename`. `rename_ms` is the immutable
-/// generation issued by the originating rename and reused by every retry;
-/// absent on a user-originated request. `name` rides the query on the mesh
-/// path (a gossip POST has no body) and the JSON body on HTTP.
+/// Query for `POST /v1/projects/:project/rename`: `rename_ms` is the immutable generation of the
+/// originating rename, reused by every retry (absent on a user request); `name` rides the query on
+/// the mesh path (a gossip POST has no body) and the JSON body on HTTP.
 #[derive(Deserialize, Default)]
 struct RenameQ {
     #[serde(default, deserialize_with = "de_lenient_bool")]
@@ -5779,10 +5523,9 @@ pub(crate) struct ProjectRenameOutcome {
     pub residuals: Vec<ProjectCleanupResidual>,
 }
 
-/// A rename generation is validated exactly like a delete generation: it may
-/// lead this receiver's clock only by the skew the origin intentionally adds
-/// plus this receiver's opposite-direction skew, and older generations stay
-/// valid forever so an idempotent retry is always accepted.
+/// A rename generation is validated exactly like a delete generation (see
+/// [`MAX_DELETE_GENERATION_FUTURE_MS`]): bounded future skew, older generations stay valid forever
+/// so an idempotent retry is always accepted.
 pub(crate) fn valid_rename_generation(rename_ms: u64) -> bool {
     valid_delete_generation(rename_ms)
 }
@@ -5810,11 +5553,6 @@ async fn project_rename(
     Query(q): Query<RenameQ>,
     body: Option<Json<RenameBody>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // SAME gate as `project_delete`, for the same reason: on an unenforced node
-    // a credential-less caller resolves to team "personal" — the platform
-    // owner's namespace — which trivially "owns" every project. Without this,
-    // every unenforced node's admin port is an anonymous rename-any-project
-    // endpoint, and renaming is how you take over another tenant's URLs.
     let claims_ref = claims.as_ref().map(|e| &e.0);
     if !has_explicit_caller_identity(
         claims.is_some(),
@@ -5856,10 +5594,6 @@ async fn project_rename(
             "the project is already named that".into(),
         ));
     }
-    // Project names are unique across the whole PLATFORM (the name becomes the
-    // podman volume, the checkout dir and `hive-browserdb-{tag}.db`), so the
-    // colliding name may belong to a tenant this caller cannot see. Say so
-    // instead of silently minting `<name>-2`.
     if let Some(hit) = c.projects.find_key_ci(&new) {
         let taken_by_caller = project_owned_by(&c, &hit, &t);
         return Err((
@@ -5871,8 +5605,6 @@ async fn project_rename(
             },
         ));
     }
-    // An old name is RESERVED, never reusable: letting someone claim it would
-    // hand them the previous project's bookmarked URLs and its redirect.
     if let Some(tomb) = c.projects.renamed_away(&new) {
         return Err((
             StatusCode::CONFLICT,
@@ -5882,8 +5614,6 @@ async fn project_rename(
             ),
         ));
     }
-    // Four authorization tiers, identical to `project_delete`: anything the
-    // platform will LIST for a tenant must be actionable by it.
     let authorized = c
         .projects
         .get_if_set(&project)
@@ -5909,11 +5639,6 @@ async fn project_rename(
                 "no project by that name is owned by this tenant here".into(),
             ));
         }
-        // Not locally verifiable ≠ deniable: this node may hold no trace of a
-        // project that lives entirely on a peer. Broadcast and let every owner
-        // authorize locally; require at least one real acceptance before
-        // answering 2xx, because the dashboard treats any 2xx as success and a
-        // rename that happened nowhere is worse than an honest failure.
         let rename_ms = supplied_rename_ms.unwrap_or_else(|| {
             now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
         });
@@ -5951,9 +5676,6 @@ async fn project_rename(
                 "no node that owns this project could be reached to perform the rename".into(),
             ));
         }
-        // Authorization is now witnessed by at least one owner. Record the
-        // reservation locally BEFORE scheduling slower retries, so the old name
-        // is reserved here even if this HTTP request disappears.
         c.projects
             .record_rename_tombstone(&project, &new, rename_ms);
         crate::persist::persist(&c);
@@ -6062,22 +5784,26 @@ async fn rename_project_local_requested(
     team: &str,
     requested_rename_ms: Option<u64>,
 ) -> ProjectRenameOutcome {
-    // Two lifecycle writers, always taken in the same (lexicographic) order, so
-    // a concurrent rename in the other direction cannot deadlock.
-    let (first, second) = if project.to_ascii_lowercase() <= new.to_ascii_lowercase() {
-        (project.to_string(), new.to_string())
-    } else {
-        (new.to_string(), project.to_string())
-    };
-    let _lifecycle_first = crate::project_settings::lifecycle_write(&first).await;
-    let _lifecycle_second = crate::project_settings::lifecycle_write(&second).await;
+    let (lexicographically_first, lexicographically_second) =
+        if project.to_ascii_lowercase() <= new.to_ascii_lowercase() {
+            (project.to_string(), new.to_string())
+        } else {
+            (new.to_string(), project.to_string())
+        };
+    let _lifecycle_first = crate::project_settings::lifecycle_write(&lexicographically_first).await;
+    let _lifecycle_second =
+        crate::project_settings::lifecycle_write(&lexicographically_second).await;
     rename_project_owned(c, project, new, team, requested_rename_ms).await
 }
 
-/// The one place a rename is applied. Holds BOTH lifecycle writers; every tree
-/// that keys on the project name is rewritten here, in one order, followed by
-/// exactly ONE `persist()` — a rename is never a delete, so no resource is
-/// purged and no tenant data is dropped.
+/// The one place a rename is applied: holds BOTH lifecycle writers and rewrites every tree that
+/// keys on the project name in one order, the settings row FIRST (the authority every other tree
+/// keys off; its incarnation carries across, a rename is never a new identity), then routing, the
+/// production-deployment row (dropping it blinds relocation), custom-domain attachments (routing
+/// keys on the FULL hostname), databases, service graphs, metrics, sandboxes, webhooks, the git
+/// index and poll watermark (the REPO is not renamed) and the relational mirror (an authorization
+/// fallback), followed by ONE `persist()`. A rename is never a delete: no resource is purged and no
+/// tenant data dropped.
 async fn rename_project_owned(
     c: &Arc<CloudState>,
     project: &str,
@@ -6097,10 +5823,6 @@ async fn rename_project_owned(
         incarnation: None,
         residuals: vec![ProjectCleanupResidual::new("rename", project, reason)],
     };
-    // Idempotent retry (or a cascade arriving after the fact): the rename
-    // already happened under this exact generation. Re-running it would try to
-    // move a row that no longer exists and report a failure for work that is
-    // already done.
     if let Some(tomb) = c.projects.rename_tombstone_of(project) {
         if tomb.new.eq_ignore_ascii_case(new) {
             return ProjectRenameOutcome {
@@ -6122,9 +5844,6 @@ async fn rename_project_owned(
         ));
     }
     let Some(row) = c.projects.get_if_set(project) else {
-        // No settings row: the caller authorized on a deployment/peer/relational
-        // tier, so a rename here has no authoritative row to move. Refuse rather
-        // than fabricating one — the owning node's own cascade is what applies it.
         return refused(
             "this node holds no settings row for the project; the rename must be applied by a node that owns it".into(),
         );
@@ -6132,8 +5851,6 @@ async fn rename_project_owned(
     if record_tenant(&row.team) != UNTAGGED_TENANT && norm(&row.team) != norm(team) {
         return refused("active project settings belong to another tenant".into());
     }
-    // Re-check the collision under the writer — a concurrent create may have
-    // taken the name between the request-path check and here.
     if c.projects.find_key_ci(new).is_some() {
         return refused(format!("a project named \"{new}\" already exists"));
     }
@@ -6147,8 +5864,6 @@ async fn rename_project_owned(
             return refused("the rename generation is older than this project's last write".into());
         }
     }
-    // Cancel and drain in-flight builds first: a build that lands after the
-    // rewrite would register a deployment under the OLD name and resurrect it.
     let mut residuals = Vec::new();
     if let Some(incarnation) = incarnation {
         if let Err(ids) = c
@@ -6192,30 +5907,18 @@ async fn rename_project_owned(
     }
     let rename_ms = requested_rename_ms
         .unwrap_or_else(|| now_ms().max(observed_project_version_ms(c, project).saturating_add(1)));
-    // 1. The settings row moves first: it is the authority every other tree is
-    //    keyed off, and it carries the incarnation across unchanged (a rename is
-    //    the same project under a new name, never a new identity).
     let moved_row = c.projects.rename_row(project, new, rename_ms);
     if moved_row.is_none() {
         return refused("the project's settings row disappeared before it could be moved".into());
     }
-    // 2. Routing: deployments + every name-derived alias.
     let renamed = c.gw.rename_project(project, new);
-    // 3. Node-death self-heal's durable "who hosts production" row — dropping it
-    //    blinds relocation for the whole project.
     c.production_deployments.rename(project, new);
-    // 4. Custom domains: routing keys on the FULL hostname so nothing about
-    //    `geniee.site` moves, but the attachment's owning project does.
     let moved_domains = c.domains.rename_project(project, new);
     let moved_databases = c.databases.rename_project(project, new);
     let moved_service_graphs = c.svcgraph.rename_project(project, new);
     let moved_metric_buckets = c.metrics.rename_project(project, new);
     let moved_sandboxes = c.sandboxes.rename_project(project, new);
-    // 5. Event subscriptions: a webhook row naming the old project is
-    //    undeliverable forever, so it follows the rename.
     let moved_webhooks = c.webhooks.rename_project(project, new);
-    // 5. Git auto-deploy index + the in-memory poll watermark. The REPO is not
-    //    renamed — only the project's name inside these two maps.
     c.git_index.rename_project(project, new);
     {
         let mut seen = c.git_poll_seen.write();
@@ -6223,10 +5926,7 @@ async fn rename_project_owned(
             seen.entry(new.to_string()).or_insert(sha);
         }
     }
-    // 6. The relational mirror is a derived projection and never gates this, but
-    //    it is an authorization fallback, so it must follow.
     crate::relational::rename_project(project, new, rename_ms).await;
-    // ONE persist: the whole rewrite must be durable before anything can answer.
     crate::persist::persist(c);
     c.audit.record(
         team,
@@ -6261,14 +5961,11 @@ async fn rename_project_owned(
     }
 }
 
-/// Dispatch a rename to ONE peer over whichever control-plane transport reaches
-/// it (HTTP admin when known, else the iroh mesh). Returns true only when the
-/// peer ACCEPTED the rename and echoed the same generation.
-///
-/// Deliberately a NEW arm rather than a parameter on the delete arm: a
-/// pre-upgrade peer answers 404 / NO_HANDLER, which is a safe no-op (a rename
-/// it cannot perform is reported as a residual), instead of an old binary
-/// ignoring the new name and running a teardown.
+/// Dispatches a rename to ONE peer over whichever control-plane transport reaches it (HTTP admin
+/// when known, else the iroh mesh); true only when the peer ACCEPTED it and echoed the same
+/// generation. Deliberately a NEW arm, not a parameter on the delete arm: a pre-upgrade peer
+/// answers 404/NO_HANDLER, a safe no-op reported as a residual, instead of an old binary ignoring
+/// the new name and running a teardown.
 pub(crate) async fn dispatch_project_rename(
     c: &Arc<CloudState>,
     node: &str,
@@ -6290,10 +5987,8 @@ pub(crate) async fn dispatch_project_rename_with(
     attempts: u32,
 ) -> bool {
     if node == c.node_name {
-        return true; // local copy already handled by the caller
+        return true;
     }
-    // A validated project name is `[a-z0-9._-]` only (`invalid_project_name`),
-    // so it needs no percent-encoding to ride a query string.
     for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
@@ -6355,13 +6050,17 @@ pub(crate) async fn dispatch_project_rename_with(
                 "/v1/projects/{project}/rename?{}&rename_ms={rename_ms}&name={new}",
                 mesh_team_qs(team)
             );
-            if let Some(body) =
-                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-                    .await
+            if let Some(body) = crate::gossip::request_to(
+                c,
+                &id,
+                &addr,
+                hive_p2p::GOSSIP_POST,
+                &path,
+                &[],
+                MESH_FORWARD_TIMEOUT_SECS,
+            )
+            .await
             {
-                // The mesh protocol carries no status code, so a REFUSAL
-                // arrives as a perfectly well-delivered body. Acceptance means
-                // the arm actually ran the rewrite (it answers `renamed`).
                 let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
                 let accepted = v
                     .as_ref()
@@ -6466,10 +6165,6 @@ fn delete_authority(
             .next()
             .expect("length was checked above")
     } else {
-        // No uniquely-authoritative incarnation survives locally. Mint a fresh
-        // server identity for the logical deletion, but do not adopt any of the
-        // ambiguous records into it; route removal will make them unreachable
-        // and the residual set will retain their storage for operator review.
         c.projects.ensure_incarnation(project).map_err(|error| {
             ProjectCleanupResidual::new("project_authority", project, error.to_string())
         })?
@@ -6564,9 +6259,6 @@ async fn delete_project_owned(
         }
     }
 
-    // Snapshot checkout ownership before cancellation: Drop-owned guards may
-    // disappear while the build unwinds, but their exact paths remain lineage
-    // evidence for the subsequent bounded source sweep.
     let active_checkouts = crate::git::active_checkout_paths(&project, incarnation);
     let mut drain_residuals = Vec::new();
     if let Err(ids) = c
