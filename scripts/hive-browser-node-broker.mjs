@@ -1,56 +1,15 @@
 #!/usr/bin/env node
-// Node-local session broker for the HEADLESS browser node (ansible role
-// `hive_browser_node`). Single canonical source lives here in scripts/ and is
-// COPIED to the node by the role -- never hand-edit a second copy (same
-// convention as scripts/hive-lockdown.sh, see roles/prerequisites).
+// Node-local session broker for the HEADLESS browser node (ansible role `hive_browser_node`;
+// single source here, copied to the node by the role). The only admissible browser-node
+// credential is a freshly minted platform JWT, so this broker holds HIVE_INTERNAL_TOKEN (systemd
+// LoadCredential=, never an Environment= line) and hands Chromium nothing but a short-lived,
+// single-tenant, member-role cookie whose claims come from this process's configuration.
 //
-// WHY THIS EXISTS AT ALL
-// ---------------------
-// The /run-node page authenticates its browser node with the httpOnly
-// `hive_jwt` cookie the dashboard's /api/token route mints from a verified
-// CLERK session. A server has no human to sign in, and the backend leaves no
-// second door open:
-//
-//   crates/hive-cloud/src/browser_admission.rs::fresh_user_claims rejects
-//     * `sub` starting with "key:"  -> a dashboard API KEY can never admit
-//     * `role == "service"`         -> no service identity can admit
-//     * `now - iat > HIVE_BROWSER_SESSION_MAX_AGE_SECS` (default 300s)
-//                                   -> no long-lived credential can admit
-//
-// So the ONLY admissible credential is a freshly-minted platform JWT, and the
-// only mint is POST /v1/token, which crates/hive-cloud/src/admin.rs::
-// mint_allowed gates on `x-hive-internal == HIVE_INTERNAL_TOKEN`.
-//
-// This broker is therefore the smallest possible thing that can exist: it
-// holds the internal token (delivered by systemd LoadCredential= from a
-// root-owned 0600 file, NEVER an Environment= line in a unit), and it hands
-// the browser nothing but a short-lived, single-tenant, non-admin cookie.
-// Chromium never sees the internal token, never sees a user password, and
-// never sees an OAuth/Clerk credential -- there is none to leak.
-//
-// LEAST PRIVILEGE OF THE MINTED TOKEN
-//   tenant : exactly HIVE_BROWSER_NODE_TEAM, hardcoded here; the request body
-//            is IGNORED, so a compromised page cannot mint for another tenant
-//   role   : "member" by default -- `may_serve_public` needs owner/admin, so a
-//            member can never be talked into a PUBLIC-scope node
-//   email  : "" -- mint_token derives `platform_admin` from ITS OWN admin_emails
-//            set against this field, so an empty email is structurally
-//            incapable of producing a platform-operator token
-//   sub    : "fleet-browser-node:<node>" -- auditable, never a human's id, and
-//            stable so browser_presence::require_owned_admission's subject
-//            check keeps matching across re-mints
-//   ttl    : whatever the backend issues (1h), re-minted every ~2min so the
-//            300s freshness bar is never the thing that breaks a renewal
-//
-// SURFACES (loopback only; Chromium treats http://127.0.0.1 as a secure
-// context, which is what makes WebCrypto/IndexedDB/OPFS available to the
-// worker without TLS):
+// Surfaces (loopback only; http://127.0.0.1 is a secure context, so WebCrypto/OPFS work):
 //   GET  /                  the headless host page
 //   GET  /config            relay list / team / scope / serveMode / abi
-//   POST /api/token         mint -> Set-Cookie: hive_jwt   (same path the
-//                           worker's own remintSession() already calls)
-//   *    /cloud/*           reverse proxy to the node's admin API, exactly
-//                           what ui/next.config.mjs's rewrite does
+//   POST /api/token         mint -> Set-Cookie: hive_jwt
+//   *    /cloud/*           reverse proxy to the node's admin API (ui/next.config.mjs's rewrite)
 //   POST /heartbeat         page liveness + last RunNodeStatus
 //   GET  /healthz           supervisor probe (scripts/hive-browser-node-run.sh)
 //   GET  /run-node-worker.js, /browser-node/**   static, from WWW_DIR
@@ -80,14 +39,9 @@ const RELAYS = env(
   "HIVE_BROWSER_NODE_RELAYS",
   "https://fc-sanjose.relay.shadw.app:3343,https://fc-bangkok.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343",
 );
-// Pinned deployment/function (optional). Empty = the automatic shape: the
-// fleet derives this tenant's whole browser-eligible set on every renewal.
+// Pinned deployment/function; empty = the fleet derives this tenant's browser-eligible set.
 const PIN_DEPLOYMENT = env("HIVE_BROWSER_NODE_DEPLOYMENT", "");
 const PIN_FUNCTION = env("HIVE_BROWSER_NODE_FUNCTION", "");
-// Geo published with presence. Operator-declared coordinates (inventory
-// `hive_geo`, the same value hive-node itself is pinned to) win outright; see
-// resolveGeoFromRegistry() below for the fallback and why there is no third
-// option.
 const GEO_LAT = env("HIVE_BROWSER_NODE_LAT", "");
 const GEO_LON = env("HIVE_BROWSER_NODE_LON", "");
 
@@ -95,13 +49,10 @@ const HEARTBEAT_STALE_MS = num("HIVE_BROWSER_NODE_HEARTBEAT_STALE_MS", 75_000);
 const BOOT_GRACE_MS = num("HIVE_BROWSER_NODE_BOOT_GRACE_MS", 300_000);
 const MINT_TIMEOUT_MS = 10_000;
 const PROXY_TIMEOUT_MS = 30_000;
-// A single artifact GET can carry a real bundle; everything else is small JSON.
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
-/** The internal token: systemd LoadCredential= puts it in a 0400 file inside a
- *  private tmpfs, so it is never in this process's env, never in the unit text,
- *  and never visible via `systemctl show` or /proc/<pid>/environ. Read ONCE at
- *  boot and held in memory only. */
+/** The internal token comes from systemd LoadCredential= (a 0400 file in a private tmpfs, never
+ *  this process's env or the unit text); read once at boot and held in memory only. */
 function loadInternalToken() {
   const explicit = env("HIVE_BROWSER_NODE_TOKEN_FILE", "");
   const credDir = env("CREDENTIALS_DIRECTORY", "");
@@ -117,17 +68,14 @@ function loadInternalToken() {
 }
 const INTERNAL_TOKEN = loadInternalToken();
 
-/** The host-ABI version is READ OUT OF the deployed worker, never hardcoded
- *  here: it keys the worker URL (ui/lib/use-run-node.ts does the same), so a
- *  copy in this file would silently drift from the artifact it is booting the
- *  moment ui/public/run-node-worker.js bumps it. */
+/** The host-ABI version is read out of the deployed worker (it keys the worker URL, as
+ *  ui/lib/use-run-node.ts does), so a copy here can never drift from the artifact. */
 function readAbiVersion() {
   try {
     const src = readFileSync(join(WWW_DIR, "run-node-worker.js"), "utf8");
     const m = src.match(/const\s+HOST_ABI_VERSION\s*=\s*(\d+)/);
     if (m) return Number.parseInt(m[1], 10);
   } catch {
-    /* fall through to the loud failure below */
   }
   throw new Error(`cannot read HOST_ABI_VERSION from ${WWW_DIR}/run-node-worker.js`);
 }
@@ -147,27 +95,10 @@ const state = {
   mintFailures: 0,
 };
 
-/** Presence coordinates, resolved in strict priority order:
- *
- *   1. HIVE_BROWSER_NODE_LAT/LON -- the OPERATOR's declared position, straight
- *      out of the inventory's `hive_geo` for this host, i.e. the same pin
- *      hive-node itself runs with.
- *   2. This host's OWN entry in the platform's node registry (`GET /v1/nodes`,
- *      the record flagged `is_self`) -- exactly where the platform already
- *      believes this machine is. The browser node then lands on top of its
- *      host node on the constellation instead of nowhere.
- *
- * There is deliberately NO third source: no geolocation HTTP service, and no
- * browser Geolocation permission -- which does not exist headlessly and would
- * be an invention if it did. Measured against the real roster
- * (`ansible-inventory --list`), only 2 of the 5 rostered hosts declare
- * `hive_geo`, so without (2) three fleet browser nodes would publish presence
- * with no fix at all -- silently, since an absent coordinate is indis-
- * tinguishable from a node that simply has not published yet.
- *
- * Resolution NEVER blocks: /config answers immediately with whatever is known,
- * and a late resolution is picked up because the page re-reads /config while
- * it is still unlocated. */
+/** Presence coordinates: HIVE_BROWSER_NODE_LAT/LON (the operator's inventory `hive_geo`), else
+ *  this host's own `is_self` entry in `GET /v1/nodes`. Deliberately no third source (no geo
+ *  HTTP service, no headless Geolocation permission). Resolution never blocks /config; the page
+ *  re-reads /config while unlocated. */
 const geo = {
   lat: Number.isFinite(Number(GEO_LAT)) && GEO_LAT !== "" ? Number(GEO_LAT) : null,
   lon: Number.isFinite(Number(GEO_LON)) && GEO_LON !== "" ? Number(GEO_LON) : null,
@@ -176,10 +107,7 @@ const geo = {
   error: null,
 };
 if (geo.lat !== null && geo.lon !== null) geo.source = "declared";
-// A failed lookup costs one mint against the backend's per-IP mint limiter
-// (20/60s, shared with hive-ui on this same loopback address), so the retry
-// floor is deliberately coarse: this is a cosmetic map fix, never worth
-// crowding out the session mints the node actually needs to stay admitted.
+// A failed lookup costs one mint against the backend's per-IP mint limiter shared with hive-ui.
 const GEO_RETRY_MS = 120_000;
 let geoInFlight = null;
 
@@ -215,12 +143,9 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
-/** The ONE mint. Every claim in the request is this process's configuration,
- *  never a caller's: the tenant, the role, the auditable subject, and the
- *  deliberately EMPTY email that makes `mint_token`'s platform_admin
- *  derivation structurally impossible. `countFailures` is false for the
- *  internal geo lookup so a cosmetic background failure cannot pollute the
- *  session-mint counters an operator reads out of /healthz. */
+/** The ONE mint. Every claim is this process's configuration, never a caller's; the EMPTY email
+ *  makes `mint_token`'s platform_admin derivation structurally impossible. `countFailures` is
+ *  false for the geo lookup so a cosmetic failure never pollutes /healthz's mint counters. */
 async function mintRaw({ countFailures = true } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MINT_TIMEOUT_MS);
@@ -267,11 +192,9 @@ async function mintToken(res) {
     });
   }
   if (!minted.token) {
-    // Unenforced backend (no HIVE_JWT_SECRET) mints nothing meaningful.
     return json(res, 200, { ok: true, tenant: TEAM, enforced: false });
   }
-  // No `Secure`: the origin is http://127.0.0.1, which browsers already
-  // classify as a trustworthy context. HttpOnly keeps it out of page JS.
+  // No `Secure`: http://127.0.0.1 is already a trustworthy context; HttpOnly keeps it from page JS.
   const cookie = [
     `hive_jwt=${minted.token}`,
     "Path=/",
@@ -282,11 +205,8 @@ async function mintToken(res) {
   return json(res, 200, { ok: true, tenant: TEAM, role: ROLE }, { "set-cookie": cookie });
 }
 
-/** Fallback (2) above: ask the platform where IT thinks this host is. Uses the
- *  same least-privilege member token every other call uses -- `/v1/nodes` is a
- *  session-gated read, and a member token is enough for it. Best-effort by
- *  construction: any failure leaves the node unlocated, which is the honest
- *  outcome, never a guessed coordinate. */
+/** Fallback (2): ask the platform where it thinks this host is, with the same member token
+ *  (`/v1/nodes` is a session-gated read). Any failure leaves the node unlocated, never guessed. */
 async function resolveGeoFromRegistry() {
   if (geo.source !== "none") return;
   if (geoInFlight) return geoInFlight;
@@ -305,7 +225,6 @@ async function resolveGeoFromRegistry() {
       let nodes;
       try {
         const headers = { accept: "application/json" };
-        // An unenforced backend mints no token; the read still works there.
         if (minted.token) headers.authorization = `Bearer ${minted.token}`;
         const r = await fetch(`${ADMIN}/v1/nodes`, { headers, signal: controller.signal });
         if (!r.ok) {
@@ -317,15 +236,12 @@ async function resolveGeoFromRegistry() {
         clearTimeout(timer);
       }
       const list = Array.isArray(nodes) ? nodes : Array.isArray(nodes?.nodes) ? nodes.nodes : [];
-      // `is_self` is the authoritative marker; the name match is only a
-      // fallback for a registry view that does not carry it.
       const self =
         list.find((n) => n && n.is_self === true) ||
         list.find((n) => n && (n.name === NODE_NAME || n.id === NODE_NAME));
       const lat = Number(self?.lat);
       const lon = Number(self?.lon);
-      // 0,0 is Null Island, which every "no fix" path in a geo pipeline
-      // eventually produces -- it is a missing value, not the Gulf of Guinea.
+      // 0,0 is Null Island: a missing fix, not a coordinate.
       if (
         !Number.isFinite(lat) ||
         !Number.isFinite(lon) ||
@@ -354,17 +270,13 @@ async function resolveGeoFromRegistry() {
   return geoInFlight;
 }
 
-/** Reverse-proxy /cloud/* to the node's own admin API -- byte-for-byte what
- *  ui/next.config.mjs's `{ source: "/cloud/:path*", destination: ADMIN }`
- *  rewrite does, so the worker's existing `fetch("/cloud" + path)` calls work
- *  unchanged against this origin. The `hive_jwt` cookie rides through as the
- *  Authorization the backend's auth::extract_token reads. */
+/** Reverse-proxy /cloud/* to the node's admin API exactly as ui/next.config.mjs's rewrite does,
+ *  so the worker's `fetch("/cloud" + path)` calls work unchanged; the cookie rides through. */
 async function proxyCloud(req, res, url) {
   const target = `${ADMIN}${url.pathname.slice("/cloud".length)}${url.search}`;
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    // Hop-by-hop + host headers must not be forwarded; `x-hive-internal` from
-    // a page would be an escalation attempt and is dropped unconditionally.
+    // Hop-by-hop + host headers are not forwarded; `x-hive-internal` from a page is an escalation.
     if (["host", "connection", "content-length", "x-hive-internal", "transfer-encoding"].includes(k)) continue;
     if (typeof v === "string") headers[k] = v;
   }
@@ -394,8 +306,7 @@ async function proxyCloud(req, res, url) {
   }
 }
 
-/** Static files under WWW_DIR. The path is normalized and re-checked against
- *  the root AFTER normalization, so no `..` segment can escape. */
+/** Static files under WWW_DIR; the path is re-checked against the root AFTER normalization. */
 async function serveStatic(res, pathname) {
   const rel = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, "");
   const abs = join(WWW_DIR, rel);
@@ -407,9 +318,7 @@ async function serveStatic(res, pathname) {
     res.writeHead(200, {
       "content-type": MIME[extname(abs)] || "application/octet-stream",
       "content-length": buf.length,
-      // Never cached: a role re-run replaces these files in place and the
-      // browser must pick the new bundle up on its next restart, not serve a
-      // stale wasm against a rolled-forward fleet.
+      // A role re-run replaces these files in place; the next restart must not serve a stale wasm.
       "cache-control": "no-store",
     });
     res.end(buf);
@@ -418,9 +327,7 @@ async function serveStatic(res, pathname) {
   }
 }
 
-/** Instantaneous health verdict. The supervisor
- *  (scripts/hive-browser-node-run.sh) requires several consecutive failures
- *  before it acts, so a momentary relay migration never recycles Chromium. */
+/** Instantaneous verdict; the supervisor needs several consecutive failures before it acts. */
 function health() {
   const now = Date.now();
   const age = now - state.lastHeartbeatMs;
@@ -450,8 +357,7 @@ function health() {
 }
 
 const server = createServer(async (req, res) => {
-  // DNS-rebinding defense: this server is loopback-bound, but a browser can
-  // still be pointed at it through a hostname that resolves to 127.0.0.1.
+  // DNS-rebinding defense: a hostname resolving to 127.0.0.1 could point a browser here.
   const host = String(req.headers.host || "");
   if (host && !/^(127\.0\.0\.1|\[::1\]|localhost)(:\d+)?$/i.test(host)) {
     return json(res, 421, { error: "unexpected host" });
@@ -464,9 +370,7 @@ const server = createServer(async (req, res) => {
     return json(res, h.ok ? 200 : 503, h);
   }
   if (p === "/config") {
-    // Never awaited: an unresolved fix must not delay the page's boot. The
-    // page re-reads /config while it is still unlocated, so a resolution that
-    // lands on the second or fiftieth attempt is still picked up.
+    // Never awaited: the page re-reads /config while unlocated, so a late fix is still picked up.
     if (geo.source === "none") void resolveGeoFromRegistry();
     return json(res, 200, {
       relay: RELAYS,
@@ -513,10 +417,7 @@ server.listen(PORT, HOST, () => {
     `hive-browser-node-broker: http://${HOST}:${PORT} admin=${ADMIN} team=${TEAM} role=${ROLE} scope=${SCOPE} ` +
       `serve=${SERVE_MODE} abi=${ABI_VERSION} node=${NODE_NAME} geo=${geo.source}\n`,
   );
-  // Kick the registry lookup at boot so the very first /config already carries
-  // a fix on a host with no declared hive_geo. Fire-and-forget: hive-node may
-  // not be listening yet (the unit is only Wants=), and the retry floor covers
-  // that without holding up the listener the supervisor is waiting on.
+  // Fire-and-forget at boot: hive-node may not be listening yet (the unit is only Wants=).
   if (geo.source === "none") void resolveGeoFromRegistry();
 });
 

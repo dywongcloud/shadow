@@ -1,40 +1,19 @@
 #!/usr/bin/env bash
-# Watchdog for the shadw node daemons: ensures each installed node answers on its
-# admin /healthz; restarts ONLY a node that is genuinely down/wedged. Runs as a
-# PERSISTENT loop under the dev.shadw.watchdog LaunchAgent (KeepAlive daemon,
-# WATCHDOG_LOOP=1 in the plist) — NOT StartInterval, which was live-witnessed
-# silently never firing on this launchd domain (runs=0 across minutes even
-# after a fresh bootout+bootstrap, while fc-lax2 sat crashed). A KeepAlive'd
-# forever-loop only needs launchd to restart a dead process, which it does
-# reliably. Manual invocations (no WATCHDOG_LOOP) run a single pass and exit.
-# Backstops the node agents' own launchd KeepAlive (which won't respawn
-# reliably in some launchd domains either — same failure family).
-#
-# DO NOT FLAP THE BACKEND. A single slow /healthz — a GC pause, a busy keep-warm
-# tick, or a node still warming up right after a restart — must NEVER cause a
-# kill. We only restart after the node fails EVERY probe across a long sustained
-# window (~1 minute). A healthy node, or one that recovers mid-window, is left
-# completely alone. (Earlier this used a 2s single-probe-then-SIGKILL check, which
-# killed the backend on any transient slowness → restart loop. Never again.)
+# Watchdog for the shadw node daemons on macOS: restarts ONLY a node that failed EVERY probe
+# across a sustained window (never on one slow /healthz). Runs as a persistent loop under the
+# dev.shadw.watchdog LaunchAgent (KeepAlive + WATCHDOG_LOOP=1; StartInterval never fires in this
+# launchd domain); without WATCHDOG_LOOP it runs one pass and exits.
 set -uo pipefail
 DOMAIN="gui/$(id -u)"
 
-# Tunables: require STRIKES consecutive failures, PROBE_TIMEOUT each, spaced by
-# SLEEP_BETWEEN → ~STRIKES*(PROBE_TIMEOUT+SLEEP_BETWEEN)s of *sustained* downtime
-# before any action. Generous on purpose — covers warm-up + transient stalls.
 STRIKES=4
 PROBE_TIMEOUT=8
 SLEEP_BETWEEN=6
 
 healthy() { curl -fsS -m"$PROBE_TIMEOUT" "http://127.0.0.1:$1/healthz" >/dev/null 2>&1; }
 
-# Mesh-membership check (/v1/mesh): /healthz stays green during SILENT PARTIAL-
-# MESH ISOLATION — the exact node-a/node-b incident class where a node serves
-# fine locally but sees ZERO of its expected fleet (orphan launch, gossip
-# signature rejection, stale identity). `isolated:true` means peers were
-# expected and none are visible. Returns 0 = fine, 1 = isolated. A node with no
-# expected peers (single-node dev), or an unreachable/old endpoint, counts as
-# fine — this check must never ADD flappiness, only surface real isolation.
+# /healthz stays green during silent partial-mesh isolation; `isolated:true` means peers were
+# expected and none are visible. No expected peers or an unreachable endpoint counts as fine.
 mesh_ok() {
   local body
   body=$(curl -fsS -m"$PROBE_TIMEOUT" "http://127.0.0.1:$1/v1/mesh" 2>/dev/null) || return 0
@@ -44,15 +23,8 @@ mesh_ok() {
   esac
 }
 
-# Impostor check: the hive-cloud process LISTENING on the admin port must be the
-# one launched with this label's own --name. /healthz and /v1/mesh both pass when
-# a DIFFERENT hive-cloud instance squats the port (live-hit 2026-07-21: a reboot's
-# RunAtLoad race let the meshless dev `node-a` win fc-lax's 8786/8787; it answered
-# /healthz green and saw LAN peers, so neither existing check fired while the real
-# fc-lax crash-looped on bind for 22h and fleet build dispatch through LA failed).
-# argv is deterministic — no sustained-window needed. Prints the squatter pid and
-# returns 0 only when a WRONG-named hive-cloud holds the port; anything else
-# (correct owner, non-hive process, no listener) returns 1 and is left alone.
+# A DIFFERENT hive-cloud squatting the admin port passes /healthz and /v1/mesh; argv is
+# deterministic, so no sustained window is needed. Prints the squatter pid, returns 0 only then.
 imposter_pid() { # <expected-name> <admin-port>
   local pid args
   pid=$(lsof -nP -tiTCP:"$2" -sTCP:LISTEN 2>/dev/null | head -1)
@@ -65,14 +37,8 @@ imposter_pid() { # <expected-name> <admin-port>
   esac
 }
 
-# A job launchd cannot even SPAWN is not fixed by `kickstart -k`: its registered
-# definition must be replaced. Witnessed 2026-09-19 -> 09-21: dev.shadw.fc-lax
-# (the mesh's `fc-lax3`) sat dead for ~59 h — 21,500 spawn attempts, this
-# watchdog kickstarting it every minute — with `last exit code = 78: EX_CONFIG`
-# and launchd's log saying "Service could not initialize: Unable to get updated
-# LWCR" (the BTM/launch-constraint record went stale after the debug binary was
-# rebuilt). The binary itself ran fine by hand; a bootout + bootstrap of the same
-# plist cured it. hive-cloud never exits 78, so the code identifies a spawn failure.
+# launchd exit code 78 (EX_CONFIG, "Unable to get updated LWCR") means the registered job
+# definition is stale: only bootout + bootstrap cures it. hive-cloud itself never exits 78.
 spawn_broken() { # <label>
   launchctl print "$DOMAIN/$1" 2>/dev/null | grep -q 'last exit code = 78'
 }
@@ -88,11 +54,7 @@ reload_job() { # <label>
 ensure() { # <label> <admin-port>
   launchctl print "$DOMAIN/$1" >/dev/null 2>&1 || return 0   # not installed → skip
 
-  # Evict a port squatter before any health interpretation: a wrong-named
-  # hive-cloud on this port means every probe below is interrogating the WRONG
-  # process. Bootout its own label if launchd owns it (stop + unload, so its
-  # KeepAlive cannot re-race), plain kill for an orphan, then kickstart the
-  # rightful label to claim the port immediately.
+  # Evict a squatter before interpreting health: every probe below would interrogate the wrong process.
   local name pid ilabel
   name=${1#dev.shadw.}
   if pid=$(imposter_pid "$name" "$2"); then
@@ -108,13 +70,8 @@ ensure() { # <label> <admin-port>
     return 0
   fi
 
-  # Fast path: healthy right now → done (the overwhelmingly common case).
   if healthy "$2"; then
-    # Same sustained-window discipline for isolation: a single isolated read
-    # (e.g. the first seconds after a restart, before gossip resyncs) must not
-    # trigger anything. Only STRIKES consecutive isolated reads — with the node
-    # otherwise healthy — earn a restart (a restart re-runs bootstrap/rejoin,
-    # which is the standard recovery for the stale-identity/orphan-launch class).
+    # Same sustained-window discipline: only STRIKES consecutive isolated reads earn a restart.
     mesh_ok "$2" && return 0
     local j
     for ((j = 2; j <= STRIKES; j++)); do
@@ -126,17 +83,13 @@ ensure() { # <label> <admin-port>
     return 0
   fi
 
-  # Not healthy on the first probe. Could be warming up or a transient stall —
-  # re-probe several times; the moment it answers, we're done and never touch it.
   local i
   for ((i = 2; i <= STRIKES; i++)); do
     sleep "$SLEEP_BETWEEN"
     healthy "$2" && return 0
   done
 
-  # Failed every probe across the whole window → genuinely down/wedged. `-k` is
-  # required to clear a wedged process that won't exit on its own; the sustained
-  # window above guarantees we only reach here for a truly dead node.
+  # Failed every probe across the window; `-k` clears a wedged process that will not exit by itself.
   echo "$(date '+%H:%M:%S') $1 down on :$2 (failed $STRIKES probes over ~$((STRIKES * (PROBE_TIMEOUT + SLEEP_BETWEEN)))s) — restarting"
   if spawn_broken "$1"; then
     echo "$(date '+%H:%M:%S') $1 cannot be spawned (last exit 78 EX_CONFIG) — kickstart cannot fix that; re-registering its plist"

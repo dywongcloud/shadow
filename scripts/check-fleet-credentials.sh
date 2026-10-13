@@ -1,32 +1,15 @@
 #!/usr/bin/env bash
-# Fleet-wide credential VERIFICATION (read-only, boolean presence only).
-#
-# For every fleet node, checks whether each required credential env var is
-# SET and non-empty:
-#   dashboard side  -- /root/hive/ui/.env.local:
-#     COMPOSIO_API_KEY, GITHUB_APP_CLIENT_ID, GITHUB_APP_CLIENT_SECRET,
-#     GITHUB_APP_REDIRECT_URI, HIVE_GITHUB_AUTH_CONFIG_ID
-#   backend side    -- hive-node.service environment (systemctl show +
-#                       unit/drop-in Environment= lines + EnvironmentFile=):
-#     GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, HIVE_SECRET_KEY
-#
-# SAFETY (hard requirement): this script NEVER prints, logs, or otherwise
-# outputs actual secret VALUES -- only "present"/"MISSING"/"UNREACHABLE" per
-# var, per node. The remote-side checks read secret values into transient
-# remote shell variables purely to test non-emptiness and never echo them.
-# Any change to this script must preserve that invariant.
-#
-# READ-ONLY: makes no writes to any fleet node (no files touched, no
-# services restarted). Safe to run at any time, does not require the
-# explicit-approval gate that write/restart actions to the fleet need.
+# Fleet-wide credential VERIFICATION: read-only, boolean presence only. Checks, per node, that
+# the dashboard's /root/hive/ui/.env.local carries COMPOSIO_API_KEY, GITHUB_APP_CLIENT_ID,
+# GITHUB_APP_CLIENT_SECRET, GITHUB_APP_REDIRECT_URI, HIVE_GITHUB_AUTH_CONFIG_ID and that
+# hive-node.service's environment carries GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, HIVE_SECRET_KEY.
+# Prints only present/MISSING/UNREACHABLE per var — NEVER a secret value; any change keeps that.
 #
 # Usage:
 #   scripts/check-fleet-credentials.sh              # every node in hosts.ini
 #   scripts/check-fleet-credentials.sh <ip> [ip...] # only the given hosts
 #
-# Exit status: 0 if every var is present on every reachable node, 1 if any
-# var is MISSING or any node is UNREACHABLE (so this can also be used as a
-# fleet health check in automation).
+# Exit status: 0 if every var is present on every reachable node, else 1.
 set -euo pipefail
 
 PEM="${HIVE_FLEET_PEM:-$HOME/Documents/billing.pem}"
@@ -47,12 +30,8 @@ BACKEND_VARS=(
 )
 ALL_VARS=("${DASHBOARD_VARS[@]}" "${BACKEND_VARS[@]}")
 
-# --- host list ---------------------------------------------------------
-# alias|ip|display_name triples. hosts.ini (ansible/inventory/hosts.ini) is
-# the single authoritative fleet host list; explicit args on the command
-# line override it (matches deploy-ui-fleet.sh's "[host ...]" usage); a
-# hardcoded fallback (same 7 nodes deploy-ui-fleet.sh defaults to) covers
-# the case hosts.ini is missing/unreadable.
+# alias|ip|display_name triples from hosts.ini; explicit args override; a hardcoded fallback
+# covers a missing inventory.
 declare -a HOST_TRIPLES=()
 
 if [[ $# -gt 0 ]]; then
@@ -88,11 +67,8 @@ fi
 
 ssh_opts=(-i "$PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes)
 
-# --- remote check script -------------------------------------------------
-# Runs entirely on the remote node via `bash -s` over stdin. Only ever
-# echoes "DASH:<VAR>=PRESENT|MISSING" / "BACK:<VAR>=PRESENT|MISSING" tokens.
-# Secret values are read into transient local shell variables purely to
-# test non-emptiness and are NEVER echoed, printed, logged, or returned.
+# Runs on the remote node via `bash -s`; only ever echoes DASH:/BACK:<VAR>=PRESENT|MISSING
+# tokens, never a value.
 read -r -d '' REMOTE_SCRIPT <<'REMOTE_EOF' || true
 set -u
 
@@ -183,7 +159,6 @@ check_dashboard
 check_backend
 REMOTE_EOF
 
-# --- run against every node ----------------------------------------------
 declare -A RESULTS   # key "alias:VAR" -> PRESENT|MISSING|UNREACHABLE
 declare -a ORDERED=()
 
@@ -208,7 +183,6 @@ for triple in "${HOST_TRIPLES[@]}"; do
   fi
 done
 
-# --- summary: full per-node / per-var table -------------------------------
 echo
 echo "================================================================================"
 echo " Fleet Credential Verification -- presence/absence only, no secret values shown"
@@ -236,7 +210,6 @@ for alias_name in "${ORDERED[@]}"; do
   done
 done
 
-# --- summary: missing-only quick-scan -------------------------------------
 echo
 echo "================================================================================"
 echo " Quick scan -- nodes with any MISSING/UNREACHABLE credential"

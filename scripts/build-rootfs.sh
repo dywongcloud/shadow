@@ -1,42 +1,14 @@
 #!/usr/bin/env bash
-# Build an ext4 rootfs for a Hive cell from an OCI image, with the cell agent
-# baked in as the guest init. Run this INSIDE the Lima guest (needs root, an OCI
-# container CLI, and mkfs.ext4). The result lands in
-# $ROOTFS_DIR/<sanitized-image>.ext4 and is what
-# the Firecracker backend boots for that logical image name.
+# Build an ext4 rootfs for a Hive cell from an OCI image with the cell agent baked in as the
+# guest init. Run INSIDE the Lima guest (root, an OCI container CLI, mkfs.ext4). Output:
+# $ROOTFS_DIR/<sanitized-image>.ext4, what the Firecracker backend boots for that logical name.
 #
 # Usage: sudo ./build-rootfs.sh <oci-image> <logical-name> [size-mib]
 #        sudo ./build-rootfs.sh --preflight-agent
-#   e.g. sudo ./build-rootfs.sh node:20-slim default 4096
-#
-# WASMER (hive_core::Runtime::Wasmer): set WASMER_TARBALL=/path/to/
-# wasmer-linux-amd64.tar.gz to bake the `wasmer` CLI into the guest. This is
-# REQUIRED for Wasmer functions on a Firecracker node and is not optional
-# plumbing: `hive-cell-agent` runs as PID1 INSIDE the microVM and execs
-# `start_cmd[0]` against the GUEST PATH, so a wasmer installed on the host is
-# invisible to it. Only `bin/wasmer` is staged (~200 MiB); the tarball's
-# `lib/*.a` static archives are another ~560 MiB that `wasmer run` never opens.
-# When staged, a `<name>.wasmer` marker file is written NEXT TO the image — that
-# marker is what `hive-cloud`'s `detect_wasm_runtime` probe stats to decide
-# whether this node may advertise `NodeInfo::wasm_runtime`, because mounting an
-# ext4 image to look inside would need root and a loop device at every boot.
-#
-# BUN (hive_core::Runtime::Bun): identical requirement and identical reason —
-# `hive-cell-agent` execs a Bun `start_cmd[0]` against the GUEST PATH too, so a
-# `bun` installed on the host is equally invisible to it. Two staging forms,
-# since (unlike wasmer's upstream `.tar.gz`) Bun's own release artifact is a
-# `.zip`: set BUN_TARBALL=/path/to/bun-linux-x64.tar.gz for a repackaged
-# tarball with `bun` at its root (`tar czf bun-linux-x64.tar.gz -C
-# bun-linux-x64 bun`, mirroring the wasmer convention above exactly), or set
-# BUN_BINARY=/path/to/bun for an already-extracted executable (e.g. after
-# unzipping the upstream artifact yourself) — set at most one. When staged, a
-# `<name>.bun` marker file is written NEXT TO the image, the same way and for
-# the same reason as `<name>.wasmer` — `hive-cloud`'s `detect_bun_runtime`
-# probe (`NodeInfo::bun_runtime`) stats it.
+# Env:   WASMER_TARBALL=<wasmer-linux-amd64.tar.gz>   stage bin/wasmer into the guest and write
+#                                                      the <name>.wasmer marker beside the image
+#        BUN_TARBALL=<bun-linux-x64.tar.gz> | BUN_BINARY=<bun>   (at most one) stage bun likewise
 set -euo pipefail
-# Convert controller/timeout signals into a normal shell exit so whichever EXIT
-# cleanup is current unmounts and removes private staging before the remote
-# restart guard brings hive-node back.
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -91,16 +63,8 @@ preflight_agent() {
     echo "missing non-symlink executable agent binary at $AGENT_BIN (run the backend packaging role first)" >&2
     return 1
   }
-  # The agent becomes /sbin/hive-cell-agent -- the guest's PID 1 -- so it must
-  # run against whatever libc the OCI base image happens to ship, which is
-  # unrelated to the build host. A dynamically-linked agent binds to the build
-  # host's glibc version and the guest usually does not have it: witnessed
-  # 2026-10-09 on fc-orlando, where the agent needed GLIBC_2.39 and the
-  # node:20-slim (bookworm) guest had 2.36, so every Firecracker cell died with
-  # "version `GLIBC_2.39' not found" followed by "Kernel panic - not syncing:
-  # Attempted to kill init!". Refuse the bake instead of shipping a rootfs that
-  # boots to a panic -- this is the one place every agent reaches the guest, so
-  # it is the only place that can catch the whole class.
+  # The agent is the guest's PID 1 against whatever libc the OCI base ships: refuse a dynamically
+  # linked agent.
   if ! python3 - "$AGENT_BIN" <<'PYSTATIC'
 import struct, sys
 with open(sys.argv[1], "rb") as handle:
@@ -262,10 +226,6 @@ WASMER_TARBALL="${WASMER_TARBALL:-}"
 BUN_TARBALL="${BUN_TARBALL:-}"
 BUN_BINARY="${BUN_BINARY:-}"
 
-# Prove the exact installed release BEFORE creating a container, rootfs lock,
-# image, or mount. Then own the installer's release lock and re-prove under that
-# serialization for the entire bake: the installed fact cannot rotate between
-# the snapshot and atomic rootfs publication.
 preflight_agent >/dev/null
 exec 8>"${AGENT_BIN}.install.lock"
 flock -n 8 || {
@@ -277,11 +237,6 @@ PACKAGED_RELEASE_FACT="$(printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifa
   "$CELL_AGENT_RELEASE_SCHEMA_EXPECTED" "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" \
   "$AGENT_WIRE_PROTOCOL" "$AGENT_WIRE_CAPABILITIES" "$AGENT_SHA256")"
 
-# Snapshot the exact proved inode before doing slow image work. Backend packaging
-# publishes the host agent by atomic rename, so a concurrent release could
-# otherwise make the later install read different bytes than AGENT_SHA256 names.
-# Re-hashing the private copy closes that path without holding the packaging lock
-# for the whole rootfs build.
 AGENT_SNAPSHOT="$(mktemp)"
 trap 'rm -f "$AGENT_SNAPSHOT"' EXIT
 install -m 0755 "$AGENT_BIN" "$AGENT_SNAPSHOT"
@@ -316,23 +271,8 @@ WORK="$(mktemp -d)"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
 
-# BUILD ASIDE, THEN RENAME. Never dd/mkfs over $OUT itself: on an already
-# provisioned node that path IS the live base image, and every cold start copies
-# it (`FirecrackerBackend::provision` -> reflink_or_copy(base, overlay)) with
-# only an existence check ahead of the copy — which `dd` satisfies the instant it
-# creates the file. Writing in place therefore gave a multi-minute window where
-# arriving cold starts copied a zeroed or half-populated filesystem, booted a
-# microVM with no /sbin/hive-cell-agent, never reached FunctionReady, and
-# surfaced as DEPLOYMENT_START_FAILED — telling the tenant to debug an entrypoint
-# that was perfectly correct. Already-RUNNING microVMs were unaffected (they hold
-# their own per-cell overlay), so the blast radius was precisely the cold starts
-# during the rebuild.
-#
-# `mv` within one directory is an atomic rename: a cold start either copies the
-# whole OLD image or the whole NEW one, never a torn one, and a copy already in
-# flight completes against the old inode. This is the same tmp+rename the
-# per-deployment path next door already uses (`deliver_build` writes
-# `<image>.ext4.tmp` then renames) — the base-image path simply never got it.
+# Build aside, then rename: $OUT is the live base image every cold start copies, so it changes
+# only by atomic rename, never in place.
 OUT_TMP="${OUT}.tmp"
 SIDECAR_TMP="${ROOTFS_PROTOCOL_SIDECAR}.tmp.$$"
 echo ">> creating ${SIZE_MIB}MiB ext4 at $OUT_TMP (renamed onto $OUT at the end)"
@@ -340,8 +280,6 @@ sudo rm -f "$OUT_TMP"
 dd if=/dev/zero of="$OUT_TMP" bs=1M count="$SIZE_MIB" status=none
 mkfs.ext4 -F -q "$OUT_TMP"
 sudo mount -o loop "$OUT_TMP" "$MNT"
-# Clean up the PARTIAL image on any failure — a half-built .tmp left behind
-# would otherwise be renamed by a later run that assumes it is complete.
 trap 'sudo umount "$MNT" 2>/dev/null || true; sudo rm -f "$OUT_TMP" "$SIDECAR_TMP"; "$CONTAINER_CLI" rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"; rm -f "$AGENT_SNAPSHOT"' EXIT
 
 echo ">> unpacking container fs into image"
@@ -351,10 +289,6 @@ echo ">> installing cell agent as /sbin/hive-cell-agent and build dir"
 sudo install -D -m0755 "$AGENT_SNAPSHOT" "$MNT/sbin/hive-cell-agent"
 sudo mkdir -p "$MNT/build" "$MNT/root" "$MNT/proc" "$MNT/sys" "$MNT/dev" "$MNT/tmp"
 
-# The marker is INSIDE the exact rootfs image and names the exact agent bytes
-# installed above. The host-side sidecar written after unmount binds this marker
-# to the whole ext4 image digest, so a sidecar copied beside a different/legacy
-# image cannot create a capability.
 ROOTFS_MARKER_TMP="$WORK/runtime-artifact-protocol.json"
 printf '{"schema":%s,"protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
   "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
@@ -362,13 +296,10 @@ printf '{"schema":%s,"protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabili
 sudo install -D -o root -g root -m0444 \
   "$ROOTFS_MARKER_TMP" "$MNT$ROOTFS_PROTOCOL_MARKER"
 
-# Make sure git + a shell exist (most base images have sh; add git if missing).
 if [ ! -e "$MNT/usr/bin/git" ] && [ ! -e "$MNT/bin/git" ]; then
   echo "   note: '$OCI_IMAGE' has no git; clones will fail. Bake git into your image if needed."
 fi
 
-# Wasmer CLI into the GUEST (see the header note for why the host copy cannot
-# serve this purpose). /usr/local/bin is on the exact PATH the agent sets.
 MARKER="${ROOTFS_DIR}/${SAFE_NAME}.wasmer"
 sudo rm -f "$MARKER"
 if [ -n "$WASMER_TARBALL" ]; then
@@ -376,19 +307,13 @@ if [ -n "$WASMER_TARBALL" ]; then
   echo ">> baking wasmer CLI into the guest at /usr/local/bin/wasmer"
   WTMP="$WORK/wasmer"
   mkdir -p "$WTMP"
-  # Extract ONLY the CLI: the lib/*.a archives are ~560 MiB of build-time
-  # artifacts `wasmer run` never opens, and this image has a fixed size budget.
   tar -xzf "$WASMER_TARBALL" -C "$WTMP" bin/wasmer
   sudo install -D -m0755 "$WTMP/bin/wasmer" "$MNT/usr/local/bin/wasmer"
-  # Fail loudly rather than shipping an image that silently cannot run wasm.
   [ -x "$MNT/usr/local/bin/wasmer" ] || { echo "wasmer staging failed"; exit 1; }
   WVER="$("$WTMP/bin/wasmer" --version 2>/dev/null || echo unknown)"
   echo "   staged: $WVER"
 fi
 
-# Bun CLI into the GUEST (see the header note for why the host copy cannot
-# serve this purpose — identical reasoning to wasmer above). /usr/local/bin is
-# on the exact PATH the agent sets.
 BUN_MARKER="${ROOTFS_DIR}/${SAFE_NAME}.bun"
 sudo rm -f "$BUN_MARKER"
 if [ -n "$BUN_TARBALL" ] && [ -n "$BUN_BINARY" ]; then
@@ -411,7 +336,6 @@ elif [ -n "$BUN_BINARY" ]; then
   BUN_STAGED_BIN="$BUN_BINARY"
 fi
 if [ -n "$BUN_STAGED_BIN" ]; then
-  # Fail loudly rather than shipping an image that silently cannot run bun.
   [ -x "$MNT/usr/local/bin/bun" ] || { echo "bun staging failed"; exit 1; }
   BVER="$("$BUN_STAGED_BIN" --version 2>/dev/null || echo unknown)"
   echo "   staged: bun $BVER"
@@ -423,11 +347,8 @@ IMAGE_BYTES="$(stat -c '%s' "$OUT_TMP")"
 [ "${#IMAGE_SHA256}" -eq 64 ] || { echo "rootfs SHA-256 has the wrong length"; exit 1; }
 [ "$IMAGE_BYTES" -gt 0 ] || { echo "rootfs image is empty"; exit 1; }
 
-# Prepare the content proof in the SAME directory as the image. Neither name is
-# published until both files are complete, fsynced, root-owned and read-only.
-# Two names cannot be renamed atomically together, so remove the old proof first:
-# every crash window then reads as NOT CAPABLE (old/new image without a proof),
-# never as a proof for the wrong image.
+# Remove the old proof before publishing: every crash window reads NOT CAPABLE, never a proof
+# for the wrong image.
 SIDECAR_BODY="$WORK/runtime-artifact-rootfs-sidecar.json"
 printf '{"schema":%s,"protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s","image_sha256":"%s","image_bytes":%s}\n' \
   "$ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
@@ -437,11 +358,8 @@ sudo install -o root -g root -m0444 "$SIDECAR_BODY" "$SIDECAR_TMP"
 sudo sync -f "$OUT_TMP"
 sudo sync -f "$SIDECAR_TMP"
 
-# Re-prove every independently-produced fact before either canonical name moves.
-# This second whole-image hash is intentional: the first produces the sidecar;
-# this one proves the image remained those exact bytes through marker extraction,
-# sidecar construction and fsync. The install lock held on fd 8 simultaneously
-# keeps the canonical agent/release pair fixed through publication.
+# Intentional second whole-image hash: proves the image kept those exact bytes through marker
+# extraction, sidecar construction and fsync.
 CURRENT_RELEASE_FACT="$(preflight_agent)"
 EMBEDDED_MARKER="$(debugfs -R "cat $ROOTFS_PROTOCOL_MARKER" "$OUT_TMP" 2>/dev/null)"
 python3 - \
@@ -500,27 +418,18 @@ if digest(image_path) != image_sha or os.stat(image_path).st_size != int(image_b
     raise SystemExit('rootfs image changed after its publication identity was computed')
 PYPUBLISH
 
-# THE ONLY MOMENT THE LIVE BASE CHANGES. A cold start copies either the whole old
-# image or the whole new image. The sidecar verifier hashes the exact current
-# inode and refuses the short image/sidecar transition window.
+# The only moment the live base changes: a cold start copies the whole old or whole new image.
 sudo rm -f "$ROOTFS_PROTOCOL_SIDECAR"
 sudo mv -f "$OUT_TMP" "$OUT"
 sudo mv -f "$SIDECAR_TMP" "$ROOTFS_PROTOCOL_SIDECAR"
 sudo sync -f "$ROOTFS_DIR"
 trap '"$CONTAINER_CLI" rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"; rm -f "$AGENT_SNAPSHOT"' EXIT
-# Marker LAST — after the clean unmount AND after the image is actually in
-# place. `$MARKER` was removed up front, so a build that dies anywhere between
-# leaves the node advertising NO wasm capability, which is the safe direction:
-# placement simply skips it instead of routing Wasmer work to an image that
-# never got the binary.
+# Marker last, after unmount and publish: a build that dies earlier leaves NO wasm capability.
 if [ -n "$WASMER_TARBALL" ]; then
   printf '%s\n' "$WVER" | sudo tee "$MARKER" >/dev/null
   echo ">> wrote capability marker: $MARKER"
 fi
-# Same "marker LAST" discipline as wasmer above, same reason: `$BUN_MARKER`
-# was removed up front, so a build that dies anywhere between leaves the node
-# advertising NO bun capability — placement simply skips it instead of
-# routing Bun work to an image that never got the binary.
+# Marker last, same discipline as wasmer.
 if [ -n "$BUN_STAGED_BIN" ]; then
   printf '%s\n' "$BVER" | sudo tee "$BUN_MARKER" >/dev/null
   echo ">> wrote capability marker: $BUN_MARKER"

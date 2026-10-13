@@ -1,21 +1,8 @@
 #!/usr/bin/env bash
-# shadwd — run the whole shadw platform as macOS launchd daemons (LaunchAgents):
-#
-#   dev.shadw.lima    — keeps the Lima nested-virt VM up (the REAL Firecracker
-#                       microVM host; see scripts/fc-vm.yaml + scripts/fc-test.sh)
-#   dev.shadw.node-a  — primary hive-cloud node: API/admin :8786, public/wildcard
-#                       :8787, data ~/.hive-cloud  (KeepAlive)
-#   dev.shadw.node-b  — peer node (meshes with node-a)            [NODES>=2]
-#   dev.shadw.fc      — keeps the REAL Firecracker-backed in-VM node up    [FC=1]
-#   dev.shadw.watchdog— restarts any down node (backstops KeepAlive)
-#
-# Auto-starts on login, restarts on crash, logs to ~/Library/Logs/shadw/.
-# The host nodes use the mock cell backend (macOS has no /dev/kvm); REAL
-# Firecracker microVMs run inside the Lima VM — `shadwd.sh fc-daemon` installs an
-# in-VM systemd service for a firecracker-backed node, and the dev.shadw.fc agent
-# keeps it running (listens in-VM on :8796/:8797, Lima-forwarded to the host).
-# Each boot prunes stopped/leaked host containers (shadw-lima-up.sh) so warm-up
-# never inherits a saturated podman lock pool / process table.
+# shadwd — run the whole shadw platform as macOS launchd agents: dev.shadw.lima (the Lima
+# nested-virt VM hosting REAL Firecracker microVMs), dev.shadw.node-a/node-b (hive-cloud nodes,
+# mock cell backend since macOS has no /dev/kvm), dev.shadw.fc (in-VM Firecracker node, FC=1),
+# dev.shadw.watchdog. Logs land in ~/Library/Logs/shadw/.
 #
 # Usage:
 #   ./scripts/shadwd.sh install      # build (release+zkauth) + install + start all
@@ -27,7 +14,6 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
-# PROFILE=release for an optimized daemon binary; default debug (fast, already built).
 PROFILE="${PROFILE:-debug}"
 BIN="$REPO/target/$PROFILE/hive-cloud"
 LA="$HOME/Library/LaunchAgents"
@@ -36,22 +22,11 @@ DOMAIN="gui/$(id -u)"
 NODES="${NODES:-2}"
 FC="${FC:-1}"   # include the Firecracker-backed in-VM node as a managed agent
 DASH="${HIVE_DASHBOARD_URL:-http://localhost:3002}"
-# Public dashboard origin for protected-preview unlock redirects reached over the
-# wildcard tunnel (so the unlock screen stays on the tunnel, not localhost).
 PUB_DASH="${HIVE_PUBLIC_DASHBOARD_URL:-https://shadw.cloud}"
-# Remote (Bangkok) node admin, reachable via the dev.shadw.peer-bkk forward tunnel
-# (Mac 127.0.0.1:18796 -> Bangkok admin). node-a peers it so it learns Bangkok's
-# deployment placement (mesh routing + the Network "serving" view). Empty = none.
+# Remote node admins via the dev.shadw.peer-* forward tunnels (Mac 127.0.0.1:1879x); empty = none.
 BKK_PEER="${BKK_PEER:-http://127.0.0.1:18796}"
-# Remote (Virginia) node admin, via the dev.shadw.peer-va forward tunnel
-# (Mac 127.0.0.1:18797 -> Virginia admin). Empty = none.
 VA_PEER="${VA_PEER:-http://127.0.0.1:18797}"
-# Remote (San Jose) node admin, via the dev.shadw.peer-sj forward tunnel
-# (Mac 127.0.0.1:18798 -> San Jose admin). node-a peers it so it can route to
-# deployments placed on fc-sanjose. Empty = none.
 SJ_PEER="${SJ_PEER:-http://127.0.0.1:18798}"
-# Remote (Virginia/Ashburn-2, fc-virginia-2) node admin, via the dev.shadw.peer-va2
-# forward tunnel (Mac 127.0.0.1:18799 -> fc-virginia-2 admin). Empty = none.
 VA2_PEER="${VA2_PEER:-http://127.0.0.1:18799}"
 NODE_BIN="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/false)")"
 PATHVAL="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
@@ -61,7 +36,6 @@ LABELS=(dev.shadw.lima dev.shadw.node-a)
 [ "$FC" = 1 ] && LABELS+=(dev.shadw.fc)   # Firecracker-backed in-VM node keeper
 LABELS+=(dev.shadw.watchdog)   # loaded last; restarts any down node (backstops KeepAlive)
 
-# --- plist writers ---------------------------------------------------------
 xml_args() { for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done; }
 
 write_node_plist() { # <label> <name> <public> <admin> <dns> <tls> <datadir> [peerUrl...]
@@ -214,15 +188,9 @@ cmd_status() {
 
 cmd_logs() { echo "tailing $LOGS/*.log (Ctrl-C to stop)"; tail -n 30 -f "$LOGS"/*.log; }
 
-# --- in-VM Firecracker node via systemd ------------------------------------
-# Runs a hive-cloud node WITH the real Firecracker backend INSIDE the Lima VM,
-# as a systemd service (auto-starts on VM boot; the lima agent boots the VM).
-# Full end-to-end serving works: builds run on the VM host, the build output is
-# delivered into each cell as a virtio-blk data disk mounted at /build, the guest
-# rootfs ships a node runtime + the cell agent (static musl, so it's rootfs-glibc
-# independent), and the agent fronts the function with the multiplexed tunnel
-# protocol over vsock. `Cargo.lock` must already resolve tokio-vsock (run
-# `cargo check -p hive-cell-agent` on the host once — the VM repo mount is RO).
+# A hive-cloud node with the REAL Firecracker backend INSIDE the Lima VM, as a systemd service.
+# `Cargo.lock` must already resolve tokio-vsock (`cargo check -p hive-cell-agent` on the host
+# once; the VM repo mount is read-only).
 cmd_fc_daemon() {
   local VM="${FC_VM:-hive}"
   local REPO_IN_VM="/Users/$(id -un)/fluid/hive"
@@ -236,21 +204,17 @@ cmd_fc_daemon() {
     cd "$REPO" 2>/dev/null || cd "$HOME"
     export CARGO_TARGET_DIR=$HOME/fc-target
 
-    # Build host needs node+git for framework builds; let root use the bind-mounted repo.
     command -v node >/dev/null 2>&1 || { sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm; }
     sudo git config --system --add safe.directory "*" 2>/dev/null || true
 
-    # Cell agent: static musl so it runs as init regardless of the rootfs glibc.
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     cargo build --release --target aarch64-unknown-linux-musl -p hive-cell-agent --locked
     sudo install -D -m0755 $HOME/fc-target/aarch64-unknown-linux-musl/release/hive-cell-agent /usr/local/bin/hive-cell-agent
 
-    # Guest rootfs with a node runtime + the agent baked in as init (build once).
     if [ ! -f /var/lib/hive/rootfs/default.ext4 ] || [ -n "${FC_REBUILD_ROOTFS:-}" ]; then
       sudo ROOTFS_DIR=/var/lib/hive/rootfs AGENT_BIN=/usr/local/bin/hive-cell-agent bash "$REPO/scripts/build-rootfs.sh" node:20-slim default 2048
     fi
 
-    # The node itself (Firecracker backend).
     cargo build --release -p hive-cloud --features zkauth --locked
     BIN=$HOME/fc-target/release/hive-cloud
     sudo tee /etc/systemd/system/hive-fc.service >/dev/null <<UNIT

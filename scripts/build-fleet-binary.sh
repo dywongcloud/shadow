@@ -1,25 +1,9 @@
 #!/bin/bash
-# Build the fleet hive-cloud binary, once per glibc group.
-#
-# Why this script exists. Two failure modes silently shipped a binary that
-# could not be debugged, twice:
-#
-#  1. **The symbol table was lost.** `Cargo.toml` declares
-#     `profile.release.strip = "debuginfo"`, but the cross-linked artifact came
-#     out with NEITHER `.debug_*` NOR `.symtab` — 29/30 ELF sections, fully
-#     stripped (measured 2026-10-09 on two independent builds). A stripped
-#     hive-cloud is what made the leader's runtime freezes un-diagnosable
-#     (`?? ()` for 25 frames). So the strip value is not trusted: the build
-#     runs with `strip = "none"` and DWARF is removed afterwards with
-#     `llvm-strip --strip-debug`, and the result is VERIFIED to still carry
-#     `.symtab` before it is called an artifact.
-#
-#  2. **jemalloc linked against a stub archive.** `tikv-jemalloc-sys` built with
-#     Apple's `ar` produces a 96-byte `libjemalloc.a`, and the link then fails
-#     with `undefined symbol: sdallocx/rallocx/mallocx/mallctl` (or, worse,
-#     resolves to nothing). LLVM's `ar`/`ranlib` are required. The 96-byte stub
-#     is also why a killed build leaves a poisoned artifact behind: pass
-#     --clean-jemalloc after any interrupted build.
+# Build the fleet hive-cloud binary, once per glibc group, with the symbol table verified present:
+# the cross-linked artifact loses .symtab despite `strip = "debuginfo"`, so the build runs with
+# strip = none, DWARF is removed with `llvm-strip --strip-debug`, and `.symtab` is checked after.
+# jemalloc needs LLVM ar/ranlib (Apple's ar yields a 96-byte stub libjemalloc.a); pass
+# --clean-jemalloc after any interrupted build.
 #
 # Usage:
 #   scripts/build-fleet-binary.sh              # both groups
@@ -38,8 +22,6 @@ for tool in "$AR_BIN" "$RANLIB_BIN" "$STRIP_BIN"; do
   [ -x "$tool" ] || { echo "FATAL: missing $tool (brew install llvm)"; exit 1; }
 done
 
-# NOTE: not named `GROUPS` -- that is a special array in zsh, and assigning
-# "2.38"/"2.39" to it yields coerced integers, not the glibc versions.
 TARGET_GROUPS=("2.38" "2.39")
 if [ "${1:-}" = "2.38" ] || [ "${1:-}" = "2.39" ]; then TARGET_GROUPS=("$1"); fi
 CLEAN=0
@@ -48,8 +30,7 @@ for a in "$@"; do [ "$a" = "--clean-jemalloc" ] && CLEAN=1; done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# $1 path, $2 "linked" (require .symtab; DWARF still present is expected)
-#           | "stripped" (require .symtab AND no .debug_* left)
+# elf_check <path> linked|stripped: .symtab required; "stripped" also requires no .debug_* left.
 elf_check() {
   python3 - "$1" "$2" <<'PY'
 import struct, sys
@@ -85,25 +66,15 @@ for G in "${TARGET_GROUPS[@]}"; do
     rm -rf "target/$TRIPLE/release/build/tikv-jemalloc-sys-"*
     echo "  cleaned tikv-jemalloc-sys artifacts"
   fi
-  # cargo-zigbuild maps BOTH `...gnu.2.38` and `...gnu.2.39` onto the real rustc
-  # triple `x86_64-unknown-linux-gnu`, so the two groups share one directory and
-  # one fingerprint namespace. Observed 2026-10-09: switching from one group to
-  # the other reported "Finished in 2.66s" -- cargo relinked nothing, so the
-  # binary sitting in that shared dir was whatever the PREVIOUS group built,
-  # silently stamped with this group's name. The glibc version is applied by zig
-  # at LINK time, so a guaranteed relink is what makes the group tag true.
-  # Removing the binary and bumping the bin crate's mtime invalidates that one
-  # target's fingerprint: a recompile of hive-cloud, not of the workspace.
+  # Both glibc groups build into the same x86_64-unknown-linux-gnu target dir and zig applies the
+  # glibc version at LINK time: force a relink of the bin crate between groups, or the previous
+  # group's binary ships under this group's name.
   rm -f "target/x86_64-unknown-linux-gnu/release/hive-cloud"
   touch crates/hive-cloud/src/main.rs
 
   AR="$AR_BIN" RANLIB="$RANLIB_BIN" CARGO_PROFILE_RELEASE_STRIP=none \
     cargo zigbuild --release --target "$TRIPLE" -p hive-cloud
 
-  # cargo names the target directory from the ABI-STRIPPED triple: both
-  # `...gnu.2.38` and `...gnu.2.39` build into `x86_64-unknown-linux-gnu/`.
-  # So each group's binary is copied out to /tmp immediately below, before the
-  # next group's build overwrites it in place.
   SRC="target/x86_64-unknown-linux-gnu/release/hive-cloud"
   OUT="/tmp/hive-cloud-$G"
   [ -f "$SRC" ] || { echo "FATAL: no artifact at $SRC"; exit 1; }
