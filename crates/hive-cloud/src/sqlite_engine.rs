@@ -1,47 +1,41 @@
-//! The managed-SQLite engine seam: everything the Hrana codec needs from a SQL
-//! engine, and nothing else.
+//! The managed-SQLite engine seam: everything the Hrana codec needs from a SQL engine, and nothing
+//! else.
 //!
-//! This module exists so the Hrana wire implementation has exactly ONE copy.
-//! Before it, `hrana_proto.rs` called `rusqlite` directly, so a second engine
-//! could only be added by reimplementing statement semantics — and a second
-//! implementation of "which rows changed" or "is this request allowed at this
-//! protocol version" is the kind of duplication that diverges silently and
-//! takes tenant data with it. The seam is narrow on purpose: a value type, one
-//! `run` per statement, `execute_batch` for `sequence`, `describe`, and
-//! `is_autocommit`. Everything else (batching, conditions, batons, SQL cache,
-//! read-only gating, the wire codec) stays in `hrana_proto.rs` and is written
-//! once against this trait.
+//! It exists so the Hrana wire implementation has exactly ONE copy. Before it, `hrana_proto.rs`
+//! called `rusqlite` directly, so a second engine could only be added by reimplementing statement
+//! semantics, and a second implementation of "which rows changed" or "is this request allowed at
+//! this protocol version" is the kind of duplication that diverges silently and takes tenant data
+//! with it. The seam is narrow on purpose: a value type, one `run` per statement, `execute_batch`
+//! for `sequence`, `describe` and `is_autocommit`. Batching, conditions, batons, the SQL cache,
+//! read-only gating and the wire codec stay in `hrana_proto.rs` and are written once against
+//! [`SqlEngine`].
 //!
 //! # Why `async`
 //!
-//! The musql engine speaks HTTP to a loopback sidecar, which is async IO; the
-//! rusqlite engine is blocking file IO. Both run through the same trait, and
-//! the CALLER decides where each one executes: `sqlite_pool::PooledConn` moves
-//! the rusqlite connection onto `spawn_blocking` and drives the future to
-//! completion there (`futures::executor::block_on`), so no blocking file IO
-//! ever lands on a serving tokio worker, while the musql engine is awaited
-//! directly on the runtime. One semantic implementation, two correct
-//! schedulings.
+//! The musql engine speaks HTTP to a loopback sidecar (async IO) while the rusqlite engine is
+//! blocking file IO. Both run through the same trait and the CALLER decides where each executes:
+//! `sqlite_pool::PooledConn` moves the rusqlite connection onto `spawn_blocking` and drives the
+//! future to completion there (`futures::executor::block_on`), so no blocking file IO lands on a
+//! serving tokio worker, while the musql engine is awaited directly on the runtime. One semantic
+//! implementation, two correct schedulings.
 //!
 //! # The musql engine's three known, bounded divergences
 //!
-//! These are properties of musql measured live (v0.3.0), not guesses, and they
-//! are all narrower than "wrong data":
-//! 1. `rows_read` — musqld reports 0, so the engine reports the rows it
-//!    actually materialised. Still a real count, never a fabrication.
-//! 2. `rows_written` — musqld reports `affected_row_count` per statement, which
-//!    is already the `total_changes`-delta value rusqlite derives. Equivalent.
-//! 3. A stored non-finite REAL comes back NULL from musqld (rusqlite raises).
-//!    That is why migration refuses a database holding one (see
-//!    `crate::musql::preflight`) instead of silently changing a tenant's rows.
+//! Properties of musqld measured live (v0.3.0), each narrower than "wrong data":
+//! 1. `rows_read`: musqld reports 0, so the engine reports the rows it actually materialised. Still
+//! a real count, never a fabrication.
+//! 2. `rows_written`: musqld reports `affected_row_count` per statement, which equals the
+//! `total_changes` delta rusqlite derives.
+//! 3. A stored non-finite REAL comes back NULL from musqld (rusqlite raises). That is why migration
+//! refuses a database holding one (`crate::musql::preflight`) instead of silently changing a
+//! tenant's rows.
 
 use async_trait::async_trait;
 use hive_crsql::rusqlite::types::{Value as RValue, ValueRef};
 use hive_crsql::rusqlite::{Connection, Statement};
 
-/// A value in, or out of, an engine. Deliberately not `rusqlite::Value`: that
-/// type belongs to one engine and leaking it into the codec is what would make
-/// a second engine impossible.
+/// A value in, or out of, an engine. Deliberately not `rusqlite::Value`: that type belongs to one
+/// engine, and leaking it into the codec would make a second engine impossible.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SqlValue {
     Null,
@@ -52,9 +46,8 @@ pub enum SqlValue {
 }
 
 impl SqlValue {
-    /// SQLite's own `typeof()` spelling. Used for the migration digest, where
-    /// two engines agreeing on a row's bytes but not its type is a real
-    /// divergence.
+    /// SQLite's own `typeof()` spelling, used for the migration digest, where two engines agreeing
+    /// on a row's bytes but not its type is a real divergence.
     pub fn typeof_name(&self) -> &'static str {
         match self {
             SqlValue::Null => "null",
@@ -65,9 +58,8 @@ impl SqlValue {
         }
     }
 
-    /// Rough wire size, so a result set can be bounded WITHOUT serialising it
-    /// first. A bound that requires the bytes it is bounding is no bound at
-    /// all — that is the whole reason this is an estimate and not
+    /// Rough wire size, so a result set can be bounded WITHOUT serialising it first: a bound that
+    /// needs the bytes it is bounding is no bound, which is why this is an estimate and not
     /// `to_string().len()`.
     pub fn approx_bytes(&self) -> usize {
         match self {
@@ -110,11 +102,17 @@ pub struct RunResult {
     pub rows: Vec<Vec<SqlValue>>,
     /// Rows this statement stepped — counted whether or not they were kept.
     pub rows_read: u64,
-    /// Rows this statement changed. 0 for DDL, `PRAGMA` and every read, which
-    /// is what stops a `CREATE TABLE` from echoing another request's insert
-    /// count on a pooled connection.
+    /// Rows this statement changed: the delta of the connection's `total_changes`, since
+    /// `sqlite3_changes` is per-CONNECTION, updated only by DML, and would echo an earlier insert's
+    /// count after a `SELECT`. That also keeps DDL, `PRAGMA` and every read at 0, which stops a
+    /// `CREATE TABLE` from echoing another request's insert count on a pooled connection.
     pub rows_written: u64,
     /// Reported only for a statement that actually wrote.
+    ///
+    /// SQLite keeps a connection's last inserted rowid indefinitely, so it is reported only for a
+    /// statement that changed rows. Deliberately NOT also gated on "the rowid moved": re-inserting
+    /// a rowid that was just deleted leaves it unchanged, and suppressing a real insert's rowid is
+    /// a worse failure than an UPDATE/DELETE echoing the connection's last one.
     pub last_insert_rowid: Option<i64>,
 }
 
@@ -135,15 +133,12 @@ pub struct Budget {
 
 #[async_trait]
 pub trait SqlEngine: Send {
-    /// Execute one statement and buffer its result. `want_rows: false` still
-    /// executes (Hrana says so) and still counts `rows_read`, it just keeps no
-    /// row bodies.
-    ///
-    /// `budget` guards what is KEPT, never what is stepped: a `SELECT` past
-    /// `max_rows` with `want_rows: false` answers `rows_read`, no rows and no
-    /// error, identically on both engines — a caller that wants a refusal for
-    /// an oversized set asks for the rows. An implementation must therefore be
-    /// able to produce the count without materialising the rows it discards.
+    /// Executes one statement and buffers its result. `want_rows: false` still executes (Hrana says
+    /// so) and still counts `rows_read`, it just keeps no row bodies. `budget` guards what is KEPT,
+    /// never what is stepped: a `SELECT` past `max_rows` with `want_rows: false` answers
+    /// `rows_read`, no rows and no error, identically on both engines (a caller that wants a
+    /// refusal for an oversized set asks for the rows), so an implementation must be able to
+    /// produce the count without materialising the rows it discards.
     async fn run(
         &mut self,
         sql: &str,
@@ -164,8 +159,6 @@ pub trait SqlEngine: Send {
     async fn is_autocommit(&mut self) -> bool;
 }
 
-// ---- rusqlite engine -------------------------------------------------------
-
 fn to_rusqlite(v: &SqlValue) -> RValue {
     match v {
         SqlValue::Null => RValue::Null,
@@ -176,11 +169,12 @@ fn to_rusqlite(v: &SqlValue) -> RValue {
     }
 }
 
-/// Bind every parameter, or fail naming the one that could not be bound.
-/// Unbound parameters default to NULL in SQLite, which turns a client-side
-/// arity bug into a query that "works" and returns the wrong rows — so this
-/// refuses instead. (The musql engine gets the same guarantee from musqld,
-/// which rejects `expected 1 arguments, got 0` — measured, not assumed.)
+/// Binds every parameter, or fails naming the one that could not be bound. Unbound parameters
+/// default to NULL in SQLite, which turns a client-side arity bug into a query that "works" and
+/// returns the wrong rows, so this refuses instead (the musql engine gets the same guarantee from
+/// musqld, which rejects `expected 1 arguments, got 0`, measured rather than assumed). Named
+/// arguments resolve with or without the SQLite sigil: the raw name first, then each of `:`, `@`
+/// and `$`.
 fn bind(stmt: &mut Statement<'_>, args: &[SqlValue], named: &[NamedArg]) -> Result<(), String> {
     let expected = stmt.parameter_count();
     if args.len() > expected {
@@ -196,9 +190,6 @@ fn bind(stmt: &mut Statement<'_>, args: &[SqlValue], named: &[NamedArg]) -> Resu
         bound[i] = true;
     }
     for na in named {
-        // Clients send names with or without the SQLite sigil; try the raw
-        // name first, then each sigil, so `:id` / `@id` / `$id` all resolve
-        // from a bare `id`.
         let idx = ["", ":", "@", "$"]
             .iter()
             .find_map(|p| {
@@ -238,8 +229,6 @@ impl SqlEngine for Connection {
         let mut stmt = self.prepare(sql).map_err(|e| e.to_string())?;
         bind(&mut stmt, args, named)?;
 
-        // Column metadata is read from the statement itself (immutable borrow)
-        // BEFORE stepping, because `raw_query` takes the statement mutably.
         let cols: Vec<Col> = stmt
             .columns()
             .iter()
@@ -249,11 +238,6 @@ impl SqlEngine for Connection {
             })
             .collect();
         let want_rows = want_rows && !cols.is_empty();
-        // `sqlite3_changes` is per-CONNECTION and is only updated by DML, so
-        // after `INSERT` then `SELECT` it still reports the insert's count.
-        // `sqlite3_total_changes` moves for exactly the statements
-        // `sqlite3_changes` is meaningful for, so its delta is the precise
-        // discriminator — and it is also what keeps DDL/`PRAGMA` at 0.
         let total_before = self.total_changes();
 
         let mut rows: Vec<Vec<SqlValue>> = Vec::new();
@@ -291,12 +275,6 @@ impl SqlEngine for Connection {
         }
         let wrote_rows = self.total_changes() != total_before;
         let changes = if !wrote_rows { 0 } else { self.changes() };
-        // SQLite keeps the connection's last inserted rowid indefinitely, so it
-        // is reported only for a statement that actually wrote. Deliberately
-        // NOT additionally gated on "the rowid moved": re-inserting a rowid
-        // that was just deleted leaves it unchanged, and suppressing a real
-        // insert's rowid is a worse failure than an UPDATE/DELETE echoing the
-        // connection's last one.
         let last_insert_rowid = if changes > 0 {
             let id = self.last_insert_rowid();
             (id != 0).then_some(id)

@@ -1,27 +1,24 @@
-//! Cloudflare DNS provider — authoritative writes for zones Vercel does not serve.
+//! Cloudflare DNS provider: authoritative writes for zones Vercel does not serve.
 //!
-//! A DB-gateway domain (`storage.dev.autheo.com`) frequently lives in a zone the
-//! platform does not control through Vercel (`autheo.com` is Cloudflare-authoritative).
-//! Nothing in this crate could write such a zone, so the gateway's DNS had to be
-//! created by hand. This module is the missing provider, and it serves exactly two
+//! A DB-gateway domain frequently lives in a zone the platform does not control through Vercel (a
+//! Cloudflare-authoritative apex, say). Nothing else in this crate could write such a zone, so the
+//! gateway's DNS had to be created by hand. This module is that provider, and it serves exactly two
 //! jobs:
 //!
-//!   * `A`/`AAAA` for the gateway apex and its wildcard, **DNS-only**
-//!     (`proxied: false`). The gateway terminates RAW TLS and routes the tenant by
-//!     SNI; a Cloudflare-proxied record makes Cloudflare terminate TLS with its own
-//!     certificate, and every tenant then looks like one unknown host.
-//!   * `TXT` `_acme-challenge.*` for ACME **DNS-01**, which is the only way to get
-//!     the `*.{db_domain}` wildcard the per-tenant gateway needs — Let's Encrypt
-//!     never offers HTTP-01 for a wildcard identifier.
+//! * `A`/`AAAA` for the gateway apex and its wildcard, **DNS-only** (`proxied: false`). The gateway
+//! terminates RAW TLS and routes the tenant by SNI; a Cloudflare-proxied record makes Cloudflare
+//! terminate TLS with its own certificate, and every tenant then looks like one unknown host.
+//! * `TXT` `_acme-challenge.*` for ACME **DNS-01**, the only way to get the `*.{db_domain}`
+//! wildcard the per-tenant gateway needs (Let's Encrypt never offers HTTP-01 for a wildcard
+//! identifier).
 //!
-//! It implements [`crate::vercel_dns::DnsApi`], the same trait `VercelApi` does, so
-//! every existing caller (the ACME DNS-01 writer, the DB-zone publisher) works
-//! against either provider unchanged.
+//! It implements [`crate::vercel_dns::DnsApi`], the trait `VercelApi` implements, so every caller
+//! (the ACME DNS-01 writer, the DB-zone publisher) works against either provider unchanged.
 //!
-//! Config (env, treated as secrets — never logged):
-//!   * `HIVE_CLOUDFLARE_API_TOKEN`   bearer token; absent ⇒ provider off.
-//!   * `HIVE_CLOUDFLARE_ZONE_ID`     pin one zone instead of resolving by name.
-//!   * `HIVE_CLOUDFLARE_ACCOUNT_ID`  scope the zone lookup to one account.
+//! Config (env, treated as secrets, never logged):
+//! * `HIVE_CLOUDFLARE_API_TOKEN`: bearer token; absent means the provider is off.
+//! * `HIVE_CLOUDFLARE_ZONE_ID`: pin one zone instead of resolving by name.
+//! * `HIVE_CLOUDFLARE_ACCOUNT_ID`: scope the zone lookup to one account.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -34,9 +31,8 @@ const API: &str = "https://api.cloudflare.com/client/v4";
 /// per-slug A record following a database to another node) fast to converge.
 pub const DEFAULT_TTL: u32 = 60;
 
-/// Cloudflare's own comment for "already exists" on create (code 81053). A
-/// duplicate is not an error for us — a reconciler that insists on creating
-/// would fail every pass after the first.
+/// Cloudflare's code (81053) for "record already exists" on create. A duplicate is not an error for
+/// us: a reconciler that insists on creating would fail every pass after the first.
 const ALREADY_EXISTS_CODE: i64 = 81_053;
 
 /// Real Cloudflare REST client. `HIVE_CLOUDFLARE_API_TOKEN` (never logged).
@@ -81,10 +77,10 @@ impl CloudflareApi {
         }
     }
 
-    /// The zone id owning `fqdn`, resolved longest-suffix-first (`autheo.com` is a
-    /// zone; `storage.dev.autheo.com` is a name inside it, not a zone of its own).
-    /// Returns `Ok(None)` when no Cloudflare zone owns the name — the caller then
-    /// falls back to Vercel rather than failing an order it cannot write for.
+    /// The zone id owning `fqdn`, resolved longest suffix first (`example.com` is a zone,
+    /// `a.b.example.com` a name inside it, not a zone of its own). `Ok(None)` when no Cloudflare
+    /// zone owns the name, so the caller falls back to Vercel rather than failing an order it
+    /// cannot write for.
     pub async fn zone_for(&self, fqdn: &str) -> anyhow::Result<Option<String>> {
         let fqdn = fqdn.trim().trim_end_matches('.').to_ascii_lowercase();
         if fqdn.is_empty() {
@@ -114,6 +110,8 @@ impl CloudflareApi {
         Ok(None)
     }
 
+    /// The name of a pinned zone id. `None` when the pin cannot be read, which degrades the pin to
+    /// ordinary name resolution.
     async fn zone_name(&self, zone_id: &str) -> anyhow::Result<Option<String>> {
         if let Some(v) = self.cached(zone_id) {
             return Ok(v);
@@ -125,7 +123,7 @@ impl CloudflareApi {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Ok(None); // an unreadable pin degrades to name resolution
+            return Ok(None);
         }
         let v: serde_json::Value = resp.json().await?;
         let name = v
@@ -215,7 +213,6 @@ impl CloudflareApi {
                 "name": fqdn,
                 "content": content,
                 "ttl": ttl,
-                // DNS-only, always: see the module doc.
                 "proxied": false,
             }))
             .send()
@@ -352,14 +349,18 @@ fn qualify(domain: &str, name: &str) -> String {
 }
 
 impl DnsApi for CloudflareApi {
+    /// Lists the zone's records under `domain`, named relative to it. A domain no Cloudflare zone
+    /// owns lists nothing rather than failing, so a Vercel-owned name never aborts a pass that also
+    /// covers Cloudflare names. Only names under `domain` are returned: one Cloudflare zone holds
+    /// every name in its domain, and a foreign name is never ours to reconcile. `created_ms` is
+    /// `None` because Cloudflare reports RFC3339 `created_on` while the ACME orphan sweeper's age
+    /// gate wants ms epoch and no ms field exists to read.
     async fn list(&self, domain: &str) -> anyhow::Result<Vec<RecordView>> {
         let zone = match self
             .zone_for(domain)
             .await?
         {
             Some(z) => z,
-            // Not a Cloudflare zone: report "nothing here" rather than an error,
-            // so a Vercel-owned name never aborts a pass that also covers CF names.
             None => return Ok(Vec::new()),
         };
         let suffix = format!(
@@ -391,9 +392,6 @@ impl DnsApi for CloudflareApi {
                     a.iter()
                         .filter_map(|r| {
                             let name = r.get("name")?.as_str()?.to_ascii_lowercase();
-                            // Only names this caller manages — one Cloudflare zone
-                            // holds every name in the domain, and a foreign name is
-                            // never ours to reconcile.
                             let rel = if name == apex {
                                 String::new()
                             } else {
@@ -404,9 +402,6 @@ impl DnsApi for CloudflareApi {
                                 name: rel,
                                 rtype: r.get("type")?.as_str()?.to_string(),
                                 value: r.get("content")?.as_str()?.to_string(),
-                                // Cloudflare reports RFC3339 `created_on`; the ACME
-                                // orphan sweeper's age gate uses ms epoch, and no
-                                // ms field exists to read.
                                 created_ms: None,
                             })
                         })
@@ -427,6 +422,13 @@ impl DnsApi for CloudflareApi {
         Ok(out)
     }
 
+    /// Creates a record, idempotently: one already carrying this exact value is returned as is,
+    /// instead of stacking duplicates every pass, and is re-patched when it is proxied or on the
+    /// wrong TTL (a gateway record in that state is broken exactly the way this provider exists to
+    /// prevent). When the create fails and a same-name, same-type record exists, the FIRST such
+    /// record is overwritten with the new value rather than accumulating (a stale challenge, a node
+    /// IP that moved); that fallback is taken on ANY create failure, the "already exists" code does
+    /// not gate it.
     async fn create(&self, domain: &str, rec: &DesiredRecord) -> anyhow::Result<String> {
         let fqdn = qualify(domain, &rec.name);
         let zone = self
@@ -434,12 +436,8 @@ impl DnsApi for CloudflareApi {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no Cloudflare zone owns {fqdn}"))?;
         let existing = self.find_all(&zone, &fqdn, &rec.rtype).await?;
-        // Idempotent: a record already carrying this exact value is the one we
-        // wanted, so return it instead of stacking duplicates every pass.
         if let Some(r) = existing.iter().find(|r| r.content == rec.value) {
             if r.proxied || r.ttl != rec.ttl {
-                // A gateway record that ended up proxied (or on the wrong TTL)
-                // is broken in exactly the way this provider exists to prevent.
                 self.patch(&zone, &r.id, &fqdn, &rec.rtype, &rec.value, rec.ttl)
                     .await?;
             }
@@ -448,9 +446,6 @@ impl DnsApi for CloudflareApi {
         match self.post(&zone, &fqdn, &rec.rtype, &rec.value, rec.ttl).await {
             Ok(id) => Ok(id),
             Err(e) => {
-                // Duplicate under a different value (a stale challenge, a node
-                // IP that moved): overwrite the first same-type record rather
-                // than accumulating.
                 let dup = e.to_string().contains(&format!("[{ALREADY_EXISTS_CODE}"));
                 let first = existing.first().cloned();
                 match (dup, first) {
@@ -474,8 +469,6 @@ impl DnsApi for CloudflareApi {
     }
 }
 
-// ---- provider selection -----------------------------------------------------
-
 /// Which authoritative DNS API a node writes through.
 pub enum DnsProvider {
     Vercel(crate::vercel_dns::VercelApi),
@@ -483,9 +476,9 @@ pub enum DnsProvider {
 }
 
 impl DnsProvider {
-    /// Vercel when `VERCEL_API_TOKEN` is present (every existing deployment), else
-    /// Cloudflare. `HIVE_ACME_DNS_PROVIDER=cloudflare` forces Cloudflare even when
-    /// a Vercel token exists, for a domain that only Cloudflare serves.
+    /// Vercel when `VERCEL_API_TOKEN` is present (every existing deployment), else Cloudflare.
+    /// `HIVE_ACME_DNS_PROVIDER=cloudflare` forces Cloudflare even when a Vercel token exists, for a
+    /// domain that only Cloudflare serves.
     pub fn from_env(http: reqwest::Client) -> Option<Self> {
         let force_cf = std::env::var("HIVE_ACME_DNS_PROVIDER")
             .map(|v| v.eq_ignore_ascii_case("cloudflare"))
@@ -527,14 +520,16 @@ impl DnsApi for DnsProvider {
     }
 }
 
-// ---- DB-gateway zone --------------------------------------------------------
-
-/// Publish the DB-gateway zone through Cloudflare: apex + wildcard (DNS-only) to
-/// every publishable address, plus one record per database slug that lives on this
-/// node. Returns how many records were written.
+/// Publishes the DB-gateway zone through Cloudflare: apex and wildcard (DNS-only) to every
+/// publishable address, plus one record per database slug hosted on THIS node (`db_gateway` splices
+/// with no forward hop, so a slug must point at the node holding the container; slugs of databases
+/// on other nodes are not published here). Wanted records are kept per name as `(A values, AAAA
+/// values)`, `""` being the apex and `"*"` the wildcard. A managed name that wants no address keeps
+/// its stale ones rather than going dark, as in the Vercel path. Returns how many records were
+/// written or removed.
 ///
-/// Gated by `HIVE_DB_DNS_PROVIDER=cloudflare` — the Vercel path in `vercel_dns`
-/// stays the default, so a fleet whose db domain IS a Vercel zone is untouched.
+/// Gated by `HIVE_DB_DNS_PROVIDER=cloudflare`: the Vercel path in `vercel_dns` stays the default,
+/// so a fleet whose db domain IS a Vercel zone is untouched.
 pub async fn publish_db_zone(
     cloud: &Arc<crate::state::CloudState>,
     cf: &CloudflareApi,
@@ -549,7 +544,6 @@ pub async fn publish_db_zone(
     let nodes = cloud.registry.nodes();
     let me = nodes.iter().find(|n| n.name == cloud.node_name);
 
-    // name -> (A values, AAAA values). `""` is the apex, `"*"` the wildcard.
     let mut want: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
     let apex = (
         nodes
@@ -565,8 +559,6 @@ pub async fn publish_db_zone(
     );
     want.insert(String::new(), apex.clone());
     want.insert("*".into(), apex);
-    // Per-slug: only databases THIS node hosts (`db_gateway` splices with no
-    // forward hop, so a slug must point at the node holding the container).
     let suffix = format!(".{db_domain}");
     if let Some(me) = me {
         for d in cloud.databases.list(None) {
@@ -633,8 +625,6 @@ pub async fn publish_db_zone(
                 written += 1;
             }
         }
-        // Never dark: a managed name keeps its stale address rather than losing
-        // every record, exactly like the Vercel path.
         if v4.is_empty() && v6.is_empty() {
             continue;
         }
@@ -652,11 +642,9 @@ pub async fn publish_db_zone(
     Ok(written)
 }
 
-/// Leader-only reconcile loop for a Cloudflare-served DB-gateway zone.
-///
-/// Off unless `HIVE_DB_DNS_PROVIDER=cloudflare` AND `HIVE_CLOUDFLARE_API_TOKEN` is
-/// set, so every node whose db domain is a Vercel zone (the whole fleet today)
-/// keeps using `vercel_dns` and is unaffected.
+/// Leader-only reconcile loop (`may_act(DnsWrite)`) for a Cloudflare-served DB-gateway zone. Off
+/// unless `HIVE_DB_DNS_PROVIDER=cloudflare` AND `HIVE_CLOUDFLARE_API_TOKEN` is set, so every node
+/// whose db domain is a Vercel zone keeps using `vercel_dns`, unaffected.
 pub fn spawn_db_dns(cloud: Arc<crate::state::CloudState>) {
     if !std::env::var("HIVE_DB_DNS_PROVIDER")
         .map(|v| v.eq_ignore_ascii_case("cloudflare"))

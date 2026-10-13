@@ -1,57 +1,39 @@
-//! Serverless GPU pool abstraction — the foundation for GPU pooling.
-//!
-//! Groups every healthy node with `gpu_count > 0` into a named pool BY REGION
-//! (region already exists on `NodeInfo`; no new grouping key — currently
-//! `"san-jose"` covers all 5 GPU/CVM nodes). Reports aggregate + per-node free
-//! VRAM: `NodeInfo::gpu_vram_mb` is the boot-time `nvidia-smi` TOTAL (see its
-//! own doc comment), never current availability, so free VRAM has to be
-//! derived from what's actually held right now.
+//! Serverless GPU pool abstraction: groups every healthy node with `gpu_count > 0` into a named
+//! pool BY REGION (the region already on `NodeInfo`; no new grouping key) and reports aggregate and
+//! per-node free VRAM. `NodeInfo::gpu_vram_mb` is the boot-time `nvidia-smi` TOTAL, never current
+//! availability, so free VRAM is derived from what is held right now.
 //!
 //! ## Allocate/release discipline
 //!
-//! Rather than bolt on a second, easily-desynced reservation counter, this
-//! reuses the SAME allocate/release accounting the platform already
-//! maintains for GPU-holding instances: `fluid_compute::Fluid`'s per-node
-//! instance registry. A GPU-requesting function pool's `instances` count
-//! (`FunctionStats::instances`, gated by `FunctionStats::gpu`) is incremented
-//! on a successful cold start and decremented the moment that instance is
-//! torn down (idle-drained, crash-reaped, or recycled) — the exact same live
-//! gauge that already drives GPU wall-time billing (`main.rs`'s metering
-//! loop: `if s.gpu { t.gpu_ms += s.fluid_ms }`). "A deployment holding a GPU
-//! slot decrements the pool's free count, a torn-down one gives it back" is
-//! therefore already true of that counter; this module reads it rather than
-//! re-implementing it, the same way `admin::resources_get` sums `NodeInfo`'s
-//! already-gossiped static capacity instead of re-probing every node.
+//! Rather than bolt on a second, easily desynced reservation counter, this reuses the
+//! allocate/release accounting the platform already keeps for GPU-holding instances:
+//! `fluid_compute::Fluid`'s per-node instance registry. A GPU-requesting function pool's
+//! `instances` count (`FunctionStats::instances`, gated by `FunctionStats::gpu`) goes up on a
+//! successful cold start and down the moment that instance is torn down (idle-drained, crash-reaped
+//! or recycled), the same live gauge that drives GPU wall-time billing (`main.rs`'s metering loop).
+//! A deployment holding a GPU slot therefore already decrements the pool's free count and a
+//! torn-down one gives it back; this module reads that counter instead of re-implementing it.
 //!
-//! This mirrors two existing disciplines directly, per AGENTS.md:
-//!   * the podman lock pool ("Containers: the podman lock pool") — a FIXED
-//!     per-host pool, decremented on allocate, given back on release, and a
-//!     missed release leaks the whole host's capacity;
-//!   * `schedule::load_map` — a live per-node count built from THIS node's
-//!     own local state plus every peer's gossiped/fetched state, never a
-//!     single node's parochial view.
+//! It mirrors two existing disciplines: the podman lock pool (a FIXED per-host pool, decremented on
+//! allocate, given back on release, where a missed release leaks the whole host's capacity) and
+//! `schedule::load_map` (a live per-node count built from this node's own state plus every peer's
+//! gossiped or fetched state, never one node's parochial view).
 //!
-//! Until per-instance fractional GPU binding exists (today's launch grants a
-//! container ALL of a host's GPUs via CDI `nvidia.com/gpu=all` — see
-//! AGENTS.md "Serverless GPU"), one live GPU instance is modeled as holding
-//! one whole GPU's worth of VRAM (`gpu_vram_mb / gpu_count`), reserved-mb
-//! capped at the node's total so an oversubscribed node reports 0 free
-//! rather than underflowing.
+//! Until per-instance fractional GPU binding exists (a launch grants a container ALL of a host's
+//! GPUs via CDI `nvidia.com/gpu=all`), one live GPU instance is modeled as holding one whole GPU's
+//! worth of VRAM (`gpu_vram_mb / gpu_count`), with the reservation capped at the node's total so an
+//! oversubscribed node reports 0 free rather than underflowing.
 //!
 //! ## Node-local state, fleet-wide read
 //!
-//! Per AGENTS.md's round-robin doc: live instance counts are NODE-LOCAL
-//! in-process state (`Fluid`'s registry), and the public `api.<domain>` /
-//! dashboard hosts are round-robin DNS across every node — so a GET that
-//! trusted only its own `c.fluid.stats()` would silently under-report every
-//! OTHER node's reservations depending on which node answered the request.
-//! `snapshot` instead fans out to every GPU-capable peer for its live count,
-//! exactly like `admin::fleet_function_stats` does for `/v1/functions` (the
-//! same `fetch_from_host` used there, hitting the SAME unauthenticated-by-
-//! team, fully-unfiltered `/v1/functions?local=true` internal view). Pool
-//! CAPACITY (`vram_total_mb`) needs no fan-out at all — like
-//! `admin::resources_get`, it's read straight off `NodeRegistry::nodes()`,
-//! which is already fleet-wide via the existing `/v1/nodes` gossip.
+//! Live instance counts are NODE-LOCAL in-process state (`Fluid`'s registry) while the public
+//! `api.<domain>` and dashboard hosts are round-robin DNS across every node, so a GET trusting only
+//! its own `c.fluid.stats()` would under-report every OTHER node's reservations depending on which
+//! node answered. [`snapshot`] therefore fans out to every GPU-capable peer for its live count, as
+//! `admin::fleet_function_stats` does for `/v1/functions` (the same `fetch_from_host`, hitting the
+//! unfiltered `/v1/functions?local=true` internal view). Pool CAPACITY (`vram_total_mb`) needs no
+//! fan-out: like `admin::resources_get`, it is read off `NodeRegistry::nodes()`, already fleet-wide
+//! through the `/v1/nodes` gossip.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,12 +48,10 @@ pub struct GpuPoolNode {
     pub gpu_model: Option<String>,
     pub vram_total_mb: u64,
     pub vram_free_mb: u64,
-    /// Measured RTT from the SERVING node to this member (registry health
-    /// probes; 0 = self). Region no longer implies locality — two "san-jose"
-    /// CVM nodes turned out to live in Ashburn, 65ms from the rest of their
-    /// region, which turned an intra-DC 11GB pooled-model load into ~2 hours.
-    /// Surfacing the real link cost here is what lets an operator see that
-    /// before a pool does.
+    /// Measured RTT from the SERVING node to this member (registry health probes; 0 = self). Region
+    /// does not imply locality: two nodes of one region can sit in different datacenters, which
+    /// once turned an intra-DC pooled-model load into hours, and surfacing the real link cost here
+    /// lets an operator see that before a pool does.
     pub latency_ms: u64,
 }
 
@@ -83,9 +63,9 @@ pub struct GpuPoolRegion {
     pub pool_vram_free_mb: u64,
 }
 
-/// VRAM one live GPU-holding instance reserves on `n`: the node's total VRAM
-/// apportioned evenly across its physical GPUs. See module doc for why this
-/// (not per-instance metadata, which doesn't exist yet) is the right unit.
+/// VRAM one live GPU-holding instance reserves on `n`: the node's total VRAM apportioned evenly
+/// across its physical GPUs (see the module doc for why this, not per-instance metadata, which does
+/// not exist yet, is the unit).
 fn per_instance_reserve_mb(n: &hive_edge::NodeInfo) -> u64 {
     if n.gpu_count == 0 {
         return 0;
@@ -103,9 +83,28 @@ fn live_gpu_instances(stats: &[fluid_compute::FunctionStats]) -> u64 {
         .sum()
 }
 
-/// Build the current GPU pool snapshot, one entry per region that has at
-/// least one healthy GPU node. See module doc for the fan-out + allocate/
-/// release rationale.
+/// Free VRAM on a node: the MINIMUM of what the DRIVER reports (`NodeInfo::gpu_free_mb`) and what
+/// the instance count implies. The reservation estimate drifts from the hardware in both directions
+/// (phantom instances reserve VRAM the card shows free, and an inference endpoint is not a
+/// serverless function instance, so its allocation is never counted), so fit decisions made on it
+/// alone, such as whether a model needs `--rpc` members at all, matched neither the hardware nor
+/// the workload. The measurement alone is not enough either: a reservation the driver has not yet
+/// materialised (an instance mid cold-start, before CUDA has allocated) is real pending demand, and
+/// trusting the momentarily empty card would let two workloads both be told they fit. `None` (no
+/// probe, or a pre-upgrade peer) falls back to the estimate, so a part-rolled fleet behaves as
+/// before.
+fn free_vram_mb(measured: Option<u64>, estimated: u64) -> u64 {
+    match measured {
+        Some(measured) => measured.min(estimated),
+        None => estimated,
+    }
+}
+
+/// Builds the current GPU pool snapshot, one entry per region with at least one healthy GPU node.
+/// This node's live count comes from its in-process pool; every other GPU node is fanned out to
+/// individually, deliberately NOT merged into one fleet-wide total as `fleet_function_stats` does,
+/// because free VRAM needs the PER-NODE breakdown. See the module doc for the fan-out and
+/// allocate/release rationale.
 pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
     let gpu_nodes: Vec<hive_edge::NodeInfo> = cloud
         .registry
@@ -114,11 +113,6 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
         .filter(|n| n.healthy && n.gpu_count > 0)
         .collect();
 
-    // Per-node live GPU-instance count: self from the in-process pool
-    // directly (no network hop needed for our own state), every other GPU
-    // node fanned out to individually — deliberately NOT merged into one
-    // fleet-wide total like `fleet_function_stats` does, because free VRAM
-    // needs the PER-NODE breakdown, not just a sum.
     let mut live_by_node: HashMap<String, u64> = HashMap::new();
     live_by_node.insert(
         cloud.node_name.clone(),
@@ -149,27 +143,7 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
             .saturating_mul(live)
             .min(n.gpu_vram_mb);
         let estimated_free_mb = n.gpu_vram_mb.saturating_sub(reserved_mb);
-        // Prefer what the DRIVER reports over what the instance count implies.
-        //
-        // The reservation estimate drifts from the hardware in both directions,
-        // measured live 2026-07-31: fc-sanjose-gpu-1 was reported with 30 GiB
-        // reserved (2 phantom instances) while nvidia-smi showed 105 MiB per
-        // card actually in use, and fc-sanjose-gpu-2's real llama-server
-        // allocation was invisible entirely, because an inference endpoint is
-        // not a serverless function instance and so is never counted. Fit
-        // decisions — whether a model needs `--rpc` members at all — were being
-        // made against a number matching neither the hardware nor the workload.
-        //
-        // Take the MINIMUM of the two rather than the measurement alone: a
-        // reservation the driver has not yet materialised (an instance mid
-        // cold-start, before CUDA has allocated) is real pending demand, and
-        // trusting the momentarily-empty card would let two workloads both be
-        // told they fit. `None` (no probe / pre-upgrade peer) falls back to the
-        // estimate unchanged, so a part-rolled fleet behaves exactly as before.
-        let vram_free_mb = match n.gpu_free_mb {
-            Some(measured) => measured.min(estimated_free_mb),
-            None => estimated_free_mb,
-        };
+        let vram_free_mb = free_vram_mb(n.gpu_free_mb, estimated_free_mb);
         by_region
             .entry(n.region.clone())
             .or_default()

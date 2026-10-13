@@ -1,18 +1,17 @@
-//! GitOps — the link between a tenant (team/personal account) and a GitHub repo
-//! that holds the declarative OpenEdge config (`openedge.yaml`).
+//! GitOps: the link between a tenant (team or personal account) and a GitHub repo that holds the
+//! declarative OpenEdge config (`openedge.yaml`).
 //!
 //! Two halves:
-//! * **Outbound** — the dashboard generates the org's config as YAML and commits
-//!   it to the linked repo via Composio. This store only persists *where* to push
-//!   (repo/branch/path) plus the last-sync metadata (commit + content hash) so a
-//!   re-sync can skip a redundant commit when nothing changed.
-//! * **Inbound** — a GitHub push/PR webhook (see `admin::git_webhook`) matches the
-//!   pushed repo against existing projects and triggers a fresh build+deploy. This
-//!   matching is accelerated by [`GitRepoIndex`], an in-memory reverse index
-//!   (normalized repo -> project names) so a webhook delivery is an O(1) lookup
-//!   instead of an O(projects) fleet-wide scan.
+//! * **Outbound**: the dashboard generates the org's config as YAML and commits it to the linked
+//! repo via Composio. This store only persists where to push (repo, branch, path) plus the
+//! last-sync metadata (commit and content hash), so a re-sync can skip a redundant commit when
+//! nothing changed.
+//! * **Inbound**: a GitHub push/PR webhook (`admin::git_webhook`) matches the pushed repo against
+//! existing projects and triggers a fresh build and deploy, accelerated by [`GitRepoIndex`], an
+//! in-memory reverse index (normalized repo -> project names) that makes a delivery an O(1) lookup
+//! instead of an O(projects) fleet-wide scan.
 //!
-//! The store is in-memory + persisted via the platform snapshot, keyed by tenant.
+//! The store is in-memory and persisted via the platform snapshot, keyed by tenant.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -162,6 +161,9 @@ impl Default for GitOpsStore {
 
 /// Normalize a git URL/`owner/repo` to a canonical `owner/repo` (lowercased) so
 /// an inbound webhook can match a push against a project's stored clone URL.
+///
+/// Userinfo (`user:token@`) is dropped, then only the last two path segments are kept, so a host
+/// prefix not stripped above goes with it.
 pub fn norm_repo(url: &str) -> String {
     let s = url.trim().to_lowercase();
     let s = s.strip_prefix("git@github.com:").unwrap_or(&s);
@@ -172,7 +174,6 @@ pub fn norm_repo(url: &str) -> String {
         .unwrap_or(s);
     let s = s.strip_prefix("github.com/").unwrap_or(s);
     let s = s.strip_suffix(".git").unwrap_or(s);
-    // Drop any leftover host (e.g. "github.com/" not stripped above) and creds.
     let s = s.rsplit('@').next().unwrap_or(s);
     let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() >= 2 {
@@ -183,38 +184,31 @@ pub fn norm_repo(url: &str) -> String {
     }
 }
 
-/// Reverse index for GitHub-webhook repo -> project matching (see
-/// `admin::git_webhook`): normalized repo full_name -> the project names
-/// currently connected to it. Turns the webhook's per-delivery project lookup
-/// from an O(projects) fleet-wide scan into an O(1) lookup for the common case.
+/// Reverse index for GitHub-webhook repo -> project matching (`admin::git_webhook`): normalized
+/// repo full_name -> the project names currently connected to it. It turns the webhook's
+/// per-delivery project lookup from an O(projects) fleet-wide scan into an O(1) lookup in the
+/// common case.
 ///
-/// **In-memory only, deliberately not persisted.** It is a pure derived cache
-/// over each project's current real-git source — the SAME source
-/// `admin::git_for_project_fleet` already derives from deployment history (this
-/// node's local gateway, falling back to gossiped fleet deployments) — so
-/// persisting it would create a second, independently-driftable source of
-/// truth for something already durable via the deployment/project stores.
-/// Rebuilt from scratch at boot (`rebuild`) and kept incrementally in sync
-/// afterward at every point a project's git connection changes: git-import at
-/// project creation and project deletion (both in `admin.rs`), a future
-/// explicit connect/reconnect settings action (also `admin.rs` — see
-/// `set_project_repo`'s doc), and freshly-gossiped fleet deployments arriving
-/// via the anti-entropy loop (`main.rs`, so a project first deployed via a
-/// DIFFERENT node than the one that later receives a webhook delivery — the
-/// `webhook.<platform_domain>` DNS root round-robins across every gateway
-/// node — still gets indexed here without waiting for its OWN next deploy).
+/// **In-memory only, deliberately not persisted.** It is a pure derived cache over each project's
+/// current real-git source, the SAME source `admin::git_for_project_fleet` derives from deployment
+/// history (this node's gateway, falling back to gossiped fleet deployments); persisting it would
+/// create a second, independently driftable source of truth for something already durable in the
+/// deployment and project stores. It is rebuilt from scratch at boot (`rebuild`) and kept in sync
+/// at every point a project's git connection changes: git-import at project creation and project
+/// deletion (both in `admin.rs`), and freshly gossiped fleet deployments arriving through the
+/// anti-entropy loop (`main.rs`), so a project first deployed through a DIFFERENT node than the one
+/// that later receives a webhook delivery (the `webhook.<platform_domain>` DNS root round-robins
+/// across every gateway node) is indexed without waiting for its own next deploy.
 ///
-/// A `git_webhook` caller must treat an index that has NEVER been populated at
-/// all (`is_empty()`, e.g. a fresh boot before the rebuild pass ran, or a bug)
-/// as "uninitialized" and fall back to the original full fleet scan
-/// defensively — that's distinct from "populated, but this particular repo
-/// genuinely has zero connected projects" (an empty `Vec` from `projects_for`).
+/// A `git_webhook` caller must treat an index that has NEVER been populated (`is_empty()`: a fresh
+/// boot before the rebuild pass, or a bug) as "uninitialized" and fall back defensively to the full
+/// fleet scan. That is distinct from "populated, but this repo has zero connected projects" (an
+/// empty `Vec` from `projects_for`).
 pub struct GitRepoIndex {
     /// normalized repo full_name -> project names currently connected to it.
     by_repo: RwLock<HashMap<String, HashSet<String>>>,
-    /// project -> its current normalized repo, so `set_project_repo` can evict
-    /// the OLD repo entry on a reconnect without the caller having to track
-    /// (or separately look up) what the previous repo was.
+    /// project -> its current normalized repo, so `set_project_repo` can evict the OLD repo entry
+    /// on a reconnect without the caller having to track what the previous repo was.
     by_project: RwLock<HashMap<String, String>>,
 }
 
@@ -226,19 +220,13 @@ impl GitRepoIndex {
         }
     }
 
-    /// Record/update `project`'s git connection to `repo_url` (any URL form —
-    /// normalized internally, same as `norm_repo`). Evicts the project's
-    /// previous repo entry first, so a reconnect to a different repo never
-    /// leaves a stale/duplicate reverse-mapping behind.
-    ///
-    /// A no-op for an empty, or synthetic non-git (`upload://`/`image://`,
-    /// see `fluid_core::GitSource::is_real_git`), `repo_url` — a zip-upload or
-    /// prebuilt-image deploy for an already-git-connected project must NOT
-    /// evict that project's real repo entry, mirroring `git_for_project_fleet`
-    /// / `Gateway::git_for_project`'s own real-git-only filtering exactly (a
-    /// caller passing a pseudo-source here is almost always a redeploy of an
-    /// existing git-connected project via a different source, not a genuine
-    /// disconnect).
+    /// Records or updates `project`'s git connection to `repo_url` (any URL form, normalized like
+    /// `norm_repo`), evicting the project's previous repo entry first so a reconnect to a different
+    /// repo never leaves a stale reverse mapping; an unchanged connection returns early. A no-op
+    /// for an empty or synthetic non-git (`upload://`, `image://`; see
+    /// `fluid_core::GitSource::is_real_git`) `repo_url`: a zip-upload or prebuilt-image deploy of
+    /// an already git-connected project must NOT evict its real repo entry, matching the
+    /// real-git-only filtering of `git_for_project_fleet` and `Gateway::git_for_project`.
     pub fn set_project_repo(&self, project: &str, repo_url: &str) {
         let repo_url = repo_url.trim();
         if repo_url.is_empty()
@@ -253,7 +241,7 @@ impl GitRepoIndex {
         }
         let mut by_project = self.by_project.write();
         if by_project.get(project).is_some_and(|prev| prev == &norm) {
-            return; // already correctly indexed
+            return;
         }
         let mut by_repo = self.by_repo.write();
         if let Some(prev) = by_project.insert(project.to_string(), norm.clone()) {
@@ -267,10 +255,9 @@ impl GitRepoIndex {
         by_repo.entry(norm).or_default().insert(project.to_string());
     }
 
-    /// Move a project's git connection to its new name (rename) — the repo it
-    /// is connected to does NOT change, so the reverse index must keep pointing
-    /// at the same repo under the new name, or a push to that repo stops
-    /// finding the project (which is how auto-deploy silently dies).
+    /// Moves a project's git connection to its new name: the repo does not change, so the reverse
+    /// index must keep pointing at it under the new name, or a push to that repo stops finding the
+    /// project and auto-deploy silently dies.
     pub fn rename_project(&self, from: &str, to: &str) {
         if from == to {
             return;
@@ -301,9 +288,8 @@ impl GitRepoIndex {
         }
     }
 
-    /// Projects currently connected to `repo_url` (any URL form — normalized
-    /// internally). Empty when the repo has no connected projects; see the
-    /// type doc for why that's distinct from "index uninitialized."
+    /// Projects currently connected to `repo_url` (any URL form, normalized). Empty when the repo
+    /// has no connected projects, which is distinct from an uninitialized index (see the type doc).
     pub fn projects_for(&self, repo_url: &str) -> Vec<String> {
         let norm = norm_repo(repo_url);
         self.by_repo
@@ -319,12 +305,10 @@ impl GitRepoIndex {
         self.by_repo.read().is_empty()
     }
 
-    /// Rebuild the whole index from scratch (boot-time). `entries` yields each
-    /// project's current real-git repo URL — the caller resolves this
-    /// fleet-aware (`admin::git_for_project_fleet`), since doing so needs
-    /// `CloudState`, which this module deliberately doesn't depend on. Entries
-    /// with an empty/pseudo-source `repo_url` are skipped, same as
-    /// `set_project_repo`.
+    /// Rebuilds the whole index from scratch, at boot. `entries` yields each project's current
+    /// real-git repo URL; the caller resolves it fleet-aware (`admin::git_for_project_fleet`)
+    /// because that needs `CloudState`, which this module deliberately does not depend on. Empty
+    /// and pseudo-source `repo_url`s are skipped, as in `set_project_repo`.
     pub fn rebuild<I: IntoIterator<Item = (String, String)>>(&self, entries: I) {
         let mut by_repo: HashMap<String, HashSet<String>> = HashMap::new();
         let mut by_project: HashMap<String, String> = HashMap::new();

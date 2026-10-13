@@ -1,40 +1,33 @@
 //! Bounded per-database SQLite connection pool for the libsql/Hrana lane.
 //!
-//! The Postgres SQL-over-HTTP surface (`db_rest::run_sql`) deliberately opens a
-//! FRESH `tokio_postgres` connection per request and bounds concurrency with a
-//! `try_acquire` semaphore that 503s on exhaustion. That is an admission cap,
-//! not a pool, and it stays exactly as it is — this module is the sqlite lane's
-//! own pool and changes nothing about the postgres lane's semantics.
+//! The Postgres SQL-over-HTTP surface (`db_rest::run_sql`) opens a FRESH `tokio_postgres`
+//! connection per request and bounds concurrency with a `try_acquire` semaphore that 503s on
+//! exhaustion: an admission cap, not a pool, and unchanged. This module is the sqlite lane's own
+//! pool.
 //!
-//! What is different here, and why a real pool is worth it: a SQLite database
-//! is a FILE on this node, so "connecting" is an `sqlite3_open` plus the WAL
-//! pragmas — cheap enough that per-request opens look fine in a microbenchmark
-//! and pathological under a Hrana workload, because an interactive Hrana stream
-//! holds its connection across MANY HTTP requests (that is what the baton is
-//! for). Reopening per request would break transactions outright.
+//! A real pool is worth it here because a SQLite database is a FILE on this node, so "connecting"
+//! is an `sqlite3_open` plus the WAL pragmas: cheap enough that per-request opens look fine in a
+//! microbenchmark and pathological under a Hrana workload, since an interactive Hrana stream holds
+//! its connection across MANY HTTP requests (that is what the baton is for). Reopening per request
+//! would break transactions outright.
 //!
 //! Shape:
-//! * capacity is a `tokio::sync::Semaphore` per database — `acquire_owned` with
-//!   a timeout, so an exhausted pool makes callers QUEUE (FIFO, the semaphore's
-//!   own waiter order) instead of getting an immediate 503. Only a caller that
-//!   waits out `HIVE_SQLITE_POOL_WAIT_MS` is refused, and it is refused with a
-//!   typed error the caller renders as a Hrana error rather than a bare 503.
-//! * the idle set is BOUNDED (`HIVE_SQLITE_POOL_MAX_IDLE`): a returned
-//!   connection is kept for reuse only while the idle set is under the bound,
-//!   otherwise it is closed. An unbounded idle set is just a leak with a nicer
-//!   name — every connection holds an fd and a private page cache.
-//! * [`PooledConn`] releases its permit in `Drop`, never on an error branch.
-//!   axum drops a request future when the client goes away (curl timeout,
-//!   browser navigation); a dropped future never returns `Err`, so any
-//!   "release on failure" living in a caller is silently skipped and the pool
-//!   wedges permanently. This is the `ColdStartGuard` rule applied to a second
-//!   reservation surface.
+//! * capacity is a `tokio::sync::Semaphore` per database, taken with `acquire_owned` under a
+//! timeout, so an exhausted pool makes callers QUEUE (FIFO, the semaphore's own waiter order)
+//! instead of getting an immediate 503. Only a caller that waits out `HIVE_SQLITE_POOL_WAIT_MS` is
+//! refused, with a typed error the caller renders as a Hrana error rather than a bare 503.
+//! * the idle set is BOUNDED (`HIVE_SQLITE_POOL_MAX_IDLE`): a returned connection is kept only
+//! while the idle set is under the bound, otherwise it is closed. An unbounded idle set is a leak
+//! with a nicer name: every connection holds an fd and a private page cache.
+//! * [`PooledConn`] releases its permit in `Drop`, never on an error branch. axum drops a request
+//! future when the client goes away; a dropped future never returns `Err`, so a "release on
+//! failure" living in a caller is silently skipped and the pool wedges permanently (the
+//! `ColdStartGuard` rule applied to a second reservation surface).
 //!
-//! Connections never cross the pool boundary as `&Connection`: `rusqlite`'s
-//! `Connection` is `Send + !Sync`, and every real call blocks on disk, so
-//! [`PooledConn::call`] MOVES the connection into `spawn_blocking` and moves it
-//! back. That keeps the async runtime free of blocking IO and makes it
-//! impossible to share one connection across two tasks.
+//! Connections never cross the pool boundary as `&Connection`: `rusqlite`'s `Connection` is `Send +
+//! !Sync` and every real call blocks on disk, so [`PooledConn::call_blocking`] MOVES the connection
+//! into `spawn_blocking` and moves it back. That keeps the async runtime free of blocking IO and
+//! makes it impossible to share one connection across two tasks.
 
 use hive_crsql::rusqlite::{Connection, OpenFlags};
 use parking_lot::Mutex;
@@ -44,9 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Live connections per database. Deliberately small: SQLite serialises
-/// writers on the file anyway, so extra connections buy read concurrency (WAL
-/// readers don't block) and nothing else.
+/// Live connections per database. Deliberately small: SQLite serialises writers on the file anyway,
+/// so extra connections buy read concurrency (WAL readers do not block) and nothing else.
 fn max_conns() -> usize {
     env_usize("HIVE_SQLITE_POOL_MAX", 8).clamp(1, 256)
 }
@@ -126,10 +118,11 @@ impl SqlitePool {
         }
     }
 
-    /// Open a connection with the pragmas every pooled connection must carry.
-    /// WAL is what makes concurrent readers non-blocking; `busy_timeout` is
-    /// what turns a contended write from an instant `SQLITE_BUSY` error into a
-    /// bounded wait.
+    /// Opens a connection with the pragmas every pooled connection must carry: WAL (concurrent
+    /// readers do not block; `journal_mode` returns a row, so it is run as a query), `busy_timeout`
+    /// (a contended write becomes a bounded wait instead of an instant `SQLITE_BUSY`),
+    /// `synchronous=NORMAL` (the documented safe pairing with WAL: durable across a process crash,
+    /// only a host power loss can lose the last commits) and foreign keys on.
     fn open(path: &Path) -> Result<Connection, PoolError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| PoolError::Open(e.to_string()))?;
@@ -141,14 +134,11 @@ impl SqlitePool {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| PoolError::Open(e.to_string()))?;
-        // `journal_mode` returns a row, so it is a query, not an `execute`.
         let _: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .map_err(|e| PoolError::Open(e.to_string()))?;
         conn.busy_timeout(std::time::Duration::from_millis(busy_ms()))
             .map_err(|e| PoolError::Open(e.to_string()))?;
-        // NORMAL is the documented safe pairing with WAL (durable across
-        // process crash; only a host power loss can lose the last commits).
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let _ = conn.pragma_update(None, "foreign_keys", "ON");
         Ok(conn)
@@ -182,7 +172,6 @@ impl SqlitePool {
             }
             None => {
                 let path = self.path.clone();
-                // Opening touches disk; keep it off the runtime threads.
                 let opened = tokio::task::spawn_blocking(move || Self::open(&path))
                     .await
                     .map_err(|_| PoolError::Lost)??;
@@ -197,17 +186,15 @@ impl SqlitePool {
         })
     }
 
-    /// Return a connection to the idle set, or close it when the set is full.
-    /// A connection that is still inside a transaction is NEVER pooled: the
-    /// next borrower would inherit an open write lock and a half-finished unit
-    /// of work.
+    /// Returns a connection to the idle set, or closes it when the set is full. A connection still
+    /// inside a transaction is rolled back first and NEVER pooled if the rollback fails: the next
+    /// borrower would inherit an open write lock and a half-finished unit of work, and a failed
+    /// rollback means the connection's state is unknowable, so it is closed rather than handed on.
     fn release(&self, conn: Connection) {
         if !conn.is_autocommit() {
             let _ = conn.execute_batch("ROLLBACK");
         }
         if !conn.is_autocommit() {
-            // Rollback failed — the connection's state is not knowable, so
-            // close it rather than hand it to the next caller.
             return;
         }
         let mut idle = self.idle.lock();
@@ -230,9 +217,9 @@ impl SqlitePool {
     }
 }
 
-/// A borrowed connection. The permit is released in `Drop` — including when the
-/// request future is dropped mid-await, which is the only reason this type
-/// exists as a guard instead of a plain return value.
+/// A borrowed connection. The permit is released in `Drop`, including when the request future is
+/// dropped mid-await, which is the only reason this type is a guard instead of a plain return
+/// value.
 pub struct PooledConn {
     pool: Arc<SqlitePool>,
     conn: Option<Connection>,
@@ -240,14 +227,11 @@ pub struct PooledConn {
 }
 
 impl PooledConn {
-    /// Run an ASYNC `f` against the connection on the blocking pool, driving it
-    /// to completion there.
-    ///
-    /// The connection is moved in and moved back out. `f` is a future because
-    /// the pipeline implementation is shared with the musql engine and is
-    /// therefore async, but this engine's work is blocking file IO, so it is
-    /// driven by `futures::executor::block_on` inside `spawn_blocking` rather
-    /// than awaited on a serving tokio worker. A panic inside `f` loses the
+    /// Runs an ASYNC `f` against the connection on the blocking pool, driving it to completion
+    /// there. The connection is moved in and moved back out. `f` is a future because the pipeline
+    /// implementation is shared with the musql engine and is therefore async, but this engine's
+    /// work is blocking file IO, so it is driven by `futures::executor::block_on` inside
+    /// `spawn_blocking` rather than awaited on a serving tokio worker. A panic inside `f` loses the
     /// connection (reported as [`PoolError::Lost`]) but never the permit.
     pub async fn call_blocking<F, R>(&mut self, f: F) -> Result<R, PoolError>
     where
@@ -281,14 +265,14 @@ impl PooledConn {
     }
 }
 
+/// Returns the connection before the permit: fields drop after this body, so the connection is back
+/// in the idle set before a queued waiter is woken (otherwise the waiter opens a new one while this
+/// one sits unused).
 impl Drop for PooledConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             self.pool.release(conn);
         }
-        // `_permit` drops right after this, freeing capacity — order matters:
-        // the connection must be back in the idle set before a queued waiter
-        // is woken, or the waiter opens a new one while this sits unused.
     }
 }
 
@@ -299,11 +283,10 @@ fn registry() -> &'static Registry {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The pool for `db_id`, created on first use. `path` is derived server-side
-/// from the database id (never from tenant input — see
-/// `crate::databases::sqlite_file_path`); it is recorded on the first call and
-/// a later call with a different path is ignored, so nothing can re-point a
-/// live pool at another file.
+/// The pool for `db_id`, created on first use. `path` is derived server-side from the database id
+/// (never from tenant input; see `crate::databases::sqlite_file_path`) and recorded on the first
+/// call: a later call with a different path is ignored, so nothing can re-point a live pool at
+/// another file.
 pub fn pool_for(db_id: &str, path: &Path) -> Arc<SqlitePool> {
     let mut reg = registry().lock();
     reg.entry(db_id.to_string())
@@ -313,12 +296,11 @@ pub fn pool_for(db_id: &str, path: &Path) -> Arc<SqlitePool> {
 
 /// Drop a database's pool (on delete). In-flight guards keep their `Arc` alive
 /// and release normally; the idle connections close as the last `Arc` drops.
+///
+/// The removal is bound to its own statement so the registry guard is DROPPED before `pool.idle` is
+/// locked: held across, it would nest registry -> idle (the order `stats()` uses, so it cannot
+/// invert today), the shape that self-deadlocked `hrana::checkout`.
 pub fn close(db_id: &str) {
-    // Bind the removal to a statement so the registry guard is DROPPED before
-    // `pool.idle` is locked. Held across, this is a registry→idle nesting; it is
-    // the same order `stats()` uses so it cannot invert today, but the shape is
-    // the one that self-deadlocked `hrana::checkout`, and unnesting it costs
-    // nothing.
     let pool = registry().lock().remove(db_id);
     if let Some(pool) = pool {
         pool.idle.lock().clear();

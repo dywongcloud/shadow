@@ -1,35 +1,30 @@
-//! Hrana v2/v3 wire codec + execution against one [`SqlEngine`].
+//! Hrana v2/v3 wire codec and execution against one [`SqlEngine`].
 //!
-//! This is the protocol half of the libsql lane (`crate::hrana` is the HTTP
-//! half). It is a direct implementation of `libsql/docs/HRANA_3_SPEC.md`, and
-//! the parts that look pedantic are the parts a real client breaks on:
+//! The protocol half of the libsql lane (`crate::hrana` is the HTTP half), a direct implementation
+//! of `libsql/docs/HRANA_3_SPEC.md`. The parts that look pedantic are the parts a real client
+//! breaks on:
 //!
-//! * **`integer` and `last_insert_rowid` are STRINGS on the wire.** JSON
-//!   numbers are f64 in every JS client, so an i64 beyond 2^53 would silently
-//!   lose its low bits. The spec makes them strings for exactly that reason and
-//!   `@libsql/client` parses them back with `BigInt`.
-//! * **`float` is a JSON number**, which cannot represent NaN/±Inf. SQLite can
-//!   store them, so a column holding one is a LOUD error naming the column
-//!   rather than a silent `null` (indistinguishable from a real NULL) or a
-//!   silent type change to text. (A musql-backed database cannot hold one at
-//!   all: `crate::musql::preflight` refuses to migrate a database that does.)
-//! * **`blob` is base64 WITH padding**: `atob` in a browser requires it, and
-//!   every padded decoder accepts it. Decoding accepts unpadded too.
-//! * **Every request in a pipeline executes, even after one errors** — the
-//!   spec is explicit, and `batch`'s conditions are built on later steps
-//!   observing an earlier step's failure.
+//! * **`integer` and `last_insert_rowid` are STRINGS on the wire.** JSON numbers are f64 in every
+//! JS client, so an i64 beyond 2^53 would silently lose its low bits; `@libsql/client` parses them
+//! back with `BigInt`.
+//! * **`float` is a JSON number**, which cannot represent NaN/+-Inf. SQLite can store them, so a
+//! column holding one is a LOUD error naming the column, never a silent `null` (indistinguishable
+//! from a real NULL) or a silent type change to text. (A musql-backed database cannot hold one at
+//! all: `crate::musql::preflight` refuses to migrate a database that does.)
+//! * **`blob` is base64 WITH padding**: `atob` in a browser requires it and every padded decoder
+//! accepts it. Decoding accepts unpadded too.
+//! * **Every request in a pipeline executes, even after one errors**: the spec is explicit, and
+//! `batch`'s conditions are built on later steps observing an earlier step's failure.
 //!
-//! Everything above the engine call is synchronous protocol work; the engine
-//! call itself is awaited, so the rusqlite engine (blocking file IO) is driven
-//! to completion inside `spawn_blocking` by `sqlite_pool::PooledConn` while the
-//! musql engine (loopback HTTP) is awaited on the runtime. One pipeline
-//! implementation serves both.
+//! Everything above the engine call is synchronous protocol work; the engine call itself is
+//! awaited, so the rusqlite engine (blocking file IO) is driven to completion inside
+//! `spawn_blocking` by `sqlite_pool::PooledConn` while the musql engine (loopback HTTP) is awaited
+//! on the runtime: one pipeline implementation serves both.
 //!
-//! Statement errors are tagged `SQLITE_ERROR` for EVERY engine. musqld emits
-//! richer codes (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_CONSTRAINT_FOREIGNKEY`,
-//! `HRANA_PROTO_ERROR`); forwarding them would change the code every existing
-//! tenant sees on day one, so `crate::musql` normalises them before they reach
-//! this file and this file keeps tagging them the way it always has.
+//! Statement errors are tagged `SQLITE_ERROR` for EVERY engine. musqld emits richer codes
+//! (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_CONSTRAINT_FOREIGNKEY`, `HRANA_PROTO_ERROR`); forwarding
+//! them would change the code every existing tenant sees, so `crate::musql` normalises them before
+//! they reach this file.
 
 use base64::Engine;
 use serde::Deserialize;
@@ -105,12 +100,12 @@ fn result_ok(response: Value) -> Value {
     json!({ "type": "ok", "response": response })
 }
 
-/// Execute a whole pipeline's `requests` array against one engine.
-/// `version` gates the v3-only requests (`get_autocommit`, the `is_autocommit`
-/// batch condition) so a v2 client can never observe a v3 response shape.
-/// `read_only` is an ADDITIONAL, connection-independent enforcement layer —
-/// see [`deny_if_forbidden_read_only_stmt`]'s doc for why a mutable
-/// `PRAGMA query_only` alone is not a sufficient boundary.
+/// Executes a whole pipeline's `requests` array against one engine. `version` gates the v3-only
+/// requests (`get_autocommit`, the `is_autocommit` batch condition), so a v2 client can never
+/// observe a v3 response shape. `read_only` is an ADDITIONAL, connection-independent enforcement
+/// layer; see [`deny_if_forbidden_read_only_stmt`] for why a mutable `PRAGMA query_only` alone is
+/// not a sufficient boundary. A `close` short-circuits nothing: every request runs, and a client
+/// legitimately pipelines `[execute, close]`.
 pub async fn execute_pipeline<E: SqlEngine>(
     eng: &mut E,
     requests: Vec<Value>,
@@ -121,8 +116,6 @@ pub async fn execute_pipeline<E: SqlEngine>(
     let mut results = Vec::with_capacity(requests.len());
     let mut closed = false;
     for req in requests {
-        // A `close` short-circuits nothing: the spec says every request runs,
-        // and a client legitimately pipelines [execute, close].
         let ty = req.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let out = match ty {
             "close" => {
@@ -203,17 +196,15 @@ pub async fn execute_pipeline<E: SqlEngine>(
     }
 }
 
-/// A read-only session's ONLY enforcement point that isn't a mutable
-/// per-connection PRAGMA. `PRAGMA query_only=ON` is not a real boundary: it
-/// is a session-scoped setting toggled by ordinary SQL text, and SQLite does
-/// not gate PRAGMA execution behind the flag it itself controls, so
-/// `PRAGMA query_only=OFF` sent over the same read-only-scoped connection
-/// silently re-enables writes for the rest of the request. `ATTACH`/`DETACH`
-/// are denied for the same reason (attaching a second database file sidesteps
-/// this file's own `max_bytes` cap and any path-scoping assumption entirely).
-/// Every raw SQL string reaching an engine's `run`/`execute_batch`/`describe`
-/// from a read-only-scoped pipeline must pass through here first — never trust
-/// a post-hoc readonly check, since PRAGMA/ATTACH survive that too.
+/// A read-only session's ONLY enforcement point that is not a mutable per-connection PRAGMA.
+/// `PRAGMA query_only=ON` is no real boundary: it is a session-scoped setting toggled by ordinary
+/// SQL text, and SQLite does not gate PRAGMA execution behind the flag it controls, so `PRAGMA
+/// query_only=OFF` sent over the same read-only-scoped connection silently re-enables writes for
+/// the rest of the request. `ATTACH`/`DETACH` are denied for the same reason (attaching a second
+/// database file sidesteps this file's own `max_bytes` cap and any path-scoping assumption). Every
+/// raw SQL string reaching an engine's `run`/`execute_batch`/`describe` from a read-only-scoped
+/// pipeline must pass through here first; a post-hoc readonly check is no substitute, since
+/// PRAGMA/ATTACH survive it too.
 fn deny_if_forbidden_read_only_stmt(sql: &str, read_only: bool) -> Result<(), String> {
     if !read_only {
         return Ok(());
@@ -298,8 +289,6 @@ fn sql_from_req(req: &Value, cache: &SqlCache) -> Result<String, String> {
     resolve_sql(&stmt, cache)
 }
 
-// ---- Value codec ----------------------------------------------------------
-
 /// Wire `Value` -> engine value. An unknown `type` is an error, never a
 /// best-effort guess: binding the wrong type is a silently wrong query.
 fn decode_value(v: &Value) -> Result<SqlValue, String> {
@@ -350,12 +339,10 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("invalid base64 in blob argument: {e}"))
 }
 
-/// The one message a non-finite REAL produces, whichever engine produced it.
-///
-/// Shared on purpose: the rusqlite path refuses to ENCODE one here, and the
-/// musql path has to re-derive it from the engine after musqld's lossy row
-/// encoder turned it into a NULL. Two engines, one message, so a client cannot
-/// tell which engine it is talking to by the error text.
+/// The one message a non-finite REAL produces, whichever engine produced it. Shared on purpose: the
+/// rusqlite path refuses to ENCODE one here, and the musql path must re-derive it from the engine
+/// after musqld's lossy row encoder turned it into a NULL. Two engines, one message, so a client
+/// cannot tell which engine it is talking to by the error text.
 pub(crate) fn non_finite_message(col: &str, f: f64) -> String {
     format!(
         "column {col:?} holds a non-finite float ({f}), which JSON cannot represent — \
@@ -400,8 +387,10 @@ fn wire_args(s: &Stmt) -> Result<(Vec<SqlValue>, Vec<NamedArg>), String> {
     Ok((args, named))
 }
 
-// ---- Statement execution --------------------------------------------------
-
+/// Runs one statement on the engine and renders the Hrana result. `rows_read` is the rows the
+/// statement STEPPED and `rows_written` the rows it changed: libsql-server derives both from
+/// `sqlite3_status` counters, and these are the honest per-statement equivalents, not a
+/// reimplementation of that accounting.
 async fn execute_stmt<E: SqlEngine>(
     eng: &mut E,
     sql: &str,
@@ -451,10 +440,6 @@ async fn execute_stmt<E: SqlEngine>(
         "rows": rows_json,
         "affected_row_count": out.rows_written,
         "last_insert_rowid": out.last_insert_rowid.map(|id| id.to_string()),
-        // `rows_read` is the rows this statement STEPPED and `rows_written` the
-        // rows it changed. libsql-server derives both from sqlite3_status
-        // counters; these are the honest per-statement equivalents, not a
-        // reimplementation of that accounting.
         "rows_read": out.rows_read,
         "rows_written": out.rows_written,
         "query_duration_ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -492,8 +477,6 @@ async fn describe<E: SqlEngine>(eng: &mut E, sql: &str) -> Result<Value, String>
     }))
 }
 
-// ---- Batch ----------------------------------------------------------------
-
 /// One batch step's observed outcome, which later steps' conditions read.
 #[derive(Clone, Copy, PartialEq)]
 enum StepState {
@@ -502,6 +485,10 @@ enum StepState {
     Failed,
 }
 
+/// Evaluates one batch condition against the steps that have run. A condition naming a step that
+/// has not run yet (or does not exist) is FALSE, never an error: the spec allows forward references
+/// and they simply cannot be satisfied. A malformed condition is an `Err` the caller attributes to
+/// ITS step.
 async fn eval_cond<E: SqlEngine>(
     cond: &Value,
     states: &[StepState],
@@ -518,9 +505,6 @@ async fn eval_cond<E: SqlEngine>(
                 .get("step")
                 .and_then(|s| s.as_u64())
                 .ok_or("batch condition is missing `step`")? as usize;
-            // A condition referring to a step that has not run yet (or does not
-            // exist) is FALSE, never an error — the spec allows forward
-            // references and they simply cannot be satisfied.
             let state = states.get(step).copied().unwrap_or(StepState::Skipped);
             Ok(match ty {
                 "ok" => state == StepState::Ok,
@@ -556,15 +540,13 @@ async fn eval_cond<E: SqlEngine>(
     }
 }
 
-/// The `v3/cursor` endpoint's newline-delimited entry stream for one batch.
-///
-/// The entries are RENDERED from the same buffered batch execution the
-/// pipeline endpoint uses — the wire shape is the spec's, the execution is not
-/// a second implementation. That is a deliberate limit and it is the honest
-/// one: `cursor` exists in Hrana so a huge result set need not be buffered, and
-/// this server still buffers it under [`MAX_ROWS`]/[`MAX_RESULT_BYTES`]. A
-/// client gets correct results and the same ceiling as the pipeline endpoint,
-/// never a truncated stream.
+/// The `v3/cursor` endpoint's newline-delimited entry stream for one batch. The entries are
+/// RENDERED from the same buffered batch execution the pipeline endpoint uses: the wire shape is
+/// the spec's, the execution is not a second implementation. That is a deliberate and honest limit:
+/// `cursor` exists in Hrana so a huge result set need not be buffered, and this server still
+/// buffers it under [`MAX_ROWS`]/[`MAX_RESULT_BYTES`], so a client gets correct results and the
+/// same ceiling as the pipeline endpoint, never a truncated stream. A skipped step emits no
+/// entries.
 pub async fn execute_cursor<E: SqlEngine>(
     eng: &mut E,
     batch: Value,
@@ -600,7 +582,6 @@ pub async fn execute_cursor<E: SqlEngine>(
             continue;
         }
         let Some(r) = step_results.get(i).filter(|v| !v.is_null()) else {
-            // Skipped step: the spec emits no entries for it.
             continue;
         };
         entries.push(json!({ "type": "step_begin", "step": i, "cols": r["cols"] }));
@@ -616,6 +597,10 @@ pub async fn execute_cursor<E: SqlEngine>(
     entries
 }
 
+/// Runs a batch's steps in order, each gated by its condition. A step failure never stops the batch
+/// (conditions are what read it), and a malformed condition fails ITS step, not the batch: the
+/// remaining steps still get their conditions evaluated. A skipped step leaves both its result and
+/// its error `null`.
 async fn execute_batch<E: SqlEngine>(
     eng: &mut E,
     batch: Batch,
@@ -634,8 +619,6 @@ async fn execute_batch<E: SqlEngine>(
             Some(c) => match eval_cond(c, &states, eng, version).await {
                 Ok(v) => v,
                 Err(e) => {
-                    // A malformed condition fails ITS step, not the batch —
-                    // the remaining steps still get their conditions evaluated.
                     states[i] = StepState::Failed;
                     step_errors[i] = err_json(e, Some("SQLITE_ERROR"));
                     continue;

@@ -1,26 +1,23 @@
 //! Cross-region database replication.
 //!
-//! When a database is provisioned with `replicas: [<region>, …]` the PRIMARY
-//! node (where the writable instance lives) fans the database out to one node in
-//! each replica region so reads are served locally in every configured region:
+//! A database provisioned with `replicas: [<region>, ...]` has its PRIMARY node (where the writable
+//! instance lives) fan it out to one node in each replica region, so reads are served locally in
+//! every configured region:
 //!
-//!   * **Record + egress replication** — the [`Database`] record is registered on
-//!     each replica node (role=`replica`) so it appears in that region's dashboard
-//!     and its connection env is auto-injected into the owning project's
-//!     deployments there too.
-//!   * **Platform-native kinds** (blob / queue / vector / pub-sub / realtime) —
-//!     the primary MIRRORS every write to each replica node over the authenticated
-//!     mesh (see [`on_write`]); an `x-hive-mirror` header breaks the loop so a
-//!     mirrored write is applied locally and never re-mirrored. Each region then
-//!     serves reads from its own local copy.
-//!   * **Postgres / Redis** — the replica node provisions a real in-region backing
-//!     container. Native physical streaming (`replicaof` / hot-standby) is enabled
-//!     when the primary is reachable from the replica (a public endpoint); across
-//!     NAT without that, the replica is an independent in-region instance and the
-//!     limitation is logged rather than silently pretended.
+//! * **Record and egress replication**: the [`Database`] record is registered on each replica node
+//! (role `replica`), so it appears in that region's dashboard and its connection env is
+//! auto-injected into the owning project's deployments there too.
+//! * **Platform-native kinds** (blob, queue, vector, pub/sub, realtime): the primary MIRRORS every
+//! write to each replica node over the authenticated mesh ([`on_write`]); an `x-hive-mirror` header
+//! breaks the loop, so a mirrored write is applied locally and never re-mirrored. Each region
+//! serves reads from its own local copy.
+//! * **Postgres and Redis**: the replica node provisions a real in-region backing container. Native
+//! physical streaming (`replicaof` / hot-standby) is enabled when the primary is reachable from the
+//! replica (a public endpoint); across NAT without that, the replica is an independent in-region
+//! instance and the limitation is logged rather than silently pretended.
 //!
-//! Transport reuses the mesh: HTTP admin URL when known, else an iroh request to
-//! the peer — the same dual path the deploy fanout uses.
+//! Transport reuses the mesh: the HTTP admin URL when known, else an iroh request to the peer, the
+//! same dual path the deploy fanout uses.
 
 use std::sync::Arc;
 
@@ -57,8 +54,17 @@ fn target_for(cloud: &Arc<CloudState>, n: &NodeInfo) -> Option<Target> {
     }
 }
 
+/// Whether `t` names a peer to send to: the target built for THIS node (see `target_for`) carries
+/// neither an admin URL nor an iroh route.
+fn is_remote(t: &Target) -> bool {
+    t.admin.is_some() || t.iroh.is_some()
+}
+
 /// One reachable target node per replica region (healthy; prefers a node that
 /// isn't the primary itself). Regions with no reachable node are skipped.
+///
+/// Candidates exclude this (primary) node and the node hosting the primary: a replica must live on
+/// a different node.
 fn replica_targets(cloud: &Arc<CloudState>, db: &Database) -> Vec<Target> {
     let nodes = cloud.registry.nodes();
     let mut out = Vec::new();
@@ -68,10 +74,6 @@ fn replica_targets(cloud: &Arc<CloudState>, db: &Database) -> Vec<Target> {
         if region.is_empty() || region == db.region {
             continue;
         }
-        // Healthy nodes in the region, EXCLUDING this (primary) node and the node
-        // hosting the primary — a replica must live on a different node. (Locally
-        // two nodes can share a region; in production the replica region differs
-        // from the primary's, so this simply picks that region's node.)
         let cands: Vec<&NodeInfo> = nodes
             .iter()
             .filter(|n| {
@@ -124,18 +126,19 @@ async fn send_replica_rpc(cloud: &Arc<CloudState>, t: &Target, op: &str, db: &Da
 }
 
 /// Provision/refresh replicas of `db` in each configured region (background).
+///
+/// The database is stamped with this node as `primary_node`, so replicas know where to stream from.
 pub fn ensure_replicas(cloud: Arc<CloudState>, mut db: Database) {
     if db.replicas.is_empty() {
         return;
     }
-    // Stamp the primary node so replicas know where to stream from.
     db.primary_node = cloud.node_name.clone();
     db.role = "primary".into();
     tokio::spawn(async move {
         let targets = replica_targets(&cloud, &db);
         for t in targets {
-            if t.admin.is_none() && t.iroh.is_none() {
-                continue; // that's us — the primary
+            if !is_remote(&t) {
+                continue;
             }
             let ok = send_replica_rpc(&cloud, &t, "register", &db).await;
             tracing::info!(db = %db.id, region_node = %t.node, ok, "database replica register");
@@ -150,17 +153,13 @@ pub fn remove_replicas(cloud: Arc<CloudState>, db: Database) {
     }
     tokio::spawn(async move {
         for t in replica_targets(&cloud, &db) {
-            if t.admin.is_none() && t.iroh.is_none() {
+            if !is_remote(&t) {
                 continue;
             }
             let _ = send_replica_rpc(&cloud, &t, "remove", &db).await;
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// Data-plane write mirroring (platform-native kinds)
-// ---------------------------------------------------------------------------
 
 /// The storage "name" a database owns for its kind (bucket/queue/index/topic/room),
 /// used to map a storage write back to its database + replica regions.
@@ -179,7 +178,6 @@ fn db_storage_name(db: &Database) -> Option<&str> {
 /// Given a raw (un-namespaced) storage name + team, return the replica-region
 /// targets to mirror a write to (empty when the name isn't a replicated DB).
 fn mirror_targets(cloud: &Arc<CloudState>, team: &str, raw_name: &str) -> Vec<Target> {
-    // Find a local PRIMARY database of this team that owns `raw_name` and has replicas.
     let db = cloud.databases.snapshot().into_iter().find(|d| {
         d.role != "replica"
             && crate::admin::norm(&d.team) == crate::admin::norm(team)
@@ -189,16 +187,17 @@ fn mirror_targets(cloud: &Arc<CloudState>, team: &str, raw_name: &str) -> Vec<Ta
     match db {
         Some(d) => replica_targets(cloud, &d)
             .into_iter()
-            .filter(|t| t.admin.is_some() || t.iroh.is_some())
+            .filter(is_remote)
             .collect(),
         None => Vec::new(),
     }
 }
 
-/// Mirror a storage write to every replica region for the owning database. No-op
-/// when this call is itself a mirrored write (`is_mirror`) or the name isn't
-/// replicated. `rel_path` is the storage API path (e.g. `/v1/storage/blob/<name>/<key>`);
-/// `method` is "PUT"/"POST". Best-effort + async — never blocks the local write.
+/// Mirrors a storage write to every replica region of the owning database. A no-op when this call
+/// is itself a mirrored write (`is_mirror`: applied locally, never re-mirrored, the loop breaker)
+/// or the name is not replicated. `rel_path` is the storage API path
+/// (`/v1/storage/blob/<name>/<key>`) and `method` is `PUT` or `POST`. Best-effort and async: it
+/// never blocks the local write, and a failed delivery is only logged at debug (no retry).
 pub fn on_write(
     cloud: &Arc<CloudState>,
     is_mirror: bool,
@@ -210,7 +209,7 @@ pub fn on_write(
     body: Vec<u8>,
 ) {
     if is_mirror {
-        return; // applied locally; do not re-mirror (loop breaker)
+        return;
     }
     let targets = mirror_targets(cloud, team, raw_name);
     if targets.is_empty() {
@@ -219,15 +218,13 @@ pub fn on_write(
     send_mirrored(cloud, targets, team, method, rel_path, content_type, body);
 }
 
-/// Fan a write to EVERY healthy peer rather than to configured replica regions.
-///
-/// Pub/Sub and Realtime aren't durable stores with a replica policy — they are
-/// live delivery over a per-process broker. `admin_ingress` sends the publish (a
-/// mutation) to the control-plane leader while WebSocket subscribers (reads)
-/// stay on whichever node they connected to, so a publish reached only the
-/// subscribers that happened to share a node with the leader — and still
-/// reported `delivered` as if it had succeeded. Delivery therefore has to reach
-/// every node that might be holding a subscriber, which means all of them.
+/// Fans a write out to EVERY healthy peer rather than to configured replica regions. Pub/Sub and
+/// Realtime are live delivery over a per-process broker, not durable stores with a replica policy:
+/// `admin_ingress` sends a publish (a mutation) to the control-plane leader while WebSocket
+/// subscribers (reads) stay on whichever node they connected to, so without this a publish reached
+/// only the subscribers sharing the leader's node and still reported `delivered`. Delivery
+/// therefore has to reach every node that might hold a subscriber. A no-op when `is_mirror`: that
+/// call IS the fan-out arriving, and delivering again would loop.
 pub fn fanout_all(
     cloud: &Arc<CloudState>,
     is_mirror: bool,
@@ -237,7 +234,7 @@ pub fn fanout_all(
     body: Vec<u8>,
 ) {
     if is_mirror {
-        return; // this call IS the fan-out arriving; delivering again would loop
+        return;
     }
     let targets: Vec<Target> = cloud
         .registry
@@ -252,9 +249,22 @@ pub fn fanout_all(
     send_mirrored(cloud, targets, team, "POST", rel_path, content_type, body);
 }
 
-/// Deliver one write to a fixed target set, over HTTP admin or the iroh mesh.
-/// Shared by replica mirroring and pub/sub fan-out so both carry the identical
-/// signed mirror proof and loop-breaker semantics.
+/// How long a mesh mirror waits: above the 10 s HTTP timeout, for fresh-discovery fallback headroom
+/// (see `admin::fetch_from_host`).
+const MESH_MIRROR_TIMEOUT_SECS: u64 = 15;
+
+/// Delivers one write to a fixed target set, over the HTTP admin URL or the iroh mesh, shared by
+/// replica mirroring and pub/sub fan-out so both carry the identical signed mirror proof and
+/// loop-breaker semantics.
+///
+/// The proof is a short-lived signed token of tenant identity that the receiving node's
+/// `write_scope()` verifies (`x-hive-mirror-tok` over HTTP, `mesh_team_qs` over the mesh), so a
+/// client-forged `x-hive-mirror`/`x-hive-team` pair can never redirect a write into another
+/// tenant's namespace. Over HTTP the same token also rides as a Bearer: `auth::require_auth` gates
+/// every mutation on `Authorization`/`hive_jwt` alone, so `x-hive-mirror-tok` by itself never
+/// reached `write_scope` on a JWT-enforced node; reusing the one signed token keeps both parses
+/// verifying byte-identical claims. Over the mesh the team and mirror flag ride the query string
+/// and the gossip dispatch reconstructs the storage write on the replica.
 fn send_mirrored(
     cloud: &Arc<CloudState>,
     targets: Vec<Target>,
@@ -277,10 +287,6 @@ fn send_mirrored(
                 } else {
                     cloud.http.post(&url)
                 };
-                // Short-lived signed proof of tenant identity for the receiving node's
-                // write_scope() to verify — mirrors mesh_team_qs's iroh-path token so a
-                // client-forged x-hive-mirror/x-hive-team pair can never redirect a write
-                // into another tenant's namespace (see admin.rs write_scope).
                 let mut rb = rb
                     .header("x-hive-team", team.clone())
                     .header("x-hive-mirror", "1")
@@ -293,15 +299,6 @@ fn send_mirrored(
                     crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
                 ) {
                     rb = rb.header("x-hive-mirror-tok", tok.clone());
-                    // Also present as a normal Bearer: auth::require_auth (main.rs)
-                    // wraps this ENTIRE router in a mutation gate that only ever
-                    // looks at Authorization/hive_jwt-cookie -- x-hive-mirror-tok
-                    // alone never reached write_scope()'s own (correct) check on any
-                    // JWT-enforced node, a real bug live-witnessed via the identical
-                    // pattern in gossip::fetch's HTTP bootstrap fallback (see its
-                    // comment). Reusing the SAME already-signed token here (not a
-                    // second issue() call) keeps write_scope's x-hive-mirror-tok
-                    // parse and this Bearer parse verifying byte-identical claims.
                     rb = rb.header("authorization", format!("Bearer {tok}"));
                 }
                 rb.body(body.clone())
@@ -311,17 +308,22 @@ fn send_mirrored(
                     .map(|r| r.status().is_success())
                     .unwrap_or(false)
             } else if let Some((id, addr)) = &t.iroh {
-                // Over the mesh: encode team + mirror flag in the query; the gossip
-                // dispatch reconstructs the storage write on the replica.
                 let sep = if rel_path.contains('?') { '&' } else { '?' };
                 let p = format!(
                     "{rel_path}{sep}mirror=1&{}",
                     crate::admin::mesh_team_qs(&team)
                 );
-                // Bumped from 10s for fresh-discovery fallback headroom (see admin.rs::fetch_from_host).
-                crate::gossip::request_to(&cloud, id, addr, hive_p2p::GOSSIP_POST, &p, &body, 15)
-                    .await
-                    .is_some()
+                crate::gossip::request_to(
+                    &cloud,
+                    id,
+                    addr,
+                    hive_p2p::GOSSIP_POST,
+                    &p,
+                    &body,
+                    MESH_MIRROR_TIMEOUT_SECS,
+                )
+                .await
+                .is_some()
             } else {
                 false
             };

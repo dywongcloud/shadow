@@ -1,40 +1,38 @@
-//! Request monitoring — rolls observed events into time buckets at THREE
-//! resolutions simultaneously (minute/hour/day) so the dashboard can draw a
-//! consumption chart at Daily, Weekly or Monthly granularity without
+//! Request monitoring: rolls observed events into time buckets at THREE resolutions at once
+//! (minute, hour, day), so the dashboard can chart Daily, Weekly or Monthly consumption without
 //! re-scanning the raw event ring on every poll.
 //!
-//! TENANT-NATIVE: every series/paths/status counter is keyed by TENANT (the owning
-//! team of the request's project). A tenant read (`Some(tenant)`) sees ONLY its own
-//! traffic — no cross-tenant leak of request volumes, status codes or URL paths.
-//! A `None` read aggregates across all tenants and is reserved for the platform
-//! OPERATOR (owner ops console), never a tenant-facing endpoint.
+//! TENANT-NATIVE: every series, path and status counter is keyed by TENANT (the owning team of the
+//! request's project). A tenant read (`Some(tenant)`) sees ONLY its own traffic: no cross-tenant
+//! leak of request volumes, status codes or URL paths. A `None` read aggregates across all tenants
+//! and is reserved for the platform OPERATOR (owner ops console), never a tenant-facing endpoint.
 //!
-//! Minute buckets are NOT persisted (high-churn, short retention — refill within
-//! minutes of a restart). Hour/day buckets ARE persisted via [`RollupSnapshot`]
-//! (see `persist.rs`'s `metrics_rollup` field) — without this a Weekly/Monthly
-//! view would silently empty out on every deploy restart, defeating the point of
-//! having a longer-retention resolution at all.
+//! Minute buckets are NOT persisted (high churn, short retention: they refill within minutes of a
+//! restart). Hour and day buckets ARE persisted via [`RollupSnapshot`] (`persist.rs`'s
+//! `metrics_rollup` field); without that a Weekly or Monthly view would silently empty out on every
+//! deploy restart, defeating the longer-retention resolutions.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-const BUCKET_MS: u64 = 60_000; // 1 minute
-const MAX_BUCKETS: usize = 1_440; // 24 hours of minute-resolution history ("Daily")
-const HOUR_MS: u64 = 3_600_000; // 1 hour
-const MAX_HOUR_BUCKETS: usize = 720; // 30 days of hour-resolution history ("Weekly")
-const DAY_MS: u64 = 86_400_000; // 1 day
-const MAX_DAY_BUCKETS: usize = 400; // ~13 months of day-resolution history ("Monthly")
-/// Events with no owning project (host-rejected, platform-internal) are recorded
-/// under this reserved tenant so they never count toward any real team's metrics
-/// and are only visible in the global (operator) aggregate.
+const BUCKET_MS: u64 = 60 * 1_000;
+/// Minute buckets kept: 24 hours of history, the "Daily" view.
+const MAX_BUCKETS: usize = 24 * 60;
+const HOUR_MS: u64 = 60 * BUCKET_MS;
+/// Hour buckets kept: 30 days of history, the "Weekly" view.
+const MAX_HOUR_BUCKETS: usize = 30 * 24;
+const DAY_MS: u64 = 24 * HOUR_MS;
+/// Day buckets kept: about 13 months of history, the "Monthly" view.
+const MAX_DAY_BUCKETS: usize = 400;
+/// Reserved tenant for events with no owning project (host-rejected, platform-internal): they never
+/// count toward a real team's metrics and are visible only in the global (operator) aggregate.
 pub const SYSTEM_TENANT: &str = "__system__";
 
-/// Time resolution a series/project-totals read is bucketed at. Each maps to an
-/// independently-retained ring buffer inside [`TenantMetrics`] — NOT a
-/// downsampling of the minute buckets (a 30-day Weekly window at minute
-/// resolution would be 43,200 points per tenant; hour/day buckets are
-/// accumulated directly in [`MetricsStore::record`] instead).
+/// Time resolution a series/project-totals read is bucketed at. Each has its own independently
+/// retained buffer inside [`TenantMetrics`], NOT a downsampling of the minute buckets (a 30-day
+/// Weekly window at minute resolution would be 43,200 points per tenant): hour and day buckets are
+/// accumulated directly in [`MetricsStore::record`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Granularity {
     Minute,
@@ -51,9 +49,9 @@ impl Granularity {
         }
     }
 
-    /// Retention ceiling for this resolution, in minutes — the largest `minutes`
-    /// span `series`/`project_totals` can usefully answer (older data has already
-    /// been evicted). Callers (`metrics_get`) clamp the requested span to this.
+    /// Retention ceiling of this resolution in minutes: the largest `minutes` span
+    /// `series`/`project_totals` can answer, since older data is already evicted. Callers
+    /// (`metrics_get`) clamp the requested span to it.
     pub fn max_span_minutes(self) -> usize {
         match self {
             Granularity::Minute => MAX_BUCKETS,
@@ -62,9 +60,8 @@ impl Granularity {
         }
     }
 
-    /// Parse the `gran` query-string value (`metrics_get`'s `MetricsQ.gran`).
-    /// Unrecognized/absent -> `Minute` (today's existing behavior), never an
-    /// error — this is a best-effort display parameter, not a validated input.
+    /// Parses the `gran` query value (`MetricsQ.gran`). Unrecognized or absent means `Minute`,
+    /// never an error: it is a best-effort display parameter, not validated input.
     pub fn parse(s: Option<&str>) -> Granularity {
         match s {
             Some("hour") => Granularity::Hour,
@@ -78,24 +75,25 @@ impl Granularity {
 pub struct Bucket {
     pub t_ms: u64,
     pub requests: u64,
-    pub errors: u64,     // status >= 500
-    pub client_err: u64, // 4xx
-    pub blocked: u64,    // waf-deny + bot-block + throttled
+    /// Responses with status >= 500.
+    pub errors: u64,
+    /// Responses with a 4xx status.
+    pub client_err: u64,
+    /// `waf-deny`, `bot-block` and `throttled` actions.
+    pub blocked: u64,
     pub cache_hits: u64,
     pub cache_miss: u64,
-    /// Per-project request counts in this bucket (within the owning tenant).
-    /// Persisted for hour/day rollups (`RollupSnapshot`) — Weekly/Monthly's
-    /// per-project breakdown needs this to survive a restart same as the totals
-    /// do; `#[serde(skip)]` would silently zero every project's history on load.
+    /// Per-project request counts in this bucket (within the owning tenant). Persisted with the
+    /// hour/day rollups so the Weekly/Monthly per-project breakdown survives a restart like the
+    /// totals; `#[serde(skip)]` would silently zero every project's history on load.
     #[serde(default)]
     pub by_project: HashMap<String, u64>,
 }
 
 impl Bucket {
-    /// Accumulate `other` into `self` (used to merge across tenants for the global
-    /// operator aggregate, and across nodes for `metrics_get`'s fleet fan-out —
-    /// see admin.rs — since MetricsStore is confirmed node-local with no live
-    /// cross-node merge otherwise). `t_ms` is preserved from `self`.
+    /// Accumulates `other` into `self`, to merge across tenants for the global operator aggregate
+    /// and across nodes for `metrics_get`'s fleet fan-out (`MetricsStore` is node-local, with no
+    /// live cross-node merge otherwise). `t_ms` is kept from `self`.
     pub(crate) fn add(&mut self, other: &Bucket) {
         self.requests += other.requests;
         self.errors += other.errors;
@@ -129,10 +127,10 @@ impl Bucket {
     }
 }
 
-/// Insert/accumulate `ev` into `map`'s bucket for `t` (floored to `bucket_ms`),
-/// then evict oldest entries past `max_buckets`. One call site per resolution
-/// in [`MetricsStore::record`], and the sole eviction policy for all three —
-/// changing retention only ever means changing the `MAX_*_BUCKETS` constant.
+/// Accumulates `ev` into `map`'s bucket for `t` (floored to the bucket size), then evicts the
+/// oldest entries past `max_buckets`. One call per resolution in [`MetricsStore::record`] and the
+/// sole eviction policy for all three: changing retention only ever means changing a
+/// `MAX_*_BUCKETS` constant.
 fn accumulate_bucket(
     map: &mut BTreeMap<u64, Bucket>,
     t: u64,
@@ -153,28 +151,31 @@ fn accumulate_bucket(
 
 #[derive(Default, Serialize, Deserialize)]
 struct TenantMetrics {
-    buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 min, NOT persisted)
-    hour_buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 hour, persisted)
-    day_buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 day, persisted)
+    /// Minute buckets by start ms; NOT persisted.
+    buckets: BTreeMap<u64, Bucket>,
+    /// Hour buckets by start ms; persisted.
+    hour_buckets: BTreeMap<u64, Bucket>,
+    /// Day buckets by start ms; persisted.
+    day_buckets: BTreeMap<u64, Bucket>,
+    /// Request count per path, trimmed to the top 200 once past 500 (the "top paths" view).
     #[serde(skip)]
-    paths: HashMap<String, u64>, // path -> count (rolling, "top paths")
+    paths: HashMap<String, u64>,
+    /// Count per status class (`2xx` .. `5xx`).
     #[serde(skip)]
-    status_classes: HashMap<String, u64>, // "2xx".."5xx" -> count
+    status_classes: HashMap<String, u64>,
 }
 
+/// Per-tenant request rollups. Keying by tenant is what makes tenant reads non-leaky.
 pub struct MetricsStore {
-    // tenant -> its metrics. Keying by tenant is what makes reads non-leaky.
     by_tenant: RwLock<HashMap<String, TenantMetrics>>,
 }
 
-/// Persisted slice of [`MetricsStore`] — hour/day rollups only (see the module
-/// doc comment for why minute buckets are excluded). Wired into
-/// `persist.rs`'s `PlatformSnapshot.metrics_rollup` / `capture()` / `restore()`,
-/// the exact same pattern as `databases.data_snapshot()`/`data_load()`.
+/// Persisted slice of [`MetricsStore`]: per tenant, the (hour, day) bucket maps only. Minute
+/// buckets, top paths and status classes are intentionally absent (see the module doc and
+/// `TenantMetrics`). Wired into `persist.rs`'s `PlatformSnapshot.metrics_rollup` through
+/// `capture()`/`restore()`, the same pattern as `databases.data_snapshot()`/`data_load()`.
 #[derive(Default, Serialize, Deserialize)]
 pub struct RollupSnapshot {
-    // tenant -> (hour_buckets, day_buckets). paths/status_classes/minute
-    // buckets are intentionally absent — see TenantMetrics's own field comments.
     by_tenant: HashMap<String, (BTreeMap<u64, Bucket>, BTreeMap<u64, Bucket>)>,
 }
 
@@ -196,10 +197,9 @@ impl MetricsStore {
         }
     }
 
-    /// Restore hour/day rollups from a snapshot (`persist.rs::restore`, boot-time
-    /// only — called once before any live traffic has been recorded, so a plain
-    /// overwrite is correct; a later call would discard rollups accumulated since
-    /// boot, which no caller does).
+    /// Restores hour/day rollups from a snapshot, at boot only (`persist.rs::restore`): called once
+    /// before any live traffic is recorded, so a plain overwrite is correct (a later call would
+    /// discard rollups accumulated since boot).
     pub fn rollup_load(&self, snap: RollupSnapshot) {
         let mut map = self.by_tenant.write();
         for (t, (hours, days)) in snap.by_tenant {
@@ -209,16 +209,12 @@ impl MetricsStore {
         }
     }
 
-    /// Rename a project inside the persisted hour/day rollups (and the live
-    /// minute buckets), merging into the target when it already has a bucket
-    /// entry — a rename is not a chance to lose history.
-    ///
-    /// Bounded by construction: every bucket map is capped at
-    /// `MAX_HOUR_BUCKETS`/`MAX_DAY_BUCKETS`/`MAX_BUCKETS` by
-    /// `accumulate_bucket`, so the whole critical section is O(tenants ×
-    /// capped buckets) map-key surgery, never O(requests). It still runs under
-    /// the project lifecycle writer (never per request) and holds one write
-    /// lock for the whole walk.
+    /// Renames a project inside the hour/day rollups and the live minute buckets, merging into the
+    /// target when it already has an entry (a rename must not lose history). Bounded by
+    /// construction: every bucket map is capped by `accumulate_bucket`, so the critical section is
+    /// O(tenants x capped buckets) key surgery, never O(requests); it runs under the project
+    /// lifecycle writer (never per request) and holds one write lock for the whole walk. Returns
+    /// the number of bucket entries renamed.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;
@@ -269,9 +265,8 @@ impl MetricsStore {
         }
     }
 
-    /// Merge the per-timestamp buckets at `gran` resolution for a tenant (`Some`)
-    /// or all tenants (`None`) into one timestamp->Bucket map. The core of every
-    /// scoped read.
+    /// Merges the per-timestamp buckets at `gran` resolution for a tenant (`Some`) or all tenants
+    /// (`None`) into one timestamp -> Bucket map: the core of every scoped read.
     fn merged_buckets(&self, gran: Granularity, tenant: Option<&str>) -> BTreeMap<u64, Bucket> {
         let map = self.by_tenant.read();
         fn pick(gran: Granularity, tm: &TenantMetrics) -> &BTreeMap<u64, Bucket> {
@@ -307,12 +302,10 @@ impl MetricsStore {
         out
     }
 
-    /// Time series for the last `minutes` at `gran` resolution, scoped to
-    /// `tenant` (`None` = global, operator-only), optionally narrowed to a
-    /// single project. `minutes` is a SPAN regardless of `gran` (e.g. Weekly
-    /// passes `minutes=10080` for a 7-day span, bucketed hourly) — callers
-    /// (`metrics_get`) are responsible for clamping it to
-    /// `gran.max_span_minutes()` beforehand.
+    /// Time series for the last `minutes` at `gran` resolution, scoped to `tenant` (`None` =
+    /// global, operator-only) and optionally narrowed to one project. `minutes` is a SPAN
+    /// regardless of `gran` (Weekly passes `10080` for a 7-day span, bucketed hourly); callers
+    /// (`metrics_get`) clamp it to `gran.max_span_minutes()` first.
     pub fn series(
         &self,
         gran: Granularity,
@@ -355,9 +348,8 @@ impl MetricsStore {
         out
     }
 
-    /// Per-project request totals over the last `minutes` at `gran` resolution,
-    /// scoped to `tenant` (`None` = global), sorted desc. Same span-vs-gran
-    /// contract as `series` (see its doc comment).
+    /// Per-project request totals over the last `minutes` at `gran` resolution, scoped to `tenant`
+    /// (`None` = global), sorted descending. Same span-versus-`gran` contract as `series`.
     pub fn project_totals(
         &self,
         gran: Granularity,
