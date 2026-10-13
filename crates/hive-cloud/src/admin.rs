@@ -3984,6 +3984,21 @@ pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> b
             }
         }
     }
+    // Step 3's optimistic fallback is "trust the caller's VERIFIED tenant" — it
+    // exists because a node with no row and no deployment evidence cannot prove
+    // otherwise. An anonymous caller has no verified tenant at all: `t` is
+    // ANON_TENANT, whose documented contract is that it "owns no data" and
+    // exists precisely so an unauthenticated read yields an empty result. Letting
+    // the fallback fire for it returned true for EVERY tenant string, so a
+    // project whose settings row is untagged and which has no deployment record
+    // anywhere in view answered to whoever asked — witnessed live: an anonymous
+    // GET /v1/logs read another project's event log (project name, host, region,
+    // an incarnation id) on a node holding exactly such a row. Narrow refusal:
+    // only the anonymous namespace loses the fallback, every real tenant keeps
+    // the behaviour step 3 was written for.
+    if t == ANON_TENANT {
+        return false;
+    }
     record_tenant(&owner) == UNTAGGED_TENANT && !dep_seen
 }
 
