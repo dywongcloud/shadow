@@ -20,10 +20,10 @@ interface GhOrg { login: string; name?: string }
 
 /** Last GitOps sync outcome, persisted for the UI (mirror card, error banner). */
 export interface GitopsSyncStatus {
-  at: number; // epoch ms
+  at: number;
   ok: boolean;
-  mode: "server"; // server-side sync is the only path (no in-browser git)
-  detail: string; // "pushed <sha>" | "unchanged" | error message
+  mode: "server";
+  detail: string;
   repo?: string;
   commit?: string;
 }
@@ -41,21 +41,14 @@ function recordStatus(s: GitopsSyncStatus) {
   try {
     localStorage.setItem(STATUS_KEY, JSON.stringify(s));
     window.dispatchEvent(new Event("gitops-status"));
-  } catch {
-    /* storage full/blocked — status is best-effort */
-  }
+  } catch {}
   const color = s.ok ? "color:#3fb950" : "color:#f85149";
   console.log(`%cgitops%c ${s.mode} sync ${s.ok ? "ok" : "FAILED"} — ${s.detail}`, "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600", color);
 }
 
-// In-flight / pending-rerun state, keyed by team — a sync for team A must never
-// block or coalesce with a trigger for team B (each gets its own trailing-edge
-// coalescing below).
 const syncInFlight = new Map<string, boolean>();
 const syncPending = new Map<string, boolean>();
 
-// Retryable-failure backoff schedule (ms before attempt 2, 3, 4). Only network
-// errors and HTTP 5xx responses consume a retry; see runGitopsSync().
 const RETRY_DELAYS_MS = [2000, 4000, 8000];
 
 function wait(ms: number) {
@@ -75,7 +68,6 @@ async function runGitopsSync(team: string) {
       });
       d = await r.json().catch(() => ({}) as any);
     } catch (e) {
-      // Thrown network error (offline, DNS, connection reset, ...) — retryable.
       if (attempt < RETRY_DELAYS_MS.length) {
         await wait(RETRY_DELAYS_MS[attempt]);
         continue;
@@ -85,10 +77,6 @@ async function runGitopsSync(team: string) {
     }
 
     if (d?.ok) {
-      // deletionsSkipped: the sync itself succeeded (still ok:true) but the
-      // fallback commit path couldn't apply its tombstone deletions this round —
-      // a stale file is left in the repo pending the next retry. Surface that
-      // distinctly so it isn't indistinguishable from a fully clean push.
       recordStatus({
         at: Date.now(),
         ok: true,
@@ -104,16 +92,10 @@ async function runGitopsSync(team: string) {
       return;
     }
     if (d?.skipped) {
-      // GitOps isn't set up yet (Composio not configured, GitHub not connected, or
-      // no config repo linked). This is a benign NOT-CONFIGURED state, not a sync
-      // failure — the "Set up GitOps" onboarding connects GitHub + links the repo.
-      // Record it (never a red error toast) and do NO in-browser git. Never retried.
       recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `not configured (${String(d.reason || "not set up")})` });
       return;
     }
 
-    // Server route reachable but the commit failed. Only a 5xx is transient enough
-    // to retry — a 4xx (bad request, auth, not found, ...) won't succeed on replay.
     const retryable = r.status >= 500 && r.status < 600;
     if (retryable && attempt < RETRY_DELAYS_MS.length) {
       await wait(RETRY_DELAYS_MS[attempt]);
@@ -124,25 +106,9 @@ async function runGitopsSync(team: string) {
   }
 }
 
-/**
- * Fire a GitOps config sync — fully autonomous and in the background.
- *
- * SERVER-SIDE ONLY: posts to the sync route (`/api/gitops/sync`), which reads the
- * tenant's linked config repo, regenerates the artifact tree from live platform
- * state, and commits it via the GitHub API using the connected (Composio) token —
- * reliable, no browser git, no CORS proxy, works for every mutation made while
- * signed in. There is NO in-browser git fallback: when GitOps isn't set up (Composio
- * not configured / GitHub not connected / no repo linked) the sync is a benign no-op
- * and the "Set up GitOps" onboarding flow is how the user connects. Every outcome
- * (pushed / unchanged / not-configured / error) is recorded to `hive_gitops_status`
- * so state is VISIBLE in the UI instead of dying in the console.
- *
- * Concurrency, per team (`currentTeam()`): a trigger that arrives while that team's
- * sync is already in flight is coalesced — not dropped — by setting a pending flag;
- * when the in-flight run finishes, a pending flag fires exactly one trailing re-run
- * (never a loop), so every coalesced trigger during the run is captured by that
- * single follow-up. A team's in-flight/pending state never blocks another team's.
- */
+/** Fires a background GitOps config sync, server-side only: `POST /api/gitops/sync` regenerates the artifact tree from live state
+ *  and commits it with the connected GitHub credential (no browser git). Per team, a trigger during an in-flight sync is coalesced
+ *  into exactly ONE trailing re-run for that same team; every outcome is recorded to `hive_gitops_status`. */
 export function triggerGitopsSync(team: string = currentTeam()) {
   if (typeof window === "undefined") return;
   if (syncInFlight.get(team)) {
@@ -157,28 +123,14 @@ export function triggerGitopsSync(team: string = currentTeam()) {
       syncInFlight.delete(team);
       if (syncPending.get(team)) {
         syncPending.delete(team);
-        // Trailing re-run must target the SAME team whose pending flag we just
-        // cleared, never a fresh currentTeam() read — the active team may have
-        // changed while this run was in flight, and re-deriving here would
-        // silently drop this team's queued change and sync the wrong team.
         triggerGitopsSync(team);
       }
     }
   })();
 }
 
-/**
- * Post-signup onboarding modal + the background config-sync loop.
- *
- * Onboarding: prompts the user to optionally connect GitHub (Composio OAuth).
- * After connecting they pick a scope (personal account or an org repo) and a
- * config repo; we then link it and push the first `openedge.yaml`. They can also
- * just skip and use their personal scope.
- *
- * Auto-sync: once linked, any settings/runtime/region/tier change reflects in the
- * committed config — a light interval re-syncs (deduped by content hash server
- * side) and a `gitops-sync` window event triggers an immediate push.
- */
+/** Post-signup onboarding modal (optional GitHub connect, scope + config-repo pick, first push) and the background sync loop: a
+ *  light interval re-sync (deduped by content hash server-side) plus an immediate push on the `gitops-sync` window event. */
 export function GitOps() {
   const [step, setStep] = useState<"hidden" | "intro" | "repo">("hidden");
   const [status, setStatus] = useState<GhStatus>({ configured: false, connected: false });
@@ -188,28 +140,20 @@ export function GitOps() {
   const [mode, setMode] = useState<"create" | "existing">("create");
   const [repo, setRepo] = useState("");
   const [orgLogin, setOrgLogin] = useState("");
-  // Accessible organizations (needs read:org) → the org dropdown that replaces the
-  // old free-text login. Empty when the scope is absent; a manual-entry fallback
-  // still lets a member type a known org login (repo listing works with `repo`).
   const [orgs, setOrgs] = useState<GhOrg[]>([]);
   const [isPrivate, setIsPrivate] = useState(true);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [result, setResult] = useState<{ repo: string; created: boolean; files: number } | null>(null);
   const [error, setError] = useState("");
-  // When an org restricts third-party OAuth apps, GitHub 403s repo creation; this
-  // holds the org-owner approval URL so we show an actionable link, not raw JSON.
   const [approveUrl, setApproveUrl] = useState("");
   const inited = useRef(false);
   const pathname = usePathname();
 
-  // Reload the "use existing" repo list for the current scope: the org's repos when
-  // an org login is entered, else the personal account's. Debounced so typing an
-  // org login doesn't spam the API.
   useEffect(() => {
     if (step !== "repo" || mode !== "existing" || !status.connected) return;
     const org = scope === "org" ? orgLogin.trim() : "";
-    if (scope === "org" && !org) return; // wait for a login before listing org repos
+    if (scope === "org" && !org) return;
     const t = setTimeout(() => loadRepos(org), 350);
     return () => clearTimeout(t);
   }, [step, mode, scope, orgLogin, status.connected]);
@@ -219,8 +163,6 @@ export function GitOps() {
     setStep("hidden");
   }, []);
 
-  // Load the accessible orgs for the dropdown once the repo step is open and GitHub
-  // is connected. Degrades to [] (→ manual-entry fallback) when read:org is absent.
   useEffect(() => {
     if (step !== "repo" || !status.connected) return;
     let cancelled = false;
@@ -231,9 +173,6 @@ export function GitOps() {
     return () => { cancelled = true; };
   }, [step, status.connected]);
 
-  // Allow the Integrations "Set up GitOps" button (or anything) to RE-OPEN this
-  // setup modal on demand — bypassing the hive_onboarded / hive_gitops_linked
-  // localStorage gate that otherwise prevents it from ever reappearing.
   useEffect(() => {
     const open = () => {
       setDone(false);
@@ -255,27 +194,22 @@ export function GitOps() {
     return () => window.removeEventListener("hive-open-gitops", open);
   }, []);
 
-  // Decide whether to show the modal, and at which step.
   useEffect(() => {
     if (inited.current) return;
     inited.current = true;
     const params = new URLSearchParams(window.location.search);
     const justConnected = params.get("connected") === "github";
     if (justConnected) {
-      // Clean the URL so a refresh doesn't reopen the flow.
       params.delete("connected");
       const qs = params.toString();
       window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
     }
     const onboarded = localStorage.getItem("hive_onboarded") === "1";
-    // Already linked a config repo in a prior session → setup is done, never nag.
     if (!justConnected && localStorage.getItem("hive_gitops_linked") === "1") {
       localStorage.setItem("hive_onboarded", "1");
       return;
     }
 
-    // Bound the status probe so a slow Composio/backend round-trip (e.g. from a
-    // far region) can't leave onboarding state hanging; abort after 4s.
     const statusCtrl = new AbortController();
     const statusTimer = setTimeout(() => statusCtrl.abort(), 4000);
     fetch("/api/github/status", { signal: statusCtrl.signal })
@@ -286,17 +220,12 @@ export function GitOps() {
           setStep("repo");
           loadRepos();
         } else if (s.connected) {
-          // GitHub is already linked (here or via Integrations/New Project) — the
-          // user has effectively set up GitOps, so never nag again. Mark done.
           localStorage.setItem("hive_onboarded", "1");
         } else if (!onboarded) {
-          // First run with no GitHub link: prompt once (offers GitHub OAuth or the
-          // personal-scope path). finishOnboarding() persists hive_onboarded.
           setStep("intro");
         }
       })
       .catch(() => {
-        // Status fetch failed/timed out — only prompt if we've never onboarded.
         if (localStorage.getItem("hive_onboarded") !== "1") setStep("intro");
       })
       .finally(() => clearTimeout(statusTimer));
@@ -304,15 +233,11 @@ export function GitOps() {
 
   async function loadRepos(org?: string) {
     setLoadingRepos(true);
-    // Clear a stale approval link; a fresh restricted response re-sets it below.
     setApproveUrl("");
     try {
-      // Org scope → list the ORG's repos, not the personal account's.
       const q = org && org.trim() ? `?org=${encodeURIComponent(org.trim())}` : "";
       const r = await fetch(`/api/github/repos${q}`);
       const d = await r.json();
-      // The org restricts third-party OAuth apps → GitHub returns no repos; surface
-      // the parsed approval link + a re-check path instead of an empty dropdown.
       if (d.restricted) {
         setRepos([]);
         setRepo("");
@@ -322,9 +247,7 @@ export function GitOps() {
       const list: Repo[] = Array.isArray(d.repos) ? d.repos : [];
       setRepos(list);
       setRepo(list[0] ? list[0].full_name : "");
-    } catch {
-      /* ignore */
-    } finally {
+    } catch {} finally {
       setLoadingRepos(false);
     }
   }
@@ -347,9 +270,6 @@ export function GitOps() {
     }
   }
 
-  // Re-run OAuth after dropping the current connection, so re-consent grants the
-  // current scopes (e.g. read:org). Used by the "grant organization access" prompt
-  // when the org dropdown is empty because read:org was never granted.
   async function reconnectGithub() {
     setBusy(true);
     try {
@@ -373,8 +293,6 @@ export function GitOps() {
     if (scope === "org" && !orgLogin.trim()) { setError("Enter the GitHub organization login."); return; }
     setBusy(true);
     try {
-      // One call: create the repo (if needed), link it, scaffold + push the full
-      // GitOps artifact tree as a single commit.
       const r = await fetch("/api/gitops/init", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -391,15 +309,11 @@ export function GitOps() {
       const d = await r.json();
       if (!d.ok) {
         setError(d.error || "Failed to set up GitOps.");
-        // Org restricts third-party OAuth apps → show the org-owner approval link.
         if (d.approve_url) setApproveUrl(d.approve_url);
         setBusy(false);
         return;
       }
       localStorage.setItem("hive_gitops_linked", "1");
-      // The linked repo is persisted server-side (backend GitOpsLink); the server
-      // sync route reads it. Kick an immediate background sync so the first
-      // post-setup change lands.
       triggerGitopsSync();
       setResult({ repo: d.repo, created: !!d.created, files: Array.isArray(d.files) ? d.files.length : 0 });
       setDone(true);
@@ -410,7 +324,6 @@ export function GitOps() {
     }
   }
 
-  // ---- background sync loop (always mounted) ----
   useEffect(() => {
     const tick = () => triggerGitopsSync();
     const onEvent = () => triggerGitopsSync();
@@ -422,13 +335,10 @@ export function GitOps() {
     };
   }, []);
 
-  // ---- sync failure toast: make broken GitHub mirroring VISIBLE ----
   const [syncErr, setSyncErr] = useState<GitopsSyncStatus | null>(null);
   useEffect(() => {
     const onStatus = () => {
       const s = readGitopsStatus();
-      // Only surface real push failures for a LINKED repo (a benign not-configured
-      // sync records ok:true, so it never toasts). Auto-clears on the next success.
       setSyncErr(s && !s.ok && localStorage.getItem("hive_gitops_linked") === "1" ? s : null);
     };
     window.addEventListener("gitops-status", onStatus);
@@ -545,7 +455,6 @@ export function GitOps() {
 
                 {scope === "org" ? (
                   orgs.length > 0 ? (
-                    // Dropdown of the orgs the connection can actually see (read:org).
                     <select
                       value={orgLogin}
                       onChange={(e) => setOrgLogin(e.target.value)}
@@ -557,8 +466,6 @@ export function GitOps() {
                       ))}
                     </select>
                   ) : (
-                    // No enumerable orgs (read:org absent) → prompt to grant org access,
-                    // but keep a manual-entry fallback (repo listing works with `repo`).
                     <div className="mt-2 space-y-2">
                       <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
                         We can&apos;t list your organizations — install the GitHub App on the
@@ -583,7 +490,6 @@ export function GitOps() {
                   )
                 ) : null}
 
-                {/* Create vs use-existing */}
                 <div className="mt-4 flex rounded-md border border-border p-0.5 text-xs">
                   {(["create", "existing"] as const).map((m) => (
                     <button

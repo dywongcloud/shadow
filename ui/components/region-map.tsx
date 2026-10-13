@@ -2,23 +2,12 @@
 
 import { useMemo } from "react";
 
-/**
- * Inline equirectangular dotted world map for the Function Regions setting.
- *
- * The land dots are sampled from the OpenEdge region art into a fixed GW×GH
- * grid, and the selected-region markers are projected into that SAME grid via
- * lon/lat, so a marker always lands on the correct part of the map. Colors are
- * driven by Tailwind theme tokens (`text-*` / `dark:`), so the map background
- * and land follow the current light/dark UI theme instead of being hard-black.
- */
-
 const GW = 100;
 const GH = 62;
-// 1 = land cell, 0 = sea. Row-major, GW*GH chars.
+/** Row-major GW*GH land mask: "1" = land, "0" = sea. */
 const LAND_BITS =
   "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011101111111111111110000000000000110001110000000000111000000000000000000000000000000000000000000001111110111111111111111000000000000111000011110000000111100000000000000000000000000000000000000000001111101111111111111111110000000000111000000011110000011100000000000000000000000000000000001100000000101111111110111111111110000011100000000000000111100000001111101111111100000000000000000111111000000111111111110111111111111000011110000000110000111110111101111111111111110000000000000000011111110000111101111111011111111111000000111000000111000011111111111111111111111111000000000000000011111111111111111111111100011111111100000000000000011010111111111111111111111111111000000000000000111111111111111111101111110001111111110000000000000001001111111111111111111111111111110000000000000011111111111111111111111111000111111110000000000000000100111111111111111111111111111111000000000000000111111111111111111111111110011111111000000000000000011011111111111111111111111111110000000000000000111111111111111111111111111000111111100000000011110111111111111111111111111111111110000000000000000001111111111111111111111111110111111000000000011111111111111111111111111111111111111100000000000000001110001111111111111111111111011111001110000011111111111111111111111111111111110001110000000000001111100000011111111111100001110001110000110000011111111111111111111111111111111111000111110000000001111000000001111111111110001111000111000000000001111111111111111111111111111111111100001100000000000000000000000011111111111000111100000000000000000111111111111111111111111111111111111100110000000000000000000000001111111111111111111000000000000011001101111111111111111111111111111111111011000000000000000000000000011111111111111111110000000000011101111111111111111111111111111111111111101100000000000000000000000001111111111111111111000000000001111111111111111111111111111111111111111111100000000000000000000000001111111111111111101100000000000011111111111111111111111111111111111111101110000000000000000000000000111111111111111111000000000000001111111111111111111111111111111111111100100000000000000000000000000111111111111111101100000000000000111111111111111111111111111111111111110010000000000000000000000000011111111111111110000000000000000111111111111111111111111111111111111011001000000000000000000000000000111111111111110000000000000000011101111111111111111111111111111111110111100000000000000000000000000001111111111110000000000000000000111111100011111111111111111111111111011100000000000000000000000000000111111111110000000000000000000111111111101111111111111111111111111111100000000000000000000000000000011111110011000000000000000000111111111111111111111111111111111111110000000000000000000011000000000001111110000111000000000000000111111111111111111111111111111111111111100000000000000000001110000000000011111011111100000000000000111111111111111111111110111111111111111110000000000000000000010000000000000011111111111100000000000011111111111111111111111001111110111111001000000000000000000000000000000000000111111000000000000000001111111111111111111110000001100000111100110000000000000000000000000000000000000011101100000000000000111111111111111111101000000110000011110011000000000000000000000000000000000000000111111110000000000001111111111111111111100000001100001111000110000000000000000000000000000000000000000111111111000000000001110111111111111100000000000001110011100000000000000000000000000000000000000100011111111100000000000000001111111111100000000000000111011101110000000000000000000000000000000000010001111111111100000000000000111111111100000000000000001111111111110000000000000000000000000000000000000111111111111110000000000001111111110000000000000000011110110011111111000000000000000000000000000000011111111111111000000000000111111111000000000000000000111111000111101110000000000000000000000000000001111111111111000000000000011111111100000000000000000000011101101110001000000000000000000000000000000011111111111000000000000001111111111110000000000000000000011111110000010011000000000000000000000000000111111111100000000000000111111110111000000000000000000011111111000001101100000000000000000000000000001111111110000000000000011111110111000000000000000000111111111100001100000000000000000000000000000000111111100000000000000000111111001100000000000000000011111111111000110000000000000000000000000000000011111110000000000000000011111000000000000000000000001111111111110000000000000000000000000000000000001111110000000000000000000111000000000000000000000000111111111111000000000000000000000000000000000000111111000000000000000000011100000000000000000000000011111111111000000000000000000000000000000000000111110000000000000000000000000000000000000000000000000000001111000000000000000000000000000000000000001111000000000000000000000000000000000000000000000000000000011100000010000000000000000000000000000000111000000000000000000000000000000000000000000000000000000001110000001000000000000000000000000000000011100000000000000000000000000000000000000000000000000000000110000001100000000000000000000000000000001110000000000000000000000000000000000000000000000000000000011000001110000000000000000000000000000000110010000000000000000000000000000000000000000000000000000000000001110000000000000000000000000000000011101000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
-// Geographic window this grid covers (tuned to the source map art).
 const LON_W = -180;
 const LON_E = 180;
 const LAT_TOP = 84;
@@ -36,14 +25,9 @@ export interface MapMarker {
   lat: number;
   lon: number;
   label?: string;
-  /** Marker color; defaults to emerald. Pass distinct colors to tell co-located
-   *  nodes apart. GPU nodes should pass `GPU_COLOR` (see `isGpu`) rather than a
-   *  round-robin palette slot. */
+  /** Marker color (default emerald); GPU nodes pass `GPU_COLOR`. */
   color?: string;
-  /** GPU-bearing node (`gpu_count > 0`). Purely informational here — the
-   *  caller is expected to have already set `color` to `GPU_COLOR` — but kept
-   *  on the marker so the map can render GPU-specific affordances without
-   *  re-deriving it from color equality. */
+  /** GPU-bearing node (`gpu_count > 0`); informational here, the caller sets `color` to `GPU_COLOR`. */
   isGpu?: boolean;
   /** This node advertises a `relay_url` — rendered as a small relay badge so
    *  the constellation shows which nodes provide mesh relay service. */
@@ -53,15 +37,11 @@ export interface MapMarker {
   hasGuardian?: boolean;
 }
 
-/** Fixed, unambiguous color for GPU-bearing nodes (`gpu_count > 0`) — never
- *  assigned round-robin, so blue reads as "this node has a GPU" fleet-wide,
- *  on both the map marker and any table/list color swatch (see regions page). */
+/** Fixed color for GPU-bearing nodes (`gpu_count > 0`), never assigned round-robin: blue reads as "has a GPU" fleet-wide
+ *  (map marker, regions table swatch, mesh diagram). */
 export const GPU_COLOR = "#3b82f6";
 
-/** Distinct, high-contrast palette so co-located non-GPU nodes are visually
- *  separable. Deliberately excludes `GPU_COLOR`'s blue so hue alone tells GPU
- *  nodes apart from everything else — a neutral node never lands on blue by
- *  round-robin chance. */
+/** Distinct palette for co-located non-GPU nodes; deliberately excludes `GPU_COLOR`'s blue. */
 export const PALETTE = [
   "#10b981", "#f59e0b", "#ef4444", "#a855f7", "#06b6d4",
   "#ec4899", "#84cc16", "#f97316", "#14b8a6", "#6366f1",
@@ -72,12 +52,8 @@ export const PALETTE = [
 const RELAY_BADGE_COLOR = "#a855f7";
 const GUARDIAN_BADGE_COLOR = "#f59e0b";
 
-/** A low-trust browser peer (bn-ui-constellation-satellites): rendered smaller
- *  and with a visually distinct glyph from every trusted fleet marker above —
- *  never a color from `PALETTE`/`GPU_COLOR`, so "satellite" reads unambiguously
- *  at a glance and is never mistaken for platform infrastructure. Positioned
- *  from a SEPARATE coarse presence feed (never `NodeInfo`) at a deliberately
- *  coarser precision than fleet markers. */
+/** A low-trust browser peer: smaller, a distinct diamond glyph, never a `PALETTE`/`GPU_COLOR` hue, and positioned from the
+ *  separate coarse presence feed (never `NodeInfo`) at a coarser precision than fleet markers. */
 export interface SatelliteMarker {
   id: string;
   lat: number;
@@ -89,36 +65,27 @@ export interface SatelliteMarker {
   ageMs?: number;
 }
 
-// Exported so the /network constellation (MeshDiagram in app/network/page.tsx)
-// renders browser peers in the exact same two hues — one meaning per color
-// fleet-wide, the same discipline as GPU_COLOR above.
-export const SATELLITE_ONLINE_COLOR = "#38bdf8"; // sky-400 — distinct from every fleet/badge color above
-export const SATELLITE_DEGRADED_COLOR = "#94a3b8"; // slate-400 — visually recedes vs. a live fleet node
+/** Browser-peer hues, shared with the /network mesh diagram: one meaning per color fleet-wide. */
+export const SATELLITE_ONLINE_COLOR = "#38bdf8";
+export const SATELLITE_DEGRADED_COLOR = "#94a3b8";
 
 function satelliteColor(state?: string): string {
   return state === "degraded" || state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR;
 }
 
-/** Same co-location fan-out as fleet markers (see `RegionMap`'s `placed`
- *  memo), factored out so satellites — quantized to a much coarser grid and
- *  therefore far more likely to collide — get identical treatment without
- *  being mixed into the fleet markers' own dedup pass. */
+const MIN_FAN_RING_RADIUS = 0.35;
+const NEAREST_CLUSTER_GAP_DIVISOR = 3;
+const FLEET_FAN_RADIUS = 1.6;
+const SATELLITE_FAN_RADIUS = 2.2;
+
+/** Fans co-located markers out on a small ring (shared by fleet markers and the coarser-grid satellites); the ring never
+ *  exceeds a third of the gap to the nearest other cluster, so a multi-node city cannot smear into its neighbour. */
 function fanOutCollisions<T extends { x: number; y: number }>(points: T[], radius: number): T[] {
   const groups = new Map<string, T[]>();
   for (const p of points) {
     const key = `${p.x.toFixed(1)}_${p.y.toFixed(1)}`;
     (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
   }
-  // The ring must never be wider than the gap to the NEAREST OTHER cluster, or
-  // a multi-node city smears into its neighbour and the two visually swap
-  // members. Witnessed live on this 100x62 world projection: San Jose lands at
-  // (16.12, 20.08) and Los Angeles at (17.15, 21.51) — only 1.76 units apart —
-  // so a fixed 1.6 ring threw a San Jose marker out to x=17.72 (PAST Los
-  // Angeles' centre) and a Los Angeles marker to x=15.55 (inside the Bay Area
-  // cluster). The markers were at their correct coordinates; the fan-out was
-  // what moved them into the wrong city. Clamping to a third of the gap keeps
-  // every ring comfortably inside its own territory, while `radius` still caps
-  // it so an isolated cluster fans out exactly as before.
   const centres = Array.from(groups.values(), (g) => ({ x: g[0].x, y: g[0].y }));
   const out: T[] = [];
   Array.from(groups.values()).forEach((group, gi) => {
@@ -132,10 +99,7 @@ function fanOutCollisions<T extends { x: number; y: number }>(points: T[], radiu
       const d = Math.hypot(centres[i].x - centres[gi].x, centres[i].y - centres[gi].y);
       if (d < nearest) nearest = d;
     }
-    // `nearest` stays Infinity when this is the only cluster — then the caller's
-    // radius applies unchanged. The lower bound keeps a dense cluster from
-    // collapsing onto a single indistinguishable point.
-    const r = Math.max(0.35, Math.min(radius, nearest / 3));
+    const r = Math.max(MIN_FAN_RING_RADIUS, Math.min(radius, nearest / NEAREST_CLUSTER_GAP_DIVISOR));
     group.forEach((p, i) => {
       const angle = (2 * Math.PI * i) / group.length;
       out.push({ ...p, x: p.x + r * Math.cos(angle), y: p.y + r * Math.sin(angle) });
@@ -144,22 +108,12 @@ function fanOutCollisions<T extends { x: number; y: number }>(points: T[], radiu
   return out;
 }
 
-/**
- * Inline equirectangular world map. Markers are placed at their ACTUAL lat/lon
- * (no hard-coded region table). Markers that land on the same spot — e.g. two
- * nodes running on the same machine, reporting identical coordinates — are fanned
- * out in a small ring and given distinct colors so each is individually visible.
- */
-/** Hard cap on rendered satellites — a real bound, not a silent one: beyond
- *  this the map would spend more SVG nodes on browser peers than on the
- *  entire rest of the constellation. Clustering the overflow into a single
- *  "+N more" glyph per cell is real future work (bn-ui-constellation-
- *  performance); today the overflow is simply not drawn, and the caller-
- *  visible count (`placedSatellites.length` via the returned aria-label) is
- *  always the true total, so a capped render is distinguishable from "there
- *  are no more than this".*/
+/** Hard cap on rendered satellites; the overflow is not drawn but is stated on the map, and the aria-label always carries
+ *  the true total. */
 const MAX_RENDERED_SATELLITES = 300;
 
+/** Inline equirectangular world map: markers sit at their ACTUAL lat/lon (no region table) in the same GW*GH grid the land
+ *  dots are sampled into, and markers landing on one spot are fanned out on a ring so each stays visible. */
 export function RegionMap({
   markers,
   satellites = [],
@@ -180,7 +134,6 @@ export function RegionMap({
   }, []);
 
   const placed = useMemo(() => {
-    // Project, then group by rounded coordinate to detect co-located markers.
     const proj = markers
       .filter((m) => Number.isFinite(m.lat) && Number.isFinite(m.lon))
       .map((m, i) => {
@@ -189,12 +142,7 @@ export function RegionMap({
           m.color || (m.isGpu ? GPU_COLOR : autoColor ? PALETTE[i % PALETTE.length] : "#10b981");
         return { ...m, x, y, color };
       });
-    // Fan co-located markers out around a small ring so each is visible. This
-    // used to be a hand-inlined copy of `fanOutCollisions` that drifted from it
-    // (it never gained the neighbour clamp), which is exactly how Los Angeles
-    // ended up rendering inside the Bay Area cluster — one shared
-    // implementation now, so a fix here can never miss one of the two callers.
-    return fanOutCollisions(proj, 1.6);
+    return fanOutCollisions(proj, FLEET_FAN_RADIUS);
   }, [markers, autoColor]);
 
   const placedSatellites = useMemo(() => {
@@ -204,25 +152,8 @@ export function RegionMap({
         const [x, y] = project(s.lon, s.lat);
         return { ...s, x, y, color: satelliteColor(s.state) };
       });
-    // A slightly larger fan-out radius than fleet markers: satellites are
-    // quantized to a much coarser grid (~55km cells), so real collisions —
-    // not just visual near-misses — are the common case, not the exception.
-    return fanOutCollisions(proj, 2.2).slice(0, MAX_RENDERED_SATELLITES);
+    return fanOutCollisions(proj, SATELLITE_FAN_RADIUS).slice(0, MAX_RENDERED_SATELLITES);
   }, [satellites]);
-  // bn-ui-constellation-performance's measurement gate, done: real CDP
-  // profiling (real SVG DOM construction + a forced layout/paint flush, the
-  // EXACT per-satellite <g><circle><rect><title> shape below, at n=50/300/
-  // 1000/3000/10000) showed rendering is NOT the bottleneck at any realistic
-  // scale -- ~2ms total at the current 300 cap, still only ~5ms even at
-  // 10,000 raw input satellites (the fanOutCollisions pass scales with the
-  // UNCAPPED input count since .slice happens after it, a real but currently
-  // inconsequential inefficiency at real-world scale -- not reordered here,
-  // since doing so would change WHICH points survive the cap in a way that
-  // needs its own design decision, not a blind reorder chasing an unmeasured
-  // problem). So the actual remaining gap was never performance -- it was
-  // that a capped render was previously silent: the aria-label already
-  // reported the true total, but nothing ON the map told a sighted user
-  // their satellite count didn't match what's drawn. This is that.
   const satelliteOverflow = Math.max(0, satellites.length - placedSatellites.length);
 
   return (
@@ -233,18 +164,13 @@ export function RegionMap({
       role="img"
       aria-label={`Region map — ${placed.length} node${placed.length === 1 ? "" : "s"}, ${satellites.length} browser node${satellites.length === 1 ? "" : "s"}`}
     >
-      {/* Land texture — follows the theme via currentColor. */}
       {landDots.map((d, i) => (
         <circle key={i} cx={d.x} cy={d.y} r={0.34} fill="currentColor" />
       ))}
-      {/* Geo markers, placed at real coordinates. */}
       {placed.map((m, i) => (
         <g key={`${m.id}-${i}`}>
           <circle cx={m.x} cy={m.y} r={2.4} fill={m.color} opacity={0.2} className="animate-pulse" />
           <circle cx={m.x} cy={m.y} r={1.3} fill={m.color} opacity={0.35} />
-          {/* GPU nodes get an extra ring beyond the fixed blue fill, so the
-              "this is a GPU node" signal survives even where fill color is
-              hard to judge (small marker, dense cluster). */}
           {m.isGpu && (
             <circle
               cx={m.x}
@@ -258,9 +184,6 @@ export function RegionMap({
           )}
           <circle cx={m.x} cy={m.y} r={0.9} fill={m.color} stroke="#ffffff" strokeWidth={0.16} />
           <title>{m.label || m.id}</title>
-          {/* Per-node mesh-service badges — small offset dots so a glance at
-              the constellation shows which nodes provide relay / GuardianDB,
-              not just where they are located. */}
           {m.hasRelay && (
             <circle cx={m.x + 1.15} cy={m.y - 1.15} r={0.55} fill={RELAY_BADGE_COLOR} stroke="#ffffff" strokeWidth={0.14}>
               <title>Relay — {m.label || m.id}</title>
@@ -280,17 +203,7 @@ export function RegionMap({
           )}
         </g>
       ))}
-      {/* Browser-node satellites — deliberately smaller, a diamond glyph (never
-          a circle, so it can never be mistaken for a trusted fleet marker even
-          at a glance), and animated only under prefers-reduced-motion:no-preference. */}
       {placedSatellites.map((s, i) => {
-        // Color-independent state encoding (bn-ui-accessibility): online vs
-        // degraded/suspended was previously ONLY a fill-color difference
-        // (sky-400 vs slate-400) — indistinguishable for some color-vision
-        // deficiencies. A dashed ring (the same non-color technique already
-        // used for the GPU badge above) gives sighted users a second,
-        // color-independent cue; the sr-only list and <title> already cover
-        // the same state in TEXT for screen readers.
         const degraded = s.state === "degraded" || s.state === "suspended";
         return (
         <g key={`sat-${s.id}-${i}`} opacity={0.9}>
@@ -322,11 +235,6 @@ export function RegionMap({
         </g>
         );
       })}
-      {/* Honest overflow indicator: the aria-label above already reports the
-          TRUE satellite count, but nothing previously told a sighted user
-          their on-map count was capped. Placed in the bottom-right corner in
-          MAP UNITS (not pixels) so it stays correctly positioned across any
-          rendered size, matching every other element in this SVG. */}
       {satelliteOverflow > 0 && (
         <text
           x={GW - 1}
@@ -341,19 +249,6 @@ export function RegionMap({
         </text>
       )}
     </svg>
-    {/* Per-satellite screen-reader summaries (bn-ui-accessibility): the SVG
-        markers above carry a <title> each, but <title> only surfaces on mouse
-        hover / a screen reader's own SVG-traversal mode — nothing here is
-        keyboard-focusable, so a keyboard/screen-reader user had NO way to
-        discover individual satellites at all, only the single aggregate
-        aria-label on the whole map. Making all 300 rendered satellite <g>s
-        individually tab-focusable would be its own regression (300 tab stops
-        to get past the map), so this follows the standard "text alternative
-        for a dense visualization" pattern instead: a visually-hidden list,
-        reachable by a screen reader's normal content-browsing mode without
-        consuming any Tab stops, covering the FULL satellite set (not capped
-        by MAX_RENDERED_SATELLITES — a text list has none of the SVG
-        rendering-cost concern that cap exists for). */}
     {satellites.length > 0 && (
       <ul className="sr-only">
         {satellites.map((s, i) => (

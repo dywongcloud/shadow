@@ -1,9 +1,5 @@
-// Server-side Composio GitHub helper using the Composio **v3 REST API**.
-// (The legacy `composio-core` SDK targets v1, which Composio has retired — it
-// returns HTTP 410, so we call v3 directly via fetch.)
-//
-// Degrades gracefully when COMPOSIO_API_KEY is unset so manual git-URL import
-// always works.
+// Server-side Composio GitHub helper over the Composio v3 REST API (the v1 `composio-core` SDK is retired: HTTP 410).
+// Degrades gracefully when COMPOSIO_API_KEY is unset so manual git-URL import always works.
 import "server-only";
 import { randomBytes } from "crypto";
 import { cookies } from "next/headers";
@@ -18,30 +14,14 @@ export function composioConfigured(): boolean {
 
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
 
-/**
- * Resolve the Composio "entity" (user_id) for the current request.
- *
- * The entity scopes a user's GitHub connection + repo access. It MUST be stable
- * for a given user so the connection survives reloads, new tabs and other
- * devices — otherwise the GitOps modal re-prompts and the repo list comes back
- * empty even though GitHub is linked.
- *
- * - Signed-in (Clerk) user  -> `gh_<clerkUserId>` (stable, per-account).
- * - Local / no-auth mode    -> the existing `hive_entity` cookie if present,
- *                              else a single stable `default` entity.
- *
- * This replaces the old per-route random `user-<random>` cookie, which differed
- * between routes (status/connect generated random, repos fell back to "default")
- * and was lost whenever cookies cleared.
- */
+/** The Composio entity for this request: `gh_<clerkUserId>` when signed in, else the `hive_entity` cookie, else `default`.
+ *  It must be stable per user so the GitHub link survives reloads, tabs and devices. */
 export async function resolveEntity(): Promise<string> {
   if (clerkEnabled) {
     try {
       const { userId } = await auth();
       if (userId) return `gh_${userId}`;
-    } catch {
-      /* auth() unavailable (e.g. outside request scope) — fall through */
-    }
+    } catch {}
   }
   const cookieEntity = (await cookies()).get("hive_entity")?.value;
   return cookieEntity || "default";
@@ -51,14 +31,8 @@ function key(): string {
   return process.env.COMPOSIO_API_KEY || "";
 }
 
-/**
- * Composio's canned refusal when a toolkit is toggled off in the Composio
- * project's OWN admin console ("Execution of toolkit 'X' is temporarily
- * disabled by the administrator") — an account-level state nothing in this
- * repo controls, sometimes auto-set by Composio on plan/trial review. Callers
- * use this to swap a third party's operational notice for a message that names
- * something the user (or the platform operator) can actually act on.
- */
+/** True for Composio's canned "toolkit temporarily disabled by the administrator" refusal: an account-level state this
+ *  repo cannot change, swapped for a message naming something the user or operator can act on. */
 export function isToolkitDisabled(msg: unknown): boolean {
   return /temporarily disabled by the administrator/i.test(String(msg ?? ""));
 }
@@ -98,15 +72,17 @@ export interface Toolkit {
   no_auth: boolean;
 }
 
-/** List EVERY toolkit/integration available on Composio, following pagination. */
+const MAX_TOOLKIT_PAGES = 60;
+const MAX_TOOLKITS = 2000;
+
+/** List EVERY toolkit/integration available on Composio, following pagination (bounded by MAX_TOOLKIT_PAGES / MAX_TOOLKITS). */
 export async function listToolkits(): Promise<Toolkit[]> {
   if (!composioConfigured()) return [];
   try {
     const out: Toolkit[] = [];
     const seen = new Set<string>();
     let cursor: string | null = null;
-    // Safety cap so a misbehaving cursor can't loop forever.
-    for (let page = 0; page < 60; page++) {
+    for (let page = 0; page < MAX_TOOLKIT_PAGES; page++) {
       const qs = new URLSearchParams({ limit: "100" });
       if (cursor) qs.set("cursor", cursor);
       const res = await v3(`/toolkits?${qs.toString()}`);
@@ -131,7 +107,7 @@ export async function listToolkits(): Promise<Toolkit[]> {
         });
       }
       cursor = res?.next_cursor ?? res?.nextCursor ?? null;
-      if (!cursor || items.length === 0 || out.length >= 2000) break;
+      if (!cursor || items.length === 0 || out.length >= MAX_TOOLKITS) break;
     }
     return out;
   } catch (e) {
@@ -169,7 +145,6 @@ export async function connectToolkit(
       }),
     });
     const url = conn?.redirect_url || conn?.redirect_uri || conn?.connectionData?.val?.redirectUrl;
-    // Some toolkits connect without an OAuth redirect (e.g. no_auth / API-key types).
     if (url) return { redirectUrl: url };
     const status = (conn?.status || "").toUpperCase();
     if (status === "ACTIVE" || status === "INITIATED") return { redirectUrl };
@@ -208,18 +183,12 @@ export interface GhRepo {
   owner?: string;
 }
 
-/** OAuth scopes the platform needs: `repo` (private repo + org CONTENT), `read:org`
- *  (enumerate the user's orgs so the org picker works + show what's reachable),
- *  `workflow` (GitHub Actions writes for the GitOps CI workflow). */
+/** OAuth scopes the platform needs: `repo` (private content), `read:org` (org picker), `workflow` (Actions writes for the
+ *  GitOps CI workflow). */
 export const GITHUB_SCOPES = ["repo", "read:org", "workflow"] as const;
 
-/** Find or create a Composio-managed GitHub auth config; return its id.
- *
- *  Operator pin: `HIVE_GITHUB_AUTH_CONFIG_ID` overrides everything — set it to a
- *  Composio auth-config (dashboard-configured, or `use_custom_auth` backed by your
- *  own GitHub OAuth app) that is known to grant `read:org`, since Composio's managed
- *  GitHub app may not honor a scope override and won't re-scope an existing config.
- *  Otherwise reuse an existing config, else create one REQUESTING `GITHUB_SCOPES`. */
+/** Finds or creates a Composio-managed GitHub auth config and returns its id; `HIVE_GITHUB_AUTH_CONFIG_ID` pins one outright
+ *  (it must grant `read:org`: the managed app may not honor a scope override or re-scope an existing config). */
 async function githubAuthConfigId(): Promise<string> {
   const pinned = process.env.HIVE_GITHUB_AUTH_CONFIG_ID?.trim();
   if (pinned) return pinned;
@@ -244,8 +213,8 @@ export interface GithubConnectionDetail {
   entity: string;
   login: string | null;
   scopes: string[];
-  hasPrivateAccess: boolean; // `repo` — private repo + org content
-  hasOrgScope: boolean; // `read:org` — org enumeration
+  hasPrivateAccess: boolean;
+  hasOrgScope: boolean;
   /** Composio says ACTIVE but the token is checked against GitHub — Composio keeps
    *  ACTIVE after GitHub revokes a token, so this catches dead-but-ACTIVE connections. */
   live: boolean;
@@ -262,9 +231,8 @@ function scopesFromAccount(active: any): string[] {
     .filter(Boolean);
 }
 
-/** The full, honest GitHub connection state for an entity. `connected` requires the
- *  token to be BOTH ACTIVE in Composio AND live against GitHub (unmasks revoked-but-
- *  ACTIVE tokens); `scopes`/`login` power the Integrations management UI. */
+/** The full GitHub connection state for an entity: `connected` needs the token ACTIVE in Composio AND live against GitHub
+ *  (Composio reports ACTIVE for revoked tokens); `scopes`/`login` power the Integrations UI. */
 export async function githubConnectionDetail(entity: string): Promise<GithubConnectionDetail> {
   const base: GithubConnectionDetail = {
     configured: composioConfigured(),
@@ -283,13 +251,12 @@ export async function githubConnectionDetail(entity: string): Promise<GithubConn
     const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE");
     if (!active) return base;
     const scopes = scopesFromAccount(active);
-    // Probe GitHub for real liveness — Composio reports ACTIVE for revoked tokens.
     const user = await githubUser(entity).catch(() => null);
     const live = !!user?.login;
-    if (!live) invalidateGithubToken(entity); // clear the 60s cache so a fresh token is picked up fast
+    if (!live) invalidateGithubToken(entity);
     return {
       configured: true,
-      connected: live, // honest: ACTIVE + actually usable
+      connected: live,
       entity,
       login: user?.login ?? null,
       scopes,
@@ -323,9 +290,8 @@ export async function githubOrgs(entity: string): Promise<{ login: string; name?
   }
 }
 
-/** Disconnect GitHub: DELETE every connected_account this entity has for the toolkit
- *  (the list can return more than one), then drop the cached token. Returns how many
- *  were removed. Reconnect = call this then `githubConnect` (re-consent grants new scopes). */
+/** Deletes every connected_account this entity has for the toolkit (there can be several), drops the cached token and
+ *  returns how many were removed; reconnecting re-consents and so grants new scopes. */
 export async function disconnectGithub(entity: string): Promise<{ ok: boolean; removed: number; error?: string }> {
   if (!composioConfigured()) return { ok: false, removed: 0, error: "COMPOSIO_API_KEY not set" };
   try {
@@ -401,7 +367,7 @@ async function githubFileSha(entity: string, owner: string, repo: string, path: 
     const data = res?.data?.details ?? res?.data ?? res ?? {};
     return data?.sha || data?.content?.sha || null;
   } catch {
-    return null; // 404 => file doesn't exist yet
+    return null;
   }
 }
 
@@ -409,25 +375,15 @@ export interface CommitResult {
   ok: boolean;
   commit?: string;
   error?: string;
-  /**
-   * Set true ONLY by commitFiles()'s catch-all per-file fallback, when this sync had
-   * (or may have had) pending tombstone deletions that the fallback could not apply —
-   * the per-file Contents API has no batch-tree-delete equivalent, so the fallback
-   * only commits `files` and silently leaves stale managed paths in place. Callers
-   * MUST NOT treat a `deletionsSkipped: true` result as fully synced (e.g. must not
-   * persist a content-hash cursor that would make the next sync short-circuit as
-   * "unchanged") — see ui/app/api/gitops/sync/route.ts. Absent/false everywhere else.
-   */
+  /** True when the per-file fallback could not apply pending tombstone deletions (it has no batch-tree-delete): callers must
+   *  not treat the sync as fully done, e.g. never persist a content-hash cursor (see ui/app/api/gitops/sync/route.ts). */
   deletionsSkipped?: boolean;
 }
 
-/**
- * Create or update a file in a repo via Composio's GitHub toolkit. Looks up the
- * existing blob SHA first (required by the GitHub contents API for updates) so the
- * same call works for both first-time creation and subsequent config syncs.
- *
- * `content` is plain UTF-8 text; it's base64-encoded here as the API requires.
- */
+const MAX_SHA_CONFLICT_ATTEMPTS = 4;
+
+/** Creates or updates one file (reading the blob SHA first, as the Contents API requires for updates); `content` is UTF-8
+ *  text, base64-encoded here. A stale-SHA conflict re-reads the fresh SHA and retries up to MAX_SHA_CONFLICT_ATTEMPTS times. */
 export async function commitFile(
   entity: string,
   opts: { owner: string; repo: string; path: string; content: string; message: string; branch?: string }
@@ -435,13 +391,8 @@ export async function commitFile(
   if (!composioConfigured()) return { ok: false, error: "COMPOSIO_API_KEY not set" };
   const { owner, repo, path, content, message, branch } = opts;
   const b64 = Buffer.from(content, "utf-8").toString("base64");
-  // The Contents API is optimistic-concurrency: it 409s ("is at X but expected Y")
-  // when the blob SHA we send is stale — i.e. the file changed between our SHA read
-  // and the write (concurrent syncs, or a just-created base commit). Re-read the
-  // FRESH SHA and retry a few times so a transient race resolves itself instead of
-  // surfacing raw GitHub JSON to the user.
   let lastErr = "GitHub commit failed";
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < MAX_SHA_CONFLICT_ATTEMPTS; attempt++) {
     try {
       const sha = await githubFileSha(entity, owner, repo, path, branch);
       const res = await ghExec(entity, "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", {
@@ -453,7 +404,7 @@ export async function commitFile(
       if (res?.successful === false) {
         const msg = String(data?.message || res?.error || "GitHub commit failed");
         lastErr = msg;
-        if (isShaConflict(msg)) continue; // stale SHA → re-read + retry
+        if (isShaConflict(msg)) continue;
         return { ok: false, error: msg };
       }
       const commit = data?.commit?.sha || data?.content?.sha || sha || "";
@@ -461,7 +412,7 @@ export async function commitFile(
     } catch (e: any) {
       const msg = String(e?.message || "unknown error");
       lastErr = msg;
-      if (isShaConflict(msg)) continue; // retry on optimistic-lock conflict
+      if (isShaConflict(msg)) continue;
       console.error("composio commitFile failed", e);
       return { ok: false, error: `Composio: ${msg}` };
     }
@@ -482,7 +433,7 @@ export interface CreateRepoResult {
   ok: boolean;
   full_name?: string;
   default_branch?: string;
-  conflict?: boolean; // the name already exists — caller should retry with a new name
+  conflict?: boolean;
   error?: string;
   /** Set when an ORG has OAuth-App access restrictions enabled: the URL an org
    *  owner must visit to grant this app access. The create can't proceed until then. */
@@ -495,10 +446,8 @@ function looksLikeOrgRestriction(s: string): boolean {
   return /OAuth App access restrictions|restricting-access-to-your-organization|third-parties is limited/i.test(s || "");
 }
 
-/** The URL an org owner/member visits to approve/request this OAuth app for an org.
- *  Prefers a concrete URL parsed from GitHub's 403 body (documentation_url or an
- *  https://github.com/... link), falling back to the org's third-party-apps policy
- *  page — never returns an empty/broken link. */
+/** Where an org owner approves this OAuth app: a URL parsed from GitHub's 403 body, else the org's third-party-apps policy
+ *  page; never empty. */
 function orgApproveUrl(org: string, errBody?: string): string {
   const body = errBody || "";
   const doc = body.match(/https:\/\/github\.com\/[^\s"')]+/i)?.[0];
@@ -508,19 +457,12 @@ function orgApproveUrl(org: string, errBody?: string): string {
 
 /** A random, collision-proof name for the GitOps config repo. */
 export function randomConfigRepoName(): string {
-  // 8 hex chars from crypto — never collides with a user's real source repo.
   return `openedge-gitops-${randomBytes(4).toString("hex")}`;
 }
 
-/**
- * Create the GitOps config repository itself (auto-initialized so it has a base
- * commit/branch to build the artifact tree on). Works for a personal account or
- * an organization.
- *
- * SAFETY: this NEVER reuses an existing repository. If the name already exists it
- * returns `{ conflict: true }` so the caller can retry with a fresh random name —
- * we must never commit GitOps artifacts on top of someone's real source repo.
- */
+/** Creates the GitOps config repository (`autoInit` gives it a base commit to build on; false creates it EMPTY). Never reuses
+ *  an existing repo: a name collision returns `{ conflict: true }` so the caller retries with a fresh name, because GitOps
+ *  artifacts must never land on top of someone's real source repo. */
 export async function createRepo(
   entity: string,
   opts: { name: string; org?: string; isPrivate?: boolean; description?: string; autoInit?: boolean }
@@ -531,9 +473,6 @@ export async function createRepo(
   const args: Record<string, unknown> = {
     name,
     private: isPrivate,
-    // `auto_init: true` (default) gives the GitOps config-repo flow a base commit to
-    // build its tree on. The in-browser Git page creates the repo EMPTY (autoInit:false)
-    // so its own first local commit is the initial push (no non-fast-forward clash).
     auto_init: autoInit,
     description: description || "OpenEdge GitOps — auto-managed config",
   };
@@ -544,10 +483,7 @@ export async function createRepo(
     const d = deep(res);
     if (res?.successful === false || d?.errors) {
       const msg = d?.message || res?.error || JSON.stringify(d?.errors || {});
-      // Name already taken → signal conflict; DO NOT reuse the existing repo.
       if (looksLikeConflict(msg)) return { ok: false, conflict: true, error: msg };
-      // Org has OAuth-App access restrictions → surface the exact approval URL so an
-      // org owner can grant this app, instead of dumping raw GitHub JSON at the user.
       if (org && looksLikeOrgRestriction(msg)) {
         return {
           ok: false,
@@ -578,27 +514,9 @@ export async function createRepo(
   }
 }
 
-/**
- * Commit MULTIPLE files as a single atomic commit (the `git add . && commit &&
- * push` of the whole artifact tree) via the GitHub Git Data API:
- * blobs → tree → commit → update ref. Falls back to per-file Contents-API
- * commits if any Git Data step is unavailable, so artifacts always land.
- *
- * Deletion reconciliation: `base_tree` overlays the given `tree` entries onto
- * the existing tree ADDITIVELY — any base_tree path this call doesn't mention
- * survives untouched. That means a per-resource file the caller stops emitting
- * (e.g. a deleted project's `projects/<slug>.yaml`) would otherwise be
- * orphaned in the repo forever. When `managedPrefixes` is given, this lists
- * the base tree, finds paths under those prefixes that are no longer in
- * `files`, and tombstones them (`sha: null`) in the same tree write — scoped
- * so files outside the managed namespace are never touched. Best-effort: a
- * failed or truncated listing just skips reconciliation for this sync (a
- * delayed-by-one-cycle deletion is fine; a destructive/incorrect one is not).
- *
- * Blob creation is parallelized with a small bounded pool (GitHub's secondary
- * rate limit can reject a fully-concurrent burst) while preserving `files`
- * order in the resulting tree so entries stay deterministic.
- */
+/** Commits MULTIPLE files as ONE atomic commit via the Git Data API (blobs -> tree -> commit -> ref), falling back to per-file
+ *  Contents-API commits when a step is unavailable. With `managedPrefixes`, base-tree paths under those prefixes that are
+ *  absent from `files` are tombstoned in the same tree write (best-effort and scoped: never outside the prefixes). */
 export async function commitFiles(
   entity: string,
   opts: {
@@ -607,10 +525,8 @@ export async function commitFiles(
     branch?: string;
     message: string;
     files: { path: string; content: string }[];
-    /** Path prefixes (e.g. `["projects/"]`) this sync fully owns. A base-tree
-     *  path under one of these prefixes that is absent from `files` this time
-     *  is treated as stale and removed. Omit/empty to skip deletion
-     *  reconciliation (pure additive behavior, the prior default). */
+    /** Path prefixes (e.g. `["projects/"]`) this sync fully owns: a base-tree path under one that is absent from `files` is
+     *  tombstoned. Omit or empty = purely additive. */
     managedPrefixes?: string[];
   }
 ): Promise<CommitResult> {
@@ -618,33 +534,23 @@ export async function commitFiles(
   const { owner, repo, message, files } = opts;
   const branch = opts.branch || "main";
   const managedPrefixes = opts.managedPrefixes || [];
-  // Declared outside the try so the catch-all fallback below (which has no
-  // batch-tree-delete equivalent) can tell whether tombstone deletions were
-  // computed — or never got the chance to be computed — for this sync, and report
-  // `deletionsSkipped` accordingly instead of silently dropping them.
   let deletions: { path: string; sha: null }[] = [];
   let deletionReconciliationAttempted = false;
   try {
-    // 1) base ref + tree (may be absent on a brand-new empty repo)
     let baseSha: string | null = null;
     let baseTree: string | null = null;
     try {
       const ref = await ghExec(entity, "GITHUB_GET_A_REFERENCE", { owner, repo, ref: `heads/${branch}` });
       const ro = deep(ref);
       baseSha = ro?.object?.sha || ro?.sha || null;
-    } catch { /* empty repo */ }
+    } catch {}
     if (baseSha) {
       const commit = await ghExec(entity, "GITHUB_GET_A_COMMIT", { owner, repo, ref: baseSha });
       const co = deep(commit);
       baseTree = co?.tree?.sha || co?.commit?.tree?.sha || null;
-      // SAFETY: the branch HAS commits but we couldn't resolve its tree. Building a
-      // tree WITHOUT base_tree here would REPLACE the whole repo (delete all other
-      // files). Never do that — abort to the non-destructive per-file fallback.
       if (!baseTree) throw new Error("base tree unresolved on non-empty repo — refusing destructive tree write");
     }
 
-    // 1b) deletion reconciliation — see doc comment above. Never throws: any
-    // failure here just leaves `deletions` empty (additive-only for this sync).
     if (baseTree && managedPrefixes.length) {
       try {
         const listing = await ghExec(entity, "GITHUB_GET_A_TREE", { owner, repo, tree_sha: baseTree, recursive: true });
@@ -667,15 +573,8 @@ export async function commitFiles(
         console.warn("commitFiles: base tree listing failed — skipping deletion reconciliation this sync", e?.message);
       }
     }
-    // Reached regardless of whether reconciliation ran, was skipped as
-    // inapplicable (no managedPrefixes/baseTree), or failed internally above —
-    // in every case `deletions` now holds its final, known value for this sync.
     deletionReconciliationAttempted = true;
 
-    // 2) blobs — bounded-concurrency pool (not unbounded Promise.all: a burst of
-    // fully-concurrent requests can trip GitHub's secondary rate limit). Results
-    // are written into an index-keyed array so the final tree preserves `files`
-    // order regardless of completion order.
     const BLOB_CONCURRENCY = 6;
     const blobShas: string[] = new Array(files.length);
     let nextIndex = 0;
@@ -696,21 +595,18 @@ export async function commitFiles(
     const tree: any[] = files.map((f, i) => ({ path: f.path, mode: "100644", type: "blob", sha: blobShas[i] }));
     tree.push(...deletions);
 
-    // 3) tree
     const treeArgs: Record<string, unknown> = { owner, repo, tree };
     if (baseTree) treeArgs.base_tree = baseTree;
     const t = await ghExec(entity, "GITHUB_CREATE_A_TREE", treeArgs);
     const treeSha = deep(t)?.sha;
     if (!treeSha) throw new Error("tree create returned no sha");
 
-    // 4) commit
     const c = await ghExec(entity, "GITHUB_CREATE_A_COMMIT", {
       owner, repo, message, tree: treeSha, parents: baseSha ? [baseSha] : [],
     });
     const commitSha = deep(c)?.sha;
     if (!commitSha) throw new Error("commit create returned no sha");
 
-    // 5) move the branch ref to the new commit (create it if the repo was empty)
     if (baseSha) {
       await ghExec(entity, "GITHUB_UPDATE_A_REFERENCE", { owner, repo, ref: `heads/${branch}`, sha: commitSha, force: false });
     } else {
@@ -719,14 +615,8 @@ export async function commitFiles(
     return { ok: true, commit: commitSha };
   } catch (e: any) {
     console.error("commitFiles atomic path failed, falling back to per-file", e?.message);
-    // The fallback below only ever creates/updates files one at a time via the
-    // Contents API — there is no batch-tree-delete equivalent, so any tombstone
-    // `deletions` computed above (or that the throw pre-empted before they could be
-    // computed at all) are NOT applied here. Surface that to the caller so it can
-    // avoid treating this sync as fully reconciled — see `deletionsSkipped` doc.
     const deletionsSkipped =
       managedPrefixes.length > 0 && (!deletionReconciliationAttempted || deletions.length > 0);
-    // Fallback: commit each file individually via the Contents API.
     let last = "";
     for (const f of files) {
       const r = await commitFile(entity, { owner, repo, path: f.path, content: f.content, branch, message });
@@ -737,12 +627,7 @@ export async function commitFiles(
   }
 }
 
-/**
- * Set a GitHub Actions repository VARIABLE (plaintext, e.g. OPENEDGE_WEBHOOK_URL).
- * Variables don't need libsodium encryption like secrets do, and the webhook URL
- * isn't sensitive — so this is the right mechanism. Creates it, or updates if it
- * already exists.
- */
+/** Sets a GitHub Actions repository VARIABLE (plaintext; no libsodium encryption, unlike secrets): creates it, else updates. */
 export async function setRepoVariable(
   entity: string,
   owner: string,
@@ -754,7 +639,6 @@ export async function setRepoVariable(
   try {
     const created = await ghExec(entity, "GITHUB_CREATE_A_REPOSITORY_VARIABLE", { owner, repo, name, value });
     if (created?.successful !== false) return { ok: true };
-    // Already exists → update.
     const updated = await ghExec(entity, "GITHUB_UPDATE_A_REPOSITORY_VARIABLE", { owner, repo, name, value });
     return updated?.successful === false ? { ok: false, error: deep(updated)?.message || "set variable failed" } : { ok: true };
   } catch {
@@ -767,16 +651,9 @@ export async function setRepoVariable(
   }
 }
 
-/**
- * Install a real GitHub repository webhook on a PROJECT's source repo so that
- * pushes (every branch) and pull-request events are delivered to the OpenEdge
- * node, which then creates production/preview deployments (the node's
- * `/v1/git/webhook` classifies: prod branch → production, every other branch / PR
- * → preview). Idempotent: GitHub 422s a duplicate hook with the same config, which
- * we treat as success. Prefer this over the Actions workflow — it covers all
- * branches + PRs (the workflow only fires on push-to-main), and avoids the
- * double-deploy you'd get from running both.
- */
+/** Installs a repository webhook so pushes (every branch) and pull-request events reach the node's `/v1/git/webhook`
+ *  (prod branch -> production, others -> preview). Idempotent: GitHub's 422 on a duplicate hook counts as success. Preferred
+ *  over the Actions workflow, which covers only push-to-main and would double-deploy beside it. */
 export async function createRepoWebhook(
   entity: string,
   owner: string,
@@ -801,11 +678,6 @@ export async function createRepoWebhook(
     });
     if (res?.successful !== false) return { ok: true };
     const msg = String(deep(res)?.message || res?.error || "");
-    // "Hook already exists on this repository" → GitHub never PATCHes an
-    // existing hook on create, so a hook first installed WITHOUT a secret (the
-    // deploy-skew bug) would stay unsigned forever and every delivery would
-    // 401 at the backend's signature check. Force-update the existing hook's
-    // config (secret + events) so re-running "reconnect" self-heals it.
     if (/already exists/i.test(msg)) return await reconcileWebhookSecret(entity, owner, repo, url, secret);
     return { ok: false, error: msg || "create webhook failed" };
   } catch (e: any) {
@@ -815,10 +687,8 @@ export async function createRepoWebhook(
   }
 }
 
-/** An existing hook for `url` must carry the current signing secret or the
- *  backend rejects its deliveries (401 "bad signature"). Find the hook by its
- *  config.url and PATCH the secret + events + active in. No secret to set → the
- *  "already exists" outcome is still success (nothing to reconcile). */
+/** An existing hook for `url` must carry the current signing secret or the backend rejects its deliveries (401 "bad
+ *  signature"): finds it by `config.url` and PATCHes secret + events + active. */
 async function reconcileWebhookSecret(
   entity: string,
   owner: string,
@@ -839,8 +709,6 @@ async function reconcileWebhookSecret(
     const norm = (u: string) => u.replace(/\/+$/, "");
     const mine = hooks.find((h) => norm(String(h?.config?.url || "")) === norm(url));
     if (!mine?.id) {
-      // Hook exists per GitHub but we can't locate it to patch — surface it so
-      // the caller (git-settings reconnect) shows a real error, not false ok.
       return { ok: false, error: "existing webhook found but could not be located to update its secret" };
     }
     const upd = await ghExec(entity, "GITHUB_UPDATE_A_REPOSITORY_WEBHOOK", {
@@ -872,11 +740,8 @@ function mapRepos(arr: any[]): GhRepo[] {
   }));
 }
 
-/** List repositories for a specific ORGANIZATION (used when the GitOps scope is an
- *  org — the "use existing repo" picker must show the ORG's repos, not the user's).
- *  `type:'all'` so PRIVATE org repos are included. When the org restricts third-party
- *  OAuth apps and hasn't approved this one, returns `{restricted, approve_url}` (with
- *  a parsed/fallback approval link) instead of silently swallowing the 403 → []. */
+/** Lists an ORGANIZATION's repos (`type=all`, private included) for the org picker; an org restricting third-party OAuth apps
+ *  yields `{restricted, approve_url}` instead of a silently swallowed 403. */
 export async function githubOrgRepos(
   entity: string,
   org: string
@@ -932,12 +797,6 @@ export async function githubRepos(entity: string): Promise<GhRepo[]> {
   }
 }
 
-// Short-lived per-entity cache for the GitHub token. A single in-browser git op
-// (clone/push) fires several proxied requests in a burst; without a cache each one
-// would re-hit Composio. The TTL is deliberately short so a rotated/revoked token
-// is picked up quickly; `invalidateGithubToken` drops an entry immediately when a
-// cached token is rejected upstream (proxy sees a 401). Module-scope = per server
-// process (fine for the Node server the dashboard runs on).
 const GH_TOKEN_TTL_MS = 60_000;
 const ghTokenCache = new Map<string, { token: string | null; expires: number }>();
 
@@ -946,18 +805,8 @@ export function invalidateGithubToken(entity: string): void {
   ghTokenCache.delete(entity);
 }
 
-/**
- * The raw GitHub OAuth access token held by this entity's ACTIVE Composio
- * connection — so server-side code (e.g. the in-browser-git CORS proxy) can use
- * the Composio-managed GitHub link as the git client credential, instead of a
- * separately-pasted PAT. Returns null when Composio is unconfigured, no ACTIVE
- * connection exists, or the token isn't exposed — callers must treat that as
- * "no token" and degrade (public/anonymous git or a user-supplied PAT).
- *
- * Cached per entity for a short TTL (`GH_TOKEN_TTL_MS`) so a burst of git requests
- * shares one Composio lookup; the short TTL + `invalidateGithubToken` keep a
- * rotated/revoked token from lingering.
- */
+/** The raw GitHub OAuth token of this entity's ACTIVE Composio connection (the credential for private clones), cached for
+ *  `GH_TOKEN_TTL_MS`; null when unconfigured, unconnected or not exposed: callers degrade to anonymous git or a pasted PAT. */
 export async function githubAccessToken(entity: string): Promise<string | null> {
   if (!composioConfigured()) return null;
   const now = Date.now();
@@ -969,8 +818,6 @@ export async function githubAccessToken(entity: string): Promise<string | null> 
       `/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${GITHUB_SLUG}`
     );
     const items: any[] = res?.items ?? [];
-    // Prefer an ACTIVE connection; the token lives under `data.access_token` (also
-    // seen as `state.val.access_token` on some payloads).
     const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE") || items[0];
     const raw =
       active?.data?.access_token ||
@@ -985,13 +832,8 @@ export async function githubAccessToken(entity: string): Promise<string | null> 
   return token;
 }
 
-/**
- * Generic credential extraction for ANY connected toolkit — the basis for
- * exposing a Composio-linked integration as a consumable platform resource.
- * Returns the active connection's auth material as a flat map (access_token /
- * api_key / token / etc.) plus a coarse auth `kind`, or null if not connected.
- * Credential shapes vary across toolkits, so we merge the few known carriers.
- */
+/** Credential extraction for ANY connected toolkit: the active connection's auth material as a flat map (access_token /
+ *  api_key / token / ...) plus a coarse auth `kind`, or null when not connected. */
 export async function connectionCredentials(
   entity: string,
   slug: string

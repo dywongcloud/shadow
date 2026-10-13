@@ -4,14 +4,6 @@ import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
-// Platform owner(s) — the accounts that keep the legacy "personal" tenant (all
-// other accounts are isolated under `u_<uid>`). Mirrors the backend's
-// HIVE_OWNER_EMAIL authoritative check. Determined HERE from the verified Clerk
-// email rather than from `/v1/identity/sync`, because that endpoint is an
-// auth-gated mutation and 401s at the enforced api.shadw.cloud ingress BEFORE we
-// hold a token (the mint is the token bootstrap). The tenant we compute is only
-// trusted by the backend because the mint (`/v1/token`) is `x-hive-internal`-
-// gated — a non-owner can neither reach the mint nor be assigned "personal" here.
 const OWNER_EMAILS = new Set(
   (process.env.HIVE_OWNER_EMAIL || "")
     .toLowerCase()
@@ -20,12 +12,8 @@ const OWNER_EMAILS = new Set(
     .filter(Boolean),
 );
 
-/** Read the `platform_admin` claim out of the JWT the backend just minted for
- * this session. The claim is derived by the BACKEND from its own
- * owner/admin-email config at mint time, so decoding it here (no verification —
- * this server trusts its own backend's response) mirrors the operator status
- * the enforced endpoints will actually apply. `null` = undecodable/absent, and
- * callers must treat that as UNKNOWN, never as "not an operator". */
+/** Reads the `platform_admin` claim from the JWT the backend just minted (unverified: this server trusts its own backend);
+ *  `null` = undecodable or absent = UNKNOWN, never "not an operator". */
 function jwtPlatformAdmin(token: string): boolean | null {
   try {
     const part = token.split(".")[1];
@@ -37,30 +25,10 @@ function jwtPlatformAdmin(token: string): boolean | null {
   }
 }
 
-/**
- * Parent-domain scope for the `hive_jwt` cookie (e.g. `.shadw.cloud` from a
- * `shadw.cloud`/`dashboard.shadw.cloud` request host), so the SAME cookie the
- * dashboard's same-origin `/cloud` proxy relies on is ALSO sent on the
- * sandbox terminal's cross-subdomain websocket handshake to
- * `wss://api.<domain>` (`ui/lib/api.ts`'s `wsBase()` derives that exact
- * target from the identical two-label-suffix rule). Without an explicit
- * `domain`, a cookie defaults to the exact host that set it and is invisible
- * to any other subdomain — the websocket would silently 401/close, not fail
- * loudly, since a browser WebSocket handshake can't attach a header to work
- * around it (this cookie is httpOnly by design). `localhost`/`127.0.0.1`/a
- * bare single-label host get `undefined` (browsers reject a `Domain`
- * attribute on those anyway) so local dev is unaffected.
- */
+/** Parent-domain scope for the `hive_jwt` cookie (e.g. `.shadw.cloud`), so the same cookie also rides the sandbox shell's
+ *  `wss://api.<domain>` handshake (a host-only cookie reaches no other subdomain, and a WebSocket cannot add a header).
+ *  `undefined` for localhost and single-label hosts, where browsers reject a `Domain` attribute. */
 function cookieDomain(req: NextRequest): string | undefined {
-  // Behind hive-node's reverse proxy the Next server's `host` is the loopback
-  // upstream (`127.0.0.1:3002`) and the browser-facing host arrives ONLY as
-  // `x-forwarded-host` (the same convention `ui/proxy.ts` reads for Clerk's
-  // redirect URLs). Reading `host` alone returned `undefined` in production,
-  // so every session cookie was host-only for `shadw.cloud`, the browser never
-  // sent it on the `wss://api.shadw.cloud` handshake, the shell upgrade
-  // arrived anonymous and was refused 403 — "WebSocket connection failed"
-  // with no diagnosis (2026-09-02, sbx_86001c0447a14171). Forwarded host
-  // first, then the direct host for local `next dev`.
   const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "")
     .split(",")[0]
     .trim()
@@ -72,30 +40,11 @@ function cookieDomain(req: NextRequest): string | undefined {
   return `.${parts.slice(-2).join(".")}`;
 }
 
-/**
- * Mint a short-lived platform JWT for the signed-in user and set it as an
- * httpOnly `hive_jwt` cookie, so the dashboard's same-origin `/cloud` calls are
- * authenticated at the admin ingress WITHOUT exposing the token to browser JS.
- *
- * The tenant claim is derived SERVER-SIDE from the verified Clerk session (active
- * org slug, else per-user `u_<id>`, else `personal` iff the account is the
- * platform owner) — never from client input — so it exactly mirrors the client's
- * `currentTeam()` namespace and cannot be spoofed to another tenant. The mint
- * itself is authorized to the backend with `x-hive-internal` (the mint is
- * server-only when the platform enforces JWT).
- *
- * SAFE / additive: when Clerk is disabled, returns `{ ok:false }` and sets no
- * cookie — the backend is unenforced in that mode, so the dashboard keeps working
- * exactly as before.
- */
+/** Mints a short-lived platform JWT for the signed-in user and sets it as the httpOnly `hive_jwt` cookie. The tenant claim is
+ *  derived SERVER-SIDE from the verified Clerk session, never from client input, and the mint call to the backend carries
+ *  `x-hive-internal`. Clerk disabled: `{ ok:false }` and no cookie (the backend is unenforced). */
 export async function POST(req: NextRequest) {
   if (!clerkEnabled) {
-    // Dev-mint branch (bn-local-dev-clerk-hydration-gap): with the auth bypass
-    // on (the same NODE_ENV-gated condition as ui/proxy.ts's hatch) and no
-    // Clerk keys, mint a LOCAL JWT for the requested team so full-page local
-    // testing exercises the REAL production mint→cookie→JWT-tenant path
-    // (401-remint included) instead of reading the anonymous/empty tenant.
-    // Never production-reachable by construction.
     const devMint = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== "production";
     if (!devMint) {
       return NextResponse.json({ ok: false, reason: "clerk-disabled" });
@@ -104,18 +53,13 @@ export async function POST(req: NextRequest) {
     try {
       const t = String(((await req.json()) as { team?: unknown })?.team ?? "").trim();
       if (t && t !== "__pending__") team = t;
-    } catch {
-      /* no/invalid body → default to personal */
-    }
+    } catch {}
     try {
+      const firstOwnerEmail = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
       const r = await fetch(`${ADMIN}/v1/token`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-        // `email` lets the backend derive `platform_admin` from its own
-        // HIVE_OWNER_EMAIL — the dev mint asserts no platform claim itself.
-        // One address, not the comma-separated list: the backend compares this
-        // claim against a single `admin_emails` entry.
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim() }),
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: firstOwnerEmail }),
         cache: "no-store",
       });
       if (!r.ok) {
@@ -130,7 +74,7 @@ export async function POST(req: NextRequest) {
       const res = NextResponse.json({ ok: true, tenant: team, role: "owner", dev: true, platform_admin: jwtPlatformAdmin(token) ?? true });
       res.cookies.set("hive_jwt", token, {
         httpOnly: true,
-        secure: false, // local-only branch (NODE_ENV !== "production" above)
+        secure: false,
         sameSite: "lax",
         domain: cookieDomain(req),
         path: "/",
@@ -141,33 +85,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, reason: "mint-unreachable" }, { status: 502 });
     }
   }
-/** Verify a Clerk session token the BROWSER already holds and return its user
- *  id, or `null` when it does not verify.
- *
- *  WHY THIS EXISTS: on a Clerk DEVELOPMENT instance (a `pk_test_` key — which
- *  is what this deployment runs) the server-side `auth()` resolves a session
- *  only when the request ALSO carries the `__clerk_db_jwt` "dev browser" cookie
- *  the handshake writes to the app domain. When that handshake fails —
- *  third-party-cookie blocking, a stale cookie, an `azp` mismatch against
- *  HIVE_AUTHORIZED_PARTIES — `auth()` reports `dev-browser-missing` /
- *  signed-out even though clerk-js still holds a perfectly valid session. The
- *  dashboard then RENDERS (Clerk's client-side state is signed-in) while
- *  `/api/token` answers `{"ok":false,"reason":"no-session"}`, no `hive_jwt`
- *  cookie is set, and every `/cloud` read 401s "missing or invalid bearer
- *  token" — live-witnessed 2026-10-12, and the exact reported symptom.
- *
- *  So the client hands us its own session token and we verify it
- *  CRYPTOGRAPHICALLY against Clerk's JWKS. This trusts NOTHING the client
- *  asserts: an unverifiable/expired/foreign token yields `null` and the caller
- *  still answers no-session. It grants no more than the cookie path would —
- *  the same user, the same tenant derivation, the same owner check.
- */
+/** Verifies a Clerk session token the BROWSER holds (JWKS, plus `azp` against HIVE_AUTHORIZED_PARTIES when present) and returns
+ *  its user id, else null: the fallback for a Clerk DEV instance whose server-side `auth()` reports signed-out without the
+ *  `__clerk_db_jwt` cookie. Trusts nothing the client asserts and grants no more than the cookie path would. */
 async function userIdFromSessionToken(tok: string): Promise<string | null> {
   try {
     const { verifyToken } = await import("@clerk/backend");
-    // Only an `azp`-bearing token can be party-checked, and the check must use
-    // the SAME allow-list the middleware does (an azp-less token has no party
-    // to match, so the check would be meaningless rather than safe).
     let azp: unknown;
     try {
       const p = tok.split(".")[1];
@@ -192,25 +115,19 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
   }
 }
 
-  // Parsed ONCE: an undici request body can only be consumed once, and both the
-  // session-token fallback above and the tenant resolution below need it.
   let clerkTokenFromBody = "";
   let requested = "";
   try {
     const body = (await req.json()) as { team?: unknown; clerk_token?: unknown } | null;
     requested = String(body?.team ?? "").trim();
     if (typeof body?.clerk_token === "string") clerkTokenFromBody = body.clerk_token.trim();
-  } catch {
-    /* no/invalid body → defaults below */
-  }
+  } catch {}
 
   let userId: string | null = null;
   let usedSessionToken = false;
   try {
     userId = (await auth()).userId ?? null;
-  } catch {
-    /* auth() unavailable */
-  }
+  } catch {}
   if (!userId) {
     const bearer = req.headers.get("authorization");
     const headerToken =
@@ -228,54 +145,29 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
     return NextResponse.json({ ok: false, reason: "no-session" });
   }
 
-  // Resolve the account email + owner status from the backend (authoritative
-  // owner check via owner_email), mirroring the identity/sync path.
   let email = "";
   let name = "";
   if (usedSessionToken) {
-    // No `auth()` context on this path (that is the whole point of it), so read
-    // the account straight from Clerk's Backend API with the verified user id.
     try {
       const u = await (await clerkClient()).users.getUser(userId);
       email = u?.primaryEmailAddress?.emailAddress || u?.emailAddresses?.[0]?.emailAddress || "";
       name = [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.username || "";
-    } catch {
-      /* user lookup unavailable */
-    }
+    } catch {}
   } else {
     try {
       const u = await currentUser();
       email = u?.primaryEmailAddress?.emailAddress || u?.emailAddresses?.[0]?.emailAddress || "";
       name = [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.username || "";
-    } catch {
-      /* currentUser unavailable */
-    }
+    } catch {}
   }
 
-  // Authoritative owner check from the verified session email (see OWNER_EMAILS).
   const isOwner = !!email && OWNER_EMAILS.has(email.toLowerCase());
-  // The user's OWN personal namespace: the owner keeps the legacy "personal",
-  // every other account is isolated under `u_<uid>`. A non-owner can NEVER be
-  // assigned "personal" here.
   const personalTenant = isOwner ? "personal" : `u_${userId}`;
-
-  // The client sends the team it is CURRENTLY viewing (its `currentTeam()`), which
-  // is the source of truth for the dashboard view — NOT Clerk's server-side active
-  // org, which lags/doesn't follow `setActive()` and left the JWT stuck on the
-  // owner's "personal" tenant regardless of the selected team (the isolation bug).
-  //
-  // ZERO-TRUST: we never mint the requested tenant on trust. An ORG tenant is
-  // granted ONLY after verifying the user is a MEMBER of that org (Clerk is the
-  // authority); the personal namespace is granted only as the user's OWN. Anything
-  // unrecognized/unauthorized falls back to the caller's own personal namespace —
-  // never another tenant's, and never the owner's "personal" for a non-owner.
-  // `requested` was parsed once above (an undici body cannot be re-read).
 
   let tenant = personalTenant;
   let role: "owner" | "admin" | "member" = "owner";
   const wantsPersonal = !requested || requested === "personal" || requested === personalTenant || requested === "__pending__";
   if (!wantsPersonal) {
-    // An org slug — authorize against the user's actual Clerk org memberships.
     try {
       const memberships = await (await clerkClient()).users.getOrganizationMembershipList({ userId, limit: 100 });
       const list = Array.isArray(memberships) ? memberships : memberships?.data ?? [];
@@ -287,26 +179,16 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
         tenant = requested;
         role = String((m as { role?: string }).role || "").includes("admin") ? "admin" : "member";
       }
-      // else: not a member → stays personalTenant (safe; never grants the org).
-    } catch {
-      /* membership lookup failed → safe default (personalTenant) */
-    }
+    } catch {}
   }
-  // For the personal namespace, the caller owns it (owner over "personal", or the
-  // user over their own `u_<uid>`).
   const orgSlug = tenant !== personalTenant ? tenant : null;
 
-  // Mint via the backend (server-only when enforced: proven by x-hive-internal).
   let token = "";
   let expiresIn = 3600;
   try {
     const r = await fetch(`${ADMIN}/v1/token`, {
       method: "POST",
       headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-      // `email` lets the backend independently derive `platform_admin` from
-      // its OWN owner_email config (defense in depth — the backend never
-      // trusts a client-asserted platform-admin claim). `role` here is only
-      // ever the TENANT-scoped role; it is never used for platform authority.
       body: JSON.stringify({ sub: userId, tenant, role, email }),
       cache: "no-store",
     });
@@ -320,43 +202,22 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
     return NextResponse.json({ ok: false, reason: "mint-unreachable" }, { status: 502 });
   }
   if (!token) {
-    // Dev backend (no secret) mints nothing meaningful / not enforced → no cookie.
-    // Unenforced means every operator gate passes, so report operator status UP.
     return NextResponse.json({ ok: true, tenant, enforced: false, platform_admin: true });
   }
 
-  // Best-effort: record identity on the backend NOW that we hold a bearer (the
-  // enforced ingress rejects this mutation pre-auth). Never blocks the mint.
   try {
     await fetch(`${ADMIN}/v1/identity/sync`, {
       method: "POST",
-      // x-hive-internal proves this sync is the SERVER-SIDE mint (email is the
-      // Clerk-verified one) — the backend only mirrors org membership into the
-      // team roster for internally-proven syncs, so a browser-forged body
-      // can't write an arbitrary email into a roster.
       headers: { "content-type": "application/json", authorization: `Bearer ${token}`, "x-hive-team": tenant, "x-hive-internal": INTERNAL },
       body: JSON.stringify({ user: { id: userId, email, name }, org: orgSlug ? { id: orgSlug, slug: orgSlug, name: orgSlug } : null }),
       cache: "no-store",
     });
-  } catch {
-    /* identity record is non-critical for auth */
-  }
+  } catch {}
 
-  // Surface the backend-derived operator status (decoded from the JWT we just
-  // minted) so operator-only surfaces can disclose the boundary instead of
-  // failing with a bare 403. Omitted when the claim is undecodable — the client
-  // treats an absent field as UNKNOWN and leaves those surfaces untouched.
   const platformAdmin = jwtPlatformAdmin(token);
   const res = NextResponse.json({ ok: true, tenant, role, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
   const domain = cookieDomain(req);
   if (domain) {
-    // Sessions minted before the forwarded-host fix hold a HOST-ONLY
-    // `hive_jwt` (no Domain attribute). A browser keeps that cookie beside the
-    // parent-domain one and sends BOTH to the dashboard origin, oldest first,
-    // so the backend would keep reading the stale (possibly other-tenant)
-    // cookie for up to its remaining hour. Expire the host-only variant in the
-    // same response, BEFORE setting the real one: two Set-Cookie headers for
-    // the same name differ by Domain and are distinct cookies to the browser.
     res.cookies.set("hive_jwt", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
   }
   res.cookies.set("hive_jwt", token, {
