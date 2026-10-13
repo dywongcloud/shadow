@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState, use } from "react";
+import { useCallback, useEffect, useMemo, useState, use } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Search, Play, RotateCw, X, ChevronDown, MapPin, ShieldCheck, Zap } from "lucide-react";
+import { Search, Play, RotateCw, X, MapPin, ShieldCheck, Zap } from "lucide-react";
 import { Triangle, Badge } from "@/components/ui";
-import { apiGet, type Event } from "@/lib/api";
+import { apiGetLogs, ApiError, type Event, type LogsPage } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function statusTone(s: number) {
@@ -19,6 +19,36 @@ function fmtTime(ms: number) {
   const d = new Date(ms);
   const p = (n: number, w = 2) => String(n).padStart(w, "0");
   return `${d.toLocaleString("en-US", { month: "short", day: "2-digit" }).toUpperCase()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 2).slice(0, 2)}`;
+}
+
+/** Timeline windows the server supports (see `admin::logs_range_ms`). `pro: true`
+ * marks a window the API refuses on the hobby plan — it is still offered so the
+ * refusal is legible, not a silently-empty table. */
+const RANGES: { value: string; label: string; pro?: boolean }[] = [
+  { value: "30m", label: "Last 30 minutes" },
+  { value: "1h", label: "Last hour" },
+  { value: "24h", label: "Last 24 hours" },
+  { value: "7d", label: "Last 7 days" },
+  { value: "30d", label: "Last 30 days", pro: true },
+];
+const LEVELS = ["warning", "error", "fatal"] as const;
+const METHODS = ["get", "post", "put", "patch", "delete", "head", "options"];
+const CACHES = ["hit", "miss", "stale", "store", "revalidate"];
+const ENVS = ["production", "preview"];
+const RESOURCES = ["static", "function", "fullstack"];
+const PAGE_SIZES = [100, 300, 1000];
+/** The server clamps `offset` to `LOGS_LIMIT_MAX - limit` so each node's scan
+ * stays bounded (see `admin::logs`). Asking for a larger offset is silently
+ * reduced, i.e. "Next" would re-return the rows already on screen — so the UI
+ * must stop at the same bound instead of offering a control that does nothing. */
+const LOGS_LIMIT_MAX = 1000;
+
+/** Union of the server's vocabulary and the values actually present in the
+ * current rows, so a dropdown always offers the enum AND only real values. */
+function optionsFor(fixed: string[], seen: string[]) {
+  const out = [...fixed];
+  for (const v of seen) if (v && !out.includes(v)) out.push(v);
+  return out;
 }
 
 export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
@@ -36,7 +66,24 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
   // time (an event handler, not render) so it stays stable for as long as
   // that event is selected instead of rerolling on every re-render.
   const [selRequestId, setSelRequestId] = useState("");
-  const [range, setRange] = useState("Last 30 minutes");
+
+  // Timeline — actually sent to the API now (it used to be written to state
+  // and never read by anything, so "Last hour" changed nothing).
+  const [range, setRange] = useState("30m");
+  const [levels, setLevels] = useState<string[]>([]);
+  const [fResource, setFResource] = useState("");
+  const [fEnv, setFEnv] = useState("");
+  const [fRoute, setFRoute] = useState("");
+  const [fStatus, setFStatus] = useState("");
+  const [fHost, setFHost] = useState("");
+  const [fMethod, setFMethod] = useState("");
+  const [fCache, setFCache] = useState("");
+  const [pageSize, setPageSize] = useState(300);
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [oldestMs, setOldestMs] = useState(0);
+  const [err, setErr] = useState<ApiError | null>(null);
 
   function selectEvent(e: Event) {
     setSel(e);
@@ -44,27 +91,100 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
     setSelRequestId(Math.random().toString(36).slice(2, 8));
   }
 
+  const levelKey = levels.slice().sort().join(",");
+  const offset = page * pageSize;
+  // Deepest offset the server will honour for this page size.
+  const maxOffset = Math.max(0, LOGS_LIMIT_MAX - pageSize);
+  const nextOffset = (page + 1) * pageSize;
+  const canNext = hasMore && nextOffset <= maxOffset;
+
   const load = useCallback(async () => {
+    const qs = new URLSearchParams();
+    qs.set("project", project);
+    qs.set("limit", String(pageSize));
+    qs.set("range", range);
+    if (q.trim()) qs.set("q", q.trim());
+    if (levelKey) qs.set("level", levelKey);
+    if (fStatus) qs.set("status", fStatus);
+    if (fMethod) qs.set("method", fMethod);
+    if (fHost) qs.set("host", fHost);
+    if (fRoute) qs.set("route", fRoute);
+    if (fCache) qs.set("cache", fCache);
+    if (fEnv) qs.set("env", fEnv);
+    if (fResource) qs.set("resource", fResource);
+    if (offset > 0) qs.set("offset", String(offset));
     try {
-      const e = await apiGet<Event[]>(`/v1/logs?limit=300&project=${encodeURIComponent(project)}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
-      setEvents(e);
-    } catch {}
-  }, [project, q]);
+      const page0: LogsPage = await apiGetLogs(`/v1/logs?${qs.toString()}`);
+      setEvents(page0.rows);
+      setTotal(page0.total);
+      setHasMore(page0.hasMore);
+      setOldestMs(page0.oldestMs);
+      setErr(null);
+    } catch (e) {
+      // Never a bare `catch {}`: a refusal here is the answer to the user's
+      // query (plan gate, bad range), and swallowing it renders "no logs".
+      setErr(e instanceof ApiError ? e : new ApiError(0, String((e as Error)?.message || e)));
+    }
+  }, [project, q, range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, pageSize, offset]);
+
+  // Wider windows are history reads, not a live tail — polling them every
+  // 1.5 s would re-scan day-files for rows that cannot have changed.
+  const pollMs = range === "30m" || range === "1h" ? 1500 : 5000;
+
   useEffect(() => {
     // Fetch-on-mount + poll: load() sets state only after its internal await
     // resolves, syncing external (server) log data into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount/poll; state is set only after an internal await, not synchronously
     load();
     if (!live) return;
-    const id = setInterval(load, 1500);
+    const id = setInterval(load, pollMs);
     return () => clearInterval(id);
-  }, [load, live]);
+  }, [load, live, pollMs]);
 
-  const counts = {
-    warning: events.filter((e) => e.action.includes("stale") || e.action === "rewrite").length,
-    error: events.filter((e) => e.status >= 500 || e.action.includes("deny") || e.action.includes("block")).length,
-    fatal: 0,
-  };
+  // Changing any filter invalidates the current page offset.
+  useEffect(() => {
+    setPage(0);
+  }, [range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, q, pageSize]);
+
+  // Counts come from the server's derived `level`, not a client-side re-guess.
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { info: 0, warning: 0, error: 0, fatal: 0 };
+    for (const e of events) if (e.level) c[e.level] = (c[e.level] || 0) + 1;
+    return c;
+  }, [events]);
+
+  const seen = useMemo(() => {
+    const hosts = new Set<string>();
+    const routes = new Set<string>();
+    const statuses = new Set<string>();
+    const methods = new Set<string>();
+    const envs = new Set<string>();
+    const resources = new Set<string>();
+    const caches = new Set<string>();
+    for (const e of events) {
+      if (e.host) hosts.add(e.host);
+      if (e.path) routes.add(e.path);
+      if (e.status) statuses.add(String(e.status));
+      if (e.method) methods.add(e.method.toLowerCase());
+      if (e.env) envs.add(e.env);
+      if (e.resource) resources.add(e.resource);
+      if (e.cache) caches.add(e.cache);
+    }
+    // Status classes are always offered: "5xx" is the useful one and no
+    // single row of the current page necessarily contains one.
+    for (const cls of ["2xx", "3xx", "4xx", "5xx"]) statuses.add(cls);
+    return {
+      hosts: [...hosts].sort(),
+      routes: [...routes].sort().slice(0, 100),
+      statuses: [...statuses].sort(),
+      methods: [...methods].sort(),
+      envs: [...envs].sort(),
+      resources: [...resources].sort(),
+      caches: [...caches].sort(),
+    };
+  }, [events]);
+
+  const upgrade = err?.code === "PLAN_UPGRADE_REQUIRED";
 
   return (
     <div>
@@ -80,27 +200,74 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
       </div>
       {/* Project sub-tabs now live in the top nav (breadcrumb-tabs model). */}
 
-      <div className="grid grid-cols-1 gap-0 overflow-hidden rounded-xl border border-border lg:grid-cols-[200px_1fr]">
+      {err && (
+        <div className={cn("mb-3 rounded-lg border px-3 py-2 text-sm", upgrade ? "border-amber-500/40 bg-amber-500/10 text-amber-600" : "border-red-500/40 bg-red-500/10 text-red-500")}>
+          <span className="font-medium">{upgrade ? "Upgrade required" : "Could not load logs"}</span>
+          <span className="text-secondary"> — {err.message}</span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-0 overflow-hidden rounded-xl border border-border lg:grid-cols-[220px_1fr]">
         {/* Filters sidebar */}
         <aside className="border-b border-border bg-subtle/40 p-4 lg:border-b-0 lg:border-r">
           <div className="mb-3 flex items-center justify-between">
             <span className="text-sm font-semibold">Filters</span>
-            <button onClick={() => { setQ(""); }} className="text-xs text-secondary hover:text-fg">Reset</button>
+            <button
+              onClick={() => {
+                setQ("");
+                setLevels([]);
+                setFResource("");
+                setFEnv("");
+                setFRoute("");
+                setFStatus("");
+                setFHost("");
+                setFMethod("");
+                setFCache("");
+                setPage(0);
+              }}
+              className="text-xs text-secondary hover:text-fg"
+            >
+              Reset
+            </button>
           </div>
           <div className="mb-4">
             <div className="mb-1.5 text-xs font-medium text-secondary">Timeline</div>
-            <select value={range} onChange={(e) => setRange(e.target.value)} className="w-full rounded-md border border-border bg-card px-2 py-1.5 text-xs focus:outline-none">
-              <option>Last 30 minutes</option><option>Last hour</option><option>Last 24 hours</option>
+            <select
+              value={range}
+              onChange={(e) => setRange(e.target.value)}
+              className="w-full rounded-md border border-border bg-card px-2 py-1.5 text-xs focus:outline-none"
+            >
+              {RANGES.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                  {r.pro ? " — Pro" : ""}
+                </option>
+              ))}
             </select>
+            {oldestMs > 0 && (
+              <div className="mt-1 text-[10px] text-muted">
+                history back to {new Date(oldestMs).toLocaleString()}
+              </div>
+            )}
           </div>
           <div className="mb-2 text-xs font-medium text-secondary">Console Level</div>
-          <Level label="Warning" n={counts.warning} />
-          <Level label="Error" n={counts.error} />
-          <Level label="Fatal" n={counts.fatal} />
-          <div className="mt-3 flex flex-col gap-1.5 text-xs text-secondary">
-            {["Resource", "Environment", "Route", "Status Code", "Host", "Request Method", "Cache"].map((f) => (
-              <button key={f} className="flex items-center justify-between py-1 hover:text-fg"><span>{f}</span><ChevronDown className="h-3 w-3" /></button>
-            ))}
+          {LEVELS.map((l) => (
+            <Level
+              key={l}
+              label={l[0].toUpperCase() + l.slice(1)}
+              n={counts[l] || 0}
+              checked={levels.includes(l)}
+              onChange={(on) => setLevels((prev) => (on ? [...prev, l] : prev.filter((x) => x !== l)))}
+            />
+          ))}
+          <div className="mt-3 flex flex-col gap-0.5 text-xs text-secondary">
+            <FilterRow label="Resource" value={fResource} options={optionsFor(RESOURCES, seen.resources)} onChange={setFResource} />
+            <FilterRow label="Environment" value={fEnv} options={optionsFor(ENVS, seen.envs)} onChange={setFEnv} />
+            <FilterRow label="Route" value={fRoute} options={seen.routes} onChange={setFRoute} />
+            <FilterRow label="Status Code" value={fStatus} options={seen.statuses} onChange={setFStatus} />
+            <FilterRow label="Host" value={fHost} options={seen.hosts} onChange={setFHost} />
+            <FilterRow label="Request Method" value={fMethod} options={optionsFor(METHODS, seen.methods)} onChange={setFMethod} />
+            <FilterRow label="Cache" value={fCache} options={optionsFor(CACHES, seen.caches)} onChange={setFCache} />
           </div>
         </aside>
 
@@ -139,9 +306,42 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                       <td className="max-w-[280px] truncate px-3 py-2">{e.path}</td>
                     </tr>
                   ))}
-                  {!events.length && <tr><td colSpan={4} className="px-3 py-10 text-center text-sm text-secondary">No logs yet — hit your deployment to generate traffic.</td></tr>}
+                  {!events.length && !err && <tr><td colSpan={4} className="px-3 py-10 text-center text-sm text-secondary">No logs match these filters.</td></tr>}
                 </tbody>
               </table>
+              <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-xs text-secondary">
+                <span>
+                  {/* `total` is capped by the server's per-query fetch budget,
+                      so a trailing "+" is the honest reading: it is a lower
+                      bound whenever more rows exist. */}
+                  {events.length
+                    ? `${offset + 1}–${offset + events.length} of ${total}${hasMore ? "+" : ""}`
+                    : `0 of ${total || 0}`}{" "}
+                  matched
+                </span>
+                <span className="flex items-center gap-2">
+                  <label className="flex items-center gap-1">
+                    rows
+                    <select value={pageSize} onChange={(e) => setPageSize(Number(e.target.value))} className="rounded-md border border-border bg-card px-1.5 py-1 text-xs focus:outline-none">
+                      {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </label>
+                  <button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))} className="rounded-md border border-border px-2 py-1 disabled:opacity-40">Prev</button>
+                  <span>page {page + 1}</span>
+                  <button
+                    disabled={!canNext}
+                    title={
+                      hasMore && !canNext
+                        ? `The API returns at most ${LOGS_LIMIT_MAX} rows per query — narrow the range or filters to reach older rows.`
+                        : undefined
+                    }
+                    onClick={() => setPage((p) => p + 1)}
+                    className="rounded-md border border-border px-2 py-1 disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </span>
+              </div>
             </div>
 
             {/* detail panel */}
@@ -168,12 +368,18 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                   <div className="mb-2 flex items-center gap-1.5 text-sm font-medium"><Zap className="h-4 w-4" /> Function Invocation</div>
                   <Field label="Action" value={sel.action} />
                   {sel.detail ? <Field label="Detail" value={sel.detail} mono /> : null}
-                  <Field label="Cache" value={sel.action.includes("cache") ? sel.action.replace("cache-", "").toUpperCase() : "MISS"} />
+                  <Field label="Cache" value={(sel.cache || "miss").toUpperCase()} />
+                  <Field label="Level" value={(sel.level || "info").toUpperCase()} />
                 </div>
                 <div className="mt-3 text-xs text-secondary">
                   <div className="mb-1 font-medium text-fg">Deployment Information</div>
                   <Field label="Project" value={project} />
-                  <Field label="Environment" value="production" />
+                  {/* Both are DERIVED from the deployment this request aliased
+                      to — never recorded on the event — so "unknown" is a real
+                      answer, not a placeholder. */}
+                  <Field label="Environment" value={sel.env || "unknown"} />
+                  <Field label="Resource" value={sel.resource || "unknown"} />
+                  {sel.deployment ? <Field label="Deployment" value={sel.deployment} mono /> : null}
                 </div>
               </div>
             )}
@@ -184,14 +390,37 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
   );
 }
 
-function Level({ label, n }: { label: string; n: number }) {
+function Level({ label, n, checked, onChange }: { label: string; n: number; checked: boolean; onChange: (on: boolean) => void }) {
   return (
     <label className="flex items-center justify-between py-1 text-xs text-secondary">
-      <span className="flex items-center gap-2"><input type="checkbox" className="h-3.5 w-3.5 accent-fg" /> {label}</span>
+      <span className="flex items-center gap-2">
+        <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="h-3.5 w-3.5 accent-fg" /> {label}
+      </span>
       <span className="rounded-full bg-card px-1.5 text-[10px]">{n}</span>
     </label>
   );
 }
+
+function FilterRow({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (v: string) => void }) {
+  return (
+    <label className="flex items-center justify-between gap-2 py-1 hover:text-fg">
+      <span className="shrink-0">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="max-w-[110px] rounded-md border border-border bg-card px-1.5 py-1 text-xs text-secondary focus:outline-none"
+      >
+        <option value="">All</option>
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="mb-2">
@@ -200,6 +429,28 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
     </div>
   );
 }
+
+/** Known edge regions; anything else falls through to its own code rather than
+ * rendering a bare id. */
 function regionLabel(r: string) {
-  return { iad1: "Washington, D.C., USA", sfo1: "San Francisco, USA", fra1: "Frankfurt, Germany" }[r] || r;
+  const map: Record<string, string> = {
+    iad1: "Washington, D.C., USA",
+    sfo1: "San Francisco, USA",
+    fra1: "Frankfurt, Germany",
+    lax1: "Los Angeles, USA",
+    "los-angeles": "Los Angeles, USA",
+    sj: "San Jose, USA",
+    sj2: "San Jose, USA",
+    hk: "Hong Kong",
+    bkk: "Bangkok, Thailand",
+    va: "Virginia, USA",
+    va2: "Virginia, USA",
+    va3: "Virginia, USA",
+    sp: "São Paulo, Brazil",
+    fr: "Frankfurt, Germany",
+    phx: "Phoenix, USA",
+    orlando: "Orlando, USA",
+    sin: "Singapore",
+  };
+  return map[r] || map[r.toLowerCase()] || r;
 }

@@ -354,6 +354,19 @@ pub fn plan_allows_deploy_protection(plan: &str) -> bool {
 pub fn plan_allows_microfrontends(plan: &str) -> bool {
     matches!(plan, "pro" | "enterprise")
 }
+/// Request-log history older than 7 days is available from Pro up.
+pub fn plan_allows_extended_logs(plan: &str) -> bool {
+    matches!(plan, "pro" | "enterprise")
+}
+/// How far back `/v1/logs` may read, per plan. This is the SERVER-SIDE gate —
+/// the UI offering a 30-day option is presentation, the refusal lives here.
+pub fn plan_max_log_age_ms(plan: &str) -> u64 {
+    if plan_allows_extended_logs(plan) {
+        30 * crate::event_log::DAY_MS
+    } else {
+        7 * crate::event_log::DAY_MS
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BillingAccount {

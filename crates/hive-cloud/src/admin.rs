@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
@@ -9190,8 +9190,18 @@ async fn mesh_discovery(
     })))
 }
 
+/// `/v1/logs` query. EVERY field is bounded at parse time (see [`logs`]): an
+/// unbounded window, list or limit on a fan-out endpoint is a
+/// denial-of-service vector, and a filter that is accepted but silently ignored
+/// is the exact bug this endpoint is being fixed for — so a malformed term is a
+/// 400, never a no-op.
+///
+/// Every parameter here must be reconstructed in BOTH
+/// [`crate::gossip::logs_query`] (the mesh dispatch arm) and in the fan-out
+/// query string built in [`logs`]; a parameter added in only one place works on
+/// the owner node and silently returns unfiltered/empty data on every peer.
 #[derive(Deserialize)]
-pub(crate) struct LimitQ {
+pub(crate) struct LogsQ {
     pub(crate) limit: Option<usize>,
     /// Filter events to a project (matches the deployment host subdomain).
     pub(crate) project: Option<String>,
@@ -9206,19 +9216,284 @@ pub(crate) struct LimitQ {
     /// local events (no fan-out) — prevents proxy recursion.
     #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
+    /// Named window: `30m` | `1h` | `24h` | `7d` | `30d`. Resolved to absolute
+    /// bounds server-side; never forwarded as a string (a peer resolving it
+    /// against its own clock would widen or shrink the window).
+    #[serde(default)]
+    pub(crate) range: Option<String>,
+    /// Absolute inclusive lower bound (ms epoch).
+    #[serde(default)]
+    pub(crate) since_ms: Option<u64>,
+    /// Absolute inclusive upper bound (ms epoch).
+    #[serde(default)]
+    pub(crate) until_ms: Option<u64>,
+    /// Status filter: comma-separated codes and/or classes (`404,5xx`).
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) method: Option<String>,
+    #[serde(default)]
+    pub(crate) host: Option<String>,
+    #[serde(default)]
+    pub(crate) route: Option<String>,
+    /// `info` | `warning` | `error` | `fatal` (derived — see `event_log`).
+    #[serde(default)]
+    pub(crate) level: Option<String>,
+    /// `hit` | `miss` | `stale` | `store` | `revalidate`.
+    #[serde(default)]
+    pub(crate) cache: Option<String>,
+    /// `production` | `preview` (derived from the deployment's target).
+    #[serde(default)]
+    pub(crate) env: Option<String>,
+    /// `static` | `function` | `fullstack` (derived from the deployment's kind).
+    #[serde(default)]
+    pub(crate) resource: Option<String>,
+    /// Rows to skip AFTER the fleet-wide merge (coordinator-only: a peer
+    /// skipping its own first N would page the wrong rows).
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// Return only events strictly older than this `ts_ms` (per-node bound).
+    #[serde(default)]
+    pub(crate) cursor: Option<u64>,
+}
+
+/// Default `limit` — unchanged, and deliberately small: the dashboard polls
+/// this endpoint every 1.5 s.
+pub(crate) const LOGS_LIMIT_DEFAULT: usize = 100;
+/// Hard ceiling on `limit`. Was unclamped (`limit=100000` was accepted), and
+/// the coordinator sorts + merges `nodes x limit` every poll.
+pub(crate) const LOGS_LIMIT_MAX: usize = 1000;
+/// Hard ceiling on `offset` (pagination depth).
+pub(crate) const LOGS_OFFSET_MAX: usize = 100_000;
+/// Retention ceiling: no plan reaches further back than this.
+pub(crate) const LOGS_MAX_AGE_MS: u64 = 30 * crate::event_log::DAY_MS;
+/// Slack applied to the age comparison. The coordinator resolves `range=7d`
+/// into an absolute `since_ms` on ITS clock and every peer then re-checks that
+/// bound against its own, so a peer whose clock is milliseconds ahead sees the
+/// window as a hair older than the plan allows and refuses a range the
+/// coordinator just accepted — the whole fleet-wide read fails on clock skew,
+/// not on policy. 5 minutes is slack against a 7/30-day window, not a loophole.
+pub(crate) const LOGS_AGE_TOLERANCE_MS: u64 = 5 * 60_000;
+
+/// Named window -> span in ms. `None` = unknown range (caller turns that into a
+/// 400 rather than silently ignoring it).
+pub(crate) fn logs_range_ms(r: &str) -> Option<u64> {
+    match r.trim().to_ascii_lowercase().as_str() {
+        "30m" | "30min" => Some(30 * 60_000),
+        "1h" | "60m" => Some(60 * 60_000),
+        "24h" | "1d" => Some(crate::event_log::DAY_MS),
+        "7d" | "1w" => Some(7 * crate::event_log::DAY_MS),
+        "30d" => Some(30 * crate::event_log::DAY_MS),
+        _ => None,
+    }
+}
+
+fn logs_err(code: &str, message: String) -> String {
+    serde_json::to_string(&json!({ "error": { "code": code, "message": message } }))
+        .unwrap_or_else(|_| code.to_string())
+}
+
+/// Validate every term of a comma-separated enum filter against `allowed`.
+fn logs_validate_terms(
+    raw: Option<&str>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), (StatusCode, String)> {
+    let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    for term in raw.split(',').map(|s| s.trim().to_ascii_lowercase()).take(16) {
+        if term.is_empty() {
+            continue;
+        }
+        if !allowed.contains(&term.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_FILTER",
+                    format!("logs: {field}='{term}' is not one of {}", allowed.join(", ")),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn logs_hdr(h: &mut HeaderMap, k: &'static str, v: impl std::fmt::Display) {
+    if let Ok(val) = HeaderValue::from_str(&v.to_string()) {
+        h.insert(k, val);
+    }
 }
 
 pub(crate) async fn logs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-    Query(q): Query<LimitQ>,
-) -> Json<Value> {
-    let limit = q.limit.unwrap_or(100);
+    Query(q): Query<LogsQ>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, String)> {
+    use crate::event_log::{parse_list, DeployFacts, EventFilter, StatusPred};
+
+    let now = hive_core::now_ms();
+    // --- bound every input first -------------------------------------------
+    let limit = q
+        .limit
+        .unwrap_or(LOGS_LIMIT_DEFAULT)
+        .clamp(1, LOGS_LIMIT_MAX);
+    let offset = q
+        .offset
+        .unwrap_or(0)
+        .min(LOGS_OFFSET_MAX)
+        .min(LOGS_LIMIT_MAX.saturating_sub(limit));
     let cl = claims.as_ref().map(|e| &e.0);
     let is_operator = operator_allowed(cl, crate::auth::enforced());
     let t = tenant(&c, &headers, cl);
-    let mut evs = c.recent_events(2000);
+
+    // --- resolve the window -------------------------------------------------
+    let mut since_ms = q.since_ms.unwrap_or(0);
+    let mut until_ms = q.until_ms.unwrap_or(u64::MAX);
+    let range_name = q
+        .range
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    if let Some(r) = range_name.as_deref() {
+        if q.since_ms.is_some() || q.until_ms.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_RANGE",
+                    "logs: pass either range= or since_ms/until_ms=, not both".into(),
+                ),
+            ));
+        }
+        let span = logs_range_ms(r).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_RANGE",
+                    format!("logs: unknown range '{r}' — use 30m, 1h, 24h, 7d or 30d"),
+                ),
+            )
+        })?;
+        since_ms = now.saturating_sub(span);
+        until_ms = u64::MAX;
+    }
+    if let Some(cur) = q.cursor {
+        until_ms = until_ms.min(cur.saturating_sub(1));
+    }
+    if since_ms > 0 && until_ms < since_ms {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            logs_err(
+                "LOGS_BAD_RANGE",
+                "logs: until_ms/sort cursor is before since_ms".into(),
+            ),
+        ));
+    }
+
+    // --- SERVER-SIDE plan gate ---------------------------------------------
+    // Ranges older than 7 days are a Pro/Enterprise capability. This is
+    // enforced on the plan HERE, not in the client: a client-only gate is
+    // trivially bypassed with curl. A request past the plan's window is
+    // REFUSED with a typed error, never silently truncated to look empty.
+    if since_ms > 0 {
+        let age_ms = now.saturating_sub(since_ms);
+        let span_ms = until_ms.min(now).saturating_sub(since_ms);
+        if age_ms > LOGS_MAX_AGE_MS + LOGS_AGE_TOLERANCE_MS
+            || span_ms > LOGS_MAX_AGE_MS + LOGS_AGE_TOLERANCE_MS
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_RANGE_TOO_LARGE",
+                    format!(
+                        "logs: requested window is wider than the {}-day history the platform retains",
+                        LOGS_MAX_AGE_MS / crate::event_log::DAY_MS
+                    ),
+                ),
+            ));
+        }
+        let plan = match q.project.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => team_plan(&c, p),
+            // Same precedence as `team_plan`: the TEAM row first, billing as the
+            // fallback for a personal namespace that has no team row. Reading
+            // billing alone made the two shapes disagree for the SAME tenant —
+            // a project-scoped read honoured a pro team row while an unscoped
+            // read (billing row never written) fell back to hobby and refused
+            // the identical window. `apply_plan_everywhere` writes both halves,
+            // so a real plan change keeps them in agreement either way.
+            None => c
+                .teams
+                .get(&t)
+                .map(|x| x.plan)
+                .unwrap_or_else(|| c.billing.account(&t).plan),
+        };
+        // No operator carve-out: platform admins read as `enterprise` through
+        // the billing floor (`team_plan`/`account()`), so this gate stays a
+        // single question — what does the OWNING TENANT's plan allow?
+        let max_age = crate::billing::plan_max_log_age_ms(&plan);
+        if age_ms > max_age + LOGS_AGE_TOLERANCE_MS
+            || span_ms > max_age + LOGS_AGE_TOLERANCE_MS
+        {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                serde_json::to_string(&json!({
+                    "error": {
+                        "code": "PLAN_UPGRADE_REQUIRED",
+                        "feature": "extended_log_history",
+                        "message": format!(
+                            "Log history older than {} days requires the Pro or Enterprise plan (current plan: {plan}).",
+                            crate::billing::plan_max_log_age_ms("hobby") / crate::event_log::DAY_MS
+                        ),
+                        "plan": plan,
+                        "requested_age_ms": age_ms,
+                        "max_age_ms": max_age,
+                    }
+                }))
+                .unwrap_or_else(|_| "PLAN_UPGRADE_REQUIRED".to_string()),
+            ));
+        }
+    }
+
+    // --- parse + validate the field filters --------------------------------
+    logs_validate_terms(q.level.as_deref(), "level", &["info", "warning", "error", "fatal"])?;
+    logs_validate_terms(
+        q.cache.as_deref(),
+        "cache",
+        &["hit", "miss", "stale", "store", "revalidate"],
+    )?;
+    logs_validate_terms(q.env.as_deref(), "env", &["production", "preview"])?;
+    logs_validate_terms(q.resource.as_deref(), "resource", &["static", "function", "fullstack"])?;
+    let mut statuses: Vec<StatusPred> = Vec::new();
+    if let Some(raw) = q.status.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for term in raw.split(',').take(16) {
+            let term = term.trim();
+            if term.is_empty() {
+                continue;
+            }
+            match StatusPred::parse(term) {
+                Some(p) => statuses.push(p),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        logs_err(
+                            "LOGS_BAD_FILTER",
+                            format!("logs: status='{term}' is not a code (404) or a class (5xx)"),
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+    let text = q
+        .q
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .map(|s| if s.len() > 256 { s[..256].to_string() } else { s });
+
+    // --- tenant + project + deployment scoping, applied INSIDE the scan ----
     // Tenant scope: only events for projects owned by this team. UNATTRIBUTED
     // events (empty project: platform-apex bot probes, unresolved hosts,
     // control-plane noise) are OPERATOR-ONLY in the unfiltered view — they are
@@ -9226,107 +9501,169 @@ pub(crate) async fn logs(
     // leaks cross-tenant request metadata (hosts/paths) and buries the team's
     // own logs in scanner noise. A project-scoped view below still re-admits
     // the project's OWN untagged host traffic via the alias-host branch.
-    evs.retain(|e| {
-        if e.project.is_empty() {
-            return is_operator;
-        }
-        // Fleet-aware: an event's project is owned per the deployment tenant
-        // tags, not the node-local (row-missing on non-hosting nodes) project row.
-        project_owned_by(&c, &e.project, &t)
-    });
-    if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
-        let pl = p.to_lowercase();
-        // EXACT project scoping. The old filter also kept any event whose `host`
-        // or `detail` merely CONTAINED the project name as a substring — so
-        // `/projects/ctest/logs` leaked in every other project's events that
-        // happened to mention "ctest" anywhere (and a short name like "css"
-        // matched "cssdemosite", "processor", …). Scope instead to: events
-        // tagged with this exact project, OR untagged/infra events whose `host`
-        // is one of THIS project's real deployment hostnames (exact label or a
-        // subdomain of it) — never a blind substring on free-text detail.
-        // The deployment host set is TENANT-CHECKED (team_of == t): a
-        // same-named project belonging to another tenant must not contribute
-        // hosts that would pull its traffic into this view.
-        let hosts: std::collections::HashSet<String> =
-            c.gw.list()
-                .into_iter()
-                .filter(|d| d.project.eq_ignore_ascii_case(&pl) && record_tenant(&d.tenant) == t)
-                .flat_map(|d| {
-                    [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
-                        .into_iter()
-                        .filter(|h| !h.is_empty())
-                        .map(|h| h.to_lowercase())
-                })
-                .collect();
-        evs.retain(|e| {
-            if e.project.to_lowercase() == pl {
-                return true;
-            }
-            if !e.project.is_empty() {
-                return false; // tagged for a DIFFERENT project — never leak it.
-            }
-            // Untagged/infra event: keep only if its host is one of this
-            // project's deployment hosts (exact or a subdomain label boundary).
-            let h = e.host.to_lowercase();
-            hosts.iter().any(|ph| {
-                h == *ph || h.starts_with(&format!("{ph}.")) || ph.starts_with(&format!("{h}."))
+    let scope_project = q
+        .project
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_lowercase());
+    let scope_deployment = q
+        .deployment
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| d.to_lowercase());
+    // EXACT project scoping, tenant-checked. The old filter also kept any event
+    // whose `host`/`detail` merely CONTAINED the project name as a substring —
+    // so `/projects/ctest/logs` leaked in every other project's events that
+    // happened to mention "ctest" anywhere. Scope instead to: events tagged with
+    // this exact project, OR untagged/infra events whose `host` is one of THIS
+    // project's real deployment hostnames (exact label or a subdomain of it).
+    let project_hosts: Vec<(String, String)> = match scope_project.as_deref() {
+        Some(pl) => c
+            .gw
+            .list()
+            .into_iter()
+            .filter(|d| d.project.eq_ignore_ascii_case(pl) && record_tenant(&d.tenant) == t)
+            .flat_map(|d| {
+                [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
+                    .into_iter()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| h.to_lowercase())
             })
-        });
-    }
-    if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
-        let dl = d.to_lowercase();
-        // Deployment scope: events exactly tagged with this deployment id at
-        // record time (see Event.deployment), plus — for events recorded before
-        // the tag existed — untagged events whose host FIRST LABEL is the
-        // deployment id itself (the id_alias URL is unambiguous over time;
-        // project/branch aliases move between deployments on promote, so those
-        // are only trusted via the record-time tag).
-        evs.retain(|e| {
-            if e.deployment.to_lowercase() == dl {
-                return true;
+            .map(|h| {
+                let dot = format!("{h}.");
+                (h, dot)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    // `project_owned_by` walks the deployment table + peer deployments, so it
+    // must not run once per scanned JSONL line (a 30-day window can examine
+    // hundreds of thousands). Distinct projects are few — memoize per project.
+    let owned_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        Default::default();
+    let scope: std::sync::Arc<dyn Fn(&crate::state::Event) -> bool + Send + Sync> = {
+        let cc = c.clone();
+        let tt = t.clone();
+        let hosts = project_hosts.clone();
+        let oc = owned_cache.clone();
+        Arc::new(move |e: &crate::state::Event| {
+            if e.project.is_empty() {
+                if !is_operator {
+                    return false;
+                }
+            } else {
+                let key = e.project.to_lowercase();
+                let hit = oc.lock().ok().and_then(|m| m.get(&key).copied());
+                let ok = match hit {
+                    Some(v) => v,
+                    None => {
+                        let v = project_owned_by(&cc, &e.project, &tt);
+                        if let Ok(mut m) = oc.lock() {
+                            if m.len() < 4096 {
+                                m.insert(key, v);
+                            }
+                        }
+                        v
+                    }
+                };
+                if !ok {
+                    return false;
+                }
             }
-            if !e.deployment.is_empty() {
-                return false;
+            if let Some(pl) = scope_project.as_ref() {
+                if e.project.to_lowercase() != *pl {
+                    if !e.project.is_empty() {
+                        return false; // tagged for a DIFFERENT project — never leak it.
+                    }
+                    let h = e.host.to_lowercase();
+                    if !hosts
+                        .iter()
+                        .any(|(ph, phd)| h == *ph || h.starts_with(phd) || ph.starts_with(h.as_str()))
+                    {
+                        return false;
+                    }
+                }
             }
-            let h = e.host.to_lowercase();
-            let label = h
-                .split(':')
-                .next()
-                .unwrap_or(&h)
-                .split('.')
-                .next()
-                .unwrap_or(&h);
-            label == dl
-        });
-    }
-    if let Some(s) = q.q.as_ref().filter(|s| !s.is_empty()) {
-        let sl = s.to_lowercase();
-        evs.retain(|e| {
-            e.path.to_lowercase().contains(&sl)
-                || e.host.to_lowercase().contains(&sl)
-                || e.detail.to_lowercase().contains(&sl)
-                || e.action.to_lowercase().contains(&sl)
-        });
-    }
+            if let Some(dl) = scope_deployment.as_ref() {
+                if e.deployment.to_lowercase() != *dl {
+                    if !e.deployment.is_empty() {
+                        return false;
+                    }
+                    // Pre-tag events: the id_alias URL is unambiguous over time
+                    // (project/branch aliases move between deployments on
+                    // promote), so the host's FIRST LABEL is the only trusted
+                    // fallback.
+                    let h = e.host.to_lowercase();
+                    let label = h
+                        .split(':')
+                        .next()
+                        .unwrap_or(&h)
+                        .split('.')
+                        .next()
+                        .unwrap_or(&h)
+                        .to_string();
+                    if label != *dl {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+    };
+
+    // `+1` is a PROBE row: fetching exactly `limit + offset` makes `total` land
+    // on `limit` whenever more rows exist, so `has_more` (`total > offset+limit`)
+    // is false on page 1 of every result set and the UI's "Next" can never
+    // advance. One extra row per node is what makes pagination discoverable.
+    // Peer + local fetch stays under `LOGS_LIMIT_MAX + 1`, so this does not
+    // widen the fan-out bound.
+    let fetch = limit + offset + 1;
+    let filter = EventFilter {
+        since_ms,
+        until_ms,
+        limit: fetch,
+        statuses,
+        methods: parse_list(q.method.as_deref(), 8, 16).unwrap_or_default(),
+        hosts: parse_list(q.host.as_deref(), 8, 128).unwrap_or_default(),
+        routes: parse_list(q.route.as_deref(), 8, 256).unwrap_or_default(),
+        levels: parse_list(q.level.as_deref(), 4, 16).unwrap_or_default(),
+        caches: parse_list(q.cache.as_deref(), 6, 16).unwrap_or_default(),
+        envs: parse_list(q.env.as_deref(), 4, 32).unwrap_or_default(),
+        resources: parse_list(q.resource.as_deref(), 4, 32).unwrap_or_default(),
+        text,
+        scope: Some(scope),
+    };
+    let facts = DeployFacts::build(&c.gw.list());
+
+    // The durable scan reads day-files: heavy, synchronous I/O, so it never
+    // runs on a serving tokio worker (same rule as `relational::exec`).
+    let evs = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| c.query_events(&filter, &facts))
+        }
+        _ => c.query_events(&filter, &facts),
+    };
+    let mut out: Vec<Value> = evs
+        .into_iter()
+        .map(|e| {
+            let d = facts.derive(&e);
+            let mut v = json!(e);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("env".into(), json!(d.env));
+                o.insert("resource".into(), json!(d.resource));
+                o.insert("cache".into(), json!(d.cache));
+                o.insert("level".into(), json!(d.level));
+            }
+            v
+        })
+        .collect();
+
     // Fleet aggregation: requests are recorded on the node that SERVES them, so a
     // project placed on a peer logs there, not here. Merge in the relevant peers'
     // events (scoped to the same project/search, `local=true` to avoid recursion),
     // then sort newest-first and truncate.
-    let mut out: Vec<Value> = evs.into_iter().map(|e| json!(e)).collect();
     if !q.local.unwrap_or(false) {
-        let qs = {
-            let mut s = format!("limit={}&local=true", limit);
-            if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
-                s.push_str(&format!("&project={}", urlencode(p)));
-            }
-            if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
-                s.push_str(&format!("&deployment={}", urlencode(d)));
-            }
-            if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
-                s.push_str(&format!("&q={}", urlencode(qq)));
-            }
-            s
-        };
+        let qs = logs_fanout_qs(&q, fetch, since_ms, until_ms);
         // A project filter targets just its host node(s); otherwise pull from every
         // peer hosting one of this tenant's projects. Address by NODE (not HTTP admin
         // URL) and go through `fetch_from_host`, which falls back to the iroh mesh —
@@ -9340,11 +9677,35 @@ pub(crate) async fn logs(
         };
         for node in nodes {
             if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/logs?{qs}"), &t).await {
+                // A peer that refused (plan gate / bad filter) answers with an
+                // error envelope — surface it instead of merging an empty array
+                // and looking like "no logs".
+                if v.get("error").is_some() {
+                    let st = v
+                        .get("error")
+                        .and_then(|e| e.get("status"))
+                        .and_then(|s| s.as_u64())
+                        .and_then(|s| StatusCode::from_u16(s as u16).ok())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Err((st, v.to_string()));
+                }
                 if let Some(arr) = v.as_array() {
                     out.extend(arr.iter().cloned());
                 }
             }
         }
+        // Stable newest-first, then a deterministic tie-break so paging with
+        // equal timestamps does not reshuffle between pages.
+        out.sort_by(|a, b| {
+            let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+            ts(b)
+                .cmp(&ts(a))
+                .then_with(|| a.get("host").and_then(|x| x.as_str()).unwrap_or("")
+                    .cmp(b.get("host").and_then(|x| x.as_str()).unwrap_or("")))
+                .then_with(|| a.get("path").and_then(|x| x.as_str()).unwrap_or("")
+                    .cmp(b.get("path").and_then(|x| x.as_str()).unwrap_or("")))
+        });
+    } else {
         out.sort_by(|a, b| {
             b.get("ts_ms")
                 .and_then(|x| x.as_u64())
@@ -9352,8 +9713,67 @@ pub(crate) async fn logs(
                 .cmp(&a.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0))
         });
     }
-    out.truncate(limit);
-    Json(json!(out))
+    let total = out.len();
+    let has_more = total > offset + limit;
+    let out: Vec<Value> = out.into_iter().skip(offset).take(limit).collect();
+
+    let mut hdrs = HeaderMap::new();
+    logs_hdr(&mut hdrs, "x-hive-logs-limit", limit);
+    logs_hdr(&mut hdrs, "x-hive-logs-offset", offset);
+    logs_hdr(&mut hdrs, "x-hive-logs-returned", out.len());
+    logs_hdr(&mut hdrs, "x-hive-logs-total", total);
+    logs_hdr(&mut hdrs, "x-hive-logs-has-more", if has_more { "1" } else { "0" });
+    logs_hdr(&mut hdrs, "x-hive-logs-oldest-ms", c.events_oldest_ms());
+    if since_ms > 0 {
+        logs_hdr(&mut hdrs, "x-hive-logs-since-ms", since_ms);
+    }
+    if until_ms != u64::MAX {
+        logs_hdr(&mut hdrs, "x-hive-logs-until-ms", until_ms);
+    }
+    if let Some(r) = range_name.as_deref() {
+        logs_hdr(&mut hdrs, "x-hive-logs-range", r);
+    }
+    Ok((hdrs, Json(json!(out))))
+}
+
+/// The query string the coordinator sends to each peer. EVERY filter above must
+/// appear here or it works on the owner node and silently returns unfiltered
+/// data everywhere else — which is the bug class being fixed. `range=` is
+/// deliberately NOT forwarded (it is resolved to absolute bounds first, so a
+/// peer cannot widen the window by re-resolving it against its own clock), and
+/// `offset=` is not forwarded either (paging happens once, after the merge).
+fn logs_fanout_qs(q: &LogsQ, fetch: usize, since_ms: u64, until_ms: u64) -> String {
+    let mut s = format!("limit={fetch}&local=true");
+    if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
+        s.push_str(&format!("&project={}", urlencode(p)));
+    }
+    if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
+        s.push_str(&format!("&deployment={}", urlencode(d)));
+    }
+    if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
+        s.push_str(&format!("&q={}", urlencode(qq)));
+    }
+    if since_ms > 0 {
+        s.push_str(&format!("&since_ms={since_ms}"));
+    }
+    if until_ms != u64::MAX {
+        s.push_str(&format!("&until_ms={until_ms}"));
+    }
+    for (k, v) in [
+        ("status", q.status.as_deref()),
+        ("method", q.method.as_deref()),
+        ("host", q.host.as_deref()),
+        ("route", q.route.as_deref()),
+        ("level", q.level.as_deref()),
+        ("cache", q.cache.as_deref()),
+        ("env", q.env.as_deref()),
+        ("resource", q.resource.as_deref()),
+    ] {
+        if let Some(v) = v.map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            s.push_str(&format!("&{k}={}", urlencode(v)));
+        }
+    }
+    s
 }
 
 // ---- WAF ----

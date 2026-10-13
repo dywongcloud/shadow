@@ -13,11 +13,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 
 use crate::state::CloudState;
 
 fn jb(j: axum::Json<serde_json::Value>) -> Vec<u8> {
     serde_json::to_vec(&j.0).unwrap_or_default()
+}
+
+/// Same as [`jb`] for a fallible handler: the error side is serialized as a
+/// `{"error": {...}}` envelope carrying the HTTP status, so a peer's refusal
+/// (plan gate, malformed filter) reaches the coordinator as a refusal instead
+/// of an empty array that reads as "no logs".
+fn jb_logs(
+    r: Result<(HeaderMap, axum::Json<serde_json::Value>), (StatusCode, String)>,
+) -> Vec<u8> {
+    match r {
+        Ok((_hdrs, j)) => jb(j),
+        Err((st, msg)) => {
+            let body = serde_json::from_str::<serde_json::Value>(&msg).unwrap_or_else(|_| {
+                serde_json::json!({ "error": { "code": "LOGS_ERROR", "message": msg } })
+            });
+            let mut v = body;
+            if let Some(o) = v.get_mut("error").and_then(|e| e.as_object_mut()) {
+                o.insert("status".into(), serde_json::json!(st.as_u16()));
+            }
+            serde_json::to_vec(&v).unwrap_or_default()
+        }
+    }
 }
 
 /// Whether iroh is the preferred gossip transport (opt-in; HTTP-over-SSH otherwise).
@@ -1264,13 +1287,17 @@ async fn dispatch_verified(
         // Request/routing event log: recorded on the SERVING node, so the coordinator
         // proxies here to read a placed project's logs. `local=true` rides in the query
         // so this node returns only its own events (no re-fan-out → no loop).
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => jb(crate::admin::logs(
-            State(cloud.clone()),
-            team_headers(p),
-            team_claims(p),
-            logs_query(p),
-        )
-        .await),
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
+            jb_logs(
+                crate::admin::logs(
+                    State(cloud.clone()),
+                    team_headers(p),
+                    team_claims(p),
+                    logs_query(p),
+                )
+                .await,
+            )
+        }
         // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY
         // its own jobs (local=true) for the requesting team. Same tenant-scoped
         // shape as /v1/logs above.
@@ -1855,23 +1882,83 @@ fn mesh_tenant(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LimitQ> {
-    axum::extract::Query(crate::admin::LimitQ {
+/// Reconstruct the logs `Query<LogsQ>` from a dispatched path's query string.
+/// EVERY field `admin::LogsQ` declares must be mirrored here: a parameter the
+/// mesh arm does not read is a parameter the peer never applies, so the filter
+/// works on the owner node and silently returns unfiltered rows on every other
+/// node — the exact bug class this endpoint is being fixed for.
+fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LogsQ> {
+    axum::extract::Query(crate::admin::LogsQ {
         limit: qparam(path, "limit").and_then(|v| v.parse().ok()),
         project: qparam(path, "project"),
         deployment: qparam(path, "deployment"),
         q: qparam(path, "q"),
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
+        // `range=` is intentionally NOT forwarded by the coordinator (it sends
+        // resolved absolute bounds), but it is parsed here so a direct mesh
+        // dispatch that still carries one is honoured rather than ignored.
+        range: qparam(path, "range"),
+        since_ms: qparam(path, "since_ms").and_then(|v| v.parse().ok()),
+        until_ms: qparam(path, "until_ms").and_then(|v| v.parse().ok()),
+        status: qparam(path, "status"),
+        method: qparam(path, "method"),
+        host: qparam(path, "host"),
+        route: qparam(path, "route"),
+        level: qparam(path, "level"),
+        cache: qparam(path, "cache"),
+        env: qparam(path, "env"),
+        resource: qparam(path, "resource"),
+        // `offset` is coordinator-only (paging happens once, after the merge),
+        // so it is deliberately not read here.
+        offset: None,
+        cursor: None,
     })
 }
 
-/// Pull a query-string value (`?k=v&...`) out of a dispatched path.
+/// Pull a query-string value (`?k=v&...`) out of a dispatched path, percent-
+/// decoded. Decoding matters: the coordinator URL-encodes every filter value
+/// (`urlencode`), so a `route=/api/x` or `status=404,5xx` would otherwise
+/// arrive here as `route=%2Fapi%2Fx` and silently match nothing.
 fn qparam(path: &str, key: &str) -> Option<String> {
     let q = path.split_once('?')?.1;
     q.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        (k == key).then(|| v.to_string())
+        (k == key).then(|| percent_decode(v))
     })
+}
+
+/// Minimal percent-decoder (`+` is left literal: query strings here are built
+/// by `urlencode`, which escapes spaces as `%20`). Invalid sequences decode to
+/// `U+FFFD` rather than failing, so a malformed value can never make a whole
+/// dispatch unparseable.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    if !b.contains(&b'%') {
+        return s.to_string();
+    }
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hexval(b[i + 1]), hexval(b[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hexval(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Splits a dispatched `/v1/projects/<project>/sandboxes[/<rest>]` path (query

@@ -46,6 +46,7 @@ mod drive_webdav;
 mod edge;
 mod enterprise;
 mod enterprise_api;
+mod event_log;
 mod geoip;
 mod git;
 mod github_app_auth;

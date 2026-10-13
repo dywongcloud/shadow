@@ -1,6 +1,5 @@
 //! Shared state for a hive-cloud node: every platform subsystem in one place.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use fluid_compute::Fluid;
@@ -12,7 +11,7 @@ use hive_edge::{
     RateLimiter, Router, RuntimeCache, Waf, WorkflowEngine,
 };
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A peer node that serves a given deployment (for mesh routing/load-balancing).
 #[derive(Clone, Serialize)]
@@ -94,7 +93,12 @@ pub fn merge_deployments_ttl(
 }
 
 /// One observed request/event, for the dashboard's live log + analytics.
-#[derive(Clone, Serialize)]
+///
+/// Also the unit of the DURABLE history (`crate::event_log`): this struct is
+/// what is appended to the day-rotated JSONL log, so it round-trips through
+/// JSON. New fields MUST keep `#[serde(default)]` — older day-files on disk
+/// have fewer keys and must still deserialize.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub ts_ms: u64,
     pub region: String,
@@ -367,7 +371,11 @@ pub struct CloudState {
     /// without touching team ownership.
     pub admin_emails: Vec<String>,
 
-    events: Mutex<VecDeque<Event>>,
+    /// Request-event history: a hot in-memory ring (the bounded default poll)
+    /// plus a durable day-rotated JSONL log that is what makes a ranged
+    /// `/v1/logs` query reach further back than the ring. See
+    /// [`crate::event_log`].
+    event_log: crate::event_log::EventLog,
     req_count: Mutex<u64>,
     blocked_count: Mutex<u64>,
 }
@@ -888,7 +896,9 @@ impl CloudState {
             firecracker,
             owner_email,
             admin_emails,
-            events: Mutex::new(VecDeque::with_capacity(512)),
+            event_log: crate::event_log::EventLog::new(
+                crate::event_log::data_subdir(&crate::persist::data_dir()),
+            ),
             req_count: Mutex::new(0),
             blocked_count: Mutex::new(0),
         });
@@ -1040,16 +1050,34 @@ impl CloudState {
             crate::admin::norm(&self.projects.team_of(&ev.project)).to_string()
         };
         self.metrics.record(&ev, &mtenant);
-        let mut q = self.events.lock();
-        if q.len() >= 500 {
-            q.pop_front();
-        }
-        q.push_back(ev);
+        self.event_log.append(ev);
     }
 
+    /// Newest-first events, bounded by `limit`. Serves the unbounded (default
+    /// poll) case straight out of the ring — no disk.
     pub fn recent_events(&self, limit: usize) -> Vec<Event> {
-        let q = self.events.lock();
-        q.iter().rev().take(limit).cloned().collect()
+        self.event_log.recent(limit)
+    }
+
+    /// Filtered query over the full retained history. A window the ring does
+    /// not cover is read from the durable JSONL log; the caller is responsible
+    /// for running this off a serving tokio worker (see `admin::logs`).
+    pub fn query_events(
+        &self,
+        f: &crate::event_log::EventFilter,
+        facts: &crate::event_log::DeployFacts,
+    ) -> Vec<Event> {
+        self.event_log.query(f, facts)
+    }
+
+    /// Oldest event this node can still answer for (0 when unknown).
+    pub fn events_oldest_ms(&self) -> u64 {
+        self.event_log.oldest_ms()
+    }
+
+    /// Reap day-files past retention. Called on boot and on day rotation.
+    pub fn sweep_event_log(&self) {
+        self.event_log.sweep();
     }
 
     pub fn counters(&self) -> (u64, u64) {

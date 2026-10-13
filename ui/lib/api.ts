@@ -537,6 +537,49 @@ const CONFIG_PATHS =
   /^\/v1\/(projects\/(?![^/]+\/sandboxes(?:\/|$))|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy|deploy\/(image|zip)|enterprise\/|routing|webhooks|domains|cron)/;
 const GITOPS_BADGE = "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
 
+/** A server refusal carrying the typed envelope the API returns, so the logs
+ * view can render a real reason ("PLAN_UPGRADE_REQUIRED") instead of
+ * "GET ... -> 402". */
+export class ApiError extends Error {
+  status: number;
+  code: string;
+  constructor(status: number, message: string, code = "") {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export interface LogsPage {
+  rows: Event[];
+  /** Rows matched before the current page's offset/limit slice. */
+  total: number;
+  hasMore: boolean;
+  /** Oldest event this node still holds — the real floor of the history. */
+  oldestMs: number;
+}
+
+/**
+ * `/v1/logs` reader that also reads the response's pagination headers. The row
+ * shape stays a plain `Event[]`; the paging metadata rides in headers so every
+ * existing caller of the array contract is unaffected.
+ */
+export async function apiGetLogs(path: string): Promise<LogsPage> {
+  const r = await fetchWithTimeout(`${BASE}${path}`, { cache: "no-store", headers: teamHeaders() }, 20_000);
+  const body = (await r.json().catch(() => null)) as unknown;
+  if (!r.ok) {
+    const e = (body as { error?: { code?: string; message?: string } } | null)?.error;
+    throw new ApiError(r.status, e?.message || `GET ${path} -> ${r.status}`, e?.code || "");
+  }
+  const num = (k: string) => Number(r.headers.get(k) || 0);
+  return {
+    rows: Array.isArray(body) ? (body as Event[]) : [],
+    total: num("x-hive-logs-total"),
+    hasMore: r.headers.get("x-hive-logs-has-more") === "1",
+    oldestMs: num("x-hive-logs-oldest-ms"),
+  };
+}
+
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetchWithTimeout(`${BASE}${path}`, {
     method,
@@ -910,6 +953,17 @@ export interface Event {
   /** Exact deployment the request host aliased to at record time (empty when
    * the host resolved to no deployment) — scopes the deployment-detail logs. */
   deployment?: string;
+  /** Derived server-side (see the `/v1/logs` handler): which build environment
+   * the request's deployment targets — "production" | "preview", empty when the
+   * event cannot be joined to a deployment. */
+  env?: string;
+  /** Derived: "static" | "function" | "fullstack". */
+  resource?: string;
+  /** Derived: "hit" | "miss" | "stale" | "store" | "revalidate". */
+  cache?: string;
+  /** Derived severity: "info" | "warning" | "error" | "fatal". */
+  level?: string;
+  request_id?: string;
 }
 
 export interface WafRule {
