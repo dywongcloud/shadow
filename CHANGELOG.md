@@ -28,15 +28,30 @@ private mount namespace (host file untouched) and green after
   `src/` — so `examples/node` (a bare `http.createServer`, no framework
   dependency, no start script) is served instead of shipped as a Static site
   that answered `NOT_FOUND` after a successful install.
-- **Audits**: new `scripts/audit-build-registry.sh` (DNS/TCP/HTTP of each
-  node's configured registry plus its resolvers); `audit-public-listeners.sh`
-  no longer reports `NONE!` for a live nft-adopted `ip filter HIVE_LOCKDOWN`
-  chain (iptables refuses the whole table once a native nft rule is in it),
-  skips `hive_retired` hosts (matching the roster generator) and reports
-  non-root-ssh hosts as SKIPPED. Findings still open: all five live nodes
-  enforce a 6-peer lockdown roster against 7 expected (fc-orlando missing),
-  and the nft-first `hive-lockdown.sh` does not retire a legacy `ip filter`
-  chain when it rolls.
+- **Audits**: new `scripts/audit-build-registry.sh` (DNS/TCP/HEAD of each
+  node's configured registry plus its resolvers — a HEAD, because the Tencent
+  mirror ignores `Range` and a GET pulls the 21 MB packument; 2xx/3xx/401/403
+  all count as "answers"; IP-literal and userinfo registries handled; a node
+  without npm is its own finding). `audit-public-listeners.sh` reads every
+  lockdown LAYER through nft (the legacy `ip filter HIVE_LOCKDOWN` chain and
+  the `inet hive_lockdown` table), compares each layer's peers with the live
+  inventory as a SET (names the missing and extra addresses, never a count),
+  flags a node carrying both layers, skips `hive_retired` hosts like the
+  roster generator, and fails closed: a mistyped `ONLY`, an empty selection
+  or a host it cannot audit (non-root ssh) is never a green verdict
+  (`ALLOW_SKIPPED=1` accepts the latter). Live finding: every node enforces a
+  6-peer roster against 7 expected — fc-orlando (209.23.0.183) is missing
+  from all five.
+- **`hive-lockdown.sh` retires the legacy chain.** The nft-first branch left
+  the iptables-era `ip filter HIVE_LOCKDOWN` chain in place beside the new
+  table; both hook INPUT, so the effective policy was their intersection and
+  a peer added to the roster stayed dropped by the stale chain while the audit
+  read the new table as healthy (reproduced in scratch network namespaces).
+  After the new table is live the script deletes every `jump HIVE_LOCKDOWN`
+  from the vendor table, flushes and deletes the chain, and fails loudly if
+  it survives; a host without the chain is untouched (idempotent, verified in
+  the same namespaces for the sj/va/va3 shape, the phoenix shape, a re-run,
+  and a chain entered from two jump rules). Rolling it is the operator's call.
 - Needs a fleet roll to take effect (backend only; `ui/` is unaffected).
 
 ## 2026-09-24 — CS-7 gossip rounds never wait on dead peers

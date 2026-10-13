@@ -77,6 +77,25 @@ if command -v nft >/dev/null 2>&1; then
   nft add rule inet hive_lockdown input iif lo accept
   nft add rule inet hive_lockdown input ip saddr "{ $PEERS_NFT }" accept
   nft add rule inet hive_lockdown input tcp dport "{ $PORTS_NFT }" drop
+  # Retire the legacy iptables-nft era chain, AFTER the table above is live so
+  # there is never a window without a lockdown. Hosts hardened before the
+  # nft-first reorder carry `chain HIVE_LOCKDOWN` inside the vendor `ip filter`
+  # table, entered by a `jump HIVE_LOCKDOWN` from INPUT. Left in place it keeps
+  # enforcing its OLD roster beside the new table: both hook INPUT, so the
+  # effective policy is their INTERSECTION and a peer added to $PEERS is still
+  # dropped by the stale chain (reproduced in a scratch netns, 2026-10-13: a new
+  # peer timed out on 8787 while the audit read the new roster as healthy).
+  nft -a list table ip filter 2>/dev/null | awk '
+    /^[ \t]*chain / { chain = $2 }
+    /jump HIVE_LOCKDOWN/ { for (i = 1; i <= NF; i++) if ($i == "handle") print chain, $(i + 1) }
+  ' | while read -r legacy_chain legacy_handle; do
+    nft delete rule ip filter "$legacy_chain" handle "$legacy_handle"
+  done
+  if nft list chain ip filter HIVE_LOCKDOWN >/dev/null 2>&1; then
+    nft flush chain ip filter HIVE_LOCKDOWN && nft delete chain ip filter HIVE_LOCKDOWN \
+      || { echo "ERROR: legacy ip filter HIVE_LOCKDOWN chain could not be retired" >&2; exit 1; }
+    echo "retired the legacy ip filter HIVE_LOCKDOWN chain"
+  fi
   echo "lockdown applied via nftables"
 elif command -v iptables >/dev/null 2>&1; then
   iptables -D INPUT -j HIVE_LOCKDOWN 2>/dev/null || true
