@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/dywongcloud/shadow/main/schemas/shadw.schema.json",
+  "title": "shadw.yml",
+  "description": "Shadw project deployment config (v1). Maps onto POST /v1/git/deploy.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "root_dir": {
+      "type": "string",
+      "not": {
+        "pattern": "(^/|(^|/)\\.\\.(/|$))"
+      }
+    },
+    "branch": {
+      "type": "string",
+      "description": "Pin a branch; default is the branch that triggered the workflow."
+    },
+    "target": {
+      "enum": [
+        "auto",
+        "production",
+        "preview"
+      ],
+      "default": "auto"
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cache": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "env": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wait": {
+          "type": "boolean",
+          "default": true
+        },
+        "timeout_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "default": 20
+        }
+      }
+    }
+  },
+  "required": [
+    "version"
+  ]
+}
