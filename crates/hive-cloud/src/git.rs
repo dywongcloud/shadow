@@ -10388,7 +10388,7 @@ impl IsolatedBuild {
         bid: &str,
         env: &std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<i32> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::BufReader;
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
         // POSIX `sh -c script [name [args...]]`: the FIRST word after the
@@ -10465,9 +10465,12 @@ impl IsolatedBuild {
         let cloud_out = cloud.clone();
         let stdout_task = tokio::spawn(async move {
             if let Some(stdout) = stdout {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    cloud_out.builds.log(&bid_out, format!("  {line}"));
+                let mut reader = BufReader::new(stdout);
+                while let Ok(Some(line)) =
+                    hive_core::logcap::read_capped_line(&mut reader, hive_core::MAX_LOG_LINE_BYTES)
+                        .await
+                {
+                    cloud_out.builds.log(&bid_out, format!("  {}", line.text));
                 }
             }
         });
@@ -10475,9 +10478,14 @@ impl IsolatedBuild {
         let cloud_err = cloud.clone();
         let stderr_task = tokio::spawn(async move {
             if let Some(stderr) = stderr {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    cloud_err.builds.log(&bid_err, format!("  stderr: {line}"));
+                let mut reader = BufReader::new(stderr);
+                while let Ok(Some(line)) =
+                    hive_core::logcap::read_capped_line(&mut reader, hive_core::MAX_LOG_LINE_BYTES)
+                        .await
+                {
+                    cloud_err
+                        .builds
+                        .log(&bid_err, format!("  stderr: {}", line.text));
                 }
             }
         });
