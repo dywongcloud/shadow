@@ -908,8 +908,8 @@ struct Authorized {
     /// The complete serve set (empty = no serve lane).
     serves: Vec<ServeGrant>,
     /// The deployment the DATABASE grant resolves against, or empty: explicit when the donor named
-    /// one, the tenant's single opted-in project in auto mode, never an arbitrary pick among
-    /// several (see `browser_db::auto_db_deployment_for_tenant`).
+    /// one; in auto mode the tenant's opted-in project, rendezvous-hashed by the browser's endpoint
+    /// id when there are several (see `browser_db::auto_db_deployment_for_tenant`).
     db_deployment: String,
     /// True when the set was derived automatically rather than pinned.
     auto: bool,
