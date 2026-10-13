@@ -662,7 +662,16 @@ impl EventLog {
                     out.push(e);
                 }
             }
-            if day == first {
+            // `<=` and not `==`: `first` is derived from `since_ms`, which is
+            // caller-supplied. A `since_ms` past `now` (or past `until_ms`)
+            // makes `first > last`, so an equality test would never match and
+            // the decrement below would run off the bottom of u64 -- a panic
+            // under overflow-checks, and under release (no overflow-checks) a
+            // wrap to u64::MAX that spins this loop ~2^64 times inside
+            // block_in_place, hanging a tokio worker permanently. Bailing out
+            // as soon as `day` reaches (or is already below) `first` keeps the
+            // walk bounded for every possible input.
+            if day <= first {
                 return;
             }
             day -= 1;
