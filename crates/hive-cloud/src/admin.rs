@@ -14096,8 +14096,12 @@ async fn wqueue_enqueue(
     Ok(Json(json!({ "message_id": id })))
 }
 
-async fn wqueue_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(c.world_queue.stats())
+async fn wqueue_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(c.world_queue.stats()))
 }
 
 // ---- Pub/Sub + Realtime (WebSocket secure streaming) ----
