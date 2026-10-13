@@ -1,16 +1,5 @@
-//! Bot management — classify traffic by User-Agent and apply a policy.
-//!
-//! Beyond human / good-bot / bad-bot, we recognize the **three types of AI bot
-//! traffic** (per Vercel's taxonomy) and let each be allowed, logged, or blocked
-//! independently:
-//!
-//! 1. **AI crawlers** — train/index models by scraping content in bulk, not tied
-//!    to any user request (GPTBot, ClaudeBot, CCBot, Google-Extended, Bytespider…).
-//! 2. **AI assistants** — fetch a page in real time to answer a user's prompt,
-//!    often sending referral traffic back (ChatGPT-User, OAI-SearchBot,
-//!    Perplexity-User…).
-//! 3. **AI agents** — act autonomously on a user's behalf (browse, click, buy);
-//!    they can mutate state, so they warrant verification (Operator, ChatGPT-Agent…).
+//! Bot management — classify traffic by User-Agent and apply a per-class policy; AI traffic
+//! splits into crawlers, assistants and agents (`AiKind`), each with its own action.
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -73,8 +62,6 @@ impl Default for BotPolicy {
         BotPolicy {
             allow_good: true,
             block_bad: true,
-            // Sensible defaults from the article: don't block assistants (they
-            // bring referral traffic); log crawlers + agents so you can decide.
             ai_crawler: Action::Log,
             ai_assistant: Action::Allow,
             ai_agent: Action::Log,
@@ -101,10 +88,7 @@ impl BotManager {
     pub fn new() -> BotManager {
         let g = |p: &str| Regex::new(p).unwrap();
         BotManager {
-            // AI bots are matched FIRST so they aren't swept up by the generic
-            // "bot|crawler" rule below.
             ai: vec![
-                // 1) Crawlers (training / indexing).
                 (g(r"(?i)gptbot"), "GPTBot", AiKind::Crawler),
                 (g(r"(?i)oai-searchbot"), "OAI-SearchBot", AiKind::Crawler),
                 (
@@ -136,7 +120,6 @@ impl BotManager {
                     "AICrawler",
                     AiKind::Crawler,
                 ),
-                // 2) Assistants (real-time fetch to answer a user).
                 (g(r"(?i)chatgpt-user"), "ChatGPT-User", AiKind::Assistant),
                 (
                     g(r"(?i)perplexity-user"),
@@ -145,7 +128,6 @@ impl BotManager {
                 ),
                 (g(r"(?i)claude-user"), "Claude-User", AiKind::Assistant),
                 (g(r"(?i)gemini-user"), "Gemini-User", AiKind::Assistant),
-                // 3) Autonomous agents (take actions).
                 (
                     g(r"(?i)(chatgpt-agent|openai-operator|\boperator\b)"),
                     "AI-Agent",

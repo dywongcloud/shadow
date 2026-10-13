@@ -1,6 +1,5 @@
-//! Web Application Firewall — a custom rule engine plus a managed ruleset for
-//! common attack signatures (SQLi / XSS / path traversal). Modeled on Vercel's
-//! WAF: ordered rules with allow/deny/log actions evaluated at the edge.
+//! Web Application Firewall: ordered custom rules (allow/deny/log) plus managed SQLi/XSS/path
+//! traversal signatures, evaluated at the edge.
 
 use parking_lot::RwLock;
 use regex::Regex;
@@ -31,6 +30,16 @@ pub struct WafMatch {
     pub header_contains: Option<(String, String)>,
     /// Substring that must appear in path+query (case-insensitive).
     pub contains: Option<String>,
+}
+
+impl WafMatch {
+    fn has_any_condition(&self) -> bool {
+        self.path_regex.is_some()
+            || self.method.is_some()
+            || self.ip_prefix.is_some()
+            || self.header_contains.is_some()
+            || self.contains.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,7 +79,6 @@ struct Compiled {
 pub struct Waf {
     inner: RwLock<Vec<Compiled>>,
     managed: RwLock<bool>,
-    // Managed signature regexes.
     sqli: Regex,
     xss: Regex,
     traversal: Regex,
@@ -199,12 +207,7 @@ fn matches(c: &Compiled, ctx: &RequestCtx, target: &str) -> bool {
             return false;
         }
     }
-    // A rule with no conditions matches nothing (avoid accidental allow-all).
-    m.path_regex.is_some()
-        || m.method.is_some()
-        || m.ip_prefix.is_some()
-        || m.header_contains.is_some()
-        || m.contains.is_some()
+    m.has_any_condition()
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
-//! Cron — scheduled function invocations. Jobs hold a standard cron expression;
-//! `tick` returns the jobs due now and advances their next run. The host wires
-//! each due job to an actual function invocation.
+//! Scheduled function invocations: jobs hold a cron expression, `tick` returns the jobs due now
+//! and advances their next run; the host runs each one.
 
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
@@ -26,9 +25,8 @@ pub struct CronJob {
     pub next_run_ms: Option<u64>,
     #[serde(default)]
     pub runs: u64,
-    /// Where the job came from: `"manual"` (created via the API/UI) or
-    /// `"vercel.json"` (declared in a deployment's config). Used to replace the
-    /// config-sourced set on each deploy without touching manual jobs.
+    /// `"manual"` (API/UI) or `"vercel.json"` (deployment config); the config-sourced set is
+    /// replaced per deploy without touching manual jobs.
     #[serde(default = "default_cron_source")]
     pub source: String,
     /// Owning team/tenant slug (empty = "personal" for jobs persisted before
@@ -53,7 +51,6 @@ impl CronScheduler {
     }
 
     pub fn add(&self, mut job: CronJob) -> Result<CronJob, String> {
-        // Validate + compute the first next_run.
         let next = next_after(&job.schedule, now_ms())
             .ok_or_else(|| format!("invalid cron expression: {}", job.schedule))?;
         job.next_run_ms = Some(next);
@@ -65,10 +62,8 @@ impl CronScheduler {
         self.jobs.write().retain(|j| j.id != id);
     }
 
-    /// Replace the set of jobs for a `(deployment, source)` pair with `jobs`
-    /// (computing each one's first run). Used to register a deployment's
-    /// `vercel.json` crons on deploy without disturbing manually-created jobs.
-    /// Invalid expressions are skipped. Returns the number registered.
+    /// Replace the jobs of a `(deployment, source)` pair, computing each first run; invalid
+    /// expressions are skipped. Returns the number registered.
     pub fn set_source_jobs(&self, deployment: &str, source: &str, jobs: Vec<CronJob>) -> usize {
         let mut g = self.jobs.write();
         g.retain(|j| !(j.deployment == deployment && j.source == source));
@@ -87,13 +82,8 @@ impl CronScheduler {
         self.jobs.read().clone()
     }
 
-    /// Wholesale-replace the job set, DEDUPED by id (first occurrence wins),
-    /// preserving each job's own schedule bookkeeping verbatim. Restore-from-
-    /// snapshot must use this rather than `add()` in a loop: `add()` pushes
-    /// unconditionally, so restoring a snapshot that already carried a job (and
-    /// every prior restart re-persisted it) duplicated it every boot — the live
-    /// bug that left `vc-shoomoo-0` present 3× on a node and fired it 3× per
-    /// schedule. Deduping here converges the store on the next restart.
+    /// Wholesale-replace the job set, deduped by id (first occurrence wins), keeping each job's
+    /// schedule bookkeeping; snapshot restore uses this, never `add()` in a loop.
     pub fn replace_all(&self, jobs: Vec<CronJob>) {
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<CronJob> = jobs
@@ -103,9 +93,8 @@ impl CronScheduler {
         *self.jobs.write() = deduped;
     }
 
-    /// Recompute every job's `next_run_ms` from its schedule expression.
-    /// Called after restore to derive schedule state from the persisted
-    /// config (telemetry fields `last_run_ms`/`runs` are left at zero).
+    /// Recompute every job's `next_run_ms` from its expression (after restore; `last_run_ms`/`runs`
+    /// stay zero).
     pub fn recompute_all(&self) {
         let now = now_ms();
         let mut jobs = self.jobs.write();
@@ -119,10 +108,8 @@ impl CronScheduler {
         self.jobs.read().iter().find(|j| j.id == id).cloned()
     }
 
-    /// Record a manual (out-of-band) run's bookkeeping — bumps `runs` and
-    /// `last_run_ms` WITHOUT touching `next_run_ms`, since an ad-hoc trigger
-    /// (the dashboard's "Run" button) doesn't affect the job's own schedule.
-    /// Returns the job's updated state, or `None` if no such job exists.
+    /// Record an out-of-band run: bumps `runs`/`last_run_ms` without touching `next_run_ms`.
+    /// `None` if no such job exists.
     pub fn record_manual_run(&self, id: &str, now: u64) -> Option<CronJob> {
         let mut jobs = self.jobs.write();
         let job = jobs.iter_mut().find(|j| j.id == id)?;
@@ -164,14 +151,8 @@ impl Default for CronScheduler {
     }
 }
 
-/// Normalize a cron expression to the 6-field (seconds-first) form the `cron`
-/// crate requires. Standard 5-field cron (`min hour dom month dow` — the
-/// POSIX/Vercel spec `vercel.json` "crons" actually declare, e.g. `"0 0 * * *"`
-/// or `"*/5 * * * *"`) has no seconds field at all; without this, EVERY
-/// `vercel.json`-declared cron job failed to parse and was silently dropped
-/// (`set_source_jobs` skips jobs `next_after` can't compute a first run for).
-/// A 6-or-7-field expression (this platform's own native/manual-job format)
-/// passes through unchanged.
+/// Normalize a 5-field (POSIX/`vercel.json`) expression to the 6-field seconds-first form the
+/// `cron` crate requires; 6/7-field expressions pass through unchanged.
 fn normalize(expr: &str) -> String {
     let fields = expr.split_whitespace().count();
     if fields == 5 {

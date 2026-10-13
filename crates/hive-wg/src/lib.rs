@@ -1,14 +1,6 @@
-//! `hive-wg` — ephemeral WireGuard-style secure tunnels for secure compute.
-//!
-//! Lets a build/function reach a **private backend** (a customer DB in a VPC)
-//! over an encrypted tunnel whose keys are short-lived and minted on demand by a
-//! **Key Exchange Service (KES)** — the pattern Vercel's Hive uses to cut
-//! secure-connection setup from ~90s to ~5s (no long-lived secrets baked into
-//! images).
-//!
-//! The datapath uses WireGuard's exact handshake —
-//! `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` — via the `snow` Noise framework,
-//! running fully in userspace (no kernel module or `wg` tooling).
+//! Ephemeral WireGuard-style tunnels for secure compute: a build/function reaches a private
+//! backend over a userspace `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` tunnel (via `snow`) whose
+//! short-lived keys a Key Exchange Service mints on demand.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -137,10 +129,8 @@ impl Default for Kes {
     }
 }
 
-/// An established secure tunnel between a connector and the gateway side. Both
-/// transport endpoints run in-process here so we can prove the encrypted
-/// datapath end to end; in a distributed deployment the two sides sit on
-/// different nodes over UDP.
+/// An established tunnel between connector and gateway; both endpoints run in-process here to
+/// prove the encrypted datapath.
 pub struct SecureLink {
     initiator: TransportState,
     responder: TransportState,
@@ -204,14 +194,12 @@ impl SecureLink {
         let mut b2 = vec![0u8; 1024];
         let mut tmp = vec![0u8; 1024];
 
-        // -> e, es, s, ss
         let n = initiator
             .write_message(&[], &mut b1)
             .map_err(|e| format!("msg1 write: {e}"))?;
         responder
             .read_message(&b1[..n], &mut tmp)
             .map_err(|e| format!("msg1 read: {e}"))?;
-        // <- e, ee, se, psk
         let n = responder
             .write_message(&[], &mut b2)
             .map_err(|e| format!("msg2 write: {e}"))?;

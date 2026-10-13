@@ -1,7 +1,5 @@
-//! L7 DDoS mitigation — a per-client-IP sliding-window rate limiter that runs at
-//! the edge *before* the compute layer, so floods are shed cheaply (429) without
-//! ever leasing a function instance. Complements the per-region burst limiter
-//! (which bounds total concurrency) by bounding any single source.
+//! Per-client-IP sliding-window rate limiter run at the edge before compute (429), bounding any
+//! single source alongside the per-region burst limiter.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -9,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use serde::Serialize;
+
+const MAX_TRACKED_IPS: usize = 50_000;
 
 pub struct RateLimiter {
     enabled: AtomicBool,
@@ -48,8 +48,7 @@ impl RateLimiter {
         let limit = self.limit.load(Ordering::Relaxed);
         let cutoff = now_ms.saturating_sub(window);
         let mut map = self.hits.write();
-        // Keep the table bounded under a real flood (many distinct IPs).
-        if map.len() > 50_000 {
+        if map.len() > MAX_TRACKED_IPS {
             map.retain(|_, q| q.back().map(|&t| t > cutoff).unwrap_or(false));
         }
         let q = map.entry(ip.to_string()).or_default();

@@ -1,25 +1,7 @@
-//! The `hive/browser/0` wire contract — one definition, two implementations.
-//!
-//! A browser tab ([`hive-browser`], wasm32) and a fleet node ([`hive-p2p`],
-//! native) both speak this protocol, and they must agree byte-for-byte. They
-//! used to agree by having the same constants typed out twice with a comment
-//! asking future editors to keep them in sync; the first byte added to the
-//! protocol (the op selector below) immediately broke that, because only one of
-//! the two sides learned about it. Everything the two sides must agree on lives
-//! here instead, so drift is a compile error rather than a silent wire bug.
-//!
-//! # Framing
-//!
-//! A request is `[u32 le total_len][op][op_payload]`, where `total_len` counts
-//! the op byte. A reply is `[u32 le len][bytes]` with **no op byte** — the
-//! caller already knows what it asked for, and echoing the op back is precisely
-//! the bug that motivated this crate (a verbatim echo returns the op byte as
-//! part of the reply text).
-//!
-//! Lengths are little-endian here and big-endian on `HIVE_ALPN`'s own
-//! `read_frame`/`write_frame`. That is not an oversight to "fix": these are
-//! separate protocols on separate ALPNs, and quietly changing either one's
-//! endianness breaks every peer already speaking it.
+//! The `hive/browser/0` wire contract shared by the browser tab (`hive-browser`) and fleet nodes
+//! (`hive-p2p`). Request: `[u32 le total_len][op][payload]`; reply: `[u32 le len][bytes]` with no
+//! op byte. Lengths are little-endian here and big-endian on `HIVE_ALPN` — separate protocols,
+//! never unify them.
 
 #![no_std]
 
@@ -28,32 +10,20 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// ALPN for browser-tab peers — a dedicated, low-trust surface, structurally
-/// disjoint from `hive_p2p::HIVE_ALPN`'s gossip/join/raw modes. Connections on
-/// this ALPN never reach that mode-byte dispatch.
+/// ALPN for browser-tab peers — a low-trust surface disjoint from `hive_p2p::HIVE_ALPN`'s
+/// mode-byte dispatch.
 pub const BROWSER_ALPN: &[u8] = b"hive/browser/0";
 
-/// Admission/control version paired with this ALPN generation. Keep it shared
-/// so the PWA and fleet reject skew explicitly instead of duplicating a number.
-/// This is the version THIS build's browser side speaks when making an
-/// admission request — always a single concrete number, never a range (a
-/// build can only ever emit one version of itself).
+/// The single admission/control version THIS build's browser side speaks.
 pub const BROWSER_PROTOCOL_VERSION: u16 = 0;
 
-/// The range of client-declared `protocol_version` values THIS build's
-/// server side will admit (bn-p2p-version-negotiation). Both bounds equal
-/// [`BROWSER_PROTOCOL_VERSION`] today (no rolling-upgrade window open yet) —
-/// widen `..MAX` first on the server fleet during a real protocol bump, THEN
-/// ship the client change, so mid-rollout old clients keep working against
-/// new servers (server-ahead is normal; client-ahead of the whole fleet is
-/// the failure this range exists to reject explicitly rather than silently).
+/// Client `protocol_version` range THIS server build admits; widen `..MAX` on the fleet before
+/// shipping a client bump.
 pub const BROWSER_PROTOCOL_MIN: u16 = 0;
 pub const BROWSER_PROTOCOL_MAX: u16 = 0;
 
-/// Where a client-declared protocol version falls relative to what this
-/// server build accepts — three-way rather than boolean so a caller can
-/// surface "you are outdated, reload" (durable, needs a client fix) distinctly
-/// from "this server hasn't rolled forward yet" (transient, retry as-is).
+/// Where a client version falls relative to this server: outdated-reload and
+/// server-not-rolled-yet are distinct outcomes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProtocolFit {
     /// Below [`BROWSER_PROTOCOL_MIN`] — the client bundle is durably outdated;
@@ -61,9 +31,8 @@ pub enum ProtocolFit {
     TooOld,
     /// Within `[BROWSER_PROTOCOL_MIN, BROWSER_PROTOCOL_MAX]` — accepted.
     Supported,
-    /// Above [`BROWSER_PROTOCOL_MAX`] — the client is ahead of this specific
-    /// server node, which is normal mid-rollout (other nodes may already
-    /// accept it); transient, worth a bounded retry, never a forced reload.
+    /// Above [`BROWSER_PROTOCOL_MAX`] — normal mid-rollout (other nodes may accept it); bounded
+    /// retry, never a forced reload.
     TooNew,
 }
 
@@ -77,29 +46,18 @@ pub const fn protocol_fit(client_version: u16) -> ProtocolFit {
     }
 }
 
-/// Cap on a single request frame — the memory-safety line for any peer serving
-/// untrusted browser traffic. An unbounded read here is a DoS lever, so both
-/// sides check against this before allocating.
+/// Cap on a single request frame, checked by both sides before allocating.
 pub const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
 
-/// Echo is a diagnostic liveness operation, not a bulk transfer path. Keeping
-/// its payload smaller than function/asset frames prevents unauthenticated Echo
-/// traffic from monopolizing browser memory and response bandwidth.
+/// Echo is diagnostic, not bulk transfer; its payload cap stays far below function/asset frames.
 pub const BROWSER_MAX_ECHO: usize = 64 << 10; // 64 KiB
 
-/// Frame cap for [`Op::CrrSync`] — deliberately larger than
-/// [`BROWSER_MAX_FRAME`] because one CRR change value may legally be up to the
-/// deployment's `max_value_bytes` (platform default 1 MiB), and a batch of
-/// bounded changes plus the watermark advertisement must fit alongside it.
-/// This is still a hard memory-safety line: both sides check it BEFORE
-/// allocating the payload buffer, and it sits far below the
-/// `max_value_bytes` CEILING (16 MiB) on purpose — a tenant that raises the
-/// value cap past what a frame can carry gets a typed sync refusal naming the
-/// value, never a silent truncation (docs/browser-db-contract.md §4).
+/// Frame cap for [`Op::CrrSync`]: one CRR value may be up to the deployment's `max_value_bytes`
+/// (default 1 MiB) plus a batch and watermarks, checked BEFORE allocation; a value cap raised
+/// past this gets a typed refusal, never truncation.
 pub const BROWSER_MAX_CRR_FRAME: usize = 4 << 20; // 4 MiB
 
-/// Stream reset codes. Shared so a reset means the same thing on both sides
-/// instead of each end inventing its own numbering.
+/// Stream reset codes shared by both sides.
 pub mod reset {
     /// Peer opened a connection with an ALPN this endpoint does not serve.
     pub const UNEXPECTED_ALPN: u32 = 1;
@@ -115,9 +73,8 @@ pub mod reset {
     /// Handler ran and failed. Distinct from [`MALFORMED_PAYLOAD`] so a caller
     /// can tell "I sent something bad" from "your side broke".
     pub const HANDLER_FAILED: u32 = 6;
-    /// The authenticated endpoint is not granted the requested function digest.
-    /// Kept distinct from [`NO_HANDLER`] so callers cannot confuse policy with a
-    /// deployment/runtime fault.
+    /// The endpoint is not granted the requested function digest — policy, distinct from
+    /// [`NO_HANDLER`].
     pub const FORBIDDEN: u32 = 7;
     /// This browser node has no bounded connection or stream slot available.
     /// Callers may retry after another operation releases its Drop-owned permit.
@@ -127,31 +84,22 @@ pub mod reset {
     pub const DEADLINE_EXCEEDED: u32 = 9;
 }
 
-/// Functions and assets share iroh's canonical lowercase BLAKE3 text form.
-/// Keeping one fixed-width identifier prevents a 64-hex SHA-256 value from
-/// becoming an ambiguous alias for a BLAKE3-addressed object.
+/// Functions and assets use iroh's lowercase BLAKE3 text form; one fixed width keeps a SHA-256
+/// hex from aliasing a BLAKE3 object.
 pub const BLAKE3_DIGEST_LEN: usize = 64;
 pub const FUNCTION_DIGEST_LEN: usize = BLAKE3_DIGEST_LEN;
 pub const ASSET_DIGEST_LEN: usize = BLAKE3_DIGEST_LEN;
 
-/// Asset replies reserve eight bytes for the complete object length. The rest
-/// of the frame is one verified chunk, so arbitrarily large assets never bypass
-/// the per-frame allocation cap.
+/// Asset replies reserve eight bytes for the complete object length; the rest is one verified
+/// chunk.
 pub const ASSET_REPLY_META_LEN: usize = 8;
 pub const ASSET_CHUNK_MAX: usize = BROWSER_MAX_FRAME - ASSET_REPLY_META_LEN;
 
-/// Maximum complete asset returned by the browser-facing whole-object API.
-/// `assetOn` returns one JavaScript `Uint8Array`, so accepting a peer-declared
-/// multi-gigabyte total would turn bounded chunks into an unbounded allocation.
+/// Maximum complete asset the whole-object browser API (`assetOn`, one `Uint8Array`) returns.
 pub const BROWSER_MAX_ASSET: usize = 64 << 20; // 64 MiB
 
-/// The op selector: the first byte of every request payload.
-///
-/// Deliberately NOT `#[non_exhaustive]`-with-a-catch-all and NOT defaulting an
-/// unrecognised byte to [`Op::Echo`]. An unknown op is a peer speaking a
-/// protocol version this build does not have, and the honest response is a loud
-/// refusal ([`reset::UNKNOWN_OP`]) rather than silently treating a future
-/// `Invoke`-shaped request as an echo and handing back its raw bytes.
+/// The op selector, first byte of every request. An unknown byte is refused with
+/// [`reset::UNKNOWN_OP`], never defaulted to [`Op::Echo`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Op {
@@ -162,14 +110,8 @@ pub enum Op {
     /// Pull one range of an exact BLAKE3-addressed asset. This is a scoped,
     /// demand-side cache fill, not a general browser CDN serving primitive.
     AssetGet = 2,
-    /// One browser↔fleet CRR anti-entropy round (docs/browser-db-contract.md):
-    /// the payload is [`encode_crr_sync_request`]'s shape, carrying the
-    /// sender's per-site watermarks plus its outbound HCB1 change batches; the
-    /// reply ([`encode_crr_sync_reply`]'s shape) carries a typed status, the
-    /// responder's watermarks (the apply acknowledgement), and the responder's
-    /// own export batches. Sync-domain refusals (gap, quota, read-only) are
-    /// reply statuses; PROTOCOL faults (malformed frames, missing grant, no
-    /// handler) stay stream reset codes.
+    /// One browser↔fleet CRR anti-entropy round (docs/browser-db-contract.md): sync-domain refusals
+    /// are reply statuses; protocol faults stay stream resets.
     CrrSync = 3,
 }
 
@@ -178,11 +120,8 @@ impl Op {
         self as u8
     }
 
-    /// The frame cap that applies to requests carrying this op — checked after
-    /// the op byte is read but BEFORE the declared payload is allocated.
-    /// [`crate::check_len`] remains the floor shared by the original three
-    /// ops; `CrrSync` gets [`BROWSER_MAX_CRR_FRAME`] for the reason documented
-    /// there.
+    /// The frame cap for requests carrying this op, checked after the op byte and BEFORE the payload
+    /// is allocated.
     pub const fn frame_cap(self) -> usize {
         match self {
             Op::Echo | Op::Invoke | Op::AssetGet => BROWSER_MAX_FRAME,
@@ -274,11 +213,8 @@ pub const fn check_len(len_le: [u8; 4]) -> Result<usize, ProtoError> {
     Ok(len)
 }
 
-/// Per-op variant of [`check_len`]: the cap is the op's own
-/// ([`Op::frame_cap`]), so a `CrrSync` frame may legally exceed
-/// [`BROWSER_MAX_FRAME`] while an `Echo` of the same size is still refused.
-/// The op byte is read before the payload is allocated, so this check still
-/// lands before any length-derived allocation.
+/// Per-op [`check_len`]: a `CrrSync` frame may exceed [`BROWSER_MAX_FRAME`] while an `Echo` of
+/// that size is refused.
 pub const fn check_len_for(op: Op, len_le: [u8; 4]) -> Result<usize, ProtoError> {
     let len = u32::from_le_bytes(len_le) as usize;
     if len > op.frame_cap() {
@@ -324,9 +260,8 @@ pub fn valid_function_digest(digest: &str) -> bool {
     valid_blake3_digest(digest)
 }
 
-/// Build an [`Op::Invoke`] payload: `[64-byte code_digest][request_json]`.
-/// Executable source is deliberately absent — the callee resolves this digest
-/// to a locally pinned artifact.
+/// Build an [`Op::Invoke`] payload `[64-byte code_digest][request_json]`; the callee resolves
+/// the digest to a pinned artifact.
 pub fn encode_invoke(code_digest: &str, request_json: &str) -> Result<Vec<u8>, ProtoError> {
     if !valid_function_digest(code_digest) {
         return Err(ProtoError::InvalidFunctionDigest);
@@ -406,38 +341,11 @@ pub fn split_asset_reply(payload: &[u8]) -> Result<(u64, &[u8]), ProtoError> {
     Ok((u64::from_le_bytes(total), &payload[ASSET_REPLY_META_LEN..]))
 }
 
-// ---------------------------------------------------------------------------
-// CRR sync op (bn-browser-fleet-crr-exchange)
-// ---------------------------------------------------------------------------
-//
-// One bidirectional anti-entropy round between a browser replica and a fleet
-// replica (docs/browser-db-contract.md; the CRR semantics themselves are
-// hive-crsql's contract — per-origin-site durable watermarks, HCB1 canonical
-// batches, gap/replay, transactional apply — named here, never redefined).
-// Both directions ride ONE request/reply pair so a round costs one round trip:
-//
-// * Request: the sender's per-site watermarks (what it durably holds — the
-//   responder's export selector) plus its outbound HCB1 batches (every site
-//   the responder advertised it is missing, chunked so the frame fits; more
-//   chunks follow in later rounds while `push_more` is set).
-// * Reply: a typed status for the APPLY half, the responder's watermarks
-//   AFTER any apply (the acknowledgement the sender persists as its
-//   push-cursor), and the responder's own export batches, bounded so the
-//   reply frame fits — `more` set means the sender re-requests (its freshly
-//   applied watermarks are the continuation cursor; there is no separate
-//   cursor state to lose).
-//
-// Framing mirrors the Invoke/AssetGet discipline exactly: explicit lengths,
-// big-endian integers (HCB1's own convention), exact-EOF consume, trailing-
-// byte rejection, every count/length bounded before allocation.
-
 /// `CrrSync` payload version. Bump on any shape change; peers refuse a version
 /// they do not know rather than misparse it.
 pub const CRR_SYNC_VERSION: u8 = 1;
 
-/// Largest site-id blob carried on the wire (crsql site ids are 16 bytes;
-/// HCB1 permits up to 255 — the wire admits a little headroom, never
-/// unbounded).
+/// Largest site-id blob on the wire (crsql site ids are 16 bytes; HCB1 permits 255).
 pub const CRR_SITE_ID_MAX: usize = 64;
 /// Bound on the watermark advertisement (one entry per known origin site).
 pub const CRR_MAX_WATERMARKS: usize = 1024;
@@ -457,32 +365,27 @@ pub const CRR_FLAG_PUSH_MORE: u8 = 1;
 /// requester re-requests (its applied watermarks are the resume cursor).
 pub const CRR_FLAG_MORE: u8 = 1;
 
-/// The APPLY half's typed outcome — sync-domain refusals travel IN the reply
-/// (the requester needs the detail: where to resume, what was refused),
-/// while protocol faults stay stream reset codes.
+/// The APPLY half's typed outcome; sync-domain refusals travel in the reply, protocol faults
+/// stay stream resets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CrrStatus {
     /// Every presented batch applied (or replayed as a no-op).
     Ok = 0,
-    /// A presented batch chained from AHEAD of the responder's durable
-    /// watermark — an intermediate batch is missing (hive-crsql `SyncGap`).
-    /// Nothing from that batch was written; re-export from the watermark the
-    /// reply carries for that site.
+    /// A presented batch chained from ahead of the responder's durable watermark (hive-crsql
+    /// `SyncGap`); nothing written, re-export from the reply's watermark.
     SyncGap = 1,
     /// Applying a presented batch would push the replica past the spec's
     /// `max_bytes` — the batch rolled back whole, never truncated.
     QuotaExceeded = 2,
-    /// A presented change's `val` payload exceeds the spec's
-    /// `max_value_bytes`; the whole batch was refused. The message names the
-    /// first offending table/pk.
+    /// A presented value exceeds the spec's `max_value_bytes`; the whole batch was refused and the
+    /// message names the first offender.
     ValueTooLarge = 3,
     /// The grant behind this request is read-only (Public-scope admission):
     /// no presented batch was applied. The export half is still served.
     ReadOnly = 4,
-    /// A presented HCB1 batch decoded but is unusable on this wire (e.g. an
-    /// empty site id or an out-of-order payload that passed HCB1's own
-    /// checks) — refused whole.
+    /// A presented HCB1 batch decoded but is unusable on this wire (empty site id, out-of-order
+    /// payload); refused whole.
     BatchRefused = 5,
 }
 
@@ -507,13 +410,8 @@ impl CrrStatus {
 /// Decoded `Op::CrrSync` request body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrrSyncRequest {
-    /// The grant identifier the sender is syncing for: the platform-templated
-    /// replica name from its admission capability (`hive-browserdb-<tag>.db`).
-    /// The responder NEVER opens this value — it compares it against the name
-    /// derived from its own server-resolved grant and refuses a mismatch
-    /// (a stale capability can never contaminate a different project's
-    /// replica; contract §6's "no wire field names a file" is preserved by
-    /// opening only the server-derived name).
+    /// The platform-templated replica name from the sender's admission capability; the responder
+    /// NEVER opens it, only compares it with its own server-derived name.
     pub db_file: String,
     /// `CRR_FLAG_PUSH_MORE` while the sender's push stream continues.
     pub push_more: bool,

@@ -1,16 +1,6 @@
-//! Runtime Cache — a regional, ephemeral key/value cache for tenant functions,
-//! mirroring Vercel's [Runtime Cache](https://vercel.com/docs/caching/runtime-cache).
-//!
-//! It stores *data* (not whole HTTP responses — that's the [`crate::cdn`] CDN
-//! cache) close to where functions run, so repeated fetches / expensive
-//! computations can be reused. Entries are:
-//!
-//! * **scoped** per `project:environment` (production vs preview are isolated),
-//! * **TTL'd** (time-based expiry) and **tagged** (so a tag can invalidate many
-//!   entries at once — `revalidateTag`),
-//! * **LRU-evicted** when the store is full.
-//!
-//! Limits match Vercel: item ≤ 2 MB, ≤ 64 tags/item, tag ≤ 256 bytes.
+//! Regional ephemeral key/value cache for tenant functions (data, not HTTP responses): scoped per
+//! `project:environment`, TTL'd, tagged for bulk invalidation, LRU-evicted; limits match Vercel
+//! (item ≤ 2 MB, ≤ 64 tags/item, tag ≤ 256 bytes).
 
 use hive_core::now_ms;
 use parking_lot::Mutex;
@@ -115,7 +105,6 @@ impl RuntimeCache {
         let fk = Self::full_key(scope, key);
         let recency = self.tick.fetch_add(1, Ordering::Relaxed);
         let mut map = self.map.lock();
-        // LRU eviction when at capacity (and inserting a new key).
         if map.len() >= self.max_entries && !map.contains_key(&fk) {
             if let Some(victim) = map
                 .iter()

@@ -1,7 +1,5 @@
-//! `hive-edge` — the edge/platform features layered on top of Hive + Fluid:
-//! WAF, bot management, CDN cache, regions/node registry, cron, and workflows.
-//! These are the Vercel-style platform capabilities the `hive-cloud` node wires
-//! into one request pipeline + control surface.
+//! Edge features layered on Hive + Fluid: WAF, bot management, CDN cache, regions/node registry,
+//! cron and workflows, wired into `hive-cloud`'s request pipeline.
 
 pub mod bot;
 pub mod cdn;

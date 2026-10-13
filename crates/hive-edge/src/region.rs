@@ -1,6 +1,5 @@
-//! Regions and the node registry — the basis for a multi-node "unified cloud".
-//! Each node has a region (e.g. `sfo1`) and an iroh endpoint id; nodes learn
-//! about peers and can route to the nearest region.
+//! Regions and the node registry: each node has a region and an iroh endpoint id; nodes learn
+//! about peers and route to the nearest region.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -17,10 +16,8 @@ pub struct NodeInfo {
     pub region: String,
     /// Public gateway URL (for same-LAN / direct addressing).
     pub public_url: String,
-    /// Reachable PUBLIC IPv4 — the address a *browser* can hit over HTTPS. Used by
-    /// the client-facing authoritative DNS (Seer) for A records. `None` for NAT'd
-    /// nodes (no inbound-reachable address) → they're excluded from client DNS.
-    /// Set from `HIVE_PUBLIC_IP`; NEVER the `--listen` bind addr and never 0.0.0.0.
+    /// Reachable public IPv4 for Seer A records (`HIVE_PUBLIC_IP`); `None` for NAT'd nodes, never
+    /// the bind address.
     #[serde(default)]
     pub public_ip: Option<String>,
     /// Reachable PUBLIC IPv6 (Seer AAAA records). `None` if the node has none.
@@ -33,82 +30,32 @@ pub struct NodeInfo {
     /// open a QUIC tunnel to this node directly. Populated when P2P is bound.
     #[serde(default)]
     pub iroh_addr: Option<String>,
-    /// GuardianDB's OWN dialable iroh address (JSON `EndpointAddr`) — a SEPARATE
-    /// identity/endpoint from `iroh_addr` above (the request-routing mesh).
-    /// GuardianDB opens its own independent iroh client per node; a peer's mesh
-    /// address is a different, unrelated identity, and feeding one in place of
-    /// the other makes GuardianDB's automatic peer-discovery try to dial an
-    /// EndpointId nothing is actually listening as. `None` until this node's
-    /// GuardianDB client has finished its own bind (best-effort, filled in by a
-    /// later gossip round once ready — never blocks boot).
+    /// GuardianDB's own dialable iroh address — a separate identity from `iroh_addr`; `None` until
+    /// its client has bound.
     #[serde(default)]
     pub guardian_iroh_addr: Option<String>,
-    /// This node's OWN embedded iroh-relay server URL (e.g. `http://1.2.3.4:3341`),
-    /// so peers can dial it as a relay/NAT-traversal fallback instead of routing
-    /// through n0's public relay or a single central backstop. `None` until the
-    /// embedded relay listener has bound (best-effort, filled in post-boot — see
-    /// `NodeRegistry::set_self_relay_url`) or when the node has no reachable public
-    /// address to advertise (NAT'd, same rule as `public_ip`). `#[serde(default)]`
-    /// so older gossiped/persisted records without this field deserialize fine.
+    /// This node's embedded iroh-relay URL (`set_self_relay_url`); `None` until bound or when the
+    /// node has no public address.
     #[serde(default)]
     pub relay_url: Option<String>,
-    /// This node answers authoritative DNS (Seer) on port 53, i.e. it is a
-    /// usable NAMESERVER for zones the platform delegates to itself. Set at
-    /// boot from `HIVE_DNS_ADDR` (only when the bind is a real public
-    /// `:53`, never a loopback/dev bind) and gossiped, so the DNS reconciler
-    /// can derive the NS/glue record set for the geo zone from the same
-    /// health-damped registry every other record already comes from instead
-    /// of a hand-maintained nameserver list. `None` = not a nameserver.
-    /// `#[serde(default)]` so pre-upgrade peers deserialize fine.
-    ///
-    /// This is a statement of INTENT, not of reachability: it is read out of
-    /// this node's OWN environment and proves only that it meant to bind. Two
-    /// live nameservers were advertised from it while being unusable from the
-    /// public internet — one silently firewalled upstream of the host, one
-    /// answering with zero records. What actually gates advertisement is
-    /// `dns_attest` below.
+    /// Intent to answer authoritative DNS (Seer) on a public `:53`, set from `HIVE_DNS_ADDR`;
+    /// `None` = not a nameserver. Reachability is proven only by `dns_attest`.
     #[serde(default)]
     pub dns_ns: Option<String>,
-    /// This node's Seer also serves the platform API zone (`api.{platform}`)
-    /// geo/health-aware — advertised only by binaries that actually carry that
-    /// answering path. Gates the `api` label's NS delegation at the parent so
-    /// the NS set can never name a nameserver that would NXDOMAIN the zone
-    /// (an older binary with `dns_ns` set answers the deploy zone fine but
-    /// knows nothing of the api zone). `#[serde(default)]`: pre-upgrade peers
-    /// deserialize `false` and are simply never eligible.
+    /// This node's Seer also serves the platform API zone; gates the `api` label's NS delegation
+    /// (pre-upgrade peers read `false`).
     #[serde(default)]
     pub dns_api: bool,
-    /// **Peer attestation**: names of OTHER nodes this node has just PROVEN
-    /// answer authoritative DNS on their public `:53`, by querying them over
-    /// the public internet from this host (`hive-cloud`'s `dns_probe`).
-    /// Gossiped so the DNS reconciler can require independent, off-host
-    /// evidence from several regions before publishing a node as a nameserver
-    /// — the thing `dns_ns` alone cannot give, since no check performed ON a
-    /// host can see an inbound block upstream of it, or an answer that is only
-    /// wrong for other people's clients. Never contains this node's own name:
-    /// self-attestation is precisely the assumption this field replaces. Empty
-    /// from pre-upgrade peers (`serde(default)`), which attests nothing —
-    /// safe, because it WITHHOLDS advertisement rather than granting it.
+    /// Other nodes this node has PROVEN answer DNS on their public `:53` (`dns_probe`); never
+    /// contains this node's own name.
     #[serde(default)]
     pub dns_attest: Vec<String>,
-    /// This node currently serves the platform DASHBOARD acceptably: its local
-    /// dashboard upstream (`HIVE_DASHBOARD_UPSTREAM`, the node's own `:3002`)
-    /// answered a live probe within budget. Gossiped so the DNS reconciler can
-    /// gate the apex/`www` A-set on nodes that will actually render the
-    /// dashboard promptly — a node whose SSR takes seconds (witnessed:
-    /// sao-paulo at 4–6s) otherwise degrades ~1/N of all first visits merely
-    /// by being healthy. A MEASUREMENT, not boot intent: refreshed by a probe
-    /// loop, `false` while the upstream is down/slow/absent. `serde(default)`
-    /// = pre-upgrade peers read `false`, and the reconciler falls back to the
-    /// full set while fewer than two nodes claim it (same floor discipline as
-    /// the NS set), so a part-rolled fleet behaves exactly as before.
+    /// Measured: the local dashboard upstream (`HIVE_DASHBOARD_UPSTREAM`) answered a probe within
+    /// budget; gates the apex/`www` A-set.
     #[serde(default)]
     pub dashboard: bool,
-    /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
-    /// on every owner promotion/failover). Gossiped so the whole fleet converges
-    /// on the highest epoch — the fencing token that lets a node reject admin
-    /// mutations forwarded by a peer whose view of ownership is stale. `0` from
-    /// pre-upgrade peers (`serde(default)`), which fences nothing (safe).
+    /// Control-plane ownership epoch as witnessed by this node (monotonic) — the fence that rejects
+    /// stale forwarded mutations. `0` fences nothing.
     #[serde(default)]
     pub cp_epoch: u64,
     pub last_seen_ms: u64,
@@ -138,155 +85,48 @@ pub struct NodeInfo {
     pub mem_total_mb: u64,
     #[serde(default)]
     pub disk_total_gb: u64,
-    /// LIVE free disk on this node's data volume, GiB — refreshed on a timer, not
-    /// a boot-time constant like `disk_total_gb` above.
-    ///
-    /// Exists because placement was disk-blind: `schedule.rs` filtered on health,
-    /// region and GPU but never on space, so it kept choosing a node that was
-    /// already full. Witnessed 2026-07-31 — fc-sanjose reached 100% (0 bytes
-    /// free) and took down 9 customer deployments with "host disk critically low
-    /// ... after GC", while fc-frankfurt and both CVM nodes sat below 10% used
-    /// with ~920 GiB free each. Capacity in this fleet is also wildly
-    /// heterogeneous (493 GiB to 1000 GiB), so a percentage alone is not enough
-    /// to compare nodes; the absolute figure is what admission needs.
-    ///
-    /// `0` means "not reported" (a peer running an older build, or a probe that
-    /// failed) and MUST be read as unknown rather than as a full disk — treating
-    /// unknown as full would exclude every pre-upgrade peer from placement during
-    /// a rollout.
+    /// Live free disk on the data volume (GiB), refreshed on a timer; `0` = not reported and must be
+    /// read as UNKNOWN, never as full.
     #[serde(default)]
     pub disk_free_gb: u64,
-    /// MEASURED free VRAM across this node's GPUs, MiB (driver-reported), or
-    /// `None` on a host with no usable `nvidia-smi`.
-    ///
-    /// The GPU pool otherwise infers free VRAM arithmetically from a count of
-    /// live serverless GPU instances, which drifts from the hardware in both
-    /// directions: measured 2026-07-31, fc-sanjose-gpu-1 was reported with
-    /// 30 GiB reserved while its cards held 105 MiB each, and
-    /// fc-sanjose-gpu-2's real `llama-server` allocation was invisible because
-    /// an inference endpoint is not a serverless function instance. Fit
-    /// decisions ("does this model need `--rpc` members?") were being made
-    /// against a number matching neither the hardware nor the workload.
-    ///
-    /// `None` = not reported (pre-upgrade peer or no probe); callers fall back
-    /// to the reservation estimate rather than reading it as zero free.
+    /// Driver-measured free VRAM across this node's GPUs (MiB); `None` = not reported, callers fall
+    /// back to the reservation estimate.
     #[serde(default)]
     pub gpu_free_mb: Option<u64>,
-    /// Isolation backend this node runs: "firecracker" (real microVMs) or "mock"
-    /// (sandboxed child processes — local/dev). The placement scheduler only
-    /// auto-targets firecracker nodes; mock/local nodes host only when a region is
-    /// explicitly selected for them.
+    /// Isolation backend: "firecracker" (microVMs) or "mock" (sandboxed processes); placement only
+    /// auto-targets firecracker nodes.
     #[serde(default)]
     pub backend: String,
-    /// GPUs physically present AND driver-visible on this host (`nvidia-smi`
-    /// probe at boot — see `hive-cloud`'s `detect_gpus`). 0 = no GPUs, which is
-    /// also what every pre-upgrade peer deserializes to (`serde(default)`), so
-    /// old nodes simply read as GPU-less rather than erroring. Placement only
-    /// targets `gpu_count > 0` nodes for functions that request a GPU; these
-    /// fields are informational for everything else (dashboard, capacity sums).
+    /// GPUs present AND driver-visible (`detect_gpus`); `0` for GPU-less and pre-upgrade peers.
+    /// Placement requires `gpu_count > 0` for GPU functions.
     #[serde(default)]
     pub gpu_count: u32,
-    /// Can this node actually EXECUTE a `Runtime::Wasmer` function — i.e. does a
-    /// `wasmer` binary exist on the filesystem the function's `start_cmd` is
-    /// spawned against? Probed at boot (`hive-cloud`'s `detect_wasm_runtime`),
-    /// which is backend-aware because the answer differs by WHERE the process
-    /// runs: a Firecracker cell execs inside the microVM GUEST rootfs
-    /// (`hive-cell-agent` does `Command::new(start_cmd[0])` with a fixed guest
-    /// PATH), so a host-side `/usr/local/bin/wasmer` is invisible to it; a
-    /// Mock/Litebox cell execs against the host. Checking the wrong one is
-    /// exactly the bug this field exists to prevent.
-    ///
-    /// `None` = NOT REPORTED, and here that is deliberately treated as NOT
-    /// CAPABLE rather than as unknown-so-admit. This is the opposite of the
-    /// `disk_free_gb == 0` / `gpu_free_mb == None` rule above, and the
-    /// difference is real: an unknown DISK reading may still have space, so
-    /// admitting and letting the cold-start floor catch it costs one failed
-    /// start; but a peer that does not report this field is by construction
-    /// running a binary predating Wasmer support, on a rootfs built before
-    /// wasmer was ever staged into it — it is KNOWN-incapable, not unknown.
-    /// Admitting it would hand every Wasmer deployment to a node guaranteed to
-    /// ENOENT on every cold start, forever. Empty placement plus an honest
-    /// error beats that, which is the same call `gpu_count == 0` already makes
-    /// (deliberately no silent fallback to a node that cannot serve).
+    /// Whether `wasmer` exists on the filesystem the cell execs against (`detect_wasm_runtime`);
+    /// `None` = NOT CAPABLE, never unknown-so-admit.
     #[serde(default)]
     pub wasm_runtime: Option<bool>,
-    /// Can this node actually EXECUTE a `Runtime::Bun` function — i.e. does a
-    /// `bun` binary exist on the filesystem the function's `start_cmd` is
-    /// spawned against? Probed at boot (`hive-cloud`'s `detect_bun_runtime`),
-    /// backend-aware for the identical reason `wasm_runtime` is: a Firecracker
-    /// cell execs inside the microVM GUEST rootfs, a Mock cell execs against
-    /// the host, and Litebox can never answer `true` regardless of what is
-    /// staged — its pinned upstream syscall shim panics
-    /// (`unimplemented!()`) on Bun's own boot-time
-    /// `readlink("/proc/self/fd/3")` probe, so advertising capability there
-    /// would turn every Bun cold start into an uncontrolled guest panic
-    /// instead of an honest placement refusal.
-    ///
-    /// `None` = NOT REPORTED, and here that is deliberately treated as NOT
-    /// CAPABLE rather than as unknown-so-admit — the same asymmetry
-    /// `wasm_runtime` documents above and for the identical reason: a peer
-    /// that does not report this field predates Bun capability probing
-    /// entirely, on a rootfs built before `bun` was ever staged into it. It
-    /// is KNOWN-incapable, not unknown. Admitting it would hand every Bun
-    /// deployment to a node guaranteed to ENOENT on every cold start,
-    /// forever.
+    /// Whether `bun` exists on the filesystem the cell execs against (`detect_bun_runtime`; litebox
+    /// always `false`); `None` = NOT CAPABLE.
     #[serde(default)]
     pub bun_runtime: Option<bool>,
-    /// Package managers / toolchains this node can ACTUALLY execute in its
-    /// BUILD lane — the filesystem a repository `install`/`build` command execs
-    /// against, which is backend-specific: mock/litebox build as plain HOST
-    /// processes (so this is a host PATH probe), while firecracker builds
-    /// INSIDE the pinned builder image (which this host can neither see nor
-    /// stat, so those nodes report `None`).
-    ///
-    /// Probed at boot and re-probed on the same refresh tick that keeps
-    /// `disk_free_gb` and `wasm_runtime` current, because the fact moves under a
-    /// running process in both directions — a provisioning run installs `bun`,
-    /// a later image/host change removes it. Measured fleet reality when this
-    /// field was added: `bun` present on fc-phoenix and absent on
-    /// fc-virginia and 170.106.158.151, while the build pipeline happily sent
-    /// a `bun install` to all of them and failed with `/bin/sh: line 1: bun:
-    /// command not found`.
-    ///
-    /// `None` = UNREPORTED, and here that means UNKNOWN and is ADMITTED by
-    /// placement — the opposite of `wasm_runtime`/`bun_runtime` directly above,
-    /// where `None` is NOT CAPABLE. The difference is the failure direction: a
-    /// missing package manager HAS a substitute (npm ships with node), so an
-    /// unreported node is not guaranteed to fail and the build lane degrades to
-    /// a present manager with a loud log. Excluding every unreported peer would
-    /// empty the candidate set mid-rollout — the `retain_dialable` partition
-    /// lesson. Names, in canonical probe order (`hive-cloud`'s
-    /// `resources::BUILD_TOOLCHAINS`), never an opaque bit field: an operator
-    /// reading `/v1/nodes` must be able to see `["node","npm"]`.
+    /// Toolchains the BUILD lane can exec, in `resources::BUILD_TOOLCHAINS` order (host PATH for
+    /// mock/litebox, `None` on firecracker); `None` = UNKNOWN and ADMITTED by placement, since npm
+    /// substitutes a missing manager.
     #[serde(default)]
     pub build_toolchains: Option<Vec<String>>,
-    /// Runtime-artifact staging protocol implemented by this node. Source-built
-    /// functions require protocol v1 so host static roots and guest workdirs are
-    /// interpreted separately and delivery is gated by backend need. `None` is a
-    /// pre-upgrade node and is deliberately not capable of hosting those builds.
+    /// Runtime-artifact staging protocol served by this node; `None` (pre-upgrade) cannot host
+    /// source-built functions.
     #[serde(default)]
     pub runtime_artifact_protocol: Option<u16>,
-    /// Repository-command isolation protocol implemented and live-probed on this
-    /// node. `None` and unknown versions are ineligible: old peers execute builds
-    /// on the root host and must never receive a source build as fallback.
+    /// Repository-command isolation protocol live-probed here; `None`/unknown versions never receive
+    /// a source build.
     #[serde(default)]
     pub build_isolation_protocol: Option<u16>,
-    /// This node can run musql as a managed-SQLite storage engine: a usable
-    /// `musqld` was PROBED here (`-h` prints `-dir` + `-idle-timeout`, the two
-    /// flags this lane depends on), not merely configured.
-    ///
-    /// Probed and advertised, never assumed — the same rule `wasm_runtime` and
-    /// `bun_runtime` follow, and `None` means NOT CAPABLE for the same reason:
-    /// a node that cannot start the engine must never be handed a `musql`
-    /// database. It is `None` on every node that has not opted in
-    /// (`HIVE_SQLITE_ENGINE=musql`), which is every node today.
+    /// A usable `musqld` was PROBED here (`HIVE_SQLITE_ENGINE=musql`); `None` = NOT CAPABLE.
     #[serde(default)]
     pub musql_engine: Option<bool>,
-    /// Sealed runtime-artifact TRANSFER protocol (coordinator→target
-    /// Begin/Chunk/Finalize/Prepare/Commit generation delivery) served by this
-    /// node's receiver. `None` = pre-upgrade peer or a receiver that failed to
-    /// initialize — deliberately NOT an immutable-generation fanout target; the
-    /// coordinator keeps the legacy per-target dispatch for it.
+    /// Sealed runtime-artifact TRANSFER protocol served by this node's receiver; `None` keeps the
+    /// coordinator on legacy per-target dispatch.
     #[serde(default)]
     pub artifact_transfer_protocol: Option<u16>,
     /// Marketing model name of the first GPU (e.g. "Tesla T4"); hosts are
@@ -296,56 +136,28 @@ pub struct NodeInfo {
     /// Total VRAM across all GPUs on the host, MiB.
     #[serde(default)]
     pub gpu_vram_mb: u64,
-    /// Epoch-ms this node's PROCESS started (not the host's boot time).
-    ///
-    /// The cheapest possible fleet-visible "is that node cycling?" signal: a
-    /// peer whose uptime keeps resetting is restarting, and until this existed
-    /// the only way to see that was to SSH in and read `dmesg`/`systemctl` on
-    /// the right host at the right moment. A node killed by the cgroup OOM
-    /// killer is back in under a second with healthz answering, so nothing
-    /// else in the gossiped record changes at all.
-    ///
-    /// `0` = not reported (a pre-upgrade peer) and must be read as UNKNOWN,
-    /// never as "just started".
+    /// Epoch-ms this PROCESS started — the fleet-visible "is that node cycling?" signal; `0` = not
+    /// reported (UNKNOWN).
     #[serde(default)]
     pub started_ms: u64,
-    /// How many times this node has restarted after an OOM kill within the
-    /// last 24h, as classified by `restart_audit` from the previous run's
-    /// marker plus kernel/cgroup evidence. `0` also means "pre-upgrade peer",
-    /// i.e. unknown — it is a floor, never a proof of health.
+    /// OOM-kill restarts in the last 24h (`restart_audit`); `0` also means pre-upgrade peer — a
+    /// floor, never proof of health.
     #[serde(default)]
     pub oom_restarts_24h: u32,
-    /// Restarts in the last 24h whose predecessor died WITHOUT a graceful
-    /// shutdown (`verdict = unclean_exit`: SIGSEGV, panic, a SIGKILL it never
-    /// asked for). Gossiped because it is the only fleet-visible counter that
-    /// sees an involuntary crash: `ControlledRestart` — and so every restart
-    /// rate cap and reason tally — only ever observes the restarts hive CHOOSES.
-    /// `0` also means "pre-upgrade peer", i.e. unknown.
+    /// Restarts in the last 24h whose predecessor died without a graceful shutdown — the only
+    /// counter that sees involuntary crashes; `0` also means unknown.
     #[serde(default)]
     pub unclean_restarts_24h: u32,
     /// Epoch-ms of the most recent boot whose predecessor was OOM-killed.
     /// `None` = never observed (or not reported).
     #[serde(default)]
     pub last_oom_ms: Option<u64>,
-    /// Cloud provider this node runs on, e.g. `"tencent"` — set from
-    /// `HIVE_CLOUD_PROVIDER`. `None` (the default for every pre-upgrade peer
-    /// and every non-cloud/dev node) means Tencent-CCN private-path
-    /// preference never applies to this node, in either direction —
-    /// `hive_p2p::private_path::is_private_path_candidate` requires BOTH
-    /// sides to declare the same recognized provider, so an unset value is
-    /// always safe, never "assume Tencent."
+    /// Cloud provider (`HIVE_CLOUD_PROVIDER`, e.g. "tencent"); `None` never qualifies for the
+    /// Tencent-CCN private path in either direction.
     #[serde(default)]
     pub provider: Option<String>,
-    /// This node's Tencent VPC-private address (`ip:port`), for CCN inter-
-    /// region traffic — set from `HIVE_PRIVATE_ADDR` (explicit operator
-    /// config only; never sniffed off an interface, since not every RFC1918
-    /// address on a host is CCN-reachable — see `main.rs`'s
-    /// `resolve_private_addr`). Gossiped alongside the existing filtered
-    /// `iroh_addr`/`public_ip` — this field is NEVER folded into those, so a
-    /// peer that doesn't understand it (pre-upgrade, or ineligible) simply
-    /// never sees it used; `dht`'s existing public-only publish filter is
-    /// untouched. `None` = no private address configured (the default), and
-    /// this node is never a CCN-private dial target.
+    /// Tencent VPC-private `ip:port` for CCN traffic (`HIVE_PRIVATE_ADDR`, never sniffed); never
+    /// folded into `iroh_addr`/`public_ip`. `None` = never a private dial target.
     #[serde(default)]
     pub private_addr: Option<String>,
 }
@@ -361,25 +173,11 @@ pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     2.0 * r * h.sqrt().asin()
 }
 
-/// Central relay backstop — a fixed, always-available relay every node can reach,
-/// used by [`select_relay_hint`] when no better (peer-owned or nearby-peer-owned)
-/// relay is known yet.
+/// Fixed relay backstop used by [`select_relay_hint`] when no peer-owned relay is known.
 pub const CENTRAL_RELAY_URL: &str = "https://relay.shadw.cloud";
 
-/// Pick the best relay URL to HINT when dialing `target`, given the full live
-/// registry snapshot (`nodes`, including `me`) — a pure, deterministic function so
-/// it's directly unit-testable with no I/O/network/registry-locking involved.
-///
-/// Preference order:
-///   1. `target`'s OWN `relay_url` (most direct — no extra hop through a third
-///      node's relay).
-///   2. The geographically closest OTHER peer's `relay_url` (simple squared lat/lon
-///      distance — good enough for "nearest", true haversine isn't needed here),
-///      excluding `target` and `me` themselves. When `target` (or a candidate) has
-///      no lat/lon, falls back to the first other peer with a `relay_url` (order is
-///      `nodes`' own order — deterministic, just not distance-ranked).
-///   3. [`CENTRAL_RELAY_URL`], the fixed backstop — always returned rather than
-///      `None`, so callers always have a usable hint.
+/// Relay URL to hint when dialing `target`: its own `relay_url`, else the geographically nearest
+/// other peer's, else [`CENTRAL_RELAY_URL`] (never `None`).
 pub fn select_relay_hint(target: &NodeInfo, nodes: &[NodeInfo], me: &NodeInfo) -> String {
     fn present(u: &Option<String>) -> Option<&str> {
         u.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -406,8 +204,6 @@ pub fn select_relay_hint(target: &NodeInfo, nodes: &[NodeInfo], me: &NodeInfo) -
             return r.to_string();
         }
     }
-    // No coordinates to rank by (either `target` or every candidate lacks
-    // lat/lon) — first other peer that has a relay_url, in registry order.
     for n in others {
         if let Some(r) = present(&n.relay_url) {
             return r.to_string();
@@ -416,60 +212,46 @@ pub fn select_relay_hint(target: &NodeInfo, nodes: &[NodeInfo], me: &NodeInfo) -
     CENTRAL_RELAY_URL.to_string()
 }
 
-/// Classify a geographic coordinate into a continent name. Used to auto-assign a
-/// node's region/zone to the right continent (e.g. a node in Los Angeles → "North
-/// America") for the regions catalog, purely from the lat/lon the node reports —
-/// no hard-coded region tables. Coarse bounding boxes, ordered most-specific
-/// first; good enough to bucket a real node into the correct continent.
+/// Coarse bounding-box classification of a coordinate into a continent name, most-specific box
+/// first.
 pub fn continent_of(lat: f64, lon: f64) -> &'static str {
-    // Antarctica: everything far south.
     if lat < -60.0 {
         return "Antarctica";
     }
-    // Oceania: Australia / New Zealand / Pacific (south of the equator, east of ~110°E).
     if lat < 0.0 && lon >= 110.0 && lon <= 180.0 {
         return "Oceania";
     }
-    // Europe: includes western Russia; north of the Mediterranean.
     if lat >= 36.0 && lat <= 72.0 && lon >= -25.0 && lon <= 60.0 {
         return "Europe";
     }
-    // Africa + Middle East band below Europe.
     if lat >= -35.0 && lat < 36.0 && lon >= -20.0 && lon <= 52.0 {
         return "Africa";
     }
-    // Asia: east of Europe/Africa.
     if lon > 52.0 && lon <= 180.0 {
         return "Asia";
     }
-    // South America: south of ~13°N in the western hemisphere.
     if lat < 13.0 && lon >= -82.0 && lon <= -34.0 {
         return "South America";
     }
-    // North America: the rest of the western hemisphere.
     if lon >= -170.0 && lon <= -34.0 {
         return "North America";
     }
     "Other"
 }
 
-/// Maximum tolerated sender/receiver wall-clock skew for gossip liveness.
-/// Anything farther in the future is not freshness evidence: without this
-/// bound, `saturating_sub` reads an arbitrarily-future timestamp as age zero
-/// forever.
+/// Maximum tolerated sender/receiver clock skew for gossip liveness; a farther-future timestamp
+/// is not freshness evidence.
 pub const MAX_GOSSIP_FUTURE_SKEW_MS: u64 = 5_000;
 
-/// Is an origin timestamp both plausibly clocked and younger than `max_age_ms`?
-/// Shared by registry expiry and hive-cloud's health demotion/restoration so
-/// the three decisions cannot disagree on a poisoned future value.
+/// Is an origin timestamp plausibly clocked and younger than `max_age_ms`? Shared by registry
+/// expiry and health demotion/restoration.
 pub fn gossip_timestamp_fresh(last_seen_ms: u64, now_ms: u64, max_age_ms: u64) -> bool {
     last_seen_ms <= now_ms.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS)
         && now_ms.saturating_sub(last_seen_ms) < max_age_ms
 }
 
-/// Stable identity of a registry peer. `name` is the current mutable lookup
-/// label; `endpoint_id` is the immutable transport identity when the peer
-/// reports one.
+/// Stable identity of a registry peer: `name` is the mutable lookup label, `endpoint_id` the
+/// immutable transport identity.
 #[derive(Clone, Debug)]
 pub struct PeerIdentity {
     pub name: String,
@@ -529,12 +311,8 @@ impl NodeRegistry {
         me
     }
 
-    /// Update this node's own `guardian_iroh_addr` once GuardianDB's
-    /// independent iroh client has finished binding (it isn't ready at boot,
-    /// when `me` is first constructed — see the field's own doc comment).
-    /// Best-effort, idempotent, safe to call every gossip round: a no-op
-    /// write when the value hasn't changed, picked up by the very next
-    /// outgoing gossip broadcast since `nodes()`/`me()` always read fresh.
+    /// Publish this node's `guardian_iroh_addr` once GuardianDB's client has bound; idempotent,
+    /// picked up by the next gossip round.
     pub fn set_self_guardian_addr(&self, addr: Option<String>) {
         let mut me = self.me.write();
         if me.guardian_iroh_addr != addr {
@@ -542,15 +320,8 @@ impl NodeRegistry {
         }
     }
 
-    /// Refresh this node's own MESH `iroh_addr` (the address peers dial for
-    /// gossip/forward RPCs — a DIFFERENT iroh identity from GuardianDB's own
-    /// client, see `guardian_iroh_addr`'s doc). Mirrors `set_self_guardian_addr`:
-    /// best-effort, idempotent, safe every gossip round, picked up by the next
-    /// outgoing broadcast. `iroh_addr` used to be captured exactly once at bind
-    /// time — before the endpoint had registered with its relay or learned
-    /// hole-punch candidates — so it shipped private-addrs-only forever; this
-    /// setter is what makes it converge to the endpoint's ACTUAL current
-    /// knowledge of itself instead of a stale boot snapshot.
+    /// Refresh this node's mesh `iroh_addr` to the endpoint's current knowledge of itself (relay
+    /// registration, hole-punch candidates); idempotent.
     pub fn set_self_iroh_addr(&self, addr: String) {
         let mut me = self.me.write();
         if me.iroh_addr.as_deref() != Some(addr.as_str()) {
@@ -558,12 +329,8 @@ impl NodeRegistry {
         }
     }
 
-    /// Update this node's own `relay_url` once the embedded iroh-relay listener
-    /// has bound (see `relay_url`'s own doc comment). Mirrors
-    /// `set_self_guardian_addr`: best-effort, idempotent, safe to call every
-    /// gossip round — a no-op write when unchanged, picked up by the very next
-    /// outgoing `/v1/nodes/announce` gossip broadcast since `nodes()`/`me()`
-    /// always read fresh. Never blocks boot.
+    /// Publish this node's `relay_url` once the embedded relay has bound; idempotent, picked up by
+    /// the next gossip round, never blocks boot.
     pub fn set_self_relay_url(&self, url: Option<String>) {
         let mut me = self.me.write();
         if me.relay_url != url {
@@ -571,13 +338,8 @@ impl NodeRegistry {
         }
     }
 
-    /// Publish which peers this node currently ATTESTS as working nameservers
-    /// (see `NodeInfo::dns_attest`). Mirrors `set_self_relay_url`: idempotent,
-    /// safe every prober round, picked up by the next gossip broadcast.
-    ///
-    /// The caller is expected to pass a SORTED list — the value is compared for
-    /// change and gossiped verbatim, so an unstable order would look like a
-    /// fresh value on every round for no reason.
+    /// Publish the peers this node ATTESTS as working nameservers. `attest` must be SORTED: the
+    /// value is compared and gossiped verbatim.
     pub fn set_self_dns_attest(&self, attest: Vec<String>) {
         let mut me = self.me.write();
         if me.dns_attest != attest {
@@ -585,10 +347,7 @@ impl NodeRegistry {
         }
     }
 
-    /// Publish whether this node's LOCAL dashboard upstream currently answers
-    /// within budget (see `NodeInfo::dashboard`). Mirrors `set_self_relay_url`:
-    /// idempotent, safe every probe round, picked up by the next gossip
-    /// broadcast.
+    /// Publish whether the local dashboard upstream currently answers within budget.
     pub fn set_self_dashboard(&self, ok: bool) {
         let mut me = self.me.write();
         if me.dashboard != ok {
@@ -596,9 +355,7 @@ impl NodeRegistry {
         }
     }
 
-    /// Update this node's gossiped control-plane epoch (see
-    /// `NodeInfo.cp_epoch`) — refreshed each gossip round from the cluster's
-    /// observed-owner tracker.
+    /// Refresh this node's gossiped control-plane epoch from the observed-owner tracker.
     pub fn set_self_cp_epoch(&self, epoch: u64) {
         let mut me = self.me.write();
         if me.cp_epoch != epoch {
@@ -606,14 +363,8 @@ impl NodeRegistry {
         }
     }
 
-    /// Update this node's own geolocation (lat/lon/city/country) when a
-    /// periodic re-check finds it moved (see `spawn_geo_refresh` in
-    /// hive-cloud). Mirrors `set_self_relay_url`: best-effort, idempotent, no
-    /// write when unchanged, picked up by the next gossip round. Deliberately
-    /// does NOT touch `region` — a node's region is its stable identity
-    /// (baked into DNS names, ACME SANs, placement), while lat/lon only feed
-    /// the regions map and DNS-nearest-by-geo; re-deriving `region` from a
-    /// drifted geolocation would be the disruptive kind of "fix".
+    /// Update this node's geolocation when a periodic re-check finds it moved; never touches
+    /// `region`, which is the node's stable identity.
     pub fn set_self_geo(&self, lat: f64, lon: f64, city: String, country: String) {
         let mut me = self.me.write();
         if me.lat != Some(lat) || me.lon != Some(lon) {
@@ -624,12 +375,7 @@ impl NodeRegistry {
         }
     }
 
-    /// Refresh this node's LIVE free-disk figure so placement can see it.
-    ///
-    /// Deliberately separate from the boot-time capacity fields: free space is
-    /// the only capacity number that moves on its own between restarts, and it
-    /// is the one placement was missing when a full node kept winning
-    /// deployments.
+    /// Refresh this node's live free-disk figure so placement can see it.
     pub fn set_self_disk_free(&self, disk_free_gb: u64) {
         let mut me = self.me.write();
         me.disk_free_gb = disk_free_gb;
@@ -641,15 +387,8 @@ impl NodeRegistry {
         me.gpu_free_mb = gpu_free_mb;
     }
 
-    /// Refresh the runtime capabilities derived from this node's active
-    /// backend and image under one write lock.
-    ///
-    /// All of these facts move under a running process: a rootfs publication can
-    /// add, remove, or replace its exact proof and Wasmer/Bun markers, and a
-    /// provisioning run can install or remove a build toolchain. Publishing them
-    /// in separate lock acquisitions lets gossip observe a tuple that no single
-    /// backend/image observation produced, so callers must always replace the
-    /// tuple atomically through this method.
+    /// Replace every backend/image-derived capability under ONE write lock, so gossip never observes
+    /// a tuple no single observation produced.
     pub fn set_self_runtime_capabilities(
         &self,
         wasm_runtime: Option<bool>,
@@ -664,25 +403,17 @@ impl NodeRegistry {
         me.build_toolchains = build_toolchains;
     }
 
-    /// Publish (or withdraw) this node's sealed-artifact transfer receiver
-    /// capability. Set once after the receiver initializes; a disabled
-    /// receiver advertises `None` so no coordinator selects this node as an
-    /// immutable-generation transfer target.
+    /// Publish (or withdraw with `None`) this node's sealed-artifact transfer receiver capability.
     pub fn set_self_artifact_transfer_protocol(&self, protocol: Option<u16>) {
         self.me.write().artifact_transfer_protocol = protocol;
     }
 
-    /// Publish this node's musql capability. Re-published on the same refresh
-    /// tick as the other capabilities: the binary can appear (a provisioning
-    /// run installs it) or disappear (a bad swap) under a running process.
+    /// Publish this node's musql capability; re-published on every refresh tick.
     pub fn set_self_musql_engine(&self, musql_engine: Option<bool>) {
         self.me.write().musql_engine = musql_engine;
     }
 
-    /// Refresh this node's restart-audit counters (see `hive-cloud`'s
-    /// `restart_audit`). Refreshed on a timer, not only at boot, because the
-    /// 24h window slides: a node that OOMed 25 hours ago must stop advertising
-    /// it, and one that OOMs while running must start.
+    /// Refresh this node's restart-audit counters on a timer, since the 24h window slides.
     pub fn set_self_restart_audit(
         &self,
         started_ms: u64,
@@ -732,11 +463,8 @@ impl NodeRegistry {
         snapshot
     }
 
-    /// A peer's last stored record REGARDLESS of freshness (`nodes()` drops a
-    /// record once its gossip is 30 s old; this does not). Accepts either the
-    /// registry name or the canonical endpoint id. For stable facts about a
-    /// known node (is it a public server, what is its endpoint id) that must
-    /// not flicker with liveness — never for "is it up".
+    /// A peer's last stored record regardless of freshness (unlike `nodes()`), by registry name or
+    /// endpoint id — for stable facts, never for "is it up".
     pub fn peer_record(&self, id: &str) -> Option<NodeInfo> {
         let peers = self.peers.read();
         let name = Self::peer_name_for(&peers, id)?;
@@ -755,10 +483,8 @@ impl NodeRegistry {
     /// impossible RTT sentinel and must remain behind every finite measurement.
     pub const RESTORED_LATENCY_MS: u64 = u64::MAX - 1;
 
-    /// Apply a failed transport observation against the peer identity that was
-    /// actually attempted. Current registry evidence and mutation share one
-    /// write lock, so a concurrent refresh wins and a renamed/replaced peer is
-    /// never withdrawn by an old completion.
+    /// Withdraw the peer identity actually attempted after a failed transport observation; a
+    /// concurrent refresh wins under the same write lock.
     pub fn demote_if_gossip_stale(
         &self,
         id: &str,
@@ -775,11 +501,8 @@ impl NodeRegistry {
         )
     }
 
-    /// [`Self::demote_if_gossip_stale`] with a caller veto evaluated under
-    /// the same write lock: `commit` sees only a peer that is gossip-stale
-    /// right now and decides whether the withdrawal is written
-    /// ([`PeerDemotion::Demoted`]) or left for later evidence
-    /// ([`PeerDemotion::Deferred`]).
+    /// [`Self::demote_if_gossip_stale`] with a caller veto under the same lock: `commit` decides
+    /// [`PeerDemotion::Demoted`] or [`PeerDemotion::Deferred`].
     pub fn demote_if_gossip_stale_gated(
         &self,
         id: &str,
@@ -860,11 +583,8 @@ impl NodeRegistry {
         restored
     }
 
-    /// Read-only view of the peers `restore_gossip_fresh` WOULD restore
-    /// (unhealthy but gossip-fresh) — the candidate input to the restore
-    /// hysteresis in hive-cloud's health loop: a single fresh packet must
-    /// not reverse a withdrawal, or a lossy-announce peer flaps
-    /// DNS/placement on every round (refutation finding F5).
+    /// Read-only view of the unhealthy-but-gossip-fresh peers `restore_gossip_fresh` would restore
+    /// — the input to the health loop's restore hysteresis.
     pub fn gossip_fresh_unhealthy(&self, max_age_ms: u64) -> Vec<String> {
         let now = now_ms();
         let peers = self.peers.read();
@@ -875,9 +595,8 @@ impl NodeRegistry {
             .collect()
     }
 
-    /// Restore ONLY the named candidates — the hysteresis-gated half of
-    /// `restore_gossip_fresh` (the streak gate lives in hive-cloud's health
-    /// loop, so the two paths apply the identical verdict mutation).
+    /// Restore only the named candidates — the hysteresis-gated half of `restore_gossip_fresh` (the
+    /// streak gate lives in the health loop).
     pub fn restore_only(&self, ids: &[String]) -> Vec<String> {
         let mut peers = self.peers.write();
         let mut restored = Vec::new();
@@ -939,9 +658,7 @@ impl NodeRegistry {
         true
     }
 
-    /// Anycast selection: the optimal node to serve a request — the lowest-latency
-    /// healthy node, preferring `preferred` region when given (automatic failover
-    /// falls through to the next-best healthy node).
+    /// Anycast selection: the lowest-latency healthy node, preferring `preferred` region when given.
     pub fn anycast(&self, preferred: Option<&str>) -> Option<NodeInfo> {
         let mut healthy: Vec<NodeInfo> = self.nodes().into_iter().filter(|n| n.healthy).collect();
         healthy.sort_by_key(|n| {
@@ -977,34 +694,9 @@ impl NodeRegistry {
         self.me.read().region.clone()
     }
 
-    /// Record/refresh a peer learned over gossip. Crucially, this does NOT bump
-    /// `last_seen` to local-now: a node's liveness is whether ITS OWN emitted record is
-    /// still recent (origin timestamp), not whether some peer just re-mentioned a cached
-    /// copy. Re-stamping on every relay is exactly what kept a dead node alive forever as
-    /// a "healthy zombie" — its record was perpetually refreshed second-hand and never
-    /// aged out. Keeping the origin timestamp means a dead node's record freezes and
-    /// drops mesh-wide via the 30s staleness window in `nodes()` (clocks are NTP-synced,
-    /// skew ≪ window). Direct probes (`set_health`) still bump freshness for OUR peers.
-    /// Upsert a peer from its OWN announcement (hot-join proof, `/v1/announce`,
-    /// or the first — self — entry of the peer's own `/v1/nodes` response).
-    ///
-    /// A node's `id` is its operator-chosen `--name`, not a stable identity —
-    /// `peer_id` (the real iroh endpoint id) is. Renaming a node keeps the
-    /// same `peer_id` but changes `id`, so without eviction here the OLD
-    /// name's entry never naturally expires: the active health-probe loop
-    /// (main.rs spawn_health_loop) dials by `peer_id`/`iroh_addr`, and since
-    /// those are unchanged the probe keeps succeeding and keeps refreshing
-    /// the OLD entry's `last_seen_ms` forever — a permanent ghost duplicate,
-    /// live-witnessed renaming fc-gpu-sj-1 -> fc-sanjose-gpu-1 (both names
-    /// stayed `healthy: true` with freshening `last_seen_ms` for minutes,
-    /// on every peer in the mesh, with no sign of self-expiry).
-    ///
-    /// Only a SELF-report may rename: eviction lives here and not in
-    /// `upsert_peer` because relayed third-party copies of the old name keep
-    /// circulating in other registries' `/v1/nodes` responses for a while —
-    /// letting a relay evict-and-rename made the two names fight (last relay
-    /// wins each gossip round, also live-witnessed: the mesh settled on the
-    /// GHOST name while the process itself was announcing the real one).
+    /// Upsert a peer from its OWN announcement — the only path that may rename (same `peer_id`, new
+    /// `id`, old name evicted). Liveness is the record's origin timestamp; a relayed copy never
+    /// re-stamps it, so a dead node's record freezes and ages out.
     pub fn upsert_peer_self_report(&self, mut peer: NodeInfo) {
         let now = now_ms();
         if peer.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
@@ -1022,10 +714,6 @@ impl NodeRegistry {
                 "peer self-report clock is behind the registry freshness window; using direct receiver time"
             );
         }
-        // This exchange came from the peer itself, so receipt is stronger
-        // liveness evidence than either host's wall clock. Stamp exactly once at
-        // this direct boundary. Relayed copies never re-stamp (see `upsert_peer`),
-        // so a dead peer's last direct receipt still freezes and ages out.
         peer.last_seen_ms = now;
         if let Some(pid) = peer.peer_id.clone().filter(|s| !s.is_empty()) {
             self.peers.write().retain(|name, existing| {
@@ -1047,21 +735,12 @@ impl NodeRegistry {
         }
     }
 
-    /// Upsert a peer from a RELAYED copy (any non-self entry of another
-    /// node's `/v1/nodes` response). A relay may update an entry it agrees
-    /// with on identity, or introduce a peer never heard from directly — but
-    /// it must never RENAME: if an entry with the same `peer_id` already
-    /// exists under a different `id`, the relayed copy is a stale echo of a
-    /// pre-rename name and is dropped (see `upsert_peer_self_report`).
+    /// Upsert a peer from a RELAYED copy: may update or introduce, never rename (a same-`peer_id`
+    /// entry under another `id` makes this a stale echo, dropped).
     pub fn upsert_peer(&self, mut peer: NodeInfo) {
         peer.is_self = false;
         let now = now_ms();
         if peer.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
-            // A relayed copy is not direct evidence from the named peer. If its
-            // clock is impossible, dropping it is safer than clamping on every
-            // relay hop (which would re-stamp a dead cached record to `now`
-            // forever). Direct reports use `upsert_peer_self_report`, which can
-            // safely clamp because the exchange itself proves current life.
             tracing::warn!(
                 node = %peer.id,
                 claimed_last_seen_ms = peer.last_seen_ms,
@@ -1091,12 +770,8 @@ impl NodeRegistry {
             if incoming_endpoint.is_none() {
                 peer.peer_id.clone_from(&existing.peer_id);
             }
-            // Health + latency are owned by our OWN direct probes, never second-hand gossip.
             peer.healthy = existing.healthy;
             peer.latency_ms = existing.latency_ms;
-            // A poisoned value already resident from a pre-fix binary must not
-            // win this max forever. Normalize it once when any valid update for
-            // the peer arrives; `nodes()` also refuses it before then.
             let existing_last_seen =
                 if existing.last_seen_ms > now.saturating_add(MAX_GOSSIP_FUTURE_SKEW_MS) {
                     tracing::warn!(
@@ -1109,69 +784,42 @@ impl NodeRegistry {
                 } else {
                     existing.last_seen_ms
                 };
-            // DNS attestations are only as good as the record they rode in on.
-            // A STALER relayed copy must not overwrite a fresher self-report:
-            // attestations change every prober round, so the same
-            // last-relay-wins race that used to flap `guardian_iroh_addr`
-            // Some -> None would here silently un-attest a working nameserver
-            // and pull it out of a live delegation. Freshness decides.
             if peer.last_seen_ms < existing_last_seen {
                 peer.dns_attest = existing.dns_attest.clone();
             }
-            // Keep the freshest plausible origin timestamp seen.
             peer.last_seen_ms = peer.last_seen_ms.max(existing_last_seen);
-            // Never regress guardian_iroh_addr to None. A peer's OWN direct
-            // announce carries its current value; a THIRD peer's relayed
-            // /v1/nodes response (this same round, processed concurrently)
-            // may carry an older, not-yet-propagated copy of that same peer's
-            // entry — still None if the relaying peer hasn't itself learned
-            // the address yet. Without this, whichever response is processed
-            // LAST this round wins regardless of freshness, so a stale relay
-            // arriving after the peer's own direct announce silently erases
-            // it (observed live: guardian_iroh_addr flapping Some -> None on
-            // the very next round with no code path that should clear it).
-            if peer.guardian_iroh_addr.is_none() {
-                peer.guardian_iroh_addr = existing.guardian_iroh_addr.clone();
-            }
-            // Same regression, same fix, for every OTHER capability-advertisement
-            // field a node can newly GAIN after boot (a rootfs rebuild that stages
-            // wasmer/bun, a litebox verification, a BuildExecutor probe passing, a
-            // runtime-artifact receiver initializing). Each is `None` = "not yet
-            // capable/known" and monotonically becomes `Some` as capability is
-            // proven live — never the reverse while the node keeps running. A
-            // relayed copy older than the peer's own most recent direct announce
-            // (this round, concurrently processed, from a peer that hasn't yet
-            // relearned the new capability) must not silently un-advertise it —
-            // witnessed live 2026-08-26: fc-phoenix's own `/v1/nodes` correctly
-            // showed `runtime_artifact_protocol: Some(1)` immediately after
-            // gaining Litebox verification, while the leader's registry stayed
-            // permanently `None` for it, incorrectly excluding it from every
-            // runtime-artifact-gated placement despite `last_seen_ms` advancing
-            // normally (proving gossip itself was flowing — just periodically
-            // clobbered by a stale relay hop that raced the direct announce).
-            if peer.wasm_runtime.is_none() {
-                peer.wasm_runtime = existing.wasm_runtime;
-            }
-            if peer.bun_runtime.is_none() {
-                peer.bun_runtime = existing.bun_runtime;
-            }
-            if peer.build_toolchains.is_none() {
-                peer.build_toolchains = existing.build_toolchains.clone();
-            }
-            if peer.runtime_artifact_protocol.is_none() {
-                peer.runtime_artifact_protocol = existing.runtime_artifact_protocol;
-            }
-            if peer.build_isolation_protocol.is_none() {
-                peer.build_isolation_protocol = existing.build_isolation_protocol;
-            }
-            if peer.artifact_transfer_protocol.is_none() {
-                peer.artifact_transfer_protocol = existing.artifact_transfer_protocol;
-            }
+            Self::keep_gained_capabilities(&mut peer, existing);
         }
         if peer.healthy && peer.latency_ms == u64::MAX {
             peer.latency_ms = Self::RESTORED_LATENCY_MS;
         }
         peers.insert(peer.id.clone(), peer);
+    }
+
+    /// Every capability advertisement only moves `None` → `Some` while a node keeps running, so a
+    /// relayed copy older than the peer's own announce must never un-advertise one.
+    fn keep_gained_capabilities(peer: &mut NodeInfo, existing: &NodeInfo) {
+        if peer.guardian_iroh_addr.is_none() {
+            peer.guardian_iroh_addr = existing.guardian_iroh_addr.clone();
+        }
+        if peer.wasm_runtime.is_none() {
+            peer.wasm_runtime = existing.wasm_runtime;
+        }
+        if peer.bun_runtime.is_none() {
+            peer.bun_runtime = existing.bun_runtime;
+        }
+        if peer.build_toolchains.is_none() {
+            peer.build_toolchains = existing.build_toolchains.clone();
+        }
+        if peer.runtime_artifact_protocol.is_none() {
+            peer.runtime_artifact_protocol = existing.runtime_artifact_protocol;
+        }
+        if peer.build_isolation_protocol.is_none() {
+            peer.build_isolation_protocol = existing.build_isolation_protocol;
+        }
+        if peer.artifact_transfer_protocol.is_none() {
+            peer.artifact_transfer_protocol = existing.artifact_transfer_protocol;
+        }
     }
 
     /// All nodes (self first), with stale peers (>30s) dropped.

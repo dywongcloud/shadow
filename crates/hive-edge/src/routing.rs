@@ -1,10 +1,5 @@
-//! Routing layer — redirects and rewrites evaluated before caching, per Vercel's
-//! CDN routing layer (<https://vercel.com/docs/how-vercel-cdn-works>):
-//!
-//! 1. **Redirects** — respond immediately with a new Location (e.g. enforce
-//!    HTTPS, move pages).
-//! 2. **Rewrites** — map a public path to a different internal path without the
-//!    client seeing it; processing continues with the rewritten path.
+//! Redirects (immediate new Location) and rewrites (internal path change, processing continues)
+//! evaluated before caching.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -90,7 +85,6 @@ impl Router {
 
 impl Default for Router {
     fn default() -> Self {
-        // Note: returns inner value, not Arc; prefer Router::new().
         Router {
             redirects: RwLock::new(Vec::new()),
             rewrites: RwLock::new(Vec::new()),

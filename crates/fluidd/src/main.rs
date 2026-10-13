@@ -1,6 +1,5 @@
-//! `fluidd` — the serving daemon: Fluid compute pool + public gateway + admin
-//! API. Runs functions in the same cells as Hive (mock processes anywhere, or
-//! Firecracker microVMs inside Lima).
+//! The serving daemon: Fluid compute pool + public gateway + admin API, running functions in the
+//! same cells as Hive.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,7 +39,6 @@ struct Args {
     #[arg(long, default_value = "default")]
     image: String,
 
-    // firecracker paths (ignored for mock)
     #[arg(long, default_value = "/usr/local/bin/firecracker")]
     fc_bin: String,
     #[arg(long, default_value = "/var/lib/hive/vmlinux")]

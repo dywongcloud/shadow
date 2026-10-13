@@ -1,6 +1,5 @@
-//! Workflows — durable, multi-step orchestration. A workflow is an ordered list
-//! of steps (each invokes a function); a run executes them sequentially with
-//! per-step state persisted so progress is observable and resumable.
+//! Durable multi-step orchestration: an ordered list of function-invoking steps, run sequentially
+//! with per-step state persisted.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -27,9 +26,8 @@ pub struct WorkflowDef {
     #[serde(default)]
     pub project: String,
     pub steps: Vec<WorkflowStep>,
-    /// When ingested from a Vercel WDK `manifest.json`, the workflow's React-Flow
-    /// graph (`{ nodes, edges }`) so the dashboard can draw it on the canvas
-    /// exactly as the WDK defined it. `None` for engine-defined workflows.
+    /// The React-Flow graph (`{ nodes, edges }`) of a workflow ingested from a Vercel WDK
+    /// `manifest.json`; `None` for engine-defined workflows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<serde_json::Value>,
 }
@@ -107,21 +105,13 @@ impl WorkflowEngine {
         self.runs.read().get(id).cloned()
     }
 
-    /// Snapshot every run for `PlatformSnapshot` (see `persist.rs`'s
-    /// `capture`/`restore`) — engine-defined-workflow run history was
-    /// previously pure in-memory and vanished on every restart, unlike
-    /// `defs` (already captured via `defs()`/`define()` above).
+    /// Every run, for the platform snapshot (`persist.rs`).
     pub fn runs_snapshot(&self) -> Vec<WorkflowRun> {
         self.runs.read().values().cloned().collect()
     }
 
-    /// Restore run history from a loaded snapshot (boot restore). An
-    /// in-flight run (`Pending`/`Running`) died with the previous process —
-    /// no background task exists to resume it on this fresh engine — so it
-    /// is reconciled to `Failed`, mirroring `persist::restore`'s own
-    /// orphaned-`Building`-deployment handling: an infinite "Running" run
-    /// with no activity is a worse, less actionable state than an honest,
-    /// retryable failure.
+    /// Restore run history at boot; an in-flight run died with the previous process and is
+    /// reconciled to `Failed`.
     pub fn runs_load(&self, runs: Vec<WorkflowRun>) {
         let mut map = self.runs.write();
         for mut run in runs {
