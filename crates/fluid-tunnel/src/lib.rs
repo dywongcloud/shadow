@@ -1,20 +1,7 @@
-//! `fluid-tunnel` — one persistent, multiplexed tunnel per instance.
-//!
-//! This is the deeper version of Vercel's "persistent TCP tunnel": instead of a
-//! pool of one-request-at-a-time keep-alive connections, a **single** connection
-//! to an instance carries **many concurrent requests**, each tagged with a
-//! `stream_id`, plus in-band **metrics** and **nack** (overload) signals.
-//!
-//! * [`TunnelClient`] — gateway side. `request()` multiplexes a request onto the
-//!   shared connection and returns a streamed response; a reader task demuxes
-//!   responses back to the right caller and tracks instance [`Health`].
-//! * [`TunnelServer`] — instance side (the cell agent, or the mock backend's
-//!   in-process bridge). Demuxes requests, proxies each to the local function
-//!   over HTTP concurrently, streams responses back, emits metrics, and nacks
-//!   when at capacity.
-//!
-//! The transport is any `AsyncRead + AsyncWrite` byte stream — TCP, vsock, or an
-//! iroh P2P stream — so the same protocol distributes infra locally or globally.
+//! One persistent, multiplexed tunnel per instance: a single connection carries many concurrent
+//! requests tagged by `stream_id`, plus in-band metrics and nack signals. [`TunnelClient`] is the
+//! gateway side, [`TunnelServer`] the instance side; the transport is any `AsyncRead + AsyncWrite`
+//! byte stream (TCP, vsock, an iroh stream).
 
 mod client;
 mod codec;
@@ -55,10 +42,8 @@ pub struct Metrics {
     /// Cumulative response bytes written back to the router over this tunnel (#14).
     #[serde(default)]
     pub bytes_out: u64,
-    /// Current write-queue depth: frames enqueued for the router but not yet
-    /// flushed to the socket (#14). A sustained non-zero depth means the router /
-    /// network can't drain responses as fast as the function produces them — i.e.
-    /// downstream backpressure.
+    /// Current write-queue depth: frames enqueued for the router but not yet flushed; sustained
+    /// non-zero means downstream backpressure.
     #[serde(default)]
     pub queue_depth: u32,
     /// Times the write queue crossed the backpressure high-water mark (#14).

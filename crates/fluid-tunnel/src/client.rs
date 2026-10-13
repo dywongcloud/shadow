@@ -59,7 +59,6 @@ impl TunnelClient {
         });
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
 
-        // Writer task.
         tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
                 if wr.write_all(&frame.encode()).await.is_err() {
@@ -68,7 +67,6 @@ impl TunnelClient {
             }
         });
 
-        // Reader task: demux responses, update health.
         let s = shared.clone();
         tokio::spawn(async move {
             loop {
@@ -108,7 +106,6 @@ impl TunnelClient {
                             h.max_concurrency = m.max_concurrency;
                             h.last_update_ms = now_ms();
                             h.alive = true;
-                            // #14: tunnel byte/backpressure metering.
                             h.bytes_in = m.bytes_in;
                             h.bytes_out = m.bytes_out;
                             h.queue_depth = m.queue_depth;
@@ -118,7 +115,6 @@ impl TunnelClient {
                     _ => {}
                 }
             }
-            // Connection closed: fail everything outstanding.
             s.closed.store(true, Ordering::SeqCst);
             s.health.lock().alive = false;
             let mut pending = s.pending.lock();
@@ -144,8 +140,10 @@ impl TunnelClient {
         *self.shared.health.lock()
     }
 
-    /// Send a request and await its response head; the body streams via the
-    /// returned receiver.
+    /// Send a request and await its response head; the body streams via the returned receiver.
+    /// `head_timeout` is the caller's own per-invocation budget (the deployment's
+    /// `max_duration_secs`): a shorter fixed value misreads a slow-but-running invocation as
+    /// unanswered and retries it, duplicating its side effects.
     pub async fn request(
         &self,
         method: &str,
@@ -183,18 +181,6 @@ impl TunnelClient {
             .send(Frame::new(id, FrameKind::Request, payload))
             .map_err(|_| anyhow::anyhow!("tunnel writer gone"))?;
 
-        // MUST be the caller's own per-invocation budget (the deployment's
-        // `max_duration_secs`, default 300s at the fluid-gateway call site),
-        // never a shorter hardcoded value: a previous fixed 30s here fired
-        // BEFORE the gateway's own `tokio::time::timeout(max_dur, ...)` around
-        // this whole call could ever see a real over-budget timeout, so every
-        // request past 30s (well within budget for an LLM/webhook call) hit
-        // this branch's `Err`, was misread as "the function never answered",
-        // and got retried — while the ORIGINAL invocation was still running
-        // server-side with no cancellation signal, silently duplicating side
-        // effects (this is the "shoomoo incident" `proxy_function` documents:
-        // `last_err = "timed out waiting for response head"` was this branch,
-        // not a real transport failure).
         let meta = match tokio::time::timeout(head_timeout, head_rx).await {
             Ok(Ok(r)) => r?,
             Ok(Err(_)) => {

@@ -1,20 +1,6 @@
-//! Live witness for `p2p-trunk-singleflight-generation` — drives the REAL
-//! PeerPool against a REAL serving endpoint:
-//!
-//!   1. `concurrent_first_contacts_share_one_dial`
-//!      → 8 concurrent first-contact `warm`s of the same cold peer must pay
-//!        exactly ONE dial (opened delta == 1): the singleflight leader dials,
-//!        the other seven await the shared outcome. Pre-fix this was up to 8
-//!        last-insert-wins double-dials.
-//!   2. `close_peer_evicts_and_redials_new_generation`
-//!      → after `close_peer`, a fresh warm dials a NEW trunk (opened total 2)
-//!        and the pool still converges to one cached trunk.
-//!   3. `waiters_receive_live_connection`
-//!      → every concurrent waiter resolves with a connection whose
-//!        close_reason is unset (the shared dial's real connection).
-//!
-//! Usage: `cargo run -p hive-p2p --example trunk_singleflight_witness`
-//! Exit code 0 = every witness line passed; 1 = at least one failed.
+//! Live witness for trunk singleflight: 8 concurrent first contacts of one cold peer pay exactly
+//! ONE dial, `close_peer` makes the next warm dial a NEW generation, and every waiter gets a live
+//! connection. `cargo run -p hive-p2p --example trunk_singleflight_witness`.
 
 use std::sync::Arc;
 
@@ -36,7 +22,6 @@ async fn main() {
         return;
     };
 
-    // 1 + 3. Eight concurrent first contacts: one dial, all live connections.
     let (opened_before, _) = pool.stats();
     let pool2 = pool.clone();
     let id2 = id.clone();
@@ -60,7 +45,6 @@ async fn main() {
     );
     all &= check("pool_converged_to_one_trunk", pool.trunk_count().await == 1);
 
-    // 2. close_peer bumps the generation: the next warm redials (opened +1).
     pool.close_peer(&id).await;
     let ok = pool.warm(&id, &addr).await;
     let (opened_final, _) = pool.stats();

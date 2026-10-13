@@ -1,24 +1,7 @@
-//! Connection-ESTABLISHMENT liveness for the hive-p2p endpoint: the inbound
-//! budgets, the accept deadline's bookkeeping, and the counters that say
-//! whether this endpoint can still form a NEW connection in either direction.
-//!
-//! The failure this exists for (fc-virginia 2026-09-12 and 09-18, fc-sanjose
-//! 2026-09-24): iroh's layer above noq stops completing connection setup —
-//! the last outbound trunk opens, `net_report` stops, and every inbound
-//! connection that finishes its handshake then waits forever in iroh's
-//! `register_connection`. Warm trunks keep serving, so every peer-count
-//! signal stays up. The accept task used to hold its budget permit across
-//! that unbounded await, so the budget filled with permits of connections
-//! that no longer existed and the endpoint answered CONNECTION_REFUSED to
-//! the whole fleet for hours (335,055 refusals on fc-sanjose in one day).
-//! [`crate::serve_tunnels_full`] now bounds the accept, and everything it and
-//! [`crate::PeerPool`] observe about establishment is recorded here, so the
-//! wedge is a number ([`establish_stats`]) instead of a journal archaeology
-//! session, and `hive-cloud`'s meshwatch can act on it.
-//!
-//! Counters are process-global like `VERIFY_STATS`/`PQ_KEX_STATS`: one
-//! endpoint per process serves the fleet ALPN, and the stats must be
-//! readable without threading a handle through every caller.
+//! Connection-ESTABLISHMENT liveness for the hive-p2p endpoint: inbound budgets, the accept
+//! deadline's bookkeeping, and the counters that say whether this endpoint can still form a NEW
+//! connection in either direction ([`establish_stats`], acted on by hive-cloud's meshwatch).
+//! Process-global like `VERIFY_STATS`/`PQ_KEX_STATS`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +25,8 @@ pub(crate) enum Event {
     InboundInitial = 3,
     /// An accepted connection completed handshake AND iroh registration.
     InboundEstablished = 4,
-    /// An accept exceeded its deadline and was closed. Any sender can cause
-    /// one (a handshake kept alive past the deadline), so on its own it is
-    /// never restart evidence.
+    /// An accept exceeded its deadline and was closed; any sender can cause one, so alone it is never
+    /// restart evidence.
     AcceptStuck = 5,
     /// This endpoint refused an inbound connection (a full budget or the
     /// per-endpoint cap).
@@ -91,8 +73,6 @@ pub(crate) fn note(event: Event) {
     let epoch = now / 1000 / BUCKET_SECS;
     let i = event as usize;
     let mut log = lock(&LOG);
-    // A clock that stepped backwards folds into the newest bucket rather than
-    // breaking the ring's ordering.
     if log.buckets.back().is_none_or(|(e, _)| *e < epoch) {
         log.buckets.push_back((epoch, [0; EVENTS]));
     }
@@ -115,15 +95,11 @@ pub(crate) fn note(event: Event) {
     }
 }
 
-// ---- in-flight accepts ---------------------------------------------------
-
 static INFLIGHT: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
 static INFLIGHT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// One accept in progress. The entry leaves the table on EVERY exit path
-/// (success, error, the deadline, runtime cancellation) because it is removed
-/// in `Drop` — the rule that decides whether `accept_inflight_oldest_ms` can
-/// be believed.
+/// One accept in progress; removed in `Drop` on EVERY exit path, which is what makes
+/// `accept_inflight_oldest_ms` believable.
 pub(crate) struct InflightAccept(u64);
 
 impl InflightAccept {
@@ -140,13 +116,9 @@ impl Drop for InflightAccept {
     }
 }
 
-// ---- inbound budgets -----------------------------------------------------
-
-/// Which inbound budget a connection is charged to. Before the handshake it
-/// is what the ClientHello's ALPN list says when the first Initial carries a
-/// parseable one; a ClientHello that does not fit one packet (every hybrid
-/// X25519MLKEM768 dial: the 1216-byte key share cannot) is `Pending` until
-/// the negotiated ALPN decides after the handshake.
+/// Which inbound budget a connection is charged to: the ClientHello's ALPN when the first Initial
+/// carries a parseable one, else `Pending` (every hybrid X25519MLKEM768 dial) until the negotiated
+/// ALPN decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnClass {
     Fleet,
@@ -179,9 +151,8 @@ impl Budget {
         }
     }
 
-    /// Never waits: an exhausted budget is a refusal, not a queue (awaiting a
-    /// semaphore in the single accept loop head-of-line blocks every later
-    /// connection, fleet trunks included).
+    /// Never waits: an exhausted budget is a refusal, not a queue (awaiting in the single accept loop
+    /// would head-of-line block every later connection).
     pub(crate) fn try_acquire(
         &self,
     ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
@@ -231,11 +202,8 @@ pub(crate) fn register_inbound(budgets: &InboundBudgets) {
     *lock(&INBOUND) = Some(budgets.clone());
 }
 
-// ---- rate-limited warnings -------------------------------------------------
-
-/// Admits one log line per interval and counts what it suppressed, so a
-/// refusal storm (9/s on fc-sanjose) is a line every few seconds carrying a
-/// count instead of a journal flood.
+/// Admits one log line per interval and counts what it suppressed, so a refusal storm is a line
+/// every few seconds carrying a count.
 pub(crate) struct WarnGate {
     last_ms: AtomicU64,
     suppressed: AtomicU64,
@@ -266,28 +234,20 @@ impl WarnGate {
     }
 }
 
-// ---- connect-error classification ---------------------------------------
-
 /// What a failed connect says about the PEER, as far as the dial path cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectFailure {
-    /// An endpoint answered `CONNECTION_REFUSED`: "not now". It precedes the
-    /// handshake and names no identity, so through a direct address it is
-    /// only the dialed peer's answer once an identity-routed path confirms it
-    /// (`PeerPool::acquire`). Re-dialing a confirmed refusal at once is
-    /// exactly the storm that hammered the wedged leader.
+    /// An endpoint answered `CONNECTION_REFUSED` ("not now"); pre-handshake and nameless, so through a
+    /// direct address it counts only once an identity-routed path confirms it (`PeerPool::acquire`).
     Refused,
-    /// The address answered with a DIFFERENT identity than the one dialed
-    /// (`invalid peer certificate: UnknownIssuer` — iroh's verifier compares
-    /// the presented key to the dialed `EndpointId`): the hint's IP addresses
-    /// belong to someone else, and every dial through them fails the same way.
+    /// The address answered with a DIFFERENT identity than dialed (`UnknownIssuer`): the hint's IP
+    /// addresses belong to someone else.
     IdentityMismatch,
     Other,
 }
 
-/// Classify by the error's rendered chain. iroh's error types are
-/// `transparent` stacks whose `source()` skips levels, so the text is the one
-/// stable contract (the same strings the journal lines carry).
+/// Classify by the error's rendered chain — iroh's `transparent` error stacks skip `source()`
+/// levels, so the text is the one stable contract.
 pub(crate) fn classify_connect_error(error: &(dyn std::error::Error + 'static)) -> ConnectFailure {
     let mut text = error.to_string();
     let mut source = error.source();
@@ -304,8 +264,6 @@ pub(crate) fn classify_connect_error(error: &(dyn std::error::Error + 'static)) 
         ConnectFailure::Other
     }
 }
-
-// ---- the exported view -----------------------------------------------------
 
 /// Per-class inbound numbers.
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -332,9 +290,8 @@ pub struct PeerBudget {
     pub conns: usize,
 }
 
-/// Connection-establishment liveness of this process's fleet endpoint.
-/// Timestamps are epoch ms (`None` = never since boot); `*_window` counts
-/// cover the last `window_secs` (10 s bucket granularity, 1 h max).
+/// Connection-establishment liveness of this process's fleet endpoint; timestamps are epoch ms
+/// (`None` = never), `*_window` counts cover the last `window_secs` (10 s buckets, 1 h max).
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct EstablishStats {
     pub window_secs: u64,
@@ -367,15 +324,8 @@ pub struct EstablishStats {
     pub budget_by_peer: Vec<PeerBudget>,
 }
 
-/// Snapshot the establishment counters over the last `window_secs`.
-/// Live connections this process holds to `peer_id` (matched against the
-/// [`PeerBudget::peer`] short form / full endpoint id keys).
-///
-/// Placement uses this to tell "advertises an address" apart from "actually
-/// reachable". A NAT'd peer may advertise only an RFC1918 address and no relay,
-/// which no remote coordinator can dial — but a peer that dialled OUT to us
-/// (which NAT permits) leaves a live trunk we can use in both directions, so the
-/// path is real even though the advertised address is not.
+/// Live connections this process holds to `peer_id`; placement uses it to tell "advertises an
+/// address" from "actually reachable" (a NAT'd peer that dialled OUT to us leaves a usable trunk).
 pub fn peer_conns(peer_id: &str) -> usize {
     if peer_id.is_empty() {
         return 0;

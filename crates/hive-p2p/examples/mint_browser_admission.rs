@@ -1,21 +1,7 @@
-//! One-shot live-witness helper for bn-p2p-revocation-latency: mints a real
-//! admissible `POST /v1/browser/admissions` body (real ed25519 keypair, real
-//! proof-of-possession signature over `"{endpoint_id}:{challenge_ms}"`,
-//! signed exactly like `hive_browser::BrowserNode::signAdmission` /
-//! `run-node-worker.js`'s `admitOnce`) and prints it as ready-to-curl JSON so
-//! a real leader-side revoke -> follower fan-out round trip can be exercised
-//! against a real local hive-cloud pair without a browser. Not part of any
-//! production binary — same category as `fake_browser_peer.rs`.
-//!
-//! Usage: `cargo run --example mint_browser_admission` — prints one JSON line.
-//!
-//! `MINT_SECRET_HEX` (32-byte seed, hex) mints for an EXISTING browser
-//! identity instead of a throwaway one — the bn-relay-denylist-restart-
-//! friction witness needs a fresh PoP signature for the SAME endpoint id
-//! while that identity's relay reconnection is denylisted (a booting browser
-//! cannot sign for itself at that point; the seed it persists for identity
-//! stability is the same key material this signs with). `MINT_RELAY_URL`
-//! then supplies the relay transport hint for the synthesized `addr_json`.
+//! One-shot helper: mints a real admissible `POST /v1/browser/admissions` body (real ed25519
+//! keypair, real proof-of-possession over `"{endpoint_id}:{challenge_ms}"`) as ready-to-curl JSON.
+//! `MINT_SECRET_HEX` mints for an EXISTING browser identity, `MINT_RELAY_URL` supplies the relay hint
+//! for the synthesized `addr_json`. `cargo run --example mint_browser_admission`.
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

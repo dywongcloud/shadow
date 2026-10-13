@@ -1,19 +1,7 @@
-//! hive-browser — a SHADW mesh node that runs inside a browser tab.
-//!
-//! This is the wasm32 networking scaffold (PRD `bn-impl-crate-scaffold`). It
-//! boots a real iroh `Endpoint` over the browser's relay-only WebSocket
-//! transport, publishes/resolves identity through a pkarr relay, and accepts
-//! inbound connections on its OWN ALPN (`hive/browser/0`) — the dedicated,
-//! never-trusted surface the design (`docs/browser-node-proposal.md` §2.8)
-//! keeps structurally disjoint from the fleet control plane. There are NO
-//! gossip/join/raw arms here by construction; the handler only serves the
-//! small op set in `hive-browser-proto` (echo plus edge-function invoke today),
-//! which is enough to prove that a browser tab is a real bidirectional iroh peer
-//! without granting it any fleet-node authority.
-//!
-//! Everything the browser cannot do (UDP, hole-punching) is absent by the same
-//! compile-time cfg iroh itself uses; all traffic rides a relay WebSocket and
-//! stays end-to-end encrypted (the relay cannot decrypt it).
+//! A mesh node that runs inside a browser tab (wasm32): a real iroh `Endpoint` over the relay-only
+//! WebSocket transport, identity via a pkarr relay, accepting only the `hive/browser/0` op set from
+//! `hive-browser-proto` — no gossip/join/raw arms by construction, so a tab is a real bidirectional
+//! peer with no fleet authority. All traffic rides a relay WebSocket, end-to-end encrypted.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,11 +20,9 @@ use serde::Serialize;
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
 
-/// The registered edge-function invoke handler: a JS callback
-/// `(codeDigest: string, requestJson: string, signal: AbortSignal) => Promise<string>` that resolves
-/// the digest to a LOCALLY pinned artifact. Executable source never crosses the
-/// wire. `Rc<RefCell<>>`, not `Arc<Mutex<>>` — wasm32 in a browser tab is
-/// single-threaded, and `js_sys::Function` isn't `Send` anyway.
+/// The registered invoke handler `(codeDigest, requestJson, signal) => Promise<string>`, resolving
+/// the digest to a LOCALLY pinned artifact; `Rc<RefCell>` because a tab is single-threaded and
+/// `js_sys::Function` is not `Send`.
 type InvokeHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
 /// Live endpoint-address observer registered by the trusted worker. The callback
@@ -47,24 +33,16 @@ type AddressHandler = Rc<RefCell<Option<js_sys::Function>>>;
 /// `(digest: string, offset: number, maxLen: number, signal: AbortSignal) => Promise<{total, bytes}>`.
 type AssetHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
-/// Trusted local CRR sync responder (bn-browser-fleet-crr-exchange):
-/// `(requestBytes: Uint8Array, signal: AbortSignal) => Promise<Uint8Array>`.
-/// The JS side (the sqlite-worker glue) decodes the `Op::CrrSync` request,
-/// runs the worker's watermark/export/apply ops against the OPFS replica, and
-/// returns the encoded reply. The wasm half knows only frames — CRR semantics
-/// live in the glue and in `hive-crsql` on the fleet side.
+/// Trusted local CRR sync responder `(requestBytes, signal) => Promise<Uint8Array>`; the JS glue
+/// owns the CRR semantics, this half knows only frames.
 type CrrSyncHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
-/// Exact execution scopes granted to each TLS-authenticated iroh endpoint.
-/// Empty at boot and shared (not snapshotted) across connection/stream tasks so
-/// revocation applies to existing pooled QUIC connections.
+/// Exact execution scopes granted per TLS-authenticated endpoint; shared, not snapshotted, so
+/// revocation reaches pooled connections.
 type InvokerGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
 type AssetGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
-/// Endpoints permitted to drive `Op::CrrSync` against this node's replica.
-/// Scopeless by construction: a CrrSync request names no resource — the grant
-/// the FLEET resolved (server-side, from the admission) already pins the one
-/// database this node replicates, so the only question here is "may this
-/// exact fleet endpoint run a sync round at all".
+/// Endpoints permitted to drive `Op::CrrSync` against this node's replica; scopeless because the
+/// fleet-resolved grant already pins the one database this node replicates.
 type CrrSyncGrants = Rc<RefCell<BTreeSet<EndpointId>>>;
 type PeerConnections = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
 type PeerStreams = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
@@ -80,16 +58,8 @@ const MAX_OUTBOUND_CONNECTIONS: usize = 16;
 const MAX_ACTIVE_OUTBOUND_STREAMS: usize = 32;
 const MAX_OUTBOUND_DIAL_WAITERS: usize = 32;
 const MAX_INFLIGHT_ASSET_BYTES: usize = 128 << 20;
-/// Budget for the best-effort "is the home relay up yet?" wait in `boot()`.
-///
-/// This was 10s, which is structurally SMALLER THAN ONE worst-case attempt:
-/// `ep.online()` cannot resolve until a net_report round finishes, that round
-/// does not short-circuit until every configured relay has answered (three are
-/// configured by default), and a single relay dial carries its own ~10s
-/// connect timeout — so ~13s+ is reachable on a perfectly healthy fleet from a
-/// slow or distant client, and the old budget guaranteed failure there. It is
-/// now both larger than that worst case AND non-fatal on expiry (see `boot`),
-/// so a slow network gets a working node either way instead of an error.
+/// Budget for the best-effort "is the home relay up yet?" wait in `boot()`: larger than one
+/// worst-case net_report round (~13 s+) and non-fatal on expiry.
 const RELAY_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,11 +68,8 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTBOUND_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
-/// One full maximum-size frame per stream (bn-browser-fleet-crr-exchange: the
-/// largest op is CrrSync's 4 MiB frame, so the receive window must cover it —
-/// QUIC flow control would still deliver a bigger frame piecemeal, but every
-/// receiver here already reads incrementally and a window matched to the
-/// frame keeps one round from degenerating into window-update round trips).
+/// One full maximum-size frame per stream (CrrSync's 4 MiB), so a round never degenerates into
+/// window-update round trips.
 const BROWSER_STREAM_WINDOW: u32 = (BROWSER_MAX_CRR_FRAME + 4) as u32;
 const BROWSER_CONNECTION_WINDOW: u32 = BROWSER_STREAM_WINDOW * MAX_STREAMS_PER_CONNECTION as u32;
 static HANDLER_SLOTS: tokio::sync::Semaphore =
@@ -988,16 +955,8 @@ fn watch_handler(
     rx
 }
 
-/// The browser node's dedicated ALPN, plus the rest of the wire contract.
-/// Intentionally distinct from `hive/tunnel/0` (the fleet data/control ALPN) so
-/// a browser peer can never be one byte from a control-plane stream mode — the
-/// fleet-side accept path dispatches per-ALPN and this one has no privileged
-/// arms.
-///
-/// Everything here comes from `hive-browser-proto`, which `crates/hive-p2p`
-/// also depends on: this crate being wasm32-only and workspace-excluded does
-/// not prevent a path dependency, so there is no second copy of the ALPN, the
-/// frame cap, the op bytes, or the framing helpers to keep in sync.
+/// The browser node's dedicated ALPN and the rest of the wire contract, from `hive-browser-proto`
+/// (shared with `hive-p2p`, so there is no second copy to keep in sync).
 pub use hive_browser_proto::BROWSER_ALPN;
 
 use hive_browser_proto::{
@@ -1010,7 +969,6 @@ use hive_browser_proto::{
 #[wasm_bindgen(start)]
 pub fn on_load() {
     console_error_panic_hook::set_once();
-    // Best-effort structured logs to the devtools console; harmless if it fails.
     let _ = std::panic::catch_unwind(|| tracing_wasm::set_as_global_default());
 }
 
@@ -1020,17 +978,9 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// bn-p2p-version-negotiation (remaining scope, item 3/3: the PWA wasm bundle
-/// itself). A service-worker-cached `hive_browser_bg.wasm` can go stale
-/// independently of the JS glue that loads it (the two are versioned/cached
-/// together as a pair by `ui/scripts/sync-browser-node.mjs`, but a partial or
-/// interrupted cache update could still leave a stale wasm binary paired with
-/// fresh `hive_browser.js`). `run-node-worker.js` calls this immediately after
-/// `await init()` succeeds — before constructing `BrowserNode` — and compares
-/// it against its own `WASM_BUNDLE_VERSION` copy (same cross-language-constant
-/// pattern as `PROTOCOL_VERSION`/`HOST_ABI_VERSION` there). Bump this whenever
-/// a change to this crate's wasm-exposed surface (BrowserNode's methods, the
-/// wire contract it implements) is not safely usable by an older worker.
+/// Version of this wasm bundle, compared by `run-node-worker.js` against its own
+/// `WASM_BUNDLE_VERSION` right after `init()` so a stale service-worker-cached `.wasm` paired with
+/// fresh JS glue is detected; bump whenever the wasm-exposed surface changes incompatibly.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
     15
@@ -1076,10 +1026,6 @@ pub struct BrowserNode {
 
 impl Drop for BrowserNode {
     fn drop(&mut self) {
-        // wasm-bindgen's generated `free()` cannot await, but it must not leave
-        // the accept loop/relay connection alive forever. Clear capabilities
-        // synchronously and begin best-effort shutdown. Callers needing a
-        // witnessed drain use the explicit async `close()` before `free()`.
         self.invoke.borrow_mut().take();
         self.asset.borrow_mut().take();
         self.crr_sync.borrow_mut().take();
@@ -1164,15 +1110,9 @@ fn spawn_address_loop(ep: Endpoint, handler: AddressHandler, tasks: TaskGroup) {
 
 #[wasm_bindgen]
 impl BrowserNode {
-    /// Boot a node: bind an endpoint against `relay_urls` (comma-separated,
-    /// same convention as the fleet's own `HIVE_RELAY_URLS` — see
-    /// `hive_p2p::relay_map_from_env` — so a caller can hand multiple relays
-    /// for failover instead of pinning to one; each must be `http://` or
-    /// `https://` — iroh derives the relay's `ws://`/`wss://` transport),
-    /// optionally wire a
-    /// pkarr `discovery_url` for publish+resolve, and restore identity from
-    /// `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a
-    /// fresh one. Spawns the `hive/browser/0` accept loop before returning.
+    /// Boot a node: bind against `relay_urls` (comma-separated `http(s)://` URLs, same convention as
+    /// `HIVE_RELAY_URLS`), optionally wire pkarr `discovery_url`, restore identity from `secret_hex`
+    /// (32-byte ed25519 seed) or generate one, and spawn the accept loop.
     #[wasm_bindgen]
     pub async fn boot(
         relay_urls: String,
@@ -1207,8 +1147,6 @@ impl BrowserNode {
         let map = RelayMap::from_iter(relays);
         let relay_mutation = Rc::new(Cell::new(false));
 
-        // Minimal preset (no n0 pkarr/DNS baked in) + our own relay map, so the
-        // browser only ever talks to the relay we hand it.
         let transport = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(VarInt::from_u32(MAX_ACTIVE_STREAMS as u32))
             .stream_receive_window(VarInt::from_u32(BROWSER_STREAM_WINDOW))
@@ -1219,9 +1157,6 @@ impl BrowserNode {
             .alpns(vec![BROWSER_ALPN.to_vec()])
             .transport_config(transport);
 
-        // Identity: restore a persisted seed if the page gave us one, else the
-        // caller is expected to read `secret back out` via a later export. A
-        // stable seed ⇒ a stable EndpointId across reloads.
         if let Some(hex) = secret_hex.as_deref().filter(|h| !h.is_empty()) {
             let raw = hex_to_32(hex)
                 .ok_or_else(|| JsError::new("secret_hex must be 64 hex chars (32 bytes)"))?;
@@ -1241,39 +1176,6 @@ impl BrowserNode {
             .await
             .map_err(|e| JsError::new(&format!("endpoint bind failed: {e}")))?;
 
-        // `bind()` resolving does NOT mean this node is dialable. The relay
-        // entry that a browser peer needs — the ONLY transport it has, since a
-        // browser cannot dial raw IP — is registered asynchronously once the
-        // home-relay connection comes up, so `ep.addr()` before that returns an
-        // EndpointAddr with an EMPTY addrs list. Handing that out looks like a
-        // valid address and fails much later at the DIALER with "No addressing
-        // information available", blaming the caller for this node's
-        // un-readiness. `browser_echo_native.rs` hit exactly this and carries
-        // the same `online()` call for the same reason.
-        // ...so we WAIT for it here — but only as a convenience, never as a
-        // gate. This used to `ep.close()` and throw "browser relay online
-        // deadline exceeded" on timeout, which turned every transient slow
-        // relay handshake into a hard, self-inflicted dead end: the endpoint
-        // was already bound and iroh would have kept working the whole
-        // RelayMap in the background, but tearing it down threw that away and
-        // left the user staring at an error with nothing retrying behind it.
-        // Live-measured for contrast, this same call returns in ~1.3s against
-        // a healthy relay from a well-connected client — but the tail is much
-        // longer than that median and was the whole bug: the net_report round
-        // `online()` waits on does not short-circuit until EVERY configured
-        // relay has answered, and only one relay is actually dialed, so a
-        // single slow or websocket-broken relay stalls the whole wait no
-        // matter how healthy the other two are. Expiring here now means "not
-        // yet", not "failed".
-        //
-        // Returning a not-yet-online node is SAFE by construction on the JS
-        // side and needs no caller change: `addr_json()` below still refuses
-        // to hand out an addr with no transport hints, `spawn_address_loop`
-        // emits `{online:false, relays:[], addrJson:null}` immediately and
-        // again the moment the home relay lands, and the worker's renew path
-        // is already guarded on having an address before it will admit. So a
-        // slow relay now surfaces as "degraded, connecting" that heals itself,
-        // instead of a dead node the user has to notice and restart by hand.
         if n0_future::time::timeout(RELAY_ONLINE_TIMEOUT, ep.online())
             .await
             .is_err()
@@ -1335,18 +1237,9 @@ impl BrowserNode {
         self.ep.id().to_string()
     }
 
-    /// Proof-of-possession signature for admission (bn-p2p-heartbeat-lease):
-    /// signs `"{this node's endpoint_id}:{challenge_ms}"` with this node's
-    /// OWN ed25519 secret key, returning 128 hex chars. `challenge_ms` is the
-    /// caller's own current-time claim (no separate server round trip to
-    /// fetch a nonce) — the backend rejects a signature whose challenge_ms is
-    /// outside a tight freshness window, bounding replay of a captured
-    /// signature to that window rather than forever. Borrowed from
-    /// Folding@home's admission-binding pattern (research:
-    /// volunteer-compute-trust-admission-models) — without this, an admission
-    /// request naming ANY endpoint_id is accepted on the CALLER's platform
-    /// auth alone, with nothing proving the caller actually controls that
-    /// endpoint's private key.
+    /// Proof-of-possession for admission: sign `"{endpoint_id}:{challenge_ms}"` with this node's own
+    /// ed25519 key (128 hex chars); the backend bounds replay by requiring `challenge_ms` inside a
+    /// tight freshness window.
     #[wasm_bindgen(js_name = signAdmission)]
     pub fn sign_admission(&self, challenge_ms: String) -> String {
         let endpoint_id = self.ep.id().to_string();
@@ -1355,27 +1248,11 @@ impl BrowserNode {
         bytes_to_hex(&sig.to_bytes())
     }
 
-    /// Sign one peer-mesh signalling envelope (bn-browser-peer-webrtc-mesh)
-    /// with this node's OWN ed25519 secret key, returning 128 hex chars.
-    ///
-    /// `context` is the canonical binding string built by
-    /// `www/peer-mesh.js::envelopeContext` — it carries BOTH endpoint ids, the
-    /// session id, a timestamp and the DTLS certificate FINGERPRINT of the
-    /// offer/answer being signalled. That last field is the whole point: the
-    /// WebRTC lane's DTLS identity is an ephemeral, self-signed certificate
-    /// with no relationship whatsoever to the iroh identity every capability on
-    /// this platform is keyed on, so without a signature binding the two, the
-    /// signalling relay (a fleet mailbox — an authenticated surface, but still
-    /// a THIRD party to the peer link) could substitute its own fingerprint and
-    /// sit in the middle of a "direct" connection. With it, a peer sets a
-    /// remote description only after verifying that the exact fingerprint in
-    /// the SDP was signed by the ed25519 key of the EndpointId the server
-    /// admitted, and the browser's own DTLS stack then refuses any certificate
-    /// that does not match it.
-    ///
-    /// Domain-separated (`hive-browser-webrtc-v1\0`) so a mesh signature can
-    /// never be replayed as an admission proof-of-possession (which signs the
-    /// bare, undomained `"{endpoint_id}:{challenge_ms}"`), nor the reverse.
+    /// Sign one peer-mesh signalling envelope: `context` (built by `www/peer-mesh.js::envelopeContext`)
+    /// binds both endpoint ids, the session id, a timestamp and the DTLS certificate fingerprint, so
+    /// the signalling relay cannot substitute its own fingerprint. Domain-separated
+    /// (`hive-browser-webrtc-v1\0`) so a mesh signature can never replay as an admission proof, nor
+    /// the reverse.
     #[wasm_bindgen(js_name = signMeshEnvelope)]
     pub fn sign_mesh_envelope(&self, context: String) -> Result<String, JsError> {
         self.ensure_open()?;
@@ -1384,26 +1261,16 @@ impl BrowserNode {
         Ok(bytes_to_hex(&sig.to_bytes()))
     }
 
-    /// The raw 32-byte ed25519 seed, as 64 hex chars — the ONLY way key
-    /// material leaves this module. Per `docs/browser-node-proposal.md` §2.2,
-    /// this exists solely so the caller can wrap it with a non-extractable
-    /// WebCrypto key before it ever touches durable storage; the wasm module
-    /// itself never persists anything. JS strings cannot be zeroed after use
-    /// (no mutable-buffer access), so the caller must encrypt this value
-    /// immediately on receipt and never log or store it bare.
+    /// The raw 32-byte ed25519 seed as 64 hex chars — the only way key material leaves this module;
+    /// the caller must wrap it in a non-extractable WebCrypto key before it touches durable storage
+    /// and never log it.
     #[wasm_bindgen(js_name = secretHex)]
     pub fn secret_hex(&self) -> String {
         bytes_to_hex(&self.ep.secret_key().to_bytes())
     }
 
-    /// Serialized `EndpointAddr` (id + relay/transport hints) a peer needs to
-    /// dial this browser node.
-    ///
-    /// THROWS rather than returning an address with no transport hints. `boot`
-    /// awaits `online()` so this should not happen, but an address carrying
-    /// only an id is undialable, and silently returning one moves the failure
-    /// to a different machine's dial attempt where the real cause is invisible.
-    /// Fail here, where the node that is not ready can actually be named.
+    /// Serialized `EndpointAddr` a peer needs to dial this node; THROWS rather than returning an
+    /// address with no transport hints, so un-readiness is named here instead of at a remote dial.
     #[wasm_bindgen(js_name = addrJson)]
     pub fn addr_json(&self) -> Result<String, JsError> {
         self.ensure_open()?;
@@ -1416,11 +1283,8 @@ impl BrowserNode {
         serde_json::to_string(&addr).map_err(|e| JsError::new(&format!("addr serialize: {e}")))
     }
 
-    /// Subscribe to the endpoint's live dialable address. The callback receives
-    /// `{online, relays, addrJson}` immediately and whenever iroh changes the
-    /// connected home-relay set. An offline update has `online:false`, an empty
-    /// relay list, and an empty addrJson; callers must never keep advertising a
-    /// previous address through that state.
+    /// Subscribe to the live dialable address: `{online, relays, addrJson}` immediately and on every
+    /// home-relay change; an offline update must stop any previous advertisement.
     #[wasm_bindgen(js_name = setAddressHandler)]
     pub fn set_address_handler(&self, handler: js_sys::Function) -> Result<(), JsError> {
         self.ensure_open()?;
@@ -1432,10 +1296,8 @@ impl BrowserNode {
         Ok(())
     }
 
-    /// Remove one configured relay at runtime. iroh's home-relay actor migrates
-    /// to another configured relay and `setAddressHandler` reports the new
-    /// dialable address. The final relay is structurally non-removable: leaving
-    /// a live node with no possible transport is never a valid state.
+    /// Remove one configured relay at runtime; iroh migrates to another and `setAddressHandler`
+    /// reports the new address. The final relay is non-removable.
     #[wasm_bindgen(js_name = removeRelay)]
     pub async fn remove_relay(&self, relay_url: String) -> Result<bool, JsError> {
         self.ensure_open()?;
@@ -1487,10 +1349,8 @@ impl BrowserNode {
         .unwrap_or_default()
     }
 
-    /// Outbound test: dial `peer_addr_json` on `hive/browser/0`, send `msg` as
-    /// an [`Op::Echo`] request, and return the echoed reply. Proves the browser
-    /// node's OUTBOUND path (browser → relay → peer) in addition to the
-    /// accept loop's inbound path.
+    /// Outbound test: dial `peer_addr_json` on `hive/browser/0` and echo `msg`, proving the
+    /// browser → relay → peer path.
     #[wasm_bindgen(js_name = echoTo)]
     pub async fn echo_to(&self, peer_addr_json: String, msg: String) -> Result<String, JsError> {
         if msg.len() > BROWSER_MAX_ECHO {
@@ -1504,11 +1364,9 @@ impl BrowserNode {
         String::from_utf8(reply).map_err(|e| JsError::new(&format!("reply not utf8: {e}")))
     }
 
-    /// Register the trusted resolver called for every authorized
-    /// [`Op::Invoke`] request. `handler` is
-    /// `(codeDigest: string, requestJson: string) => Promise<string>` and must
-    /// resolve `codeDigest` to a LOCALLY pinned artifact; executable source is
-    /// never accepted from a peer. Installing a handler grants nobody.
+    /// Register the trusted resolver for authorized [`Op::Invoke`] requests; it must resolve
+    /// `codeDigest` to a LOCALLY pinned artifact (source never comes from a peer). Installing a
+    /// handler grants nobody.
     #[wasm_bindgen(js_name = setInvokeHandler)]
     pub fn set_invoke_handler(&self, handler: js_sys::Function) -> Result<(), JsError> {
         self.ensure_open()?;
@@ -1563,9 +1421,8 @@ impl BrowserNode {
         Ok(removed)
     }
 
-    /// Grant one TLS-authenticated iroh endpoint permission to invoke exactly
-    /// one pinned code digest. The boot-empty map is the execution boundary;
-    /// future platform admission is its sole production writer.
+    /// Grant one TLS-authenticated endpoint permission to invoke exactly one pinned digest; the
+    /// boot-empty map is the execution boundary.
     #[wasm_bindgen(js_name = grantInvoker)]
     pub fn grant_invoker(&self, endpoint_id: String, code_digest: String) -> Result<bool, JsError> {
         self.ensure_open()?;
@@ -1579,9 +1436,8 @@ impl BrowserNode {
             .insert(code_digest))
     }
 
-    /// Revoke one exact endpoint/digest scope. Idempotent: a valid but absent
-    /// scope returns `false`; malformed IDs/digests throw without mutation.
-    /// Existing connections re-read this map for every invoke stream.
+    /// Revoke one exact endpoint/digest scope; idempotent (absent scope → `false`, malformed input
+    /// throws without mutation). Existing connections re-read the map per stream.
     #[wasm_bindgen(js_name = revokeInvoker)]
     pub fn revoke_invoker(
         &self,
@@ -1602,10 +1458,8 @@ impl BrowserNode {
         Ok(removed)
     }
 
-    /// Clear every capability, abort and drain the platform-owned Rust task tree,
-    /// then gracefully close the iroh endpoint. JavaScript handlers receive an
-    /// AbortSignal; noncooperative Promises remain counted against the fixed
-    /// handler pool until they actually settle.
+    /// Clear every capability, abort and drain the Rust task tree, then close the endpoint; JS
+    /// handlers get an AbortSignal and uncooperative Promises stay counted until they settle.
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) {
         self.invoke.borrow_mut().take();
@@ -1631,10 +1485,8 @@ impl BrowserNode {
         Ok(())
     }
 
-    /// Outbound: dial `peer_addr_json` and ask it to invoke the locally pinned
-    /// artifact named by `code_digest` against `request_json` (a Lagon-shaped
-    /// `{method,path,headers,body}` envelope), returning raw response bytes as a
-    /// UTF-8 string. No executable source crosses the wire.
+    /// Outbound: ask `peer_addr_json` to invoke its locally pinned `code_digest` against
+    /// `request_json` (a `{method,path,headers,body}` envelope); no source crosses the wire.
     #[wasm_bindgen(js_name = invokeOn)]
     pub async fn invoke_on(
         &self,
@@ -1649,10 +1501,8 @@ impl BrowserNode {
         String::from_utf8(reply).map_err(|e| JsError::new(&format!("reply not utf8: {e}")))
     }
 
-    /// Pull a complete BLAKE3-addressed asset in bounded chunks. Every reply
-    /// repeats the immutable total length. Bytes land directly in one capped JS
-    /// buffer while BLAKE3 is updated incrementally, so wasm never retains a
-    /// second whole-asset copy.
+    /// Pull a complete BLAKE3-addressed asset in bounded chunks into one capped JS buffer while
+    /// BLAKE3 is updated incrementally; wasm never holds a second whole-asset copy.
     #[wasm_bindgen(js_name = assetOn)]
     pub async fn asset_on(
         &self,
@@ -1723,12 +1573,8 @@ impl BrowserNode {
         Ok(out.expect("asset peer supplied a first reply"))
     }
 
-    /// Register the trusted local responder for inbound [`Op::CrrSync`]
-    /// requests (bn-browser-fleet-crr-exchange): `(requestBytes, signal) =>
-    /// Promise<Uint8Array>` — the sqlite-worker glue decodes the round,
-    /// applies/exports against the OPFS replica, and returns the reply frame.
-    /// Installing a handler grants nobody; each caller still needs an exact
-    /// endpoint grant via `grantCrrSync`.
+    /// Register the trusted local responder for inbound [`Op::CrrSync`] rounds `(requestBytes,
+    /// signal) => Promise<Uint8Array>`; installing it grants nobody — each caller needs `grantCrrSync`.
     #[wasm_bindgen(js_name = setCrrSyncHandler)]
     pub fn set_crr_sync_handler(&self, handler: js_sys::Function) -> Result<(), JsError> {
         self.ensure_open()?;
@@ -1739,9 +1585,8 @@ impl BrowserNode {
         Ok(())
     }
 
-    /// Grant one TLS-authenticated fleet endpoint permission to run CRR sync
-    /// rounds against this node's replica. Boot-empty: nothing may sync until
-    /// the admission capability's server-derived peer set is granted.
+    /// Grant one TLS-authenticated fleet endpoint permission to run CRR sync rounds; boot-empty until
+    /// the admission's server-derived peer set is granted.
     #[wasm_bindgen(js_name = grantCrrSync)]
     pub fn grant_crr_sync(&self, endpoint_id: String) -> Result<bool, JsError> {
         self.ensure_open()?;
@@ -1758,10 +1603,8 @@ impl BrowserNode {
         Ok(self.crr_sync_grants.borrow_mut().remove(&endpoint_id))
     }
 
-    /// Outbound CRR sync round: dial `peer_addr_json` (a fleet node from the
-    /// admission capability's server-derived peer set), send one encoded
-    /// `Op::CrrSync` request, return the reply frame verbatim. The glue
-    /// (sqlite-worker side) owns all CRR semantics; this is pure transport.
+    /// Outbound CRR sync round: send one encoded `Op::CrrSync` request to `peer_addr_json` and return
+    /// the reply frame verbatim; pure transport.
     #[wasm_bindgen(js_name = crrSyncOn)]
     pub async fn crr_sync_on(
         &self,
@@ -1780,11 +1623,8 @@ impl BrowserNode {
         Ok(js_sys::Uint8Array::from(reply.as_slice()))
     }
 
-    /// Shared request/response plumbing for every outbound op. Dial, stream-open,
-    /// write, and reply phases each have their own bounded idle deadline, so a
-    /// large frame making progress is not cancelled by a transfer-size-blind
-    /// whole-request timer. Once a stream exists, its Drop guard sends explicit
-    /// DEADLINE_EXCEEDED cancellation on timeout or caller-future abandonment.
+    /// Shared plumbing for every outbound op: dial, stream-open, write and reply each have their own
+    /// bounded idle deadline; a stream's Drop guard sends `DEADLINE_EXCEEDED` on timeout or abandonment.
     async fn request(
         &self,
         peer_addr_json: String,
@@ -1894,15 +1734,6 @@ impl BrowserNode {
     }
 }
 
-/// Spawn the `hive/browser/0` accept loop. One connection → many bi streams;
-/// each stream is a `[u32 len][op][payload]` request dispatched on its op byte.
-/// No gossip, no join, no trust arms — this ALPN has no privileged surface, and
-/// growing one belongs behind admission (`bn-impl-mesh-admission`), not here.
-///
-/// Every refusal is loud and carries a distinct `hive-browser-proto` reset code.
-/// There is deliberately no "unknown op falls back to echo" arm: that would
-/// answer a future protocol version's request with its own raw bytes and look
-/// like success to the caller.
 async fn read_with_progress_deadline(recv: &mut RecvStream, mut out: &mut [u8]) -> Result<(), u32> {
     while !out.is_empty() {
         match n0_future::time::timeout(STREAM_READ_IDLE_TIMEOUT, recv.read(out)).await {
@@ -2068,10 +1899,6 @@ fn spawn_accept_loop(
                             let mut opb = [0u8; 1];
                             read_with_progress_deadline(&mut recv, &mut opb).await?;
                             let op = Op::from_byte(opb[0]).map_err(|error| error.reset_code())?;
-                            // Per-op cap before the payload allocation:
-                            // CrrSync frames may exceed BROWSER_MAX_FRAME up
-                            // to BROWSER_MAX_CRR_FRAME (bn-browser-fleet-crr-
-                            // exchange); Echo keeps its tighter cap.
                             let len = check_len_for(op, lenb).map_err(|error| error.reset_code())?;
                             if len == 0 {
                                 return Err(proto_reset::MALFORMED_PAYLOAD);
@@ -2253,10 +2080,6 @@ fn spawn_accept_loop(
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(())) => {
-                                // Peer stopped reading mid-reply: the send-side reset
-                                // is moot, but the stop still lands on the peer's send
-                                // half with a protocol code (mirrors the native
-                                // serve_browser_conn write-failure arm).
                                 reject_stream(&mut send, &mut recv, proto_reset::HANDLER_FAILED);
                                 return;
                             }
@@ -2277,16 +2100,7 @@ fn spawn_accept_loop(
     });
 }
 
-/// Run one [`Op::Invoke`] payload against the trusted local artifact resolver.
-///
-/// `Err` is the reset code to refuse the stream with, so each distinguishable
-/// failure reaches the caller as a distinct code instead of collapsing into an
-/// empty reply. Authorization is re-read at the final synchronous point before
-/// `Function::call3`; pooled connections never cache a grant.
-///
-/// The handler and grant `Rc`s are NOT borrowed across the await. `RefCell` has
-/// no async awareness, so keeping either borrow alive over `JsFuture` would
-/// panic on concurrent invoke/grant/revoke activity.
+/// `Err` is the reset code to refuse the stream with.
 fn parse_invoke_owned(payload: &[u8], remote_id: &EndpointId) -> Result<(String, String), u32> {
     let (code_digest, request_json) = split_invoke(payload).map_err(|error| {
         tracing::warn!(error = %error, remote = %remote_id, "browser invoke: bad payload");
@@ -2331,8 +2145,6 @@ async fn run_invoke(
         })?;
     drop(request_json);
 
-    // The handler may be sync or async; `Promise::resolve` normalises both, so
-    // a handler returning a plain string is not a silent failure.
     let resolved = JsFuture::from(js_sys::Promise::resolve(&ret))
         .await
         .map_err(|e| {
@@ -2415,13 +2227,9 @@ async fn run_asset(
     encode_asset_reply(total as u64, &chunk).map_err(|e| e.reset_code())
 }
 
-/// Run one inbound [`Op::CrrSync`] payload against the trusted local glue
-/// (bn-browser-fleet-crr-exchange). Same authorization discipline as
-/// [`run_invoke`]: the grant set is re-read at the synchronous points
-/// bracketing the await, never borrowed across it, so a revocation mid-round
-/// is honored. The handler gets the request frame verbatim and returns the
-/// reply frame verbatim — CRR semantics live in the JS glue and in
-/// `hive-crsql` on the fleet side, never in this transport half.
+/// Run one inbound [`Op::CrrSync`] payload against the trusted local glue, re-reading the grant
+/// set at the synchronous points around the await (never borrowed across it); request and reply
+/// frames pass verbatim.
 async fn run_crr_sync(
     handler: &CrrSyncHandler,
     grants: &CrrSyncGrants,
@@ -2468,18 +2276,12 @@ async fn run_crr_sync(
     Ok(out)
 }
 
-/// Domain separator for every peer-mesh signalling signature
-/// (bn-browser-peer-webrtc-mesh). MUST stay byte-identical to
-/// `MESH_SIG_DOMAIN` in `crates/hive-browser/www/peer-mesh.js` — the JS half
-/// builds the context string, this half decides what is actually signed, and a
-/// drift between them silently rejects every peer handshake.
+/// Domain separator for every peer-mesh signalling signature; MUST stay byte-identical to
+/// `MESH_SIG_DOMAIN` in `www/peer-mesh.js`.
 const MESH_SIG_DOMAIN: &[u8] = b"hive-browser-webrtc-v1\0";
 
-/// Upper bound on a signable context. An SDP is NOT signed (it is far larger
-/// and its only security-relevant field, the fingerprint, is extracted and
-/// bound explicitly); this covers the fixed-shape binding string only, so a
-/// caller handing a whole session description gets a loud refusal rather than
-/// a signature over something the verifier will never reconstruct.
+/// Upper bound on a signable context: only the fixed-shape binding string is signed (an SDP's
+/// fingerprint is extracted and bound explicitly), so a whole session description is refused.
 const MESH_CONTEXT_MAX: usize = 1024;
 
 fn mesh_signing_message(context: &str) -> Result<Vec<u8>, JsError> {
@@ -2497,16 +2299,8 @@ fn mesh_signing_message(context: &str) -> Result<Vec<u8>, JsError> {
     Ok(message)
 }
 
-/// Verify a peer's signalling envelope against the EndpointId the SERVER
-/// admitted (bn-browser-peer-webrtc-mesh). Free function, not a method: it
-/// needs no local key, no live endpoint and no grant — it answers exactly one
-/// question ("did the holder of this ed25519 identity sign this context"), and
-/// binding it to node state would only invite callers to believe it means more
-/// than that.
-///
-/// Returns `false` for a valid-shaped-but-wrong signature and THROWS for a
-/// malformed id/signature/context, so a caller cannot conflate "this peer is
-/// lying" with "I built the call wrong".
+/// Verify a peer's signalling envelope against the EndpointId the SERVER admitted; a free function
+/// needing no local key or endpoint. `false` for a wrong signature, THROWS for malformed input.
 #[wasm_bindgen(js_name = verifyMeshEnvelope)]
 pub fn verify_mesh_envelope(
     endpoint_id: &str,
@@ -2521,9 +2315,8 @@ pub fn verify_mesh_envelope(
     Ok(key.verify(&message, &signature).is_ok())
 }
 
-/// Parse the cryptographic endpoint identity used by iroh's completed TLS
-/// handshake. Keeping the typed key in the grants map avoids string aliases
-/// (hex/base32/case) that could make revocation miss the original grant.
+/// Parse the endpoint identity from iroh's completed TLS handshake; the typed key in the grants
+/// map avoids hex/base32/case aliases that could make revocation miss.
 fn parse_endpoint_id(raw: &str) -> Result<EndpointId, JsError> {
     raw.trim()
         .parse::<EndpointId>()

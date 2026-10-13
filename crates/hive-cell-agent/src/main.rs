@@ -1,13 +1,7 @@
-//! `hive-cell-agent` — the **cell daemon**, running inside the microVM (guest).
-//!
-//! It is the in-guest counterpart of Hive's cell daemon: it listens on vsock,
-//! receives a [`AgentRequest::Run`] from the box daemon, executes the build,
-//! streams [`AgentEvent::Log`] frames, and finishes with [`AgentEvent::Done`].
-//!
-//! Designed to run as the guest's `init` (PID 1) via `init=/sbin/hive-cell-agent`
-//! in the kernel cmdline, but also works as an ordinary process (e.g. launched
-//! from a systemd unit). It is Linux-only at runtime; on other platforms `main`
-//! is a stub so the workspace still builds on macOS.
+//! The cell daemon inside the microVM guest: listens on vsock, runs builds ([`AgentRequest::Run`]),
+//! function launches and exec/pty sessions, streaming [`AgentEvent`]s back. Runs as the guest's
+//! `init` (PID 1) or as an ordinary process; Linux-only at runtime (`main` is a stub elsewhere so
+//! the workspace builds on macOS).
 
 fn protocol_probe_requested() -> bool {
     let Some(arg) = std::env::args_os().nth(1) else {
@@ -69,10 +63,9 @@ mod linux {
         AgentFunctionFault, AgentFunctionFaultCode, AgentHandshake, AgentHandshakeReady,
         AgentProtocolFault, AgentProtocolFaultCode, AgentRequest, AgentRequestFrameKind, BuildJob,
         BuildResult, ExecPtyRequest, ExecRequest, FunctionLaunch, LogLine, LogStream,
-        RuntimeArtifactIdentity,
-        RuntimeArtifactRootfsMarker, AGENT_HANDSHAKE_NONCE_BYTES, AGENT_WIRE_CAPABILITIES,
-        AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
-        RUNTIME_ARTIFACT_MARKER_FILE, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
+        RuntimeArtifactIdentity, RuntimeArtifactRootfsMarker, AGENT_HANDSHAKE_NONCE_BYTES,
+        AGENT_WIRE_CAPABILITIES, AGENT_WIRE_PROTOCOL_VERSION, CELL_AGENT_PORT, CELL_FUNCTION_PORT,
+        CELL_GUEST_CID, RUNTIME_ARTIFACT_MARKER_FILE, RUNTIME_ARTIFACT_PROTOCOL_VERSION,
         RUNTIME_ARTIFACT_ROOTFS_MARKER_PATH, RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION,
     };
     use sha2::{Digest, Sha256};
@@ -87,9 +80,8 @@ mod linux {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    /// Live exec child PIDs, keyed by `ExecRequest.id`, so a `KillExec` arriving
-    /// on a SEPARATE connection can signal a command started on another
-    /// connection/thread. Guest-process-global (single agent process per cell).
+    /// Live exec child PIDs keyed by `ExecRequest.id`, so a `KillExec` on a separate connection can
+    /// signal a command started elsewhere; process-global (one agent per cell).
     static EXEC_REGISTRY: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, u32>>,
     > = std::sync::OnceLock::new();
@@ -97,15 +89,8 @@ mod linux {
         EXEC_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
-    /// Set exactly once during `minimal_init`, before any connection is served:
-    /// `/dev/vdb` (the host's attached data image) existed but the `mount(2)`
-    /// syscall itself failed. Distinct from "no `/dev/vdb`" (a normal build
-    /// cell, `false`) and "mounted fine" (also `false`) — this flag exists so a
-    /// later `start_function` can refuse loudly instead of treating the
-    /// `create_dir_all`-created, still-empty `/workspace` as a valid cwd.
-    /// `create_dir_all` runs unconditionally before the syscall (it must, to
-    /// give `mount(2)` a mountpoint), so directory existence alone was never
-    /// proof the mount happened — only the syscall's own return code is.
+    /// Set once in `minimal_init` when `/dev/vdb` existed but `mount(2)` failed, so `start_function`
+    /// refuses loudly instead of running on the empty `/workspace` directory `create_dir_all` left.
     static WORKSPACE_MOUNT_FAILED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -118,7 +103,6 @@ mod linux {
             eprintln!("hive-cell-agent fatal: {e}");
         }
         if as_init {
-            // As PID1 we must not return; power the VM off so the host reaps it.
             unsafe {
                 libc::sync();
                 libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
@@ -136,19 +120,7 @@ mod linux {
         mount("sysfs", "/sys", "sysfs");
         mount("devtmpfs", "/dev", "devtmpfs");
         mount("tmpfs", "/tmp", "tmpfs");
-        // Bring up the loopback interface. The function server binds 0.0.0.0:$PORT
-        // (works without lo), but we reach it over 127.0.0.1 to bridge it to vsock
-        // — and 127.0.0.1 is unreachable until `lo` is UP. Without this every
-        // function looks like it "did not bind its port".
         bring_up_loopback();
-        // If a second drive (the delivered build output) is attached, mount it at
-        // /workspace so a monorepo app retains its checkout-relative cwd. NOT
-        // best-effort once the device exists: a build cell with no second drive
-        // is a normal, expected no-op, but a cell whose host attached `/dev/vdb`
-        // and whose guest mount then failed must never silently continue with an
-        // empty `/workspace` — that is exactly the "ran, but on nothing" failure
-        // mode `start_function`'s workdir gate exists to catch (see
-        // `WORKSPACE_MOUNT_FAILED`).
         if std::path::Path::new("/dev/vdb").exists() && !mount("/dev/vdb", "/workspace", "ext4") {
             WORKSPACE_MOUNT_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -157,15 +129,12 @@ mod linux {
     /// Set IFF_UP on the loopback interface via SIOCSIFFLAGS (no `ip`/iproute2
     /// dependency in the guest rootfs). Best-effort.
     fn bring_up_loopback() {
-        // Mirrors `struct ifreq` for the flags ioctls: 16-byte name + flags.
         #[repr(C)]
         struct IfReqFlags {
             name: [libc::c_char; 16],
             flags: libc::c_short,
             _pad: [u8; 22],
         }
-        // ioctl request arg type differs by libc (c_ulong on glibc, c_int on
-        // musl); `as _` coerces to whichever this target expects.
         const SIOCGIFFLAGS: u64 = 0x8913;
         const SIOCSIFFLAGS: u64 = 0x8914;
         unsafe {
@@ -184,13 +153,8 @@ mod linux {
         }
     }
 
-    /// Returns whether the `mount(2)` syscall itself reported success. Callers
-    /// that treat a mount as best-effort (proc/sys/dev/tmp — the kernel may
-    /// already have mounted some of these) are free to ignore the result; a
-    /// caller staging tenant data may not, because `create_dir_all` below
-    /// always leaves `target` existing as an empty directory regardless of
-    /// whether the mount happened, so directory existence can never stand in
-    /// for a checked syscall result.
+    /// Returns whether `mount(2)` itself succeeded; `create_dir_all` always leaves `target` existing,
+    /// so directory existence never stands in for the syscall result.
     fn mount(src: &str, target: &str, fstype: &str) -> bool {
         let _ = std::fs::create_dir_all(target);
         let c_src = cstr(src);
@@ -239,9 +203,8 @@ mod linux {
     static ACCEPTED_HANDSHAKE_NONCES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
-    /// Once any authenticated H1 succeeds, this VM never accepts the pre-H1
-    /// StartFunction lane again, even if that connection disappears before its
-    /// launch frame. This is process-global because one agent process is the VM.
+    /// Once any authenticated H1 succeeds, this VM never accepts the pre-H1 StartFunction lane again;
+    /// process-global because one agent process is the VM.
     static VERSIONED_LAUNCH_ONLY: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -422,8 +385,6 @@ mod linux {
             agent_wire_protocol: observed.agent_wire_protocol,
             agent_wire_capabilities: observed.agent_wire_capabilities,
             agent_sha256: observed.agent_sha256,
-            // The immutable image digest is host-observed. The guest binds it to
-            // its independently-observed marker and executable in the transcript.
             rootfs_image_sha256: expected.rootfs_image_sha256.clone(),
             rootfs_image_bytes: expected.rootfs_image_bytes,
         };
@@ -479,9 +440,6 @@ mod linux {
         stream: &mut UnixStream,
         launch: FunctionLaunch,
     ) -> std::io::Result<bool> {
-        // This path deliberately performs neither half of runtime-artifact H1/H2:
-        // no host identity is trusted, no artifact marker is asserted, and no
-        // RuntimeArtifactReady authorization event is emitted.
         match start_function(&launch, true) {
             Ok(()) => send(stream, &AgentEvent::FunctionReady)?,
             Err(error) => send(stream, &AgentEvent::FunctionError(error.to_string()))?,
@@ -490,10 +448,8 @@ mod linux {
         Ok(false)
     }
 
-    /// Returns Ok(true) if a build was executed (caller should stop serving).
-    /// Takes the stream BY VALUE (not &mut): the Exec branch moves it into a
-    /// dedicated thread that outlives this call, so the accept loop can serve
-    /// the next connection without waiting for the command to finish.
+    /// Returns Ok(true) if a build was executed (caller stops serving). Takes the stream by value: the
+    /// Exec branch moves it into a thread that outlives this call.
     fn handle_conn(mut stream: UnixStream) -> std::io::Result<bool> {
         let first_frame = read_frame(&mut stream)?;
         let first = match parse_agent_request(&first_frame) {
@@ -516,9 +472,6 @@ mod linux {
                         return Ok(false);
                     }
                 };
-                // Latch before HandshakeReady is written. A peer that receives the
-                // ready frame and disconnects (or whose write is only partially
-                // observed) cannot reopen the legacy lane on its next connection.
                 VERSIONED_LAUNCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
                 send(&mut stream, &AgentEvent::HandshakeReady(ready))?;
                 stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -586,7 +539,6 @@ mod linux {
                 let _ = stream.flush();
                 Ok(true)
             }
-            // Only valid as a reply during a build (handled in cache_restore).
             AgentRequest::CacheData { .. } => Ok(false),
             AgentRequest::Exec(req) => {
                 std::thread::spawn(move || {
@@ -608,9 +560,6 @@ mod linux {
                 });
                 Ok(false)
             }
-            // Only valid as follow-up frames on an already-open ExecPty
-            // connection (consumed inside run_exec_pty's own read loop, never
-            // seen here as a fresh connection's first frame).
             AgentRequest::PtyInput { .. } | AgentRequest::PtyResize { .. } => refuse_protocol(
                 &mut stream,
                 AgentProtocolFaultCode::OutOfOrder,
@@ -619,10 +568,8 @@ mod linux {
         }
     }
 
-    /// Run one `ExecRequest` to completion on its OWN dedicated connection,
-    /// streaming `ExecOutput` lines with stdout/stderr kept distinct, then a
-    /// final `ExecDone`. Registers/deregisters the child PID so `KillExec`
-    /// (arriving on a different connection) can find and signal it.
+    /// Run one `ExecRequest` on its own connection, streaming distinct stdout/stderr `ExecOutput` then
+    /// `ExecDone`; registers the child PID for `KillExec`.
     fn run_exec(stream: &mut UnixStream, req: ExecRequest) {
         let id = req.id.clone();
         let exit_code = match spawn_exec(stream, &req) {
@@ -646,7 +593,6 @@ mod linux {
 
     fn spawn_exec(stream: &mut UnixStream, req: &ExecRequest) -> std::io::Result<Option<i32>> {
         let mut cmd = if req.shell {
-            // Explicit, informed opt-in only (validated one layer up too).
             let mut full = req.cmd.clone();
             for a in &req.args {
                 full.push(' ');
@@ -656,17 +602,12 @@ mod linux {
             c.arg("-c").arg(full);
             c
         } else {
-            // Default: real argv exec, no shell — shell injection is
-            // structurally impossible on this path (no string is ever
-            // reparsed by a shell).
             let mut c = Command::new(&req.cmd);
             c.args(&req.args);
             c
         };
 
         if req.sudo {
-            // Only ever honored if `sudo` actually exists in this guest image;
-            // otherwise fail loudly rather than silently running unprivileged.
             let sudo_path = ["/usr/bin/sudo", "/bin/sudo"]
                 .iter()
                 .find(|p| std::path::Path::new(p).exists());
@@ -725,9 +666,6 @@ mod linux {
             .unwrap()
             .insert(req.id.clone(), child.id());
 
-        // Two reader threads (stdout/stderr) so neither pipe's backpressure can
-        // stall the other — both feed the SAME connection, guarded by a mutex
-        // (UnixStream doesn't support concurrent writers safely otherwise).
         let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let mut handles = Vec::new();
         if let Some(out) = child.stdout.take() {
@@ -755,13 +693,13 @@ mod linux {
         Ok(status.code())
     }
 
-    /// Run one interactive `ExecPtyRequest` for its whole life on its own
-    /// dedicated connection: allocate a real pty (`openpty`), fork a child
-    /// attached to the slave as its controlling terminal running the caller's
-    /// shell, pump the master fd's raw bytes to `PtyOutput` on a reader
-    /// thread while THIS thread keeps reading the connection for
-    /// `PtyInput`/`PtyResize` frames and applying them, until the shell exits
-    /// or the connection closes.
+    fn pty_slave_closed(e: &std::io::Error) -> bool {
+        e.raw_os_error() == Some(libc::EIO)
+    }
+
+    /// Run one interactive `ExecPtyRequest` on its own connection: `openpty`, fork the shell on the
+    /// slave, pump the master to `PtyOutput` on a reader thread while this thread applies
+    /// `PtyInput`/`PtyResize` until the shell exits or the connection closes.
     fn run_exec_pty(stream: &mut UnixStream, req: ExecPtyRequest) {
         let id = req.id.clone();
         let exit_code = match spawn_pty(stream, &req) {
@@ -819,20 +757,19 @@ mod linux {
             req.cwd.clone()
         };
         let _ = std::fs::create_dir_all(&cwd);
-        let shell_c = CString::new(shell.as_str())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in shell path"))?;
+        let shell_c = CString::new(shell.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in shell path")
+        })?;
         let cwd_c = CString::new(cwd.as_str())
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in cwd"))?;
-        // `-<name>` argv[0] tells most shells to behave as a login shell,
-        // which is what a real terminal session expects (profile sourcing).
-        let argv0 = format!(
+        let login_shell_argv0 = format!(
             "-{}",
             std::path::Path::new(&shell)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("sh")
         );
-        let argv0_c = CString::new(argv0)
+        let argv0_c = CString::new(login_shell_argv0)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in argv0"))?;
 
         // SAFETY: fork() is async-signal-safe to call; the child path below
@@ -848,10 +785,6 @@ mod linux {
             return Err(err);
         }
         if pid == 0 {
-            // Child: become session leader, attach the pty slave as our
-            // controlling terminal, wire it to fd 0/1/2, drop the now-unused
-            // fds, chdir, then execve. Any failure here calls _exit directly
-            // — never unwind back into the parent's Rust runtime state.
             unsafe {
                 libc::close(master);
                 if libc::setsid() < 0 {
@@ -895,8 +828,6 @@ mod linux {
             }
         }
 
-        // Parent: close the slave (the child owns its own copy across the
-        // fork), keep the master as our pty end.
         unsafe {
             libc::close(slave);
         }
@@ -920,10 +851,7 @@ mod linux {
                     let n = match master_read.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => n,
-                        // EIO on a pty master is the normal "slave closed"
-                        // signal once the shell (and every child holding the
-                        // slave open) has exited — not a real error.
-                        Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                        Err(e) if pty_slave_closed(&e) => break,
                         Err(_) => break,
                     };
                     let _guard = write_lock.lock().unwrap();
@@ -942,11 +870,6 @@ mod linux {
             })
         };
 
-        // This thread: keep reading frames off the SAME connection for
-        // PtyInput/PtyResize until the connection closes or the child exits.
-        // The write side of the connection is shared with `reader` above via
-        // `write_lock` (PtyOutput never interleaves with anything this loop
-        // sends, though this loop currently sends nothing back).
         loop {
             let frame = match read_frame(stream) {
                 Ok(f) => f,
@@ -980,10 +903,6 @@ mod linux {
                     };
                     libc::ioctl(master_write_fd, libc::TIOCSWINSZ as _, &ws);
                 },
-                // A fresh ExecPty/anything else on this connection is a
-                // protocol violation once a session is already open — just
-                // stop reading; the reader thread and child-wait below still
-                // finish this session's teardown cleanly.
                 _ => break,
             }
         }
@@ -1011,11 +930,6 @@ mod linux {
         write_lock: std::sync::Arc<std::sync::Mutex<()>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            // BOUNDED capture — see `hive_core::logcap`. `lines()` retains an
-            // unbounded String when the child writes without newlines, and the
-            // resulting frame is then serialized and pushed to the HOST, so an
-            // unbounded line here is an unbounded allocation on both sides of
-            // the vsock. Cap it at the source.
             let mut reader = BufReader::new(pipe);
             loop {
                 let l = match hive_core::logcap::read_capped_line_blocking(
@@ -1042,10 +956,8 @@ mod linux {
         })
     }
 
-    /// Deliver SIGKILL to a live exec's child process by request id. Returns
-    /// true if a live registration was found (does not guarantee the process
-    /// had not already exited — that race is harmless: `kill` on a reaped pid
-    /// just errors, ignored).
+    /// SIGKILL a live exec's child by request id; true if a registration was found (a pid already
+    /// reaped just makes `kill` error, ignored).
     fn kill_registered_exec(id: &str) -> bool {
         let pid = exec_registry().lock().unwrap().get(id).copied();
         match pid {
@@ -2033,7 +1945,6 @@ mod linux {
             .current_dir(format!("/proc/self/fd/{}", workdir.dir.as_raw_fd()))
             .env_clear()
             .envs(launch.env.iter())
-            // Platform-owned constraints are applied last, after launch env.
             .env("PATH", effective_path)
             .env("HOME", "/root")
             .env("PORT", launch.port.to_string())
@@ -2156,7 +2067,6 @@ mod linux {
 
         let _ = std::fs::create_dir_all("/build");
 
-        // Build cache: restore before the build.
         if let Some(key) = &job.cache_key {
             if !job.cache_paths.is_empty() {
                 cache_restore(stream, key, &job.cache_paths)?;
@@ -2172,7 +2082,6 @@ mod linux {
             }
         }
 
-        // Build cache: save after a successful build.
         if exit_code == 0 {
             if let Some(key) = &job.cache_key {
                 if !job.cache_paths.is_empty() {
@@ -2273,12 +2182,10 @@ mod linux {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Ensure the work dir exists.
         let _ = std::fs::create_dir_all("/build");
 
         let mut child = cmd.spawn()?;
         if let Some(out) = child.stdout.take() {
-            // BOUNDED capture — see `hive_core::logcap`.
             let mut reader = BufReader::new(out);
             while let Ok(Some(l)) = hive_core::logcap::read_capped_line_blocking(
                 &mut reader,
@@ -2314,8 +2221,6 @@ mod linux {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_frame(stream, &bytes)
     }
-
-    // ---- vsock + framing (sync) ------------------------------------------
 
     fn vsock_listen(port: u32) -> std::io::Result<i32> {
         unsafe {

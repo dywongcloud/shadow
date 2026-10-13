@@ -1,25 +1,8 @@
-//! Live witness for `bn-impl-relay-byte-metering`: real iroh endpoints, the
-//! REAL `serve_tunnels_full` browser accept path and the REAL `BrowserPool`
-//! invoke path, with a meter installed through the REAL
-//! `hive_p2p::set_browser_meter` — proving per-tenant framed-byte accounting
-//! is exact and separately attributed.
-//!
-//! Tenant attribution here uses a fixed endpoint→tenant map standing in for
-//! hive-cloud's admission store: the join seam (`endpoint_id` → tenant) is
-//! the same one `browser_metering::meter_handler` closes over via
-//! `live_for_endpoint`. What this witness proves is the part this crate owns:
-//! the counted bytes equal the framed wire bytes EXACTLY, per endpoint.
-//!
-//! Witnesses:
-//!   1. OUTBOUND invoke (fleet → browser): a request_json of EXACTLY 64 KiB
-//!      moves the tenant's counters by exactly the framed byte total
-//!      (outbound = 4 + 1 + 64-byte digest + 65536, inbound = 4 + reply).
-//!   2. A second tenant's identical invoke is attributed SEPARATELY.
-//!   3. INBOUND echo (browser → fleet): a known-size Echo frame moves the
-//!      same tenant's counters by exactly 4+1+payload in / 4+payload out.
-//!
-//! Usage: `cargo run -p hive-p2p --example browser_meter_witness`
-//! Exit code 0 = every witness line passed; 1 = at least one mismatch.
+//! Live witness for per-tenant framed-byte metering: real iroh endpoints, the real
+//! `serve_tunnels_full` browser accept path and the real `BrowserPool` invoke path with a meter
+//! installed through `hive_p2p::set_browser_meter`, proving the counted bytes equal the framed
+//! wire bytes exactly and per endpoint. `cargo run -p hive-p2p --example browser_meter_witness`;
+//! exit 0 = every witness line passed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -66,10 +49,7 @@ impl TenantMap {
     }
 }
 
-/// A minimal in-process browser peer: accepts `hive/browser/0` connections and
-/// answers every well-formed `Op::Invoke` with the fixed `reply` bytes. The
-/// same accept loop shape as `fake_browser_peer.rs`, kept inline so the
-/// witness is one self-contained process.
+/// A minimal in-process browser peer answering every well-formed `Op::Invoke` with `reply`.
 async fn spawn_fake_browser(reply: Vec<u8>) -> anyhow::Result<(iroh::Endpoint, String, String)> {
     let ep = hive_p2p::bind().await?;
     let endpoint_id = ep.id().to_string();
@@ -134,15 +114,12 @@ fn check(label: &str, expected: (u64, u64, u64), actual: (u64, u64, u64), failur
 async fn main() -> anyhow::Result<()> {
     let mut failures = 0usize;
 
-    // The meter: installed through the REAL registration point, attributing
-    // endpoint → tenant through the same seam hive-cloud uses.
     let map = TenantMap::default();
     let recorder = map.clone();
     hive_p2p::set_browser_meter(Some(Arc::new(move |endpoint_id, inbound, outbound| {
         recorder.record(endpoint_id, inbound, outbound);
     })));
 
-    // ---- The fleet node: real serve_tunnels_full with a real admission gate ----
     let fleet_ep = hive_p2p::bind().await?;
     let fleet_addr_json = hive_p2p::addr_json(&fleet_ep)
         .ok_or_else(|| anyhow::anyhow!("fleet addr_json unavailable"))?;
@@ -166,7 +143,6 @@ async fn main() -> anyhow::Result<()> {
     ));
     let pool = hive_p2p::BrowserPool::new(fleet_ep);
 
-    // ---- Two browser peers, two tenants ----
     let reply_a = format!("{{\"tenant\":\"alpha\",\"pad\":\"{}\"}}", "a".repeat(480)).into_bytes();
     let reply_b = format!("{{\"tenant\":\"beta\",\"pad\":\"{}\"}}", "b".repeat(480)).into_bytes();
     let (ep_a, id_a, addr_a) = spawn_fake_browser(reply_a.clone()).await?;
@@ -177,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
     println!("WITNESS_BROWSER_A:{id_a} (tenant-alpha)");
     println!("WITNESS_BROWSER_B:{id_b} (tenant-beta)");
 
-    // ---- Witness 1: one invoke with an EXACTLY 64 KiB request payload ----
     let digest = "a".repeat(64);
     let request_json = "x".repeat(64 * 1024);
     let invoke_payload = hive_browser_proto::encode_invoke(&digest, &request_json)?;
@@ -204,7 +179,6 @@ async fn main() -> anyhow::Result<()> {
         &mut failures,
     );
 
-    // ---- Witness 2: the SAME invoke against tenant-beta attributes separately ----
     let reply = pool
         .invoke(&id_b, &addr_b, &digest, &request_json)
         .await
@@ -224,9 +198,6 @@ async fn main() -> anyhow::Result<()> {
         &mut failures,
     );
 
-    // ---- Witness 3: INBOUND echo — browser A dials the fleet node itself ----
-    // The dial carries browser A's admitted identity (a fresh endpoint would
-    // be refused by the admission gate), exactly like a real browser tab.
     let fleet_addr: iroh::EndpointAddr = serde_json::from_str(&fleet_addr_json)?;
     let conn = ep_a.connect(fleet_addr, hive_p2p::BROWSER_ALPN).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -244,8 +215,6 @@ async fn main() -> anyhow::Result<()> {
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body).await?;
     assert_eq!(body, echo_payload, "echo returns the payload verbatim");
-    // Program order makes this race-free: the fleet meters the reply BEFORE
-    // send.finish(), and the client cannot observe EOF until the FIN lands.
     check(
         "inbound-echo-tenant-alpha",
         (expected_in_a + 5 + 1000, expected_frame + 4 + 1000, 4),
