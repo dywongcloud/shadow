@@ -556,6 +556,27 @@ impl ServiceGraphStore {
             .max_by_key(|g| g.generated_ms)
             .cloned()
     }
+    /// Rename a project's service graphs IN PLACE. Graphs are keyed by
+    /// DEPLOYMENT id (which a rename never touches), so this only rewrites the
+    /// `project` label the dashboard groups on, plus any graph node whose name
+    /// is exactly the old project name (the app node is named after it).
+    pub fn rename_project(&self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut map = self.map.write();
+        let mut n = 0;
+        for g in map.values_mut().filter(|g| g.project == from) {
+            g.project = to.to_string();
+            for node in g.nodes.iter_mut() {
+                if node.name == from {
+                    node.name = to.to_string();
+                }
+            }
+            n += 1;
+        }
+        n
+    }
     pub fn snapshot(&self) -> Vec<ServiceGraph> {
         self.map.read().values().cloned().collect()
     }
