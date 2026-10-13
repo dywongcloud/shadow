@@ -1,13 +1,6 @@
-//! `fluid-core` — the deployment model for the serving layer.
-//!
-//! Where Hive builds code, Fluid *serves* it. A [`Deployment`] is the unit a
-//! user ships: some static assets plus zero or more [`FunctionConfig`]s, with
-//! [`Route`]s mapping request paths to either static files or a function.
-//!
-//! The function config carries the knobs that make compute "Fluid": an
-//! in-function `max_concurrency` (many requests per instance), `min_instances`
-//! (keep-warm), `max_instances` (autoscale ceiling), and an `idle_ttl` for
-//! scale-to-zero.
+//! The deployment model for the serving layer: a [`Deployment`] is static assets plus zero or more
+//! [`FunctionConfig`]s, with [`Route`]s mapping paths to either; the function config carries the
+//! Fluid knobs (`max_concurrency`, `min_instances`, `max_instances`, `idle_ttl`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -82,32 +75,11 @@ impl std::fmt::Debug for DeploymentId {
     }
 }
 
-/// Application protocol a service speaks, driving ingress/routing decisions
-/// (Railway-style, configurable per service). Wire representation is the
-/// existing lowercase strings already persisted in deployment records
-/// ("http", "https", "ws", "wss", "grpc", "json-rpc", "tcp", "udp") — this
-/// enum is a drop-in typed replacement for the old bare `String` field, not a
-/// new format. An absent field or a legacy empty string both deserialize to
-/// [`ServiceProtocol::Http`] (backward-compatible with older manifests).
-///
-/// Strict-vs-lenient split (load-bearing — do not collapse the two):
-/// - `FromStr` is STRICT: an unrecognized string is an [`InvalidProtocol`]
-///   error. Deploy-input boundaries (fluid.json ingestion via
-///   [`Manifest::from_json`], compose port suffixes, admin API fields) use it
-///   to reject malformed fresh input with a clear error.
-/// - serde `Deserialize` is LENIENT: an unrecognized string coerces to
-///   [`ServiceProtocol::Http`] with a `tracing::warn!`, NEVER an error. The
-///   pre-enum field was an unvalidated bare `String`, so arbitrary strings
-///   ("h2c", "HTTP", typos) can already sit inside persisted `state.json`
-///   snapshots and gossip-replicated snapshots — and those loaders treat any
-///   deserialize failure as "no state" (`unwrap_or_default()` /
-///   skip-and-continue), so a hard error here would silently WIPE a node's
-///   entire persisted platform state on restart. Loading stored state must
-///   never fail on this field.
-///
-/// HTTP-family protocols (`Http`, `Https`, `Ws`, `Wss`, `JsonRpc`) ride the
-/// normal L7 path. Connection-oriented ones (`Grpc`, `Tcp`, `Udp`) are
-/// spliced as a raw connection cross-node — see [`FunctionConfig::needs_raw_proxy`].
+/// Application protocol a service speaks (wire strings `http`/`https`/`ws`/`wss`/`grpc`/`json-rpc`/
+/// `tcp`/`udp`; absent or empty = `Http`). Load-bearing split: `FromStr` is STRICT (deploy-input
+/// boundaries reject unknown strings) while serde `Deserialize` is LENIENT (unknown → `Http` + warn),
+/// because every persisted-state loader turns a deserialize error into silent total state loss.
+/// HTTP-family protocols ride L7; `Grpc`/`Tcp`/`Udp` are raw-spliced ([`FunctionConfig::needs_raw_proxy`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceProtocol {
@@ -122,13 +94,9 @@ pub enum ServiceProtocol {
 }
 
 impl ServiceProtocol {
-    /// Whether a service speaking this protocol is spliced as a RAW connection
-    /// (vs the buffered/streamed HTTP tunnel) when proxied — gRPC (HTTP/2
-    /// trailers) and raw TCP/UDP. The single source of truth behind
-    /// [`FunctionConfig::needs_raw_proxy`] AND the per-[`PortSpec`]
-    /// public-port-allocation decision (each raw-protocol spec gets its own
-    /// allocated public port; HTTP-family specs ride 80/443 Host routing).
-    /// `json-rpc` stays HTTP-framed (it's HTTP-transported despite the name).
+    /// Whether a service speaking this protocol is spliced as a RAW connection (gRPC, TCP, UDP) — the
+    /// single source of truth behind [`FunctionConfig::needs_raw_proxy`] and per-[`PortSpec`] public-port
+    /// allocation; `json-rpc` stays HTTP-framed.
     pub fn needs_raw_proxy(self) -> bool {
         matches!(
             self,
@@ -165,10 +133,8 @@ impl std::fmt::Display for ServiceProtocol {
     }
 }
 
-/// Error returned when parsing a protocol string that isn't one of the known
-/// values (`http`/`https`/`ws`/`wss`/`grpc`/`json-rpc`/`tcp`/`udp`, or empty).
-/// Carries the invalid input so the caller can surface a clear, actionable
-/// deploy-time error instead of silently defaulting to HTTP.
+/// Error for a protocol string that is none of the known values (or empty); carries the input so the
+/// deploy-time error names it instead of silently defaulting to HTTP.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidProtocol(pub String);
 
@@ -186,11 +152,8 @@ impl std::error::Error for InvalidProtocol {}
 impl std::str::FromStr for ServiceProtocol {
     type Err = InvalidProtocol;
 
-    /// Strict parse for raw (non-JSON) input — e.g. a compose port suffix, a
-    /// CLI/UI field, a query string — so callers reject malformed protocol
-    /// strings at the point of entry rather than falling through to a silent
-    /// HTTP default. Mirrors the `#[serde(alias = "")]` convention: empty
-    /// string is treated as "http" for backward compatibility.
+    /// Strict parse for raw (non-JSON) input — compose port suffixes, CLI/UI fields — rejecting malformed
+    /// strings at the point of entry; the empty string is `http` for backward compatibility.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "" | "http" => Ok(ServiceProtocol::Http),
@@ -206,13 +169,8 @@ impl std::str::FromStr for ServiceProtocol {
     }
 }
 
-/// LENIENT deserialization — see the strict-vs-lenient split on
-/// [`ServiceProtocol`]. This impl backs every serde path that reads
-/// already-stored state (persisted `state.json` snapshots, gossip-replicated
-/// snapshots, guardian restores) where a hard error would be amplified into
-/// silent total state loss by `unwrap_or_default()`-style loaders. Unknown
-/// strings coerce to `Http` with a warning; deploy-time rejection of unknown
-/// values lives at the input boundaries via the strict `FromStr`.
+/// LENIENT deserialization for every serde path that reads already-stored state; unknown strings
+/// coerce to `Http` with a warning, never an error (see [`ServiceProtocol`]).
 impl<'de> Deserialize<'de> for ServiceProtocol {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -238,12 +196,8 @@ impl<'de> Deserialize<'de> for ServiceProtocol {
     }
 }
 
-/// One published port + protocol on a service. A single deployment MAY expose
-/// more than one (Docker-Compose/Railway-style multi-port), e.g. a Minecraft
-/// server (`itzg/minecraft-server`) publishing game (25565/tcp), rcon
-/// (25575/tcp), and query (25565/udp) simultaneously. `label` is a free-form,
-/// purely informational identifier surfaced to the user (e.g. "game", "rcon",
-/// "query") — never matched against by routing.
+/// One published port + protocol on a service; a deployment MAY expose several (a Minecraft server's
+/// game/rcon/query ports). `label` is informational only, never matched by routing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortSpec {
     pub container_port: u16,
@@ -251,39 +205,21 @@ pub struct PortSpec {
     pub protocol: ServiceProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// The PUBLIC port allocated for this spec when its protocol needs raw
-    /// (non-HTTP) ingress — what an external client actually connects to
-    /// (HTTP-family specs ride the shared 80/443 gateway and stay `None`).
-    /// Stamped at deploy time by the platform's raw-port allocator
-    /// (hive-cloud's `raw_ports` module), never user-supplied; the allocation
-    /// is keyed by (project, function, container_port, protocol) so it is
-    /// STABLE across redeploys — a new deployment of the same service is
-    /// re-stamped with the same public port. `None` also for records written
-    /// before the allocator existed (re-allocated on their next deploy).
+    /// The PUBLIC port allocated when this spec's protocol needs raw ingress (HTTP-family specs ride
+    /// 80/443 and stay `None`); stamped by hive-cloud's `raw_ports` allocator, keyed by (project,
+    /// function, container_port, protocol) so it is STABLE across redeploys, never user-supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
-    /// The compose-declared HOST port this spec asks to be published on
-    /// (`ports: ["9000:9000"]` → 9000). This is a PUBLISH REQUEST with two
-    /// effects, both matching docker-compose's own publish semantics: its
-    /// presence alone makes the spec eligible for a public raw allocation even
-    /// when `protocol` is Http (served as plain-TCP passthrough — exactly what
-    /// `docker compose up` does with a published HTTP port; no TLS on raw
-    /// ports, the shared 443 gateway remains the TLS surface), and the
-    /// allocator PREFERS this exact number, falling back to its normal range
-    /// with a loud build log when the number is taken fleet-wide or reserved —
-    /// never a silent substitution. `public_port` above remains the GRANT.
-    /// Absent for every record written before this field existed and for all
-    /// non-compose paths — those keep today's behavior byte-for-byte.
+    /// The compose-declared HOST port (`ports: ["9000:9000"]` → 9000): a PUBLISH REQUEST that makes even
+    /// an Http spec eligible for a public raw allocation (plain-TCP passthrough, as `docker compose up`
+    /// does) and that the allocator PREFERS, falling back to its range with a loud build log when the
+    /// number is taken or reserved. `public_port` remains the GRANT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_public_port: Option<u16>,
 }
 
 impl PortSpec {
-    /// Build a single-port list entry — the compatibility bridge for callers
-    /// that still carry exactly one bare `u16` port (`ImageDeployReq`,
-    /// `ContainerSpec`, and other single-port representations elsewhere in
-    /// the codebase not rewritten in this pass). No `label`: there is no
-    /// multi-port distinction to make with only one port.
+    /// Build a single-port list entry — the bridge for callers that still carry one bare `u16` port.
     pub fn single(container_port: u16, protocol: ServiceProtocol) -> PortSpec {
         PortSpec {
             container_port,
@@ -294,23 +230,16 @@ impl PortSpec {
         }
     }
 
-    /// Same bridge for an `Option<u16>` legacy port field: `None` normalizes
-    /// to an empty port list (nothing declared), `Some(port)` to a
-    /// single-element list via [`PortSpec::single`].
+    /// Same bridge for an `Option<u16>` legacy port: `None` → no ports, `Some` → one [`PortSpec::single`].
     pub fn from_legacy_port(port: Option<u16>, protocol: ServiceProtocol) -> Vec<PortSpec> {
         port.map(|p| vec![PortSpec::single(p, protocol)])
             .unwrap_or_default()
     }
 }
 
-/// One ALLOCATED public raw-ingress binding on a deployment: a [`PortSpec`]
-/// whose `public_port` has been stamped by the platform's raw-port allocator,
-/// flattened together with the owning function's name. This is the shape the
-/// generic raw proxy routes on — `public_port` → which function/container port
-/// to splice to, over which protocol — and it rides [`DeploymentInfo`] so the
-/// mapping is visible FLEET-WIDE via the existing deployment gossip (any edge
-/// node must know which public ports exist and who serves them, exactly like
-/// HTTP hosts ride `peer_routes`).
+/// One ALLOCATED public raw-ingress binding: a [`PortSpec`] with its stamped `public_port`, flattened
+/// with the owning function's name — the shape the raw proxy routes on, carried on
+/// [`DeploymentInfo`] so the mapping gossips fleet-wide.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawPortBinding {
     pub public_port: u16,
@@ -322,17 +251,10 @@ pub struct RawPortBinding {
     pub label: Option<String>,
 }
 
-/// A single Tencent Cloud EIP (Elastic IP) purchased and associated for a
-/// deployment that opted into `functions[].dedicated_ipv4` — one dotted-quad
-/// address the function is reachable on, distinct from the shared edge IPs.
-/// `tencent_eip_id` ("eip-xxxxxxxx") is the idempotency anchor: it is the
-/// handle every `AssociateAddress`/`ReleaseAddresses` call needs, and its
-/// presence in the durable claim registry (`hive-cloud::tencent_eip`) is what
-/// stops a redeploy or a crash-retry from purchasing a second address for the
-/// same (project, function). `owner_node` names the node whose CVM NIC the
-/// address is actually associated with — only that node may bind it
-/// (`raw_proxy.rs`); every other node keeps binding the wildcard address for
-/// the same public port, so cross-node splice still works.
+/// A Tencent Cloud EIP bought for a `functions[].dedicated_ipv4` opt-in. `tencent_eip_id` is the
+/// idempotency anchor (its presence in the durable claim registry stops a redeploy or crash-retry
+/// buying a second address); `owner_node` is the only node that binds it (`raw_proxy.rs`), every
+/// other node binds the wildcard for the same public port.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DedicatedIpv4 {
     pub address: String,
@@ -361,21 +283,13 @@ pub struct FunctionConfig {
     pub vcpus: u32,
     #[serde(default = "default_memory")]
     pub memory_mib: u32,
-    /// Per-deployment CPU quota override for a CONTAINER function (podman
-    /// `--cpus`), e.g. 4.0 — from fluid.json `container.cpus` /
-    /// `ImageDeployReq.cpus`. 0.0 = the node's generous env-tunable default
-    /// (`ContainerLimits::default`). Clamped to a fleet-wide ceiling in
-    /// `ContainerLimits::for_container` (`HIVE_CONTAINER_CPUS_MAX`) so one
-    /// tenant's own request can never remove the ceiling entirely. Distinct
-    /// from `vcpus` above (microVM sizing); ignored for microVM/process
-    /// functions.
+    /// Per-deployment CPU quota for a CONTAINER function (podman `--cpus`, from fluid.json
+    /// `container.cpus` / `ImageDeployReq.cpus`); 0.0 = node default, clamped fleet-wide
+    /// (`HIVE_CONTAINER_CPUS_MAX`), ignored for microVM/process functions.
     #[serde(default)]
     pub cpus: f64,
-    /// Per-deployment max-PIDs override for a CONTAINER function's cgroup
-    /// (podman `--pids-limit`) — a fork-bomb guard — from fluid.json
-    /// `container.pids` / `ImageDeployReq.pids`. 0 = the node's default.
-    /// Clamped to a fleet-wide ceiling (`HIVE_CONTAINER_PIDS_MAX`). Ignored
-    /// for microVM/process functions.
+    /// Per-deployment max-PIDs for a CONTAINER function's cgroup (podman `--pids-limit`, a fork-bomb
+    /// guard); 0 = node default, clamped (`HIVE_CONTAINER_PIDS_MAX`), ignored for microVM/process.
     #[serde(default)]
     pub pids: u32,
     /// Fluid in-function concurrency: max simultaneous requests per instance.
@@ -404,92 +318,47 @@ pub struct FunctionConfig {
     /// Glob of files to exclude (`functions[].excludeFiles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_files: Option<String>,
-    /// Application protocol this service speaks, for ingress/routing decisions
-    /// (Railway-style, configurable per service). See [`ServiceProtocol`] for
-    /// the full semantics (wire strings, HTTP-family vs raw-proxied, the
-    /// empty-string/absent-field backward-compat default, and the
-    /// strict-FromStr-vs-lenient-serde split: malformed values are rejected
-    /// at the deploy-input boundary, but stored state always loads).
+    /// Application protocol this service speaks; see [`ServiceProtocol`] for the wire strings, the
+    /// HTTP-family vs raw split and the strict-input / lenient-storage rule.
     #[serde(default, skip_serializing_if = "is_default_protocol")]
     pub protocol: ServiceProtocol,
-    /// Forward-looking multi-port representation: every port this service
-    /// publishes, each with its own protocol and an optional label (e.g.
-    /// "game"/"rcon"/"query" for a Minecraft-style multi-port service). Empty
-    /// by default — no call site populates this yet; single-port callers keep
-    /// using their own bare port field and bridge to this shape via
-    /// [`PortSpec::single`]/[`PortSpec::from_legacy_port`] when they migrate.
+    /// Every port this service publishes, each with its own protocol and optional label; empty by
+    /// default — single-port callers bridge via [`PortSpec::single`]/[`PortSpec::from_legacy_port`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortSpec>,
-    /// This function needs a serverless GPU. Placement then only targets nodes
-    /// advertising GPUs (`NodeInfo::gpu_count > 0`) and the container launch
-    /// passes the host GPUs through (CDI `nvidia.com/gpu=all`, plus gVisor
-    /// `nvproxy` when the sandbox runtime is `runsc`). `false`/absent = today's
-    /// behavior exactly, for every existing deployment and every pre-upgrade
-    /// peer (`serde(default)`). From fluid.json `functions[].gpu` / the
-    /// dashboard function-settings toggle.
+    /// This function needs a serverless GPU: placement targets only `NodeInfo::gpu_count > 0` nodes
+    /// and the container launch passes the host GPUs through (CDI `nvidia.com/gpu=all`, gVisor
+    /// `nvproxy` under `runsc`); `false`/absent is today's behavior.
     #[serde(default, skip_serializing_if = "is_false")]
     pub gpu: bool,
-    /// Explicit opt-in to browser-node execution (fluid.json
-    /// `functions[].browser`) with a bounded execution policy. ABSENT means the
-    /// function is NOT browser-eligible, by construction: only an opted-in
-    /// function whose handler survives the build-time bundle + rejection pass
-    /// ([`BrowserPolicy`]'s docs) gets a [`FunctionConfig::browser_artifact`]
-    /// descriptor, and only descriptor-carrying functions can ever be admitted
-    /// for browser serving. This is the contract that replaces "pretend every
-    /// deployed Node/Bun/container function can run in a browser".
+    /// Explicit opt-in to browser-node execution (fluid.json `functions[].browser`) with a bounded
+    /// policy; ABSENT means not browser-eligible, by construction — only a function that survives the
+    /// build-time bundle pass gets a [`FunctionConfig::browser_artifact`] descriptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserPolicy>,
-    /// Build-stamped descriptor of the emitted browser artifact — digest
-    /// metadata ONLY (source + canonical-policy BLAKE3, size, resolved
-    /// limits), never the bytes. Written by the build pipeline after the
-    /// bundle pass succeeds; `None` in every user-authored manifest and for
-    /// any function the build rejected or never opted in. Because this rides
-    /// the manifest, it reaches the replicated deployment state
-    /// (`DeployRecord`) and the gossiped [`DeploymentInfo::browser_functions`]
-    /// view — that metadata is what admission ties a donor's digest to.
+    /// Build-stamped descriptor of the emitted browser artifact — digest metadata only, never bytes;
+    /// `None` in user-authored manifests and for rejected or never-opted-in functions. Rides the
+    /// manifest into `DeployRecord` and [`DeploymentInfo::browser_functions`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_artifact: Option<BrowserArtifact>,
-    /// Why this function is NOT browser-servable, stamped by the build pipeline
-    /// whenever it evaluated the function and declined to emit an artifact — an
-    /// unsupported runtime, no handler-shaped entry on disk, or the exact
-    /// `browser_artifacts::bundle` rejection an AUTO-detected candidate hit.
-    /// SERVER-DERIVED ONLY: the build clears any tenant-supplied value before
-    /// evaluating, so a fluid.json cannot inject a fake reason. Mutually
-    /// exclusive with [`FunctionConfig::browser_artifact`] (eligible functions
-    /// carry a descriptor and no reason). This is what turns "the picker just
-    /// doesn't list my function" into a sentence naming the cause: it rides the
-    /// manifest into `DeployRecord` and out through
-    /// [`DeploymentInfo::browser_ineligible`].
+    /// Why this function is NOT browser-servable, stamped by the build (SERVER-DERIVED: any
+    /// tenant-supplied value is cleared first); mutually exclusive with
+    /// [`FunctionConfig::browser_artifact`] and surfaced through [`DeploymentInfo::browser_ineligible`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_ineligible_reason: Option<String>,
-    /// Opt-in to a dedicated public IPv4 address for this function (fluid.json
-    /// `functions[].dedicatedIpv4` / the dashboard function-settings toggle),
-    /// mirroring [`FunctionConfig::gpu`]'s shape. `false`/absent = today's
-    /// behavior exactly: the function is reached only through the shared edge
-    /// IPs. Deploy time purchases (or re-adopts, on a redeploy) a real Tencent
-    /// Cloud EIP via `hive-cloud::tencent_eip`; no placement filter follows
-    /// from this flag — unlike GPU, any node can hold an EIP.
+    /// Opt-in to a dedicated public IPv4 (fluid.json `functions[].dedicatedIpv4`): deploy time buys or
+    /// re-adopts a Tencent Cloud EIP via `hive-cloud::tencent_eip`; no placement filter follows (any
+    /// node can hold an EIP).
     #[serde(default, skip_serializing_if = "is_false")]
     pub dedicated_ipv4: bool,
-    /// The allocated address, stamped onto the manifest by the deploy path
-    /// once `tencent_eip::claim_or_allocate` succeeds — the same
-    /// stamp-before-`deploy_full` shape [`RawPortBinding::public_port`] uses,
-    /// so [`Manifest::dedicated_ipv4_binding`] can hoist it onto
-    /// [`DeploymentInfo::dedicated_ipv4`] exactly like `raw_port_bindings`
-    /// hoists ports. `None` until allocation succeeds and for every function
-    /// that never opted in.
+    /// The allocated address, stamped onto the manifest once `tencent_eip::claim_or_allocate` succeeds
+    /// (the same stamp-before-`deploy_full` shape as [`RawPortBinding::public_port`]) and hoisted onto
+    /// [`DeploymentInfo::dedicated_ipv4`]; `None` until allocation succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_ipv4_alloc: Option<DedicatedIpv4>,
-    /// Per-function CWD override, relative to the deployment's runtime
-    /// workdir — additive, `None` for every existing caller and every
-    /// pre-upgrade peer. Build Output API v3 Node functions are the first
-    /// user: each `.func` bundle is its own self-contained directory
-    /// (`.vercel/output/functions/<name>.func`), so a deployment with several
-    /// functions must launch EACH ONE from its own directory rather than the
-    /// single shared `runtime_workdir` every other runtime uses — sharing one
-    /// CWD across functions would let one function's relative `import()`
-    /// resolve into a SIBLING function's files. `None` preserves today's
-    /// exact behavior (the shared deployment-wide workdir).
+    /// Per-function CWD override relative to the runtime workdir; Build Output API v3 Node functions
+    /// launch each `.func` bundle from its own directory so one function's relative `import()` can
+    /// never resolve into a sibling's files. `None` = the shared deployment-wide workdir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd_relative: Option<String>,
 }
@@ -509,11 +378,8 @@ impl FunctionConfig {
         self.protocol.as_str()
     }
 
-    /// Whether this service needs a RAW connection splice (vs the buffered/streamed
-    /// HTTP tunnel) when proxied cross-node — gRPC (HTTP/2 trailers) and raw
-    /// TCP/UDP. These are spliced byte-for-byte like a WebSocket so framing
-    /// survives the mesh; `json-rpc` stays HTTP-framed (it's HTTP-transported
-    /// despite the name), matching the existing grpc/json-rpc distinction.
+    /// Whether this service needs a RAW connection splice when proxied cross-node (gRPC, TCP, UDP —
+    /// spliced byte-for-byte like a WebSocket); `json-rpc` stays HTTP-framed.
     pub fn needs_raw_proxy(&self) -> bool {
         self.protocol.needs_raw_proxy()
     }
@@ -525,9 +391,10 @@ fn default_runtime() -> String {
 fn default_vcpus() -> u32 {
     1
 }
+const STANDARD_SERVERLESS_MEMORY_MB: u32 = 2048;
+
 fn default_memory() -> u32 {
-    // Standard serverless tier: 2 GB.
-    2048
+    STANDARD_SERVERLESS_MEMORY_MB
 }
 fn default_max_concurrency() -> u32 {
     10
@@ -574,55 +441,21 @@ impl Default for FunctionConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Browser-executable function artifact contract
-// (browser-function-artifact-build-contract)
-// ---------------------------------------------------------------------------
-//
-// A function becomes browser-eligible ONLY by opting in through fluid.json
-// `functions[].browser` and surviving the build-time bundle pass. The build
-// emits ONE deterministic, self-contained source string — an
-// `async function (request, ops)` expression in exactly the shape the browser
-// substrate evaluates (`module.exports = (<source>)`, run as CommonJS by the
-// vendored node-worker guest — see
-// `crates/hive-browser/www/node-worker-host.js`) — computes two BLAKE3 digests
-// (source bytes; canonical policy encoding), persists the bytes
-// content-addressed on the building node, and stamps only the descriptor onto
-// the manifest. The digest the wire protocol routes on
-// (`hive_browser_proto::encode_invoke`'s code digest,
-// `BrowserFunctionRuntime.pin`'s return value) is the POLICY digest: it binds
-// the exact source digest to the exact bounded policy, so a browser pinning
-// the artifact re-derives — and thereby verifies — the same 64-hex value the
-// deployment state carries.
-//
-// The canonical policy encoding below is byte-for-byte the one
-// `crates/hive-browser/www/function-runtime.js`'s `policyDigest` implements.
-// Any change to either side without the other silently breaks every artifact
-// verification — they are ONE contract with two implementations.
-
 /// Domain separator of the canonical policy encoding — identical to
 /// function-runtime.js's `policyDigest`.
 pub const BROWSER_POLICY_DIGEST_DOMAIN: &[u8] = b"hive-browser-policy-v1\0";
 
-/// Ceiling on a single browser entry file's UTF-8 source. The artifact is one
-/// self-contained source string executed inside a donor's browser tab; an
-/// unbounded bundle would turn the (per-tab) QuickJS memory limit and the
-/// delivery path into a denial-of-service vector. 256 KiB is generous for an
-/// edge handler — larger apps belong on the container/microVM path.
+/// Ceiling on a single browser entry file's UTF-8 source; the artifact runs inside a donor's tab,
+/// so an unbounded bundle is a denial-of-service lever. Larger apps belong on the container path.
 pub const BROWSER_ENTRY_MAX_SOURCE_BYTES: usize = 256 * 1024;
 
-/// Platform defaults — identical to `normalizePolicy`'s fallbacks in
-/// function-runtime.js, so an unset fluid.json limit resolves to the value
-/// the browser would have assumed anyway.
+/// Platform defaults — identical to `normalizePolicy`'s fallbacks in function-runtime.js.
 pub const BROWSER_TIMEOUT_MS_DEFAULT: u64 = 1_000;
 pub const BROWSER_MEMORY_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 pub const BROWSER_STACK_BYTES_DEFAULT: u64 = 512 * 1024;
 
-/// Ceilings a tenant's own fluid.json can never exceed (the
-/// `ContainerLimits::for_container` clamp precedent: a tenant request must
-/// never remove the ceiling entirely). The timeout ceiling matches the
-/// gateway's default browser circuit (`HIVE_BROWSER_CIRCUIT_MS`, 30 s) — a
-/// longer invocation would be cut by the circuit anyway.
+/// Ceilings a tenant's fluid.json can never exceed; the timeout ceiling matches the gateway's
+/// default browser circuit (`HIVE_BROWSER_CIRCUIT_MS`, 30 s).
 pub const BROWSER_TIMEOUT_MS_MAX: u64 = 30_000;
 pub const BROWSER_MEMORY_BYTES_MAX: u64 = 256 * 1024 * 1024;
 pub const BROWSER_STACK_BYTES_MAX: u64 = 8 * 1024 * 1024;
@@ -635,9 +468,8 @@ pub const BROWSER_ALLOWED_OPS_MAX: usize = 16;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserExecMode {
-    /// quickjs-emscripten inside the sandboxed frame: deterministic metering
-    /// (memory/stack/interrupt quotas) — the default and the only mode with
-    /// engine-enforced limits.
+    /// quickjs-emscripten inside the sandboxed frame: deterministic metering (memory/stack/interrupt
+    /// quotas) — the default and the only mode with engine-enforced limits.
     #[default]
     Quickjs,
     /// Same-frame Worker running the artifact directly: full-JIT throughput,
@@ -660,13 +492,9 @@ impl BrowserExecMode {
 /// Its PRESENCE is the opt-in; every field has a platform default.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BrowserPolicy {
-    /// Entry file, relative to the deployment root — a single self-contained
-    /// `.js`/`.mjs`/`.cjs` file assigning its handler to `module.exports`
-    /// (or `exports.handler`). Required: the function's `start_cmd` entry is
-    /// the long-running SERVER, a different contract from the request→response
-    /// browser handler, so it is never silently reused. TypeScript entries are
-    /// rejected loudly (no deterministic toolchain-free transpile exists) —
-    /// ship the compiled JS.
+    /// Entry file relative to the deployment root — one self-contained `.js`/`.mjs`/`.cjs` assigning
+    /// its handler to `module.exports` (or `exports.handler`). Required: the `start_cmd` entry is the
+    /// long-running SERVER, never silently reused; TypeScript entries are rejected loudly.
     pub entry: String,
     #[serde(default)]
     pub mode: BrowserExecMode,
@@ -680,9 +508,8 @@ pub struct BrowserPolicy {
     /// QuickJS `setMaxStackSize`. 0 = default, clamped to ceiling.
     #[serde(default)]
     pub stack_bytes: u64,
-    /// Host-op ids the artifact may call (`ops.call(id, payload)`), each
-    /// resolvable in [`browser_host_op_abi`]. Ids are deduplicated and sorted
-    /// at resolution so the canonical policy encoding is order-insensitive.
+    /// Host-op ids the artifact may call (`ops.call(id, payload)`), each resolvable in
+    /// [`browser_host_op_abi`]; deduplicated and sorted at resolution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_ops: Vec<u64>,
 }
@@ -702,9 +529,8 @@ pub struct ResolvedBrowserPolicy {
 }
 
 impl BrowserPolicy {
-    /// Validate + resolve to concrete limits. Unknown host-op ids are a hard
-    /// error (loud build rejection); over-ceiling limits clamp with a note,
-    /// matching the container-limits convention.
+    /// Validate + resolve to concrete limits: unknown host-op ids are a hard error, over-ceiling limits
+    /// clamp with a note.
     pub fn resolve(&self) -> Result<ResolvedBrowserPolicy, String> {
         let mut notes = Vec::new();
         let clamp = |value: u64, default: u64, max: u64, name: &str, notes: &mut Vec<String>| {
@@ -767,18 +593,15 @@ impl BrowserPolicy {
     }
 }
 
-/// Descriptor of one build-emitted browser artifact. This is ALL the
-/// replicated deployment state ever carries about an artifact — the source
-/// bytes stay in the building node's content-addressed store.
+/// Descriptor of one build-emitted browser artifact — ALL the replicated state ever carries about
+/// it; the bytes stay in the building node's content-addressed store.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserArtifact {
-    /// BLAKE3 (lowercase hex) of the exact emitted source string — what
-    /// `BrowserFunctionRuntime.pin` re-computes from the delivered bytes and
-    /// refuses to pin on mismatch.
+    /// BLAKE3 (lowercase hex) of the exact emitted source string, re-computed by
+    /// `BrowserFunctionRuntime.pin` from the delivered bytes.
     pub source_digest: String,
-    /// BLAKE3 of the canonical policy encoding — binds `source_digest` to
-    /// this exact policy. THE wire digest: `encode_invoke`'s code digest,
-    /// `pin`'s return value, the admission's `digest`.
+    /// BLAKE3 of the canonical policy encoding — binds `source_digest` to this exact policy; THE wire
+    /// digest (`encode_invoke`, `pin`, the admission's `digest`).
     pub policy_digest: String,
     /// Byte length of the emitted source (UTF-8).
     pub source_bytes: u64,
@@ -790,10 +613,8 @@ pub struct BrowserArtifact {
     pub allowed_ops: Vec<u64>,
 }
 
-/// One browser-eligible function of a deployment, carried by
-/// [`DeploymentInfo::browser_functions`] so a peer (the admission-validating
-/// control-plane leader in particular) can tie an admission's digest to a
-/// real build artifact without holding the deployment's full manifest.
+/// One browser-eligible function of a deployment, carried by [`DeploymentInfo::browser_functions`]
+/// so a peer can tie an admission's digest to a real build artifact without the full manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserFunctionRef {
     pub name: String,
@@ -801,28 +622,18 @@ pub struct BrowserFunctionRef {
     pub artifact: BrowserArtifact,
 }
 
-/// The NEGATIVE half of [`BrowserFunctionRef`]: one function the build
-/// evaluated for browser eligibility and declined, with the reason. Carried on
-/// [`DeploymentInfo::browser_ineligible`] for exactly the same reason its
-/// positive twin is carried — the picker (and any operator view) resolves it
-/// for deployments hosted on other nodes — and because a browser-eligibility
-/// decision that only exists in a build log is invisible to the person who
-/// asked for it. Absent from a deployment built before the build pipeline
-/// evaluated eligibility at all, which is itself a distinguishable state (no
-/// artifact AND no reason ⇒ never evaluated ⇒ redeploy).
+/// The NEGATIVE half of [`BrowserFunctionRef`]: a function the build evaluated and declined, with
+/// the reason; carried on [`DeploymentInfo::browser_ineligible`]. No artifact AND no reason means
+/// never evaluated ⇒ redeploy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserIneligibility {
     pub function: String,
     pub reason: String,
 }
 
-/// The platform browser host-op registry: op id → canonical ABI string. This
-/// is the ONLY source of truth for which host operations a built artifact may
-/// request — the browser side registers handlers under these exact ABI
-/// strings (`crates/hive-browser/www/index.html`'s harness ops 1/2,
-/// `node-compat.js`'s op 16), and the canonical policy digest commits to the
-/// ABI text, so an id missing here is an unresolvable — and therefore loudly
-/// rejected — policy.
+/// The platform browser host-op registry: op id → canonical ABI string, the ONLY source of truth
+/// for which host operations an artifact may request (the browser registers handlers under these
+/// exact strings and the policy digest commits to them).
 pub fn browser_host_op_abi(op: u64) -> Option<&'static str> {
     match op {
         1 => Some("hive-browser/identity-json-v1"),
@@ -838,16 +649,16 @@ pub fn browser_source_digest(source: &str) -> String {
     blake3::hash(source.as_bytes()).to_hex().to_string()
 }
 
-/// BLAKE3 (lowercase hex) of the canonical policy encoding — byte-for-byte
-/// function-runtime.js's `policyDigest`:
-/// `"hive-browser-policy-v1\0" || source_digest(32 raw bytes) || u32le op_count
-/// || per op (ascending id): u64le id || u8 effect(0=read) || u32le abi_len || abi
-/// || u8 mode (0=native, 1=quickjs) || u64le timeout_ms || u64le memory_bytes
-/// || u64le stack_bytes`.
-///
-/// `allowed_ops` must already be in canonical (sorted, deduplicated) form and
-/// every id must resolve in [`browser_host_op_abi`] — callers get both by
-/// going through [`BrowserPolicy::resolve`].
+/// The only op effect the browser runtime accepts; write ops are rejected by `readOperation`
+/// before a policy is ever encoded.
+const POLICY_EFFECT_READ: u8 = 0;
+
+/// BLAKE3 (lowercase hex) of the canonical policy encoding — byte-for-byte function-runtime.js's
+/// `policyDigest`: `"hive-browser-policy-v1\0" || source_digest(32 raw bytes) || u32le op_count ||
+/// per op (ascending id): u64le id || u8 effect(0=read) || u32le abi_len || abi || u8 mode
+/// (0=native, 1=quickjs) || u64le timeout_ms || u64le memory_bytes || u64le stack_bytes`.
+/// `allowed_ops` must already be canonical (sorted, deduplicated, every id resolvable) — go through
+/// [`BrowserPolicy::resolve`].
 pub fn browser_policy_digest(
     source_digest: &str,
     mode: BrowserExecMode,
@@ -892,9 +703,7 @@ pub fn browser_policy_digest(
     bytes.extend_from_slice(&(abis.len() as u32).to_le_bytes());
     for (op, abi) in &abis {
         bytes.extend_from_slice(&op.to_le_bytes());
-        // effect: 0 = read (the only effect the browser runtime accepts today;
-        // write ops are rejected by readOperation before any of this runs).
-        bytes.push(0);
+        bytes.push(POLICY_EFFECT_READ);
         bytes.extend_from_slice(&(abi.len() as u32).to_le_bytes());
         bytes.extend_from_slice(abi.as_bytes());
     }
@@ -905,56 +714,13 @@ pub fn browser_policy_digest(
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Browser-replicated database opt-in (bn-browser-db-ownership-contract)
-// ---------------------------------------------------------------------------
-//
-// A project gets a browser-replicated cr-sqlite database ONLY by opting in
-// through a fluid.json top-level `browser_db` block — the same presence-is-
-// the-opt-in discipline as [`FunctionConfig::browser`], and the same fail-the-
-// input-loudly boundary as [`Manifest::from_json`]'s strict validation (a
-// mistyped block is a deploy error, never a silently dropped opt-in). The
-// SPEC rides the replicated deployment state — `Manifest::browser_db` inside
-// `DeployRecord` (persisted in `PlatformSnapshot`) and stamped verbatim onto
-// [`DeploymentInfo::browser_db`] for the `/v1/fleet-deployments` gossip view —
-// so the admission-issuing leader and every fleet exchange peer resolve the
-// exact caps for deployments they do not host, without any client input.
-//
-// The full ownership/retention/naming contract (what the browser↔fleet
-// exchange row implements against) is `docs/browser-db-contract.md`. The
-// load-bearing shape decisions:
-//
-// * ONE logical database per PROJECT, not per deployment and not per
-//   function. Database identity is the project — the `container_volume_cfg`
-//   `hive-vol-{project}` precedent, so data survives redeploys — while the
-//   opt-in spec and every grant are resolved against a specific Ready
-//   deployment's descriptor. A redeploy that keeps the block re-uses the same
-//   database; a redeploy that drops it stops new grants.
-// * The block is REPLICATED RAW and resolved at the point of use
-//   ([`BrowserDbPolicy::resolve`]) — the `InferenceSpec` precedent (raw spec
-//   synced, validated at consume), so every consumer applies its own binary's
-//   defaults/ceilings deterministically and a pre-upgrade peer simply carries
-//   no field (`serde(default)`).
-// * Resolution can only clamp (never hard-fail): there is no tenant-authored
-//   value that is dangerous to the platform, only values that exceed a
-//   platform ceiling, and those clamp with a build-log note — the
-//   `ContainerLimits::for_container` / [`BrowserPolicy::resolve`] convention.
-
-/// Per-replica total database size cap, enforced on BOTH the browser's OPFS
-/// copy and every fleet-side replica file. 64 MiB is generous for an edge app's
-/// replicated dataset; the 1 GiB ceiling exists because browser OPFS copies
-/// live under the origin's storage quota inside a tab — a larger dataset
-/// belongs on the platform's server-side storage paths, not replicated into
-/// donors' browsers.
+/// Per-replica total database size cap, enforced on BOTH the browser's OPFS copy and every
+/// fleet-side replica file; the ceiling exists because OPFS copies live under a tab's storage quota.
 pub const BROWSER_DB_MAX_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 pub const BROWSER_DB_MAX_BYTES_MAX: u64 = 1024 * 1024 * 1024;
-/// Cap on ONE change's value payload (a single `crsql_changes` `val`), enforced
-/// at the sync boundary in both directions: an oversized value stays in its
-/// origin replica and is refused replication, loudly, rather than ever being
-/// truncated (truncation in an LWW store is silent permanent divergence).
-/// Change rows travel as structured-clone JSON on the browser side and HCB1
-/// frames on the fleet side; a payload past the 16 MiB ceiling belongs in the
-/// content-addressed asset store, not in a CRR cell.
+/// Cap on ONE change's value payload, enforced at the sync boundary in both directions: an
+/// oversized value stays in its origin replica and is refused loudly, never truncated (truncation
+/// in an LWW store is silent permanent divergence).
 pub const BROWSER_DB_VALUE_MAX_BYTES_DEFAULT: u64 = 1024 * 1024;
 pub const BROWSER_DB_VALUE_MAX_BYTES_MAX: u64 = 16 * 1024 * 1024;
 
@@ -962,47 +728,27 @@ pub const BROWSER_DB_VALUE_MAX_BYTES_MAX: u64 = 16 * 1024 * 1024;
 /// block. Its PRESENCE is the opt-in; every field has a platform default.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDbPolicy {
-    /// Per-replica total size cap in bytes (browser OPFS copy AND each
-    /// fleet-side replica file). 0 = platform default, clamped to the platform
-    /// ceiling. Exceeding it refuses the applying change set with a typed
-    /// quota error and rolls the batch back — never a truncated replica.
+    /// Per-replica total size cap in bytes (0 = platform default, clamped to the ceiling); exceeding it
+    /// refuses the change set with a typed quota error and rolls the batch back.
     #[serde(default)]
     pub max_bytes: u64,
-    /// Single change-value payload cap in bytes. 0 = platform default, clamped
-    /// to the platform ceiling. Enforced at the sync boundary (export/apply),
-    /// not on local SQL execution: an oversized value persists in its origin
-    /// replica but never replicates, and the sync error names the table/pk.
+    /// Single change-value payload cap in bytes (0 = platform default, clamped), enforced at the sync
+    /// boundary only: an oversized value persists locally but never replicates.
     #[serde(default)]
     pub max_value_bytes: u64,
-    /// Allow PUBLIC-scope admissions (anonymous donors) a READ-ONLY replica of
-    /// this project's database. Default `false`: only Team-scope admissions —
-    /// browsers operated by members of the owning tenant — hold DB grants at
-    /// all. Read-only means the fleet applies nothing originating from that
-    /// grant (`changes-since` export only); a public donor must never write
-    /// tenant data regardless of the toggle.
+    /// Allow PUBLIC-scope admissions (anonymous donors) a READ-ONLY replica; default `false` means only
+    /// Team-scope admissions hold DB grants. A public donor can never write tenant data.
     #[serde(default, skip_serializing_if = "is_false")]
     pub public_read: bool,
-    /// The database's schema as an ordered list of tables to create and
-    /// upgrade to CRRs. cr-sqlite v0.17 does NOT replicate schema inside
-    /// `crsql_changes`, so both replica halves (the fleet replica file and
-    /// every browser OPFS copy) must create the same tables out-of-band —
-    /// carrying the DDL in the spec is how every side derives it from the
-    /// SAME server-replicated source (admission's `db` capability block hands
-    /// it to the browser verbatim; the fleet reconcile applies it to the
-    /// replica file). Author each `ddl` idempotent (`CREATE TABLE IF NOT
-    /// EXISTS`); the platform runs it and then `crsql_as_crr(name)` on every
-    /// replica it touches. An opted-in deployment with an EMPTY schema can
-    /// still sync — no tracked tables means exports are simply empty until a
-    /// later deploy adds tables (loud apply errors, never silent divergence).
+    /// The schema as ordered tables to create and upgrade to CRRs: cr-sqlite v0.17 does NOT replicate
+    /// schema, so every replica derives it from this SAME server-replicated source. Each `ddl` must be
+    /// idempotent; the platform runs it then `crsql_as_crr(name)`. An empty schema still syncs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema: Vec<BrowserDbTable>,
 }
 
-/// One CRR-tracked table of a [`BrowserDbPolicy`]'s schema: the table `name`
-/// (validated identifier-shaped at resolve time) plus the idempotent DDL that
-/// creates it. `name` is what `crsql_as_crr` upgrades; `ddl` runs verbatim
-/// first. Splitting the two (instead of parsing the DDL for its table name)
-/// keeps the platform's `as_crr` call explicit and the validation trivial.
+/// One CRR-tracked table: the identifier-shaped `name` (what `crsql_as_crr` upgrades) plus the
+/// idempotent `ddl` that creates it, kept separate so no DDL parsing is needed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDbTable {
     /// Base table name — `[A-Za-z_][A-Za-z0-9_]*` only (the same identifier
@@ -1020,9 +766,7 @@ pub struct ResolvedBrowserDbPolicy {
     pub max_bytes: u64,
     pub max_value_bytes: u64,
     pub public_read: bool,
-    /// The schema subset that survived validation (identifier-shaped table
-    /// name, non-empty DDL), in declared order. Rejected entries produced a
-    /// note — they never silently vanish.
+    /// The schema subset that survived validation, in declared order; rejected entries produced a note.
     pub schema: Vec<BrowserDbTable>,
     /// Human-readable notes for the build log — values the platform ceilings
     /// (or internal consistency) clamped.
@@ -1030,10 +774,8 @@ pub struct ResolvedBrowserDbPolicy {
 }
 
 impl BrowserDbPolicy {
-    /// Resolve to concrete caps. Infallible by design (see the section docs):
-    /// over-ceiling values clamp with a note, and a `max_value_bytes` larger
-    /// than `max_bytes` — a single value that could never fit the database —
-    /// clamps to `max_bytes` with a note rather than failing the deploy.
+    /// Resolve to concrete caps; infallible — over-ceiling values clamp with a note, and a
+    /// `max_value_bytes` larger than `max_bytes` clamps to `max_bytes`.
     pub fn resolve(&self) -> ResolvedBrowserDbPolicy {
         let mut notes = Vec::new();
         let clamp = |value: u64, default: u64, max: u64, name: &str, notes: &mut Vec<String>| {
@@ -1100,14 +842,7 @@ impl BrowserDbPolicy {
     }
 }
 
-// `Runtime` (the language/engine selector) lives in `hive_core` — the lower
-// crate in the dependency graph, reachable from `hive-cell-agent`/
-// `hive-backend` (which do NOT depend on fluid-core) as well as from here.
 pub use hive_core::Runtime;
-
-// ---------------------------------------------------------------------------
-// Lossless Build Output API v3 contract
-// ---------------------------------------------------------------------------
 
 pub const BUILD_OUTPUT_V3_VERSION: u32 = 3;
 /// Schema baseline pinned to the Vercel Build Output Configuration reference
@@ -1129,11 +864,9 @@ pub const BUILD_OUTPUT_V3_MAX_CRONS: usize = 1024;
 pub const BUILD_OUTPUT_V3_MAX_CACHE_PATHS: usize = 1024;
 pub const BUILD_OUTPUT_V3_MAX_IMAGE_VALUES: usize = 1024;
 
-/// Durable, host-authority-free Build Output API v3 descriptor. `config` and
-/// every function config remain exact JSON values so an older binary cannot
-/// silently erase a route/runtime field it does not implement. Absolute builder
-/// paths never enter this type; `assets` and `files` are validated relative
-/// inventories.
+/// Durable, host-authority-free Build Output API v3 descriptor: `config` and every function config
+/// stay exact JSON so an older binary cannot silently erase a field; `assets`/`files` are validated
+/// relative inventories, never absolute builder paths.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BuildOutputV3 {
     #[serde(default)]
@@ -1414,9 +1147,8 @@ enum CompiledBuildOutputV3Route {
 }
 
 impl BuildOutputV3 {
-    /// Deserialize the host-path-free envelope emitted by
-    /// `fluid_build::BuildOutput::descriptor_value`, then enforce the durable
-    /// contract. This serde bridge keeps the crate dependency graph acyclic.
+    /// Deserialize the host-path-free envelope from `fluid_build::BuildOutput::descriptor_value` and
+    /// enforce the durable contract (the serde bridge that keeps the crate graph acyclic).
     pub fn from_parser_value(
         value: serde_json::Value,
     ) -> Result<BuildOutputV3, BuildOutputV3Refusal> {
@@ -1582,16 +1314,6 @@ impl BuildOutputV3 {
                         "must be a non-empty string",
                     )
                 })?;
-            // A Node handler must resolve inside the parser's OWN exact
-            // regular-file inventory for this function — never a bare
-            // presence check. This closes two real gaps: a handler string
-            // that is not a portable relative path (absolute, `..`,
-            // control bytes — the exact shape `validate_build_output_relative_path`
-            // already enforces for `files`/`assets`), and a handler that
-            // names a file the parser never actually saw on disk (a
-            // dangling/foreign reference). `edge` is exempted here — it is
-            // refused as an unsupported runtime downstream regardless, and
-            // its `entrypoint` field is not cross-checked against `files`.
             if entry_key == "handler" {
                 validate_build_output_relative_path(
                     entry_value,
@@ -1661,9 +1383,8 @@ impl BuildOutputV3 {
         Ok(())
     }
 
-    /// Compile ordered routes and exact output indexes once at provisioning.
-    /// Unknown top-level/route semantics and domain wildcard routing are stable
-    /// capability refusals, never ignored metadata.
+    /// Compile ordered routes and exact output indexes once at provisioning; unknown semantics and
+    /// domain wildcard routing are stable capability refusals, never ignored metadata.
     pub fn compile(&self) -> Result<BuildOutputV3Evaluator, BuildOutputV3Refusal> {
         self.validate()?;
         let config = self.config_view()?;
@@ -2531,11 +2252,9 @@ pub struct Route {
     pub target: RouteTarget,
 }
 
-/// Runtime-facing classification of a (Next.js) route (#16). The canonical home
-/// for the cache/retry/concurrency POLICY a route kind implies — `fluid-build`
-/// discovers the kind at build time (`per_route::RouteKind`) and `hive-cloud`
-/// maps it onto this when persisting the per-route manifest into [`Manifest`].
-/// The snake_case wire form is the cross-crate contract with `RouteKind::class_name`.
+/// Runtime-facing classification of a Next.js route — the canonical home for the cache/retry/
+/// concurrency policy a route kind implies; the snake_case wire form is the contract with
+/// `fluid_build::per_route::RouteKind::class_name`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteClass {
@@ -2549,9 +2268,7 @@ pub enum RouteClass {
 }
 
 impl RouteClass {
-    /// Parse the cross-crate class string (`RouteKind::class_name`). Unknown
-    /// strings map to `SsrPage` (the safe dynamic default: defers caching to the
-    /// origin and uses the method gate for retries).
+    /// Parse the cross-crate class string; unknown strings map to `SsrPage`, the safe dynamic default.
     pub fn from_name(s: &str) -> RouteClass {
         match s {
             "static" => RouteClass::Static,
@@ -2589,10 +2306,8 @@ impl RouteClass {
         }
     }
 
-    /// Whether a response is safe to replay on failover regardless of HTTP method.
-    /// Pure reads (Static/ISR/SSR page render) are idempotent; side-effect-capable
-    /// kinds must still pass the method+idempotency gate (`hive-cloud retry`).
-    /// Returns only "definitely safe", never "definitely unsafe".
+    /// Whether a response is safe to replay on failover regardless of HTTP method (pure reads);
+    /// returns only "definitely safe", never "definitely unsafe".
     pub fn always_replayable(self) -> bool {
         matches!(
             self,
@@ -2644,10 +2359,8 @@ pub struct RoutePolicy {
     pub revalidate: Option<i64>,
 }
 
-/// A redirect rule mapped from the framework build (Next.js `redirects()`,
-/// Build Output API routes with a 3xx status) or from `vercel.json`. Evaluated
-/// by the gateway before routing — first match wins. `status` is the resolved
-/// HTTP code (308 permanent / 307 temporary / explicit `statusCode`).
+/// A redirect rule from the framework build or `vercel.json`, evaluated by the gateway before
+/// routing (first match wins); `status` is the resolved HTTP code.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Redirect {
     pub source: String,
@@ -2683,9 +2396,8 @@ pub struct Header {
     pub value: String,
 }
 
-/// A response-header rule (`vercel.json` `headers`). When `source` (+ optional
-/// `has`/`missing`) matches a request path, the gateway injects `headers` onto
-/// the response.
+/// A response-header rule (`vercel.json` `headers`): when `source` (+ `has`/`missing`) matches, the
+/// gateway injects `headers` onto the response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeaderRule {
     pub source: String,
@@ -2873,12 +2585,9 @@ pub fn redirect_status(permanent: Option<bool>, status_code: Option<u16>) -> u16
     }
 }
 
-// ---- path-to-regexp-lite matcher (Vercel `:param` / `:param*` + inline regex) ----
-
-/// Compile a Vercel source pattern (`/blog/:slug`, `/post/:p(\\d+)`,
-/// `/proxy/:m*`, `/(.*)`) into an anchored regex with named captures. Returns
-/// `None` if the pattern isn't regex-like or fails to compile (caller falls back
-/// to literal/prefix matching).
+/// Compile a Vercel source pattern (`/blog/:slug`, `/post/:p(\\d+)`, `/proxy/:m*`, `/(.*)`) into an
+/// anchored regex with named captures; `None` when not regex-like or uncompilable (caller falls
+/// back to literal/prefix matching).
 fn compile_source(source: &str) -> Option<regex::Regex> {
     if !(source.contains(':') || source.contains('(') || source.contains('*')) {
         return None;
@@ -2908,9 +2617,7 @@ fn compile_source(source: &str) -> Option<regex::Regex> {
                     lit.push(':');
                     continue;
                 }
-                // Optional modifier or inline regex.
                 if i < chars.len() && chars[i] == '(' {
-                    // Balanced custom pattern.
                     let mut depth = 0i32;
                     let mut body = String::new();
                     while i < chars.len() {
@@ -2943,7 +2650,6 @@ fn compile_source(source: &str) -> Option<regex::Regex> {
                 }
             }
             '(' => {
-                // Raw regex group passes through verbatim (balanced copy).
                 flush(&mut out, &mut lit);
                 let mut depth = 0i32;
                 while i < chars.len() {
@@ -2991,7 +2697,6 @@ fn subst_dest(dest: &str, caps: &regex::Captures) -> String {
                 name.push(chars[i]);
                 i += 1;
             }
-            // Consume an optional trailing `*`/`+` modifier in the destination.
             if i < chars.len() && (chars[i] == '*' || chars[i] == '+') {
                 i += 1;
             }
@@ -3015,8 +2720,6 @@ pub fn rule_apply(source: &str, dest: &str, path: &str) -> Option<String> {
         if let Some(caps) = re.captures(path) {
             return Some(subst_dest(dest, &caps));
         }
-        // A regex-like source that didn't match: also try the literal fallback,
-        // since lookahead-bearing sources may have failed to compile elsewhere.
         if rule_match(source, path) {
             return Some(rule_target(source, dest, path));
         }
@@ -3038,9 +2741,8 @@ pub fn rule_matches(source: &str, path: &str) -> bool {
     }
 }
 
-/// Middleware / proxy (`middleware.ts` / `proxy.ts`) detected in the build. Runs
-/// in the edge runtime ahead of routing; `matcher` lists the path patterns it
-/// applies to.
+/// Middleware / proxy (`middleware.ts` / `proxy.ts`) detected in the build; runs in the edge
+/// runtime ahead of routing on the `matcher` paths.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Middleware {
     #[serde(default)]
@@ -3059,19 +2761,16 @@ pub struct Manifest {
     /// Relative dir (within the deployment root) holding static assets.
     #[serde(default)]
     pub static_dir: Option<String>,
-    /// Per-deployment cell image key. When set, the function pool provisions
-    /// cells with this image instead of the node's default, so an isolated
-    /// backend (Firecracker) can attach this deployment's delivered build
-    /// artifact. `None` => use the node's default image (mock / same-host).
+    /// Per-deployment cell image key, so an isolated backend attaches this deployment's delivered
+    /// build artifact; `None` = the node's default image.
     #[serde(default)]
     pub image: Option<String>,
     #[serde(default)]
     pub functions: Vec<FunctionConfig>,
     #[serde(default)]
     pub routes: Vec<Route>,
-    /// Server-derived Build Output API v3 descriptor. `Some` is authoritative:
-    /// the gateway evaluates its ordered regex routes and exact output inventory
-    /// directly. `None` preserves legacy prefix routing byte-for-byte.
+    /// Server-derived Build Output API v3 descriptor; `Some` is authoritative (ordered regex routes +
+    /// exact output inventory), `None` preserves legacy prefix routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_output_v3: Option<BuildOutputV3>,
     /// Redirects mapped from the framework build (gateway honors these).
@@ -3099,50 +2798,32 @@ pub struct Manifest {
     /// `vercel.json` `images` — Image Optimization config (gateway enforces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<ImagesConfig>,
-    /// Per-route runtime policies (#16) from Next.js per-route classification.
-    /// Empty for non-Next deployments / when per-route discovery is disabled — in
-    /// which case the serve path behaves byte-for-byte as before. When present,
-    /// the gateway consults [`Manifest::route_policy`] to apply route-type-aware
-    /// caching/retry without changing the common (empty) case.
+    /// Per-route runtime policies from Next.js classification; empty for non-Next deployments, else
+    /// consulted via [`Manifest::route_policy`] for route-type-aware caching/retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_policies: Vec<RoutePolicy>,
-    /// The origin/SSR function a Static route falls through to when the requested
-    /// asset doesn't exist on disk (the CDN→function model). Used by adapter
-    /// frameworks (OpenNext, vinext) whose server function renders dynamic routes
-    /// while immutable assets are served from `static_dir`. `None` (the default)
-    /// means a Static miss stays a 404/SPA-fallback — behavior unchanged.
+    /// The origin/SSR function a Static route falls through to when the asset is missing (the
+    /// CDN→function model used by OpenNext/vinext); `None` keeps a Static miss a 404/SPA fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_function: Option<String>,
-    /// Explicit opt-in to a browser-replicated cr-sqlite database for this
-    /// project (fluid.json top-level `browser_db`). ABSENT means the project
-    /// gets NO browser database, by construction: only a deployment whose
-    /// manifest carries the block can ever ground a DB grant. See
-    /// [`BrowserDbPolicy`]'s docs and `docs/browser-db-contract.md` for the
-    /// full ownership/retention/naming contract this rides.
+    /// Explicit opt-in to a browser-replicated cr-sqlite database (fluid.json `browser_db`); ABSENT
+    /// means no browser database, by construction. See [`BrowserDbPolicy`] and
+    /// `docs/browser-db-contract.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_db: Option<BrowserDbPolicy>,
-    /// The detected/build-config framework SLUG (nextjs, vite, astro, remix,
-    /// docker, …), stamped at build time so the dashboard can show each
-    /// project's real framework logo. Empty = unknown → the UI falls back to
-    /// the default mark; absent on pre-upgrade builds, which is the same
-    /// unknown state.
+    /// The detected framework slug (nextjs, vite, astro, remix, docker, …), stamped at build time for
+    /// the dashboard's framework logo; empty/absent = unknown.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub framework: String,
 }
 
-/// Domain separator for [`normalized_manifest_sha256`]. One contract, one
-/// formula: every producer (the build coordinator sealing a generation) and
-/// every consumer (a transfer receiver re-proving the manifest it was handed)
-/// must hash exactly `domain || canonical_manifest_bytes`.
+/// Domain separator for [`normalized_manifest_sha256`]: every producer and consumer hashes exactly
+/// `domain || canonical_manifest_bytes`.
 pub const NORMALIZED_MANIFEST_DOMAIN: &[u8] = b"hive-normalized-manifest-v1\0";
 
-/// The ONE canonical byte encoding of a finalized deployment manifest.
-///
-/// serde_json emits struct fields in declaration order and every map inside
-/// [`Manifest`] is a `BTreeMap`, so encoding is deterministic and
-/// `canonical_manifest_bytes(&decode(bytes)) == bytes` holds for bytes this
-/// function produced — which is exactly the round-trip equality a receiver
-/// enforces before trusting a wire manifest.
+/// The ONE canonical byte encoding of a finalized manifest: declaration-ordered fields and
+/// `BTreeMap`s make it deterministic, so `canonical_manifest_bytes(&decode(bytes)) == bytes` — the
+/// round-trip a receiver enforces before trusting a wire manifest.
 pub fn canonical_manifest_bytes(manifest: &Manifest) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(manifest)
 }
@@ -3157,50 +2838,12 @@ pub fn normalized_manifest_sha256(canonical_manifest: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-//
-// ---------------------------------------------------------------------------
-// Content identity: BLAKE3 for anything newly addressed, legacy SHA-256 still
-// accepted on every read.
-// ---------------------------------------------------------------------------
-//
-// BLAKE3 is already the platform hash where we hash for content addressing
-// ([`browser_source_digest`], [`browser_policy_digest`]) and the two digests
-// are the same width — hex(BLAKE3) and hex(SHA-256) are BOTH 64 lowercase hex
-// characters — so no shape check anywhere in the tree can tell them apart.
-// That is the whole hazard this block exists to contain: a rehash is
-// undetectable by inspection, so it must be detectable by construction.
-//
-// Two rules, and they are not symmetric:
-//
-//   * `content_hash` (BLAKE3) is what NEW addresses are minted with.
-//   * `verify_content` accepts EITHER algorithm, so every digest already
-//     written to disk, gossiped to a peer, or sealed into a ledger keeps
-//     verifying under the algorithm that produced it. Nothing here is a flag
-//     day: a store that holds SHA-256-named objects and one that holds
-//     BLAKE3-named objects verify identically to a reader holding only the
-//     bytes.
-//
-// A digest that names STORED BYTES (a content-addressed filename, a store
-// directory, a GC keep-set key) therefore must NOT switch writers until
-// every reader dual-accepts — otherwise every existing object reads as a
-// miss or as an orphan. See [`ContentHasher`]'s docs for the one place a
-// switch is safe precisely because a miss is not a corruption.
-//
-// SECURITY BOUNDARY — this block is content identity ONLY. It is never a
-// signature, a MAC, a JWT/HMAC, a TLS/certificate input, or a credential
-// hash. Those stay on their own algorithms; see the exclusion list in
-// AGENTS.md. Mixing them is how a content-addressing change silently becomes
-// an authentication change.
-//
-
 /// Domain separator for the platform's general BLAKE3 content-identity
 /// namespace. One namespace, one formula: `domain || bytes`.
 pub const CONTENT_HASH_DOMAIN: &[u8] = b"hive-content-hash-v1\0";
 
-/// Whether `value` is the one canonical shape every platform digest uses: 64
-/// lowercase hexadecimal characters. BLAKE3 and SHA-256 hex are the SAME
-/// width, so this proves shape and never algorithm — [`verify_content`] is
-/// the only thing that may decide which algorithm a stored digest came from.
+/// Whether `value` is the canonical digest shape (64 lowercase hex); BLAKE3 and SHA-256 hex are the
+/// same width, so this proves shape, never algorithm — only [`verify_content`] decides that.
 pub fn is_hex64(value: &str) -> bool {
     value.len() == 64
         && value
@@ -3217,11 +2860,8 @@ pub fn content_hash(domain: &[u8], bytes: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// hex(SHA-256) of `domain || bytes` — the LEGACY content identity this
-/// namespace is migrating away from. Kept as a named function so a verifier
-/// states both algorithms explicitly instead of burying one in a fallback
-/// branch, and so a caller can mint a legacy digest deliberately during a
-/// mixed-version roll.
+/// hex(SHA-256) of `domain || bytes` — the LEGACY content identity, named so a verifier states
+/// both algorithms explicitly and a mixed-version roll can mint one deliberately.
 pub fn legacy_content_sha256(domain: &[u8], bytes: &[u8]) -> String {
     use sha2::Digest as _;
     let mut hash = sha2::Sha256::new();
@@ -3230,34 +2870,18 @@ pub fn legacy_content_sha256(domain: &[u8], bytes: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-/// Verify `bytes` against a stored digest that may be EITHER the current
-/// BLAKE3 [`content_hash`] or the legacy [`legacy_content_sha256`] over the
-/// same `domain`.
-///
-/// This is the coexistence primitive: it is what lets one node mint BLAKE3
-/// addresses while another still holds SHA-256 ones, in any order, with no
-/// coordinated cutover and no digest that starts failing. Rejecting a stored
-/// digest is only correct when NEITHER algorithm reproduces it, which is
-/// also the only honest "these bytes are not what was sealed" signal.
-///
-/// Not constant-time, and does not need to be: a content digest is public
-/// data, and the bytes are already in hand. Anything secret is not content
-/// identity and has no business reaching this function.
+/// Verify `bytes` against a stored digest under EITHER the BLAKE3 [`content_hash`] or the legacy
+/// [`legacy_content_sha256`] of the same `domain` — the coexistence primitive; rejecting is only
+/// correct when NEITHER reproduces it. Not constant-time: content digests are public data.
 pub fn verify_content(domain: &[u8], bytes: &[u8], stored: &str) -> bool {
     let alg = verify_content_alg(domain, bytes, stored);
     record_verify_outcome(alg);
     alg.is_some()
 }
 
-/// Which algorithm a stored content digest was actually minted under.
-///
-/// This enum exists because hex(BLAKE3) and hex(SHA-256) are the same width,
-/// so a stored digest never SAYS which algorithm produced it. A verifier that
-/// only returns `bool` throws that answer away, and with it the only way to
-/// ask "how much of this fleet is still reading legacy-minted digests?" — the
-/// question that gates flipping any writer off SHA-256. A writer may only move
-/// once every node reports its legacy accepts flat, because a flip before that
-/// makes every already-written object read as a miss or an orphan.
+/// Which algorithm a stored content digest was minted under — the answer a `bool` verifier throws
+/// away, and the only way to ask how much of the fleet still reads legacy digests before any
+/// writer may flip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ContentAlg {
     /// BLAKE3: every address minted from now on.
@@ -3277,16 +2901,8 @@ impl ContentAlg {
     }
 }
 
-/// Decide which algorithm `stored` was minted under, or `None` when NEITHER
-/// reproduces it — the only honest "these bytes are not what was sealed".
-///
-/// Comparison is hex-case-insensitive: a digest's case carries no information
-/// (`git::verify_pulled_artifact` has compared case-insensitively since it was
-/// written), and rejecting an uppercase-but-correct digest would be a false
-/// integrity failure wearing a strictness costume.
-///
-/// Legacy first: in a mixed fleet almost every stored digest is still SHA-256,
-/// so the common case costs one hash, not two.
+/// Decide which algorithm `stored` was minted under, or `None` when NEITHER reproduces it;
+/// hex-case-insensitive, legacy tried first (the common case in a mixed fleet).
 pub fn verify_content_alg(domain: &[u8], bytes: &[u8], stored: &str) -> Option<ContentAlg> {
     if stored.len() != 64 {
         return None;
@@ -3299,20 +2915,6 @@ pub fn verify_content_alg(domain: &[u8], bytes: &[u8], stored: &str) -> Option<C
     }
     None
 }
-
-//
-// The un-domain-separated namespace.
-//
-// Several content digests predate domain separation and were minted as a BARE
-// hash of the bytes: transfer chunk digests, runtime-artifact package and
-// semantic-tree digests, litebox archive digests. They cannot be moved onto
-// [`verify_content`] without changing what their producer writes — the digest
-// IS the value on the wire — so they get their own explicitly-named pair under
-// the same dual-accept rule. They are named `raw_*` precisely so nobody
-// mistakes them for the domain-separated namespace, and a future writer flip
-// in this namespace must domain-separate at the same time (bump the field),
-// never silently reinterpret an old one.
-//
 
 /// BLAKE3 (lowercase hex) of `bytes` with no domain prefix: the current mint
 /// for the raw namespace.
@@ -3349,13 +2951,6 @@ pub fn verify_raw_content(bytes: &[u8], stored: &str) -> bool {
     alg.is_some()
 }
 
-//
-// Observability. A dual-accepting verifier that reports nothing is a
-// permanently unverifiable claim that "the fleet has moved" — the counters
-// below are the inspection point that turns it into a measurable one. Served
-// at `GET /v1/admin/content-hash` (operator-only, node-local).
-//
-
 static VERIFY_BLAKE3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static VERIFY_SHA256: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static VERIFY_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3369,9 +2964,8 @@ fn record_verify_outcome(alg: Option<ContentAlg>) {
     slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-local counts of which algorithm the content verifiers actually
-/// accepted on THIS node. Purely monotonic counters, never a correctness
-/// input: nothing in a verify path reads them.
+/// Process-local counts of which algorithm the content verifiers accepted on THIS node; monotonic
+/// counters, never a correctness input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ContentVerifyStats {
     /// Verifications accepted because BLAKE3 reproduced the stored digest.
@@ -3394,37 +2988,22 @@ pub fn content_verify_stats() -> ContentVerifyStats {
     }
 }
 
-/// Verify canonical manifest bytes against a stored normalized-manifest
-/// digest, accepting either algorithm. Same contract as [`verify_content`],
-/// pinned to [`NORMALIZED_MANIFEST_DOMAIN`] so no caller re-types the domain
-/// and drifts from the producer at [`normalized_manifest_sha256`].
+/// Verify canonical manifest bytes against a stored normalized-manifest digest under either
+/// algorithm, pinned to [`NORMALIZED_MANIFEST_DOMAIN`].
 pub fn verify_normalized_manifest(canonical_manifest: &[u8], stored: &str) -> bool {
     verify_content(NORMALIZED_MANIFEST_DOMAIN, canonical_manifest, stored)
 }
 
-/// Streaming [`content_hash`] for callers that fold many labelled fields into
-/// one digest rather than hashing one contiguous buffer.
-///
-/// The field encoding is length-delimited in BOTH directions — `u64le label
-/// length || label || u64le value length || value` — so no field boundary is
-/// ambiguous and two different field sets can never collide. That encoding
-/// was already open-coded in two places (`git::compute_cache_key` and
-/// `build_executor::policy_digest`); this is the shared form of it.
-///
-/// A `ContentHasher` digest is safe to switch algorithms on ONLY where the
-/// digest is a lookup key and a miss is merely a miss (a build cache key,
-/// say). Where the digest NAMES stored bytes — a store directory, a
-/// content-addressed filename, a GC keep-set entry — switching makes every
-/// already-written object unreachable, so leave the writer alone.
+/// Streaming [`content_hash`] over labelled fields, length-delimited in BOTH directions (`u64le
+/// label length || label || u64le value length || value`) so field sets can never collide. Safe to
+/// switch algorithms ONLY where the digest is a lookup key and a miss is merely a miss.
 pub struct ContentHasher {
     hasher: blake3::Hasher,
 }
 
 impl ContentHasher {
-    /// Start a digest in the given domain. Every caller passes its own
-    /// domain — including a version — so a caller can move to BLAKE3 by
-    /// bumping its domain string instead of silently reinterpreting an old
-    /// one.
+    /// Start a digest in the given domain; every caller's domain carries a version so it can move
+    /// algorithms by bumping the string instead of reinterpreting an old one.
     pub fn new(domain: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(domain);
@@ -3452,13 +3031,9 @@ impl ContentHasher {
     }
 }
 
-/// Strict deploy-time protocol validation for raw `fluid.json` text: walk
-/// every `functions[*].protocol` and `functions[*].ports[*].protocol` string
-/// in the RAW JSON and reject unrecognized values via the strict
-/// `ServiceProtocol::FromStr`. Must run on the raw text (not the deserialized
-/// [`Manifest`]) because the lenient serde impl has already coerced unknowns
-/// to `http` by the time the typed value exists. Non-string values are left
-/// for serde to reject with its own type error.
+/// Strict deploy-time protocol validation over the RAW `fluid.json` text (every
+/// `functions[*].protocol` and `functions[*].ports[*].protocol`), because the lenient serde impl has
+/// already coerced unknowns to `http` once the typed value exists.
 fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
     use serde::de::Error as _;
     let raw: serde_json::Value = serde_json::from_str(s)?;
@@ -3498,13 +3073,9 @@ fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
 }
 
 impl Manifest {
-    /// Parse a fresh, user-authored `fluid.json`. This is a DEPLOY-INPUT
-    /// boundary, so unknown protocol strings are a hard, clearly-worded error
-    /// here — checked against the RAW strings via the strict
-    /// `ServiceProtocol::FromStr` BEFORE the lenient serde impl coerces them
-    /// to `http` (see the strict-vs-lenient split on [`ServiceProtocol`]).
-    /// Persisted-state loaders must NOT go through this function; they
-    /// deserialize [`Manifest`] directly and get the lenient behavior.
+    /// Parse a fresh, user-authored `fluid.json` — a DEPLOY-INPUT boundary where unknown protocol
+    /// strings are a hard error (checked on the RAW text before lenient serde). Persisted-state loaders
+    /// must NOT use this; they deserialize [`Manifest`] directly.
     pub fn from_json(s: &str) -> Result<Manifest, serde_json::Error> {
         validate_protocols_strict(s)?;
         serde_json::from_str(s)
@@ -3514,12 +3085,8 @@ impl Manifest {
         self.functions.iter().find(|f| f.name == name)
     }
 
-    /// Every STAMPED raw-ingress binding in this manifest (specs whose
-    /// `public_port` the raw-port allocator filled in) — the flattened
-    /// `public_port` → function/container-port/protocol view the generic raw
-    /// proxy serves, also surfaced on [`DeploymentInfo`] so it gossips
-    /// fleet-wide. Only raw-protocol specs ever get stamped, so this is empty
-    /// for HTTP-only deployments.
+    /// Every STAMPED raw-ingress binding in this manifest — the flattened `public_port` →
+    /// function/container-port/protocol view the raw proxy serves and [`DeploymentInfo`] gossips.
     pub fn raw_port_bindings(&self) -> Vec<RawPortBinding> {
         let mut out = Vec::new();
         for f in &self.functions {
@@ -3538,12 +3105,8 @@ impl Manifest {
         out
     }
 
-    /// The deployment's dedicated public IPv4 allocation, if any function
-    /// opted in and the deploy-time claim succeeded — hoisted from whichever
-    /// function carries a stamp, the same manifest-then-`view_of` shape
-    /// [`Manifest::raw_port_bindings`] uses. `DeploymentInfo` carries a single
-    /// slot (not one per function): today's contract is at most one dedicated
-    /// address per deployment, so the first stamped function wins.
+    /// The deployment's dedicated public IPv4 allocation, hoisted from whichever function carries a
+    /// stamp; at most one per deployment, so the first stamped function wins.
     pub fn dedicated_ipv4_binding(&self) -> Option<DedicatedIpv4> {
         self.functions
             .iter()
@@ -3557,10 +3120,6 @@ impl Manifest {
         for r in &self.routes {
             if path_matches(&r.pattern, path) {
                 match best {
-                    // Specificity is the matched PREFIX, not the raw pattern
-                    // text — else a catch-all `/*` (2 chars) would outrank the
-                    // `/api` (4 chars) it is meant to be the fallback for the
-                    // moment wildcards became matchable.
                     Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {
                     }
                     _ => best = Some(r),
@@ -3571,20 +3130,14 @@ impl Manifest {
             .unwrap_or(RouteTarget::Static)
     }
 
-    /// Did any declared route actually match `path`? `resolve` answers
-    /// `RouteTarget::Static` for BOTH "a route says static" and "no route
-    /// matched at all", which is exactly the ambiguity that let an unroutable
-    /// deployment 404 as if it were an ordinary missing file. Callers that need
-    /// to explain a 404 ask this.
+    /// Did any declared route actually match `path`? `resolve` answers `RouteTarget::Static` for both
+    /// "a route says static" and "nothing matched", so callers explaining a 404 ask this.
     pub fn route_matched(&self, path: &str) -> bool {
         self.routes.iter().any(|r| path_matches(&r.pattern, path))
     }
 
-    /// The per-route runtime policy (#16) for a request path, if any. Matches the
-    /// request against the persisted Next.js route patterns (exact + dynamic
-    /// `[seg]` / catch-all `[...seg]`), preferring the most specific (fewest
-    /// dynamic segments, then longest) match. Returns `None` when no per-route
-    /// policy is configured — the common case, leaving behavior unchanged.
+    /// The per-route runtime policy for a request path, matching persisted Next.js patterns (exact,
+    /// `[seg]`, `[...seg]`) most-specific first; `None` when no per-route policy is configured.
     pub fn route_policy(&self, path: &str) -> Option<&RoutePolicy> {
         if self.route_policies.is_empty() {
             return None;
@@ -3657,9 +3210,8 @@ impl Manifest {
         out
     }
 
-    /// Trailing-slash normalization for `path`. Returns `Some(new_path)` when a
-    /// 308 redirect should be issued, else `None`. Paths with a file extension in
-    /// the last segment are never given a trailing slash (Vercel semantics).
+    /// Trailing-slash normalization: `Some(new_path)` when a 308 should be issued; paths whose last
+    /// segment has a file extension never get a trailing slash (Vercel semantics).
     pub fn trailing_slash_redirect(&self, path: &str) -> Option<String> {
         let want = self.trailing_slash?;
         if path == "/" {
@@ -3708,32 +3260,15 @@ fn rule_target(source: &str, destination: &str, path: &str) -> String {
     destination.to_string()
 }
 
-/// The matching PREFIX a route pattern denotes, with a trailing wildcard
-/// stripped. `"/"` → `""`, `"/*"` → `""`, `"*"` → `""`, `"/api/*"` → `"/api"`,
-/// `"/api"` → `"/api"`.
-///
-/// The wildcard forms are why this exists. `path_matches` used to be a bare
-/// `strip_prefix`, so a `fluid.json` route written the natural way —
-/// `{"pattern": "/*", "target": {"function": "web"}}` — matched NOTHING: no
-/// request path begins with the literal two characters `/*`. Every request then
-/// fell through `Manifest::resolve`'s `RouteTarget::Static` default, so the
-/// deployment 404'd `not found` on every path while reporting Ready with its
-/// function registered, and `try_browser` (reachable only from the
-/// `RouteTarget::Function` branch) was never consulted either — a deployment
-/// that could serve neither from the fleet nor from a donor browser. Witnessed
-/// live on `archive-zip.shadw.app` (2026-08-05): `GET /` → 404 `not found`,
-/// while `GET /fluid.json` returned the project's own source as a static file.
-///
-/// Only a TRAILING wildcard is understood — a pattern with one in the middle
-/// (`/api/*/x`) keeps its literal, matches-nothing behaviour rather than being
-/// silently reinterpreted as something it does not say.
+/// The matching PREFIX a route pattern denotes, with a trailing wildcard stripped: `"/"`, `"/*"`
+/// and `"*"` → `""`, `"/api/*"` and `"/api"` → `"/api"`. Only a TRAILING wildcard is understood; a
+/// pattern with one in the middle keeps its literal, matches-nothing behaviour.
 pub fn route_prefix(pattern: &str) -> &str {
     pattern.trim().trim_end_matches('*').trim_end_matches('/')
 }
 
-/// Prefix match with `/` boundary awareness. `"/api"` matches `/api` and
-/// `/api/x` but not `/apixyz`. `"/"`, `"/*"` and `"*"` match everything;
-/// `"/api/*"` matches exactly what `"/api"` does.
+/// Prefix match with `/` boundary awareness: `"/api"` matches `/api` and `/api/x`, not `/apixyz`;
+/// `"/"`, `"/*"` and `"*"` match everything; `"/api/*"` matches exactly what `"/api"` does.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
     let prefix = route_prefix(pattern);
     if prefix.is_empty() {
@@ -3746,12 +3281,9 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
-/// Match a request path against a Next.js route pattern (#16), supporting exact
-/// segments, dynamic `[seg]` (one segment), and catch-all `[...seg]` /
-/// `[[...seg]]` (one-or-more / zero-or-more trailing segments). Returns a
-/// specificity score on match (higher = more specific: static segments score
-/// highest, single-dynamic lower, catch-all lowest), or `None` if it doesn't
-/// match. Used only for per-route policy lookup; the normal router is unaffected.
+/// Match a request path against a Next.js route pattern (exact segments, `[seg]`, `[...seg]` /
+/// `[[...seg]]`), returning a specificity score (static > single-dynamic > catch-all) or `None`;
+/// used only for per-route policy lookup.
 pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
     let pat = pattern.trim_matches('/');
     let req = path.trim_matches('/');
@@ -3770,19 +3302,16 @@ pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
     let mut i = 0;
     while i < pseg.len() {
         let p = pseg[i];
-        // Catch-all: `[...x]` (>=1 remaining) or optional `[[...x]]` (>=0 remaining).
         if p.starts_with("[[...") && p.ends_with("]]") {
             return Some(score + 1); // optional catch-all matches the rest (incl. none)
         }
         if p.starts_with("[...") && p.ends_with(']') {
-            // Requires at least one remaining segment.
             return if i < rseg.len() {
                 Some(score + 2)
             } else {
                 None
             };
         }
-        // Out of request segments but pattern still has required parts -> no match.
         if i >= rseg.len() {
             return None;
         }
@@ -3795,7 +3324,6 @@ pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
         }
         i += 1;
     }
-    // All pattern segments consumed: match iff request has no leftover segments.
     if rseg.len() == pseg.len() {
         Some(score)
     } else {
@@ -3813,14 +3341,9 @@ pub struct GitSource {
 }
 
 impl GitSource {
-    /// `repo_url` is a real git remote (github.com/... etc), not the synthetic
-    /// `upload://`/`image://` pseudo-URLs `run_build` also stamps into this same
-    /// field for zip/prebuilt-image deploys (so build metadata/webhook payloads
-    /// still have a source string). A caller resolving "the repo this project's
-    /// pushes should match" (e.g. GitHub webhook dispatch) must skip non-git
-    /// records — otherwise a zip/image redeploy becoming a project's NEWEST
-    /// deployment poisons that lookup, silently breaking future git-push
-    /// auto-deploys for the project's real, unrelated repo.
+    /// `repo_url` is a real git remote, not the synthetic `upload://`/`image://` pseudo-URL `run_build`
+    /// stamps for zip/prebuilt-image deploys; a caller resolving the repo a project's pushes should
+    /// match must skip non-git records or a zip/image redeploy poisons git-push auto-deploys.
     pub fn is_real_git(&self) -> bool {
         !self.repo_url.starts_with("upload://") && !self.repo_url.starts_with("image://")
     }
@@ -3834,9 +3357,8 @@ pub enum DeployState {
     Building,
     Ready,
     Error,
-    /// The in-flight build was stopped by an explicit user cancel
-    /// (`POST /v1/builds/:id/cancel`) — distinct from `Error` (a build the
-    /// platform tried and failed) so the dashboard can tell the two apart.
+    /// The in-flight build was stopped by an explicit user cancel (`POST /v1/builds/:id/cancel`),
+    /// distinct from `Error`.
     Cancelled,
 }
 impl Default for DeployState {
@@ -3862,18 +3384,16 @@ pub struct DeployRecord {
     pub creator: String,
     pub git: Option<GitSource>,
     pub production: bool,
-    /// Environment the deployment was built for: "production" | "preview".
-    /// Immutable; `production` only reflects whether it currently holds the prod
-    /// alias. Defaults to empty (derive from `production`) for old snapshots.
+    /// Environment the deployment was built for: "production" | "preview" (immutable; `production` only
+    /// reflects the current alias). Empty = derive from `production`, for old snapshots.
     #[serde(default)]
     pub target: String,
     /// Final lifecycle state (so a failed build stays "error" across restarts).
     /// Defaults to `ready` for back-compat with snapshots written before this field.
     #[serde(default)]
     pub state: DeployState,
-    /// Owning team/tenant. `#[serde(default)]` keeps pre-tenancy snapshots
-    /// loadable (they normalize to "personal"); on restore this re-registers the
-    /// deployment's function pools under the correct tenant.
+    /// Owning team/tenant; `serde(default)` keeps pre-tenancy snapshots loadable (they normalize to
+    /// "personal") and restore re-registers the function pools under the correct tenant.
     #[serde(default)]
     pub tenant: String,
 }
@@ -3894,24 +3414,19 @@ pub struct Deployment {
     pub state: DeployState,
     pub creator: String,
     pub git: Option<GitSource>,
-    /// Whether this deployment currently holds the project's PRODUCTION alias
-    /// (Vercel's "promoted" flag). Flips on promote/rollback — it does NOT change
-    /// `target`.
+    /// Whether this deployment currently holds the project's PRODUCTION alias; flips on
+    /// promote/rollback and never changes `target`.
     pub production: bool,
-    /// The environment the deployment was BUILT for: "production" | "preview".
-    /// Immutable for the life of the deployment (a superseded production build
-    /// keeps target=production even after a newer one is promoted). Empty string
-    /// means "derive from `production`" (back-compat for old in-memory values).
+    /// The environment the deployment was BUILT for: "production" | "preview", immutable for its life;
+    /// empty = derive from `production` (old in-memory values).
     pub target: String,
-    /// Owning team/tenant slug (empty = "personal"). Set at deploy time from the
-    /// project's team; flows into each cell's `CellSpec` and the Fluid pool so
-    /// compute is partitioned and quota'd per tenant.
+    /// Owning team/tenant slug (empty = "personal"), set at deploy time; flows into each cell's
+    /// `CellSpec` and the Fluid pool so compute is partitioned and quota'd per tenant.
     pub tenant: String,
 }
 
-/// Admin API: request to create a direct local deployment. `root` is source
-/// acquisition input only; the gateway seals it before registration, and serving
-/// uses paths derived from that immutable artifact.
+/// Admin API: request to create a direct local deployment. `root` is source-acquisition input only;
+/// the gateway seals it before registration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployRequest {
     pub root: String,
@@ -3932,26 +3447,14 @@ pub struct GitDeployRequest {
     pub repo_url: String,
     #[serde(default)]
     pub branch: Option<String>,
-    /// Exact commit SHA to build, when known (parsed from a GitHub webhook
-    /// payload's `after` for a push, or `pull_request.head.sha` for a PR). When
-    /// Some, the clone pins to this EXACT commit instead of the branch tip —
-    /// closes a race where a rapid double-push could otherwise silently build a
-    /// newer commit than the one GitHub actually notified about. None (manual
-    /// deploys, redeploys, the "New Project" import flow) has no specific commit
-    /// to pin to and falls back to a plain branch-tip clone.
+    /// Exact commit SHA to build when known (a webhook's `after` / `pull_request.head.sha`): the clone
+    /// pins to it instead of the branch tip, so a rapid double-push cannot build a newer commit than
+    /// the one notified. `None` (manual deploys, redeploys, import) clones the branch tip.
     #[serde(default)]
     pub commit: Option<String>,
-    /// When a webhook-triggered PR build's HEAD commit lives on a FORK (not the
-    /// base repo `repo_url` points at), this is the fork's clone URL — the PR's
-    /// branch (and, for an older host without SHA-fetch support, the commit
-    /// itself) only exists on the fork's remote, so cloning/fetching against
-    /// `repo_url` would find nothing. When Some, the clone/fetch step in
-    /// `run_build` sources from THIS url instead of `repo_url`. `repo_url` itself
-    /// is left untouched everywhere else — project ownership/matching, the
-    /// displayed `Build.repo_url`, and commit-status reporting all stay on the
-    /// BASE repo, since a fork PR still belongs to the base project. None for
-    /// same-repo PRs, pushes, and every non-webhook deploy (manual import,
-    /// redeploy, "New Project").
+    /// The fork's clone URL when a webhook-triggered PR's HEAD lives on a FORK: `run_build` clones
+    /// from it instead of `repo_url`, while `repo_url` keeps naming the BASE repo everywhere else
+    /// (ownership, display, commit status). `None` for same-repo PRs, pushes and non-webhook deploys.
     #[serde(default)]
     pub head_repo_url: Option<String>,
     #[serde(default)]
@@ -3962,141 +3465,87 @@ pub struct GitDeployRequest {
     pub creator: Option<String>,
     #[serde(default = "default_prod")]
     pub production: bool,
-    /// Explicit deploy target: "production" | "preview". When None (the default),
-    /// the target is CLASSIFIED from the branch — a push to the project's
-    /// production branch is production, every other branch / PR is a preview
-    /// (Vercel's model). Webhooks set this to "preview" for PR events; the import
-    /// + redeploy flows leave it None so the branch decides.
+    /// Explicit deploy target "production" | "preview"; `None` classifies from the branch (the
+    /// production branch is production, anything else a preview). Webhooks set "preview" for PRs.
     #[serde(default)]
     pub target: Option<String>,
-    /// Whether to reuse the existing dependency build cache. Defaults to true.
-    /// A redeploy can set this false ("Use existing Build Cache" unchecked) to
-    /// force a clean install — when a package-lock.json is present that means
-    /// `npm ci` instead of `npm install`, and the cached node_modules is skipped.
+    /// Reuse the existing dependency build cache (default true); `false` forces a clean install
+    /// (`npm ci` with a lockfile, cached node_modules skipped).
     #[serde(default = "default_prod")]
     pub use_cache: bool,
     /// Subdirectory within the repo to build (for monorepo templates, e.g.
     /// `examples/nextjs`). Empty/None = repo root.
     #[serde(default)]
     pub root_dir: Option<String>,
-    /// Environment variables supplied by a direct creation request. The server
-    /// persists them as runtime-only variables for the server-derived deployment
-    /// environment; fork-sourced requests never persist them. Build variables are
-    /// configured explicitly through the project environment API with build scope.
+    /// Environment variables supplied by a direct creation request, persisted as runtime-only
+    /// variables; fork-sourced requests never persist them. Build variables go through the project
+    /// environment API with build scope.
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
-    /// When true, this node deploys LOCALLY only (build + host) and does NOT run
-    /// the placement scheduler / fanout. The coordinator sets this on the
-    /// per-target deploys it dispatches, so a target node "just hosts this" and
-    /// placement never recurses.
+    /// This node deploys LOCALLY only (build + host) and runs no placement/fanout — set by the
+    /// coordinator on the per-target deploys it dispatches, so placement never recurses.
     #[serde(default)]
     pub no_fanout: bool,
-    /// Set by the coordinator on every per-target deploy of a MULTI-target
-    /// fanout EXCEPT the designated primary (the first placement target). A
-    /// `no_fanout` sub-build skips the coordinator's placement gates entirely,
-    /// so this flag is how the stateful/single-writer fanout guard reaches the
-    /// pure-remote fanout path: at initial placement a Dockerfile/compose
-    /// deploy's container-ness (and thus statefulness) is UNKNOWN, so the
-    /// coordinator may legitimately fan an unknown deploy out to several
-    /// regions — and only each target's own build discovers whether the result
-    /// is a stateful single-writer service (container volume / raw protocol).
-    /// A target that discovers it IS stateful while `fanout_secondary` is true
-    /// declines to host (see the guard in `git.rs::run_build`), collapsing the
-    /// deploy to the primary region instead of silently creating independent,
-    /// diverging per-region volumes (split-brain). False (the default) on
-    /// direct deploys, single-target dispatches, and the primary target —
-    /// stateless multi-region fanout is unaffected because the guard also
-    /// requires the post-build stateful signal.
+    /// Set by the coordinator on every per-target deploy of a MULTI-target fanout except the primary.
+    /// A target whose build discovers it is a stateful single-writer service (container volume / raw
+    /// protocol) declines to host while this is true (`git.rs::run_build`), collapsing the deploy to
+    /// the primary region instead of creating diverging per-region volumes.
     #[serde(default)]
     pub fanout_secondary: bool,
-    /// Project BuildConfig (framework/install/build/output/root), forwarded by the
-    /// coordinator on a fanout deploy so the target builds with the SAME settings
-    /// the user configured — not just whatever it auto-detects. Opaque JSON to
-    /// avoid a fluid-core → hive-cloud dependency. None on direct user deploys.
+    /// Project BuildConfig forwarded by the coordinator on a fanout deploy so the target builds with
+    /// the user's configured settings; opaque JSON (no fluid-core → hive-cloud dependency).
     #[serde(default)]
     pub build_config: Option<serde_json::Value>,
     /// Project FunctionSettings (vcpus/memory/regions/…), forwarded on fanout so a
     /// remotely-placed deployment honors the user's compute tier. Opaque JSON.
     #[serde(default)]
     pub function_settings: Option<serde_json::Value>,
-    /// Set by the "New Deployment" modal on a project's own page: this is a fresh
-    /// deployment of an EXISTING project, not a new-project create. When the named
-    /// project already exists for the requesting tenant, its name is used verbatim
-    /// (no `-N` suffix, no "already exists" 409) even if the source repo/branch
-    /// differs — the user is intentionally deploying a new source into that project.
+    /// A fresh deployment of an EXISTING project (the project page's "New Deployment" modal): the
+    /// existing name is used verbatim — no `-N` suffix, no 409 — even if the source differs.
     #[serde(default)]
     pub redeploy: bool,
-    /// Base64 of an uploaded ZIP archive — an alternative SOURCE to `repo_url`.
-    /// When set, the build EXTRACTS this instead of `git clone`. It rides inside the
-    /// request so the existing placement/fanout ships it to the target node (bounded
-    /// by the gossip frame; the upload endpoint enforces ~10 MB raw). Cleared right
-    /// after extraction so it is never persisted or logged.
+    /// Base64 of an uploaded ZIP archive, an alternative SOURCE to `repo_url` extracted instead of a
+    /// clone; rides placement/fanout (the upload endpoint caps it ~10 MB) and is cleared right after
+    /// extraction so it is never persisted or logged.
     #[serde(default)]
     pub zip_b64: Option<String>,
-    /// A PRE-BUILT OCI image reference to run directly (Docker Hub / Quay / any
-    /// registry), e.g. `fruitbox12/simplifi:latest` or `quay.io/org/img:tag`. When
-    /// set, the deploy SKIPS clone + build entirely: the target node `podman pull`s
-    /// the image, auto-detects its port, and runs it as a container with an automatic
-    /// persistent volume + the project's env vars. Rides the normal placement/fanout.
+    /// A PRE-BUILT OCI image reference to run directly: the deploy skips clone + build, the target
+    /// `podman pull`s it, auto-detects its port and runs it with a persistent volume + the project's env.
     #[serde(default)]
     pub image_ref: Option<String>,
     /// Optional explicit container port for an `image_ref` deploy. When None, the port
     /// is auto-detected from the image's `ExposedPorts` (falling back to 8080).
     #[serde(default)]
     pub image_port: Option<u16>,
-    /// Optional explicit protocol for an `image_ref` deploy (Railway-style; see
-    /// [`ServiceProtocol`]), e.g. `Udp` for a UDP-only service (Minecraft Bedrock,
-    /// port 19132/udp — an image exposing no TCP port at all can't be auto-detected
-    /// as anything but this). `None` falls back to whatever `image_container_manifest`
-    /// (hive-cloud) detects from the image's `ExposedPorts` alongside `image_port`
-    /// (defaulting to `Http` when nothing is exposed either). Independent of
-    /// `image_port`: either may be set without the other — the resolution order lives
-    /// in `image_container_manifest`, not here.
+    /// Optional explicit protocol for an `image_ref` deploy (e.g. `Udp` for a UDP-only service that
+    /// exposes no TCP port); `None` lets `image_container_manifest` detect it from `ExposedPorts`.
+    /// Independent of `image_port`.
     #[serde(default)]
     pub image_protocol: Option<ServiceProtocol>,
-    /// Memory ceiling override for an `image_ref` deploy's container, e.g. "4g",
-    /// "2048m", "512" — same string format/semantics as a Dockerfile-build
-    /// project's fluid.json `container.memory`. `None` = the node's generous
-    /// env-tunable default. Always clamped to a fleet-wide ceiling
-    /// (`ContainerLimits::for_container`) so a request can never remove the
-    /// ceiling entirely.
+    /// Memory ceiling override for an `image_ref` container ("4g", "2048m", "512" — fluid.json
+    /// `container.memory` semantics); `None` = node default, always clamped fleet-wide.
     #[serde(default)]
     pub image_memory: Option<String>,
-    /// CPU quota override for an `image_ref` deploy's container, e.g. "2.0",
-    /// "0.5" — same format as fluid.json `container.cpus`. `None` = the node's
-    /// default. Clamped fleet-wide.
+    /// CPU quota override for an `image_ref` container (fluid.json `container.cpus` format); `None` =
+    /// node default, clamped fleet-wide.
     #[serde(default)]
     pub image_cpus: Option<String>,
-    /// Max-PIDs override for an `image_ref` deploy's container cgroup (fork-bomb
-    /// guard) — same as fluid.json `container.pids`. `None` = the node's
-    /// default. Clamped fleet-wide.
+    /// Max-PIDs override for an `image_ref` container cgroup (fluid.json `container.pids`); `None` =
+    /// node default, clamped fleet-wide.
     #[serde(default)]
     pub image_pids: Option<u32>,
-    /// Full multi-port declaration for an `image_ref` deploy — when non-empty,
-    /// this REPLACES the single `image_port`/`image_protocol` resolution
-    /// entirely (the first entry is the primary/listen port, used the same way
-    /// `image_port` would be); when empty/absent, the single-port path is
-    /// unchanged. Lets a service that needs more than one raw port declared
-    /// (e.g. a game server's play + query ports) describe all of them in one
-    /// deploy, the same way a compose service's `x-shadw-expose` already can.
-    /// NOTE: only the PRIMARY (first) port is forwardable through the mesh
-    /// splice today (`mesh_raw::resolve`'s existing, separately-tracked
-    /// `spec_idx != 0` limitation) — a secondary port here gets a real public
-    /// allocation but cross-node forwarding to it isn't wired yet.
+    /// Full multi-port declaration for an `image_ref` deploy; when non-empty it REPLACES the single
+    /// `image_port`/`image_protocol` resolution (first entry = primary). Only the PRIMARY port is
+    /// forwardable through the mesh splice today (`mesh_raw::resolve`'s `spec_idx != 0` limitation).
     #[serde(default)]
     pub image_ports: Option<Vec<PortSpec>>,
-    /// GitHub access token for cloning a PRIVATE repo. Fed to the git process
-    /// through a 0600 temp-file descriptor-backed credential helper (never embedded
-    /// in a URL, argv, or env), cleared (`take()`) right after clone so no persisted/
-    /// gossiped/displayed record retains it. Rides placement/fanout like `zip_b64`;
-    /// `skip_serializing_if` omits it entirely when absent (public repos / no connection).
+    /// GitHub access token for cloning a PRIVATE repo, fed to git through a 0600 temp-file credential
+    /// helper (never a URL, argv or env) and `take()`n right after clone so no persisted, gossiped or
+    /// displayed record retains it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_token: Option<String>,
-    /// Upload-source lineage ids for a server-resolved redeploy. Despite the
-    /// compatibility field name, values are platform-issued BUILD ids stamped in
-    /// `GitSource.commit`: checkout dirs and retained archives use build ids, while
-    /// gateway deployment ids are independently minted. Empty means no proven
-    /// upload lineage and must fail closed rather than scan newest-any source.
+    /// Upload-source lineage ids for a server-resolved redeploy — platform-issued BUILD ids stamped in
+    /// `GitSource.commit`; empty means no proven upload lineage and must fail closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_deployment_ids: Vec<String>,
 }
@@ -4114,9 +3563,7 @@ pub struct DeploymentInfo {
     pub created_at_ms: u64,
     /// Convenience: the project (production-domain) Host alias `<project>.localhost`.
     pub alias: String,
-    /// Immutable per-commit Host alias `<project>-<shortsha>.localhost` (Vercel's
-    /// commit URL). Empty when the deployment has no git commit. Always resolves
-    /// to THIS exact deployment.
+    /// Immutable per-commit Host alias `<project>-<shortsha>.localhost`; empty without a git commit.
     #[serde(default)]
     pub commit_alias: String,
     /// Per-branch Host alias `<project>-git-<branch>.localhost` (Vercel's branch
@@ -4141,9 +3588,8 @@ pub struct DeploymentInfo {
     /// Type label for the UI: "static" | "function" | "fullstack".
     #[serde(default)]
     pub kind: String,
-    /// The build's framework slug (nextjs/vite/astro/docker/…) — carried from
-    /// the manifest so the dashboard shows each project's real framework logo,
-    /// with a default fallback. Empty/absent = unknown.
+    /// The build's framework slug, carried from the manifest for the dashboard's framework logo;
+    /// empty/absent = unknown.
     #[serde(default)]
     pub framework: String,
     /// Framework features mapped onto this deployment (redirects, middleware…).
@@ -4152,49 +3598,26 @@ pub struct DeploymentInfo {
     /// Owning team/tenant slug (empty = "personal").
     #[serde(default)]
     pub tenant: String,
-    /// Allocated public raw-ingress bindings (TCP/UDP/gRPC public ports stamped
-    /// on this deployment's manifest by the raw-port allocator). Carried here —
-    /// unlike the rest of the manifest — because the generic raw proxy on EVERY
-    /// edge node needs the fleet-wide `public_port` → deployment mapping, and
-    /// `DeploymentInfo` is exactly what the `/v1/fleet-deployments` gossip
-    /// already replicates into each node's `peer_deployments`. Empty for
-    /// HTTP-only deployments and for peers running older binaries.
+    /// Allocated public raw-ingress bindings, carried here (unlike the rest of the manifest) because
+    /// the raw proxy on EVERY edge node needs the fleet-wide `public_port` → deployment mapping that
+    /// `/v1/fleet-deployments` gossip replicates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_ports: Vec<RawPortBinding>,
-    /// The deployment's dedicated public IPv4 (fluid.json
-    /// `functions[].dedicatedIpv4`), if any function opted in and the deploy
-    /// path's Tencent EIP purchase/associate succeeded. Hoisted here for the
-    /// same reason as `raw_ports`: `raw_proxy.rs`'s bind reconcile loop on
-    /// EVERY node needs the address to decide which local IP to bind, and DNS
-    /// / the dashboard need it fleet-wide. `None` for every deployment with no
-    /// opt-in and for peers running older binaries.
+    /// The deployment's dedicated public IPv4, if any function opted in and the EIP purchase succeeded;
+    /// hoisted so `raw_proxy.rs`'s bind reconcile on every node, DNS and the dashboard see it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_ipv4: Option<DedicatedIpv4>,
-    /// Browser-eligible functions with their build-stamped artifact descriptors
-    /// (digest metadata only, never bytes — see [`BrowserArtifact`]). Carried
-    /// here for the same reason as `raw_ports`: the control-plane leader
-    /// validates browser admissions against deployments it may not host, and
-    /// this gossip view is what it sees. Empty for every deployment with no
-    /// browser opt-in and for peers running older binaries.
+    /// Browser-eligible functions with their build-stamped artifact descriptors (digest metadata only),
+    /// so the control-plane leader can validate admissions against deployments it may not host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_functions: Vec<BrowserFunctionRef>,
-    /// Functions the build EVALUATED for browser eligibility and declined, each
-    /// with the reason ([`BrowserIneligibility`]). Replicated alongside
-    /// `browser_functions` because the two are one answer: a deployment absent
-    /// from the run-node picker is either not ready, listed here with a cause,
-    /// or — carrying neither an artifact nor a reason — was built before
-    /// eligibility was evaluated and needs a redeploy. Empty for peers running
-    /// older binaries, which is the "never evaluated" state by construction.
+    /// Functions the build EVALUATED for browser eligibility and declined, with the reason; absent from
+    /// the picker means not ready, listed here with a cause, or never evaluated (redeploy).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_ineligible: Vec<BrowserIneligibility>,
-    /// The deployment's browser-database opt-in block, VERBATIM from the
-    /// manifest (raw policy — resolved at the point of use via
-    /// [`BrowserDbPolicy::resolve`], the `InferenceSpec` raw-spec-replicated
-    /// precedent). Carried for the same reason as `browser_functions`: the
-    /// admission-issuing leader and the fleet exchange peers resolve DB grants
-    /// and caps for deployments they may not host, and this gossip view is
-    /// what they see. `None` for every deployment with no `browser_db` opt-in
-    /// and for peers running older binaries.
+    /// The browser-database opt-in block VERBATIM from the manifest (resolved at the point of use via
+    /// [`BrowserDbPolicy::resolve`]) so the admission-issuing leader and fleet exchange peers resolve
+    /// grants and caps for deployments they may not host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_db: Option<BrowserDbPolicy>,
 }
@@ -4213,12 +3636,9 @@ pub struct DeploymentFeatures {
     pub serverless_functions: usize,
 }
 
-/// Structured platform failure taxonomy (Fluid hardening #18). Maps each way a
-/// request can fail to route/serve to a STABLE public code + correct HTTP status.
-/// The public body is the code ONLY — internal error detail (`{e}`, peer ids,
-/// tunnel internals) is logged/evented, never returned to the caller. Shared by the
-/// gateway (lease/serve) and the edge (mesh routing) so the taxonomy is one source
-/// of truth. Pure + dep-free (status as u16; callers convert to their HTTP type).
+/// Structured platform failure taxonomy: each way a request can fail to route/serve maps to a
+/// STABLE public code + HTTP status; the public body is the code ONLY, internal detail is logged.
+/// Shared by the gateway and the edge; pure, status as `u16`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClass {
     /// Tenant exceeded its fairness limit (rate / quota). 429.
@@ -4227,54 +3647,20 @@ pub enum FailureClass {
     CapacityExhausted,
     /// A deployment's circuit breaker is open (crash-looping). 503.
     DeploymentCircuitOpen,
-    /// THIS NODE is missing a cell artifact it must have to boot anything: the
-    /// per-image rootfs, the shared base rootfs, or the guest kernel. 503.
-    ///
-    /// A NODE PROVISIONING fault — neither an app fault nor a lack of capacity,
-    /// and the only remedy is an operator reprovisioning the node's images.
-    /// Deliberately distinct from [`FailureClass::CapacityExhausted`], which is
-    /// where it used to land: witnessed on fc-sanjose-cvm-2, a missing
-    /// `/var/lib/hive/rootfs/default.ext4` was reported as CAPACITY_EXHAUSTED on
-    /// a node with 923 GB free disk and 2046 free podman locks, which sent the
-    /// operator hunting a capacity problem that did not exist. Also distinct from
-    /// [`FailureClass::DeploymentCircuitOpen`]: the missing rootfs failed every
-    /// cold start, so the pool circuited too and the user-visible code alternated
-    /// between two labels that both named the wrong thing.
+    /// THIS NODE is missing a cell artifact it must have (per-image rootfs, base rootfs, guest kernel).
+    /// 503. A NODE PROVISIONING fault, deliberately distinct from `CapacityExhausted` and
+    /// `DeploymentCircuitOpen`, both of which named the wrong remedy.
     NodeImageMissing,
-    /// THIS NODE's isolation backend cannot run cells at all — no `/dev/kvm`, no
-    /// firecracker binary, wrong OS. 503.
-    ///
-    /// Split from [`FailureClass::NodeImageMissing`] because the remedy is
-    /// different: the artifacts are fine and the HYPERVISOR is not there. On this
-    /// fleet that is usually the documented PVM failure mode (`kvm_pvm` refuses
-    /// to load while host PTI is active, so `/dev/kvm` silently disappears), not
-    /// anything a copy of the rootfs would fix.
+    /// THIS NODE's isolation backend cannot run cells at all (no `/dev/kvm`, no firecracker binary,
+    /// wrong OS). 503. The artifacts are fine and the HYPERVISOR is not there — on this fleet usually
+    /// `kvm_pvm` refusing to load while host PTI is active.
     NodeBackendUnavailable,
-    /// THIS NODE's container lock pool is exhausted and nothing was reclaimable,
-    /// so NO container can start here until an operator resizes it. 503.
-    ///
-    /// podman takes one lock from a fixed per-HOST pool (`num_locks`, default
-    /// 2048) per container AND per volume, so a leak starves every tenant on the
-    /// node. Reported as CAPACITY_EXHAUSTED it reads as "you need more capacity"
-    /// when the truth is "this host's lock pool has to be renumbered" — the
-    /// self-heal already reclaims what it safely can, and this class is what is
-    /// left when it reclaimed nothing.
+    /// THIS NODE's podman lock pool (`num_locks`, one lock per container AND per volume) is exhausted
+    /// and nothing was reclaimable, so no container can start until an operator renumbers it. 503.
     NodeLockPoolExhausted,
-    /// THIS NODE does not have the interpreter/runtime this deployment declares
-    /// (e.g. a `runtime: "wasmer"` function on a node with no `wasmer` binary on
-    /// the filesystem its cells exec against). 503.
-    ///
-    /// Split from every class around it because each names a different remedy
-    /// and this one's is "provision the runtime on this node" — for Firecracker
-    /// specifically that means the GUEST rootfs image, since the cell agent
-    /// execs inside the microVM and a host-side install is invisible to it.
-    /// Without its own class this lands in [`FailureClass::DeploymentCircuitOpen`]
-    /// (the cold starts DO circuit the pool), which tells the tenant to go debug
-    /// an entrypoint that is perfectly fine — the same inversion
-    /// [`FailureClass::NodeImageMissing`] exists to prevent, one layer up.
-    ///
-    /// Placement's capability filter is meant to make this unreachable; see
-    /// `hive_core::fault::NODE_RUNTIME_MISSING` for when it still fires.
+    /// THIS NODE lacks the runtime the deployment declares (e.g. `wasmer` on the filesystem its cells
+    /// exec against — for Firecracker that is the GUEST rootfs). 503. Placement's capability filter
+    /// should make this unreachable; see `hive_core::fault::NODE_RUNTIME_MISSING`.
     NodeRuntimeMissing,
     /// No healthy peer in the mesh can serve this deployment. 503.
     NoHealthyPeer,
@@ -4282,15 +3668,9 @@ pub enum FailureClass {
     NoHealthyRegion,
     /// The runtime tunnel to the chosen instance failed. 502.
     RuntimeTunnelFailed,
-    /// The tunnel CONNECTED and the function never produced a response head,
-    /// on every instance we rerouted to. 504.
-    ///
-    /// Deliberately distinct from [`FailureClass::RuntimeTunnelFailed`]: both
-    /// used to report `RUNTIME_TUNNEL_FAILED`, and because that name blames the
-    /// transport, several debugging sessions were spent on vsock/tunnel plumbing
-    /// while the real fault was an app that accepted the connection and then hung.
-    /// Also distinct from `FUNCTION_INVOCATION_TIMEOUT`, which means one
-    /// invocation outran its own `max_duration` on an otherwise healthy instance.
+    /// The tunnel CONNECTED and the function never produced a response head on any instance. 504.
+    /// Distinct from `RuntimeTunnelFailed` (which blames the transport) and from
+    /// `FUNCTION_INVOCATION_TIMEOUT` (one invocation outran its `max_duration`).
     FunctionNoResponse,
     /// The chosen peer was unreachable over both iroh and HTTP. 502.
     PeerUnreachable,
