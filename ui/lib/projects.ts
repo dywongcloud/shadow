@@ -7,7 +7,7 @@
 // tenant owns; this hook merges the two, deployment first.
 
 import { useCallback, useMemo } from "react";
-import { usePoll, type Deployment } from "@/lib/api";
+import { apiGet, usePoll, type Deployment } from "@/lib/api";
 
 export type LastBuildState = "ready" | "error" | "cancelled";
 
@@ -87,6 +87,15 @@ export function projectState(p: ProjectEntry): "building" | "error" | "cancelled
   const last = p.summary?.last_build;
   if (!last) return "empty";
   return last.state === "ready" ? "ready" : last.state;
+}
+
+/** Every project name the tenant owns, for one-shot lookups such as the command bar. */
+export async function loadProjectNames(): Promise<string[]> {
+  const [deployments, rows] = await Promise.all([
+    apiGet<Deployment[]>("/deployments").catch(() => null),
+    apiGet<ProjectSummary[]>(SUMMARY_PATH).catch(() => null),
+  ]);
+  return mergeProjects(deployments, rows).map((p) => p.project);
 }
 
 export function useProjects(intervalMs = 15000) {

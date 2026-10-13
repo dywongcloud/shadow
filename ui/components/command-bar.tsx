@@ -7,7 +7,7 @@ import {
   ShieldHalf, Plug, Network, BarChart3, CreditCard, Settings, Users, User,
   BookOpen, Triangle, CornerDownLeft,
 } from "lucide-react";
-import { apiGet, type Deployment } from "@/lib/api";
+import { loadProjectNames } from "@/lib/projects";
 import { useIsPlatformOwner } from "@/lib/owner";
 
 /* The platform command bar (⌘K / Ctrl-K). Opens from the global shortcut or via
@@ -32,7 +32,7 @@ export function CommandBar() {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
-  const [deps, setDeps] = useState<Deployment[]>([]);
+  const [projectNames, setProjectNames] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
@@ -63,7 +63,7 @@ export function CommandBar() {
     setQ("");
     setIdx(0);
     setTimeout(() => inputRef.current?.focus(), 0);
-    apiGet<Deployment[]>("/deployments").then(setDeps).catch(() => {});
+    loadProjectNames().then(setProjectNames);
   }, [open]);
 
   const go = (href: string) => () => {
@@ -103,7 +103,7 @@ export function CommandBar() {
       icon,
       run: go(href),
     }));
-    const projects = Array.from(new Set(deps.map((d) => d.project))).map((p) => ({
+    const projects = projectNames.map((p) => ({
       id: "proj-" + p,
       label: p,
       group: "Projects",
@@ -113,7 +113,7 @@ export function CommandBar() {
       run: go(`/projects/${encodeURIComponent(p)}`),
     }));
     return [...actions, ...pages, ...projects];
-  }, [deps, isOwner]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [projectNames, isOwner]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
