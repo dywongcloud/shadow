@@ -1,13 +1,12 @@
-//! Enterprise feature suite (Vercel-parity): account-level IP blocking, custom
-//! SIEM audit-log streaming, SAML SSO, SCIM directory sync, deployment password
-//! protection + protection scope ("only production"), microfrontends, and
-//! Conformance. All team-scoped, all Enterprise-plan-gated at the API layer, and
-//! persisted (secrets AEAD-encrypted at rest via [`crate::secrets`]).
+//! Enterprise feature suite: account-level IP blocking, SIEM audit-log streaming, SAML SSO, SCIM
+//! directory sync, deployment password protection with a protection scope, microfrontend groups and
+//! conformance policies. All team-scoped, Enterprise-plan-gated at the API layer and persisted
+//! (secrets AEAD-encrypted at rest via [`crate::secrets`]).
 //!
-//! One `EnterpriseStore` holds every sub-feature so persistence is a single
-//! snapshot/load pair. Enforcement lives where it belongs: IP blocking + the
-//! password gate in `edge.rs`, SIEM streaming off `audit.rs::record`, SCIM/SAML
-//! provisioning into `teams.rs`, conformance computed from the build/service graph.
+//! One `EnterpriseStore` holds every sub-feature so persistence is a single snapshot/load pair.
+//! Enforcement lives elsewhere: IP blocking and the password gate in `edge.rs`, SIEM streaming off
+//! `audit.rs::record`, SCIM/SAML provisioning into `teams.rs`, conformance computed from the
+//! build/service graph.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,16 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use hive_core::now_ms;
 
-// ---------------------------------------------------------------------------
-// Account-level IP blocking (Vercel WAF / IP blocking)
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IpBlock {
     pub id: String,
-    /// IPv4/IPv6 address or CIDR-ish prefix (prefix match, e.g. "203.0.113." or
-    /// a full address). Matching is a normalized string prefix — good enough for
-    /// operator denylists without a full CIDR engine.
+    /// An address or a textual prefix such as `203.0.113.`. A block matches when the client address
+    /// string STARTS WITH it: there is no CIDR arithmetic, so end a prefix at an octet boundary
+    /// (`10.1` also matches `10.10.0.1`).
     pub prefix: String,
     #[serde(default)]
     pub note: String,
@@ -38,10 +33,6 @@ pub struct IpBlock {
 fn yes() -> bool {
     true
 }
-
-// ---------------------------------------------------------------------------
-// Custom SIEM log streaming (Audit Log → external SIEM)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SiemConfig {
@@ -66,10 +57,6 @@ fn http_fmt() -> String {
     "http".into()
 }
 
-// ---------------------------------------------------------------------------
-// SAML SSO
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SamlConfig {
     pub idp_entity_id: String,
@@ -90,14 +77,11 @@ pub struct SamlConfig {
     pub updated_ms: u64,
 }
 
-// ---------------------------------------------------------------------------
-// SCIM 2.0 directory sync
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ScimUser {
     pub id: String,
-    pub user_name: String, // usually the email
+    /// The IdP's user name, usually the email.
+    pub user_name: String,
     #[serde(default)]
     pub display_name: String,
     #[serde(default = "yes")]
@@ -119,10 +103,6 @@ pub struct ScimTenant {
     pub updated_ms: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Deployment protection (password + scope; "only production")
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployProtection {
     /// "off" | "standard" (SSO/membership) | "password"
@@ -132,7 +112,8 @@ pub struct DeployProtection {
     /// "all" | "production" (only production deployments — Vercel option).
     #[serde(default = "preview_scope")]
     pub scope: String,
-    /// bcrypt-ish hash of the shared password (mode="password"). Never returned.
+    /// Argon2id PHC hash of the shared password (`mode = "password"`), gossiped in `EdgeExport`.
+    /// Never returned to clients.
     #[serde(default)]
     pub password_hash: String,
     #[serde(default)]
@@ -165,26 +146,19 @@ impl DeployProtection {
         match self.scope.as_str() {
             "all" => true,
             "production" => is_prod,
-            _ => !is_prod, // "preview"
+            _ => !is_prod,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Microfrontends (path-composed multi-project apps)
-// ---------------------------------------------------------------------------
-// The rich model + path matcher + validation + config generation live in
-// `crate::microfrontends`; this store holds + gossips the groups. Re-exported so
-// existing `crate::enterprise::{MfeGroup, MfeChild}` import paths keep resolving.
+/// The model, path matcher, validation and config generation live in [`crate::microfrontends`];
+/// this store holds and gossips the groups. Re-exported so `crate::enterprise::{MfeGroup,
+/// MfeChild}` import paths keep resolving.
 pub use crate::microfrontends::{MfeChild, MfeGroup};
-
-// ---------------------------------------------------------------------------
-// Conformance (org-wide project checks)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConformancePolicy {
-    /// Rule id -> required (must pass) / advisory. Keyed by our built-in rule ids.
+    /// Ids of the built-in rules that are REQUIRED (must pass); every other rule is advisory.
     #[serde(default)]
     pub required: Vec<String>,
     #[serde(default = "yes")]
@@ -194,7 +168,6 @@ pub struct ConformancePolicy {
 }
 impl Default for ConformancePolicy {
     fn default() -> Self {
-        // Sensible enterprise defaults — all built-in rules required.
         ConformancePolicy {
             required: RULES.iter().map(|r| r.0.to_string()).collect(),
             enabled: true,
@@ -217,12 +190,14 @@ pub struct ConformanceReport {
     pub project: String,
     pub deployment_id: String,
     pub results: Vec<ConformanceResult>,
-    pub passed: bool, // all REQUIRED rules passed
-    pub score: u32,   // % of all rules passed
+    /// True when every REQUIRED rule passed.
+    pub passed: bool,
+    /// Percentage of ALL rules that passed.
+    pub score: u32,
     pub ran_ms: u64,
 }
 
-/// Built-in conformance rules: (id, title). The evaluator (in admin.rs) fills in
+/// Built-in conformance rules: (id, title). The evaluator (in `enterprise_api.rs`) fills in
 /// pass/fail from the deployment's service graph + settings.
 pub const RULES: &[(&str, &str)] = &[
     ("https-only", "Serves over HTTPS with HSTS"),
@@ -242,15 +217,10 @@ pub const RULES: &[(&str, &str)] = &[
     ),
 ];
 
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
-
-/// The edge-enforcement subset of enterprise config, gossiped mesh-wide so ANY
-/// node — region ingress or the deployment's hosting node — enforces IP blocks
-/// and deployment protection, regardless of which node the config was authored
-/// on. Contains NO secrets: block prefixes, protection modes/scopes, and the
-/// salted one-way password hash (needed for remote verification).
+/// The edge-enforcement subset of enterprise config, gossiped mesh-wide so ANY node (region ingress
+/// or the deployment's hosting node) enforces IP blocks, deployment protection and microfrontend
+/// routing wherever the config was authored. Carries NO secrets: block prefixes, protection
+/// modes/scopes and the salted one-way password hash that remote verification needs.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EdgeExport {
     #[serde(default)]
@@ -263,26 +233,27 @@ pub struct EdgeExport {
     pub mfe: HashMap<String, Vec<MfeGroup>>,
 }
 
+/// One lock per sub-feature. Maps are keyed by normalized team (`norm`), except `protection` (by
+/// project), `reports` (by deployment id) and `peer_edge` (by node name).
 #[derive(Default)]
 pub struct EnterpriseStore {
-    ip_blocks: RwLock<HashMap<String, Vec<IpBlock>>>, // team -> blocks
-    siem: RwLock<HashMap<String, SiemConfig>>,        // team -> siem
-    saml: RwLock<HashMap<String, SamlConfig>>,        // team -> saml
-    scim: RwLock<HashMap<String, ScimTenant>>,        // team -> scim
-    protection: RwLock<HashMap<String, DeployProtection>>, // project -> protection
-    mfe: RwLock<HashMap<String, Vec<MfeGroup>>>,      // team -> microfrontend groups
-    conformance: RwLock<HashMap<String, ConformancePolicy>>, // team -> policy
-    reports: RwLock<HashMap<String, ConformanceReport>>, // deployment_id -> report
+    ip_blocks: RwLock<HashMap<String, Vec<IpBlock>>>,
+    siem: RwLock<HashMap<String, SiemConfig>>,
+    saml: RwLock<HashMap<String, SamlConfig>>,
+    scim: RwLock<HashMap<String, ScimTenant>>,
+    protection: RwLock<HashMap<String, DeployProtection>>,
+    mfe: RwLock<HashMap<String, Vec<MfeGroup>>>,
+    conformance: RwLock<HashMap<String, ConformancePolicy>>,
+    reports: RwLock<HashMap<String, ConformanceReport>>,
     /// Gossip-replicated edge config from peers (node name -> their export).
     /// Refreshed every gossip round; NOT persisted (rebuilt from the mesh).
     peer_edge: RwLock<HashMap<String, EdgeExport>>,
 }
 
-/// Argon2id password hash → PHC string (`$argon2id$v=19$...`), embedding a random
-/// salt + params. Memory-hard: a leaked hash is not cheaply brute-forceable
-/// (unlike the previous `sha256(project ":" password)`). The PHC string is
-/// self-describing, so a hash minted once on the owning node stays verifiable on
-/// every peer it is gossiped to — no node-local key material required.
+/// Argon2id hash of the shared password as a PHC string (`$argon2id$v=19$...`) with its own random
+/// salt and parameters: memory-hard, and self-describing, so a hash minted on the owning node
+/// verifies on every peer it is gossiped to with no node-local key material. A hashing failure
+/// returns an empty string, which never matches a password.
 fn password_hash(_project: &str, password: &str) -> String {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use argon2::Argon2;
@@ -293,11 +264,10 @@ fn password_hash(_project: &str, password: &str) -> String {
     }
 }
 
-/// Verify a plaintext against a stored password representation, transparently
-/// handling all three on-disk formats: current Argon2id PHC strings, the legacy
-/// per-node AEAD envelope (`enc:v1:`), and the legacy portable
-/// `sha256(project ":" password)` hex. All comparisons are constant-time
-/// (Argon2 verify is inherently so; the others via `ct_eq`).
+/// Verifies a submitted password against a stored one in all three on-disk formats: Argon2id PHC
+/// strings (current), the legacy per-node AEAD envelope (`enc:v1:`) and the legacy portable
+/// `sha256(project ":" password)` hex. Comparisons are constant-time (Argon2 verify inherently, the
+/// others via `ct_eq`); an empty stored value never matches.
 fn password_matches(project: &str, stored: &str, submitted: &str) -> bool {
     if stored.is_empty() {
         return false;
@@ -337,7 +307,6 @@ impl EnterpriseStore {
         Self::default()
     }
 
-    // ---- IP blocking ----
     pub fn ip_blocks(&self, team: &str) -> Vec<IpBlock> {
         self.ip_blocks
             .read()
@@ -365,9 +334,9 @@ impl EnterpriseStore {
             v.retain(|b| b.id != id);
         }
     }
-    /// Is `ip` allowed for `team`? Consults BOTH locally-authored blocks and the
-    /// gossip-replicated blocks from peers (config is authored on the dashboard
-    /// coordinator, but enforcement happens on whatever node the request enters).
+    /// Whether `ip` is allowed for `team`: consults BOTH the locally-authored blocks and the
+    /// gossip-replicated ones from peers, since the config is authored on the dashboard coordinator
+    /// but enforced on whatever node the request enters.
     pub fn ip_allowed(&self, team: &str, ip: &str) -> bool {
         let t = norm(team);
         let hit = |v: &Vec<IpBlock>| {
@@ -397,7 +366,6 @@ impl EnterpriseStore {
                 .any(hit)
     }
 
-    // ---- mesh replication of the edge-enforcement subset ----
     /// This node's LOCALLY-AUTHORED edge config (never the replicated overlay —
     /// re-exporting peer data would echo stale copies around the mesh forever).
     pub fn edge_export(&self) -> EdgeExport {
@@ -413,7 +381,6 @@ impl EnterpriseStore {
         self.peer_edge.write().insert(node.to_string(), export);
     }
 
-    // ---- SIEM ----
     pub fn siem(&self, team: &str) -> Option<SiemConfig> {
         self.siem.read().get(&norm(team)).cloned()
     }
@@ -446,7 +413,6 @@ impl EnterpriseStore {
         Some((c, tok))
     }
 
-    // ---- SAML ----
     pub fn saml(&self, team: &str) -> SamlConfig {
         self.saml
             .read()
@@ -461,7 +427,6 @@ impl EnterpriseStore {
         c
     }
 
-    // ---- SCIM ----
     pub fn scim(&self, team: &str) -> ScimTenant {
         self.scim
             .read()
@@ -531,13 +496,10 @@ impl EnterpriseStore {
         }
         false
     }
-    /// Fully ERASE a SCIM user record (email/`user_name` + `display_name`),
-    /// rather than the soft `active=false` flip `scim_deactivate_user` does.
-    /// An IdP issuing SCIM `DELETE /Users/:id` is signaling real deprovisioning
-    /// — often itself driven by an employee offboarding or a data-subject
-    /// erasure request — and expects the receiving system to actually forget
-    /// the user, not keep their PII in the directory indefinitely (surfaced
-    /// via every future `GET /Users/:id` and platform snapshot/backup).
+    /// Fully ERASES a SCIM user (email/`user_name` and `display_name`), unlike the soft
+    /// `active=false` flip of `scim_deactivate_user`: SCIM `DELETE /Users/:id` signals real
+    /// deprovisioning, often an offboarding or a data-subject erasure request, so the PII must not
+    /// linger in `GET /Users/:id` or in snapshots and backups.
     pub fn scim_purge_user(&self, team: &str, id: &str) -> bool {
         if let Some(t) = self.scim.write().get_mut(&norm(team)) {
             let before = t.users.len();
@@ -556,10 +518,9 @@ impl EnterpriseStore {
             .cloned()
     }
 
-    // ---- Deployment protection ----
-    /// Effective protection for a project: locally-authored config wins; else the
-    /// freshest gossip-replicated copy from a peer (the dashboard coordinator
-    /// authors the config, but the HOSTING node enforces the gate).
+    /// Effective protection for a project: the locally-authored config wins, else the freshest
+    /// gossip-replicated peer copy (the dashboard coordinator authors the config, the HOSTING node
+    /// enforces the gate).
     pub fn protection(&self, project: &str) -> DeployProtection {
         if let Some(p) = self.protection.read().get(project) {
             return p.clone();
@@ -584,9 +545,6 @@ impl EnterpriseStore {
         p.mode = mode.to_string();
         p.scope = scope.to_string();
         if let Some(pw) = password_plain.filter(|p| !p.is_empty()) {
-            // Deterministic salted hash — PORTABLE across nodes (unlike a per-node
-            // AEAD envelope), so a peer hosting the deployment can verify the gate
-            // from the gossiped edge-export. Never reversible; never the plaintext.
             p.password_hash = password_hash(project, pw);
         }
         if mode == "off" {
@@ -601,11 +559,10 @@ impl EnterpriseStore {
         let stored = self.protection(project).password_hash;
         password_matches(project, &stored, submitted)
     }
-    /// Seal a validated password into an opaque cookie value. Returns the STORED
-    /// hash itself (an Argon2id PHC string — never the plaintext, never a fresh
-    /// re-hash which would differ under the random salt), so the cookie is
-    /// comparable by constant-time equality on every node that has the replica
-    /// and auto-invalidates when the password (hence the stored hash) changes.
+    /// Seals a validated password into an opaque cookie value: the STORED hash itself, never the
+    /// plaintext and never a fresh re-hash (which would differ under the random salt). Every node
+    /// holding the replica compares it in constant time, and it auto-invalidates when the password,
+    /// hence the stored hash, changes.
     pub fn seal_password_cookie(&self, project: &str, _submitted: &str) -> String {
         self.protection(project).password_hash
     }
@@ -616,11 +573,9 @@ impl EnterpriseStore {
         !stored.is_empty() && !cookie_val.is_empty() && crate::admin::ct_eq(cookie_val, &stored)
     }
 
-    // ---- Microfrontends ----
-    /// A team's groups, LOCAL + gossiped-from-peers, deduped by id (local wins),
-    /// each normalized (legacy children migrated, roles stamped). This is the read
-    /// used by the API and the edge so MFE routing works on every ingress node,
-    /// not only the authoring one.
+    /// A team's microfrontend groups, local plus gossiped from peers, deduped by id (local wins)
+    /// and normalized (legacy children migrated, roles stamped). The one read the API and the edge
+    /// share, so MFE routing works on every ingress node, not only the authoring one.
     pub fn mfe_groups(&self, team: &str) -> Vec<MfeGroup> {
         let team = norm(team);
         let mut out: Vec<MfeGroup> = self.mfe.read().get(&team).cloned().unwrap_or_default();
@@ -663,9 +618,8 @@ impl EnterpriseStore {
         };
         has(&self.mfe.read()) || self.peer_edge.read().values().any(|e| has(&e.mfe))
     }
-    /// The enabled group whose default (host) project is `host_project`, if any —
-    /// merged across local + peers. The edge then resolves the child + fallback via
-    /// [`crate::microfrontends`].
+    /// The enabled group whose default (host) project is `host_project`, merged across local and
+    /// peer copies; the edge resolves the child and fallback through [`crate::microfrontends`].
     pub fn mfe_group_for_host(&self, team: &str, host_project: &str) -> Option<MfeGroup> {
         self.mfe_groups(team)
             .into_iter()
@@ -698,7 +652,6 @@ impl EnterpriseStore {
         }
     }
 
-    // ---- Conformance ----
     pub fn conformance_policy(&self, team: &str) -> ConformancePolicy {
         self.conformance
             .read()
@@ -719,7 +672,6 @@ impl EnterpriseStore {
         self.reports.read().get(deployment_id).cloned()
     }
 
-    // ---- persistence ----
     pub fn snapshot(&self) -> EnterpriseSnapshot {
         EnterpriseSnapshot {
             ip_blocks: self.ip_blocks.read().clone(),
@@ -770,21 +722,18 @@ pub struct EnterpriseSnapshot {
     pub reports: Vec<ConformanceReport>,
 }
 
-// ---------------------------------------------------------------------------
-// SIEM streamer — a global async sink fed by audit.rs::record.
-// ---------------------------------------------------------------------------
-
 static SIEM_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<crate::audit::AuditEntry>> =
     std::sync::OnceLock::new();
 
-/// Start the background SIEM streamer. Every audit entry emitted via
-/// [`siem_emit`] is looked up against its tenant's [`SiemConfig`] and, if
-/// enabled, POSTed to the configured endpoint (best-effort, never blocks the
-/// audit write path). Called once at boot with the shared state + http client.
+/// Starts the background SIEM streamer: every audit entry passed to [`siem_emit`] is matched to its
+/// tenant's [`SiemConfig`] and, if enabled, POSTed to the endpoint (best-effort, never blocking the
+/// audit write path) in a vendor-shaped payload (`http`, `datadog`, `splunk-hec`) so a real
+/// endpoint accepts it. Called once at boot with the shared state and HTTP client; later calls are
+/// no-ops.
 pub fn spawn_siem_streamer(store: Arc<EnterpriseStore>, http: reqwest::Client) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audit::AuditEntry>();
     if SIEM_TX.set(tx).is_err() {
-        return; // already started
+        return;
     }
     tokio::spawn(async move {
         while let Some(entry) = rx.recv().await {
@@ -792,7 +741,6 @@ pub fn spawn_siem_streamer(store: Arc<EnterpriseStore>, http: reqwest::Client) {
                 continue;
             };
             let ok = deliver_siem(&http, &cfg, &token, &entry).await;
-            // Update counters (best-effort; not persisted).
             if let Some(c) = store.siem.write().get_mut(&norm(&entry.tenant)) {
                 if ok {
                     c.delivered += 1;
@@ -817,7 +765,6 @@ async fn deliver_siem(
     token: &str,
     e: &crate::audit::AuditEntry,
 ) -> bool {
-    // Vendor-shaped payloads so a real Datadog/Splunk endpoint accepts them.
     let body = match cfg.format.as_str() {
         "datadog" => serde_json::json!({
             "ddsource": "shadw", "service": "platform", "ddtags": format!("team:{}", e.tenant),

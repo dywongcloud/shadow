@@ -1,39 +1,23 @@
-//! Memory observability + an episodic-burst catcher.
+//! Memory observability and an episodic-burst catcher. OOM kills here are BURSTS (a process
+//! consuming everything the host has within minutes), so profiling the idle state never describes
+//! them. Two things are provided:
 //!
-//! Why this exists, stated as the gap it closes. The fleet's OOM kills are
-//! BURSTS, not steady growth: fc-hongkong idled around 1 GB RSS and was killed
-//! three times at 98,214,816 / 98,215,476 / 98,189,292 kB anon-rss — within
-//! 0.03% of each other, i.e. a process consuming everything the host has, in
-//! minutes, roughly hourly. Two hours of manual `jeprof` sampling never caught
-//! one, so the profile that was collected only ever described the idle state.
-//! Two things were missing and are provided here:
+//! 1. **The numbers that distinguish a leak from fragmentation.** [`snapshot`] reads jemalloc's own
+//! `stats.allocated/active/resident/retained/mapped` live through `GET /v1/debug/memory`
+//! (`stats_print` writes only at exit, which a node being killed never reaches). A sampled live
+//! heap far below RSS says most resident memory is not live objects.
 //!
-//! 1. **The numbers that distinguish a leak from fragmentation.** Live sampled
-//!    heap was ~80 MB against ~1.09 GB RSS (~7%) — which says most resident
-//!    memory was NOT live malloc'd objects. Confirming that needs jemalloc's
-//!    own `stats.allocated/active/resident/retained/mapped`, and nothing on the
-//!    node could read them (`stats_print:true` writes at exit, and the process
-//!    never exits gracefully enough to run the atexit hook).
-//!    [`snapshot`] reads them live, via `GET /v1/debug/memory`.
+//! 2. **A profile taken DURING the burst.** Sampling is off at boot on purpose, so the watchdog
+//! ([`spawn`]) arms it when RSS crosses a low threshold and dumps when it crosses a high one: the
+//! next burst leaves a profile on disk instead of only a kernel kill line.
 //!
-//! 2. **A profile taken DURING the burst.** A heap profile is only useful if
-//!    sampling was already on when memory ran away, and sampling is off at boot
-//!    on purpose. The watchdog ARMS sampling when RSS crosses a low threshold
-//!    and DUMPS when it crosses a high one, so the next burst leaves a profile
-//!    on disk instead of only a kernel kill line.
+//! Arming is OPT-IN (`HIVE_MEM_PROF=1`), never automatic: jemalloc captures a backtrace per sampled
+//! allocation with `prof_backtrace_impl`, a frame-pointer stack walk, and a release build without
+//! frame pointers hands it a garbage saved-rbp chain and it faults (SIGSEGV seconds after arming),
+//! so arming killed the node it existed to diagnose.
 //!
-//!    Arming is OPT-IN (`HIVE_MEM_PROF=1`), never automatic. jemalloc captures
-//!    a backtrace per sampled allocation with `prof_backtrace_impl`, a
-//!    frame-pointer stack walk; a release build without frame pointers hands it
-//!    a garbage saved-rbp chain and it faults. Measured on fc-sanjose
-//!    2026-10-10: eight SIGSEGV cores, each 2–3 s after this watchdog armed
-//!    `prof.active`, on the only one of five nodes running the identical binary
-//!    whose RSS crossed `HIVE_MEM_ARM_MB` — arming was killing the node it
-//!    existed to diagnose.
-//!
-//! Both halves are bounded and honest: dumps are rate-limited, capped in count,
-//! and written under `$HIVE_DATA` (never `/tmp`, which a reboot wipes — the
-//! `git::deploy_root` lesson); arming is logged at WARN naming the threshold
+//! Both halves are bounded and honest: dumps are rate-limited, capped in count and written under
+//! `$HIVE_DATA` (never `/tmp`, which a reboot wipes); arming is logged at WARN naming the threshold
 //! that fired, so a profile appearing on disk is never a mystery.
 
 use serde_json::{json, Value};
@@ -59,12 +43,10 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Read one `Key:  <n> kB` field out of `/proc/self/status`, in bytes.
-/// `VmRSS` rather than `/proc/self/statm` deliberately: statm reports PAGES, and
-/// converting needs the page size, which is 4 KiB on the fleet's x86_64 hosts
-/// but 16/64 KiB on aarch64 — a silent 16x error in exactly the number the
-/// watchdog's thresholds are compared against. The kernel already did the
-/// conversion here.
+/// Reads one `Key: <n> kB` field of `/proc/self/status`, in bytes. `VmRSS` rather than
+/// `/proc/self/statm`: statm counts PAGES and the page size differs by architecture (4 KiB on the
+/// x86_64 fleet, 16/64 KiB on aarch64), a silent 16x error in exactly the number the watchdog
+/// thresholds compare against. The kernel already did the conversion here.
 fn proc_status_kb(key: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -76,16 +58,14 @@ fn proc_status_kb(key: &str) -> Option<u64> {
     None
 }
 
-/// This process's resident set, in bytes. `None` off Linux or if `/proc` is
-/// unreadable — never a guess, because a fabricated RSS would arm the watchdog
-/// wrongly (or, worse, never arm it).
+/// This process's resident set in bytes. `None` off Linux or when `/proc` is unreadable, never a
+/// guess: a fabricated RSS would arm the watchdog wrongly or never arm it.
 pub fn rss_bytes() -> Option<u64> {
     proc_status_kb("VmRSS:")
 }
 
-/// Live threads in this process (`/proc/self/status: Threads`). The report's
-/// fragmentation hypothesis hangs on this number — jemalloc's per-arena dirty
-/// pages scale with thread count, and this process was running ~195 threads.
+/// Live threads in this process (`/proc/self/status: Threads`). jemalloc's per-arena dirty pages
+/// scale with thread count, so it is the second input to the fragmentation reading.
 fn thread_count() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -96,10 +76,11 @@ fn thread_count() -> Option<u64> {
     None
 }
 
-/// jemalloc's own accounting. `epoch` MUST be advanced first: every `stats.*`
-/// mallctl reads a cached snapshot that only refreshes on an epoch write, so
-/// reading without it returns the same numbers forever — which looks exactly
-/// like "memory is stable" and is the most misleading possible failure.
+/// jemalloc's own accounting. `epoch` MUST be advanced first: every `stats.*` mallctl reads a
+/// snapshot that refreshes only on an epoch write, so skipping it returns the same numbers forever,
+/// indistinguishable from stable memory. `allocated` is live bytes (the leak number); `resident -
+/// allocated` is the fragmentation/dirty-page gap; `retained` is virtual memory returned to the OS
+/// but not unmapped, so NOT resident.
 #[cfg(target_os = "linux")]
 fn jemalloc_stats() -> Value {
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<u64>(b"epoch\0", 1) };
@@ -110,15 +91,9 @@ fn jemalloc_stats() -> Value {
     };
     let prof_active = unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"prof.active\0") }.ok();
     json!({
-        // Bytes in live allocations. The "is it a leak?" number.
         "allocated": read(b"stats.allocated\0"),
-        // Bytes in pages jemalloc is using for allocations (incl. per-run slop).
         "active": read(b"stats.active\0"),
-        // Physically resident bytes jemalloc believes it holds. `resident`
-        // minus `allocated` is the fragmentation/dirty-page gap that the
-        // 80 MB-live-vs-1.09 GB-RSS reading pointed at.
         "resident": read(b"stats.resident\0"),
-        // Virtual, returned to the OS but not unmapped — NOT resident.
         "retained": read(b"stats.retained\0"),
         "mapped": read(b"stats.mapped\0"),
         "metadata": read(b"stats.metadata\0"),
@@ -147,15 +122,11 @@ pub fn snapshot(hive: Option<&hive_controlplane::Hive>) -> Value {
         "rss_bytes": rss_bytes(),
         "threads": thread_count(),
         "jemalloc": jemalloc_stats(),
-        // Bounds this node enforces, as live gauges — a bound nobody can read
-        // is indistinguishable from no bound at all.
         "bounds": {
-            // hive_core::logcap — subprocess output capture.
             "log_lines_captured": log_lines,
             "log_lines_truncated": log_truncated,
             "log_bytes_dropped": log_dropped_bytes,
             "log_line_cap_bytes": hive_core::MAX_LOG_LINE_BYTES,
-            // hive_controlplane — retained job records / replay buffers.
             "job_records_retained": job_records,
             "job_log_buses_retained": job_log_buses,
             "job_log_bytes_retained": job_log_bytes,
@@ -171,9 +142,8 @@ fn dump_dir() -> std::path::PathBuf {
     crate::persist::data_dir().join("heapdumps")
 }
 
-/// Keep only the newest `keep` dumps. Bounded like every other reclaim path
-/// here: it only ever deletes files it created (`heap-*.prof` in its own
-/// directory), never an empty-keep-set wipe of somebody else's data.
+/// Keeps only the newest `keep` dumps and deletes only what this module wrote (`heap-*` files in
+/// its own directory), never anything else.
 fn prune_dumps(keep: usize) {
     let dir = dump_dir();
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = match std::fs::read_dir(&dir)
@@ -191,46 +161,31 @@ fn prune_dumps(keep: usize) {
     if files.len() <= keep {
         return;
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    files.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, path) in files.into_iter().skip(keep) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Watchdog loop. Runs on EVERY node (like the container lock sweep — the
-/// resource is per-host), not leader-only.
+/// Watchdog loop. Runs on EVERY node (the resource is per-host), not leader-only, and ends on its
+/// first tick where `/proc` is unavailable (not Linux).
 ///
-/// Thresholds, all env-tunable, all in MiB:
-/// * `HIVE_MEM_ARM_MB`   (default 3072) — start reporting, and (only with
-///   `HIVE_MEM_PROF=1`) turn jemalloc sampling on. Chosen well above the
-///   ~1–1.8 GB idle band so a normal node never pays for it, and well below
-///   the ~93 GiB kill point so there is time to sample.
-/// * `HIVE_MEM_PROF=1`   — the opt-in that actually arms `prof.active`. Off by
-///   default: see the module doc (a frame-pointer backtrace walk faults on a
-///   release build without frame pointers). Each tier below fires whether or
-///   not profiling is armed; without it a dump still lands, just without
-///   per-site attribution.
-/// * `HIVE_MEM_DUMP_MB`  (default 8192) — write a profile.
-/// * `HIVE_MEM_RESTART_MB` (default 16384) — self-restart. A confirmed real
-///   leak (not fragmentation — see the module doc's "80 MB live vs 1.09 GB
-///   RSS" contrast, which does NOT hold here: a live profile taken during a
-///   real burst sampled ~9.9 GiB of live-allocated bytes against ~11.3 GiB
-///   RSS, i.e. genuinely leaked memory, not idle pages) left unattended
-///   crosses into real OOM territory and drags the node's mesh connectivity
-///   down with it — measured live: a node at this RSS band stops answering
-///   gossip promptly enough to be reachable, and peers correctly mark it
-///   isolated. `Restart=always` in the systemd unit means a clean exit here
-///   is a full recovery, not a crash — this mirrors the exact manual
-///   `systemctl restart hive-node` recovery already proven live, just
-///   automatic instead of requiring an operator to notice. Set above
-///   `HIVE_MEM_DUMP_MB` so a profile is always captured before the exit that
-///   would otherwise erase the evidence.
-/// * `HIVE_MEM_WATCH_SECS` (default 15) — tick interval. Must be short relative
-///   to the burst (minutes), or the watchdog samples only the corpse.
-/// * `HIVE_MEM_DUMP_COOLDOWN_SECS` (default 120), `HIVE_MEM_DUMP_KEEP` (8).
+/// Three tiers, each tested against its OWN threshold (MiB, env-tunable), so raising one never
+/// disables another:
+/// * `HIVE_MEM_ARM_MB` (3072): log the full [`snapshot`] every tick, the record that survives a
+///   kill (the kernel's OOM line carries one number and no attribution), and, only with
+///   `HIVE_MEM_PROF=1`, turn jemalloc sampling on. Above the idle band so a normal node never
+///   pays for it, far below the kill point so there is time to sample.
+/// * `HIVE_MEM_DUMP_MB` (8192): write a heap profile, at most once per
+///   `HIVE_MEM_DUMP_COOLDOWN_SECS` (120), keeping the newest `HIVE_MEM_DUMP_KEEP` (8). Without
+///   `HIVE_MEM_PROF=1` the dump carries no per-site attribution.
+/// * `HIVE_MEM_RESTART_MB` (16384): dump a final profile, then request a controlled restart
+///   (`Restart=always` makes the clean exit a full recovery). Above the dump threshold so the
+///   evidence exists before the exit that would erase it; a node at this band stops answering
+///   gossip promptly and peers mark it isolated. `0` disables only this tier.
 ///
-/// `HIVE_MEM_WATCH=0` disables it entirely. `HIVE_MEM_RESTART_MB=0` disables
-/// only the restart tier — arm/dump still run.
+/// `HIVE_MEM_WATCH_SECS` (15) is the tick, short relative to a burst (minutes) or the watchdog
+/// samples only the corpse. `HIVE_MEM_WATCH=0` disables the watchdog entirely.
 pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::ControlledRestart) {
     if std::env::var("HIVE_MEM_WATCH").ok().as_deref() == Some("0") {
         tracing::info!("memory watchdog disabled (HIVE_MEM_WATCH=0)");
@@ -252,22 +207,10 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::Cont
         loop {
             tokio::time::sleep(interval).await;
             let Some(rss) = rss_bytes() else {
-                // No /proc — not Linux. Nothing to watch; stop the loop rather
-                // than spin forever reading a file that will never exist.
                 return;
             };
 
-            // Tier 1: report (and, only when opted in, arm profiling).
-            //
-            // NOT a `continue` gate for the tiers below. When the arm threshold
-            // also gated dump and restart, `HIVE_MEM_ARM_MB` was really
-            // "watchdog on/off": raising it to stop arming silently disabled
-            // leak protection too, which is how a node ends up with no dump and
-            // no restart on a genuine runaway. Each tier tests its own number.
             if rss >= arm_bytes {
-                // Above the arm threshold: emit the full reading every tick.
-                // This is the record that survives the kill — the kernel's OOM
-                // line reports one number and no attribution.
                 let snap = snapshot(Some(&hive));
                 tracing::warn!(
                     rss_mb = rss / 1024 / 1024,
@@ -289,8 +232,6 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>, restart: crate::Cont
                 }
             }
 
-            // Tier 2: write a profile. Tested on its own threshold, so it still
-            // fires on a node whose arm threshold was raised.
             if rss >= dump_bytes {
                 let now = hive_core::now_ms();
                 let last = LAST_DUMP_MS.load(Ordering::Relaxed);
@@ -333,8 +274,6 @@ fn arm_profiling() {
             "memory watchdog ARMED heap profiling (prof.active=true) — the next dump will \
              attribute the growth to allocation sites"
         ),
-        // Not fatal: a binary built without profiling still gets the gauges
-        // above, which is strictly more than the fleet had before.
         Err(e) => tracing::warn!(error = %e, "memory watchdog could not enable prof.active"),
     }
 }

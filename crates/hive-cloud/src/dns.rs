@@ -37,10 +37,11 @@ fn default_ttl() -> u32 {
 pub struct SslCert {
     pub id: String,
     pub cns: Vec<String>,
-    pub renewal: String, // "auto"
+    /// `"auto"` once a real bundle is installed, `"pending"` before.
+    pub renewal: String,
     pub issued_ms: u64,
     pub expires_ms: u64,
-    pub provider: String, // "OpenEdge (Let's Encrypt)"
+    pub provider: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,23 +57,20 @@ pub struct DomainRecord {
     pub nameservers: Vec<String>,
     pub ssl: SslCert,
     pub records: Vec<DnsRecord>,
-    /// Ownership-verification state for custom-domain attachment. `None` for
-    /// records that only manage DNS (never attached to a project) and for
-    /// attachments that predate verification (grandfathered — they keep
-    /// routing; only NEW attaches are gated).
+    /// Custom-domain ownership proof. `None` for DNS-only records and for attachments that predate
+    /// verification (grandfathered: they keep routing, only NEW attaches are gated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<DomainVerify>,
 }
 
-/// TXT-challenge ownership proof for a custom domain attach. The alias only
-/// activates once the applying node observes `txt_value` in a
-/// `_hive-verify.<domain>` TXT answer (DoH, independently at activation
-/// time — never trusted from a caller). Status vocabulary mirrors the
-/// industry shape: pending -> verified (failed is reserved for probe errors,
-/// never for "not yet propagated").
+/// TXT-challenge ownership proof for a custom-domain attach. The alias activates only once the
+/// applying node itself observes `txt_value` in a `_hive-verify.<domain>` TXT answer (DoH,
+/// re-checked at activation, never trusted from a caller).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DomainVerify {
-    pub status: String, // "pending" | "verified"
+    /// `"pending"` until the TXT is observed, then `"verified"`; `"failed"` is reserved for probe
+    /// errors, never for "not yet propagated".
+    pub status: String,
     pub txt_name: String,
     pub txt_value: String,
     /// The project this verification gates (the attach target).
@@ -90,6 +88,11 @@ pub struct DomainStore {
     map: RwLock<HashMap<String, DomainRecord>>,
 }
 
+/// The honest SSL block of a record with no installed bundle. A record never claims a certificate
+/// at creation: the dashboard would show "Managed SSL active" for a domain with no bundle on any
+/// edge, and the HTTP-01-only custom path can issue only apex+`www` SANs.
+/// [`DomainStore::set_ssl_issued`] fills it from the REAL bundle when `custom_cert_pass` installs
+/// one.
 fn pending_ssl() -> SslCert {
     SslCert {
         id: String::new(),
@@ -101,6 +104,10 @@ fn pending_ssl() -> SslCert {
     }
 }
 
+/// A fresh record: platform defaults, a pending SSL block and only the issuer CAA that a managed
+/// certificate needs. The apex A/AAAA set is deliberately NOT seeded (a fake address would resolve
+/// the domain somewhere that does not serve it); [`DomainStore::set_system_address_records`] pins
+/// the real edge addresses when an attachment verifies.
 fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
     let now = now_ms();
     DomainRecord {
@@ -114,19 +121,7 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
         expires_ms: now + YEAR_MS,
         nameservers: vec!["ns1.openedge-dns.com".into(), "ns2.openedge-dns.com".into()],
         verify: None,
-        // HONEST default: no cert exists yet, so the block says so. It used
-        // to fabricate a cert_<uuid> id with a wildcard `*.{domain}` CN and
-        // issued_ms=now at record CREATION — a cert the HTTP-01-only custom
-        // path cannot even issue (apex+www SANs only, AGENTS.md) — so the
-        // dashboard showed "Managed SSL active" for domains with no bundle
-        // on any edge (witnessed: numo.gg). `set_ssl_issued` fills this from
-        // the REAL bundle when `custom_cert_pass` installs one.
         ssl: pending_ssl(),
-        // A free managed cert needs CAA records authorizing the issuer. The
-        // apex A/AAAA set is deliberately NOT seeded here: a fake "anycast"
-        // address would resolve the domain somewhere that does not serve it.
-        // Real edge addresses are pinned by `set_system_address_records` when
-        // an attachment verifies (the same set the roster endpoint shows).
         records: vec![DnsRecord {
             id: rec_id(),
             name: String::new(),
@@ -208,9 +203,8 @@ impl DomainStore {
         Some(r.clone())
     }
 
-    /// Bulk-import records (DNS migration). Skips exact duplicates (same
-    /// type + name + value) so re-importing is idempotent. Returns the records
-    /// actually added.
+    /// Bulk-imports records (DNS migration), skipping exact duplicates (type + name + value) so a
+    /// re-import is idempotent. Returns the records actually added.
     pub fn import_records(&self, domain: &str, recs: Vec<DnsRecord>) -> Vec<DnsRecord> {
         let mut m = self.map.write();
         let Some(d) = m.get_mut(domain) else {
@@ -256,13 +250,12 @@ impl DomainStore {
         true
     }
 
-    /// Record the REAL installed bundle on the domain's ssl block — the only
-    /// writer allowed to claim an issued cert. Called from acme's
-    /// custom-domain issuance/adoption with the bundle's actual SANs and
-    /// notAfter; everything else (creation default, the renew button) leaves
-    /// the block pending. Fabricating this state was a false-health claim
-    /// the dashboard rendered as "Managed SSL active" (witnessed: numo.gg
-    /// showed a wildcard CN no HTTP-01 order can produce).
+    /// Records the REAL installed bundle on the domain's ssl block: the only writer allowed to
+    /// claim an issued cert (the creation default and [`Self::renew_ssl`] leave it pending). Called
+    /// from acme's custom-domain issuance/adoption with the bundle's actual SANs and expiry.
+    /// Returns `true` only when the block changed: an unattached domain, a non-`dom-*` bundle, an
+    /// implausible validity window, SANs outside apex+`www` and an unchanged block all return
+    /// `false`.
     pub fn set_ssl_issued(
         &self,
         domain: &str,
@@ -306,11 +299,9 @@ impl DomainStore {
         true
     }
 
-    /// The UI's "reissue certificate" button. This must never fabricate an
-    /// issued state (its previous behavior: fresh cert_<uuid> id +
-    /// issued_ms=now with no bundle anywhere); the real issuance is
-    /// `acme::custom_cert_pass`, which the HTTP arm kicks after calling
-    /// this. Returns the CURRENT block, honestly.
+    /// Backs the UI's "reissue certificate" button and never fabricates an issued state: the real
+    /// issuance is `acme::custom_cert_pass`, which the HTTP arm kicks after this call. Returns the
+    /// CURRENT block.
     pub fn renew_ssl(&self, domain: &str) -> Option<SslCert> {
         self.get(domain).map(|d| d.ssl)
     }
@@ -318,13 +309,12 @@ impl DomainStore {
     pub fn snapshot(&self) -> Vec<DomainRecord> {
         self.map.read().values().cloned().collect()
     }
+    /// Adopts a snapshot. Any ssl block that is not a real HTTP-01 custom bundle of an attached
+    /// domain (`dom-*` id, `auto` renewal, a valid window, apex plus optional `www` SANs) is reset
+    /// to pending: records created before the honest default carried fabricated `cert_*` ids and
+    /// wildcard CNs. A valid block survives restarts because it records a bundle actually installed
+    /// by `custom_cert_pass`, not this node's current SNI cache.
     pub fn load(&self, mut list: Vec<DomainRecord>) {
-        // Pre-fix records fabricated `cert_*` ids, wildcard CNs and issue
-        // timestamps at domain creation. They cannot describe this platform's
-        // HTTP-01 custom bundles (`dom-*`, apex plus optional www), so migrate
-        // those claims to the honest pending shape on adoption. A valid block
-        // remains durable after restart: it records a bundle that was actually
-        // installed by `custom_cert_pass`, not this node's current SNI cache.
         for d in &mut list {
             let domain = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
             let www = format!("www.{domain}");
@@ -346,20 +336,16 @@ impl DomainStore {
         *self.map.write() = list.into_iter().map(|d| (d.domain.clone(), d)).collect();
     }
 
-    /// Create (or refresh, when the attach target changed) the verification
-    /// challenge for a domain attach. Keeps an existing challenge for the
-    /// SAME project (rotating it would strand the TXT the user just pasted);
-    /// a different project re-issues (the proof is per-attach).
+    /// Creates (or refreshes, when the attach target changed) the verification challenge for a
+    /// domain attach: an existing challenge for the SAME project is kept (rotating it would strand
+    /// the TXT the user just pasted), a different project re-issues (the proof is per-attach).
     ///
-    /// **Only a VERIFIED record locks to its tenant.** An unproven record —
-    /// never verified (DNS-only zone) or a pending claim — confers no
-    /// ownership: any tenant's attach takes it over with a fresh challenge
-    /// and the tenant binding moves with it. DNS control is the only proof,
-    /// so a bare claim can never lock the real owner out of their own domain
-    /// (adversarial finding: a first-come squatter's pending claim 403'd the
-    /// real owner forever, and for a delegated zone the victim's own NS
-    /// delegation completed the squatter's "proof" via the platform-served
-    /// challenge). A verified record is the one settled state: it 409s.
+    /// **Only a VERIFIED record locks to its tenant.** An unproven record (never verified, or a
+    /// pending claim) confers no ownership: any tenant's attach takes it over with a fresh
+    /// challenge and the tenant binding moves with it, so the attaching team can manage the zone
+    /// while it proves. DNS control is the only proof, and a bare claim must never lock the real
+    /// owner out of their own domain. A record verified for another project is the one settled
+    /// state and is refused (`Err`).
     pub fn ensure_verify(
         &self,
         domain: &str,
@@ -381,9 +367,6 @@ impl DomainStore {
                 ));
             }
         }
-        // Fresh claim or takeover of an unproven one: the tenant binding
-        // moves with the challenge so the attaching team can manage the zone
-        // while it proves; verification rebinds definitively.
         rec.tenant = tenant.to_string();
         let v = DomainVerify {
             status: "pending".into(),
@@ -416,15 +399,13 @@ impl DomainStore {
         }
     }
 
-    /// Mark verified AND rebind the record's tenant to the proving team (the
-    /// proving attach owns the record from now on — the first-come claim is
-    /// superseded by real proof, so a squatter who pre-created the record
-    /// loses it exactly when someone actually proves control).
+    /// Marks the attachment verified AND rebinds the record's tenant to the proving team: real
+    /// proof supersedes the first-come claim, so a squatter who pre-created the record loses it
+    /// exactly when someone proves control. An empty tenant means "unknown" (personal namespaces
+    /// have no team row) and never rebinds the record to nothing.
     pub fn mark_verified_as(&self, domain: &str, tenant: Option<&str>) -> Option<DomainVerify> {
         let mut m = self.map.write();
         let d = m.get_mut(domain)?;
-        // An empty tenant means "unknown" (personal namespaces have no team
-        // row) — never rebind a record to nothing.
         if let Some(t) = tenant.filter(|t| !t.is_empty()) {
             d.tenant = t.to_string();
         }
@@ -435,10 +416,9 @@ impl DomainStore {
         Some(v.clone())
     }
 
-    /// Pending challenges older than this are abandoned: the watcher stops
-    /// polling them and the claim lapses (a claim is a statement of intent,
-    /// not a lease — an unproven claim must not hold a domain or its LE/watcher
-    /// budget forever).
+    /// Pending challenges older than this are abandoned: the watcher stops polling them and the
+    /// claim lapses, so an unproven claim never holds a domain or its Let's Encrypt/watcher budget
+    /// forever (a claim is a statement of intent, not a lease).
     pub const PENDING_VERIFY_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
 
     /// Every record with a live pending verification, for the leader's
@@ -464,10 +444,9 @@ impl DomainStore {
         out
     }
 
-    /// Every record with a VERIFIED attachment as (domain, project), for the
-    /// watcher's address refresh + routing re-assert: the pinned apex set
-    /// must track fleet membership, and a redeployed project's alias must be
-    /// re-applied on its new host.
+    /// Every VERIFIED attachment as (domain, project), for the watcher's address refresh and
+    /// routing re-assert: the pinned apex set must track fleet membership, and a redeployed
+    /// project's alias must be re-applied on its new host.
     pub fn verified_attachments(&self) -> Vec<(String, String)> {
         self.map
             .read()
@@ -481,10 +460,9 @@ impl DomainStore {
             .collect()
     }
 
-    /// Clear verification and issued-certificate metadata (detach) — a later
-    /// re-attach proves again and obtains a fresh bundle. Keeping a `dom-*`
-    /// claim after cert-sync prunes the detached bundle would make the API say
-    /// issued while no edge serves that certificate.
+    /// Clears verification AND the issued-certificate claim (detach): a later re-attach proves
+    /// again and obtains a fresh bundle, and a kept `dom-*` claim would make the API say issued
+    /// once cert-sync prunes the detached bundle.
     pub fn clear_verify(&self, domain: &str) {
         let mut m = self.map.write();
         if let Some(d) = m.get_mut(domain) {
@@ -493,12 +471,11 @@ impl DomainStore {
         }
     }
 
-    /// Clear verification for every domain gated on `project` unless another
-    /// live project attachment still lists that domain. A tombstoned project
-    /// must not keep domains or TLS metadata alive, while a shared attachment
-    /// must not lose the bundle it still serves. The billing-style
-    /// both-halves-or-neither rule applies here too: verification and SSL are
-    /// reset under the same DomainStore write lock. Returns affected domains.
+    /// Clears verification for every domain gated on `project` unless `preserved_domains` (another
+    /// live project attachment) still lists it: a tombstoned project must not keep domains or TLS
+    /// metadata alive, while a shared attachment must not lose the bundle it still serves.
+    /// Verification and SSL reset under the same write lock, both halves or neither. Returns the
+    /// affected domains.
     pub fn clear_verify_for_project(
         &self,
         project: &str,
@@ -518,12 +495,11 @@ impl DomainStore {
         out
     }
 
-    /// Rename the project a verified custom domain is attached to. The routing
-    /// key is the FULL hostname (`aliases_full`), never the project name, so a
-    /// rename cannot disturb `geniee.site`-style routing — but the attachment's
-    /// `verify.project` names the owning project and every authorize/re-attach
-    /// check compares against it, so it must move or the domain detaches from
-    /// its project on the next verification compare. Returns affected domains.
+    /// Renames the project a verified custom domain is attached to. Routing is keyed by the FULL
+    /// hostname (`aliases_full`), never the project name, so a rename cannot disturb routing; but
+    /// `verify.project` names the owner and every authorize/re-attach check compares against it, so
+    /// it must move or the domain detaches from its project on the next verification compare.
+    /// Returns the affected domains.
     pub fn rename_project(&self, from: &str, to: &str) -> Vec<String> {
         if from == to {
             return Vec::new();
@@ -541,16 +517,19 @@ impl DomainStore {
         out
     }
 
-    /// Replace the zone's serving records for a verified attachment: the
-    /// system apex A/AAAA set (the platform's live edge addresses) plus a
-    /// `www` CNAME to the apex — LE's HTTP-01 order carries a `www` SAN and
-    /// a delegated zone must resolve it or the WHOLE order fails (adversarial
-    /// finding: path-B zones NODATA'd `www`, so no cert ever issued). An
-    /// EMPTY address set clears all three (full detach): the zone stops
-    /// claiming the platform's edge. Only system records are touched —
-    /// tenant records and the CAA are never disturbed. The input is
-    /// `dnsserver::lb_records_strings`, the identical set the roster endpoint
-    /// tells the tenant to point at.
+    /// Replaces the zone's serving records for a verified attachment: the system apex A/AAAA set
+    /// (`dnsserver::lb_records_strings`, the live edge addresses, identical to what the roster
+    /// endpoint tells the tenant to point at) plus a `www` CNAME to the apex, since Let's Encrypt's
+    /// HTTP-01 order carries a `www` SAN and a delegated zone that does not resolve it fails the
+    /// WHOLE order. An EMPTY address set clears all three (full detach), so the zone stops claiming
+    /// the platform's edge. Only system records are touched: tenant records and the CAA are never
+    /// disturbed.
+    ///
+    /// Returns `true` only when the record set changed. An unchanged set is a no-op (the watcher
+    /// re-pins every cadence, and rewriting would bump every record's id and `created_ms`, churning
+    /// the wholesale-replicated store on a healthy fleet). A legacy system CNAME with an EMPTY name
+    /// (the `www` alias was once pushed without its name, so every cadence appended another copy)
+    /// forces one rewrite, so a bloated zone converges to one correct record set.
     pub fn set_system_address_records(
         &self,
         domain: &str,
@@ -561,10 +540,6 @@ impl DomainStore {
         let Some(d) = m.get_mut(domain) else {
             return false;
         };
-        // Damping: an unchanged set is a no-op — the watcher re-pins every
-        // cadence, and without this each pass would bump every record's
-        // created_ms/id, churning the wholesale-replicated store (and every
-        // follower's copy of it) on a healthy fleet.
         let same = |kind: &str, ips: &[String]| {
             let mut have: Vec<&str> = d
                 .records
@@ -590,13 +565,6 @@ impl DomainStore {
         } else {
             Vec::new()
         };
-        // A system CNAME with an EMPTY name is the legacy buggy shape: the
-        // www alias used to be pushed with `name: String::new()`, which this
-        // damping check and the retain below both missed — so every watcher
-        // cadence appended one more identical record (witnessed live:
-        // numo.gg reached 581 records, www.numo.gg 694). Their presence
-        // forces a rewrite pass so bloated zones converge back to one
-        // correct record set.
         let legacy_apex_cname = d
             .records
             .iter()

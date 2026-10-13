@@ -1,17 +1,15 @@
-//! Platform-native Microfrontends — the model, path matcher, conflict detector,
-//! config generation, validation, and fallback-environment resolution.
+//! Platform-native Microfrontends: the model, path matcher, conflict detector, config generation,
+//! validation and fallback-environment resolution.
 //!
-//! One logical application is composed of multiple independently deployed
-//! projects. Exactly one project is the DEFAULT application (serves `/` and any
-//! unmatched path); every other member is a CHILD that owns one or more path
-//! routes. The ingress rewrites the request host to the child project so the
-//! existing alias-resolution + dispatch serves the child's deployment for that
-//! path — one domain, many projects, no second runtime path.
+//! One logical application is composed of multiple independently deployed projects. Exactly one
+//! project is the DEFAULT application (serves `/` and any unmatched path); every other member is a
+//! CHILD that owns one or more path routes. The ingress rewrites the request host to the child
+//! project, so the existing alias resolution and dispatch serve the child's deployment for that
+//! path: one domain, many projects, no second runtime path.
 //!
-//! Storage lives in [`crate::enterprise::EnterpriseStore`] (`mfe` field, team ->
-//! groups), persisted with the rest of the enterprise config and gossiped via
-//! `EdgeExport`. This module owns only PURE logic (types + matcher + validation +
-//! config), so it is exhaustively unit-testable with no I/O.
+//! Storage lives in [`crate::enterprise::EnterpriseStore`] (`mfe`, team -> groups), persisted with
+//! the rest of the enterprise config and gossiped via `EdgeExport`. This module owns only PURE
+//! logic (types, matcher, validation, config), so it needs no I/O.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,10 +22,6 @@ fn default_fallback_env() -> String {
 fn default_observability() -> String {
     "default_application".into()
 }
-
-// ---------------------------------------------------------------------------
-// Typed errors
-// ---------------------------------------------------------------------------
 
 /// Every failure mode carries a stable machine code (the `code()` string) plus a
 /// human message. The API layer maps these to HTTP 4xx with the code in the body.
@@ -131,13 +125,9 @@ impl MfeError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
-/// One route rule: a set of path patterns, optionally scoped to a routing group
-/// label and/or gated behind a feature flag (both are metadata carried through
-/// to the generated config; the platform router matches on `paths`).
+/// One route rule: a set of path patterns, optionally scoped to a routing group label and/or gated
+/// behind a feature flag. Both are metadata carried into the generated config; the platform router
+/// matches on `paths` alone.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MfeRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,7 +307,6 @@ impl MfeGroup {
             self.members = members;
         }
         self.children.clear();
-        // Stamp roles from host_project so `role` is always authoritative.
         for m in &mut self.members {
             m.role = if m.project == self.host_project {
                 "default".into()
@@ -341,10 +330,6 @@ impl MfeGroup {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Path matcher (Vercel-style patterns)
-// ---------------------------------------------------------------------------
-
 /// One compiled path-pattern segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seg {
@@ -363,9 +348,9 @@ enum Seg {
     Affix { prefix: String, suffix: String },
 }
 
-/// A compiled route pattern with a precomputed specificity score (higher = more
-/// specific), used to deterministically resolve which child owns an overlapping
-/// path (e.g. `/docs/api/:path*` beats `/docs/:path*`).
+/// A compiled route pattern with a precomputed specificity score (higher = more specific), used to
+/// deterministically resolve which child owns an overlapping path (`/docs/api/:path*` beats
+/// `/docs/:path*`).
 #[derive(Clone, Debug)]
 pub struct RoutePattern {
     raw: String,
@@ -375,7 +360,6 @@ pub struct RoutePattern {
 
 /// Parse a single pattern segment string.
 fn parse_seg(s: &str) -> Result<Seg, String> {
-    // Catch-alls: `:name*` / `:name+`.
     if let Some(rest) = s.strip_prefix(':') {
         if let Some(name) = rest.strip_suffix('*') {
             if is_ident(name) {
@@ -387,7 +371,6 @@ fn parse_seg(s: &str) -> Result<Seg, String> {
                 return Ok(Seg::CatchAllPlus);
             }
         }
-        // Alternates: `:name(a|b)`.
         if let Some(open) = rest.find('(') {
             if rest.ends_with(')') {
                 let name = &rest[..open];
@@ -400,18 +383,14 @@ fn parse_seg(s: &str) -> Result<Seg, String> {
                 }
             }
         }
-        // Plain `:name`.
         if is_ident(rest) {
             return Ok(Seg::Param);
         }
         return Err(format!("malformed parameter segment ':{rest}'"));
     }
-    // Affix: literal text containing a single `:name` somewhere inside a segment,
-    // e.g. `prefix-:path-suffix` or `v-:ver`.
     if let Some(colon) = s.find(':') {
         let prefix = s[..colon].to_string();
         let after = &s[colon + 1..];
-        // Read the identifier, then the suffix is the literal remainder.
         let id_end = after
             .find(|c: char| !is_ident_char(c))
             .unwrap_or(after.len());
@@ -511,8 +490,8 @@ fn match_segs(pat: &[Seg], path: &[&str]) -> bool {
     let mut si = 0;
     while pi < pat.len() {
         match &pat[pi] {
-            Seg::CatchAllStar => return true, // last seg by construction; matches remaining (incl. none)
-            Seg::CatchAllPlus => return si < path.len(), // needs >= 1 remaining
+            Seg::CatchAllStar => return true,
+            Seg::CatchAllPlus => return si < path.len(),
             _ => {}
         }
         let Some(seg) = path.get(si) else {
@@ -538,14 +517,10 @@ fn match_segs(pat: &[Seg], path: &[&str]) -> bool {
     si == path.len()
 }
 
-// ---------------------------------------------------------------------------
-// Routing resolution
-// ---------------------------------------------------------------------------
-
-/// The child project (if any) that owns `path` in this group, resolving overlap
-/// by specificity (most specific wins; ties broken by project name for
-/// determinism — validation rejects true equal-specificity conflicts up front).
-/// Returns `(project, matched_pattern)`. `None` => the default app serves it.
+/// The child project (if any) that owns `path` in this group, resolving overlap by specificity
+/// (most specific wins; ties break by project name for determinism, and validation rejects the
+/// equal-specificity conflicts [`patterns_conflict`] can detect). Returns `(project,
+/// matched_pattern)`; `None` means the default app serves it.
 pub fn resolve_child(group: &MfeGroup, path: &str) -> Option<(String, String)> {
     let mut best: Option<(i64, String, String)> = None;
     for m in group.child_members() {
@@ -569,13 +544,9 @@ pub fn resolve_child(group: &MfeGroup, path: &str) -> Option<(String, String)> {
     best.map(|(_, project, pat)| (project, pat))
 }
 
-// ---------------------------------------------------------------------------
-// Conflict detection
-// ---------------------------------------------------------------------------
-
-/// Build a representative concrete path for a pattern (params -> a placeholder
-/// segment, catch-alls -> one placeholder segment). Used to probe cross-pattern
-/// overlap. Returns `None` for a root-only (`/`) pattern.
+/// Builds a representative concrete path for a pattern to probe cross-pattern overlap: literals as
+/// written, an alternate's first value, an affix around `x`, and a placeholder segment for params
+/// and catch-alls. A root-only pattern yields `/`.
 fn probe_path(rp: &RoutePattern) -> Option<String> {
     if rp.segs.is_empty() {
         return Some("/".into());
@@ -597,13 +568,14 @@ fn probe_path(rp: &RoutePattern) -> Option<String> {
     Some(out)
 }
 
-/// Two patterns CONFLICT when some path matches BOTH with EQUAL specificity — the
-/// router then cannot deterministically pick an owner. Nested patterns of
-/// differing specificity (`/docs/:path*` vs `/docs/api/:path*`) do NOT conflict
-/// (the more specific one wins). Probes both patterns' representative paths.
+/// Two patterns CONFLICT when some path matches BOTH with EQUAL specificity: the router then cannot
+/// deterministically pick an owner. Nested patterns of differing specificity (`/docs/:path*` vs
+/// `/docs/api/:path*`) do NOT conflict, the more specific one wins. Detection is probe-based: each
+/// pattern's representative path ([`probe_path`]) is tested against the other, so an overlap
+/// reachable only through a path neither probe visits (for example two alternate sets sharing a
+/// non-first value) is not detected.
 pub fn patterns_conflict(a: &RoutePattern, b: &RoutePattern) -> bool {
     if a.specificity() != b.specificity() {
-        // Differing specificity is always resolvable, even if paths overlap.
         return false;
     }
     for probe in [probe_path(a), probe_path(b)].into_iter().flatten() {
@@ -614,13 +586,14 @@ pub fn patterns_conflict(a: &RoutePattern, b: &RoutePattern) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
 /// Full structural + routing validation of a group. Returns the FIRST error.
+///
+/// Checks, in order: exactly one default application; a named environment when the fallback policy
+/// is `custom`; per member, a well-formed default route, a route for every child, valid patterns
+/// (`MfeError::InvalidRoute`) and an `assetPrefix` backed by a matching `/{prefix}/:path*` route on
+/// the SAME member; finally route conflicts between DIFFERENT members (a member's own routes
+/// overlapping each other are not a conflict).
 pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
-    // Exactly one default application.
     let defaults = group
         .members
         .iter()
@@ -632,7 +605,6 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
         _ => return Err(MfeError::MultipleDefaultApps),
     }
 
-    // Fallback policy.
     if group.fallback_environment == "custom"
         && group
             .custom_fallback_environment_name
@@ -644,7 +616,6 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
         return Err(MfeError::MissingFallback);
     }
 
-    // Per-member checks + collect (project, compiled-pattern) for conflict pass.
     let mut compiled: Vec<(String, RoutePattern)> = Vec::new();
     for m in &group.members {
         let is_default = m.project == group.host_project;
@@ -666,11 +637,10 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
         }
 
         for p in &paths {
-            let rp = RoutePattern::compile(p)?; // InvalidRoute on bad syntax / missing leading '/'
+            let rp = RoutePattern::compile(p)?;
             compiled.push((m.project.clone(), rp));
         }
 
-        // assetPrefix requires a matching "/{prefix}/:path*" route on the SAME member.
         if let Some(ap) = m.asset_prefix.as_deref() {
             let ap = ap.trim().trim_matches('/');
             if !ap.is_empty() {
@@ -688,8 +658,6 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
         }
     }
 
-    // Cross-child conflict detection (routes from DIFFERENT members only —
-    // a member overlapping itself is not a conflict).
     for i in 0..compiled.len() {
         for j in (i + 1)..compiled.len() {
             if compiled[i].0 == compiled[j].0 {
@@ -706,10 +674,10 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
     Ok(())
 }
 
-/// Can `project` be removed from `group`? The default app cannot be removed while
-/// child apps remain (they would be orphaned) — remove/reassign children or
-/// promote a new default first. Removing the last remaining member (the default
-/// alone) IS allowed (the caller then deletes the empty group).
+/// Whether `project` can be removed from `group`. The default app cannot be removed while child
+/// apps remain (they would be orphaned): remove or reassign them, or promote a new default, first.
+/// Removing the last remaining member (the default alone) IS allowed; the caller then deletes the
+/// empty group.
 pub fn can_remove_member(group: &MfeGroup, project: &str) -> Result<(), MfeError> {
     if group.member(project).is_none() {
         return Err(MfeError::UnknownMember(project.to_string()));
@@ -748,13 +716,10 @@ fn normalize_pattern(p: &str) -> String {
         .join("/")
 }
 
-// ---------------------------------------------------------------------------
-// Config generation (Vercel-compatible-ish)
-// ---------------------------------------------------------------------------
-
-/// Emit the `microfrontends.json`-shaped config for a group. Applications are
-/// keyed by project name; the default app carries `development.fallback`, each
-/// child carries `routing` + optional `assetPrefix`/`development`.
+/// Emits the `microfrontends.json`-shaped config for a group. Applications are keyed by project
+/// name; the default app carries `development.fallback`, each child carries `routing` plus optional
+/// `assetPrefix`/`development`. A `development.local` that parses as a port is emitted as a number
+/// (Vercel accepts either).
 pub fn to_vercel_config(group: &MfeGroup) -> serde_json::Value {
     use serde_json::{json, Map, Value};
     let mut applications = Map::new();
@@ -796,7 +761,6 @@ pub fn to_vercel_config(group: &MfeGroup) -> serde_json::Value {
         if let Some(dev) = &m.development {
             let mut d = Map::new();
             if let Some(local) = dev.local.as_deref().filter(|s| !s.trim().is_empty()) {
-                // Emit as a number when it parses as one (Vercel accepts either).
                 match local.parse::<u64>() {
                     Ok(n) => d.insert("local".into(), json!(n)),
                     Err(_) => d.insert("local".into(), json!(local)),
@@ -828,10 +792,6 @@ pub fn to_vercel_config(group: &MfeGroup) -> serde_json::Value {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Fallback-environment resolution
-// ---------------------------------------------------------------------------
-
 /// A candidate deployment the resolver can select for a child.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeployCand {
@@ -855,22 +815,23 @@ pub struct ChildTarget {
     pub fallback: String,
 }
 
-/// Resolve which of a child project's deployments should serve a request.
+/// Resolves which of a child project's deployments serves a request.
 ///
-/// * Production requests ALWAYS route to the child's production deployment.
-/// * Preview/custom requests prefer the child's deployment for the SAME commit;
-///   absent that, apply the group's `fallback_environment`:
-///     - `same_environment`: newest preview deployment of the child, else prod;
-///     - `production`: the child's production deployment;
-///     - `custom`: a deployment tagged with the custom environment name (matched
-///       against `commit`), else production.
+/// * A production request ALWAYS routes to the child's production deployment.
+/// * A preview/custom request prefers the child's deployment for the SAME commit; absent that,
+///   the group's `fallback_environment` applies:
+///     - `same_environment`: the first preview deployment in `cands` order, else production;
+///     - `custom`: the deployment whose `commit` equals the custom environment name, else
+///       production;
+///     - anything else (`production`): the child's production deployment.
 ///
-/// `cands` is every deployment of the child project (newest first is not
-/// required; production is identified by `production == true`).
+/// `request_env` is `production` or `preview`. `cands` is every deployment of the child project,
+/// newest first (that order picks among previews). Production is the candidate flagged
+/// `production`, else the first whose `env` is `production`.
 pub fn resolve_child_target(
     group: &MfeGroup,
     child_project: &str,
-    request_env: &str, // "production" | "preview"
+    request_env: &str,
     request_commit: &str,
     cands: &[DeployCand],
 ) -> Result<ChildTarget, MfeError> {
@@ -891,7 +852,6 @@ pub fn resolve_child_target(
             });
     }
 
-    // Preview/custom: exact same-commit deployment wins with no fallback.
     if !request_commit.is_empty() {
         if let Some(exact) = cands.iter().find(|c| c.commit == request_commit) {
             return Ok(ChildTarget {
@@ -933,7 +893,6 @@ pub fn resolve_child_target(
                     project: child_project.into(),
                 })
         }
-        // "production" (default): route to the child's production deployment.
         _ => production
             .map(|c| ChildTarget {
                 project: child_project.into(),

@@ -1,28 +1,19 @@
-//! Durable request-event history — what makes `/v1/logs` reach further back
-//! than the in-memory ring.
+//! Durable request-event history: what makes `/v1/logs` reach further back than the in-memory ring
+//! (the newest 500 events per node, never persisted).
 //!
-//! `CloudState` used to hold exactly 500 events per node in memory
-//! (`VecDeque`, count-capped, never persisted): on a busy node that is minutes
-//! of traffic, which is why the dashboard "only supports ~30 minutes". Nothing
-//! in the tree persisted a request event anywhere, so no query parameter could
-//! widen a window that was never stored — the 30-minute symptom was an emergent
-//! property of the ring, not a window.
+//! * every recorded [`Event`] is ALSO appended to a day-rotated JSONL file under the node's data
+//! dir (`events-YYYY-MM-DD.jsonl`), newest last;
+//! * a query with an explicit time window reads those files newest-first under a line/byte budget
+//! instead of the ring;
+//! * a query with NO time bound keeps using the ring (the 1.5 s dashboard poll stays O(500) and
+//! never touches disk).
 //!
-//! This module is the missing durable half:
-//! * every recorded [`Event`] is ALSO appended to a day-rotated JSONL file
-//!   under the node's data dir (`events-YYYY-MM-DD.jsonl`), newest last;
-//! * a query with an explicit time window reads those files newest-first under
-//!   a line/byte budget instead of the ring;
-//! * a query with NO time bound keeps using the ring (the 1.5 s dashboard poll
-//!   stays O(500) and never touches disk).
+//! Requests are recorded on the node that SERVES them, so this history is per-node by construction:
+//! the coordinator fan-out in `admin::logs` merges the peers' windows, which is why every new
+//! filter parameter has to ride the fan-out query string.
 //!
-//! Requests are recorded on the node that SERVES them, so this history is
-//! per-node by construction — the coordinator fan-out in `admin::logs` merges
-//! the peers' windows, which is why every new filter parameter has to ride the
-//! fan-out query string.
-//!
-//! Retention is a day-file sweep (age + total bytes), so disk is bounded and a
-//! query can never be more expensive than what is actually kept.
+//! Retention is a day-file sweep (age and total bytes), so disk is bounded and a query can never
+//! cost more than what is actually kept.
 
 use crate::state::Event;
 use parking_lot::Mutex;
@@ -34,13 +25,10 @@ use std::path::{Path, PathBuf};
 
 pub const DAY_MS: u64 = 86_400_000;
 
-/// Newest `limit` matches are kept per day-file, so this bounds both the work
-/// and the resident memory of one ranged query regardless of file size.
+/// The day-file writer's buffer: flushed to the OS once this many bytes are pending, never fsynced.
 const FLUSH_BYTES: usize = 64 * 1024;
 /// A single JSONL line longer than this is corrupt/foreign — skip, never panic.
 const MAX_LINE_BYTES: usize = 8192;
-
-// ---- config ---------------------------------------------------------------
 
 /// `HIVE_EVENT_LOG=0` disables the durable half (ring-only, the old behaviour).
 fn durable_enabled() -> bool {
@@ -71,8 +59,6 @@ fn scan_max_lines() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(500_000)
 }
-
-// ---- day-file naming ------------------------------------------------------
 
 fn day_index(ts_ms: u64) -> u64 {
     ts_ms / DAY_MS
@@ -121,17 +107,8 @@ fn parse_day_label(s: &str) -> Option<u64> {
     days_from_civil(y, m, d).map(|v| v as u64)
 }
 
-// ---- derived dimensions ---------------------------------------------------
-//
-// `Event` carries no environment/resource/cache/level column — they are derived
-// here from fields that DO exist, and the derivation is the single place the
-// filter and the UI agree on. `env`/`resource` are a JOIN (event -> deployment),
-// never a recorded field, and the UI must label them as such; `cache`/`level`
-// derive from `action` + `status` alone.
-
-/// Cache outcome of one event, from its `action`
-/// (`hit | stale | store | revalidate | miss`), matching the vocabulary
-/// `metrics.rs` already buckets on.
+/// Cache outcome of one event from its `action` (`hit | stale | store | revalidate | miss`), the
+/// vocabulary `metrics.rs` buckets on.
 pub fn derive_cache(action: &str) -> &'static str {
     match action {
         "cache-hit" => "hit",
@@ -179,14 +156,14 @@ pub fn derive_level(status: u16, action: &str) -> &'static str {
     }
 }
 
+/// Normalizes a deployment kind to `static | function | fullstack`. With no recorded kind it falls
+/// back to what the deployment carries: functions make it a function workload, otherwise it is a
+/// static asset tree.
 fn norm_kind(kind: &str, functions: &[String]) -> String {
     let k = kind.trim().to_ascii_lowercase();
     if k == "static" || k == "function" || k == "fullstack" {
         return k;
     }
-    // No recorded kind: fall back to what the deployment actually carries —
-    // a deployment with functions is a function/fullstack workload, otherwise
-    // it is a static asset tree.
     if functions.is_empty() {
         "static".to_string()
     } else {
@@ -205,13 +182,15 @@ pub struct DeployFacts {
 }
 
 impl DeployFacts {
+    /// A deployment's environment is its IMMUTABLE `target` (`production` or `preview`), falling
+    /// back to the live promoted `production` flag when it records none. Every alias an event could
+    /// have arrived on maps to the same deployment, so an event recorded before `Event.deployment`
+    /// was tagged still resolves by the host it was served on.
     pub fn build(deps: &[fluid_core::DeploymentInfo]) -> Self {
         let mut f = DeployFacts::default();
         for d in deps {
             let id = d.id.to_string().to_ascii_lowercase();
             let kind = norm_kind(&d.kind, &d.functions);
-            // `target` is IMMUTABLE ("production"|"preview") while `production`
-            // is the live promoted flag — prefer target, fall back to the flag.
             let target = if !d.target.is_empty() {
                 d.target.to_ascii_lowercase()
             } else if d.production {
@@ -223,9 +202,6 @@ impl DeployFacts {
                 f.kind_by_dep.insert(id.clone(), kind.clone());
                 f.target_by_dep.insert(id, target.clone());
             }
-            // Host fallback: an event recorded before `Event.deployment` was
-            // tagged still names the host it was served on, and every alias an
-            // event could have arrived on maps to the same deployment.
             for h in [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias] {
                 let h = h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase();
                 if h.is_empty() {
@@ -238,10 +214,12 @@ impl DeployFacts {
         f
     }
 
-    /// Derived dimensions for one event. Empty strings mean UNKNOWN (the event
-    /// has no deployment tag and its host matches no known deployment) — an
-    /// UNKNOWN dimension is excluded by any filter naming a concrete value,
-    /// which is the honest answer rather than a guess.
+    /// Derived dimensions for one event. `Event` records no environment, resource, cache or level,
+    /// so they are derived here, the single place the filter and the UI agree on: `env` and
+    /// `resource` are a JOIN (event -> deployment) that the UI must label as such, `cache` and
+    /// `level` come from `action` and `status` alone. Empty strings mean UNKNOWN (no deployment tag
+    /// and a host that matches no known deployment): an UNKNOWN dimension is excluded by any filter
+    /// naming a concrete value, the honest answer rather than a guess.
     pub fn derive(&self, e: &Event) -> Derived {
         let dep = e.deployment.to_ascii_lowercase();
         let host = e
@@ -287,8 +265,6 @@ pub struct Derived {
     pub level: String,
 }
 
-// ---- filter ---------------------------------------------------------------
-
 /// One `status=` term: an exact code or a class (`5xx`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusPred {
@@ -297,9 +273,9 @@ pub enum StatusPred {
 }
 
 impl StatusPred {
-    /// Parse one comma-separated term. Returns `None` for junk, which the
-    /// caller turns into a 400 rather than silently ignoring (a filter that
-    /// silently does nothing is the bug this module exists to remove).
+    /// Parses one comma-separated term. `None` for junk, which the caller turns into a 400 rather
+    /// than silently ignoring (a filter that silently does nothing is the bug this module exists to
+    /// remove).
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
         if s.len() == 3 && (s.ends_with("xx") || s.ends_with("**")) {
@@ -349,19 +325,17 @@ pub struct EventFilter {
     pub resources: Vec<String>,
     /// Free text, lowercased at parse time.
     pub text: Option<String>,
-    /// Tenant/project/deployment scoping, applied BY THE SCAN so that `limit`
-    /// counts rows the caller is actually allowed to see. Scoping after the
-    /// scan would let a tenant filter eat the whole page and silently return
-    /// fewer rows than requested with more still on disk.
+    /// Tenant/project/deployment scoping, applied BY THE SCAN so `limit` counts rows the caller may
+    /// see: scoping after the scan would let a tenant filter eat the page and silently return fewer
+    /// rows than requested with more still on disk.
     #[doc(hidden)]
     pub scope: Option<std::sync::Arc<dyn Fn(&Event) -> bool + Send + Sync>>,
 }
 
 impl EventFilter {
-    /// Whether any filter reads a DERIVED dimension. When none does, the scan
-    /// skips the (allocating) derivation entirely — a 30-day window can examine
-    /// hundreds of thousands of lines and must not pay for a join nobody asked
-    /// for. Derived values are still stamped onto the handful of rows returned.
+    /// Whether any filter reads a DERIVED dimension. When none does the scan skips the allocating
+    /// derivation entirely (a 30-day window can examine hundreds of thousands of lines), and
+    /// derived values are still stamped onto the few rows returned.
     pub fn needs_derived(&self) -> bool {
         !self.levels.is_empty()
             || !self.caches.is_empty()
@@ -442,8 +416,6 @@ pub fn parse_list(raw: Option<&str>, max_items: usize, max_len: usize) -> Option
     }
 }
 
-// ---- the store ------------------------------------------------------------
-
 struct DayWriter {
     day: u64,
     buffered: usize,
@@ -516,6 +488,11 @@ impl EventLog {
         })
     }
 
+    /// Appends one JSONL line to the current day-file, rotating (and sweeping) once per calendar
+    /// day, never per event. Flushes on a byte budget (`FLUSH_BYTES`), never an fsync: a
+    /// per-request fsync on the serving path would serialize every request behind a disk barrier,
+    /// and the worst case is losing the tail of the current buffer, which is exactly the window the
+    /// in-memory ring still covers.
     fn append_durable(&self, ev: &Event) {
         let Ok(line) = serde_json::to_string(ev) else {
             return;
@@ -527,7 +504,6 @@ impl EventLog {
             if let Some(mut old) = w.take() {
                 let _ = old.file.flush();
             }
-            // Sweep on rotation: once per calendar day, never per event.
             self.sweep();
             *w = self.open_day(day);
         }
@@ -535,10 +511,6 @@ impl EventLog {
         if writeln!(w.file, "{line}").is_ok() {
             w.buffered += line.len() + 1;
         }
-        // Flush on a byte budget, never fsync: a per-request fsync on the
-        // serving path would serialize every request behind a disk barrier.
-        // Worst case is losing the tail of the current 64 KiB buffer, which is
-        // exactly the window the in-memory ring still covers.
         if w.buffered >= FLUSH_BYTES {
             let _ = w.file.flush();
             w.buffered = 0;
@@ -571,10 +543,6 @@ impl EventLog {
     pub fn query(&self, f: &EventFilter, facts: &DeployFacts) -> Vec<Event> {
         let mut out = Vec::with_capacity(f.limit.min(1024));
         if self.needs_disk(f) {
-            // The durable writer is buffered (64 KiB), so the last seconds of
-            // traffic are not on disk yet. Flush first — otherwise a ranged
-            // query would MISS the very newest events, i.e. the ones the user
-            // just generated, which reads as "the range filter is broken".
             self.flush();
             self.scan_disk(f, facts, &mut out);
         } else {
@@ -597,9 +565,9 @@ impl EventLog {
         out
     }
 
-    /// Disk is consulted only when the ring provably does not cover the window:
-    /// `since_ms == 0` (unbounded) or the ring's oldest event is newer than the
-    /// requested start. That is what keeps the default poll cheap.
+    /// Disk is consulted only for a time-bounded query the ring provably does not cover: never when
+    /// `since_ms == 0` (unbounded, ring only), and only when the ring is empty or its oldest event
+    /// is newer than the requested start. That is what keeps the default poll cheap.
     fn needs_disk(&self, f: &EventFilter) -> bool {
         if !self.durable || f.since_ms == 0 {
             return false;
@@ -610,12 +578,18 @@ impl EventLog {
         }
     }
 
+    /// Walks day-files newest first until `limit` rows or the line budget
+    /// (`HIVE_EVENT_LOG_SCAN_LINES`) is reached: the newest files fill `limit`, so older ones are
+    /// usually never opened. Per file only the NEWEST `limit` matches are kept (files are
+    /// chronological), so the resident set is bounded by `limit`. The stop test is `day <= first`,
+    /// not `==`: `first` derives from the caller-supplied `since_ms`, so it can lie past `last`,
+    /// and an equality test would never match and decrement `day` off the bottom of u64 (a panic
+    /// with overflow checks; without them a wrap to `u64::MAX` that spins ~2^64 iterations inside
+    /// `block_in_place` and hangs a tokio worker).
     fn scan_disk(&self, f: &EventFilter, facts: &DeployFacts, out: &mut Vec<Event>) {
         let now = hive_core::now_ms();
         let last = day_index(f.until_ms.min(now));
         let first = day_index(f.since_ms);
-        // Newest day first: the newest files are the ones that fill `limit`,
-        // so older files are usually never opened at all.
         let mut day = last;
         let mut lines = 0usize;
         let max_lines = scan_max_lines();
@@ -624,8 +598,6 @@ impl EventLog {
                 return;
             }
             if let Ok(fh) = File::open(self.path_for(day)) {
-                // Keep only this day's NEWEST `limit` matches (files are
-                // chronological), so the resident set is bounded by `limit`.
                 let mut keep: VecDeque<Event> = VecDeque::with_capacity(f.limit.min(1024) + 1);
                 let derived = Derived::default();
                 for line in BufReader::with_capacity(1 << 16, fh).lines() {
@@ -662,15 +634,6 @@ impl EventLog {
                     out.push(e);
                 }
             }
-            // `<=` and not `==`: `first` is derived from `since_ms`, which is
-            // caller-supplied. A `since_ms` past `now` (or past `until_ms`)
-            // makes `first > last`, so an equality test would never match and
-            // the decrement below would run off the bottom of u64 -- a panic
-            // under overflow-checks, and under release (no overflow-checks) a
-            // wrap to u64::MAX that spins this loop ~2^64 times inside
-            // block_in_place, hanging a tokio worker permanently. Bailing out
-            // as soon as `day` reaches (or is already below) `first` keeps the
-            // walk bounded for every possible input.
             if day <= first {
                 return;
             }

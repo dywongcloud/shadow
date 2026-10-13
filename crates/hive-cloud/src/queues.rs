@@ -1,21 +1,16 @@
-//! Cloudflare Queues, 1:1: a durable, tenant-scoped message queue service
-//! matching Cloudflare's REST contract (`/accounts/{account_id}/queues`),
-//! consumer model (Worker push + HTTP pull), and metrics surface.
+//! A durable, tenant-scoped message queue service shaped like Cloudflare Queues: the
+//! `/accounts/{account_id}/queues` REST contract, Worker push and HTTP pull consumers, and the
+//! metrics surface.
 //!
-//! Two storage tiers, matching AGENTS.md's round-robin-reads-vs-leader-
-//! forwarded-writes split:
-//! * **Metadata** (queue + consumer records) is small and store_sync-
-//!   replicated — every node holds a fresh copy, `merge_synced` follows the
-//!   exact tombstone-preserving pattern `databases.rs`'s `SyncedDatabases`
-//!   already proved (never adopt-by-replace: a leader OOM-killed before its
-//!   debounced save ran must not erase every follower's copy of a record it
-//!   never got to save).
-//! * **Messages** are node-local to the queue's elected owner (deterministic
-//!   per-queue election, the same `Cluster::elect_among` shape
-//!   `world_queue.rs`'s `is_primary_for_team` already validated) and mirrored
-//!   to GuardianDB for durability across a restart — never full-mesh
-//!   replicated, since message volume is unbounded and only the owner needs
-//!   the working set.
+//! Two storage tiers:
+//! * **Metadata** (queue and consumer records) is small and store_sync-replicated, so every node
+//! holds a fresh copy. `merge_synced` merges per row with tombstones, as `databases.rs`'s
+//! `SyncedDatabases` does, and never adopts by replace: a leader killed before its debounced save
+//! ran must not erase every follower's copy of a record it never saved.
+//! * **Messages** are node-local to the queue's elected owner (a deterministic per-queue election,
+//! the same `Cluster::elect_among` shape as `world_queue.rs`'s `is_primary_for_team`) and mirrored
+//! to GuardianDB for durability across a restart. They are never replicated mesh-wide: volume is
+//! unbounded and only the owner needs the working set.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -25,12 +20,13 @@ use std::sync::Arc;
 
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-// ---- Cloudflare bounds (verified against developers.cloudflare.com/queues) ----
+/// Minimum delivery delay in seconds. Every bound in this block is Cloudflare Queues' documented
+/// limit (developers.cloudflare.com/queues).
 pub const DELIVERY_DELAY_MIN_SECS: u32 = 0;
 pub const DELIVERY_DELAY_MAX_SECS: u32 = 86_400;
 pub const RETENTION_MIN_SECS: u32 = 60;
 pub const RETENTION_MAX_SECS: u32 = 1_209_600;
-pub const RETENTION_DEFAULT_SECS: u32 = 345_600; // 4 days
+pub const RETENTION_DEFAULT_SECS: u32 = 4 * 24 * 60 * 60;
 pub const BATCH_SIZE_MIN: u32 = 1;
 pub const BATCH_SIZE_MAX: u32 = 100;
 pub const BATCH_SIZE_DEFAULT: u32 = 10;
@@ -42,8 +38,7 @@ pub const PULL_BATCH_SIZE_DEFAULT: u32 = 5;
 pub const PULL_BATCH_SIZE_MAX: u32 = 100;
 pub const VISIBILITY_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 pub const VISIBILITY_TIMEOUT_MAX_MS: u64 = 12 * 60 * 60 * 1000;
-/// Cloudflare's own per-message body cap (128 KB) — refused loudly, never
-/// silently truncated (the browser_db / hcb1 precedent: truncation in a
+/// Cloudflare's per-message body cap: refused loudly, never silently truncated (truncation in a
 /// durable store is silent divergence, not a size limit).
 pub const MAX_MESSAGE_BODY_BYTES: usize = 128 * 1024;
 
@@ -76,11 +71,9 @@ impl Default for QueueSettings {
     }
 }
 impl QueueSettings {
-    /// Clamp to Cloudflare's documented bounds — never reject a slightly
-    /// out-of-range request, clamp it and let the caller see the effective
-    /// value in the response (matches this platform's `BrowserDbPolicy`
-    /// resolve()-with-notes precedent: defaulted fields, clamped ceilings,
-    /// never a silent drop).
+    /// Clamps to Cloudflare's documented bounds: an out-of-range request is clamped, never
+    /// rejected, and the caller sees the effective value in the response (defaulted fields and
+    /// clamped ceilings, never a silent drop).
     pub fn clamped(mut self) -> Self {
         self.delivery_delay = self
             .delivery_delay
@@ -96,9 +89,8 @@ impl QueueSettings {
 pub struct Queue {
     pub queue_id: String,
     pub queue_name: String,
-    /// Server-resolved tenant (the platform's account_id equivalent) — never
-    /// trusted from the request body, matching `database_create`'s
-    /// `req.team = tenant(...)` override.
+    /// Server-resolved tenant (the platform's account_id equivalent), never trusted from the
+    /// request body.
     pub tenant: String,
     pub created_on: u64,
     pub modified_on: u64,
@@ -184,29 +176,22 @@ pub struct QueueMessage {
     pub attempts: u32,
     #[serde(default)]
     pub metadata: serde_json::Value,
-    /// `None` = available for lease/delivery. `Some((lease_id, expires_ms))` =
-    /// currently leased — an expired lease is treated as available again by
-    /// every reader, never eagerly swept (matches `PooledConn`'s Drop-release
-    /// discipline: state is checked at use time, not by a separate janitor
-    /// racing real acquisition).
+    /// `None` = available for lease and delivery; `Some((lease_id, expires_ms))` = currently
+    /// leased. An expired lease counts as available again for every reader and is never eagerly
+    /// swept: state is checked at use time, not by a janitor racing real acquisition.
     #[serde(default)]
     pub lease: Option<(String, u64)>,
 }
 
-/// A queue's live message working set. Node-local (the owner's), mirrored to
-/// GuardianDB — never store_sync'd (unbounded volume, only the owner needs
-/// the hot set, exactly `world_queue.rs`'s `WorldQueue.pending` precedent).
+/// A queue's live message working set: node-local (the owner's) and mirrored to GuardianDB, never
+/// store_sync'd (unbounded volume, and only the owner needs the hot set).
 #[derive(Default)]
 struct MessageLog {
     messages: RwLock<Vec<QueueMessage>>,
-    /// Set once this log has been recovered from GuardianDB at least once —
-    /// without this, a freshly-restarted node's message store, metrics, and
-    /// pull-consumer reads all raced the periodic (~5s cadence) recovery
-    /// tick: a queue with real durable messages read as an honestly-empty
-    /// backlog for up to 5 seconds after every restart. Every read path now
-    /// forces a synchronous recovery the FIRST time it touches a queue this
-    /// process has not yet loaded, then relies on the periodic tick for
-    /// ongoing convergence.
+    /// Set once this log has been recovered from GuardianDB at least once. Every read path forces a
+    /// synchronous recovery the FIRST time it touches a queue this process has not loaded, then
+    /// relies on the periodic ~5 s tick for ongoing convergence; without it a freshly restarted
+    /// node read an empty backlog for up to a tick.
     synced_once: std::sync::atomic::AtomicBool,
 }
 
@@ -249,8 +234,6 @@ impl QueueStore {
             .or_insert_with(|| Arc::new(MessageLog::default()))
             .clone()
     }
-
-    // ---- Queue CRUD ----
 
     pub fn list(&self, tenant: &str) -> Vec<Queue> {
         self.queues
@@ -308,10 +291,9 @@ impl QueueStore {
         Some(q.clone())
     }
 
-    /// Cascades to every consumer of this queue (Cloudflare's own delete
-    /// behavior) and tombstones both the queue and its consumers so the
-    /// deletion replicates instead of being silently re-adopted from a peer
-    /// that has not heard about it yet.
+    /// Cascades to every consumer of the queue (as Cloudflare's delete does) and tombstones the
+    /// queue and its consumers, so the deletion replicates instead of being re-adopted from a peer
+    /// that has not heard about it.
     pub fn delete(&self, tenant: &str, queue_id: &str) -> bool {
         let existed = {
             let mut qs = self.queues.write();
@@ -342,8 +324,6 @@ impl QueueStore {
         self.logs.write().remove(queue_id);
         true
     }
-
-    // ---- Consumer CRUD ----
 
     pub fn list_consumers(&self, queue_id: &str) -> Vec<Consumer> {
         self.consumers
@@ -405,11 +385,8 @@ impl QueueStore {
             .cloned()
     }
 
-    // ---- Messages: send / pull / ack ----
-
-    /// Enqueue one message. Mirrors to GuardianDB so a restart of this
-    /// queue's owner recovers the message (the `world_queue.rs` durability
-    /// precedent). Returns the assigned message id.
+    /// Enqueues one message and mirrors it to GuardianDB so a restart of this queue's owner
+    /// recovers it. Returns the assigned message id.
     pub fn send(
         &self,
         queue_id: &str,
@@ -439,11 +416,9 @@ impl QueueStore {
         Ok(id)
     }
 
-    /// Recover `queue_id`'s messages from GuardianDB exactly once per process
-    /// lifetime on first touch (a fresh restart otherwise reads an honestly-
-    /// empty backlog for up to the periodic sync loop's ~5s cadence).
-    /// Idempotent and safe to call redundantly — `sync_from_guardian` itself
-    /// only adds messages absent from the local set.
+    /// Recovers `queue_id`'s messages from GuardianDB exactly once per process lifetime, on first
+    /// touch. Idempotent and safe to call redundantly: `sync_from_guardian` only adds messages
+    /// absent from the local set.
     async fn ensure_synced(&self, queue_id: &str) {
         let log = self.log_for(queue_id);
         if log
@@ -474,11 +449,9 @@ impl QueueStore {
         (count, bytes, oldest)
     }
 
-    /// Lease up to `batch_size` available messages. A message is "available"
-    /// when its scheduled time has arrived AND it carries no lease, or its
-    /// lease has expired — checked and re-leased atomically under one write
-    /// lock so two concurrent pulls can never both lease the same message
-    /// (the TOCTOU class `queues-adversarial-edge-cases` names explicitly).
+    /// Leases up to `batch_size` available messages. A message is available when its scheduled time
+    /// has arrived AND it carries no lease, or its lease has expired; this is checked and re-leased
+    /// atomically under one write lock, so two concurrent pulls can never lease the same message.
     pub async fn pull(
         &self,
         queue_id: &str,
@@ -510,10 +483,9 @@ impl QueueStore {
         leased
     }
 
-    /// Ack (permanently remove) a leased message. Returns `false` for an
-    /// unknown or already-expired-then-reclaimed lease id — a typed refusal,
-    /// never a silent success (an ack racing an expiry must not appear to
-    /// have worked when the message was already re-leased to someone else).
+    /// Acks (permanently removes) a leased message. Returns `false` for an unknown, or expired and
+    /// since re-leased, lease id: a typed refusal, never a silent success (an ack racing an expiry
+    /// must not look like it worked when the message went to someone else).
     pub fn ack(&self, queue_id: &str, lease_id: &str) -> bool {
         let log = self.log_for(queue_id);
         let mut msgs = log.messages.write();
@@ -560,14 +532,12 @@ impl QueueStore {
         found
     }
 
-    /// Due messages this node currently holds for `queue_id`, removed from
-    /// the log (re-inserted by the caller on a retriable failure) — the
-    /// worker-consumer batch source. Never leases: push delivery owns the
-    /// message directly, unlike the pull-consumer's lease/ack/retry cycle.
-    /// Increments `attempts` on take (matching `pull`'s own counting) so a
-    /// message's attempt count reflects DISPATCH attempts consistently
-    /// across both consumer types — the caller compares the RETURNED
-    /// `attempts` against `max_retries` directly, no separate reap scan.
+    /// Due messages this node holds for `queue_id`, removed from the log (the caller re-inserts
+    /// them on a retriable failure): the Worker-consumer batch source. Never leases: push delivery
+    /// owns the message directly, unlike the pull consumer's lease/ack/retry cycle. Increments
+    /// `attempts` on take, as `pull` does, so the count means DISPATCH attempts for both consumer
+    /// types and the caller compares the returned `attempts` against `max_retries` directly, with
+    /// no separate reap scan.
     pub fn take_due_for_push(&self, queue_id: &str, max_batch: u32) -> Vec<QueueMessage> {
         let log = self.log_for(queue_id);
         let mut msgs = log.messages.write();
@@ -586,9 +556,9 @@ impl QueueStore {
         taken
     }
 
-    /// Dead-letter (or drop, with no DLQ configured) exactly the given
-    /// messages — never a queue-wide reap scan, which would also catch
-    /// unrelated pull-consumer messages sharing the same log.
+    /// Dead-letters (or drops, when no DLQ is configured) exactly the given messages, never a
+    /// queue-wide reap scan, which would also catch unrelated pull-consumer messages sharing the
+    /// log.
     pub fn dead_letter(&self, queue_id: &str, dlq_id: Option<&str>, messages: Vec<QueueMessage>) {
         if messages.is_empty() {
             return;
@@ -613,10 +583,9 @@ impl QueueStore {
         }
     }
 
-    /// Re-queue a message after a failed push-delivery attempt. `attempts`
-    /// was already incremented by `take_due_for_push` at dispatch time —
-    /// incrementing it again here would double-count and let a message
-    /// exceed `max_retries` after only half as many real attempts.
+    /// Re-queues a message after a failed push-delivery attempt. `attempts` was already incremented
+    /// by `take_due_for_push` at dispatch time; incrementing it again here would double-count and
+    /// let a message exceed `max_retries` after half as many real attempts.
     pub fn reschedule(&self, queue_id: &str, mut msg: QueueMessage, backoff_ms: u64) {
         msg.timestamp_ms = now_ms() + backoff_ms;
         msg.lease = None;
@@ -632,10 +601,9 @@ impl QueueStore {
         tokio::spawn(async move { crate::guardian::delete(&key).await });
     }
 
-    /// Bounded TTL sweep against `message_retention_period` — never reap more
-    /// than half a queue's backlog in one pass (the `gc_rootfs_images`
-    /// blast-radius-guard precedent: a bug in the age computation must not
-    /// silently empty an entire live queue in one tick).
+    /// Bounded TTL sweep against `message_retention_period`: reaps at most half of a queue's
+    /// backlog per pass (at least one message), so a bug in the age computation cannot silently
+    /// empty a live queue in one tick. Returns the count reaped.
     pub fn sweep_expired(&self, queue_id: &str, retention_secs: u32) -> usize {
         let log = self.log_for(queue_id);
         let now = now_ms();
@@ -666,9 +634,8 @@ impl QueueStore {
         to_reap.len()
     }
 
-    /// Recover a queue's messages from GuardianDB into the local working set
-    /// (adopt-if-absent, idempotent) — run when this node becomes/rejoins as
-    /// the elected owner for `queue_id`.
+    /// Recovers a queue's messages from GuardianDB into the local working set (adopt-if-absent,
+    /// idempotent); run when this node becomes, or rejoins as, the elected owner for `queue_id`.
     pub async fn sync_from_guardian(&self, queue_id: &str) {
         let log = self.log_for(queue_id);
         let prefix = format!("queues/msg/{queue_id}/");
@@ -687,8 +654,7 @@ impl QueueStore {
         }
     }
 
-    // ---- Disk persistence (this node's own boot/restore, not cross-node merge) ----
-
+    /// Restores this node's own persisted copy at boot: a disk restore, not a cross-node merge.
     pub fn load(&self, synced: SyncedQueues) {
         *self.queues.write() = synced.queues;
         *self.consumers.write() = synced.consumers;
@@ -696,8 +662,8 @@ impl QueueStore {
         *self.consumer_tombstones.write() = synced.consumer_tombstones;
     }
 
-    // ---- Replicated snapshot / merge (metadata only — messages never ride this) ----
-
+    /// The replicated snapshot: queue and consumer metadata plus tombstones, sorted by id. Messages
+    /// never ride it.
     pub fn snapshot_synced(&self) -> SyncedQueues {
         let mut queues = self.queues.read().clone();
         queues.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
@@ -711,6 +677,11 @@ impl QueueStore {
         }
     }
 
+    /// Merges a peer's snapshot and returns the resulting queue count. Tombstones union keeping the
+    /// LATEST deletion time and expire after [`TOMBSTONE_RETENTION_MS`]; a queue takes the copy
+    /// with the newer `modified_on` (the remote wins ties); consumers are add-only, a local
+    /// consumer is never overwritten; a record whose tombstone is at or after its `created_on` is
+    /// dropped.
     pub fn merge_synced(&self, remote: SyncedQueues) -> usize {
         let now = now_ms();
         {
@@ -768,10 +739,9 @@ impl QueueStore {
     }
 }
 
-/// Deterministic per-queue primary election, scoped to nodes currently
-/// hosting the consumer's tenant — identical shape to
-/// `world_queue::is_primary_for_team`, so delivery ownership cannot drift
-/// between the two queue mechanisms this platform now runs side by side.
+/// Deterministic per-queue primary election among the nodes currently hosting the consumer's
+/// tenant, the same shape as `world_queue::is_primary_for_team`, so delivery ownership cannot drift
+/// between the two queue mechanisms. A tenant hosted nowhere makes every node primary.
 async fn is_primary_for_queue(cloud: &Arc<crate::state::CloudState>, tenant: &str) -> bool {
     let mut candidates: Vec<String> = Vec::new();
     if cloud
@@ -799,16 +769,20 @@ async fn is_primary_for_queue(cloud: &Arc<crate::state::CloudState>, tenant: &st
         == Some(cloud.node_name.as_str())
 }
 
-/// Push delivery for Worker-type consumers: batches due messages up to
-/// `max_batch_size`/`max_batch_timeout`, POSTs the batch to the consumer's
-/// `script_name` project (a real deployed platform function reached over its
-/// normal public invocation URL — the same `world_queue.rs` HTTP-dispatch
-/// shape already proven live, just addressed at the tenant's own function
-/// instead of an arbitrary webhook URL). On success the whole batch acks; on
-/// failure every message's `attempts` increments and reschedules with
-/// exponential backoff, dead-lettering at `max_retries`.
+const DELIVERY_TICK_MS: u64 = 500;
+/// GuardianDB recovery and the retention sweep run on every Nth delivery tick (about 5 s).
+const MAINTENANCE_EVERY_TICKS: u32 = 10;
+
+/// Push delivery for Worker-type consumers, ticking every `DELIVERY_TICK_MS`. For each unpaused
+/// queue this node is primary for it first recovers the queue once (`ensure_synced`, so a restarted
+/// node does not skip messages it has not loaded yet), runs GuardianDB recovery and the retention
+/// sweep every `MAINTENANCE_EVERY_TICKS` ticks, then takes due messages up to the consumer's
+/// `batch_size` and POSTs the batch to the consumer's `script_name` project over its normal public
+/// invocation URL (the `world_queue.rs` HTTP-dispatch shape, addressed at the tenant's own
+/// function). On success the whole batch acks; on failure every message's `attempts` increments and
+/// it reschedules with exponential backoff, dead-lettering at `max_retries`.
 pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(DELIVERY_TICK_MS));
     let mut sweep_tick: u32 = 0;
     loop {
         interval.tick().await;
@@ -821,14 +795,8 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
             if !is_primary_for_queue(&cloud, &queue.tenant).await {
                 continue;
             }
-            // First-touch recovery, same rationale as `ensure_synced` on the
-            // read paths: without this a push consumer's messages were
-            // invisible for up to the full periodic-sweep cadence (5s) after
-            // every restart, not just the pull-consumer/metrics paths.
             cloud.queues.ensure_synced(&queue.queue_id).await;
-            // Periodic retention sweep + GuardianDB recovery, same cadence
-            // idea as world_queue's ~5s sync tick (10 ticks * 500ms).
-            if sweep_tick % 10 == 0 {
+            if sweep_tick % MAINTENANCE_EVERY_TICKS == 0 {
                 cloud.queues.sync_from_guardian(&queue.queue_id).await;
                 let reaped = cloud
                     .queues

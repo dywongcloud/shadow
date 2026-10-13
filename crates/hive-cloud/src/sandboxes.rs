@@ -1,29 +1,19 @@
-//! Platform-native Sandboxes — isolated, on-demand, tenant-scoped Linux
-//! environments for running commands, testing code, and executing untrusted
-//! workloads (Vercel Sandbox parity). This module owns the PURE model:
-//! records, validation, secret redaction, and the [`SandboxProvider`]
-//! abstraction. The concrete production backend
-//! ([`crate::sandboxes_platform::PlatformSandboxProvider`]) runs real
-//! isolated cells via `hive_backend::CellBackend` (Firecracker microVMs, or
-//! Litebox where verified) — this platform is a self-hosted cloud, not a
-//! Vercel customer, so "production provider" means the platform's OWN
-//! microVM/sandbox tech (the same primitives serverless functions already
-//! use), not a call out to Vercel's commercial API. [`MockSandboxProvider`]
-//! here is strictly for tests.
+//! Platform-native Sandboxes: isolated, on-demand, tenant-scoped Linux environments for running
+//! commands, testing code and executing untrusted workloads. This module owns the PURE model
+//! (records, validation, secret redaction) and the [`SandboxProvider`] abstraction. The production
+//! backend, [`crate::sandboxes_platform::PlatformSandboxProvider`], runs real isolated cells
+//! through `hive_backend::CellBackend` (Firecracker microVMs, or Litebox where verified): the
+//! platform's OWN sandbox tech, the same primitives serverless functions use, not a call out to a
+//! vendor API. [`MockSandboxProvider`] is strictly for tests.
 //!
-//! SECURITY (ZeroTrust): every record is tenant + project scoped
-//! (`SandboxRecord.tenant_id`/`project_id`); every mutation is authorized via
-//! the same `require_project` guard the rest of the platform uses. Command argv
-//! is never shell-interpolated by default (`shell: false`); secrets are stored
-//! via `crate::secrets::encrypt` and redacted out of logs before they are
-//! persisted or returned.
+//! SECURITY: every record is tenant and project scoped (`SandboxRecord.tenant_id`/`project_id`) and
+//! every mutation is authorized through the same `require_project` guard as the rest of the
+//! platform. Command argv is never shell-interpolated by default (`shell: false`); secrets are
+//! stored via `crate::secrets::encrypt` and redacted out of logs before they are persisted or
+//! returned.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,9 +64,9 @@ pub struct NetworkPolicy {
 fn default_policy_mode() -> String {
     "allow-all".into()
 }
-// A manual impl, NOT `#[derive(Default)]`: derive would give `mode = ""` (plain
-// `String::default()`), which fails validation — `#[serde(default = "...")]`
-// only wires up (de)serialization, not `Default::default()`.
+/// A manual impl, not `#[derive(Default)]`: the derive would give `mode = ""`, which fails
+/// validation, and `#[serde(default = "...")]` wires up only deserialization, not
+/// `Default::default()`.
 impl Default for NetworkPolicy {
     fn default() -> Self {
         NetworkPolicy {
@@ -89,12 +79,10 @@ impl Default for NetworkPolicy {
     }
 }
 
-/// A referenced env var: `value` is the caller-supplied plaintext ONLY at write
-/// time; what's stored is `EnvRef` with the value already sealed via
-/// `crate::secrets::encrypt` when the caller marks it sensitive (or always, for
-/// sandboxes we default env values to sensitive-safe handling since a sandbox
-/// env var is functionally equivalent to a project secret to whatever process
-/// runs inside it).
+/// A stored environment reference. The caller's plaintext value exists only at write time and is
+/// sealed with `crate::secrets::encrypt` before storage: a sandbox env var is as sensitive as a
+/// project secret to whatever process runs inside it, so `PlatformSandboxProvider::create_sandbox`
+/// seals every value, whatever `sensitive` flag the create input carries.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvRef {
     pub key: String,
@@ -162,22 +150,18 @@ pub struct SandboxRecord {
     /// exposed to a different tenant/project since the whole record is scoped.
     #[serde(default)]
     pub container: String,
-    /// Human-readable operator note for degraded states (e.g. a record whose
-    /// cell was lost to a node restart and is re-provisioned on next use).
-    /// A provisioning FAILURE never produces a record at all —
-    /// `PlatformSandboxProvider::create_sandbox` fails closed with a typed
+    /// Human-readable operator note for degraded states (for example a record whose cell was lost
+    /// to a node restart and is re-provisioned on next use). A provisioning FAILURE never produces
+    /// a record at all: `PlatformSandboxProvider::create_sandbox` fails closed with a typed
     /// `EngineUnavailable`, so this is never a "simulated" marker.
     #[serde(default)]
     pub note: String,
-    /// The node that holds this sandbox's live cell — the ONLY node that can
-    /// run commands, open a shell, stop or delete it. Sandbox mutations are
-    /// still forwarded to the control-plane leader (`admin_ingress`), but the
-    /// leader itself may have no exec-capable backend (fc-sanjose runs Mock),
-    /// in which case `sandboxes_api::create_sandbox` delegates provisioning to
-    /// a capable peer and adopts the peer's record; every cell-reaching
-    /// operation then re-routes to THIS node. Empty only on a record persisted
-    /// before this field existed — readers treat that as "the leader" (the
-    /// pre-field placement rule).
+    /// The node holding this sandbox's live cell: the ONLY node that can run commands, open a
+    /// shell, stop or delete it. Mutations are forwarded to the control-plane leader
+    /// (`admin_ingress`), but a leader with no exec-capable backend has
+    /// `sandboxes_api::create_sandbox` delegate provisioning to a capable peer and adopt the peer's
+    /// record; every cell-reaching operation then re-routes to THIS node. Empty only on a record
+    /// persisted before this field existed, which readers treat as "the leader".
     #[serde(default)]
     pub owner_node: String,
 }
@@ -204,9 +188,8 @@ pub struct SandboxCommandRecord {
     pub status: CommandStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Redacted, size-bounded output — the log lines themselves ARE the
-    /// "stdoutRef"/"stderrRef" (no separate blob store exists in this repo; this
-    /// mirrors the `BuildStore`/`Vec<LogLine>` idiom exactly).
+    /// Redacted, size-bounded output: the log lines themselves ARE the stdout/stderr reference (no
+    /// separate blob store exists), the same `BuildStore`/`Vec<LogLine>` idiom.
     #[serde(default)]
     pub stdout: Vec<LogLine>,
     #[serde(default)]
@@ -272,10 +255,6 @@ pub struct SandboxMountRecord {
     pub updated_at: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Typed errors
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxError {
     NotFound(String),
@@ -291,9 +270,9 @@ pub enum SandboxError {
     SnapshotNotFound(String),
     MountNotFound(String),
     AlreadyExists(String),
-    /// No node in the live registry advertises an exec-capable sandbox backend
-    /// (or every one that does refused/timed out) — the create was applied
-    /// NOWHERE. Carries the candidates tried and why each failed.
+    /// No node in the live registry advertises an exec-capable sandbox backend, or every one that
+    /// does refused or timed out: the create was applied NOWHERE. Carries the candidates tried and
+    /// why each failed.
     NoCapableNode(String),
     /// The record names an owner node that could not be reached for a
     /// cell-touching operation — nothing was applied; retry later.
@@ -340,21 +319,16 @@ impl SandboxError {
     }
 }
 
-/// THE capability predicate: can a node whose gossiped `NodeInfo::backend` is
-/// `backend` provision a sandbox cell AND execute commands / open a PTY inside
-/// it? One function, used by every caller — the local "may I provision here"
-/// check and the remote candidate filter — so the two can never disagree.
-/// "firecracker" runs `hive-cell-agent`'s `Exec`/`KillExec`/`ExecPty` over
-/// vsock; "litebox" runs `LiteboxBackend::exec_command`/`kill_exec`/`exec_pty`
-/// against a host-spawned guest. "mock" (and anything unknown / a pre-upgrade
-/// peer's empty string) has no real isolation and is never a candidate.
+/// THE capability predicate: can a node whose gossiped `NodeInfo::backend` is `backend` provision a
+/// sandbox cell AND execute commands / open a PTY inside it? One function serves the local "may I
+/// provision here" check and the remote candidate filter, so the two can never disagree.
+/// `firecracker` runs `hive-cell-agent`'s `Exec`/`KillExec`/`ExecPty` over vsock; `litebox` runs
+/// `LiteboxBackend::exec_command`/`kill_exec`/`exec_pty` against a host-spawned guest. `mock`,
+/// anything unknown and a pre-upgrade peer's empty string have no real isolation and are never a
+/// candidate.
 pub fn sandbox_exec_capable(backend: &str) -> bool {
     matches!(backend, "firecracker" | "litebox")
 }
-
-// ---------------------------------------------------------------------------
-// Validation (pure — no I/O)
-// ---------------------------------------------------------------------------
 
 pub const RUNTIMES: &[&str] = &["node26", "node24", "node22", "python3.13"];
 
@@ -368,9 +342,8 @@ pub fn validate_runtime(runtime: &str) -> Result<(), SandboxError> {
     }
 }
 
-/// Sandbox names follow the same DNS-label-safe shape used for projects/
-/// containers elsewhere in the platform: lowercase alnum + hyphen, 1-63 chars,
-/// not starting/ending with a hyphen.
+/// Names are DNS-label safe like projects and containers elsewhere in the platform: lowercase
+/// alphanumerics and hyphens, 1-63 chars, no leading or trailing hyphen.
 pub fn validate_name(name: &str) -> Result<(), SandboxError> {
     let n = name.trim();
     if n.is_empty() || n.len() > 63 {
@@ -392,10 +365,9 @@ pub fn validate_name(name: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// argv validation: every command runs as argv (`cmd`, `args: Vec<String>`),
-/// NEVER shell-interpolated — this is what makes shell injection structurally
-/// impossible for the default path. Rejects empty commands and embedded NUL
-/// bytes (the one byte that can desync argv parsing/exec syscalls).
+/// Every command runs as argv (`cmd`, `args`), never shell-interpolated, which makes shell
+/// injection structurally impossible on the default path. Rejects an empty command and embedded NUL
+/// bytes (the one byte that can desync argv parsing across exec syscalls).
 pub fn validate_argv(cmd: &str, args: &[String]) -> Result<(), SandboxError> {
     if cmd.trim().is_empty() {
         return Err(SandboxError::InvalidArgv(
@@ -410,9 +382,8 @@ pub fn validate_argv(cmd: &str, args: &[String]) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// `sudo` is a project-policy opt-in, never implicit — this enforces the
-/// "only if explicitly enabled" invariant at the validation layer so every
-/// caller (API, tests) shares one gate.
+/// `sudo` is a project-policy opt-in, never implicit: the one gate every caller (API, tests) shares
+/// for the "only if explicitly enabled" invariant.
 pub fn validate_sudo(requested: bool, project_allows_sudo: bool) -> Result<(), SandboxError> {
     if requested && !project_allows_sudo {
         return Err(SandboxError::Unauthorized(
@@ -508,11 +479,10 @@ pub fn validate_mount(
     Ok(())
 }
 
-/// Redact every occurrence of each secret's PLAINTEXT value out of `text`,
-/// replacing with `[REDACTED]`. Applied to command output before it is
-/// persisted or returned to the client — secrets never reach logs/telemetry.
-/// Longest-first so a secret that is a substring of another doesn't leave a
-/// partial, still-sensitive fragment behind.
+/// Redacts every occurrence of each secret's PLAINTEXT value out of `text` with `[REDACTED]`;
+/// applied to command output before it is persisted or returned, so secrets never reach logs or
+/// telemetry. Longest first, so a secret that is a substring of another leaves no partial,
+/// still-sensitive fragment behind.
 pub fn redact_secrets(text: &str, secret_values: &[String]) -> String {
     if secret_values.is_empty() {
         return text.to_string();
@@ -541,10 +511,6 @@ pub fn bound_line(line: &str, max_bytes: usize) -> String {
     format!("{}… [truncated]", &line[..end])
 }
 
-// ---------------------------------------------------------------------------
-// Quotas
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug)]
 pub struct SandboxQuota {
     pub max_sandboxes: u32,
@@ -565,9 +531,8 @@ pub fn check_quota(current: u32, max: u32, resource: &str) -> Result<(), Sandbox
     Ok(())
 }
 
-/// Persisted snapshot of all sandbox-related records — mirrors the
-/// `EnterpriseSnapshot`/`DatabaseStore` idiom (`#[serde(default)]` on every
-/// field so schema evolution is backward-compatible).
+/// Persisted snapshot of all sandbox records; every field is `#[serde(default)]` so the schema can
+/// evolve backward-compatibly.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SandboxesSnapshot {
     #[serde(default)]
@@ -579,10 +544,6 @@ pub struct SandboxesSnapshot {
     #[serde(default)]
     pub mounts: Vec<SandboxMountRecord>,
 }
-
-// ---------------------------------------------------------------------------
-// Provider abstraction
-// ---------------------------------------------------------------------------
 
 /// Also the wire shape of a leader→owner delegated create (serde derives), so
 /// the delegate provisions from EXACTLY the input the leader validated.
@@ -596,7 +557,9 @@ pub struct CreateSandboxInput {
     pub persistent: bool,
     pub ports: Vec<u16>,
     pub network_policy: NetworkPolicy,
-    pub env: Vec<(String, String, bool)>, // (key, value, sensitive)
+    /// `(key, value, sensitive)`. `PlatformSandboxProvider` seals every value regardless of the
+    /// flag.
+    pub env: Vec<(String, String, bool)>,
     pub tags: Vec<String>,
     /// "empty" | "git" | "tarball" | "snapshot" | "project".
     pub source_kind: String,
@@ -633,10 +596,9 @@ pub struct MountConfigInput {
     pub extra_args: HashMap<String, String>,
 }
 
-/// Provider-neutral sandbox backend. The UI/API talk to this trait, never to a
-/// concrete engine directly — [`crate::sandboxes_platform::PlatformSandboxProvider`]
-/// (Firecracker/Litebox) is the production implementation; [`MockSandboxProvider`]
-/// exists ONLY for unit tests.
+/// Provider-neutral sandbox backend: the UI/API talk to this trait, never to a concrete engine.
+/// [`crate::sandboxes_platform::PlatformSandboxProvider`] (Firecracker/Litebox) is the production
+/// implementation; [`MockSandboxProvider`] exists only for tests.
 #[async_trait::async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError>;
@@ -657,12 +619,11 @@ pub trait SandboxProvider: Send + Sync {
         project_id: &str,
         input: CreateSandboxInput,
     ) -> Result<SandboxRecord, SandboxError>;
-    /// Bring a STOPPED sandbox back up: re-provision its cell (the cell handle
-    /// is dropped by `stop`/`delete`/a restart, so `start` is a fresh
-    /// provision, never a resume of dead state) and publish it as `Running`.
-    /// Idempotent: starting an already-`Running` sandbox refreshes only its
-    /// idle deadline and never resets `last_started_at`, so
-    /// `stop`'s `total_duration_ms` accumulation stays correct.
+    /// Brings a STOPPED sandbox back up: re-provisions its cell (`stop`, `delete` and a restart
+    /// drop the cell handle, so `start` is a fresh provision, never a resume of dead state) and
+    /// publishes it as `Running`. Idempotent: starting an already-`Running` sandbox refreshes only
+    /// its idle deadline and never resets `last_started_at`, so `stop`'s `total_duration_ms`
+    /// accumulation stays correct.
     async fn start_sandbox(&self, project_id: &str, id: &str)
         -> Result<SandboxRecord, SandboxError>;
     async fn stop_sandbox(&self, project_id: &str, id: &str)
@@ -691,14 +652,12 @@ pub trait SandboxProvider: Send + Sync {
         id: &str,
         command_id: &str,
     ) -> Result<SandboxCommandRecord, SandboxError>;
-    /// Open an interactive terminal session against the sandbox's cell (real
-    /// pty: `vim`/`less`/`^C`/tab-completion all work). Returns an event
-    /// receiver (`hive_core::AgentEvent::PtyOutput`* then one `PtyExited`)
-    /// plus a [`hive_backend::PtyIo`] the caller uses to push typed bytes /
-    /// resize events back — mirrors `run_command`'s shape but duplex and
-    /// long-lived instead of one-shot. `EngineUnavailable` on a node with no
-    /// real isolation backend, or one whose backend doesn't implement PTY
-    /// support yet (`CellBackend::exec_pty`'s own unsupported default).
+    /// Opens an interactive terminal session against the sandbox's cell (a real pty: `vim`, `less`,
+    /// `^C` and tab-completion work). Returns an event receiver (`hive_core::AgentEvent::PtyOutput`
+    /// events, then one `PtyExited`) plus a [`hive_backend::PtyIo`] for pushing typed bytes and
+    /// resize events back: `run_command`'s shape, but duplex and long-lived. `EngineUnavailable` on
+    /// a node with no real isolation backend or one whose backend does not implement PTY support
+    /// (`CellBackend::exec_pty`'s unsupported default).
     async fn open_shell(
         &self,
         project_id: &str,
@@ -760,10 +719,6 @@ pub trait SandboxProvider: Send + Sync {
     ) -> Result<Vec<SandboxMountRecord>, SandboxError>;
     async fn delete_mount(&self, project_id: &str, mount_id: &str) -> Result<(), SandboxError>;
 }
-
-// ---------------------------------------------------------------------------
-// MockSandboxProvider — strictly for tests. Never the production default.
-// ---------------------------------------------------------------------------
 
 /// In-memory provider used ONLY by unit/integration tests exercising the
 /// service layer (authz, quotas, validation) without spinning up real

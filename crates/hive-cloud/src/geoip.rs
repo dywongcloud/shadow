@@ -1,80 +1,61 @@
-//! Local IP-prefix → coordinate table: the geo half of Seer's proximity answers
+//! Local IP-prefix to coordinate table: the geo half of Seer's proximity answers
 //! (`crate::dns_geo`), resolved in-process with no network call at all.
 //!
-//! # Why this replaced an HTTP lookup
+//! # Why a table
 //!
-//! `GeoCache` used to answer "where is this client" by calling `ip-api.com` on a
-//! paced background worker. That put a free third-party service in a production
-//! data path: it rate-limits per source IP, it can go down, and every lookup
-//! handed a real client prefix to someone else's logs. Degradation was graceful
-//! (an unplaceable prefix simply gets the generic health-ordered answer), so
-//! this was never an outage — it was a dependency with no upside. A table we
-//! ship removes it: same answer, no request, no rate limit, nothing leaked, and
-//! it works on a node with no egress at all.
+//! A shipped table replaced a paced HTTP lookup against a free third-party service. That service
+//! rate-limits per source IP, can go down, and was handed every client prefix to log, while
+//! degradation was graceful (an unplaceable prefix just gets the generic health-ordered answer), so
+//! it was a dependency with no upside. The table gives the same answer with no request, no rate
+//! limit, nothing leaked, and it works on a node with no egress at all.
 //!
 //! # Where the table comes from
 //!
-//! `assets/geoloc.bin`, built by `scripts/gen-geo-table.py` from DB-IP's
-//! "IP to City Lite" CSV (CC-BY-4.0 — the licence is why it, and not MaxMind's
-//! otherwise-equivalent GeoLite2, is the input). The blob is COMMITTED and
-//! `include_bytes!`-embedded, which is the whole point: a build needs no network
-//! and a node needs no provisioning step. Refreshing it is deliberate — re-run
-//! the generator, commit, roll the fleet like any other binary change. Prefix →
-//! city assignments move on the order of months, and a stale table degrades to
-//! "slightly wrong nearest node", never to a failure.
+//! `assets/geoloc.bin`, built by `scripts/gen-geo-table.py` from DB-IP's "IP to City Lite" CSV
+//! (CC-BY-4.0, which is why it, and not MaxMind's otherwise equivalent GeoLite2, is the input). The
+//! blob is COMMITTED and `include_bytes!`-embedded: a build needs no network and a node needs no
+//! provisioning step. Refreshing it is deliberate (re-run the generator, commit, roll the fleet
+//! like any other binary change); prefix to city assignments move over months, and a stale table
+//! degrades to "slightly wrong nearest node", never to a failure.
 //!
 //! # Size and memory cost
 //!
-//! 5.3 MB of `.rodata`: 804 441 IPv4 rows + 81 040 IPv6 rows, six bytes each.
-//! Being static, it is demand-paged straight from the executable and never
-//! copied to the heap — a binary search touches ~20 pages, so the *resident*
-//! cost is tens of KB of clean, evictable page cache. That matters: fc-saopaulo
-//! has 2.2 GB of RAM, and this must not be a per-node megabyte tax. Loading the
-//! same data into a `HashMap` would cost ~50 MB of dirty heap on every node to
-//! answer the same question no faster.
-//!
-//! The 8.05M source ranges reduce to 885k rows through two lossy steps, both
-//! measured against the raw data rather than assumed (see the generator):
-//! coordinates snap to a 1° grid cell (u16, ~48 km median error), and adjacent
-//! runs fold together when folding moves the answer under 800 km. Cost of that
-//! reduction, measured over 60 000 addresses sampled proportionally to
-//! allocation size: **18 km** of extra great-circle distance per query against a
-//! hypothetical 24-site global fleet, **1 km** against the real 5-metro one.
-//! Both are far below the error already inherent in equating geographic
-//! distance with network latency.
+//! About 5 MB of `.rodata`, on the order of a million six-byte rows. Being static, it is
+//! demand-paged straight from the executable and never copied to the heap: a binary search touches
+//! ~20 pages, so the RESIDENT cost is tens of KB of clean, evictable page cache, which matters on
+//! small-RAM nodes. Loading the same data into a `HashMap` would cost tens of MB of dirty heap on
+//! every node to answer the same question no faster. The source ranges reduce to those rows through
+//! two lossy steps (coordinates snapped to a grid cell, adjacent runs folded within a distance
+//! tolerance), both measured against the raw data by the generator.
 //!
 //! # Lookup
 //!
-//! Rows are `(start: u32, cell: u16)` sorted ascending, meaning "from `start`
-//! until the next row's start, the location is `cell`" — a longest-prefix match
-//! degenerates to `partition_point` over a sorted range table. IPv6 keys on the
-//! address's top 32 bits (a /32, one RIR allocation), so both families share one
-//! row shape and one search. `cell == 0xFFFF` is an explicit hole: space the
-//! source cannot place. It is a row, not a gap, precisely so a lookup inside it
-//! returns "unknown" instead of silently inheriting the previous row's city.
+//! Rows are `(start: u32, cell: u16)` sorted ascending, meaning "from `start` until the next row's
+//! start, the location is `cell`", so a longest-prefix match degenerates to `partition_point` over
+//! a sorted range table. IPv6 keys on the address's top 32 bits (a /32, one RIR allocation), so
+//! both families share one row shape and one search. `cell == 0xFFFF` is an explicit hole: space
+//! the source cannot place. It is a row, not a gap, precisely so a lookup inside it returns
+//! "unknown" instead of silently inheriting the previous row's city.
 //!
 //! # When the table is absent
 //!
-//! It cannot be, for the embedded copy — a build without it does not link. The
-//! `HIVE_DNS_GEO_TABLE` override can name a file that is missing or corrupt; a
-//! failed header/checksum check logs once and falls back to the embedded table
-//! rather than running blind. And a lookup that legitimately misses (a hole, or
-//! a prefix newer than the table) returns `None`, which is exactly the state
-//! `GeoCache` already had a path for: generic answer now, optional remote
-//! lookup in the background if the operator configured one.
+//! It cannot be, for the embedded copy: a build without it does not link. The `HIVE_DNS_GEO_TABLE`
+//! override can name a file that is missing or corrupt; a failed header/checksum check logs once
+//! and falls back to the embedded table rather than running blind. A lookup that legitimately
+//! misses (a hole, or a prefix newer than the table) returns `None`, the state `GeoCache` already
+//! had a path for: a generic answer now, an optional remote lookup in the background if the
+//! operator configured one.
 
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-/// The table shipped with the binary. `include_bytes!` rather than a build
-/// script: the asset is an input, not a derived artifact, and a build script
-/// that regenerates it would put the source CSV's availability back on the
-/// build path — the dependency this module exists to delete.
+/// The table shipped with the binary: `include_bytes!` of a committed asset (an input, not a
+/// derived artifact), because a build script that regenerated it would put the source CSV's
+/// availability back on the build path.
 static EMBEDDED: &[u8] = include_bytes!("../assets/geoloc.bin");
 
-/// File header sentinel. Format version is the last byte, so a future v2 blob
-/// fails the magic check outright instead of being parsed as a v1 with garbage
-/// counts.
+/// File header sentinel. The format version is the last byte, so a future v2 blob fails the magic
+/// check outright instead of being parsed as v1 with garbage counts.
 const MAGIC: &[u8; 8] = b"HIVEGEO\x01";
 const HEADER_LEN: usize = 32;
 const ROW_LEN: usize = 6;
@@ -96,13 +77,10 @@ struct Table {
 }
 
 impl Table {
-    /// Validate a blob and borrow its two row arrays.
-    ///
-    /// Every field the reader will later trust is checked HERE, once: magic,
-    /// grid geometry, declared row counts against the actual length, and an
-    /// FNV-1a checksum over the row bytes. Re-verifying per lookup would mean
-    /// hashing 5 MB to answer one query; the structure is immutable after this
-    /// point, so once is the correct number of times.
+    /// Validates a blob and borrows its two row arrays. Every field the reader later trusts is
+    /// checked HERE, once: magic, grid geometry, declared row counts against the actual length, and
+    /// an FNV-1a checksum over the row bytes. Re-verifying per lookup would hash megabytes to
+    /// answer one query, and the structure is immutable from this point on.
     fn parse(buf: &'static [u8], source: &'static str) -> Result<Self, String> {
         if buf.len() < HEADER_LEN {
             return Err(format!("truncated: {} bytes", buf.len()));
@@ -140,12 +118,9 @@ impl Table {
         })
     }
 
-    /// Longest-prefix match: the last row whose start is `<= key`.
-    ///
-    /// `partition_point` is a plain branchless-ish binary search over a slice we
-    /// never copy — ~20 iterations, no allocation, no lock, no syscall. That is
-    /// what makes it safe to call inline from the DNS loop where the old HTTP
-    /// lookup was not.
+    /// Longest-prefix match: the last row whose start is `<= key`, found by a binary search over
+    /// the borrowed bytes (~20 iterations, no allocation, no lock, no syscall), which is what makes
+    /// it safe to call inline from the DNS loop.
     fn cell(&self, rows: &[u8], key: u32) -> u16 {
         let n = rows.len() / ROW_LEN;
         let idx = partition_point(n, |i| start_at(rows, i) <= key);
@@ -187,11 +162,10 @@ fn start_at(rows: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([rows[off], rows[off + 1], rows[off + 2], rows[off + 3]])
 }
 
-/// Index of the first `i` in `0..n` for which `pred(i)` is false, `pred` being
-/// monotone. Written out rather than reached for via `slice::partition_point`
-/// because the rows are a flat byte array, not a slice of a row type — decoding
-/// 885k rows into a `Vec<(u32, u16)>` to get one method back would cost 7 MB of
-/// heap per node.
+/// Index of the first `i` in `0..n` for which the monotone `pred(i)` is false. Written out rather
+/// than reached for via `slice::partition_point` because the rows are a flat byte array, not a
+/// slice of a row type: decoding every row into a `Vec<(u32, u16)>` to get one method back would
+/// cost several MB of heap per node.
 fn partition_point(n: usize, pred: impl Fn(usize) -> bool) -> usize {
     let (mut lo, mut hi) = (0usize, n);
     while lo < hi {
@@ -218,21 +192,20 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// read from the DNS loop: no lock, no refcount traffic, one validation.
 static TABLE: OnceLock<Option<Table>> = OnceLock::new();
 
+/// The process-wide table, resolved once. `HIVE_DNS_GEO_TABLE` lets an operator ship a fresher or
+/// higher-resolution blob without a rebuild: it SUPERSEDES the embedded table only if it validates,
+/// and a missing or corrupt file falls back to the embedded one, because a typo in a path must not
+/// silently switch geo routing off. An override file is leaked deliberately: the table lives for
+/// the whole process, and leaking once gives every lookup the same `&'static` zero-copy shape as
+/// the embedded blob. Only a corrupt committed asset, which a build cannot detect, ends with no
+/// table: that logs loudly and geo degrades to generic answers, never to a wrong one.
 fn table() -> Option<&'static Table> {
     TABLE
         .get_or_init(|| {
-            // `HIVE_DNS_GEO_TABLE` lets an operator ship a fresher or
-            // higher-resolution blob without a rebuild. It SUPERSEDES the
-            // embedded table only if it validates; a missing or corrupt file
-            // falls back rather than leaving the node blind, because a typo in
-            // a path must not silently switch geo routing off.
             if let Ok(p) = std::env::var("HIVE_DNS_GEO_TABLE") {
                 let p = p.trim().to_string();
                 if !p.is_empty() {
                     match std::fs::read(&p) {
-                        // Leaked deliberately: the table lives for the whole
-                        // process, and leaking once buys every lookup the same
-                        // `&'static` zero-copy shape the embedded blob has.
                         Ok(bytes) => match Table::parse(Box::leak(bytes.into_boxed_slice()), "file") {
                             Ok(t) => {
                                 tracing::info!(path = %p, "geoip: using override table");
@@ -247,9 +220,6 @@ fn table() -> Option<&'static Table> {
             match Table::parse(EMBEDDED, "embedded") {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    // Only reachable if the committed asset is corrupt, which a
-                    // build cannot detect. Loud, and geo degrades to generic
-                    // answers — never to a wrong answer.
                     tracing::error!(error = %e, "geoip: embedded table rejected; proximity answers disabled");
                     None
                 }
@@ -258,12 +228,10 @@ fn table() -> Option<&'static Table> {
         .as_ref()
 }
 
-/// Coordinates for `ip` from the local table, or `None` when the table cannot
-/// place it (an explicit hole, or space allocated after the table was built).
-///
-/// Non-blocking by construction: a binary search over static bytes. There is no
-/// I/O here and there must never be — the contract `dns_geo` depends on is that
-/// locating a client can never stall a DNS response.
+/// Coordinates for `ip` from the local table, or `None` when the table cannot place it (an explicit
+/// hole, or space allocated after the table was built). Non-blocking by construction: a binary
+/// search over static bytes with no I/O, and there must never be any, since `dns_geo` depends on
+/// locating a client never stalling a DNS response.
 pub fn locate(ip: IpAddr) -> Option<(f64, f64)> {
     table()?.locate(ip)
 }
