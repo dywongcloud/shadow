@@ -176,6 +176,8 @@ mod linux {
     }
 
     /// Listen on AF_VSOCK and serve requests until a build completes.
+    /// A `handle_conn` answer of `true` means a build ran and ends the loop (the cell is
+    /// single-use); ping, keepalive, exec and function requests keep it listening.
     fn serve() -> std::io::Result<()> {
         let listen_fd = vsock_listen(CELL_AGENT_PORT)?;
         eprintln!(
@@ -192,12 +194,19 @@ mod linux {
             // just a typed wrapper around read()/write() on it.
             let stream = unsafe { UnixStream::from_raw_fd(conn_fd) };
             match handle_conn(stream) {
-                Ok(true) => return Ok(()), // a build ran; cell is single-use
-                Ok(false) => continue,     // ping/keepalive/exec/function; keep listening
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
                 Err(e) => eprintln!("connection error: {e}"),
             }
         }
     }
+
+    /// `sudo -n`: fail instead of prompting for a password.
+    const SUDO_NON_INTERACTIVE_FLAG: &str = "-n";
+
+    /// Exit status of a forked child whose `execv` returned (it only returns on failure), the shell
+    /// convention for command-not-found.
+    const EXEC_FAILED_EXIT_CODE: i32 = 127;
 
     const MAX_ACCEPTED_HANDSHAKE_NONCES: usize = 4096;
     static ACCEPTED_HANDSHAKE_NONCES: std::sync::OnceLock<
@@ -614,7 +623,7 @@ mod linux {
             match sudo_path {
                 Some(sudo) => {
                     let mut wrapped = Command::new(sudo);
-                    wrapped.arg("-n"); // never prompt for a password
+                    wrapped.arg(SUDO_NON_INTERACTIVE_FLAG);
                     if req.shell {
                         wrapped.arg("/bin/sh").arg("-c");
                         let mut full = req.cmd.clone();
@@ -824,7 +833,7 @@ mod linux {
                 }
                 let argv: [*const libc::c_char; 2] = [argv0_c.as_ptr(), std::ptr::null()];
                 libc::execv(shell_c.as_ptr(), argv.as_ptr());
-                libc::_exit(127); // execv only returns on failure
+                libc::_exit(EXEC_FAILED_EXIT_CODE);
             }
         }
 

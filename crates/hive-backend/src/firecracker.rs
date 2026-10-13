@@ -431,13 +431,13 @@ impl FirecrackerBackend {
                 continue;
             }
             let Ok(md) = e.metadata().await else { continue };
-            let recent = md
+            let recent_or_unknown_age = md
                 .modified()
                 .ok()
                 .and_then(|t| now.duration_since(t).ok())
                 .map(|age| age < grace)
-                .unwrap_or(true); // unknown mtime => treat as recent, never reap
-            if recent {
+                .unwrap_or(true);
+            if recent_or_unknown_age {
                 continue;
             }
             candidates.push((e.path(), stem.to_string(), md.len()));
@@ -2897,6 +2897,9 @@ impl CellBackend for FirecrackerBackend {
 impl FirecrackerBackend {
     /// Start one argv command inside `cell` and stream its `AgentEvent`s (`ExecOutput`* then one
     /// `ExecDone`) on an unbounded channel; returns once the connection is established.
+    /// The returned channel closes when the connection does (callers read that as done or killed)
+    /// and the stream pump stops when the receiver is dropped (e.g. the command was killed and the
+    /// caller stopped listening).
     pub async fn exec_command(
         &self,
         cell: &CellHandle,
@@ -2915,7 +2918,7 @@ impl FirecrackerBackend {
             loop {
                 let frame = match read_frame(&mut stream).await {
                     Ok(f) => f,
-                    Err(_) => break, // connection closed — caller treats as done/killed
+                    Err(_) => break,
                 };
                 let ev: AgentEvent = match serde_json::from_slice(&frame) {
                     Ok(e) => e,
@@ -2923,7 +2926,7 @@ impl FirecrackerBackend {
                 };
                 let is_done = matches!(ev, AgentEvent::ExecDone { .. });
                 if tx.send(ev).is_err() {
-                    break; // receiver dropped (e.g. command was killed and caller stopped listening)
+                    break;
                 }
                 if is_done {
                     break;
@@ -2935,6 +2938,8 @@ impl FirecrackerBackend {
 
     /// Open one interactive pty session inside `cell`: an `AgentEvent` receiver (`PtyOutput`* then
     /// `PtyExited`) plus a [`PtySender`] for typed bytes / resize events on the SAME connection.
+    /// The event channel closes when the connection does (callers read that as exited) and the pump
+    /// stops when the receiver is dropped; sends on a closed connection are silently dropped.
     pub async fn exec_pty(
         &self,
         cell: &CellHandle,
@@ -2954,7 +2959,7 @@ impl FirecrackerBackend {
             loop {
                 let frame = match read_frame(&mut read_half).await {
                     Ok(f) => f,
-                    Err(_) => break, // connection closed — caller treats as exited
+                    Err(_) => break,
                 };
                 let ev: AgentEvent = match serde_json::from_slice(&frame) {
                     Ok(e) => e,
@@ -2962,7 +2967,7 @@ impl FirecrackerBackend {
                 };
                 let is_exited = matches!(ev, AgentEvent::PtyExited { .. });
                 if tx.send(ev).is_err() {
-                    break; // receiver dropped (caller stopped listening)
+                    break;
                 }
                 if is_exited {
                     break;
@@ -2977,7 +2982,7 @@ impl FirecrackerBackend {
                     continue;
                 };
                 if write_frame(&mut write_half, &payload).await.is_err() {
-                    break; // connection closed — further sends are silently dropped
+                    break;
                 }
             }
         });
