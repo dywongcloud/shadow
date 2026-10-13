@@ -907,10 +907,10 @@ pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
             if !p.is_dir() {
                 continue;
             }
-            let has_build_input = p.join("package.json").exists()
-                || p.join("Dockerfile").exists()
-                || p.join("Containerfile").exists();
-            if !has_build_input {
+            let lacks_build_input = !p.join("package.json").exists()
+                && !p.join("Dockerfile").exists()
+                && !p.join("Containerfile").exists();
+            if lacks_build_input {
                 continue;
             }
             if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
@@ -969,10 +969,10 @@ fn newest_deploy_dir_for_ids_inner(project: &str, ids: &[String]) -> Option<Path
             if !p.is_dir() {
                 continue;
             }
-            let has_build_input = p.join("package.json").exists()
-                || p.join("Dockerfile").exists()
-                || p.join("Containerfile").exists();
-            if !has_build_input {
+            let lacks_build_input = !p.join("package.json").exists()
+                && !p.join("Dockerfile").exists()
+                && !p.join("Containerfile").exists();
+            if lacks_build_input {
                 continue;
             }
             if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
@@ -1310,6 +1310,8 @@ pub(crate) fn upload_source_build_id(source: &fluid_core::GitSource) -> Option<S
 /// Durable retained source for one upload lineage: the build id is platform-issued and validated
 /// before it becomes a path component, so previews and production uploads never overwrite one
 /// project-wide archive.
+/// Stored as a FILE beside the checkouts: `gc_build_dirs` only reaps directories, so it survives
+/// build-dir GC and host reboots; written via tmp + rename so readers never see a torn zip.
 fn retained_source_write_path(project: &str, build_id: &str) -> PathBuf {
     debug_assert!(valid_source_build_id(build_id));
     deploy_root().join(format!("{}-{build_id}.src.zip", checkout_tag(project)))
@@ -2060,6 +2062,38 @@ fn drop_git_token_for_non_git_source(req: &mut GitDeployRequest) {
     }
 }
 
+/// Project function settings only fill in what a function left at its default: a fluid.json value
+/// always survives, and an explicit value equal to the default is indistinguishable from omission,
+/// which is a no-op whenever the two agree.
+fn fill_unset_from_project_defaults(
+    f: &mut fluid_core::FunctionConfig,
+    fsettings: &crate::project_settings::FunctionSettings,
+) {
+    if f.max_duration_secs == fluid_core::FunctionConfig::default().max_duration_secs {
+        f.max_duration_secs = fsettings.default_max_duration_secs;
+    }
+    if f.vcpus == fluid_core::FunctionConfig::default().vcpus {
+        f.vcpus = fsettings.vcpus.max(1);
+    }
+    if f.memory_mib == fluid_core::FunctionConfig::default().memory_mib {
+        f.memory_mib = fsettings.memory_mib;
+    }
+    f.vcpus = f.vcpus.max(1);
+}
+
+/// Fluid Compute ON (the default): one warm instance serves many concurrent requests (in-instance
+/// concurrency suits I/O-bound work) and at least one instance stays warm; OFF is classic
+/// one-request-per-instance with scale-to-zero.
+fn apply_compute_mode(f: &mut fluid_core::FunctionConfig, fluid_enabled: bool) {
+    if fluid_enabled {
+        f.max_concurrency = f.max_concurrency.max(10);
+        f.min_instances = f.min_instances.max(1);
+    } else {
+        f.max_concurrency = 1;
+        f.min_instances = 0;
+    }
+}
+
 fn resolve_build_trust(
     cloud: &Arc<CloudState>,
     req: &GitDeployRequest,
@@ -2129,12 +2163,14 @@ fn build_isolation_unavailable_message(
 ) -> String {
     let requirement = "this source deployment needs a node that can run repository build commands (an isolated BuildExecutor v1, or a host-exec mock/litebox backend that builds on the host), but no healthy reachable placement satisfying the request offers one";
     let mut sentences: Vec<String> = Vec::new();
-    if diagnosis.capable_total > 0 && regions.is_empty() {
+    let fleet_has_no_build_capable_node = diagnosis.capable_total == 0;
+    if fleet_has_no_build_capable_node {
+    } else if regions.is_empty() {
         sentences.push(format!(
             "{} node(s) known to the mesh can run repository build commands, of which {} currently pass placement (healthy, reachable and otherwise eligible).",
             diagnosis.capable_total, diagnosis.placeable_in_region
         ));
-    } else if diagnosis.capable_total > 0 {
+    } else {
         let head = format!(
             "{} node(s) known to the mesh can run repository build commands; {} of those are in the project's configured region(s) ({})",
             diagnosis.capable_total,
@@ -2191,11 +2227,6 @@ async fn run_build(
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
 
-    // This is the first operation in the build driver. It runs before fanout,
-    // source acquisition, Git metadata reads, ignoreCommand, install, build,
-    // warmup, or cache access, and is recomputed independently on every target.
-    // The request's target is only an assertion checked against server state;
-    // fork provenance and the stored production branch remain authoritative.
     let trust = resolve_build_trust(cloud, &req, &project, incarnation)?;
     req.target = Some(trust.lane.environment().to_string());
     if trust.lane.is_production() {
@@ -2214,13 +2245,9 @@ async fn run_build(
         }
     }
 
-    // Persist env supplied by a DIRECT deploy as runtime-only and only for the
-    // selected environment. A fanout sub-build receives an already-filtered
-    // ephemeral runtime map from its coordinator; writing that map back would
-    // widen its provenance. A fork request is never allowed to mutate durable
-    // project env, even when it landed on the coordinator directly.
     if let Some(env) = &req.env {
-        if !req.no_fanout && !trust.lane.is_fork() {
+        let direct_deploy_may_persist_env = !req.no_fanout && !trust.lane.is_fork();
+        if direct_deploy_may_persist_env {
             for (k, v) in env {
                 if k.trim().is_empty() {
                     continue;
@@ -2251,10 +2278,6 @@ async fn run_build(
         }
     }
 
-    // On a fanout deploy, adopt the coordinator's forwarded BuildConfig +
-    // FunctionSettings so this target builds with the user's configured framework/
-    // commands + compute tier (not just auto-detect). Direct user deploys omit
-    // these (the coordinator reads its own store).
     if let Some(value) = req.build_config.as_ref() {
         let build_config = serde_json::from_value::<crate::project_settings::BuildConfig>(
             value.clone(),
@@ -2285,55 +2308,16 @@ async fn run_build(
             .set_functions_exact(&project, incarnation, function_settings)?;
     }
 
-    // ---- Placement scheduler / fanout (coordinator only) -------------------
-    // Unless this is already a per-target deploy (`no_fanout`), decide WHERE this
-    // project should be HOSTED from its configured regions + live mesh state, and
-    // place it there rather than always building on this (the coordinator) node —
-    // which is the resource-poor local Mac. See `schedule::place`.
-    if !req.no_fanout {
+    let coordinator_places_project = !req.no_fanout;
+    if coordinator_places_project {
         let placement_settings = cloud.projects.get_exact(&project, incarnation)?;
         let regions = placement_settings.functions.regions.clone();
-        // is_container is unknown until the repo is built (Dockerfile detection),
-        // so default to firecracker placement here; a container is re-homed to a
-        // podman-capable node after the build (see the capability re-dispatch below).
-        // EXCEPT a prebuilt-image deploy is known to be a container up front → place
-        // it on a container-capable node immediately (no post-build re-home needed).
-        // Lease-holder-sticky for redeploys: an existing container project's live
-        // lease pins the redeploy to its current serving node (see
-        // schedule::place_for_project); no lease / new project → normal policy.
-        //
-        // Stateful/single-writer fanout guard: a prebuilt-image deploy is a known
-        // container up front (per the comment above), and per the existing
-        // container-lease single-owner model (`lease.rs`) every container is
-        // treated as stateful for fanout-placement purposes — see
-        // `schedule::place`'s `stateful` doc for why an un-synced multi-region
-        // fanout would silently diverge a container's per-node volume. A
-        // Dockerfile/compose-detected container isn't known yet at this point
-        // (see comment above); once its manifest (and real protocol) exists it
-        // is covered post-build instead — by the multi-region-tail guard below
-        // when THIS node hosts the build, and by the `fanout_secondary`
-        // stateful-replica guard (each dispatched sub-build declines to host if
-        // it turns out stateful and non-primary) on the pure-remote fanout
-        // branch, which never reaches the tail here and whose `no_fanout`
-        // sub-builds skip both of this coordinator's gates.
         let known_container = req.image_ref.is_some();
         let needs_gpu = placement_settings.functions.gpu;
-        // Pre-build placement, so there is no manifest yet — the only Wasmer
-        // signal available this early is an explicit runtime in Project
-        // Settings. A project that declares `runtime: "wasmer"` ONLY in a
-        // vercel.json inside the repo is not knowable until after checkout, and
-        // is caught by the post-build fanout gate and the cold-start refusal
-        // instead. Partial knowledge used honestly: it can only ever REMOVE
-        // incapable nodes, never add one.
         let known_wasm = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
             == Some(hive_core::Runtime::Wasmer);
         let known_bun = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
             == Some(hive_core::Runtime::Bun);
-        // The package manager this build will invoke, when an explicit install
-        // or build command already names one. Known this early only from
-        // Project Settings (vercel.json/fluid.json inside the repo are not read
-        // until checkout) — partial knowledge used honestly, exactly like
-        // `known_wasm`: it can only ever REMOVE an incapable node.
         let known_build_toolchain = build_toolchain_need(
             &placement_settings.build.install_command,
             &placement_settings.build.build_command,
@@ -2354,14 +2338,6 @@ async fn run_build(
             needs_build_isolation,
             known_build_toolchain,
         );
-        // Nodes that can run repository build commands: the isolated executor
-        // (Firecracker) OR a host-exec backend (mock/litebox) that builds on
-        // the host. A fleet with litebox/mock nodes is NOT builder-less.
-        // Diagnosed with `place`'s OWN predicates (health, reachability and
-        // every other `capable()` filter), so the refusal can name the
-        // constraint that actually emptied `targets` instead of reporting a
-        // fleet-wide capability count next to the words "healthy reachable
-        // placement".
         let build_diagnosis = crate::schedule::build_placement_diagnosis(
             cloud,
             &regions,
@@ -2375,17 +2351,10 @@ async fn run_build(
             known_build_toolchain,
         );
         if needs_build_isolation && targets.is_empty() && build_diagnosis.capable_total == 0 {
-            // Refuse EARLY only when project settings already prove a
-            // repository-controlled command will run (an explicit
-            // install/build command). Everything else proceeds to checkout
-            // and planning — platform-only work that executes no repository
-            // code — and the command chokepoints below refuse with this same
-            // message the moment a plan would actually execute anything.
-            // That keeps a pure-static zero-command repo deployable on a
-            // builder-less fleet without weakening the isolation boundary.
-            let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
-                || !placement_settings.build.build_command.trim().is_empty();
-            if explicit_commands {
+            let settings_prove_repository_commands =
+                !placement_settings.build.install_command.trim().is_empty()
+                    || !placement_settings.build.build_command.trim().is_empty();
+            if settings_prove_repository_commands {
                 let msg = build_isolation_unavailable_message(&build_diagnosis, &regions);
                 log(msg.clone());
                 tracing::warn!(project = %project, "deploy refused: no isolated builder capability");
@@ -2393,14 +2362,6 @@ async fn run_build(
             }
             log("No node on this fleet can run repository build commands — only zero-command static deploys can succeed; any repository command will be refused.".into());
         }
-        // A GPU deployment must NEVER fall through to this node when placement
-        // found no GPU-capable target. Everywhere else an empty `targets` means
-        // "host locally", which is the right default — but for a GPU request that
-        // silently lands the deployment on a GPU-less host, and every cold start
-        // then dies with `unresolvable CDI devices nvidia.com/gpu=all`. Witnessed
-        // live: a gpu project was placed on the CPU-only leader (its GPU nodes had
-        // been marked unhealthy) and served 503 DEPLOYMENT_CIRCUIT_OPEN instead of
-        // reporting the real reason. Fail loudly here, naming the actual cause.
         if needs_gpu && targets.is_empty() {
             let gpu_nodes = cloud
                 .registry
@@ -2409,9 +2370,6 @@ async fn run_build(
                 .filter(|n| n.gpu_count > 0)
                 .count();
             let msg = format!(
-                // Assembled from single-line pieces on purpose: a `\`-continued
-                // Rust string literal keeps its source indentation, which shipped
-                // as a run of spaces mid-sentence in a message users actually read.
                 "{} {} {}",
                 format_args!(
                     "this project requests a serverless GPU, but no healthy GPU-capable node is currently reachable ({gpu_nodes} GPU node(s) known to the mesh)."
@@ -2423,15 +2381,6 @@ async fn run_build(
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
             return Err(anyhow::anyhow!(msg));
         }
-        // Same refusal for the wasm runtime, and for the identical reason the GPU
-        // arm above exists. An empty `targets` otherwise means "host locally",
-        // which is the right default for an ordinary deployment but puts a
-        // Wasmer function on a node with no `wasmer` binary — every cold start
-        // then fails NODE_RUNTIME_MISSING forever. `schedule::wasm_capable` is a
-        // HARD filter precisely so this case is reachable; without a loud
-        // refusal here the filter just produced an empty set that the caller
-        // quietly ignored, and the capability gate's own doc comment promised a
-        // guarantee the code did not keep.
         if known_wasm && targets.is_empty() {
             let capable_nodes = cloud
                 .registry
@@ -2452,25 +2401,10 @@ async fn run_build(
             return Err(anyhow::anyhow!(msg));
         }
         if needs_build_isolation && targets.is_empty() {
-            // Same deferred-refusal rule as the fleet-wide gate above: only an
-            // explicit command setting proves a repository-controlled command
-            // will run. Everything else proceeds locally — the command
-            // chokepoints (`require_build_session`) refuse the moment the
-            // resolved plan would actually execute anything, so a
-            // zero-command static repo still deploys on a builder-less node.
-            let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
-                || !placement_settings.build.build_command.trim().is_empty();
-            if explicit_commands {
-                // The refusal now reports all three counts `place` actually
-                // decided on, not just the fleet-wide one: "capable" (can run
-                // repository build commands at all), "capable in the configured
-                // region(s)", and — the figure that explains THIS arm firing —
-                // "healthy and reachable there". Reporting only the first two
-                // read as "plenty of capacity exists" whether the real problem
-                // was the region pin OR every in-region node being
-                // unhealthy/unreachable, and the latter is exactly what sent a
-                // tenant looking for a BuildExecutor on macOS/litebox nodes
-                // that never needed one.
+            let settings_prove_repository_commands =
+                !placement_settings.build.install_command.trim().is_empty()
+                    || !placement_settings.build.build_command.trim().is_empty();
+            if settings_prove_repository_commands {
                 let msg = build_isolation_unavailable_message(&build_diagnosis, &regions);
                 log(msg.clone());
                 tracing::warn!(
@@ -2484,10 +2418,8 @@ async fn run_build(
                 return Err(anyhow::anyhow!(msg));
             }
         }
-        // #3: surface the auto-chosen region(s) in Function Settings — when a
-        // project has none configured (new project), persist where the scheduler
-        // placed it so the dashboard shows that region pre-selected/checked.
-        if regions.is_empty() && !targets.is_empty() {
+        let auto_chosen_regions_to_surface = regions.is_empty() && !targets.is_empty();
+        if auto_chosen_regions_to_surface {
             let node_region: std::collections::HashMap<String, String> = cloud
                 .registry
                 .nodes()
@@ -2514,8 +2446,6 @@ async fn run_build(
                 ));
             }
         }
-        // A target is LOCAL only when it has neither an HTTP admin nor an iroh route
-        // (iroh targets are remote FC nodes reached over the mesh).
         let local_selected = targets
             .iter()
             .any(|t| t.admin.is_none() && t.iroh.is_none());
@@ -2526,53 +2456,22 @@ async fn run_build(
             .collect();
 
         if !targets.is_empty() && !local_selected {
-            // Pure remote placement: do NOT build/host locally. Dispatch to the
-            // chosen region node(s), mirror their build into this build record,
-            // then remove the project from any other node that still hosts it.
             let mut names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             log(format!(
                 "Placement: region-aware scheduler → {}",
                 names.join(", ")
             ));
-            // `primary_first: true` — on this branch NO local target was selected,
-            // so `remote` IS the entire placement in region order: remote[0] (the
-            // first requested region's node, matching the region `schedule::place`'s
-            // stateful guard would itself constrain to) is the designated primary;
-            // every other target is dispatched as a `fanout_secondary` replica.
-            // That flag is what closes the stateful-guard hole on this pure-remote
-            // path: a first-time Dockerfile/compose deploy's container-ness is
-            // UNKNOWN here (see `known_container` above), so this placement gate
-            // ran with stateful=false, and each dispatched sub-build carries
-            // `no_fanout: true` — skipping BOTH its own initial placement gate AND
-            // the post-build multi-region tail gate. Without the flag, a stateful
-            // service whose 2+ selected regions exclude the coordinator's own
-            // region would build independently in every region with the guard
-            // consulted nowhere (the exact split-brain it exists to prevent). With
-            // it, each secondary re-evaluates statefulness AFTER its own build and
-            // declines to host if stateful (see the fanout-replica guard in
-            // `run_build`), collapsing the deploy to the primary region only —
-            // while a STATELESS multi-region fanout proceeds on every target
-            // exactly as before.
-            let mut ok =
-                fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
-            // DISPATCH FALLBACK. `nothing_ran` means every placed target was
-            // UNREACHABLE — the request never arrived anywhere, so nothing is
-            // known about the app and no node holds a half-finished build.
-            // That is exactly the condition under which trying the next
-            // capable node is free of side effects, and refusing to is how a
-            // single cold trunk failed eight consecutive deploys of one
-            // project (see `schedule::dispatch_fallbacks`). Candidates are
-            // tried ONE AT A TIME, each with `fanout_remote`'s own bounded
-            // per-target budget (HTTP 15s, then 2 x 20s iroh), and the loop
-            // stops the moment any node actually RAN the deploy — Ready,
-            // BuildFailed or Declined all mean the app was executed and the
-            // verdict below is about the app, not the fleet.
-            //
-            // Never for a project whose live container lease is held by one of
-            // the unreachable targets: its state volume lives on that node, and
-            // "deploying somewhere else" would silently fork it (the
-            // `place_for_project` stickiness rule). That deploy stays an honest
-            // reachability failure.
+            let primary_first = true;
+            let mut ok = fanout_remote(
+                cloud,
+                bid,
+                &req,
+                &project,
+                incarnation,
+                &remote,
+                primary_first,
+            )
+            .await;
             let mut fallback_landed: Option<String> = None;
             if ok.nothing_ran() && !cloud.build_cancels.is_cancelled(bid) {
                 let pinned = cloud
@@ -2645,29 +2544,10 @@ async fn run_build(
                     }
                 }
             }
-            // Atomic promotion (Vercel convention): only relocate — i.e. remove the
-            // project from nodes that still host the PREVIOUS deployment — once the
-            // new placement actually built & is serving. A FAILED build must never
-            // take down the currently-serving deployment; the old one keeps serving
-            // and the user just sees a failed build. (This is the bug that dropped a
-            // healthy project when a relocating redeploy errored.)
-            // PROMOTION POLICY (see `FanoutOutcome::promotable`): at least one
-            // target genuinely Ready promotes the deployment. A target we could
-            // never REACH degrades capacity; it does not veto the regions that
-            // are demonstrably serving. Before this, every outcome folded into
-            // one bool, so an unreachable node failed the whole deploy even
-            // when two regions had built and gone live.
             let promotable = ok.promotable();
             let unreachable = ok.unreachable();
             let cancelled = (!promotable && ok.cancelled())
                 || (!promotable && cloud.build_cancels.is_cancelled(bid));
-            // Honest wording. "Keeping the existing deployment in place" is a
-            // claim that something is still serving, and it is FALSE for a
-            // project's first-ever deploy attempt — there is nothing to keep.
-            // Witnessed live: internet-structure failed every attempt (0
-            // deployment records, ever) and every failure log line still said
-            // "keeping the existing deployment in place", which reads as "your
-            // site is fine" to an operator watching a genuinely-down project.
             let had_prior_deployment =
                 cloud.gw.deployment_records().iter().any(|r| {
                     r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready
@@ -2675,9 +2555,6 @@ async fn run_build(
                     d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready
                 });
             if promotable {
-                // DEGRADED, not failed: name every target the deploy could not
-                // be delivered to, so the operator sees reduced replication
-                // instead of silence, and so a later reconcile can repair it.
                 if let Some(landed) = fallback_landed.as_deref().filter(|_| ok.ready() > 0) {
                     log(format!(
                         "⚠ Deployed on {landed} because {} could not be reached. The configured region is a preference, not a fence: the next deploy re-evaluates placement and lands back in region once that node is reachable again.",
@@ -2693,25 +2570,9 @@ async fn run_build(
                         unreachable.join(", ")
                     ));
                 }
-                // OFF the critical path: the new placement is provably serving
-                // at this point, so the user's build must not stay "Building"
-                // while stale copies are reaped from unrelated peers. Every
-                // delete is idempotent and independently retried, and nothing
-                // below reads its result.
-                //
-                // Unreachable targets are EXCLUDED from the relocation set's
-                // "keep" list only in the sense that they were never reached —
-                // `names` still lists every intended target, so a node that is
-                // simply unreachable right now is NOT reaped as a stale copy.
-                // Relocation reaping is PRODUCTION-lane semantics: only a
-                // production build defines a new authoritative placement whose
-                // non-targets hold "stale copies". A preview build must never
-                // reap anything (its placement says nothing about where
-                // production lives), and an UNRESOLVABLE environment (no
-                // explicit target, production_branch unknown here) skips the
-                // reap — stale copies linger until the next classified
-                // production build, which is retention, never correctness.
-                if request_is_production(cloud, &req, &project) == Some(true) {
+                let provably_production =
+                    request_is_production(cloud, &req, &project) == Some(true);
+                if provably_production {
                     let c2 = cloud.clone();
                     let p2 = project.clone();
                     let n2 = names.clone();
@@ -2726,12 +2587,6 @@ async fn run_build(
                     "Build cancelled by user.".to_string()
                 });
             } else if ok.build_failed() == 0 && !unreachable.is_empty() {
-                // NOTHING ran anywhere: every target was unreachable. Still a
-                // failed deploy (there is no new version serving), but it must
-                // NOT be reported as a build failure — the application was
-                // never executed, so nothing is known about whether it builds.
-                // Saying "Build failed" here sent users to debug an app that
-                // was never run.
                 log(format!(
                     "✗ Could not reach any target to run this deploy ({}). Nothing was built, so {} \
                      This is a fleet-reachability fault, not a build failure — retry when the \
@@ -2744,10 +2599,6 @@ async fn run_build(
                     }
                 ));
             } else if ok.build_failed() == 0 && ok.declined() > 0 {
-                // Every reachable target deliberately declined to host (stateful
-                // single-writer guard) and none failed. Nothing is serving the new
-                // version, but no application fault occurred — reporting "Build
-                // failed" here would send the user to debug an app that built fine.
                 log(format!(
                     "✗ No target hosted this deploy: {} target(s) declined as a stateful \
                      single-writer service. Nothing was built incorrectly — this is a placement \
@@ -2784,48 +2635,19 @@ async fn run_build(
                 names.join(", ")
             ));
         }
-        // local_selected (host here, fanout extras at the tail) OR no eligible
-        // target (empty → host locally as a safe fallback): fall through.
     }
 
     log(format!("Running build in {region_label} - {region}"));
     log("Build machine configuration: 4 cores, 8 GB".into());
-    // (No artificial pause here. A fixed 350ms sleep used to sit between these
-    // two cosmetic log lines and the real work; nothing synchronizes on it —
-    // the checkout-collision it was once entangled with is solved by the
-    // build-id-suffixed dir names below.)
 
-    // Acquire the source: extract an uploaded ZIP through a descriptor-relative
-    // no-follow bounded importer, or `git clone` a repo.
-    //
-    // The checkout dir carries the BUILD ID, not just the millisecond stamp:
-    // two concurrent builds of the same project used to collide on
-    // `<project>-<now_ms()>` (both wake from the synchronized 350ms sleep above
-    // on the same timer tick), extracting + installing into ONE shared dir —
-    // two racing extraction processes then kill one build with "cannot create
-    // …: No such file or directory" (exit 50) and the loser never reaches
-    // ready (witnessed live 3x). The project component is `sanitize_tag`'d: a
-    // tenant-controlled name is never a path component verbatim.
     let stamp = now_ms();
     let dir = deploy_root().join(format!("{}-{}-{}", checkout_tag(&project), stamp, bid));
-    // Register before the path can become visible to the reaper. Drop releases
-    // it on every return, panic, task abort, and client cancellation; successful
-    // builds have already registered their deployment root before that release.
     let _active_checkout = ActiveCheckoutGuard::new(dir.clone(), &project, incarnation);
     tokio::fs::create_dir_all(deploy_root()).await?;
     let branch = req.branch.clone().unwrap_or_default();
 
-    // Typed immutable source identity for the deployment-generation spine,
-    // captured at the SAME proof boundary each lane acquires its source.
-    // `None` means this lane cannot PROVE an immutable source (checkout-copy
-    // redeploys, prebuilt images) — the generation transfer lane then stays
-    // off for this build and the legacy fanout path is unchanged; it is never
-    // a build failure by itself.
     let mut source_snapshot: Option<fluid_build::SourceSnapshot> = None;
     let (commit, full_sha, commit_message) = if let Some(image) = req.image_ref.clone() {
-        // Prebuilt OCI image: NO source to clone/extract or build. Make an empty build
-        // dir so the shared tail (env injection, deploy_full) is unchanged; the image
-        // is pulled + turned into a container manifest in `produce_manifest`.
         tokio::fs::create_dir_all(&dir).await?;
         log(format!("Deploying prebuilt image: {image}"));
         (
@@ -2834,9 +2656,6 @@ async fn run_build(
             format!("Image: {image}"),
         )
     } else if let Some(zip_b64) = req.zip_b64.take() {
-        // Drag-drop / zip upload: decode + extract instead of cloning, and synthesize
-        // git-ish metadata so the rest of the pipeline is unchanged. `take()` drops the
-        // base64 off the request so it's never logged/persisted past this point.
         let name = req.repo_url.trim_start_matches("upload://").to_string();
         log(format!(
             "Extracting uploaded archive: {}",
@@ -2850,20 +2669,12 @@ async fn run_build(
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(zip_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("invalid upload encoding: {e}"))?;
-        // Seal the ORIGINAL decoded archive bytes — the exact input the build
-        // consumes — before extraction can diverge from them.
         source_snapshot = zip_source_snapshot(&bytes);
         let files = extract_zip_into(&bytes, &dir).await?;
         log(format!(
             "Extracted {files} file(s) in {}ms",
             now_ms().saturating_sub(t0)
         ));
-        // Retain the ORIGINAL archive under this build's immutable lineage id so
-        // a later Redeploy can rebuild exactly the selected production/preview
-        // source. A project-wide archive let a newer preview overwrite the bytes
-        // a production redeploy would consume. Stored as a FILE beside checkouts —
-        // `gc_build_dirs` only reaps directories, so it survives build-dir GC and
-        // host reboots. Written via tmp+rename so readers never observe a torn zip.
         let retained = retained_source_write_path(&project, bid);
         let retained_tmp = deploy_root().join(format!(
             "{}.{}.tmp",
@@ -2898,11 +2709,6 @@ async fn run_build(
             ),
         )
     } else if req.repo_url.starts_with("upload://") {
-        // REDEPLOY of a zip-uploaded project: no git remote to clone and the request
-        // carries no fresh archive. Rebuild only from source carrying the selected
-        // deployment's immutable build-lineage id: its per-build retained archive,
-        // else that exact prior checkout. Legacy records with no lineage fail closed
-        // and ask for re-upload rather than guessing across production/preview lanes.
         let name = req.repo_url.trim_start_matches("upload://").to_string();
         let mut source_build_ids = req
             .source_deployment_ids
@@ -2930,8 +2736,6 @@ async fn run_build(
                 }
             ));
             let bytes = tokio::fs::read(&retained).await?;
-            // The retained archive IS the immutable lineage source; a redeploy
-            // re-proves exactly those bytes.
             source_snapshot = zip_source_snapshot(&bytes);
             let files = extract_zip_into(&bytes, &dir).await?;
             log(format!(
@@ -2970,13 +2774,6 @@ async fn run_build(
             ),
         )
     } else {
-        // A PR opened from a FORK has its branch/commit only on the fork's own
-        // remote — the base repo (`req.repo_url`) never has it. `git_webhook` sets
-        // `head_repo_url` for exactly that case; every other deploy path (push,
-        // manual import, redeploy, non-fork PR) leaves it None and clones
-        // `req.repo_url` as before. Project ownership/matching and every displayed
-        // field (`Build.repo_url`, commit-status reporting below) stay on the BASE
-        // repo — only the actual clone/fetch source changes here.
         let clone_source_url = req
             .head_repo_url
             .clone()
@@ -2995,62 +2792,15 @@ async fn run_build(
                 .unwrap_or_else(|| "HEAD".into())
         ));
         let t0 = now_ms();
-        // Credential for a PRIVATE repo: the deploy request's `git_token` — either
-        // attached server-side by the dashboard from the user's connected GitHub
-        // (interactive deploys), or a freshly minted GitHub App installation
-        // token attached by `admin::git_webhook` (webhook-triggered deploys have
-        // no user session, see `github_app_auth`) — else a node-level
-        // `GITHUB_TOKEN`. Fed to the git process ONLY through `credential_feed`'s
-        // fixed FD-backed helper — never embedded in a clone URL — so
-        // `clone_source_url`/`req.repo_url` stay tokenless everywhere: argv,
-        // `.git/config`, logs, the Build row, webhooks, and fanout. Applied when
-        // cloning `clone_source_url` (the fork, when this is a fork PR): the same
-        // installation/token resolution as the base repo is reused verbatim (no new
-        // auth flow) — it may not grant access to an arbitrary fork, but a public
-        // fork still clones fine anonymously, and a rejected token falls back to the
-        // anonymous retry below exactly as it does for the base repo today.
         let git_token: Option<String> = match req.git_token.clone().filter(|t| !t.is_empty()) {
             Some(token) => Some(token),
             None => match std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
                 Some(token) => Some(token),
-                // No request-attached credential and no node-level token: fall
-                // back to the SAME server-side GitHub App installation-token
-                // resolution the poll and webhook paths use. Without this, only
-                // dashboard deploys (user token attached client-side) and
-                // webhook deploys (token attached by `admin::git_webhook`)
-                // could clone a private repo — a bare API `/v1/git/deploy` or
-                // `redeploy` shipped NO credential and failed as "private or
-                // inaccessible over anonymous HTTPS" on a repo the platform's
-                // own App could read fine (witnessed live 2026-08-26,
-                // DecOperations/Nodes.WTF). `resolve_git_poll_token` is a
-                // no-op for non-github hosts and public repos, so behavior is
-                // unchanged everywhere a credential isn't actually needed.
                 None => resolve_git_poll_token(&clone_source_url).await,
             },
         }
         .filter(|_| clone_source_url.starts_with("https://github.com/"));
 
-        // Run `git clone <url>` into `dir`; returns (success, token-scrubbed stderr).
-        // Never let git open an interactive credential prompt (GIT_TERMINAL_PROMPT=0 /
-        // GIT_ASKPASS): this daemon has no controlling terminal, so a rejected/absent
-        // credential must fail cleanly instead of crashing on /dev/tty.
-        //
-        // When `req.commit` names an exact SHA (a webhook-triggered deploy), a plain
-        // `--depth 1 --branch` clone is not enough — under a rapid double-push the
-        // branch tip may already have moved past the commit GitHub notified us
-        // about, and a shallow branch clone simply does not contain that older
-        // commit. Pin to it instead: `git init` + `git fetch --depth 1 <sha>` fetches
-        // exactly that commit directly (GitHub, and any PAT/GitHub-App authenticated
-        // host, serve an arbitrary reachable SHA on request — this is the same trick
-        // GitHub Actions' own checkout action uses), then `checkout FETCH_HEAD` pins
-        // to it, staying just as cheap as the branch-tip shallow clone in the common
-        // case. If the remote rejects a direct SHA fetch (older/self-hosted git
-        // servers without `uploadpack.allowReachableSHA1InWant`), fall back to a full
-        // (unshallowed) clone of the branch followed by `checkout <sha>`, which is
-        // guaranteed to contain the commit as long as it is reachable from that
-        // branch. When `req.commit` is None (manual deploy, redeploy, import — no
-        // specific commit to pin to), behavior is EXACTLY the prior shallow
-        // branch-tip clone.
         let run_clone = |use_token: bool| {
             let (dir, branch, token, commit, ccloud, cbid, clone_url) = (
                 dir.clone(),
@@ -3070,7 +2820,6 @@ async fn run_build(
                     s
                 };
                 if let Some(sha) = commit {
-                    // Fast path: fetch the exact commit directly into a fresh repo.
                     if tokio::fs::create_dir_all(&dir).await.is_ok() {
                         let mut init = Command::new("git");
                         init.arg("-c").arg("credential.helper=");
@@ -3100,11 +2849,6 @@ async fn run_build(
                             fetch
                                 .env("GIT_TERMINAL_PROMPT", "0")
                                 .env("GIT_ASKPASS", "/bin/echo")
-                                // Abort a STALLED transfer instead of hanging the
-                                // build forever: some nodes' GitHub egress wedges
-                                // mid-connection (witnessed 135s+ hangs), and a
-                                // hung fetch left the deploy page frozen at
-                                // "Cloning…" with no failure and no retry.
                                 .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
                                 .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                             let _cred = match apply_credential(&mut fetch, token.as_deref()) {
@@ -3161,12 +2905,10 @@ async fn run_build(
                             }
                         }
                     }
-                    // Fallback: full (unshallowed) clone of the branch, then pin via checkout.
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
                         .env("GIT_ASKPASS", "/bin/echo")
-                        // Stall-abort, same rationale as the SHA fetch above.
                         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
                         .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                     let _cred = match apply_credential(&mut cmd, token.as_deref()) {
@@ -3200,12 +2942,9 @@ async fn run_build(
                         Err(e) => (false, format!("{e}")),
                     }
                 } else {
-                    // No specific commit to pin to: exactly the prior behavior — a
-                    // shallow clone of the branch tip.
                     let mut cmd = Command::new("git");
                     cmd.env("GIT_TERMINAL_PROMPT", "0")
                         .env("GIT_ASKPASS", "/bin/echo")
-                        // Stall-abort, same rationale as the SHA fetch above.
                         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
                         .env("GIT_HTTP_LOW_SPEED_TIME", "60");
                     let _cred = match apply_credential(&mut cmd, token.as_deref()) {
@@ -3229,18 +2968,10 @@ async fn run_build(
                 || s.contains("Authentication failed")
                 || s.contains("terminal prompts disabled")
                 || s.contains("invalid username or password")
-                // GitHub returns this (not a generic 401) when a token lacks access to a
-                // repo — including private repos, which is exactly the fork-PR case where
-                // the surrounding retry-anonymously fallback must still trigger.
                 || s.contains("Repository not found")
         };
 
         let used_token = git_token.is_some();
-        // Heartbeat while the clone runs: a large repo emits NOTHING between
-        // "Cloning …" and "Cloning completed" for minutes, which on the deploy
-        // page is indistinguishable from a stall. Drop-guarded so every exit
-        // path (success, ensure! error, cancellation) stops it — an Err return
-        // must never leave a task logging into a finished build.
         struct AbortOnDrop(tokio::task::JoinHandle<()>);
         impl Drop for AbortOnDrop {
             fn drop(&mut self) {
@@ -3261,9 +2992,6 @@ async fn run_build(
         });
         let mut with_token = used_token;
         let (mut ok, mut stderr) = run_clone(with_token).await;
-        // A stored token that is expired / lacks access must never break a repo that
-        // would clone fine anonymously (public repos, token rotation): retry once
-        // without the credential before surfacing an error.
         if !ok && used_token && auth_failed(&stderr) {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             log("Retrying clone without the stored GitHub credential…".into());
@@ -3272,11 +3000,6 @@ async fn run_build(
             ok = ok2;
             stderr = stderr2;
         }
-        // Transient-network retry. GitHub egress from some fleet nodes fails
-        // (and, before the stall-abort above, hung) transiently — a first-try
-        // network error must not fail the whole deploy. Auth failures are
-        // excluded (already retried anonymously above; a private repo does not
-        // become readable by waiting), and a cancelled build stops retrying.
         let mut attempt = 1usize;
         while !ok && !auth_failed(&stderr) && attempt < 3 {
             if cloud.build_cancels.is_cancelled(bid) {
@@ -3316,14 +3039,7 @@ async fn run_build(
                 format!("git clone failed: {stderr}")
             }
         );
-        // Clone finished — stop the heartbeat before the (occasionally slow)
-        // post-clone steps below, or they'd keep logging "still cloning".
         drop(_heartbeat);
-        // `.git/config`'s origin URL was ALWAYS `clone_source_url` (tokenless) —
-        // the credential only ever lived in the FD-backed helper, never in a
-        // clone URL — so there is nothing to scrub here anymore.
-        // The token has done its job; drop it so no build/deploy record, gossip frame,
-        // or displayed field constructed from `req` beyond this point can retain it.
         req.git_token = None;
         log(format!(
             "Cloning completed: {}ms",
@@ -3332,22 +3048,16 @@ async fn run_build(
         let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"])
             .await
             .unwrap_or_default();
-        // Full SHA for GitHub commit-status reporting (the statuses API needs it).
         let full_sha = run_git(&dir, &["rev-parse", "HEAD"])
             .await
             .unwrap_or_else(|| commit.clone());
         let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"])
             .await
             .unwrap_or_default();
-        // Exact tree object beside the commit: the pair is the immutable
-        // source identity the generation snapshot carries and re-proves. The
-        // ACTUAL cloned URL (the fork, for fork PRs) is recorded — never the
-        // display base repo.
         let tree_sha = run_git(&dir, &["rev-parse", "HEAD^{tree}"])
             .await
             .unwrap_or_default();
         source_snapshot = git_source_snapshot(&clone_source_url, &full_sha, &tree_sha);
-        // Best-effort "pending" check on the commit (no-op without GITHUB_TOKEN).
         {
             let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
             tokio::spawn(async move {
@@ -3369,16 +3079,9 @@ async fn run_build(
         b.branch = actual_branch.clone();
     });
     if let Some(fluid_build::SourceSnapshot::Git { branch, .. }) = source_snapshot.as_mut() {
-        // The resolved branch is only known after clone (a branch-less first
-        // deploy learns its default branch here); stamp it into the sealed
-        // source identity before the snapshot is constructed.
         *branch = Some(actual_branch.clone()).filter(|value| !value.is_empty());
     }
 
-    // Verify the pre-command trust decision against the branch Git resolved. A
-    // branch-less first deploy can only learn its default branch after clone; it
-    // may establish that branch, but it may not silently change a pre-existing
-    // production branch.
     let mut prod_branch = cloud
         .projects
         .get_exact(&project, incarnation)?
@@ -3414,9 +3117,6 @@ async fn run_build(
         allow_all_environment,
     )?;
     let runtime_env = if req.no_fanout {
-        // Coordinator-filtered, ephemeral runtime values. Build variables are
-        // always re-selected locally by explicit environment + build scope and
-        // can never hitchhike in this compatibility map.
         req.env.clone().unwrap_or(stored_runtime_env)
     } else {
         stored_runtime_env
@@ -3428,9 +3128,6 @@ async fn run_build(
             runtime_env.len(),
         ));
     }
-    // A variable the user can SEE in settings but the build cannot see is a
-    // silent mystery ("DATABASE_URL is not set" after they set it) — name the
-    // gap in the build log, keys only, never values.
     {
         let runtime_only: Vec<&str> = runtime_env
             .keys()
@@ -3448,10 +3145,6 @@ async fn run_build(
     }
     let build_cache_enabled = req.use_cache;
 
-    // Build from a subdirectory for monorepo templates (e.g. `examples/nextjs`).
-    // This is the one chokepoint for request, persisted, webhook, redeploy and
-    // fanout roots: old stored rows are untrusted input too, not a reason to
-    // bypass the checkout boundary.
     let persisted_root = cloud
         .projects
         .get_exact(&project, incarnation)?
@@ -3571,8 +3264,6 @@ async fn run_build(
     let vercel_config = fluid_build::load_vercel_config_checked(&build_dir).map_err(|error| {
         fluid_build::BuildContractError::invalid_metadata("load selected-app vercel.json", error)
     })?;
-    // Package/workspace metadata and outputDirectory are interpreted only after
-    // application selection, and before the executor receives the checkout.
     let mut fdi_preparation = if req.image_ref.is_none()
         && tokio::fs::read_to_string(build_dir.join("fluid.json"))
             .await
@@ -3628,15 +3319,6 @@ async fn run_build(
             fluid_build::OutputDirectory::parse(output)?;
         }
     }
-    // Backends that run tenant functions as plain HOST PROCESSES (mock,
-    // litebox) also BUILD on the host — that is their design, and it never
-    // required the microVM-era isolated executor (AGENTS.md: litebox
-    // `run_build` is byte-identical to `crate::mock::run_build_process`). Only
-    // Firecracker, whose guest cannot exec host build commands, needs the
-    // isolated executor. So the build lane is chosen by BACKEND, not by whether
-    // an executor happens to be installed: a host-exec backend runs repository
-    // commands directly, a microVM backend requires the isolated executor and
-    // fails closed without it.
     let host_exec_backend = matches!(cloud.gw.backend_name(), "mock" | "litebox");
     let mut isolated = if req.image_ref.is_some() {
         None
@@ -3647,11 +3329,6 @@ async fn run_build(
         ));
         Some(IsolatedBuild::begin_host(&checkout_dir))
     } else {
-        // Firecracker (or any future microVM backend): the isolated executor is
-        // mandatory. A node with NO executor gets `None` (only zero-command
-        // static deploys proceed — every command chokepoint refuses on None);
-        // an executor that EXISTS but fails to begin errors loudly (a broken
-        // builder, not a missing capability).
         match crate::build_executor::get() {
             Ok(_) => Some(IsolatedBuild::begin(&checkout_dir).await?),
             Err(error) => {
@@ -3670,10 +3347,6 @@ async fn run_build(
         log(format!("WARN: {warning}"));
     }
 
-    // ---- Ignored Build Step (vercel.json `ignoreCommand`) ----
-    // Vercel semantics: run the command in the project root; exit 0 => skip this
-    // build entirely (no new deployment — the prior one keeps serving), non-zero
-    // => continue. Lets a repo short-circuit commits that don't need a rebuild.
     if let Some(vc) = vercel_config.as_ref() {
         if let Some(cmd) = vc
             .ignore_command
@@ -3711,8 +3384,6 @@ async fn run_build(
                 Err(error) => return Err(error),
             }
         }
-        // devCommand / bunVersion are recorded for parity but not executed: the
-        // platform has no local dev server and manages the runtime itself.
         if let Some(dc) = vc
             .dev_command
             .as_ref()
@@ -3762,9 +3433,6 @@ async fn run_build(
     coordinates.normalize_function_cwds(&mut manifest)?;
     manifest.project = project.clone();
 
-    // Build Output carries its own compiled feature contract. Never let a second
-    // framework heuristic pass overwrite it; vercel.json's explicit overlay below
-    // remains the only higher-precedence source.
     if !build_failed && !fluid_build::has_build_output(&build_dir) {
         let feats = fluid_build::detect_features(&build_dir);
         if !feats.is_empty() {
@@ -3795,7 +3463,6 @@ async fn run_build(
                     runtime: mw.runtime.clone(),
                 });
             }
-            // Mark edge-runtime functions so the service graph / overview can show them.
             if !feats.edge_functions.is_empty() {
                 for f in manifest.functions.iter_mut() {
                     f.runtime = "edge".into();
@@ -3811,12 +3478,6 @@ async fn run_build(
         }
     }
 
-    // Sync the fluid.json top-level `inference` block into project settings —
-    // presence creates/updates the managed llama.cpp endpoint (see
-    // inference.rs), absence tears it down. Parsed from the RAW file so it
-    // works identically across every manifest-shape path (FDI, explicit
-    // fluid.json, container) rather than only the paths that deserialize the
-    // whole file into `Manifest`.
     {
         #[derive(serde::Deserialize)]
         struct InfWrap {
@@ -3848,21 +3509,6 @@ async fn run_build(
         }
     }
 
-    // Sync/merge the browser-replicated database opt-in (bn-storages-page-
-    // browser-db-wiring). Unlike `inference` above, `browser_db` already lives
-    // IN `fluid_core::Manifest` (parsed straight off fluid.json by
-    // `Manifest::from_json`, the explicit-fluid.json branch of
-    // `produce_manifest`), so `manifest.browser_db` here already reflects an
-    // explicit repo-authored block for every manifest-shape path that goes
-    // through it. Two directions, never fighting each other:
-    //   * fluid.json declared a block -> mirror it into project settings (the
-    //     `inference` read-side precedent) so the Storages page shows what's
-    //     actually deployed even for a hand-edited fluid.json.
-    //   * fluid.json declared NONE -> apply the dashboard-managed settings
-    //     spec instead (the `FunctionSettings::gpu` OR precedent, applied to
-    //     an `Option`: an explicit fluid.json block always wins over the
-    //     UI-managed one). This is what lets the Storages page's "Deploy a
-    //     replicated SQLite database" flow take effect with no git push.
     {
         let current = cloud
             .projects
@@ -3884,10 +3530,6 @@ async fn run_build(
         }
     }
 
-    // Stamp the framework slug onto the manifest so the deployment record
-    // (and the dashboard's project grid) carries the real framework for its
-    // logo — the build already detected it into BuildConfig.framework
-    // (auto-detect saves it there), empty stays empty (UI falls back).
     if manifest.framework.is_empty() {
         let bc = cloud.projects.get_exact(&project, incarnation)?.build;
         let fw = bc.framework.trim();
@@ -3896,11 +3538,6 @@ async fn run_build(
         }
     }
 
-    // Inject project env vars + function settings. FILTERED BY ENVIRONMENT:
-    // the classification above must happen BEFORE this, because a preview
-    // deployment launching with the project's production secrets is exactly
-    // the isolation the dashboard's Production/Preview selector promises and
-    // nothing enforced.
     let env = runtime_env;
     let project_settings = cloud.projects.get_exact(&manifest.project, incarnation)?;
     let dedicated_ipv4_alloc = project_settings.dedicated_ipv4;
@@ -3912,52 +3549,7 @@ async fn run_build(
         for (k, v) in &env {
             f.env.insert(k.clone(), v.clone());
         }
-        // A fluid.json-declared `max_duration_secs` must WIN over the project-level
-        // dashboard default — settings can only fill in what a function left
-        // unset, never silently discard what it explicitly asked for (the exact
-        // "settings can only turn GPU ON, never strip a function's own declared
-        // need" precedent a few lines below). This was previously an unconditional
-        // overwrite: every deploy silently replaced a real fluid.json
-        // `max_duration_secs` (e.g. 60 for a bot that legitimately needs an LLM
-        // round trip) with whatever the project's dashboard default happened to
-        // be, with no way for the manifest's own declaration to survive even one
-        // redeploy. `FunctionConfig::default().max_duration_secs` (300, serde's
-        // own fallback when fluid.json omits the field) can't be distinguished
-        // from a developer explicitly writing 300 — falling back to the project
-        // setting in that one case is a no-op (300 already IS the default), so
-        // every OTHER explicit value is preserved with no observable downside.
-        if f.max_duration_secs == fluid_core::FunctionConfig::default().max_duration_secs {
-            f.max_duration_secs = fsettings.default_max_duration_secs;
-        }
-        // Same rule, same reason, for the size knobs: a value the FUNCTION
-        // declared must survive the project default. These two were left as
-        // unconditional overwrites when `max_duration_secs` above was fixed,
-        // so a fluid.json `{"memory_mib": 8192}` (or a container's
-        // `{"container":{"memory":"8g"}}`, which lands here as `memory_mib`)
-        // was silently replaced by the dashboard default on EVERY deploy. The
-        // user-visible shape is the reported one: the setting has no effect,
-        // and a container that genuinely needs the memory is OOM-killed
-        // (exit 137) — which then presents as repeated cold-start failure and
-        // an open circuit, blamed on the app.
-        //
-        // Distinguishing "explicitly wrote the default" from "omitted" is not
-        // possible through serde here, and it does not matter: falling back to
-        // the project setting when the function is AT the default is a no-op
-        // whenever they agree, and honours the project default when they
-        // differ — which is exactly the intent.
-        if f.vcpus == fluid_core::FunctionConfig::default().vcpus {
-            f.vcpus = fsettings.vcpus.max(1);
-        }
-        if f.memory_mib == fluid_core::FunctionConfig::default().memory_mib {
-            f.memory_mib = fsettings.memory_mib;
-        }
-        f.vcpus = f.vcpus.max(1);
-        // Per-plan resource CEILING (capacity policy): an enterprise function
-        // is capped at 2 vCPU / 4 GiB. `plan_resource_ceiling` returns None for
-        // every other plan, so a legacy/grandfathered tenant is untouched.
-        // Applied AFTER the project-default fallback and the min-1 floor so it
-        // is the last word on sizing — a fluid.json or project setting can ask
-        // for more, but the plan caps it (and the deploy log says so).
+        fill_unset_from_project_defaults(f, &fsettings);
         if let Some((max_vcpus, max_mem)) =
             crate::billing::plan_resource_ceiling(&crate::admin::team_plan(cloud, &project))
         {
@@ -3976,44 +3568,16 @@ async fn run_build(
                 f.memory_mib = max_mem;
             }
         }
-        // Serverless GPU: the project-level toggle marks every function; a
-        // per-function fluid.json `gpu: true` (already parsed into the manifest)
-        // is preserved — settings can only turn GPU ON, never strip a
-        // function's own declared need.
         f.gpu = f.gpu || fsettings.gpu;
-        // Dedicated public IPv4 is a PAID add-on, not a free fluid.json
-        // opt-in like GPU: the project setting is the ONLY source (an
-        // assignment, not an OR) — a fluid.json author can no longer
-        // self-grant the feature by writing `dedicatedIpv4: true` in their
-        // own manifest. The setting itself is only ever flipped on by
-        // `tencent_eip::provision_from_checkout` after a real purchase.
         f.dedicated_ipv4 = fsettings.dedicated_ipv4;
-        // Stamp (or clear) the actual allocated address alongside the flag —
-        // every redeploy re-adopts the SAME claim from `ProjectSettings`
-        // rather than purchasing a new one (`Manifest::dedicated_ipv4_binding`
-        // hoists whichever function carries this onto `DeploymentInfo`).
         f.dedicated_ipv4_alloc = if f.dedicated_ipv4 {
             dedicated_ipv4_alloc.clone()
         } else {
             None
         };
-        // Fluid Compute (the project's `fluid_enabled` toggle): when ON (default),
-        // one warm instance serves MANY concurrent requests (in-instance
-        // concurrency — ideal for I/O-bound work like LLM/DB calls that sit idle
-        // waiting) and at least one instance is kept warm to avoid cold starts.
-        // When OFF, fall back to classic one-request-per-instance + scale-to-zero.
-        if fsettings.fluid_enabled {
-            f.max_concurrency = f.max_concurrency.max(10);
-            f.min_instances = f.min_instances.max(1);
-        } else {
-            f.max_concurrency = 1;
-            f.min_instances = 0;
-        }
+        apply_compute_mode(f, fsettings.fluid_enabled);
     }
 
-    // ---- Merge vercel.json routing/headers/crons/images + per-function config ----
-    // Applied AFTER project defaults so vercel.json per-function overrides win,
-    // and its redirects/rewrites are evaluated before framework-derived ones.
     if !build_failed {
         if let Some(vc) = vercel_config.as_ref() {
             apply_vercel_config(&mut manifest, vc, &|s| log(s));
@@ -4037,10 +3601,6 @@ async fn run_build(
         prod_branch
     ));
 
-    // Runtime Cache wiring: expose the regional data cache to this deployment's
-    // function cells via env. Scope isolates production vs preview per Vercel.
-    // Cells reach the loopback admin endpoint (HIVE_RUNTIME_CACHE_URL override
-    // for non-standard admin ports / isolated backends).
     {
         let rc_url = std::env::var("HIVE_RUNTIME_CACHE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8786/v1/runtime-cache".to_string());
@@ -4061,32 +3621,14 @@ async fn run_build(
         }
     }
 
-    // Register the routable deployment.
     let git = GitSource {
         repo_url: req.repo_url.clone(),
         branch: actual_branch.clone(),
         commit: commit.clone(),
         commit_message: commit_message.clone(),
     };
-    // CONTAINER deployments (`__container__`/podman) now run on ANY node — the
-    // Firecracker backend runs them via podman ON THE HOST (outside the microVM),
-    // just like the mock backend. So no re-home is needed: the container builds
-    // (podman build, below) and serves on whichever node it was placed on.
     let is_container = manifest.functions.iter().any(|f| f.runtime == "container");
-    // Captured here (before `manifest` moves into `deploy_full` below) for the
-    // multi-region-fanout stateful guard in the "Multi-region tail" block further
-    // down. Either signal marks a single-writer service that must not be silently
-    // fanned out to independent, non-synchronized regional replicas: `is_container`
-    // (every container gets its own durable per-node volume — see
-    // `container_volume_cfg` — matching the existing single-owner lease model in
-    // `lease.rs`), or `FunctionConfig::needs_raw_proxy()` (gRPC/TCP/UDP — a
-    // Postgres or Minecraft-style stateful protocol even when NOT containerized).
     let is_stateful = is_container || manifest.functions.iter().any(|f| f.needs_raw_proxy());
-    // Captured for the same reason and at the same point as `is_stateful`: the
-    // multi-region fanout below needs it after `manifest` has moved. Resolved
-    // through `Runtime::resolve` (config value wins, else argv basename) rather
-    // than a bare string compare, so a function whose runtime was inferred from
-    // a `wasmer …` start_cmd counts too.
     let is_wasm = manifest.functions.iter().any(|f| {
         hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer
     });
