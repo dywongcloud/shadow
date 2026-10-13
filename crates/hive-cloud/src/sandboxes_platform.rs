@@ -93,12 +93,19 @@ pub fn mint_sandbox_id() -> String {
 
 /// Host programs a sandbox shell needs beyond the fixed tool set, by runtime
 /// family — the interpreter itself. Naming just the interpreter is enough:
-/// the litebox backend's `support_tree_for` recognizes `node`/`python3` by
+/// the litebox backend's `support_plan_for` recognizes `node`/`python3` by
 /// their resolved binary name and stages their whole standard-library/
 /// package-manager tree (npm's `node_modules_22`, Python's stdlib)
 /// alongside them — see that function's doc for what that covers and why a
 /// single interpreter name is the right unit to request here rather than
 /// listing `npm`/`npx` separately.
+///
+/// `python3`, `git`, `curl` and `wget` are NOT listed: the backend stages
+/// them into every shell tar on its own (`SHELL_GUEST_TOOL_PROGRAMS`), so a
+/// node sandbox gets them too. `npx` deliberately stays tied to a node
+/// runtime — it needs `node` plus the 15 MiB npm tree, and staging that into
+/// a python-runtime shell is ~90 MiB of guest filesystem for a tool that
+/// shell has no use for.
 fn shell_runtime_programs(runtime: &str) -> Vec<String> {
     if runtime.starts_with("node") {
         vec!["node".to_string()]

@@ -3965,9 +3965,18 @@ const GUEST_NSSWITCH_CONF: &[u8] = b"hosts: files dns\n";
 
 /// Where the guest expects CA roots. Both spellings are planted because distros
 /// disagree and Node/OpenSSL use the compiled-in path, not ours.
-const GUEST_CA_PATHS: [&str; 2] = [
+const GUEST_CA_PATHS: [&str; 3] = [
     "etc/ssl/certs/ca-certificates.crt",
     "etc/pki/tls/certs/ca-bundle.crt",
+    // OpenSSL's compiled-in default CA *file* on RHEL/Rocky, and therefore
+    // the one Python's `ssl` module reads: measured 2026-10-13 inside a
+    // litebox guest, `ssl.get_default_verify_paths()` reported
+    // `openssl_cafile=/etc/pki/tls/cert.pem` while only the two paths above
+    // were planted, so `urllib.request.urlopen('https://…')` failed with
+    // `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`
+    // even though `curl` (which reads `/etc/pki/tls/certs/ca-bundle.crt`) got
+    // HTTP 200 on the same URL.
+    "etc/pki/tls/cert.pem",
 ];
 
 /// The host's CA bundle, best-effort.
@@ -4400,6 +4409,60 @@ const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/gzip",
 ];
 
+/// The toolchain a sandbox shell (and a `shell: true` exec) is expected to
+/// offer: `python3`, `git`, `curl` and `wget`. `npx` rides the node support
+/// tree (`SHELL_GUEST_PROGRAMS`'s `extra` path) and is therefore tied to a
+/// node runtime, see below.
+///
+/// Closed and explicit for the same reason as the two lists above, and staged
+/// OPTIONALLY (a host without one is skipped with a debug line, never a
+/// failure) because a base image missing `wget` must still boot a shell. They
+/// cannot simply be appended to `SHELL_GUEST_OPTIONAL_PROGRAMS`, because that
+/// list stages an `ldd` closure and nothing else — and `ldd` only reports an
+/// ELF's own `NEEDED` entries, saying nothing about the data these programs
+/// load at RUNTIME. Measured on the fleet 2026-10-13 (fc-sanjose and
+/// fc-phoenix agree):
+///   * `python3` is a 16 KiB ELF; its standard library is
+///     `/usr/lib64/python3.12` (841 files / 63 MiB) and its
+///     `lib-dynload/*.so` C extensions pull 19 further shared objects that
+///     `ldd` of the interpreter never names (libssl, libffi, liblzma,
+///     libexpat, libbz2, libgdbm, libmpdec, libncursesw, libtinfo, libpanelw,
+///     libreadline, libcrypt, libuuid — 3.0 MiB of distinct libraries by
+///     measurement, not the 60 MiB a whole-`/usr/lib` guess would cost).
+///     Without them `import ssl`, `import sqlite3` and `import ctypes` all
+///     fail with a bare `ImportError: libssl.so.3: cannot open shared object
+///     file`, and `urllib` cannot speak https at all.
+///   * `git` execs helpers out of `/usr/libexec/git-core` (44 real files) and
+///     reads its templates from `/usr/share/git-core`. `git-remote-https` is
+///     itself a symlink to the real `git-remote-http` ELF, so it is staged as
+///     an entry point rather than discovered by the tree walk (which skips
+///     symlinks). Without them `git clone https://…` answers
+///     `git: 'remote-https' is not a git command`.
+///   * `curl`/`wget` are ordinary ELFs — their `ldd` closure really is enough.
+///
+/// A host symlink here is staged as the REAL file under its canonical path
+/// plus a matching symlink entry (`/usr/bin/node` -> `/usr/bin/node-22`).
+/// That is what makes `npx` work at all: `/usr/lib/node_modules_22/npm/bin/
+/// npx-cli.js` carries a `#!/usr/bin/node-22` shebang and only
+/// `/usr/bin/node` used to be staged, so the interpreter in the shebang did
+/// not exist in the guest.
+const SHELL_GUEST_TOOL_PROGRAMS: &[&str] = &[
+    "/usr/bin/python3",
+    "/usr/bin/git",
+    "/usr/bin/curl",
+    "/usr/bin/wget",
+];
+
+/// Shared objects glibc `dlopen`s out of `getaddrinfo` at RUNTIME, so no `ldd`
+/// output names them: even with `/etc/resolv.conf` planted, anything resolving
+/// through libc (`curl`, `wget`, `python3`'s `socket`, `git`) found no
+/// resolver in the guest. Closed list, staged only where the host has it.
+const GUEST_NSS_LIBS: &[&str] = &[
+    "/lib64/libnss_files.so.2",
+    "/lib64/libnss_dns.so.2",
+    "/lib64/libresolv.so.2",
+];
+
 /// Host directories a bare `exec_command` name (`node`, `ls`, `python3`) is
 /// resolved against — the guest `PATH` this backend hands the runner, plus
 /// `/usr/local/bin` for operator-installed runtimes. The resolved binary is
@@ -4445,6 +4508,62 @@ fn resolve_guest_program(cmd: &str) -> anyhow::Result<PathBuf> {
         "command '{cmd}' is not available inside this litebox sandbox (searched {})",
         EXEC_PROGRAM_DIRS.join(":")
     )
+}
+
+/// The interpreter a file's shebang line names, split into the program and its
+/// optional single argument (`#!/usr/bin/env node` -> `["/usr/bin/env",
+/// "node"]`). `None` when `path` is not a `#!/…` script. Files over 1 MiB are
+/// not read at all, so naming something huge costs nothing.
+fn shebang_interpreter(path: &Path) -> Option<Vec<String>> {
+    if std::fs::metadata(path).ok()?.len() > 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let end = bytes.iter().position(|b| *b == b'\n').unwrap_or(bytes.len());
+    let line = std::str::from_utf8(&bytes[2..end]).ok()?;
+    let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+    if parts.is_empty() || !parts[0].starts_with('/') {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Resolve a NON-shell `exec_command` to the `(program, argv)` the runner is
+/// spawned with.
+///
+/// The runner's AOT rewriter accepts only an ELF as the program it first execs
+/// (`--rewrite-syscalls` rewrites that one binary up front; a `#!/…` script
+/// there fails with `failed to rewrite …: Unknown file magic`, measured
+/// 2026-10-12), while the GUEST's own `execve` honours shebangs perfectly well
+/// (measured 2026-10-13: a staged `#!/bin/sh` script ran and printed its
+/// output). So a command naming a shebang script — `npx`, `npm` — is started
+/// as `<interpreter> [<arg>] <script> <args>`, exactly what the kernel's own
+/// shebang handling would have done, rather than failing before the guest ever
+/// runs.
+fn resolve_guest_argv(cmd: &str, args: &[String]) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let program = resolve_guest_program(cmd)?;
+    let Some(interpreter) = shebang_interpreter(&program) else {
+        return Ok((program, args.to_vec()));
+    };
+    let mut argv = Vec::with_capacity(interpreter.len() + args.len() + 1);
+    argv.extend(interpreter);
+    // The script's CANONICAL path, not the name it was found under: on the
+    // host `/usr/bin/npx` is a symlink whose bytes are `npx-cli.js`, but what
+    // the guest gets at `/usr/bin/npx` is the exec-wrapper `build_shell_tar_
+    // blocking` synthesizes (`copies`) — hand that to node and it parses shell
+    // as JavaScript (`SyntaxError: Unexpected string` at line 2, measured
+    // 2026-10-13 on fc-phoenix). The canonical file is always staged.
+    argv.push(
+        canonical_target(&program)
+            .unwrap_or_else(|| program.clone())
+            .display()
+            .to_string(),
+    );
+    argv.extend(args.iter().cloned());
+    Ok((PathBuf::from(&argv[0]), argv[1..].to_vec()))
 }
 
 /// Pump one exec pipe into `ExecOutput` events, one per line, each bounded
@@ -4517,17 +4636,19 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
 /// enough: the guest shell resolves a typed command (`npm`) through
 /// `PATH=/usr/bin:/bin` (see `exec_pty`'s `.env("PATH", ...)`), and on the
 /// host `/usr/bin/npm` is a SYMLINK into the tree
-/// (`-> ../lib/node_modules_22/npm/bin/npm-cli.js`) — without a matching
-/// symlink entry in the guest tar, `PATH` search finds nothing at
-/// `/usr/bin/npm` even though the real file is staged elsewhere in the
-/// tree, and a not-found command is fatal under litebox's fork emulation
-/// rather than a clean error (see the module's fork-corruption notes).
-/// `(guest_path, real_target)`: `real_target` is host-absolute and must
-/// already be one of the paths this walk stages (it's just the symlink's
-/// own on-host target — the tar entry mirrors the real filesystem exactly).
-struct SupportTree {
-    tree: &'static Path,
-    entry_points: &'static [(&'static str, &'static str)],
+/// (`-> ../lib/node_modules_22/npm/bin/npm-cli.js`) — without an entry at
+/// `/usr/bin/npm`, `PATH` search finds nothing there even though the real
+/// file is staged elsewhere in the tree, and a not-found command is fatal
+/// under litebox's fork emulation rather than a clean error (see the module's
+/// fork-corruption notes). `(guest_path, real_target)`: `real_target` is
+/// host-absolute and must already be one of the paths this walk stages (it
+/// is just the symlink's own on-host target). The entry is written as a REAL
+/// FILE carrying `real_target`'s bytes, not as a symlink — see
+/// `build_shell_tar_blocking`'s `copies` for why a symlink entry point is
+/// invisible to the guest's own `PATH` search.
+struct SupportPlan {
+    trees: Vec<PathBuf>,
+    entry_points: Vec<(PathBuf, PathBuf)>,
 }
 
 /// Support trees a resolved `extra` program needs beyond its own `ldd`
@@ -4539,8 +4660,46 @@ struct SupportTree {
 /// `/usr/bin/node`. Skipped harmlessly if the host doesn't have the tree
 /// (an older base image, a stripped-down build) — see `walk_support_tree`'s
 /// doc.
-fn support_tree_for(resolved: &Path) -> Option<SupportTree> {
-    match resolved.file_name().and_then(|n| n.to_str())? {
+fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
+    let name = resolved.file_name().and_then(|n| n.to_str())?;
+    // `git`: helpers plus templates. `git-remote-https` is a symlink to the
+    // real `git-remote-http` ELF, so the walk (which skips symlinks) can
+    // never produce it — it is an explicit entry point instead.
+    if name == "git" {
+        return Some(SupportPlan {
+            trees: vec![
+                PathBuf::from("/usr/libexec/git-core"),
+                PathBuf::from("/usr/share/git-core"),
+            ],
+            entry_points: vec![(
+                PathBuf::from("/usr/libexec/git-core/git-remote-https"),
+                PathBuf::from("/usr/libexec/git-core/git-remote-http"),
+            )],
+        });
+    }
+    // `python3`: the stdlib directory is named by the interpreter's own
+    // version, and the caller hands us the CANONICAL binary (a host `python3`
+    // symlink has already become `python3.12`), so there is no version list
+    // to maintain here and no cross-version guess. `/usr/lib64` is tried
+    // first: on this fleet `/usr/lib/python3.12` holds site-packages ONLY
+    // (verified: no `os.py`, no `encodings/`), so staging it instead would
+    // add 20 MiB and still leave the interpreter unable to boot. `/usr/lib`
+    // is the fallback for distros with no lib64 split. First existing wins.
+    if let Some(version) = name.strip_prefix("python") {
+        if version.starts_with('3') {
+            return [
+                PathBuf::from(format!("/usr/lib64/python{version}")),
+                PathBuf::from(format!("/usr/lib/python{version}")),
+            ]
+            .into_iter()
+            .find(|dir| dir.is_dir())
+            .map(|dir| SupportPlan {
+                trees: vec![dir],
+                entry_points: Vec::new(),
+            });
+        }
+    }
+    match name {
         // npm/npx are scripts under this tree (`bin/npm-cli.js`), not
         // separate binaries — staging `node` alone leaves `npm install`
         // a not-found. The tree also carries npm's own vendored
@@ -4548,22 +4707,36 @@ fn support_tree_for(resolved: &Path) -> Option<SupportTree> {
         // `/usr/bin/npm`+`/usr/bin/npx` are the `$PATH` entry points a
         // typed `npm ...`/`npx ...` actually resolves through — real
         // symlinks on the host, mirrored as real symlinks in the guest.
-        "node" | "node-22" | "node-24" | "node-26" => Some(SupportTree {
-            tree: Path::new("/usr/lib/node_modules_22"),
-            entry_points: &[
-                ("/usr/bin/npm", "/usr/lib/node_modules_22/npm/bin/npm-cli.js"),
-                ("/usr/bin/npx", "/usr/lib/node_modules_22/npm/bin/npx-cli.js"),
+        "node" | "node-22" | "node-24" | "node-26" => Some(SupportPlan {
+            trees: vec![PathBuf::from("/usr/lib/node_modules_22")],
+            entry_points: vec![
+                (
+                    PathBuf::from("/usr/bin/npm"),
+                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npm-cli.js"),
+                ),
+                (
+                    PathBuf::from("/usr/bin/npx"),
+                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npx-cli.js"),
+                ),
             ],
-        }),
-        // python3 itself is already the staged `extra` program (it's a real
-        // ELF, not a tree entry point), so no additional entry points here.
-        "python3" | "python3.12" | "python3.13" => Some(SupportTree {
-            tree: Path::new("/usr/lib64/python3.12"),
-            entry_points: &[],
         }),
         _ => None,
     }
 }
+
+/// Bound on how many of a support tree's own shared objects get their `ldd`
+/// closure resolved. Real trees carry 59 (`python3.12`'s `lib-dynload`, the
+/// only one that matters — 19 distinct libraries / 3.0 MiB); the bound keeps a
+/// tree that somehow grew thousands of `.so` files from turning one shell
+/// start into thousands of `ldd` spawns.
+const SUPPORT_TREE_SO_CLOSURE_MAX: usize = 128;
+
+/// Upper bound on one duplicated `$PATH` entry point (`build_shell_tar_
+/// blocking`'s `copies`). Real ones are interpreters and CLI shims — 16 KiB
+/// (`python3.12`), 28 KiB (`node-22`), 2.9 KiB (`npx-cli.js`) — and the whole
+/// point of the copy is that it is small: the megabytes behind them (closure
+/// libraries, stdlib, the npm tree) are staged once and shared by inode.
+const GUEST_COPY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Bound on any one support-tree walk — real trees here are ~15-60 MiB /
 /// 1.7-2.8k files (npm, Python's stdlib); a limit an order of magnitude
@@ -4633,15 +4806,15 @@ fn walk_support_tree(dir: &Path) -> Vec<PathBuf> {
 /// `exec_command` binary, or the sandbox runtime for an interactive shell —
 /// see `ExecPtyRequest.programs`), each with its `ldd` closure (a real
 /// subprocess spawn — cannot run inside the blocking tar-writer below) and,
-/// for an interpreter like `node`/`python3`, its support tree
-/// (`support_tree_for`), merged/deduped and handed to the blocking writer.
+/// for an interpreter like `node`/`python3`/`git`, its support tree
+/// (`support_plan_for`), merged/deduped and handed to the blocking writer.
 /// A closure failure on an EXTRA program (a static binary or a script has
 /// none) stages the program alone; the fixed set's closure stays strict, as
 /// it always was.
 async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut programs: Vec<PathBuf> = SHELL_GUEST_PROGRAMS.iter().map(PathBuf::from).collect();
     let mut deps: Vec<PathBuf> = Vec::new();
-    let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
     for program in &programs {
         deps.extend(ldd_closure(program).await?);
     }
@@ -4663,75 +4836,26 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
             ),
         }
     }
+    // The toolchain set (`SHELL_GUEST_TOOL_PROGRAMS`): every shell and every
+    // `shell: true` exec gets it, and a host missing one is skipped with a
+    // debug line, never a failure.
+    for tool in SHELL_GUEST_TOOL_PROGRAMS {
+        let path = PathBuf::from(tool);
+        if !path.is_file() {
+            tracing::debug!(tool, "litebox guest tar: sandbox tool absent on this host; skipped");
+            continue;
+        }
+        stage_guest_program(&path, &mut programs, &mut deps, &mut copies).await;
+    }
+    // Resolver/NSS shared objects: `dlopen`ed out of `getaddrinfo`, so no
+    // `ldd` output names them and a guest had no libc resolver at all.
+    for lib in GUEST_NSS_LIBS {
+        if Path::new(lib).is_file() {
+            deps.push(PathBuf::from(lib));
+        }
+    }
     for program in extra {
-        match ldd_closure(&program).await {
-            Ok(closure) => deps.extend(closure),
-            Err(error) => tracing::debug!(
-                program = %program.display(),
-                %error,
-                "litebox exec: no dynamic closure for program; staging it alone"
-            ),
-        }
-        if let Some(tree) = support_tree_for(&program) {
-            if tree.tree.is_dir() {
-                let tree_buf = tree.tree.to_path_buf();
-                let walk_target = tree_buf.clone();
-                let files = tokio::task::spawn_blocking(move || walk_support_tree(&walk_target))
-                    .await
-                    .unwrap_or_default();
-                tracing::debug!(
-                    program = %program.display(),
-                    tree = %tree_buf.display(),
-                    files = files.len(),
-                    "litebox: staging interpreter support tree"
-                );
-                programs.extend(files);
-                for (guest_path, target) in tree.entry_points {
-                    let guest_path = Path::new(guest_path);
-                    let target = Path::new(target);
-                    // Verify the entry point genuinely RESOLVES (via
-                    // whatever chain of symlinks the host actually stores —
-                    // `readlink` alone is often relative, e.g.
-                    // `../lib/node_modules_22/npm/bin/npm-cli.js`, so
-                    // comparing its raw text against our absolute expected
-                    // target would never match) to the EXACT file this list
-                    // expects, before trusting it — a base-image change that
-                    // moves npm's real file would otherwise stage a symlink
-                    // to nothing, silently.
-                    match std::fs::symlink_metadata(guest_path) {
-                        Ok(meta) if meta.file_type().is_symlink() => {
-                            match (std::fs::canonicalize(guest_path), std::fs::canonicalize(target)) {
-                                (Ok(actual), Ok(expected)) if actual == expected => {
-                                    symlinks.push((guest_path.to_path_buf(), target.to_path_buf()));
-                                }
-                                (Ok(actual), _) => tracing::debug!(
-                                    guest_path = %guest_path.display(),
-                                    expected = %target.display(),
-                                    actual = %actual.display(),
-                                    "litebox: $PATH entry point resolves somewhere unexpected; not staged"
-                                ),
-                                (Err(error), _) => tracing::debug!(
-                                    guest_path = %guest_path.display(),
-                                    %error,
-                                    "litebox: $PATH entry point symlink unresolvable; not staged"
-                                ),
-                            }
-                        }
-                        _ => tracing::debug!(
-                            guest_path = %guest_path.display(),
-                            "litebox: $PATH entry point absent or not a symlink on this host; not staged"
-                        ),
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    program = %program.display(),
-                    tree = %tree.tree.display(),
-                    "litebox: support tree absent on this host; interpreter stages alone"
-                );
-            }
-        }
-        programs.push(program);
+        stage_guest_program(&program, &mut programs, &mut deps, &mut copies).await;
     }
     // Same legacy-soname compat stubs `ensure_combined_tar_locked` stages —
     // a coreutils build linked against a split libpthread/libdl/librt/libutil
@@ -4756,9 +4880,158 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     programs.append(&mut deps);
     programs.sort();
     programs.dedup();
-    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs, &symlinks))
+    // A program that is itself a host symlink contributes the same `$PATH`
+    // entry point its support tree already declared (`/usr/bin/npx` for both),
+    // and a duplicate tar entry would let one overwrite the other.
+    copies.sort();
+    copies.dedup();
+    tokio::task::spawn_blocking(move || build_shell_tar_blocking(archive, &programs, &copies))
         .await
         .context("litebox shell guest tar construction task failed")?
+}
+
+/// When `program` is a host SYMLINK: the real file it points at.
+///
+/// The guest gets the real file under BOTH spellings — the canonical one as a
+/// normal staged file and the symlink's own path as a byte copy — because the
+/// two names are both load-bearing and a tar symlink cannot serve either:
+/// a litebox guest's `stat`/`lstat` of a symlink stored in the tar layer
+/// answers ENOSYS, so anything that LOOKS A PROGRAM UP rather than exec'ing a
+/// literal path never finds it. Measured 2026-10-13 on fc-phoenix: with
+/// `/usr/bin/python3` staged as a symlink, `execve("/usr/bin/python3")` worked
+/// (`python3 -V` -> `Python 3.12.13`) while `command -v python3` said MISSING
+/// and a typed `python3 -V` answered `/bin/sh: line 1: /usr/bin/python3: Not a
+/// directory`; `ls -ld` on the same symlink reported `Function not
+/// implemented`. And `npx-cli.js`'s shebang is `#!/usr/bin/node-22` while only
+/// `/usr/bin/node` used to be staged, so `npx` could never start. Duplicating
+/// the bytes costs 16 KiB (python3.12) / 28 KiB (node-22) — the closure and
+/// the support tree, which are the megabytes, are shared by inode dedup.
+fn canonical_target(program: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(program).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(program).ok()?;
+    if canonical == program || !canonical.is_file() {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Stage one program and everything it needs AT RUNTIME into a guest tar: its
+/// `ldd` closure, its support tree (`support_plan_for`), the closures of that
+/// tree's own shared objects, and its `$PATH` entry points. Never fails the
+/// tar — every gap is a debug line and a tool that is then missing in the
+/// guest, the same contract `SHELL_GUEST_OPTIONAL_PROGRAMS` has always had.
+async fn stage_guest_program(
+    program: &Path,
+    programs: &mut Vec<PathBuf>,
+    deps: &mut Vec<PathBuf>,
+    copies: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    let canonical = canonical_target(program);
+    let staged = canonical.clone().unwrap_or_else(|| program.to_path_buf());
+    if let Some(canonical) = canonical {
+        copies.push((program.to_path_buf(), canonical));
+    }
+    match ldd_closure(&staged).await {
+        Ok(closure) => deps.extend(closure),
+        Err(error) => tracing::debug!(
+            program = %staged.display(),
+            %error,
+            "litebox: no dynamic closure for program; staging it alone"
+        ),
+    }
+    let Some(plan) = support_plan_for(&staged) else {
+        programs.push(staged);
+        return;
+    };
+    let mut tree_files: Vec<PathBuf> = Vec::new();
+    for tree in &plan.trees {
+        if !tree.is_dir() {
+            tracing::debug!(
+                program = %staged.display(),
+                tree = %tree.display(),
+                "litebox: support tree absent on this host; skipped"
+            );
+            continue;
+        }
+        let walk_target = tree.clone();
+        let files = tokio::task::spawn_blocking(move || walk_support_tree(&walk_target))
+            .await
+            .unwrap_or_default();
+        tracing::debug!(
+            program = %staged.display(),
+            tree = %tree.display(),
+            files = files.len(),
+            "litebox: staging support tree"
+        );
+        tree_files.extend(files);
+    }
+    // The tree's OWN ELF objects are the reason this pass exists: python's
+    // `lib-dynload/*.so` C extensions carry `NEEDED` entries (libssl, libffi,
+    // liblzma, libexpat, libbz2, libgdbm, libmpdec, libncursesw, libtinfo,
+    // libpanelw, libreadline, libcrypt, libuuid) that `ldd` of the
+    // interpreter never reports, so without it `import ssl` fails inside the
+    // guest with a bare `libssl.so.3: cannot open shared object file`.
+    for object in tree_files
+        .iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("so"))
+        .take(SUPPORT_TREE_SO_CLOSURE_MAX)
+    {
+        match ldd_closure(object).await {
+            Ok(closure) => deps.extend(closure),
+            Err(error) => tracing::debug!(
+                object = %object.display(),
+                %error,
+                "litebox: support-tree shared object has no resolvable closure; skipped"
+            ),
+        }
+    }
+    programs.extend(tree_files);
+    for (guest_path, target) in &plan.entry_points {
+        // Verify the entry point genuinely RESOLVES (via whatever chain of
+        // symlinks the host actually stores — `readlink` alone is often
+        // relative, e.g. `../lib/node_modules_22/npm/bin/npm-cli.js`, so
+        // comparing its raw text against our absolute expected target would
+        // never match) to the EXACT file this list expects, before trusting
+        // it — a base-image change that moves npm's real file would otherwise
+        // stage a copy of nothing, silently.
+        match std::fs::symlink_metadata(guest_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                match (
+                    std::fs::canonicalize(guest_path),
+                    std::fs::canonicalize(target),
+                ) {
+                    (Ok(actual), Ok(expected)) if actual == expected => {
+                        // A REAL FILE, not a symlink entry: a guest `stat` of
+                        // a tar symlink is ENOSYS, so a `$PATH` entry point
+                        // stored as one is invisible to every lookup that
+                        // does not exec a literal path — which is exactly what
+                        // made typed `npx`/`npm` "command not found" while
+                        // `node /usr/lib/.../npx-cli.js` worked.
+                        copies.push((guest_path.clone(), target.clone()));
+                    }
+                    (Ok(actual), _) => tracing::debug!(
+                        guest_path = %guest_path.display(),
+                        expected = %target.display(),
+                        actual = %actual.display(),
+                        "litebox: $PATH entry point resolves somewhere unexpected; not staged"
+                    ),
+                    (Err(error), _) => tracing::debug!(
+                        guest_path = %guest_path.display(),
+                        %error,
+                        "litebox: $PATH entry point symlink unresolvable; not staged"
+                    ),
+                }
+            }
+            _ => tracing::debug!(
+                guest_path = %guest_path.display(),
+                "litebox: $PATH entry point absent or not a symlink on this host; not staged"
+            ),
+        }
+    }
+    programs.push(staged);
 }
 
 
@@ -4766,7 +5039,7 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
 fn build_shell_tar_blocking(
     archive: File,
     paths: &[PathBuf],
-    symlinks: &[(PathBuf, PathBuf)],
+    copies: &[(PathBuf, PathBuf)],
 ) -> anyhow::Result<()> {
     let root = File::open("/").context("open root filesystem")?;
     let mut seen_inodes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
@@ -4822,37 +5095,109 @@ fn build_shell_tar_blocking(
         );
     }
 
-    // `$PATH`-visible entry points into an already-staged support tree
-    // (e.g. `/usr/bin/npm` -> the npm tree's real `bin/npm-cli.js`) — real
-    // symlink entries, mirroring the host filesystem exactly, so the
-    // guest's own `PATH` search finds them the same way it would on a real
-    // system. See `SupportTree::entry_points`'s doc for why the tree's
-    // files alone aren't enough.
-    for (guest_path, target) in symlinks {
+    // `$PATH`-visible entry points, and the second spelling of a program the
+    // host stores as a symlink (`/usr/bin/python3` for `python3.12`,
+    // `/usr/bin/node` for `node-22`, `/usr/bin/npm`/`/usr/bin/npx` for the
+    // npm tree's real `bin/*.js`). Written as REAL FILES carrying the target's
+    // bytes, not as symlink entries: a litebox guest's `stat` of a symlink
+    // stored in the tar layer answers ENOSYS, so a symlink entry point is
+    // invisible to every lookup that does not exec a literal path — measured
+    // 2026-10-13 on fc-phoenix, `/usr/bin/python3` as a symlink gave
+    // `command -v python3` -> MISSING and `python3 -V` -> `/bin/sh: line 1:
+    // /usr/bin/python3: Not a directory`, while `execve` of the same path
+    // worked. Deliberately bypasses the inode dedup above: the WHOLE point is
+    // two names for one file, and the duplicates here are 16 KiB-28 KiB
+    // interpreters. See `SupportPlan::entry_points` for why the tree's files
+    // alone are not enough.
+    for (guest_path, host_path) in copies {
         let relative = guest_path.strip_prefix("/").map_err(|_| {
             anyhow::anyhow!(
-                "shell guest symlink path {} is not absolute",
+                "shell guest copy path {} is not absolute",
                 guest_path.display()
             )
         })?;
-        let mut header = tar::Header::new_ustar();
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(0);
-        header.set_mode(0o777);
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_size(0);
-        header.set_username("")?;
-        header.set_groupname("")?;
-        builder
-            .append_link(&mut header, relative, target)
-            .with_context(|| {
+        let bytes = match std::fs::read(host_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(
+                    guest_path = %guest_path.display(),
+                    host_path = %host_path.display(),
+                    %error,
+                    "litebox: cannot read the file backing a $PATH entry point; not staged"
+                );
+                continue;
+            }
+        };
+        if bytes.len() as u64 > GUEST_COPY_MAX_BYTES {
+            tracing::debug!(
+                guest_path = %guest_path.display(),
+                bytes = bytes.len(),
+                limit = GUEST_COPY_MAX_BYTES,
+                "litebox: $PATH entry point is too large to duplicate; not staged"
+            );
+            continue;
+        }
+        if bytes.starts_with(b"#!") {
+            // A SCRIPT resolves its own `require`/imports RELATIVE TO ITS REAL
+            // LOCATION, so a byte copy of it at `/usr/bin/npx` breaks exactly
+            // what the copy was meant to fix: measured 2026-10-13 on
+            // fc-phoenix, `npx --version` answered `Error: Cannot find module
+            // '../lib/cli.js'` / `requireStack: [ '/usr/bin/npx' ]`. Exec the
+            // real path through its own shebang interpreter instead — the
+            // interpreter, not the copy, is what must be on `$PATH`.
+            let interpreter = bytes[2..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|end| &bytes[2..2 + end])
+                .and_then(|line| std::str::from_utf8(line).ok())
+                .and_then(|line| line.split_whitespace().next())
+                .unwrap_or("/bin/sh");
+            let wrapper = format!("#!/bin/sh\nexec {interpreter} {host} \"$@\"\n", host = host_path.display());
+            let mut header = litebox_tar_header(wrapper.len() as u64, 0o755)?;
+            let mut slice: &[u8] = wrapper.as_bytes();
+            builder.append_data(&mut header, relative, &mut slice).with_context(|| {
                 format!(
-                    "append shell guest symlink {} -> {}",
+                    "append shell guest wrapper {} -> {}",
                     guest_path.display(),
-                    target.display()
+                    host_path.display()
                 )
             })?;
+            continue;
+        }
+        let mode = std::fs::metadata(host_path)
+            .map(|meta| meta.mode())
+            .unwrap_or(0o755);
+        let mut header = litebox_tar_header(bytes.len() as u64, mode)?;
+        let mut slice: &[u8] = &bytes;
+        builder.append_data(&mut header, relative, &mut slice).with_context(|| {
+            format!(
+                "append shell guest copy {} (bytes of {})",
+                guest_path.display(),
+                host_path.display()
+            )
+        })?;
+    }
+
+    // Guest `/etc`. This tar is a SEPARATE archive from the runtime
+    // augmentation's, and none of these entries were ever written into it, so
+    // a command typed into a sandbox shell had no resolver and no CA roots
+    // whatsoever — measured 2026-10-13 on fc-sanjose: `/etc` did not exist at
+    // all, and a staged `curl` answered exit 6 `Could not resolve host:
+    // example.com` and then exit 77 `error setting certificate file:
+    // /etc/pki/tls/certs/ca-bundle.crt`. `use-vc` stays mandatory: a litebox
+    // guest has TCP egress but no UDP one, so a UDP resolver would time out
+    // even with the file present. Guest `execve` handles shebangs and symlinks
+    // fine, so nothing else is needed for these to take effect.
+    append_platform_tar_entry(&mut builder, Path::new("etc/resolv.conf"), GUEST_RESOLV_CONF)?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/nsswitch.conf"),
+        GUEST_NSSWITCH_CONF,
+    )?;
+    if let Some(bundle) = host_ca_bundle() {
+        for path in GUEST_CA_PATHS {
+            append_platform_tar_entry(&mut builder, Path::new(path), &bundle)?;
+        }
     }
 
     // The shell's rc file (`ENV`), synthesized here rather than read from the
@@ -4877,7 +5222,7 @@ fn build_shell_tar_blocking(
 fn build_shell_tar_blocking(
     _archive: File,
     _paths: &[PathBuf],
-    _symlinks: &[(PathBuf, PathBuf)],
+    _copies: &[(PathBuf, PathBuf)],
 ) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar construction requires Linux openat2")
 }
@@ -5645,13 +5990,23 @@ impl CellBackend for LiteboxBackend {
             }
             (PathBuf::from("/bin/sh"), vec!["-c".to_string(), line])
         } else {
-            (resolve_guest_program(&req.cmd)?, req.args.clone())
+            resolve_guest_argv(&req.cmd, &req.args)?
         };
 
         let directories = self.prepare_artifact_dirs()?;
         directories.verify_bindings()?;
         let exec_tar = self.allocate_temp_file(&directories.temporary, "exec", ".tar")?;
-        build_guest_tar(exec_tar.file.try_clone()?, vec![program.clone()]).await?;
+        // The program the runner first execs, plus (for a shebang script) the
+        // script itself: `resolve_guest_argv` turns `npx` into
+        // `/usr/bin/node-22 /usr/bin/npx`, and the script has to be in the
+        // guest for that argv to mean anything.
+        let mut staged = vec![program.clone()];
+        if !req.shell {
+            if let Ok(named) = resolve_guest_program(&req.cmd) {
+                staged.push(named);
+            }
+        }
+        build_guest_tar(exec_tar.file.try_clone()?, staged).await?;
         let initial_files_alias =
             self.allocate_initial_files_alias(&directories.temporary, &exec_tar.file)?;
 
