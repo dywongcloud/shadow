@@ -1,110 +1,74 @@
-//! libsql/Hrana + Upstash-style REST surface for `browser_db` replicas
-//! (bn-browser-db-rest) — the fleet-replicated CRR database
-//! (`crate::browser_db`) has, until now, been reachable ONLY through the
-//! browser↔fleet `Op::CrrSync` protocol; this module gives it a plain HTTP
-//! query interface too, so a server, a CI job, or `curl` can read/write the
-//! same replica a tenant's browsers are syncing, without embedding a QUIC
-//! client.
+//! libsql/Hrana + Upstash-style REST surface for `browser_db` replicas: the fleet-replicated CRR
+//! database (`crate::browser_db`) is otherwise reachable only through the browser-to-fleet
+//! `Op::CrrSync` protocol, and this gives it a plain HTTP query interface too, so a server, a CI
+//! job or `curl` can read and write the same replica a tenant's browsers are syncing, without
+//! embedding a QUIC client.
 //!
-//! # The "no guaranteed local replica" problem, and its fix
+//! # The 'no guaranteed local replica' problem, and its fix
 //!
-//! Unlike managed SQLite (`DbKind::Sqlite`), a `browser_db` project has no
-//! `Database` record and no `host_node` field — its module doc is explicit
-//! that "there is deliberately NO owner-proxy HTTP arm: a file copy is not a
-//! merge", so a replica FILE only exists on nodes that have actually served
-//! a CRR round for that project. A REST request landing on a random node
-//! (round-robin DNS) could hit one with no local copy at all.
+//! Unlike managed SQLite (`DbKind::Sqlite`), a `browser_db` project has no `Database` record and no
+//! `host_node`, and `browser_db` deliberately has NO owner-proxy HTTP arm for CRR sync (a file copy
+//! is not a merge), so a replica FILE only exists on nodes that have served a CRR round for that
+//! project. A REST request landing on a random node (round-robin DNS) could hit one with no local
+//! copy at all.
 //!
-//! The fix is the SAME deterministic rendezvous-hash election this codebase
-//! already uses for the managed-inference GPU coordinator
-//! (`inference::coordinator_for`) and for `browser_db`'s own
-//! `auto_db_deployment_for_tenant`/shard placement: every node computes the
-//! identical answer from the gossiped healthy-node roster
-//! ([`crate::browser_db::rest_owner_for_project`]), so there is no election
-//! round trip and no coordinator state. The elected owner lazily
-//! opens-or-creates its local replica (schema applied from the resolved
-//! spec) on its FIRST request — the same self-heal `reconcile_replicas`
-//! already performs on a timer, just triggered synchronously instead of
-//! waiting up to `HIVE_BROWSER_DB_RECONCILE_SECS`. Every other node PROXIES
-//! to the elected owner — HTTP admin first, the iroh gossip transport as the
-//! NAT'd-peer fallback — mirroring `hrana.rs`'s owner-routing shape exactly,
-//! with one difference named honestly: `hrana` proxies to a STORED
-//! `Database::host_node` field, this proxies to a COMPUTED election result,
-//! because there is no database record to store one in.
+//! The fix is the same deterministic rendezvous-hash election used for the managed-inference GPU
+//! coordinator (`inference::coordinator_for`) and for `browser_db`'s own
+//! `auto_db_deployment_for_tenant`/shard placement: every node computes the identical answer from
+//! the gossiped healthy-node roster ([`crate::browser_db::rest_owner_for_project`]), with no
+//! election round trip and no coordinator state. The elected owner lazily opens-or-creates its
+//! local replica (schema applied from the resolved spec) on its FIRST request, the self-heal
+//! `reconcile_replicas` performs on a timer, triggered synchronously instead. Every other node
+//! PROXIES to it (HTTP admin first, the iroh gossip transport as the NAT'd-peer fallback),
+//! mirroring `hrana.rs`'s owner routing with one difference: `hrana` proxies to a STORED
+//! `Database::host_node`, this proxies to a COMPUTED election result, because there is no database
+//! record to store one in.
 //!
 //! # Credential
 //!
-//! `browser_db`'s existing access model is a QUIC-endpoint-identity
-//! admission lease — structurally unlike a static bearer token, and not
-//! reusable here. This module adds a NEW, independently-revocable credential
-//! (`POST /v1/projects/:project/browser-db/rest-token`), minted the way
-//! `drive_api::webdav_token_mint` mints the WebDAV credential: a random
-//! token is generated, shown to the caller exactly ONCE in the mint
-//! response, and only its SHA-256 hash is stored
-//! (`project_settings::BrowserDbRestToken`, replicated fleet-wide via
-//! `store_sync::REGISTRY`'s existing "projects" entry — the same store
-//! `browser_db`'s own opt-in policy already lives in). Two independent
-//! slots — team (read+write) and public (read-only, mintable only while
-//! `browser_db.public_read` is enabled and re-checked live on every
-//! request, not just at mint time) — mirror the Team/Public scope duality
-//! `browser_admission` already encodes for the CRR sync protocol.
-//! [`credential_scope`] checks a presented bearer constant-time against both
-//! hashes, the exact shape `db_rest::credential_matches` and
-//! `relational::drive_token_verify` already use.
+//! `browser_db`'s existing access model is a QUIC-endpoint-identity admission lease, structurally
+//! unlike a static bearer token and not reusable here, so this module adds a NEW, independently
+//! revocable credential (`POST /v1/projects/:project/browser-db/rest-token`), minted the way
+//! `drive_api::webdav_token_mint` mints the WebDAV credential: shown to the caller exactly ONCE and
+//! stored only as its SHA-256 hash (`project_settings::BrowserDbRestToken`, replicated fleet-wide
+//! with the rest of the project settings). Two independent slots, team (read+write) and public
+//! (read-only, mintable only while `browser_db.public_read` is enabled and re-checked live on every
+//! request), mirror the Team/Public scope duality `browser_admission` encodes for CRR sync.
+//! [`credential_scope`] compares a presented bearer in constant time against both hashes, the shape
+//! `db_rest::credential_matches` and `relational::drive_token_verify` use.
 //!
 //! # Two dialects, one connection lifecycle
 //!
-//! Both dialects open the local replica via `hive_crsql::open` (loads the
-//! real cr-sqlite extension — `sqlite_pool`'s bare `rusqlite::Connection`
-//! must NEVER be pointed at a `browser-dbs` file, exactly the hazard
-//! AGENTS.md names) and wrap the whole request in one explicit
-//! transaction, calling `hive_crsql::set_ts` once right after `BEGIN` for
-//! any non-read-only request — before the writes, as `hive_crsql::set_ts`'s
-//! own doc requires, and covering every statement in the pipeline/batch
-//! because the transaction stays open (autocommit off) until this module's
-//! own `COMMIT`, so the extension's per-commit `ts` reset never fires
-//! mid-pipeline. (Known v1 scope limit: a client-supplied pipeline may not
-//! itself issue literal `BEGIN`/`COMMIT` SQL text, since one is already
-//! open; use Hrana's own `"batch"` request type for atomic multi-statement
-//! groups, which does not emit SQL `BEGIN` text.)
+//! Both dialects open the replica through `hive_crsql::open` (it loads the real cr-sqlite
+//! extension: `sqlite_pool`'s bare `rusqlite::Connection` must NEVER be pointed at a `browser-dbs`
+//! file) and wrap the whole request in one explicit transaction, calling `hive_crsql::set_ts` once
+//! right after `BEGIN` for any non-read-only request: before the writes, as its own doc requires,
+//! and covering every statement because the transaction stays open until this module's own
+//! `COMMIT`, so the extension's per-commit `ts` reset never fires mid-pipeline. Known v1 limit: a
+//! client pipeline may not itself issue literal `BEGIN`/`COMMIT` SQL; use Hrana's `batch` request
+//! type for atomic groups.
 //!
-//! * **libsql/Hrana** (`POST v2/pipeline`, `POST v3/pipeline`, `GET v2`,
-//!   `GET v3` capability probes) reuses `hrana_proto::execute_pipeline`
-//!   VERBATIM against the cr-sqlite-loaded connection — the wire codec is
-//!   generic over any `rusqlite::Connection`, so this gets the full,
-//!   already-hardened Hrana value/error/type handling for free. Interactive
-//!   multi-request streams (a baton continuing across HTTP requests) are
-//!   NOT supported in v1 — every pipeline is self-contained and closes
-//!   automatically (`baton` in the reply is always `null`); a client
-//!   presenting a non-empty `baton` gets an honest `STREAM_EXPIRED`. `v3
-//!   cursor` (unbounded streaming reads) is out of scope for the same
-//!   reason and simply 404s with a message naming the gap.
-//! * **Upstash-style JSON-over-HTTP** (`POST sql`, `{query, params} ->
-//!   {fields, rows, rowCount}`) is the SQL-over-HTTP shape `db_rest`'s
-//!   `postgres_rest` already established for Postgres, applied to SQLite:
-//!   real parameter binding (`raw_bind_parameter`, never string
-//!   interpolation), `rowCount` gated on the prepared statement's own
-//!   `readonly()` flag (the same `sqlite3_stmt_readonly`/`sqlite3_changes`
-//!   discipline `hrana`'s doc names — an unguarded read after a write must
-//!   never claim it wrote a row), and the same integer-precision discipline
-//!   Hrana enforces: an i64 that does not fit exactly in an f64 is encoded
-//!   as a JSON STRING rather than silently losing bits.
+//! * **libsql/Hrana** (`POST v2/pipeline`, `POST v3/pipeline`, `GET v2`/`GET v3` probes) reuses
+//!   `hrana_proto::execute_pipeline` VERBATIM against the cr-sqlite connection, so it inherits the
+//!   hardened Hrana value, error and type handling. Interactive streams (a baton continuing across
+//!   HTTP requests) are NOT supported in v1: every pipeline is self-contained and closes (`baton`
+//!   in the reply is always `null`), a non-empty `baton` gets an honest `STREAM_EXPIRED`, and `v3
+//!   cursor` 404s with a message naming the gap.
+//! * **Upstash-style JSON-over-HTTP** (`POST sql`, `{query, params}` -> `{fields, rows, rowCount}`)
+//!   is the SQL-over-HTTP shape `db_rest`'s `postgres_rest` established, applied to SQLite: real
+//!   parameter binding (`raw_bind_parameter`, never string interpolation), `rowCount` gated on the
+//!   statement's own `readonly()` flag, and Hrana's integer-precision rule (an i64 that does not
+//!   fit exactly in an f64 is a JSON STRING).
 //!
 //! # Caps
 //!
-//! `max_value_bytes` is enforced ONLY at the CRR sync boundary by design —
-//! `ResolvedBrowserDbPolicy`'s own doc says so explicitly ("not on local SQL
-//! execution: an oversized value persists in its origin replica but never
-//! replicates") — so a REST write that creates an oversized value is
-//! already handled correctly with NO extra code here: `sync_round`'s export
-//! half will simply never ship it onward. `max_bytes` (the per-replica total
-//! size cap) is different: it binds every write path, REST included. This
-//! module enforces it the same way `apply_push_batches` does — checked
-//! against the file's size on disk BEFORE the write, and on a real detected
-//! write (`Connection::total_changes` advancing) the whole transaction is
-//! ROLLED BACK with a typed quota message, never partially applied. Reads
-//! are never refused for being over cap (mirrors `sync_round`'s "the export
-//! half is still served" rule for a read-only/refused grant).
+//! `max_value_bytes` is enforced ONLY at the CRR sync boundary by design (an oversized value
+//! persists in its origin replica but never replicates), so a REST write needs no extra code for
+//! it: `sync_round`'s export half never ships it onward. `max_bytes` (the per-replica size cap)
+//! binds every write path, REST included, and is enforced the way `apply_push_batches` does: the
+//! file's size on disk is checked BEFORE the write, and on a real detected write
+//! (`Connection::total_changes` advancing) the whole transaction is ROLLED BACK with a typed quota
+//! message, never partially applied. Reads are never refused for being over cap.
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
@@ -126,14 +90,9 @@ type Claims = Option<axum::Extension<crate::auth::Claims>>;
 
 /// Max request body for a pipeline/sql POST — the `hrana`/`db_rest` cap.
 const BODY_CAP: usize = 4 * 1024 * 1024;
-/// Rows buffered for one `sql` result — the `postgres_rest` cap, applied to
-/// SQLite (a single connection per request means no server-side cursor to
-/// page through here either).
+/// Rows buffered for one `sql` result: the `postgres_rest` cap, applied to SQLite (a single
+/// connection per request means no server-side cursor to page through either).
 const MAX_ROWS: usize = 10_000;
-
-// ---------------------------------------------------------------------------
-// Credential mint
-// ---------------------------------------------------------------------------
 
 fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
@@ -159,10 +118,9 @@ struct MintReq {
     scope: String,
 }
 
-/// `POST /v1/projects/:project/browser-db/rest-token` — mint (rotating) one
-/// of this project's two REST credentials. JWT/API-key authed via
-/// `require_project` (only a tenant member may mint or rotate); the
-/// resulting token is shown exactly once.
+/// `POST /v1/projects/:project/browser-db/rest-token`: mints (rotating) one of this project's two
+/// REST credentials. JWT/API-key authed through `require_project` (only a tenant member may mint or
+/// rotate); the resulting token is shown exactly once.
 async fn rest_token_mint(
     State(cloud): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -225,11 +183,10 @@ async fn rest_token_mint(
     })))
 }
 
-/// The two public URLs of a project's REST/Hrana surface, derived from the
-/// same `api_base()` everywhere they are published (mint response, status
-/// endpoint) — one construction, never two format strings to keep in sync.
-/// The libsql base's TRAILING SLASH is load-bearing: libsql clients resolve
-/// `v2/pipeline` RELATIVELY against it (the `hrana.rs` precedent).
+/// The two public URLs of a project's REST/Hrana surface, derived from the same `api_base()`
+/// everywhere they are published (mint response, status endpoint): one construction, never two
+/// format strings to keep in sync. The libsql base's TRAILING SLASH is load-bearing: libsql clients
+/// resolve `v2/pipeline` RELATIVELY against it (the `hrana.rs` precedent).
 pub(crate) fn rest_urls(cloud: &Arc<CloudState>, project: &str) -> (String, String) {
     let base = cloud.api_base();
     let base_trimmed = base.trim_end_matches('/');
@@ -243,11 +200,10 @@ pub(crate) fn rest_urls(cloud: &Arc<CloudState>, project: &str) -> (String, Stri
     )
 }
 
-/// Which scope (if any) `bearer` matches for `project`'s minted REST
-/// credentials — constant-time on the stored HASH, the
-/// `relational::drive_token_verify` / `db_rest::credential_matches` shape.
-/// `None` covers both "no token was ever minted" and "wrong token": a probe
-/// must not be able to distinguish them.
+/// Which scope (if any) `bearer` matches for `project`'s minted REST credentials, comparing in
+/// constant time on the stored HASH (the `relational::drive_token_verify` /
+/// `db_rest::credential_matches` shape). `None` covers both 'no token was ever minted' and 'wrong
+/// token': a probe must not be able to distinguish them.
 fn credential_scope(cloud: &Arc<CloudState>, project: &str, bearer: &str) -> Option<BrowserScope> {
     if bearer.is_empty() {
         return None;
@@ -267,14 +223,10 @@ fn credential_scope(cloud: &Arc<CloudState>, project: &str, bearer: &str) -> Opt
     None
 }
 
-// ---------------------------------------------------------------------------
-// Per-project write concurrency admission (the `db_rest::rest_conn_permit`
-// shape) — bounds how many REST requests may hold an open connection to one
-// project's replica file at once, so a burst of callers queues via a typed
-// 503 rather than piling up unbounded blocking-pool threads each holding
-// their own sqlite3 handle.
-// ---------------------------------------------------------------------------
-
+/// Per-project write concurrency admission (the `db_rest::rest_conn_permit` shape): bounds how many
+/// REST requests may hold an open connection to one project's replica file at once, so a burst of
+/// callers queues via a typed 503 rather than piling up unbounded blocking-pool threads, each
+/// holding its own sqlite3 handle.
 const MAX_REST_CONNS_PER_PROJECT: usize = 8;
 
 static REST_CONNS: OnceLock<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> =
@@ -291,14 +243,16 @@ fn rest_conn_permit(project: &str) -> Option<tokio::sync::OwnedSemaphorePermit> 
     sem.try_acquire_owned().ok()
 }
 
-// ---------------------------------------------------------------------------
-// Local execution
-// ---------------------------------------------------------------------------
-
-/// Open-or-create the local replica, apply schema, run `f` inside one
-/// explicit transaction with `set_ts` called once (for a non-read-only
-/// request) before any write, enforce the `max_bytes` cap on a real detected
-/// write, and commit — or roll back on any error, including a cap refusal.
+/// Opens-or-creates the local replica, applies the schema, runs `f` inside one explicit transaction
+/// with `set_ts` called once (for a non-read-only request) before any write, enforces the
+/// `max_bytes` cap on a real detected write, and commits, or rolls back on any error, including a
+/// cap refusal. A write session starts with `BEGIN IMMEDIATE`, which takes the RESERVED (write)
+/// lock up front and fails fast on contention instead of deadlocking against another writer's later
+/// upgrade; a read-only (Public-scope) session sets `query_only=ON`, which refuses to take a write
+/// lock AT ALL, so it uses a plain deferred `BEGIN`. The cap's `bytes_before` is measured AFTER
+/// that lock is held, because SQLite serializes writers on it: read before `BEGIN`, up to
+/// `MAX_REST_CONNS_PER_PROJECT` concurrent writers could all observe the same stale under-cap size
+/// and all pass the check.
 async fn with_replica<F, T>(
     project: String,
     resolved: ResolvedBrowserDbPolicy,
@@ -331,27 +285,12 @@ where
                 .map_err(|e| e.to_string())?;
         }
         let changes_before = conn.total_changes();
-        // `BEGIN IMMEDIATE` acquires a RESERVED (write) lock up front — the
-        // right choice for a write session (fails fast on contention rather
-        // than deadlocking against another writer's later upgrade attempt),
-        // but `query_only=ON` refuses to take a write lock AT ALL, so issuing
-        // it for a read-only (Public-scope) session would refuse every
-        // request, including a plain SELECT, with "attempt to write a
-        // readonly database" — caught live via the Public-scope read test.
-        // A read-only session uses a plain (deferred) `BEGIN` instead.
         let begin = if read_only {
             "BEGIN"
         } else {
             "BEGIN IMMEDIATE"
         };
         conn.execute_batch(begin).map_err(|e| e.to_string())?;
-        // Measured AFTER the RESERVED lock is held, not before: SQLite
-        // serializes writers on that lock (a concurrent `BEGIN IMMEDIATE`
-        // blocks/fails until this transaction ends), so `bytes_before` here
-        // is the true just-committed size with no other writer able to have
-        // landed a change in between. Reading it before BEGIN let up to
-        // `MAX_REST_CONNS_PER_PROJECT` concurrent writers all observe the
-        // same stale under-cap size and all pass the cap check below.
         let bytes_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if !read_only {
             if let Err(e) = hive_crsql::set_ts(&conn, hive_core::now_ms()) {
@@ -387,6 +326,12 @@ where
     .map_err(|e| format!("worker join failed: {e}"))?
 }
 
+/// Runs one Hrana pipeline against the replica. This lane NEVER runs on musql: `conn` is a
+/// cr-sqlite CRR replica opened through `hive_crsql::open`, and a plain SQL engine writing it would
+/// bypass the clock tables the CRR merge reads and diverge permanently. The pipeline implementation
+/// is shared with the managed-SQLite lane, but the engine is always this file's own connection,
+/// driven to completion inside `spawn_blocking` (it is blocking file IO), never awaited on the
+/// runtime.
 async fn pipeline(
     project: &str,
     resolved: &ResolvedBrowserDbPolicy,
@@ -428,13 +373,6 @@ async fn pipeline(
         resolved.clone(),
         read_only,
         move |conn| {
-            // This lane NEVER runs on musql. `conn` is a cr-sqlite CRR replica
-            // opened through `hive_crsql::open`; a plain SQL engine writing it
-            // would bypass the clock tables the CRR merge reads and diverge
-            // permanently. The pipeline implementation is shared with the
-            // managed-SQLite lane, but the ENGINE here is always this file's
-            // own connection. Driven to completion inside `spawn_blocking`
-            // (it is blocking file IO), never awaited on the runtime.
             let o = futures::executor::block_on(crate::hrana_proto::execute_pipeline(
                 conn,
                 requests,
@@ -507,6 +445,8 @@ fn json_to_sql(v: &Value) -> hive_crsql::rusqlite::types::Value {
 
 /// Real parameter binding (never string interpolation), a real prepared
 /// statement, real rows — the `db_rest::run_sql` shape applied to SQLite.
+/// `rowCount` is gated on the statement's own readonly-ness: `sqlite3_changes` is per-CONNECTION
+/// and only DML updates it, so an unguarded read after a write would claim it wrote a row.
 fn run_upstash_sql(
     conn: &hive_crsql::rusqlite::Connection,
     query: &str,
@@ -524,9 +464,6 @@ fn run_upstash_sql(
         stmt.raw_bind_parameter(i + 1, json_to_sql(p))
             .map_err(|e| format!("cannot bind param {}: {e}", i + 1))?;
     }
-    // Gate `rowCount` on the statement's own readonly-ness — `sqlite3_changes`
-    // is per-CONNECTION and only DML updates it, so an unguarded read after a
-    // write would claim it wrote a row (the `hrana.rs` doc's own warning).
     let is_readonly = stmt.readonly();
     let col_names: Vec<String> = stmt
         .column_names()
@@ -560,12 +497,11 @@ fn run_upstash_sql(
     Ok(json!({ "fields": fields, "rows": rows_json, "rowCount": affected }))
 }
 
-/// Precision discipline: `integer` beyond what an f64 can hold exactly
-/// becomes a JSON STRING rather than silently losing bits (the `hrana.rs`
-/// wire-codec rule, applied to the plain-JSON dialect). Blob is base64;
-/// non-finite float is a loud, named error (JSON cannot represent it and
-/// `null` would be indistinguishable from a real NULL) — both the
-/// `db_rest::col_to_json` precedent.
+/// Precision discipline: an `integer` beyond what an f64 can hold exactly becomes a JSON STRING
+/// rather than silently losing bits (the `hrana.rs` wire-codec rule, applied to the plain-JSON
+/// dialect). A blob is base64; a non-finite float is a loud, named error (JSON cannot represent it,
+/// and `null` would be indistinguishable from a real NULL), both the `db_rest::col_to_json`
+/// precedent.
 fn sql_value_to_json(
     v: hive_crsql::rusqlite::types::ValueRef<'_>,
     col: &str,
@@ -597,10 +533,6 @@ fn sql_value_to_json(
         ValueRef::Blob(b) => Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Dispatch + owner routing
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 enum Endpoint {
@@ -640,9 +572,9 @@ async fn serve_local(
     }
 }
 
-/// Entry point every dialect HTTP handler funnels through: credential check,
-/// live opt-in + scope re-check, owner election, then either serve locally
-/// (this node IS the elected owner) or proxy (mirrors `hrana::serve`).
+/// Entry point every dialect HTTP handler funnels through: credential check, live opt-in and scope
+/// re-check, owner election, then either serve locally (this node IS the elected owner) or proxy
+/// (mirroring `hrana::serve`).
 async fn serve(
     cloud: Arc<CloudState>,
     project: String,
@@ -824,11 +756,10 @@ fn decode_envelope(v: &Value) -> Option<Response> {
     ))
 }
 
-/// Owner-side re-check: this is `hrana::mesh_serve`'s shape, re-deriving
-/// authorization from THIS node's own replicated state rather than trusting
-/// anything the envelope claims — the `proxy_to_owner` precedent. Refuses to
-/// re-proxy: if this node is not the elected owner either, the caller's
-/// routing information is stale, and answering honestly beats a proxy loop.
+/// Owner-side re-check, `hrana::mesh_serve`'s shape: re-derives authorization from THIS node's own
+/// replicated state rather than trusting anything the envelope claims. Refuses to re-proxy: if this
+/// node is not the elected owner either, the caller's routing information is stale, and answering
+/// honestly beats a proxy loop.
 pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> Value {
     let refuse = |status: StatusCode, msg: &str| {
         json!({
@@ -897,10 +828,6 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, project: &str, env: &Value) -> 
         "body_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Route wiring
-// ---------------------------------------------------------------------------
 
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     use axum::routing::{get, post};
@@ -997,10 +924,6 @@ async fn mesh_route(
 ) -> Json<Value> {
     Json(mesh_serve(&c, &project, &env).await)
 }
-
-// ---------------------------------------------------------------------------
-// Response helpers
-// ---------------------------------------------------------------------------
 
 fn ok_json(v: Value) -> Response {
     cors(

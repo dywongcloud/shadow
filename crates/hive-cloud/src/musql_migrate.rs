@@ -1,30 +1,27 @@
-//! musql migration: convert one managed SQLite database from a `.db` file to a
-//! `.musq` file, prove it row-for-row, and be able to go back.
+//! musql migration: converts one managed SQLite database from a `.db` file to a `.musq` file,
+//! proves it row-for-row, and can go back.
 //!
 //! # The rule this module exists to enforce
 //!
-//! **No original file is deleted, truncated or rewritten in place until its
-//! migrated copy has been verified against it.** Every step is therefore
-//! ordered: pre-flight the source, quiesce it, COPY it, convert the DATABASE
-//! (not the copy — the copy is the insurance), then compare the two engines
+//! **No original file is deleted, truncated or rewritten in place until its migrated copy has been
+//! verified against it.** Every step is therefore ordered: pre-flight the source, quiesce it, COPY
+//! it, convert the DATABASE (not the copy: the copy is the insurance), then compare the two engines
 //! table by table, and only then let the record point at the new engine.
 //!
 //! # Why conversion is safe even when a tenant's data is only in the WAL
 //!
-//! Measured, not assumed: `musql-convert import` reads an un-checkpointed
-//! `-wal`. A source built with 500 inserts and 71 deletes, killed without
-//! closing so the main file was 4096 B and the WAL held every committed row,
-//! converted to a 429-row `.musq` whose canonical digest matched SQLite's
-//! exactly — rows, `typeof` per value and rowids all preserved.
+//! Measured, not assumed: `musql-convert import` reads an un-checkpointed `-wal`. A source killed
+//! without closing (main file 4096 B, every committed row only in the WAL) converted to a `.musq`
+//! whose canonical digest matched SQLite's exactly: rows, `typeof` per value and rowids all
+//! preserved.
 //!
-//! # The one thing that can stop a migration
+//! # What can stop a migration
 //!
-//! A non-finite REAL. SQLite stores `Inf`/`-Inf`/`NaN`; musql stores the value
-//! but returns it as `{"type":"null"}` on the wire, where Hive today raises a
-//! loud, column-naming error. That is an observable change for that tenant, so
-//! [`preflight`] counts them per table/column and migration REFUSES a database
-//! holding one. Refusing a migration is recoverable; silently turning a
-//! tenant's `Inf` into `NULL` is not.
+//! A source whose `integrity_check` is not `ok`, and a non-finite REAL. SQLite stores
+//! `Inf`/`-Inf`/`NaN`; musql stores the value but returns it as `{"type":"null"}` on the wire,
+//! where Hive today raises a loud, column-naming error. That is an observable change for that
+//! tenant, so [`preflight`] counts them per table/column and migration REFUSES a database holding
+//! one. Refusing a migration is recoverable; silently turning a tenant's `Inf` into `NULL` is not.
 
 use crate::musql::{convert_bin, Engine, MusqlEngine};
 use crate::sqlite_engine::{Budget, SqlEngine, SqlValue};
@@ -32,16 +29,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Backups live beside the store, never inside it: `musqld -dir` serves every
-/// `.musq` in `sqlite-dbs`, and a backup directory inside it would either be
-/// ignored (fine) or, if it ever held a `.musq`, be served as a database.
+/// Backups live beside the store, never inside it: `musqld -dir` serves every `.musq` in
+/// `sqlite-dbs`, and a backup directory inside it would either be ignored (fine) or, if it ever
+/// held a `.musq`, be served as a database.
 pub fn backup_root() -> PathBuf {
     crate::persist::data_dir().join("sqlite-dbs-backup")
 }
 
-/// A budget for verification reads only: a migration must see every row, and
-/// the Hrana pipeline cap (20k rows) exists to bound a CLIENT's response, not
-/// an operator's integrity check.
+/// A budget for verification reads only: a migration must see every row, and the Hrana pipeline cap
+/// (20k rows) exists to bound a CLIENT's response, not an operator's integrity check.
 fn verify_budget() -> Budget {
     Budget {
         max_rows: usize::MAX / 4,
@@ -81,10 +77,9 @@ fn digest_rows(rows: &[String]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Every row of one table, in a stable order. `ORDER BY rowid` when the table
-/// has one; a `WITHOUT ROWID` table has no rowid, so its rows are SORTED before
-/// digesting rather than compared in whatever order each engine happened to
-/// return them — an unsorted comparison would report divergence between two
+/// Every row of one table, in a stable order: `ORDER BY rowid` when the table has one. A `WITHOUT
+/// ROWID` table has no rowid, so its rows are SORTED before digesting rather than compared in
+/// whatever order each engine happened to return them, which would report divergence between two
 /// identical databases.
 async fn dump<E: SqlEngine>(eng: &mut E, table: &str) -> Result<(Vec<String>, bool), String> {
     let budget = verify_budget();
@@ -129,8 +124,6 @@ async fn tables<E: SqlEngine>(eng: &mut E) -> Result<Vec<String>, String> {
         .collect())
 }
 
-// ---- Pre-flight ------------------------------------------------------------
-
 pub struct NonFinite {
     pub table: String,
     pub column: String,
@@ -155,10 +148,11 @@ impl Preflight {
     }
 }
 
-/// Read-only inspection of a rusqlite database before anything is copied.
-/// `integrity_check` must be `ok`: `musql-convert` refuses a corrupt source with
-/// `ErrSourceCorrupt`, and `-force` would push through a broken file, so the
-/// only correct move is to stop here and say why.
+/// Read-only inspection of a rusqlite database before anything is copied. `integrity_check` must be
+/// `ok`: `musql-convert` refuses a corrupt source with `ErrSourceCorrupt`, and `-force` would push
+/// through a broken file, so the only correct move is to stop here and say why. The non-finite scan
+/// casts each column to TEXT, because text renders Inf/-Inf/NaN as exactly those three strings and
+/// nothing else does: it separates 'this database cannot migrate yet' from 'it can'.
 pub async fn preflight(id: &str) -> Result<Preflight, String> {
     let path = crate::databases::sqlite_file_path(id)
         .ok_or_else(|| "database id is not a platform-issued id".to_string())?;
@@ -198,9 +192,6 @@ pub async fn preflight(id: &str) -> Result<Preflight, String> {
                 c
             };
             for col in cols {
-                // text renders Inf/-Inf/NaN as exactly those three strings and
-                // nothing else does, so this is the scan that separates "this
-                // database cannot migrate yet" from "it can".
                 let sql = format!(
                     "SELECT count(*) FROM {} WHERE CAST({} AS TEXT) IN ('Inf','-Inf','NaN')",
                     quote_ident(t),
@@ -228,11 +219,9 @@ pub async fn preflight(id: &str) -> Result<Preflight, String> {
     .map_err(|e| format!("preflight task failed: {e}"))?
 }
 
-// ---- Backup ----------------------------------------------------------------
-
-/// Crash-safe copy of the source: the `.db` AND its `-wal`/`-shm`, because a
-/// live database's committed rows can live only in the WAL, and a backup of the
-/// main file alone would be a backup of a stale snapshot.
+/// Crash-safe copy of the source: the `.db` AND its `-wal`/`-shm`, because a live database's
+/// committed rows can live only in the WAL, and a backup of the main file alone would be a backup
+/// of a stale snapshot.
 fn backup(id: &str) -> Result<PathBuf, String> {
     let src = crate::databases::sqlite_file_path(id)
         .ok_or_else(|| "database id is not a platform-issued id".to_string())?;
@@ -265,8 +254,6 @@ fn backup(id: &str) -> Result<PathBuf, String> {
     }
     Ok(dir)
 }
-
-// ---- Convert + verify ------------------------------------------------------
 
 pub struct TableCheck {
     pub table: String,
@@ -324,13 +311,31 @@ fn run_convert(args: &[&str]) -> Result<String, String> {
     Ok(text)
 }
 
-/// Convert `id` to musql and prove it. Steps, in order:
-/// pre-flight -> refuse new writers -> quiesce -> back up -> convert -> verify
-/// -> (caller flips the record). The record flip is deliberately NOT here: a
-/// migration that has not been verified must not be able to make itself live.
+/// Converts `id` to musql and proves it. Steps, in order: pre-flight -> refuse new writers ->
+/// quiesce -> back up -> convert -> verify -> (the caller flips the record). The record flip is
+/// deliberately NOT here: a migration that has not been verified must not be able to make itself
+/// live. `live_is_musql` says whether the record ALREADY points at musql, i.e. whether the `.musq`
+/// on disk is the live database or only a staged artifact.
 ///
-/// `live_is_musql` says whether the record ALREADY points at musql, i.e.
-/// whether the `.musq` on disk is the live database or only a staged artifact.
+/// The CONVERSION WINDOW (`hrana::begin_conversion`, released by `Drop` when this returns) refuses
+/// new Hrana streams, so nothing can write to the source after the snapshot and be lost when the
+/// record flips: `close_streams` plus `sqlite_pool::close` alone only quiesce what is already open,
+/// and a client arriving a second later reopens the file. Closing the open streams matters too:
+/// every stream holds a pooled connection and one mid-`BEGIN` holds the file's write lock, and
+/// closing them checkpoints and removes `-wal`, so what is converted is a self-contained file.
+///
+/// A `.musq` already on disk while the record still says rusqlite is a STAGED artifact of an
+/// earlier run, not the live database (nothing serves it), so it is moved aside into this run's
+/// backup (never deleted) and re-converted from the current source; refusing blocked every real
+/// flip, since a prior verified run had already staged them all. A stale `.musq.lock` or
+/// `.musq.delta` is moved aside the same way, because a leftover delta makes the import fail: it
+/// still describes the segment that was just moved aside. The destination must be a clean one, and
+/// everything removed is inside `backup_dir`. After the conversion the `.musq.lock` and
+/// `.musq.delta` sidecars are copied into the backup too (the `.musq` itself stays in place; which
+/// states leave committed data in the delta is not documented), and the result is verified by
+/// OPENING the database, never by comparing bytes. Verification also compares the table lists: a
+/// table present in the source but missing from the target is the failure a per-table walk cannot
+/// see.
 pub async fn migrate(id: &str, live_is_musql: bool) -> Result<Report, String> {
     let pre = preflight(id).await?;
     if pre.integrity != "ok" {
@@ -365,26 +370,13 @@ pub async fn migrate(id: &str, live_is_musql: bool) -> Result<Report, String> {
         ));
     }
 
-    // CONVERSION WINDOW. Held until this function returns, by `Drop`: from here
-    // on no new Hrana stream can open this database, so nothing can write to the
-    // source after the snapshot below and be lost when the record flips.
-    // `close_streams` + `sqlite_pool::close` alone only quiesce what is already
-    // open — a client arriving a second later reopens the file.
     let _converting = crate::hrana::begin_conversion(id);
 
-    // QUIESCE. Every stream holds a pooled connection and one mid-`BEGIN` holds
-    // the file's write lock; closing them checkpoints and removes `-wal`, so
-    // what is converted is a self-contained file.
     crate::hrana::close_streams(id);
     crate::sqlite_pool::close(id);
 
     let backup_dir = backup(id)?;
 
-    // A `.musq` already on disk while the record still says rusqlite is a STAGED
-    // artifact from an earlier run, not the live database: nothing serves it, so
-    // it is moved aside into this run's backup (never deleted) and re-converted
-    // from the current source. Refusing here blocked every real flip, because a
-    // prior verified run had already staged all of them.
     if dst.exists() {
         let staged = backup_dir.join(format!(
             "{}.staged-{}",
@@ -401,15 +393,6 @@ pub async fn migrate(id: &str, live_is_musql: bool) -> Result<Report, String> {
         );
     }
 
-    // A `.musq.delta` beside it is the same stale artifact, and leaving one
-    // behind makes the import fail outright — measured live, flipping a database
-    // back to musql after a rollback:
-    //   `musql-convert: sqlite: the source database fails integrity_check:
-    //    engine: segment delta was built against a different segment file
-    //    (delta was built for counter 2 pages 1; this file is counter 1 pages 2)`
-    // i.e. the delta still describes the segment that was just moved aside.
-    // Move them into this run's backup as well (never delete): the destination
-    // must be a clean one, and everything removed is inside `backup_dir`.
     let stamped = hive_core::now_ms();
     for suffix in [".lock", ".delta"] {
         let from = PathBuf::from(format!("{}{suffix}", dst.display()));
@@ -444,10 +427,6 @@ pub async fn migrate(id: &str, live_is_musql: bool) -> Result<Report, String> {
     };
     convert.map_err(|e| format!("migration of {id} failed (backup kept at {}): {e}", backup_dir.display()))?;
     let musq_bytes = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
-    // musql keeps a 0-byte `.musq.lock` beside the database and, transiently, a
-    // `.musq.delta`. Which states leave committed data in the delta is not
-    // documented, so the backup rule is: keep `.musq` AND every `*.musq.*`
-    // sidecar, and verify by OPENING the database, never by comparing bytes.
     if let Err(e) = backup_musq_sidecars(id, &backup_dir) {
         tracing::warn!(db = %id, error = %e, "could not back up musql sidecar files");
     }
@@ -484,8 +463,6 @@ pub async fn migrate(id: &str, live_is_musql: bool) -> Result<Report, String> {
                 ordered,
             });
         }
-        // A table present in the source but missing from the target is the
-        // failure a per-table walk cannot see: it just never gets compared.
         let source_tables: Vec<String> = {
             let mut stmt = source
                 .prepare(
@@ -549,9 +526,12 @@ fn backup_musq_sidecars(id: &str, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Roll back: `musql-convert export` the `.musq` to a NEW file, verify it the
-/// same way, and only then put it in place. The pre-migration `.db` is renamed
-/// aside, never deleted, so the rollback is itself reversible.
+/// Rolls back: `musql-convert export` the `.musq` to a NEW file, verify it the same way (against
+/// the engine, BEFORE it becomes the live file), and only then put it in place, under the same
+/// conversion window as `migrate` (the live file is replaced at the end, so nothing may be writing
+/// to it in between). The pre-migration `.db` is renamed aside first, never deleted, so a crash
+/// between the two operations leaves both files present and neither lost, and the rollback is
+/// itself reversible.
 pub async fn rollback(id: &str) -> Result<Report, String> {
     let live = crate::databases::sqlite_file_path(id)
         .ok_or_else(|| "database id is not a platform-issued id".to_string())?;
@@ -560,8 +540,6 @@ pub async fn rollback(id: &str) -> Result<Report, String> {
     if !musq.exists() {
         return Err(format!("{} does not exist — nothing to roll back", musq.display()));
     }
-    // Same conversion window as `migrate`: the live file is being replaced at
-    // the end of this function, so nothing may be writing to it in between.
     let _converting = crate::hrana::begin_conversion(id);
     crate::hrana::close_streams(id);
     crate::sqlite_pool::close(id);
@@ -583,7 +561,6 @@ pub async fn rollback(id: &str) -> Result<Report, String> {
         .map_err(|e| format!("export task failed: {e}"))??;
     }
 
-    // Verify the export BEFORE it becomes the live file.
     let mut target = {
         let restored_name = restored.clone();
         tokio::task::spawn_blocking(move || {
@@ -639,9 +616,6 @@ pub async fn rollback(id: &str) -> Result<Report, String> {
             report.json()
         ));
     }
-    // Only now does the live file move: the old one is renamed aside first, so a
-    // crash between the two operations leaves both files present and neither
-    // lost.
     if live.exists() {
         let aside = dir.join(format!("{}.pre-musql", crate::databases::sqlite_file_name(id)));
         std::fs::rename(&live, &aside)
@@ -651,10 +625,10 @@ pub async fn rollback(id: &str) -> Result<Report, String> {
     Ok(report)
 }
 
-/// Provision a NEW musql database: build an empty SQLite file and convert it, so
-/// the `.musq` exists before any request can reach it. (musqld's `-create` would
-/// also do this, but it creates a database for ANY unknown name, which is the
-/// silent-empty-database hazard; provisioning is deliberate, `-create` is not.)
+/// Provisions a NEW musql database: builds an empty SQLite file and converts it, so the `.musq`
+/// exists before any request can reach it. (musqld's `-create` would also do this, but it creates a
+/// database for ANY unknown name, which is the silent-empty-database hazard; provisioning is
+/// deliberate, `-create` is not.)
 pub async fn provision(id: &str) -> Result<(), String> {
     let dst = crate::databases::sqlite_musql_path(id)
         .ok_or_else(|| "database id is not a platform-issued id".to_string())?;
@@ -692,21 +666,35 @@ pub async fn plan(id: &str) -> Result<Value, String> {
     }))
 }
 
-// ---- Operator diagnostic ---------------------------------------------------
-
-/// `--sqlite-engine-probe`: run the SAME Hrana pipeline through BOTH engines on
-/// the SAME data and print both envelopes, so "the musql swap is wire-identical"
-/// is a measurement and not a claim.
+/// `--sqlite-engine-probe`: runs the SAME Hrana pipeline through BOTH engines on the SAME data and
+/// prints both envelopes, so 'the musql swap is wire-identical' is a measurement and not a claim.
+/// It exists because asking the question with a second implementation is how a diagnostic and the
+/// decision it informs quietly diverge (the reason `--dns-probe` runs `dns_probe::probe_nameserver`
+/// rather than its own probe): the pipeline is executed by the production
+/// `hrana_proto::execute_pipeline`, once against `rusqlite` and once against `musql`, and the two
+/// JSON envelopes are diffed. It requires `HIVE_SQLITE_ENGINE=musql`, `HIVE_MUSQLD_BIN`,
+/// `HIVE_MUSQL_CONVERT_BIN` and a scratch `HIVE_DATA`, and touches nothing but that scratch
+/// directory.
 ///
-/// This exists because asking the question with a second implementation is how
-/// a diagnostic and the decision it informs quietly diverge (the reason
-/// `--dns-probe` runs `dns_probe::probe_nameserver` rather than its own probe).
-/// Here that means: the pipeline below is executed by
-/// `hrana_proto::execute_pipeline` — the production function — once against
-/// `rusqlite` and once against `musql`, and the two JSON envelopes are diffed.
-///
-/// Requires `HIVE_SQLITE_ENGINE=musql`, `HIVE_MUSQLD_BIN`, `HIVE_MUSQL_CONVERT_BIN`
-/// and a scratch `HIVE_DATA`. It touches nothing but that scratch directory.
+/// Steps: (1) build a source with every value type plus deletions, so a migration that dropped a
+/// type or a rowid shows in the digest; (2) snapshot the PRISTINE source, since the pipeline
+/// MUTATES and both engines must start from the same bytes (after a WAL checkpoint, which returns
+/// three INTEGER columns and so runs as a batch); (3) the pipeline: every request type the Hrana
+/// surface serves, including a v3-only one, a statement that must fail, a `rows_read` for a
+/// row-returning statement the caller did NOT ask rows for (rusqlite steps and counts it, so musql
+/// must too), a computed non-finite (`encode_value` refuses it and musql must raise the SAME error
+/// rather than the NULL its row encoder substitutes) and a negative-zero literal; (4) the rusqlite
+/// pass; (5) restore the pristine source; (6) start the sidecar and `migrate`, watching the
+/// conversion window from another task (holding it for the whole conversion is the only thing
+/// stopping a client from reopening the file after the snapshot), then (6b) migrate again with the
+/// `.musq` STILL on disk, proving a staged file is moved aside and re-converted; (7) the musql
+/// pass; (8) `rollback` in the real direction on the real files, checking the rolled-back file
+/// against the engine, then the envelope diff (`query_duration_ms` is wall-clock, the one field
+/// that must differ, so it is stripped recursively); (9) the exported env surface for
+/// `DbKind::Sqlite` is identical with and without an `engine` key; (10) the record is the ONLY
+/// thing that makes a database musql: with `HIVE_SQLITE_ENGINE=musql` the default IS musql, and a
+/// record with `engine: "sqlite"` or no `engine` key (it predates the field) must still resolve to
+/// rusqlite.
 pub async fn run_probe() -> anyhow::Result<()> {
     use crate::hrana_proto::execute_pipeline;
 
@@ -730,8 +718,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(p);
     }
 
-    // 1. A source database with every value type plus deletions, so a migration
-    //    that dropped a type or a rowid would show up in the digest.
     {
         let src = src.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -762,18 +748,11 @@ pub async fn run_probe() -> anyhow::Result<()> {
         .await??;
     }
 
-    // 2. Snapshot the PRISTINE source. The pipeline below MUTATES (insert,
-    //    update, delete, create table), so running it twice against the same
-    //    file would compare two different databases. Both engines must start
-    //    from these exact bytes; the snapshot is what makes that true.
     let pristine = {
         let src = src.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
             {
                 let conn = hive_crsql::rusqlite::Connection::open(&src)?;
-                // Checkpoint so the file alone is the whole database. (It
-                // returns three INTEGER columns, so it is a batch, not a
-                // one-row string query — unlike `journal_mode`.)
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
             }
             Ok(std::fs::read(&src)?)
@@ -793,8 +772,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         Ok(())
     };
 
-    // 3. The pipeline. Every request type the Hrana surface serves, including a
-    //    v3-only one and a statement that must fail.
     let requests: Vec<Value> = vec![
         json!({"type":"execute","stmt":{"sql":"SELECT id,name,score,blob,note FROM users WHERE id<=3 ORDER BY id","args":[],"want_rows":true}}),
         json!({"type":"execute","stmt":{"sql":"SELECT count(*) c, min(id) lo, max(id) hi FROM users","args":[],"want_rows":true}}),
@@ -811,15 +788,8 @@ pub async fn run_probe() -> anyhow::Result<()> {
             {"condition":{"type":"ok","step":0},"stmt":{"sql":"INSERT INTO probe_s(x) VALUES(?1)","args":[{"type":"integer","value":"12"}],"want_rows":true}},
             {"condition":{"type":"is_autocommit"},"stmt":{"sql":"SELECT count(*) c FROM probe_s","args":[],"want_rows":true}}
         ]}}),
-        // `rows_read` for a row-returning statement the caller did NOT ask rows
-        // for: the rusqlite engine steps it and counts it, so musql must too.
         json!({"type":"execute","stmt":{"sql":"SELECT count(*) AS c FROM users","args":[],"want_rows":false}}),
-        // A computed non-finite: SQLite yields Inf, `hrana_proto::encode_value`
-        // refuses to encode it, and musql must raise the SAME error rather than
-        // hand back the NULL its row encoder substitutes.
         json!({"type":"execute","stmt":{"sql":"SELECT 1e308*10 AS overflow","args":[],"want_rows":true}}),
-        // Negative zero as a literal (the stored-value case is a documented
-        // musqld normalisation, not something this lane can see here).
         json!({"type":"execute","stmt":{"sql":"SELECT -0.0 AS nz","args":[],"want_rows":true}}),
         json!({"type":"store_sql","sql_id":7,"sql":"SELECT 42 AS answer"}),
         json!({"type":"execute","stmt":{"sql_id":7,"args":[],"want_rows":true}}),
@@ -827,7 +797,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         json!({"type":"get_autocommit"}),
     ];
 
-    // 4. rusqlite pass.
     let before = {
         let src = src.clone();
         let requests = requests.clone();
@@ -845,14 +814,8 @@ pub async fn run_probe() -> anyhow::Result<()> {
         .await??
     };
 
-    // 5. Put the source back exactly as it was, so the migration converts the
-    //    same bytes the rusqlite pass started from.
     restore(&pristine)?;
 
-    // 6. Start the sidecar and convert + verify. The conversion window is
-    //    watched from another task: `migrate` must hold it for the whole
-    //    conversion, because that is the only thing stopping a client from
-    //    reopening the file after the snapshot and losing the write.
     let watching = id.to_string();
     let window_watch = tokio::spawn(async move {
         for _ in 0..2000 {
@@ -876,12 +839,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
 
-    // 6b. Re-run the migration with the `.musq` from the pass above STILL ON
-    //     DISK. This is the case that used to be refused outright ("refusing to
-    //     overwrite a musql database"), which meant a database that had ever
-    //     been staged could never actually be flipped. A staged file is not a
-    //     live one — the record still points at rusqlite — so it is moved aside
-    //     and re-converted, and this proves the flip is runnable.
     let staged = crate::databases::sqlite_musql_path(id)
         .map(|p| p.exists())
         .unwrap_or(false);
@@ -901,7 +858,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         anyhow::bail!("the conversion window was never held; a write could land after the snapshot");
     }
 
-    // 7. musql pass, on the migrated file.
     let mut eng = MusqlEngine::connect(reqwest::Client::new(), id)
         .await
         .map_err(|e| anyhow::anyhow!("cannot open the migrated database: {e}"))?;
@@ -909,11 +865,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         .await
         .results;
 
-    // 8b. Rollback, in the real direction and on the real files. It is the half
-    //     of this swap that has only ever been written, never run: export the
-    //     `.musq` back to SQLite, verify it against the engine BEFORE it
-    //     becomes the live file, install it, then prove the file an app would
-    //     open is the same database the engine still serves.
     let rolled = rollback(id)
         .await
         .map_err(|e| anyhow::anyhow!("rollback failed: {e}"))?;
@@ -956,9 +907,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
     println!("\n--- app-visible data after rollback (rusqlite file vs musql engine) ---");
     println!("{}", serde_json::to_string_pretty(&post)?);
 
-    // 8c. Diff. `query_duration_ms` is wall-clock and is the one field that must
-    //    differ between two runs; everything else is the contract. Walked
-    //    recursively so a nested result (batch `step_results`) is covered too.
     fn strip(v: &Value) -> Value {
         match v {
             Value::Object(m) => Value::Object(
@@ -993,7 +941,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         anyhow::bail!("the two engines produced different Hrana envelopes");
     }
 
-    // 9. The exported env surface for this kind — names and shapes an app reads.
     let mut conn = std::collections::HashMap::new();
     conn.insert("LIBSQL_URL".into(), "libsql://api.example.host/v1/sqlite/".to_string() + id + "/");
     conn.insert("DB_REST_TOKEN".into(), "dbt_probe".into());
@@ -1018,10 +965,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         db_host: String::new(),
         host_node: "probe".into(),
     };
-    // The env surface an app reads is produced by `env_exports`, which does not
-    // read `engine` at all — but "should be unchanged" is not evidence, so print
-    // both the pre-swap record shape (no `engine` key) and the post-swap one and
-    // compare them here.
     let mut legacy = db.clone();
     legacy.connection.remove("engine");
     let before_env = crate::databases::env_exports(&legacy, "https://api.example.host");
@@ -1037,11 +980,6 @@ pub async fn run_probe() -> anyhow::Result<()> {
         anyhow::bail!("the exported env surface changed");
     }
 
-    // 10. The record is the ONLY thing that makes a database musql. With
-    //     HIVE_SQLITE_ENGINE=musql the default IS musql, so this is the check
-    //     that proves an env var alone cannot flip an existing database: the
-    //     pre-change provisioner wrote `engine: "sqlite"`, and a database with
-    //     no `engine` key at all predates the field.
     let mut legacy = db.connection.clone();
     legacy.insert("engine".into(), "sqlite".into());
     let mut no_key = db.connection.clone();

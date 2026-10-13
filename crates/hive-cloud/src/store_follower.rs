@@ -1,35 +1,28 @@
-//! The follower pull: adopt the control-plane owner's `store_sync::REGISTRY`
-//! stores on every other node. Two supervised loops, neither of which ever
-//! touches GuardianDB or the relational SQL mirror — replication of canonical
-//! state must never wait on either (it used to run inside
-//! `spawn_relational_mirror_loop`, after `relational::sync_deployments`, whose
-//! guardian SQL open has no bound):
+//! The follower pull: adopts the control-plane owner's `store_sync::REGISTRY` stores on every other
+//! node. Two supervised loops, neither of which ever touches GuardianDB or the relational SQL
+//! mirror, because replication of canonical state must never wait on either:
 //!
-//! * `store-follower-sync` — every `HIVE_STORE_SYNC_SECS` (60), every small
-//!   store fetched CONCURRENTLY from the owner (`HIVE_STORE_SYNC_CONCURRENCY`,
-//!   8), then adopted one at a time.
-//! * `store-large-lane` — LARGE stores (`store_sync::LARGE_STORE_BYTES`:
-//!   billing, incidents, audit) one at a time, each under the budget its size
-//!   calls for (`store_sync::fetch_budget`), in their own task so the small
-//!   cadence never waits on a multi-minute transfer. At the ~170 KB/s one
-//!   trunk sustains, billing (6.2 MB) and incidents (10.9 MB) could never
-//!   finish in the batch's 10 s, and 8-way concurrency on the same trunk only
-//!   split the bandwidth further.
+//! * `store-follower-sync`: every `HIVE_STORE_SYNC_SECS` (60), every small store fetched
+//!   CONCURRENTLY from the owner (`HIVE_STORE_SYNC_CONCURRENCY`, 8), then adopted one at a time.
+//! * `store-large-lane`: LARGE stores (`store_sync::LARGE_STORE_BYTES`: billing, incidents, audit)
+//!   one at a time, each under the budget its size calls for (`store_sync::fetch_budget`), in their
+//!   own task so the small cadence never waits on a multi-minute transfer. One trunk sustains well
+//!   under a megabyte per second to a cross-country peer, so multi-MB stores can never finish in
+//!   the batch's 10 s budget, and 8-way concurrency on the same trunk only splits the bandwidth
+//!   further.
 //!
-//! Lanes ([`StoreLanes`]): a store is in the large lane while its size — the
-//! local copy or the last snapshot a peer served — is over the threshold
-//! (pulled at most once per [`LARGE_STORE_PULL_EVERY`] after a success,
-//! retried after [`LARGE_STORE_RETRY`] after a failure), or while it is
-//! SUSPECT: its batch fetch ran out the whole budget while other stores on
-//! the same trunk fetched, which is the one failure shape that says "too big
-//! for the batch" before any size is known (a fresh follower's empty copy).
-//! A suspect store is pulled every lane round until a pull succeeds and its
-//! size decides. Any other failure stays in the batch and retries next tick;
-//! a tick where every store failed is the link, and the lane holds off until
-//! the batch sees the link again.
+//! Lanes ([`StoreLanes`]): a store is in the large lane while its size (the local copy or the last
+//! snapshot a peer served) is over the threshold (pulled at most once per
+//! [`LARGE_STORE_PULL_EVERY`] after a success, retried after [`LARGE_STORE_RETRY`] after a
+//! failure), or while it is SUSPECT: its batch fetch ran out the whole budget while other stores on
+//! the same trunk fetched, which is the one failure shape that says 'too big for the batch' before
+//! any size is known (a fresh follower's empty copy). A suspect store is pulled every lane round
+//! until a pull succeeds and its size decides. Any other failure stays in the batch and retries
+//! next tick; a tick where every store failed is the link, and the lane holds off until the batch
+//! sees the link again.
 //!
-//! Adoption rules (wholesale only from an owner every node agrees on, merge
-//! stores from anyone) are unchanged; see the comment in [`pull_batch`].
+//! Adoption rules (wholesale only from an owner every node agrees on, merge stores from anyone):
+//! see [`resolve_target`] and [`pull_batch`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,23 +30,17 @@ use std::time::Duration;
 use crate::state::CloudState;
 use crate::store_sync::{self, SyncedStore};
 
-/// A large store is pulled at most once per this interval after a success.
-/// 15 min, not 5: two large stores (billing 6.3 MB, incidents 10.5 MB) at a
-/// 5-min cadence put ~56 KB/s of sustained bulk on one trunk, and a
-/// cross-country trunk sustaining 25-90 KB/s cannot carry that alongside the
-/// small-store batch — measured live, incidents went 113 s → 203 s → ran out
-/// its budget and then every later attempt failed, leaving megabytes of
-/// abandoned transfer on the connection. 15 min puts the sustained demand
-/// (~19 KB/s) well under the trunk instead of level with it, which is what
-/// keeps the pull that does run fast enough to finish.
+/// A large store is pulled at most once per this interval after a success. 15 min and not 5: two
+/// multi-MB stores at a 5-min cadence put sustained bulk on one trunk that a cross-country link
+/// cannot carry alongside the small-store batch (the pulls then ran out their budget and left
+/// megabytes of abandoned transfer on the connection), while 15 min keeps the sustained demand well
+/// under the trunk, which is what lets the pull that does run finish.
 const LARGE_STORE_PULL_EVERY: Duration = Duration::from_secs(900);
-/// A failed large-lane pull is retried after this long the FIRST time; each
-/// consecutive failure doubles the wait up to [`LARGE_STORE_PULL_EVERY`]. A
-/// flat 60 s retry was the feedback loop that starved the owner: a pull that
-/// ran out its budget because the owner's egress was saturated came back
-/// 60 s later and re-saturated it (fc-virginia-3 logged 73 consecutive FAILED
-/// pulls of billing/docs/incidents from fc-sanjose). A failure is still not a
-/// size proof, so the store stays in the lane; it just stops hammering.
+/// A failed large-lane pull is retried after this long the FIRST time; each consecutive failure
+/// doubles the wait up to [`LARGE_STORE_PULL_EVERY`]. A flat 60 s retry was the feedback loop that
+/// starved the owner: a pull that ran out its budget because the owner's egress was saturated came
+/// back 60 s later and re-saturated it. A failure is still not a size proof, so the store stays in
+/// the lane; it just stops hammering.
 const LARGE_STORE_RETRY: Duration = Duration::from_secs(60);
 /// Consecutive failures after which the retry wait stops doubling.
 const LARGE_STORE_RETRY_DOUBLINGS: u32 = 4;
@@ -75,12 +62,11 @@ struct Shared {
     failures: StorePullFailures,
     /// The last batch failed every store: the lane holds off.
     link_down: bool,
-    /// A large-lane pull is on the trunk right now. The batch DEFERS while it
-    /// is: one trunk sustains ~50-100 KB/s to a cross-country peer (measured:
-    /// a 10.5 MB incidents snapshot took 113-231 s depending on how much of
-    /// the batch was running beside it), so 8 concurrent small fetches beside
-    /// a multi-MB transfer push EVERY small store past its 10 s budget, and
-    /// the large pull pays for the sharing too. Serial wins on both counts.
+    /// A large-lane pull is on the trunk right now. The batch DEFERS while it is: one trunk
+    /// sustains only tens of KB/s to a cross-country peer, so 8 concurrent small fetches beside a
+    /// multi-MB transfer push EVERY small store past its 10 s budget and the large pull pays for
+    /// the sharing too; serial wins on both counts. The deferred batch tick fires as soon as the
+    /// lane releases the trunk (`MissedTickBehavior::Delay`).
     large_in_flight: bool,
     last_peer_lookup_warn: Option<std::time::Instant>,
     last_fallback_warn: Option<std::time::Instant>,
@@ -103,10 +89,6 @@ pub fn spawn(cloud: Arc<CloudState>) {
                 loop {
                     tick.tick().await;
                     crate::supervise::beat("store-follower-sync");
-                    // The trunk is carrying a multi-MB pull: run the small
-                    // stores AFTER it, not beside it (see `large_in_flight`).
-                    // `MissedTickBehavior::Delay` means the deferred tick
-                    // fires as soon as the lane releases the trunk.
                     if shared.lock().large_in_flight {
                         continue;
                     }
@@ -149,9 +131,9 @@ impl Target {
         self.wholesale_ok || store_sync::MERGE_STORES.contains(&store.name)
     }
 
-    /// A pull can take minutes: before it and again before adopting, the
-    /// owner must still be the one in view AND still entitled to this store's
-    /// adoption, so a deposed leader's snapshot is never adopted late.
+    /// A pull can take minutes: before it and again before adopting, the owner must still be the
+    /// one in view AND still entitled to this store's adoption, so a deposed leader's snapshot is
+    /// never adopted late.
     fn still_permitted(&self, cloud: &CloudState, store: &SyncedStore) -> bool {
         cloud
             .control_plane_leader_with_source()
@@ -166,17 +148,22 @@ impl Target {
     }
 }
 
-/// Pull from the owner when it is ANOTHER node. This node being the owner
-/// (acting, or still inside the leader-writes tenure/quorum gate) pulls from
-/// nobody; no resolvable owner (a configured chain dark in this view) pulls
-/// from nobody either — the resolver has already WARNed the HOLD. `report`:
-/// this is the batch loop, which owns the WARNs and the retarget.
+/// Pulls from the owner when it is ANOTHER node. This node being the owner (acting, or still inside
+/// the leader-writes tenure/quorum gate) pulls from nobody, and `report` (the batch loop, which
+/// owns the WARNs and the retarget) then closes what was recorded against the leader it used to
+/// follow; no resolvable owner (a configured chain dark in this view) pulls from nobody either, the
+/// resolver having already WARNed the HOLD.
+///
+/// Wholesale replace is correct ONLY from an owner every node agrees on
+/// (`OwnerSource::may_adopt_wholesale_from`): the chain HEAD (with differing per-node chains a
+/// backup is the owner only in some observers' views, so a node resolving a backup whose own chain
+/// never names itself would adopt that backup's stale fork) or the identity election on a
+/// chain-less mesh. A FALLBACK forwarding target is never an authority. From anyone else only the
+/// per-row MERGE stores are pulled.
 fn resolve_target(cloud: &CloudState, shared: &SharedState, report: bool) -> Option<Target> {
     let resolved = cloud.control_plane_leader_with_source();
     if resolved.as_ref().is_some_and(|(owner, _)| *owner == cloud.node_name) {
         if report {
-            // The owner pulls from nobody: close what was recorded against
-            // the leader it used to follow.
             shared.lock().failures.retarget(cloud, None);
         }
         return None;
@@ -185,16 +172,6 @@ fn resolve_target(cloud: &CloudState, shared: &SharedState, report: bool) -> Opt
     if cloud.mesh_health().isolated {
         return None;
     }
-    // Wholesale replace is correct ONLY from an owner every node agrees on:
-    // `OwnerSource::may_adopt_wholesale_from` — the chain HEAD (with
-    // differing per-node chains, a backup is the owner only in some
-    // observers' views: phx/va3 resolving va, whose own chain never names
-    // itself, would adopt va's stale fork) or the identity election on a
-    // chain-less mesh. A FALLBACK forwarding target is never an authority —
-    // fc-virginia adopted fc-phoenix's stores wholesale under exactly that
-    // shape on 2026-09-24. From anyone else only the per-row MERGE stores are
-    // pulled; a failover owner's wholesale stores reach followers once the
-    // signed lease (CS-3/CS-4) can attest them.
     let wholesale_ok =
         source.may_adopt_wholesale_from(&leader, &crate::cluster::Cluster::owner_chain_from_env());
     let due = |at: &mut Option<std::time::Instant>| {
@@ -236,10 +213,9 @@ fn resolve_target(cloud: &CloudState, shared: &SharedState, report: bool) -> Opt
     })
 }
 
-/// Adopt `bytes` for `store` when they differ from the local snapshot.
-/// Raw byte-compare change-gate: `snapshot` is deterministic, so equal bytes
-/// = no change. Empties are skipped (an old leader without this arm returns
-/// []). Returns whether the store adopted.
+/// Adopts `bytes` for `store` when they differ from the local snapshot. The change-gate is a raw
+/// byte comparison: `snapshot` is deterministic, so equal bytes mean no change. Empties are skipped
+/// (an old leader without this arm returns `[]`). Returns whether the store adopted.
 fn adopt(
     cloud: &Arc<CloudState>,
     target: &Target,
@@ -265,34 +241,27 @@ fn adopt(
     true
 }
 
-/// One batch round: every small store concurrently, adopted after.
+/// One batch round: every small store fetched concurrently, adopted after (`adopt` is synchronous
+/// and takes store locks, so it runs in a plain loop after the join).
 ///
-/// A whole CLASS of stores (teams, incidents, apikeys, webhooks, databases,
-/// domains, integrations, gitops, docs, notifications, identity, enterprise)
-/// take mutations only on the leader (admin_ingress forward) but serve GETs
-/// from the local store, so a follower's copy otherwise diverges forever —
-/// live-witnessed as sj=5 / bkk=4 / va=2 teams and the admin incidents page
-/// showing nothing on non-leader nodes. The merge stores
-/// (`store_sync::MERGE_STORES`) are written on whichever node the request
-/// reached, so a wholesale replace would silently drop every record admitted
-/// through another node; each one's own `adopt` merges per key — do not
-/// "restore consistency" by making them replace again. Each entry's `adopt`
-/// declines an empty/unparsable payload so an unreachable/booting leader can
+/// A whole CLASS of stores (teams, incidents, apikeys, webhooks, databases, domains, integrations,
+/// gitops, docs, notifications, identity, enterprise) take mutations only on the leader (the
+/// admin_ingress forward) but serve GETs from the local store, so a follower's copy otherwise
+/// diverges forever. The merge stores (`store_sync::MERGE_STORES`) are written on whichever node
+/// the request reached, so a wholesale replace would silently drop every record admitted through
+/// another node: each one's own `adopt` merges per key, and must not be 'fixed' to replace again.
+/// Every `adopt` declines an empty or unparsable payload, so an unreachable or booting leader can
 /// never wipe a follower.
 ///
-/// Fetch concurrently, adopt after: `adopt` is synchronous and takes store
-/// locks, so it runs in a plain loop after the join.
+/// A store not fetched here goes to the large lane when proven large or suspect. A node without a
+/// large lane (see `pulls_large_stores`) skips only stores PROVEN large by size, because a suspect
+/// mark is cleared solely by a large-lane pull, so on such a node it would park a small store for
+/// the life of the process. A fetch that ran out the WHOLE budget while the trunk carried other
+/// stores marks the store suspect (the one batch failure that suggests size). A merge changes local
+/// state, recovered permanent tombstones included, so persistence is queued at once instead of
+/// leaving a crash-loss window until the unrelated periodic capture.
 async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Target) {
     use futures::StreamExt as _;
-    // Where a store goes when it is NOT fetched here. With a large lane, a
-    // proven-large or suspect store belongs to that lane. Without one (a
-    // node that skips large stores, see `pulls_large_stores`) only a store
-    // PROVEN large by its size is skipped: a suspect mark is cleared solely
-    // by a large-lane pull, so on such a node it would park a small store
-    // for the life of the process. Witnessed 2026-09-30 right after the
-    // large-lane gate shipped: `docs` and `audit` hit the 10 s budget once
-    // on a saturated owner link and never replicated again on all six
-    // mock-backend nodes, and `projects` froze the same way on shadw3.
     let large_lane = pulls_large_stores(cloud);
     let mut small: Vec<(&'static SyncedStore, Vec<u8>, usize)> = Vec::new();
     for store in store_sync::REGISTRY.iter().filter(|s| target.pulls(s)) {
@@ -338,8 +307,6 @@ async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
         let mut sh = shared.lock();
         sh.link_down = link_down;
         for &(store, ok, elapsed) in &outcomes {
-            // Ran out the WHOLE budget while the trunk carried other stores:
-            // the one batch failure that suggests size.
             if large_lane && !ok && !link_down && elapsed + Duration::from_millis(500) >= budget {
                 sh.lanes.suspect(store);
             }
@@ -356,14 +323,13 @@ async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
         .failures
         .tick(cloud, &target.leader, &outcomes);
     if adopted {
-        // A follower merge is a real mutation, including recovered permanent
-        // tombstones. Queue persistence now instead of leaving a crash-loss
-        // window until the unrelated periodic capture.
         crate::persist::persist(cloud);
     }
 }
 
 /// One large-lane round: every due large store, one at a time.
+/// A completed multi-MB pull proves the link even when the batch has not run for minutes (it defers
+/// to this lane), so it clears a stale `link_down` that would otherwise park the lane behind it.
 async fn pull_large(cloud: &Arc<CloudState>, shared: &SharedState, target: &Target) {
     if !pulls_large_stores(cloud) {
         static NOTED: std::sync::Once = std::sync::Once::new();
@@ -400,9 +366,6 @@ async fn pull_large(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
         {
             let mut sh = shared.lock();
             sh.large_in_flight = false;
-            // A completed multi-MB pull proves the link even when the batch
-            // has not run for minutes (it defers to this lane), so a stale
-            // `link_down` can never park the lane behind it.
             if bytes.is_some() {
                 sh.link_down = false;
             }
@@ -488,10 +451,10 @@ impl StoreLanes {
         }
     }
 
-    /// A lane pull finished; `len` is the fetched size when it succeeded.
-    /// Success settles the size (`store_sync` recorded it; a small store
-    /// returns to the batch) and starts the 5-min floor; failure retries
-    /// after [`LARGE_STORE_RETRY`].
+    /// A lane pull finished; `len` is the fetched size when it succeeded. Success settles the size
+    /// (`store_sync` recorded it; a small store returns to the batch) and starts the
+    /// `LARGE_STORE_PULL_EVERY` floor; failure retries after [`LARGE_STORE_RETRY`], doubling per
+    /// consecutive failure.
     fn pulled(&mut self, store: &'static str, len: Option<usize>) {
         let lane = self.stores.entry(store).or_default();
         let now = std::time::Instant::now();
@@ -511,18 +474,13 @@ impl StoreLanes {
     }
 }
 
-/// Whether this node pulls LARGE stores at all. A laptop-class node -- one
-/// running the mock cell backend, which is every macOS node and every dev
-/// node behind a home NAT -- is never a public ingress and serves no tenant
-/// traffic, so it has no use for the multi-megabyte billing, incidents and
-/// audit snapshots; it still receives every small store (projects, teams,
-/// browser admissions) through the batch. Measured 2026-09-30 on the owner:
-/// of ~6 Mbit/s of mesh QUIC leaving fc-sanjose, 3.78 Mbit/s went to the one
-/// residential NAT that hosts the seven mock-backend followers, on a public
-/// egress capped at ~10-12 Mbit/s -- the reason every cloud follower's pull
-/// of those same stores ran at 3-110 KB/s or timed out. Fixing it here, at
-/// the one place the lane decides to pull, fixes every such node at once.
-/// `HIVE_STORE_SYNC_LARGE=1` forces the lane on (a mock node that must hold
+/// Whether this node pulls LARGE stores at all. A laptop-class node (one running the mock cell
+/// backend: every macOS node and every dev node behind a home NAT) is never a public ingress and
+/// serves no tenant traffic, so it has no use for the multi-megabyte billing, incidents and audit
+/// snapshots, and several of them behind one residential NAT can eat the owner's capped public
+/// egress and slow every cloud follower's pull of the same stores; it still receives every small
+/// store through the batch. Deciding here, at the one place the lane decides to pull, fixes every
+/// such node at once. `HIVE_STORE_SYNC_LARGE=1` forces the lane on (a mock node that must hold
 /// billing for local development), `0` forces it off.
 fn pulls_large_stores(cloud: &CloudState) -> bool {
     match std::env::var("HIVE_STORE_SYNC_LARGE").ok().as_deref() {
@@ -539,27 +497,23 @@ fn pulls_large_stores(cloud: &CloudState) -> bool {
     !mock
 }
 
-/// Per-store accounting for the follower pull. A failed snapshot fetch was a
-/// silent `continue`: billing (~6 MB) and incidents (~11 MB) never finished
-/// inside the 10 s budget over one trunk, so no follower replicated either
-/// off fc-sanjose for days and not one log line said so. Every failure now
-/// counts, for the CURRENT leader only:
+/// Per-store accounting for the follower pull. Every failed snapshot fetch counts (it used to be a
+/// silent `continue`, so a store that never fit its budget simply never replicated and nothing said
+/// so), for the CURRENT leader only:
 ///
-/// * a WARN names the leader, the store and how long the attempt took (at most
-///   once per 5 min per store), and every [`STORE_PULL_INCIDENT_AFTER`]
-///   consecutive failures open (deduped by `IncidentStore::open`) one incident
-///   per store, resolved on the next successful fetch;
-/// * a batch where EVERY store failed is the leader link being down, not N
-///   store faults: one WARN and one "every store" incident instead of one per
-///   store, resolved as soon as any store fetches again;
-/// * a change of leader, or this node becoming the owner, resolves everything
-///   recorded against the previous leader — those incidents describe a link
-///   this node no longer uses, and an owner that stops pulling would otherwise
-///   replicate them to every follower forever.
+/// * a WARN names the leader, the store and how long the attempt took (at most once per 5 min per
+///   store), and every [`STORE_PULL_INCIDENT_AFTER`] consecutive failures open (deduped by
+///   `IncidentStore::open`) one incident per store, resolved on the next successful fetch;
+/// * a batch where EVERY store failed is the leader link being down, not N store faults: one WARN
+///   and one 'every store' incident instead of one per store, resolved as soon as any store fetches
+///   again;
+/// * a change of leader, or this node becoming the owner, resolves everything recorded against the
+///   previous leader: those incidents describe a link this node no longer uses, and an owner that
+///   stops pulling would otherwise replicate them to every follower forever.
 ///
-/// The incidents live in this follower's own store, which the next wholesale
-/// adoption of `incidents` replaces (re-asserted on the streak cadence); the
-/// WARN lines are the durable signal on a follower.
+/// The incidents live in this follower's own store, which the next wholesale adoption of
+/// `incidents` replaces; they are re-asserted on the streak cadence with a 30 min TTL (two missed
+/// large-lane rounds lapse it), and the WARN lines are the durable signal on a follower.
 #[derive(Default)]
 struct StorePullFailures {
     /// The leader the recorded streaks are against.
@@ -606,9 +560,8 @@ impl StorePullFailure {
 }
 
 impl StorePullFailures {
-    /// This node is about to pull from `leader`, or (`None`) no longer pulls at
-    /// all because it is the owner. Anything recorded against a different
-    /// leader is closed.
+    /// This node is about to pull from `leader`, or (`None`) no longer pulls at all because it is
+    /// the owner. Anything recorded against a different leader is closed.
     fn retarget(&mut self, cloud: &CloudState, leader: Option<&str>) {
         if self.leader.as_deref() == leader {
             return;
@@ -712,7 +665,7 @@ impl StorePullFailures {
         }
         f.consecutive = f.consecutive.saturating_add(1);
         if link_down {
-            return; // reported once, as the link
+            return;
         }
         if f.warn_due() {
             tracing::warn!(
@@ -747,8 +700,6 @@ fn open_pull_incident(
         .incidents
         .open(crate::incidents::OpenReq {
             condition: format!("store-pull:{leader}:{store}"),
-            // Re-asserted on the streak cadence; the large lane pulls every
-            // 15 min, so two missed lanes lapse it.
             ttl_ms: 30 * 60 * 1000,
             title: format!("store replication from {leader} failing: {what}"),
             severity: crate::incidents::Severity::Minor,

@@ -1,78 +1,56 @@
 //! **Prove-before-advertise for the geo zone's nameservers.**
 //!
-//! `NodeInfo::dns_ns` records only that a node *intended* to bind a public
-//! `:53` — it is a string read out of this node's own environment. That is a
-//! statement of configuration, not of reachability, and the live delegation for
-//! `deploy.shadw.app` showed exactly what that costs: of five advertised
-//! nameservers, two were broken from the public internet while both reported
-//! themselves perfectly healthy.
-//!
-//!   * `ns-fc-hongkong` (43.128.46.225) answered nothing at all — the query
-//!     never reached the host (cloud security group), so no check performed ON
-//!     that host could ever have noticed.
-//!   * `ns-fc-sanjose-cvm-2` (43.166.233.114) answered, authoritatively, with
-//!     ZERO answer records for some clients (the pre-85f8447 `lb_records` bug,
-//!     where proximity truncation ran before the address-family filter). A
-//!     liveness check that asks "did a packet come back" calls that node
-//!     healthy.
-//!
-//! A recursive resolver that happens to pick either one gets a timeout or an
-//! empty answer, so every name under the zone resolves intermittently. This
-//! module is the fix: **a node is advertised as a nameserver only while other
-//! nodes can currently prove, from their own hosts, that it answers.**
+//! `NodeInfo::dns_ns` records only that a node *intended* to bind a public `:53`: a string read out
+//! of this node's own environment, a statement of configuration and not of reachability. Two
+//! failure shapes show what that costs, and the node reported itself perfectly healthy in both: a
+//! nameserver whose queries never reach the host at all (a cloud security group), so no check
+//! performed ON that host could ever notice; and one that answers authoritatively with ZERO answer
+//! records for some clients (a proximity truncation that ran before the address-family filter),
+//! which a liveness check asking 'did a packet come back' calls healthy. A recursive resolver that
+//! happens to pick either one gets a timeout or an empty answer, so every name under the zone
+//! resolves intermittently. This module is the fix: **a node is advertised as a nameserver only
+//! while other nodes can currently prove, from their own hosts, that it answers.**
 //!
 //! ## Why peer attestation (and not a self-check)
 //!
-//! A self-check — bind test, loopback query, "is my listener alive" — is
-//! worthless for this. Both live failures are invisible from inside the host:
-//! one is an inbound drop upstream of the NIC, the other is a wrong answer that
-//! only manifests for *other people's* clients. Off-host evidence requires a
-//! second machine, and the mesh already has ten of them in five regions,
-//! already exchanging one gossip record per node per round. So the cheapest
-//! real evidence available is also the best one: every node queries every
-//! candidate nameserver's PUBLIC `:53` over the public internet — the same
-//! question, in the same wire format, that a recursive resolver asks — and
-//! gossips the list of nodes that answered ([`NodeInfo::dns_attest`]).
+//! A self-check (bind test, loopback query, 'is my listener alive') is worthless for this: both
+//! failures are invisible from inside the host, one being an inbound drop upstream of the NIC and
+//! the other a wrong answer that only manifests for *other people's* clients. Off-host evidence
+//! needs a second machine, and the mesh already has several in different regions, already
+//! exchanging one gossip record per node per round. So every node queries every candidate
+//! nameserver's PUBLIC `:53` over the public internet, the same question in the same wire format a
+//! recursive resolver asks, and gossips the list of nodes that answered ([`NodeInfo::dns_attest`]).
 //!
 //! Three deliberate constraints on what counts as proof:
 //!
-//! 1. **Answering is not enough; the answer must be usable.** A probe passes
-//!    only on `NOERROR` + `AA` + at least one address record of the queried
-//!    family. `cvm-2` is precisely the node that a weaker bar would have kept
-//!    advertising.
-//! 2. **Two distinct attester REGIONS, not two attesters.** Hong Kong's failure
-//!    is a cloud-level inbound block, and a peer in the same datacenter or VPC
-//!    is exactly the vantage most likely to sit *inside* whatever still permits
-//!    the traffic. Requiring vantages in two different regions means at least
-//!    one long-haul internet path has actually been proven. (Degrades to one
-//!    when the fleet genuinely has only one other region — the alternative is
-//!    refusing to ever delegate, which is worse.)
-//! 3. **Never self-attest.** A node's own opinion of itself is the thing this
-//!    module exists to stop trusting.
+//! 1. **Answering is not enough; the answer must be usable.** A probe passes only on `NOERROR` +
+//!    `AA` + at least one address record of the queried family.
+//! 2. **Two distinct attester REGIONS, not two attesters.** A cloud-level inbound block is
+//!    invisible from a peer in the same datacenter or VPC, the vantage most likely to sit *inside*
+//!    whatever still permits the traffic; vantages in two regions mean at least one long-haul
+//!    internet path has been proven. It degrades to one when the fleet genuinely has only one other
+//!    region, because refusing to ever delegate is worse.
+//! 3. **Never self-attest.** A node's own opinion of itself is the thing this module exists to stop
+//!    trusting.
 //!
 //! ## Why the probe also asks on behalf of real clients (EDNS Client Subnet)
 //!
-//! The `cvm-2` defect is CLIENT-LOCATION SPECIFIC, and that was measured, not
-//! assumed: on 2026-07-28 the same live server answered `43.166.206.175`'s own
-//! query with 8 records and answered a US-West client subnet with 0. A probe
-//! that only ever asks on the prober's own behalf is structurally blind to the
-//! entire class. So each round also asks the candidate a few questions carrying
-//! an EDNS Client Subnet option for REAL client networks this node has already
-//! served (`GeoCache`'s located set — no invented address list, and it samples
-//! exactly the population that would be hurt). An empty answer for any of them
-//! fails the round.
-//!
-//! This samples rather than proves-for-all-clients: the sample rotates each
-//! round so coverage accumulates, but a defect that only affects a client
-//! network nobody in the fleet has served yet will not be caught until one is.
-//! That is a real limit, stated rather than papered over.
+//! The empty-answer defect is CLIENT-LOCATION SPECIFIC: the same live server can answer a nearby
+//! client with several records and a client subnet from another region with none, so a probe that
+//! only asks on the prober's own behalf is structurally blind to the whole class. Each round
+//! therefore also asks the candidate a few questions carrying an EDNS Client Subnet option for REAL
+//! client networks this node has already served (`GeoCache`'s located set: no invented address
+//! list, and it samples exactly the population that would be hurt); an empty answer for any of them
+//! fails the round. This samples rather than proves for all clients: the sample rotates each round
+//! so coverage accumulates, but a defect that only affects a client network nobody in the fleet has
+//! served yet is not caught until one is.
 //!
 //! ## Cost and cadence
 //!
-//! A handful of ~100-byte UDP datagrams per candidate per round (default 30s).
-//! Withdrawal is damped by two consecutive failed rounds — the same K the DNS
-//! reconciler already uses for host health, so one lost UDP datagram cannot
-//! pull a nameserver out of a live delegation.
+//! A handful of ~100-byte UDP datagrams per candidate per round (default 30 s). Withdrawal is
+//! damped by two consecutive failed rounds (`FAILED_ROUNDS_BEFORE_WITHDRAW`, the same K the DNS
+//! reconciler uses for host health), so one lost UDP datagram cannot pull a nameserver out of a
+//! live delegation.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -86,37 +64,35 @@ use parking_lot::RwLock;
 use crate::dns_geo::ClientSubnet;
 use crate::state::CloudState;
 
-/// Consecutive failed probe rounds before this node stops attesting a peer.
-/// Matches `vercel_dns::UNHEALTHY_PASSES_BEFORE_WITHDRAW`: a single dropped UDP
-/// datagram must not evict a working nameserver from a live delegation.
+/// Consecutive failed probe rounds before this node stops attesting a peer. Matches
+/// `vercel_dns::UNHEALTHY_PASSES_BEFORE_WITHDRAW`: a single dropped UDP datagram must not evict a
+/// working nameserver from a live delegation.
 pub const FAILED_ROUNDS_BEFORE_WITHDRAW: u32 = 2;
 
 /// Distinct attester REGIONS required to consider a nameserver proven. See the
 /// module doc for why this is regions and not a raw attester count.
 pub const MIN_ATTESTER_REGIONS: usize = 2;
 
-/// How many real client subnets each round asks on behalf of. Small on purpose:
-/// the sample ROTATES, so coverage accumulates across rounds instead of costing
-/// a burst of queries every 30 seconds.
+/// How many real client subnets each round asks on behalf of. Small on purpose: the sample ROTATES,
+/// so coverage accumulates across rounds instead of costing a burst of queries every 30 seconds.
 const ECS_SAMPLE: usize = 3;
 
-// ---- wire format -------------------------------------------------------------
-
-/// Build a DNS query for `qname`/`qtype`, optionally carrying an EDNS Client
-/// Subnet option so the candidate answers as if for a client in `ecs`.
+/// Builds a DNS query for `qname`/`qtype`, optionally carrying an EDNS Client Subnet option (scope
+/// 0, RFC 7871 section 6: scope is the responder's field) so the candidate answers as if for a
+/// client in `ecs`. The header is the id, flags 0 (a standard QUERY with `RD=0`), QDCOUNT 1,
+/// ANCOUNT 0, NSCOUNT 0 and ARCOUNT 1 when the OPT RR follows the question (QCLASS IN).
 ///
-/// `RD=0` deliberately: this is a direct question to a server that must be
-/// AUTHORITATIVE for the name. Asking with recursion desired would let a node
-/// that is not serving the zone at all still look healthy by fetching the
-/// answer from somewhere else.
+/// `RD=0` deliberately: this is a direct question to a server that must be AUTHORITATIVE for the
+/// name, and asking with recursion desired would let a node that is not serving the zone at all
+/// still look healthy by fetching the answer from somewhere else.
 fn build_query(id: u16, qname: &str, qtype: u16, ecs: Option<ClientSubnet>) -> Vec<u8> {
     let mut m = Vec::with_capacity(64);
     m.extend_from_slice(&id.to_be_bytes());
-    m.extend_from_slice(&0u16.to_be_bytes()); // flags: standard QUERY, RD=0
-    m.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    m.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
-    m.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    m.extend_from_slice(&(ecs.is_some() as u16).to_be_bytes()); // ARCOUNT (the OPT RR)
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&(ecs.is_some() as u16).to_be_bytes());
     for label in qname
         .trim_end_matches('.')
         .split('.')
@@ -129,9 +105,8 @@ fn build_query(id: u16, qname: &str, qtype: u16, ecs: Option<ClientSubnet>) -> V
     }
     m.push(0);
     m.extend_from_slice(&qtype.to_be_bytes());
-    m.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    m.extend_from_slice(&1u16.to_be_bytes());
     if ecs.is_some() {
-        // Scope 0 in a QUERY (RFC 7871 §6): scope is the responder's field.
         m.extend_from_slice(&crate::dns_geo::encode_opt_rr(ecs, 0));
     }
     m
@@ -148,15 +123,14 @@ fn rcode_name(rcode: u8) -> &'static str {
     }
 }
 
-/// Count the usable answer records of `qtype` in a response, or explain why the
-/// response is not acceptable evidence.
-///
-/// Everything here is a REJECTION reason a real resolver would also act on: a
-/// mismatched id (not our answer), a non-authoritative reply (this server is
-/// not actually serving the zone), a non-zero rcode, or a truncated/garbled
-/// message. `Ok(0)` — a well-formed authoritative NOERROR with no addresses —
-/// is returned as such so the caller can name it `empty-answer`, which is the
-/// exact live defect this exists to catch.
+/// Counts the usable answer records of `qtype` in a response, or explains why the response is not
+/// acceptable evidence. Everything here is a REJECTION reason a real resolver would also act on: a
+/// mismatched id (not our answer), a non-authoritative reply (this server is not actually serving
+/// the zone), a non-zero rcode, or a truncated or garbled message. Only an A (4-byte) or AAAA
+/// (16-byte) rdata counts as usable, since anything else under those types is not an address a
+/// client could connect to. `Ok(0)`, a well-formed authoritative NOERROR with no addresses, is
+/// returned as such so the caller can name it `empty-answer`, the exact live defect this exists to
+/// catch.
 fn parse_answers(id: u16, qtype: u16, msg: &[u8]) -> Result<usize, String> {
     let bad = |s: &str| Err(s.to_string());
     if msg.len() < 12 {
@@ -183,13 +157,11 @@ fn parse_answers(id: u16, qtype: u16, msg: &[u8]) -> Result<usize, String> {
             Some(o) => o,
             None => return bad("malformed-question"),
         };
-        off += 4; // QTYPE + QCLASS
+        off += 4;
         if off > msg.len() {
             return bad("malformed-question");
         }
     }
-    // An A rdata is 4 bytes and an AAAA rdata is 16; anything else under those
-    // types is not an address a client could connect to.
     let want_rdlen = if qtype == 28 { 16 } else { 4 };
     let mut usable = 0usize;
     for _ in 0..ancount {
@@ -218,20 +190,11 @@ fn fmt_subnet(cs: &ClientSubnet) -> String {
     format!("{}/{}", cs.addr, cs.source_prefix)
 }
 
-/// Send ONE query to `target` and report the usable answer count, or why not.
-///
-/// Late/stray datagrams that don't match our query id are skipped rather than
-/// treated as the answer, but the whole receive window is bounded by a single
-/// deadline so a chatty or hostile peer cannot hold the probe open.
-/// TXT values `target` answers AUTHORITATIVELY for `qname`.
-///
-/// Exists for ACME DNS-01 on a zone delegated to this fleet's own nameservers:
-/// Let's Encrypt queries a RANDOM one of them, so a challenge present on one
-/// server and missing from another fails validation intermittently. Measured
-/// 2026-10-01 — the `deploy` zone's challenge was served by 1 of 4 NS and the
-/// order went `Invalid`. A public resolver cannot detect this: it caches and
-/// asks one server, so one success masks the rest. The only honest check is to
-/// ask every nameserver directly, which is what [`super::acme`] now does.
+/// TXT values `target` answers AUTHORITATIVELY for `qname`. Exists for ACME DNS-01 on a zone
+/// delegated to this fleet's own nameservers: Let's Encrypt queries a RANDOM one of them, so a
+/// challenge present on one server and missing from another fails validation intermittently, and a
+/// public resolver cannot detect it (it caches and asks one server, so one success masks the rest).
+/// The only honest check is to ask every nameserver directly, which is what [`super::acme`] does.
 pub async fn txt_values(
     target: SocketAddr,
     qname: &str,
@@ -268,6 +231,8 @@ pub async fn txt_values(
 
 /// Parse the TXT answers of a response, rejecting anything a real resolver
 /// would reject: id mismatch, non-authoritative, non-zero rcode, truncation.
+/// TXT rdata is one or more `<length><bytes>` strings (RFC 1035), concatenated into one value per
+/// record.
 fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
     let bad = |s: &str| Err(s.to_string());
     if msg.len() < 12 {
@@ -330,7 +295,6 @@ fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
             return bad("truncated-rdata");
         }
         if rtype == 16 {
-            // RFC 1035: TXT rdata is one or more <length><bytes>.
             let mut i = 0usize;
             let mut v = String::new();
             while i < rdlen {
@@ -349,6 +313,10 @@ fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Sends ONE query to `target` and reports the usable answer count, or why not. Late or stray
+/// datagrams that do not match our query id are skipped rather than treated as the answer, but the
+/// whole receive window is bounded by a single deadline so a chatty or hostile peer cannot hold the
+/// probe open.
 pub async fn probe_query(
     target: SocketAddr,
     qname: &str,
@@ -385,11 +353,10 @@ pub async fn probe_query(
     }
 }
 
-/// True for a failure that is a lost/blocked DATAGRAM rather than a verdict.
-/// Retrying these once is honest (UDP is lossy and a probe round asks several
-/// questions, so the chance of one unlucky loss compounds); retrying a
-/// `empty-answer` / `rcode=…` / `not-authoritative` would not be — those are
-/// deterministic answers the server actually gave, and re-asking until it says
+/// True for a failure that is a lost or blocked DATAGRAM rather than a verdict. Retrying these once
+/// is honest (UDP is lossy and a probe round asks several questions, so the chance of one unlucky
+/// loss compounds); retrying an `empty-answer`, `rcode=...` or `not-authoritative` would not be,
+/// since those are deterministic answers the server actually gave, and re-asking until it says
 /// something nicer is exactly how a check stops meaning anything.
 fn transport_failure(reason: &str) -> bool {
     reason == "timeout" || reason.starts_with("recv:") || reason.starts_with("send:")
@@ -427,14 +394,12 @@ pub struct ProbeReport {
     pub subnets: Vec<String>,
 }
 
-/// Prove — or fail to prove — that `ip` serves `zone` as an authoritative
-/// nameserver, from THIS host, over the public internet.
-///
-/// Round shape: one baseline query on our own behalf (does the listener exist,
-/// is it reachable from here, does it answer authoritatively with an address),
-/// then one query per sampled real client subnet (does it answer usefully for
-/// clients that are not us). First failure wins and short-circuits — the report
-/// is evidence for a yes/no decision, not a survey.
+/// Proves, or fails to prove, that `ip` serves `zone` as an authoritative nameserver, from THIS
+/// host, over the public internet. Round shape: one baseline query on our own behalf (does the
+/// listener exist, is it reachable from here, does it answer authoritatively with an address), then
+/// one query per sampled real client subnet (does it answer usefully for clients that are not us).
+/// The first failure wins and short-circuits: the report is evidence for a yes/no decision, not a
+/// survey.
 pub async fn probe_nameserver(
     ip: IpAddr,
     zone: &str,
@@ -478,8 +443,6 @@ pub async fn probe_nameserver(
     }
 }
 
-// ---- what THIS node currently observes --------------------------------------
-
 /// This node's own latest observation of one peer's nameserver.
 #[derive(Clone, Debug)]
 pub struct PeerProbe {
@@ -498,9 +461,8 @@ pub struct PeerProbe {
     pub attested: bool,
 }
 
-/// Everything this node has directly observed about its peers' nameservers.
-/// Node-local by nature (it IS this node's vantage); the derived attestation
-/// list is what gets gossiped.
+/// Everything this node has directly observed about its peers' nameservers. Node-local by nature
+/// (it IS this node's vantage); the derived attestation list is what gets gossiped.
 #[derive(Default)]
 pub struct NsProbes {
     inner: RwLock<HashMap<String, PeerProbe>>,
@@ -558,8 +520,6 @@ impl NsProbes {
     }
 }
 
-// ---- the verdict the reconciler acts on -------------------------------------
-
 /// Whether one node may be advertised as a nameserver, and the evidence behind
 /// that answer. Surfaced verbatim by `GET /v1/dns/stats`.
 #[derive(Clone, Debug)]
@@ -579,10 +539,14 @@ pub struct NsVerdict {
     pub reason: String,
 }
 
-/// Decide, from the gossiped registry alone, which declared nameservers are
-/// currently PROVEN. Pure — the reconciler and the stats endpoint call the same
-/// function so an operator can never be looking at a different answer than the
-/// one being published.
+/// Decides, from the gossiped registry alone, which declared nameservers are currently PROVEN.
+/// Pure: the reconciler and the stats endpoint call the same function, so an operator is never
+/// looking at a different answer than the one being published. A node is never its own attester,
+/// and a peer this node considers down is not counted as a vantage either (a node that fails our
+/// health probes has no DNS opinion worth acting on). The required region count is capped by the
+/// vantages the fleet can offer: a two-region fleet cannot produce two attester regions for a
+/// candidate that owns one of them, and refusing to ever delegate would be a worse failure than a
+/// thinner proof.
 pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
     let region_of: HashMap<&str, &str> = nodes
         .iter()
@@ -593,9 +557,6 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
         let has_addr = cand.public_ip.is_some() || cand.public_ip6.is_some();
         let mut attesters: Vec<String> = nodes
             .iter()
-            // Never self-attest, and never count a peer we consider down: a
-            // node that is not answering our health probes is not a vantage
-            // whose DNS opinion we should be acting on either.
             .filter(|a| a.name != cand.name && a.healthy)
             .filter(|a| a.dns_attest.iter().any(|x| x == &cand.name))
             .map(|a| a.name.clone())
@@ -608,10 +569,6 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
             .collect();
         attester_regions.sort();
         attester_regions.dedup();
-        // How many independent vantages the fleet could possibly offer. A
-        // two-region fleet cannot produce two attester regions for a candidate
-        // that owns one of them, and refusing to ever delegate in that case
-        // would be a worse failure than a thinner proof.
         let mut other_regions: Vec<&str> = nodes
             .iter()
             .filter(|n| n.name != cand.name)
@@ -654,8 +611,6 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
     out
 }
 
-// ---- the prober loop ---------------------------------------------------------
-
 fn probe_timeout() -> Duration {
     Duration::from_millis(
         std::env::var("HIVE_DNS_PROBE_TIMEOUT_MS")
@@ -674,10 +629,17 @@ fn subnet_of(net: IpAddr) -> ClientSubnet {
     }
 }
 
-/// Every node runs this: probe every peer that claims to be a nameserver, and
-/// gossip the ones that currently answer. Not leader-elected on purpose — the
-/// whole point is independent vantages, and a single prober would be a single
-/// vantage with a single network path.
+/// Every node runs this: probes every peer that claims to be a nameserver every
+/// `HIVE_DNS_PROBE_SECS` (default 30) and gossips the ones that currently answer. Not
+/// leader-elected on purpose: the whole point is independent vantages, and a single prober would be
+/// a single vantage with a single network path. The first round waits 15 s for gossip to converge
+/// (probing an empty registry would produce an empty attestation list that peers would then act
+/// on), and a registry that currently sees only self is a transient un-synced view, not evidence
+/// that every nameserver vanished, so the round is skipped rather than gossiping an empty list
+/// (harmless, since the reconciler HOLDS rather than deletes, but a needless fleet-wide flap), the
+/// convergence guard of the DNS reconciler. The client subnets asked on behalf of rotate through
+/// the networks this node has really served, `ECS_SAMPLE` per round, so successive rounds cover
+/// different parts of the population without a burst.
 pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
     let Some(zone) = crate::dnsserver::deploy_zone() else {
         tracing::info!(
@@ -693,19 +655,11 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
     );
     tracing::info!(%zone, secs = interval.as_secs(), "nameserver prover up (peer-attested prove-before-advertise)");
     tokio::spawn(async move {
-        // Let gossip converge before the first round: probing an empty registry
-        // just produces an empty attestation list that peers would then act on.
         tokio::time::sleep(Duration::from_secs(15)).await;
         let mut round: usize = 0;
         loop {
             round = round.wrapping_add(1);
             let nodes = cloud.registry.nodes();
-            // Convergence guard, same shape as the DNS reconciler's: a registry
-            // that currently sees only self is a transient un-synced view, not
-            // evidence that every nameserver in the fleet vanished. Gossiping
-            // an empty attestation list from it would tell every peer we
-            // withdraw everything — harmless (the reconciler HOLDS rather than
-            // deletes) but a needless fleet-wide flap.
             if nodes.len() <= 1 {
                 tokio::time::sleep(interval).await;
                 continue;
@@ -728,9 +682,6 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
                         .map(|ip| (n.name.clone(), ip))
                 })
                 .collect();
-            // Rotate through the client networks this node has really served,
-            // so successive rounds cover different parts of the population
-            // without sending a burst every time.
             let mut nets = cloud.dns_geo.known_networks();
             nets.retain(|n| !n.is_loopback());
             let clients: Vec<ClientSubnet> = if nets.is_empty() {
@@ -791,18 +742,13 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
     });
 }
 
-// ---- operator diagnostic ------------------------------------------------------
-
-/// `hive-cloud --dns-probe <ip>[,<ip>…]` — run the REAL probe from this host
-/// against specific addresses and print the verdict, then exit.
-///
-/// This is the same code path the prober loop runs, deliberately: "is this
-/// nameserver actually serving?" is a question an operator needs to answer from
-/// an arbitrary vantage (a laptop, a peer, a bastion) during an incident, and
-/// answering it with a different implementation than the one making the
-/// decision is how the two quietly diverge. Zone comes from `HIVE_DEPLOY_ZONE`;
-/// `HIVE_DNS_PROBE_SUBNETS` (comma-separated CIDRs) adds client subnets to ask
-/// on behalf of.
+/// `hive-cloud --dns-probe <ip>[,<ip>...]`: runs the REAL probe from this host against specific
+/// addresses and prints the verdict, then exits. It is the same code path the prober loop runs,
+/// deliberately: 'is this nameserver actually serving?' is a question an operator must answer from
+/// an arbitrary vantage (a laptop, a peer, a bastion) during an incident, and answering it with a
+/// different implementation than the one making the decision is how the two quietly diverge. The
+/// zone comes from `HIVE_DEPLOY_ZONE`; `HIVE_DNS_PROBE_SUBNETS` (comma-separated CIDRs) adds client
+/// subnets to ask on behalf of.
 pub async fn run_cli(targets: &[String]) -> anyhow::Result<()> {
     let zone = std::env::var("HIVE_DEPLOY_ZONE")
         .ok()
