@@ -5095,15 +5095,6 @@ async fn fanout_remote(
         cloud.builds.log(bid, format!("→ {}: dispatching deploy (via {route})", t.node));
         let mut attempt_failures: Vec<String> = Vec::new();
         let resp_json: Option<serde_json::Value> = if let Some(admin) = &t.admin {
-            // `x-hive-team` alone is only trusted by the target's `tenant()`
-            // resolver in UNENFORCED/dev mode — under JWT enforcement (every
-            // production node) a request with no Authorization bearer resolves
-            // to ANON_TENANT regardless of this header, silently losing the
-            // project's real team on the target (or, prior to the UNTAGGED_TENANT
-            // fix, stamping it into the target's own personal namespace). Attach
-            // the SAME short-lived signed delegation token the iroh path uses
-            // (`mesh_team_qs`) as a real Bearer credential so this HTTP fanout
-            // authenticates identically to a normal request.
             let mut rb = cloud
                 .http
                 .post(format!("{admin}{RUNTIME_ARTIFACT_FANOUT_PATH}"))
@@ -5123,9 +5114,6 @@ async fn fanout_remote(
         } else {
             None
         };
-        // Fall back to the mesh when HTTP produced nothing (never attempted, or
-        // attempted and failed). This is the path that matters on nodes whose
-        // 8786/8787 is firewalled off — healthy over iroh, unreachable over HTTP.
         let resp_json: Option<serde_json::Value> = match resp_json {
             Some(v) => Some(v),
             None if t.iroh.is_some() => {
@@ -5138,20 +5126,6 @@ async fn fanout_remote(
                     "{RUNTIME_ARTIFACT_FANOUT_PATH}?{}",
                     crate::admin::mesh_team_qs(&team)
                 );
-                // `PeerPool::request`'s own doc is explicit that it retries a
-                // PRE-send failure once internally but deliberately leaves a
-                // POST-send failure (the request already on the wire) to the
-                // caller's own failover judgment — see hive-p2p's
-                // `request_stream` doc. For a node whose ONLY route is iroh
-                // (no HTTP admin — see `Target`'s doc), a single post-send
-                // firstbyte timeout on an otherwise-healthy trunk (intermittent
-                // path degradation, not the peer being down) used to end the
-                // whole dispatch attempt with no second try. `run_build`'s
-                // request body is idempotent from the target's perspective
-                // (the target's own stateful fanout-replica guard governs
-                // whether it actually starts a build), so retrying it here is
-                // safe. Bounded at 2 attempts total, same shape as the
-                // pre-send retries elsewhere in this stack.
                 let mut iroh_result = None;
                 let mut last_failure = String::new();
                 for iroh_attempt in 1..=2 {
@@ -5172,14 +5146,6 @@ async fn fanout_remote(
                             break;
                         }
                         None => {
-                            // Name the MEASURED elapsed time. The previous text
-                            // claimed "timed out after 20s" for every failure,
-                            // while the witnessed ones (2026-09-01, eight
-                            // express deploys) all failed in 5-15s: the DIAL
-                            // failed (cached-hint connect timeout + fresh-
-                            // discovery giving up) long before the 20s request
-                            // budget — a different fault than a peer that
-                            // accepted the stream and never answered.
                             let elapsed_ms = t0.elapsed().as_millis();
                             last_failure = if elapsed_ms >= 19_500 {
                                 format!("iroh: no reply within the 20s request budget ({elapsed_ms}ms; the peer accepted nothing or answered nothing)")
@@ -5210,8 +5176,6 @@ async fn fanout_remote(
         };
         let Some(resp_json) = resp_json else {
             if attempt_failures.is_empty() {
-                // Neither transport was even available: the node advertised no
-                // admin URL and no iroh address, so there was nothing to try.
                 attempt_failures.push("no dispatch route (node advertises neither an admin URL nor an iroh address)".into());
             }
             cloud.builds.log(bid, format!(
@@ -5237,24 +5201,13 @@ async fn fanout_remote(
         }
     });
 
-    // Dispatch all targets at once. `join_all` polls these futures on THIS
-    // task (no spawn), so the borrows of `cloud`/`req`/`remote` stay valid and
-    // nothing needs to be 'static.
     let dispatched: Vec<Option<(String, bool)>> = futures::future::join_all(dispatch_futs).await;
 
-    // Register the PRIMARY's cancel mirror before any mirroring begins — see
-    // this fn's doc: `cancel_build` on the coordinator's mirror build id has to
-    // reach the REAL process, which runs on the primary target, not here.
-    // Secondaries are extras a cancel doesn't need to chase.
     let mut live: Vec<(&crate::schedule::Target, String)> = Vec::new();
     let mut per_target: Vec<(String, TargetOutcome)> = Vec::new();
     for (t, d) in remote.iter().zip(dispatched.into_iter()) {
         match d {
             None => {
-                // Dispatch never landed (every transport failed, or the node
-                // advertised none) — the deploy did NOT run here, so this can
-                // never be reported as an application failure. Already logged
-                // with its real cause by the dispatch future.
                 per_target.push((t.node.clone(), TargetOutcome::DispatchFailed));
             }
             Some((target_bid, secondary)) => {
@@ -5273,8 +5226,6 @@ async fn fanout_remote(
         }
     }
 
-    // PHASE 2 — mirror every dispatched build concurrently. Wall-clock is now
-    // the SLOWEST remote build, not their sum.
     let mirrors = futures::future::join_all(
         live.iter()
             .map(|(t, target_bid)| mirror_remote_build(cloud, bid, t, target_bid, &t.node)),
@@ -5284,10 +5235,6 @@ async fn fanout_remote(
         per_target.push((t.node.clone(), *outcome));
     }
 
-    // Sync auto-detected Build settings back from ONE reachable HTTP target
-    // (they all built the same project, so N syncs wrote the same fields N
-    // times — and doing it inside the now-concurrent mirror phase would race
-    // `set_build` against itself).
     let sync_from = live
         .iter()
         .zip(mirrors.iter())
@@ -5295,11 +5242,6 @@ async fn fanout_remote(
         .map(|(entry, _)| entry.0);
     if let Some(t) = sync_from {
         if let Some(admin) = &t.admin {
-            // Sync the host's auto-detected Build settings back to THIS coordinator
-            // so the dashboard (which reads settings here) shows the framework +
-            // commands that were actually used (Issue #3). Only fill fields the
-            // user hasn't explicitly set, so manual overrides are never clobbered.
-            // HTTP targets only (non-critical; iroh targets skip it).
             if let Some(v) = cloud
                 .http
                 .get(format!("{admin}/v1/projects/{project}/settings"))
@@ -5325,12 +5267,6 @@ async fn fanout_remote(
                                 }
                             };
                             let mut changed = false;
-                            // Filling framework from the remote must carry its
-                            // AUTO marker too — copying only the string persisted
-                            // the target's auto-detected slug here as if
-                            // user-explicit, and the next fanout forwarded that
-                            // frozen value back, permanently pinning a first-build
-                            // misdetection (the exact defect framework_auto fixes).
                             let fw_fill = cur.framework.trim().is_empty()
                                 && !remote_bc.framework.trim().is_empty();
                             for (cf, rf) in [
@@ -5367,10 +5303,9 @@ async fn fanout_remote(
     FanoutOutcome { per_target }
 }
 
-/// Poll a remote node's `/v1/builds/{id}` and stream NEW log lines into this
-/// build record (prefixed with the node name) until it reaches a terminal state
-/// or times out. On success, copies the remote deployment's id + alias onto this
-/// build record so the dashboard shows the live URL. Returns true iff Ready.
+/// Polls a remote node's `/v1/builds/{id}` and streams NEW log lines into this build record
+/// (prefixed with the node name) until it reaches a terminal state or times out; on success copies
+/// the remote deployment's id + alias onto this record so the dashboard shows the live URL.
 async fn mirror_remote_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -5380,14 +5315,6 @@ async fn mirror_remote_build(
 ) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
-    // INACTIVITY deadline, not an absolute cap. The old fixed 10-minute cap
-    // declared "remote build timed out" for any legitimately long build (a
-    // large monorepo's install + build alone routinely exceeds it on a 4-core
-    // builder) even while every poll was succeeding and log lines were
-    // streaming. Only a window with ZERO successful state reads now counts
-    // toward giving up; every successful read pushes the deadline out. A much
-    // larger absolute ceiling still bounds the whole mirror so a target wedged
-    // in `Building` forever cannot pin this coordinator task indefinitely.
     let idle_window_ms = std::env::var("HIVE_BUILD_MIRROR_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -5400,22 +5327,6 @@ async fn mirror_remote_build(
         .unwrap_or(120 * 60 * 1000);
     let started = now_ms();
     let mut deadline = started + idle_window_ms;
-    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-    // anonymous tenant, `build_owned_by` never matched the build's real
-    // team, and every poll 404'd — INCLUDING every poll against a target
-    // build that had already finished. Verified live: 400/400 polls failed
-    // for a target build that reached `ready` in under 3 seconds, on a
-    // reachable node, every single time. This is not a mesh-health symptom;
-    // it silently broke remote-build status mirroring for every
-    // fanout-placed deployment on the whole fleet, always burning the full
-    // 10-minute deadline regardless of how fast the actual remote build was.
-    // `mesh_team_qs` is the SAME delegation-token minting already used for
-    // every other mesh-internal proxied read (`fetch_from_host` and
-    // friends) — the coordinator knows the real owning team from its own
-    // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -5423,41 +5334,12 @@ async fn mirror_remote_build(
         .unwrap_or_default();
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        // `cancel_build` already fired the kill (local process group or, for a
-        // primary target, a direct remote cancel dispatch — see
-        // `BuildCancelRegistry::cancel`) and stamped the coordinator's own
-        // record `Cancelled` BEFORE calling it — this loop just needs to stop
-        // polling promptly instead of riding out the full 10-minute deadline.
         if cloud.build_cancels.is_cancelled(bid) {
             cloud
                 .builds
                 .log(bid, format!("{node}: mirror stopped (build cancelled)"));
             return TargetOutcome::Cancelled;
         }
-        // Poll the target's build over HTTP admin when one is advertised, and
-        // FALL BACK to iroh IN THE SAME ITERATION when HTTP yields nothing.
-        //
-        // This used to be an `else if` — HTTP *or* iroh, chosen once by which
-        // field was populated — and that is a real, measured 10-minute stall,
-        // not a theoretical one. `fanout_remote`'s DISPATCH already falls back
-        // (it logs "HTTP dispatch failed, retrying via iroh"), so on a node
-        // whose 8786/8787 is firewalled — a documented condition on this fleet
-        // (AGENTS.md, "a restrictive cloud security group that blocks
-        // 8786/8787 … pushes deploys onto the iroh path"; the GPU/CVM hosts
-        // allow inbound 22 only) — the deploy is dispatched fine over iroh
-        // while every subsequent poll retries only the dead HTTP route. The
-        // remote build finishes in seconds; the coordinator keeps polling a
-        // black hole until the 10-minute deadline below and then reports
-        // "lost contact with remote build". A target that advertises an admin
-        // URL is therefore NOT evidence that the admin URL is reachable, and
-        // the poll must never assume it is.
-        // Minted PER ITERATION, never once before the loop: `mesh_team_qs`
-        // signs a 60-SECOND delegation token, so a single pre-loop mint meant
-        // every poll after the first minute presented an expired token — the
-        // target rejected it (signature fine, expiry only), the coordinator
-        // read nothing for the rest of the build, and any remote build longer
-        // than 60s "stalled" to the deadline and reported lost contact while
-        // the target was building (or already Ready) the whole time.
         let team_qs = crate::admin::mesh_team_qs(&team);
         let sep = if team_qs.is_empty() { "" } else { "?" };
         let mut tried_http = false;
@@ -5478,11 +5360,6 @@ async fn mirror_remote_build(
         }
         if v.is_none() {
             if let Some((id, addr)) = &target.iroh {
-                // 20s, matching the DISPATCH timeout above. This poll used to get 8s,
-                // which is a shorter budget than the request that successfully placed
-                // the deploy in the first place — an iroh dial that has to fall back
-                // through a relay can exceed it, and then every single poll returns
-                // None while the remote build has actually already finished.
                 v = crate::gossip::request_to(
                     cloud,
                     id,
@@ -5497,12 +5374,6 @@ async fn mirror_remote_build(
             }
         }
         let Some(v) = v else {
-            // A failed poll used to be SILENT (request_to just returns None), so a
-            // build stuck at "Building" for a deploy that had really succeeded gave
-            // the next reader nothing to go on — it took reading the TARGET's own
-            // build record to discover it was `ready` all along. Log the first
-            // failure and then every ~30s so the transport, not the app, is
-            // implicated immediately.
             polls_failed += 1;
             if polls_failed == 1 || polls_failed % 20 == 0 {
                 let transport = match (tried_http, target.iroh.is_some()) {
@@ -5520,17 +5391,12 @@ async fn mirror_remote_build(
             }
             if now_ms() > deadline {
                 cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
-                // NOT a build failure: this node never told us its app failed —
-                // we simply could not read it. Treated as unreachable so it
-                // degrades capacity instead of vetoing healthy regions.
                 return TargetOutcome::DispatchFailed;
             }
             continue;
         };
         polls_failed = 0;
-        // A successful read IS progress — push the inactivity deadline out.
         deadline = now_ms() + idle_window_ms;
-        // Stream any log lines we haven't mirrored yet.
         if let Some(lines) = v.get("lines").and_then(|x| x.as_array()) {
             for line in lines.iter().skip(mirrored) {
                 if let Some(text) = line.get("line").and_then(|x| x.as_str()) {
@@ -5541,12 +5407,6 @@ async fn mirror_remote_build(
         }
         let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
         if state.eq_ignore_ascii_case("ready") {
-            // A Ready state with NO deployment id is not a replica: it is the
-            // stateful `fanout_secondary` guard declining to host (it stamps its
-            // own build Ready on the way out). Counting it as Ready would let a
-            // deploy promote with nothing serving it, so the deployment id — the
-            // proof that something is actually registered and routable on that
-            // node — is what distinguishes the two.
             let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) else {
                 cloud.builds.log(
                     bid,
@@ -5575,12 +5435,6 @@ async fn mirror_remote_build(
             return TargetOutcome::Ready;
         }
         if state.eq_ignore_ascii_case("error") {
-            // Link the FAILED remote build to its deployment too (the remote
-            // sets deployment_id on both success and failure): without this,
-            // the coordinator's mirror record was unlinked on failure, so
-            // /v1/deployments/:id/build could never answer locally for a
-            // failed fanout deploy and the detail page showed no logs at all —
-            // exactly when the user most needs them.
             if let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) {
                 let dep = dep.to_string();
                 cloud.builds.update(bid, |b| {
@@ -5598,20 +5452,15 @@ async fn mirror_remote_build(
                     ceiling_ms / 60_000
                 ),
             );
-            // Distinct from "lost contact": we COULD read this node's state, so
-            // the deploy really did run there and never reached Ready.
             return TargetOutcome::BuildFailed;
         }
     }
 }
 
-/// After placing a project on its target node(s), tell every OTHER node that
-/// still hosts it to delete it — so changing regions RELOCATES the deployment
-/// rather than leaving stale copies. Best-effort; never fails the deploy.
-/// Resolve a request's environment WITHOUT running the build: Some(true/false)
-/// when this node can classify it (explicit target, or branch vs a locally
-/// KNOWN production_branch), None when it genuinely cannot. Callers that gate
-/// destructive production-lane actions treat None as "not production".
+/// Resolves a request's environment WITHOUT running the build: `Some(true/false)` when this node
+/// can classify it (explicit target, or branch vs a locally KNOWN production_branch), `None` when
+/// it genuinely cannot; callers that gate destructive production-lane actions treat `None` as "not
+/// production".
 fn request_is_production(
     cloud: &Arc<CloudState>,
     req: &fluid_core::GitDeployRequest,
@@ -5632,13 +5481,13 @@ fn request_is_production(
     }
 }
 
+/// Relocation cleanup once a placement is serving: drops this node's stale PRODUCTION copies
+/// (`remove_project_superseded`, never previews; the project settings stay, the coordinator holds
+/// the authoritative env/build config) when it is not a target, and broadcasts the SCOPED reap
+/// (`dispatch_deployments_reap`, never the full project delete) CONCURRENTLY to every healthy
+/// non-target peer, since one registry-healthy but unreachable peer costs ~107 s serially.
+/// Best-effort; never fails the deploy.
 async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_names: &[String]) {
-    // SELF cleanup first: peer_routes only ever lists PEERS, so a stale copy on
-    // THIS (coordinator) node would otherwise survive a relocation — wasting disk,
-    // keeping it a lease candidate, and inflating the serving count. If this node
-    // isn't a chosen target but still hosts the project, drop the local
-    // DEPLOYMENTS (gateway) — but keep the project SETTINGS, since the coordinator
-    // holds the authoritative env/build config for future redeploys.
     let me = cloud.node_name.clone();
     if !target_names.iter().any(|t| t == &me) {
         let hosts_locally = cloud.gw.served_hosts().iter().any(|h| {
@@ -5646,9 +5495,6 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             sub == project || sub.starts_with(&format!("{project}-"))
         });
         if hosts_locally {
-            // Superseded PRODUCTION records only — a preview hosted here is not
-            // a stale copy of the production placement; reaping it is what made
-            // preview URLs 404 after every production push.
             let removed = cloud.gw.remove_project_superseded(project).await;
             tracing::info!(
                 project,
@@ -5658,12 +5504,6 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             crate::persist::persist(cloud);
         }
     }
-    // Relocation cleanup: BROADCAST a single-hop delete to every healthy peer
-    // EXCEPT the chosen targets, over HTTP admin OR the iroh mesh. (Previously
-    // derived a "hosting" set from gossiped routes and dispatched HTTP-only —
-    // sparse post-restart gossip + empty node_admins for FC nodes meant stale
-    // copies silently survived relocations.) The receiving arm is team-checked
-    // and idempotent, so non-hosting peers are a cheap no-op.
     let team = cloud.projects.team_of(project);
     let peers: Vec<String> = cloud
         .registry
@@ -5672,21 +5512,6 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
         .filter(|n| !n.is_self && n.healthy)
         .map(|n| n.name)
         .collect();
-    // CONCURRENTLY, not one peer at a time. `dispatch_project_delete` retries
-    // 3x with a 15s HTTP timeout plus a 20s iroh timeout per attempt, so a
-    // single registry-healthy-but-unreachable peer costs ~107s serially and
-    // every peer behind it waits — on the pure-remote branch this ran BEFORE
-    // the build was stamped Ready, i.e. it showed up to the user as minutes of
-    // "Building" on a deployment that was already serving. The receiving arm
-    // is idempotent and order-independent, so fanning out is safe.
-    // SCOPED reap, never the full project delete: the receiving arm removes
-    // only superseded production-lane records — previews survive, and so do
-    // the peer's node-local ProjectSettings (team tag, production_branch,
-    // env). Reusing the full-teardown primitive here is what made projects
-    // vanish from accounts (the team tag is how listings find them) and made
-    // preview records disappear after every production push. A pre-upgrade
-    // peer answers NO_HANDLER and keeps its stale copies until it upgrades —
-    // retention, not correctness.
     futures::future::join_all(
         peers
             .iter()
@@ -5696,10 +5521,9 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
     .await;
 }
 
-/// Best-effort GitHub Commit Status report (Vercel-style "shadw — Deployment
-/// ready" check on the commit/PR). No-op unless `GITHUB_TOKEN` is set in the
-/// node's environment and the repo is on github.com. All failures are swallowed
-/// so deploys never depend on GitHub being reachable.
+/// Best-effort GitHub Commit Status (the Vercel-style "shadw — Deployment ready" check on the
+/// commit/PR): a no-op unless `GITHUB_TOKEN` is set and the repo is on github.com, and every
+/// failure is swallowed so deploys never depend on GitHub being reachable.
 async fn report_github_status(
     repo_url: &str,
     sha: &str,
@@ -5719,7 +5543,7 @@ async fn report_github_status(
     };
     let url = format!("https://api.github.com/repos/{owner}/{repo}/statuses/{sha}");
     let mut body = serde_json::json!({
-        "state": state, // pending | success | failure | error
+        "state": state,
         "description": description,
         "context": "shadw",
     });
@@ -6004,9 +5828,10 @@ async fn prepare_fdi(
     })
 }
 
-/// Produce the deployment manifest from a cloned repo: Dockerfile (podman),
-/// explicit `fluid.json`, or Framework-Defined Infrastructure. Any error here is
-/// recoverable by the caller (the deployment is still created with a fallback).
+/// Produces the deployment manifest from a cloned repo in one of five shapes: prebuilt image,
+/// docker-compose, Dockerfile (podman), explicit `fluid.json` or Framework-Defined Infrastructure;
+/// only the plain-`fluid.json` branch deserializes the file into a `Manifest` (see
+/// `fluid_json_browser_optins`).
 async fn produce_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -6032,15 +5857,10 @@ async fn produce_manifest(
     image_ports: Option<Vec<fluid_core::PortSpec>>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
-    // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
-    // port, and run it as a container with an automatic persistent volume + env. No
-    // Dockerfile build, no framework detection.
     if let Some(image) = image_ref {
-        // Same override format/semantics as the Dockerfile-build path's fluid.json
-        // `container` block below — parsed here since an image deploy has no
-        // repo/fluid.json of its own to read.
         let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
         let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
+        let skip_pull = false;
         return image_container_manifest(
             cloud,
             bid,
@@ -6053,20 +5873,11 @@ async fn produce_manifest(
             cpus,
             image_pids,
             image_ports,
-            // false: a registry image must actually be fetched before it can run.
-            false,
+            skip_pull,
         )
         .await;
     }
-    // `isolated` stays Optional past this point: a builder-less node may still
-    // complete a plan that executes NO repository-controlled command (the
-    // zero-command static lane). Every site that would run a command — or
-    // materialize a sealed workspace one produced — requires `Some` and
-    // refuses with BUILD_ISOLATION_UNAVAILABLE otherwise.
     let mut isolated = isolated;
-    // docker-compose / compose.yaml: a multi-service container deployment in ONE
-    // project namespace. Takes precedence over a lone Dockerfile (it expresses the
-    // full topology). Single-Dockerfile projects are unaffected.
     let compose_path = crate::compose::compose_file(dir);
     if let Some(compose_path) = compose_path {
         return compose_container_manifest(
@@ -6141,16 +5952,12 @@ async fn produce_manifest(
     }
 }
 
-/// The module a direct-interpreter `start_cmd` names, when the argv is one
-/// plain `node <entry>` / `bun <entry>` / `bun run <entry>` launch. `None`
-/// for every other shape — package-manager and script indirection (`npm
-/// start`, `bun run start`), `next start`, container/python/command runtimes,
-/// stdin/eval/REPL forms, and any Node option that takes the NEXT argv as its
-/// value (`-r x`, `--require x`, `--import x`, `--loader x`), because there
-/// the first non-option argument is not the entry. `None` means "not this
-/// check's business": the backend's own launch validation still runs. Only
-/// `--flag` / `--flag=value` options are skipped ahead of the entry; a
-/// short `-x` option bails out for the same reason.
+/// The module a direct-interpreter `start_cmd` names, when the argv is one plain `node <entry>` /
+/// `bun <entry>` / `bun run <entry>` launch; `None` for every other shape (package-manager and
+/// script indirection, `next start`, container/python/command runtimes, stdin/eval/REPL forms, any
+/// Node option that takes the NEXT argv as its value such as `-r x` or `--import x`, a short `-x`
+/// option), meaning "not this check's business": the backend's own launch validation still runs.
+/// Only `--flag` / `--flag=value` options are skipped ahead of the entry.
 fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
     let first = start_cmd.first()?;
     let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
@@ -6208,20 +6015,14 @@ fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
     plain_relative.then(|| candidate.clone())
 }
 
-/// Build-time launch-shape preflight: every function whose `start_cmd` is a
-/// direct `node`/`bun` launch ([`direct_launch_entry`]) must have its entry
-/// module present in the runtime artifact tree that is about to be sealed
-/// (`checkout_root/app_rel/cwd_relative/<entry>`, plus Node's extensionless
-/// `.js`/`.mjs`/`.cjs` resolution; a directory counts, Node resolves its
-/// `index.js`). Deliberately conservative — it fires only when NOTHING exists
-/// at the entry, the one case that is provably unlaunchable on every backend
-/// (mock spawns `node <entry>` from the same tree; litebox refuses the launch
-/// against the same sealed bytes; the microVM agent execs the same path).
-/// The refusal names the function, the entry, the exact checkout-relative
-/// path examined, what the sealed root actually contains, and the field that
-/// chose the entry: `fluid.json functions[N].start_cmd` — whose lane ships
-/// the checkout as-is with no install/build command — or the build-derived
-/// start command (package.json `scripts.start` / framework detection).
+/// Build-time launch-shape preflight: every function whose `start_cmd` is a direct `node`/`bun`
+/// launch ([`direct_launch_entry`]) must have its entry module present in the runtime artifact tree
+/// about to be sealed (`checkout_root/app_rel/cwd_relative/<entry>`, plus Node's extensionless
+/// `.js`/`.mjs`/`.cjs` resolution; a directory counts). Deliberately conservative: it fires only
+/// when NOTHING exists at the entry, the one case provably unlaunchable on every backend. The
+/// refusal names the function, the entry, the exact path examined, what the sealed root actually
+/// contains and the field that chose the entry (`fluid.json functions[N].start_cmd`, whose lane
+/// ships the checkout as-is with no install/build, or the build-derived start command).
 async fn preflight_direct_entries(
     manifest: &Manifest,
     runtime_artifact: &hive_backend::RuntimeArtifactSpec,
@@ -6369,11 +6170,10 @@ async fn preflight_direct_entries(
     Ok(())
 }
 
-/// Whether to use `npm ci` (a clean, lockfile-exact install) instead of
-/// `npm install`. Restricted to npm projects that have a committed
-/// `package-lock.json` (yarn/pnpm have their own lockfiles), and only when this
-/// is the project's first deployment (Task 1) or the build cache was explicitly
-/// disabled on a redeploy (Task 2). All other builds use `npm install` + cache.
+/// Whether to use `npm ci` (clean, lockfile-exact install) instead of `npm install`: only for npm
+/// projects with a committed `package-lock.json`, and only on the project's first deployment or
+/// when the build cache was explicitly disabled on a redeploy; every other build uses `npm install`
+/// + cache.
 fn should_use_npm_ci(
     pm: &str,
     has_package_lock: bool,
@@ -6565,10 +6365,9 @@ fn pnpm_runtime_dependency_roots(
     Ok(roots)
 }
 
-/// Framework-Defined Infrastructure: detect the framework, run its real install
-/// + build commands (streamed), then normalize the output into a Manifest —
-/// either static assets or a serverless server. This is the executor that turns
-/// a source repo into the Build Output API contract (`fluid-build`).
+/// Framework-Defined Infrastructure: detects the framework, runs its real install + build commands
+/// (streamed) and normalizes the output into a Manifest (static assets or a serverless server), the
+/// executor that turns a source repo into the Build Output API contract (`fluid-build`).
 async fn build_via_fdi(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -6614,8 +6413,6 @@ async fn build_via_fdi(
         ));
     }
 
-    // Auto-detected framework provenance is persisted independently from package
-    // planning so package-less static and Wasmer lanes retain their bypasses.
     if runtime_override != Some(hive_core::Runtime::Wasmer) {
         let current = build_config.clone().unwrap_or_default();
         if current.framework.trim().is_empty() || settings_are_auto {
@@ -6630,26 +6427,7 @@ async fn build_via_fdi(
         }
     }
 
-    // An explicit Wasmer runtime is a precompiled `.wasm` artifact: no `npm
-    // install`, no framework build step, and no `fluid_build::plan_build`
-    // call at all (there is no package.json for any of it to act on, and
-    // `detect()` has no Wasmer preset — a `.wasm`-only project falls
-    // through to its own "unknown -> static" default, which would
-    // mislabel the dashboard's Build settings AND, left to reach the
-    // `Primitive::Static` arm further down, silently serve the project as
-    // a static site with no function at all). Short-circuits before any
-    // of that runs — an explicit `runtime: "wasmer"` config must win over
-    // every auto-detection step below, the same precedence every other
-    // explicit runtime choice already gets.
     if runtime_override == Some(hive_core::Runtime::Wasmer) {
-        // An explicitly configured install/build command is NOT silently
-        // dropped just because this path skips framework detection. The user
-        // set it deliberately (vercel.json > project settings, the precedence
-        // this function documents at the top), and a `.wasm` very often IS the
-        // output of a build step — `cargo wasix build --release`, `tinygo
-        // build`, `wasm-pack`. Discarding it without a word would leave the
-        // deployment serving a stale committed artifact, or nothing at all,
-        // with a green build and no explanation.
         if let Some(cmd) = install_override
             .as_deref()
             .filter(|command| !command.trim().is_empty())
@@ -6683,8 +6461,6 @@ async fn build_via_fdi(
         if let Some(session) = isolated.as_deref_mut() {
             session.finish().await?;
         }
-        // Resolved AFTER the build step above, so a `.wasm` the build just
-        // produced is found rather than only one committed to the repo.
         let Some(start) = detect_wasmer_start_cmd(dir).await else {
             anyhow::bail!(
                 "runtime \"wasmer\" is set, but no `.wasm` entry module was found — \
@@ -6702,17 +6478,6 @@ async fn build_via_fdi(
         return Ok(manifest);
     }
 
-    // ---- Build toolchain: PROBED, never assumed --------------------------
-    // The plan's resolved package manager may not exist on the filesystem this
-    // build actually execs against — the host PATH for a host-exec backend
-    // (mock/litebox), the inside of the pinned builder image for a microVM one.
-    // Measured when this probe was added: `bun` present on fc-phoenix and
-    // absent on fc-virginia and 170.106.158.151, while the pipeline dispatched a
-    // `bun install` to all three (`/bin/sh: line 1: bun: command not found`).
-    // The probe runs through the SAME session that will run the repository
-    // commands, so its verdict cannot disagree with the command's own
-    // resolution. A build that runs no repository command (a zero-command
-    // static deploy) never pays for it.
     let steps = &repository_build.contract().steps;
     let runs_repository_command = !matches!(steps.install, fluid_build::StepAuthority::None)
         || !matches!(steps.build, fluid_build::StepAuthority::None);
@@ -6721,12 +6486,6 @@ async fn build_via_fdi(
     } else {
         None
     };
-    // Honest degradation for the DETECTED manager. An absent package manager is
-    // SUBSTITUTED, never executed-and-failed and never silently ignored: npm
-    // ships with node, so a `bun`/`pnpm`/`yarn` plan still installs. Where no
-    // substitute exists the command is left alone and the existing
-    // BUILD_TOOLCHAIN_MISSING classifier names the missing binary — never the
-    // tenant's application.
     let detected_manager = package_manager.manager;
     let mut toolchain_substituted = false;
     if let Some(available) = available_toolchains.as_ref() {
@@ -6750,9 +6509,6 @@ async fn build_via_fdi(
                         "BUILD_TOOLCHAIN_SUBSTITUTED: resolved package manager absent; degraded to a present one"
                     );
                     package_manager.manager = substitute;
-                    // The absent tool's exact version declaration and its
-                    // lockfile kind describe a toolchain that is not here; the
-                    // substitute re-derives its own install arguments.
                     package_manager.declaration = None;
                     package_manager.lockfile = None;
                     toolchain_substituted = true;
@@ -6831,20 +6587,6 @@ async fn build_via_fdi(
             }
         ));
     }
-    // Explicit repository commands are repository authority and otherwise run
-    // byte-for-byte. The ONE exception is a command naming a package manager
-    // this build environment does not have: running it can only ever produce
-    // `/bin/sh: line 1: <tool>: command not found`, so the tool is swapped for
-    // one that IS present and the substitution is logged. Only two shapes are
-    // rewritten, both with a shape the substitute genuinely carries:
-    //   * `<tool> install|i|ci|add …` — manager-specific flags
-    //     (`--frozen-lockfile` is pnpm/bun, `--no-audit` is npm) are NOT
-    //     transplanted; the command is rebuilt for the substitute.
-    //   * `<tool> run <script>` — identical on every manager.
-    // Anything else (a compound shell command, bun-only flags such as
-    // `bun run --bun start`) is left alone, and the existing
-    // BUILD_TOOLCHAIN_MISSING classifier then names the absent binary instead
-    // of blaming the tenant's application.
     let rewrite_absent_tool = |command: &str| -> Option<(String, &'static str, &'static str)> {
         let available = available_toolchains.as_ref()?;
         let requested = command_toolchain(command)?;
@@ -6860,11 +6602,6 @@ async fn build_via_fdi(
         };
         Some((replacement, requested, substitute))
     };
-    // Why detection and the executed command can disagree, stated in the build
-    // log: an explicit install command (vercel.json > Project Settings) is
-    // repository authority and overrides detection entirely. Witnessed live —
-    // a redeploy logged `package manager: npm (Default)` and then ran
-    // `bun install`, because the project's own install command named bun.
     let requested_install_tool = install_cmd.as_deref().and_then(command_toolchain);
     if let Some((replacement, requested, substitute)) =
         install_cmd.as_deref().and_then(rewrite_absent_tool)
@@ -6940,24 +6677,11 @@ async fn build_via_fdi(
         );
         build_cmd = Some(replacement);
     }
-    // Host tar extraction/creation would put repository-controlled cache bytes
-    // back outside the executor. Do not inspect repository toolchains on the host
-    // while isolated cache import/export is disabled; future cache identity must
-    // come from the pinned builder capability and sealed artifact protocol.
     if use_cache {
         log("Build cache bypassed: isolated cache import/export is not yet enabled.".into());
     } else {
         log("Build cache disabled — installing dependencies fresh.".into());
     }
-    // 1) Install dependencies. GENERATED installs run at the install dir (the
-    // workspace root for monorepos — pnpm/npm workspaces install once at the
-    // root). An EXPLICIT install command (vercel.json/project settings) runs
-    // in the SELECTED APP directory instead, because that is the cwd Vercel
-    // gives every command under a Root Directory — tenants author against
-    // that contract. Witnessed live (Drugs.WTF, dpl-7a1ff94b66): vercel.json
-    // declared `cd ../.. && pnpm install …`, correct on Vercel where the cwd
-    // is apps/web; run at OUR workspace root the `cd ../..` climbed out of
-    // the checkout into $HIVE_DATA and died ERR_PNPM_NO_PKG_MANIFEST.
     let install_is_explicit = matches!(&steps.install, fluid_build::StepAuthority::Explicit(_));
     if let Some(install_cmd) = install_cmd
         .as_deref()
@@ -6990,9 +6714,6 @@ async fn build_via_fdi(
         .await
         .map_err(|error| classify_command_failure("install command failed", install_cmd, error))?;
     }
-    // 1.5) SvelteKit: perform both dependency adaptation and config rewrite in
-    // the same isolated workspace as install/build. No installed package or
-    // repository path is read or mutated on the host between build steps.
     let is_sveltekit = has_pkg && plan.framework.slug == "sveltekit";
     if is_sveltekit {
         let add_adapter = launcher.add_svelte_adapter();
@@ -7071,9 +6792,6 @@ printf '%s\n' "SvelteKit adapter switched to $spec"
             .await
             .context("adapting SvelteKit failed")?;
     }
-    // 1.6) OpenNext's default wrapper is Lambda-shaped. Generate the fixed Node
-    // wrapper inside the isolated workspace, refusing repository symlinks rather
-    // than letting a platform write follow one.
     if has_pkg && plan.framework.slug == "opennext" {
         let script = r#"set -eu
 for cfg in open-next.config.ts open-next.config.js open-next.config.mjs; do
@@ -7115,8 +6833,6 @@ printf '%s\n' 'OpenNext: generated Node wrapper configuration'
             .await
             .context("configuring OpenNext failed")?;
     }
-    // 2) Build through the workspace root orchestrator when it exists; otherwise
-    // build in the selected project directory.
     if let Some(repository_from_app) = turbo_repository_from_app.as_deref() {
         const TURBO_BUILD_SCRIPT: &str = r#"set -eu
 repo=$1
@@ -7188,13 +6904,6 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("staging platform after shim failed")?;
-        // Also stage the exported-app launcher. It is consumed only when the
-        // selected app has NO usable start script but its entry EXPORTS the
-        // server (the Vercel zero-config Express shape) — see the launcher
-        // fallback at the catch-all-start refusal below. Staged here
-        // unconditionally because the session is still open at this point and
-        // is already closed by the time that refusal can run; an unused
-        // launcher file is as harmless as an unused after-shim.
         let launcher_script = r#"set -eu
 p=.hive-express-launcher.mjs
 [ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: launcher path may not be a symlink' >&2; exit 41; }
@@ -7218,12 +6927,6 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("staging platform exported-app launcher failed")?;
-        // And the Worker adapter. Consumed only when the selected app is a
-        // Cloudflare Worker (wrangler config + exported `fetch` handler) — its
-        // own `scripts.start` runs the `wrangler` CLI, which our Node substrate
-        // cannot launch. Staged here for the same reason as the launcher above:
-        // the build session is still open now and is closed by the time the
-        // start command is resolved.
         let worker_script = r#"set -eu
 p=.hive-worker-launcher.mjs
 [ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: worker launcher path may not be a symlink' >&2; exit 41; }
@@ -7248,17 +6951,6 @@ trap - EXIT HUP INT TERM
             .await
             .context("staging platform worker launcher failed")?;
     }
-    // Runtime dependency normalization for nested pnpm workspaces, auto-planned
-    // lane only: repository-controlled install/build overrides own their output
-    // shape and are never re-normalized behind the tenant's back. pnpm's
-    // isolated linker materializes a `.pnpm` virtual store whose alias graph
-    // legitimately revisits the same directory inode through many links — a
-    // dereferencing runtime-artifact enumeration multiplies it past the entry
-    // bound (witnessed: 100k entries / 2.1 GB from a 694 MB store). Replacing
-    // ONLY the package-manager materialization roots with one frozen,
-    // production-only, hoisted, offline install yields a symlink-free bounded
-    // graph while leaving every build-output tree (.next/standalone included)
-    // byte-untouched.
     if is_monorepo
         && package_manager.manager == "pnpm"
         && install_override.is_none()
@@ -7285,15 +6977,6 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("removing pnpm dependency materialization roots failed")?;
-        // `package-import-method=copy` is load-bearing, not an optimization:
-        // pnpm's default hardlinks every package file from a content-addressable
-        // STORE OUTSIDE the checkout, so each installed file reports nlink=2 with
-        // only one link inside the artifact. The runtime-artifact seal rejects
-        // exactly that ("checkout-external hardlink provenance: expected 2 links,
-        // approved 1") -- and it is right to: the artifact would not own its own
-        // bytes and could be mutated through the store link. Copying makes every
-        // file nlink=1 and the artifact genuinely self-contained. Cost is disk,
-        // not correctness, and it only applies to this runtime normalization.
         let runtime_install = launcher.invoke(
             "install --prod --frozen-lockfile --config.node-linker=hoisted \
              --config.package-import-method=copy --offline --ignore-scripts",
@@ -7319,17 +7002,6 @@ trap - EXIT HUP INT TERM
                 .into(),
         );
     }
-    // De-link dependency files that share inodes with paths OUTSIDE the
-    // checkout. bun installs by HARDLINKING from its global cache
-    // (~/.bun/install/cache), so every installed file carries extra link
-    // counts the runtime-artifact seal correctly refuses ("rejects
-    // checkout-external hardlink provenance" — that proof is load-bearing: a
-    // tenant build script must not be able to hardlink a host file into the
-    // artifact). Re-materializing each multi-link file in place (copy +
-    // rename) keeps the exact bytes the install produced while giving every
-    // file a private inode, so the seal's containment proof passes without
-    // being weakened. Witnessed live: tokenhun's `bun install` + `next build`
-    // both succeeded and the seal then refused `expected 3 links, approved 1`.
     {
         const DELINK_SCRIPT: &str = r#"set -eu
 [ -d node_modules ] || exit 0
@@ -7353,10 +7025,6 @@ done' hive-delink {} +
             .await
             .context("re-materializing hardlinked dependency files failed")?;
     }
-    // Seal once after the complete ordered command graph. A checked-in static
-    // Build Output has its own exact output directory; otherwise the normalized
-    // selected-app outputDirectory is the directory that must exist in the sealed
-    // volume before any bytes are materialized on the host.
     let explicit_commands = install_override.is_some() || build_override.is_some();
     if !explicit_commands {
         if let Some(output) = build_output.as_ref() {
@@ -7364,16 +7032,6 @@ done' hive-delink {} +
         }
     }
     if explicit_commands {
-        // Repository-controlled install/build commands choose their own
-        // output shape — which may be a package-less Build Output API v3
-        // artifact under `.vercel/output`, a directory the framework's own
-        // `output_dir` heuristic never anticipated. Seal the whole checkout
-        // unconditionally: `finish()` still materializes every byte
-        // (`finish_inner`'s `sealed.materialize_replace` runs regardless of
-        // any directory precondition), so nothing is dropped, and the real
-        // `.vercel/output` parse right below decides what actually shipped
-        // instead of a precondition that can name a directory the explicit
-        // build never promised to produce.
         require_build_session(&mut isolated)?.finish().await?;
     } else if let Some(session) = isolated.as_deref_mut() {
         let expected_output =
@@ -7383,11 +7041,6 @@ done' hive-delink {} +
         && plan.output_dir.as_str() != "."
         && !coordinates.output_root().is_dir()
     {
-        // Builder-less zero-command lane: no sealed workspace exists (the
-        // checkout bytes ARE the output), but the plan's declared output
-        // directory must still exist — a framework plan whose output only a
-        // build step would have produced must fail here exactly like
-        // `finish_with_output`'s precondition, never serve an empty site.
         anyhow::bail!(
             "BUILD_ISOLATION_UNAVAILABLE: plan expects output directory {:?} which does not exist in the checkout, and no isolated build executor is available to produce it. No repository-controlled command was run on the host.",
             plan.output_dir.as_str()
@@ -7398,9 +7051,6 @@ done' hive-delink {} +
     if let Some(output) = parsed_build_output.as_ref() {
         log("Build Output API v3 detected (.vercel/output).".into());
         let mut manifest = build_output_manifest(project, plan.framework.slug, output)?;
-        // Stage the platform-owned launcher AFTER the artifact is fully
-        // materialized (`finish`/`finish_with_output` above) and validated
-        // (`build_output_manifest` just succeeded) — never before.
         stage_build_output_node_launchers(dir, &mut manifest)?;
         return Ok(manifest);
     }
@@ -7415,11 +7065,6 @@ done' hive-delink {} +
             Ok(manifest)
         }
         Primitive::Serverless | Primitive::Hybrid => {
-            // Next.js DEPLOYMENT ADAPTERS (OpenNext / vinext): the build emits a
-            // Node HTTP server + a separate immutable-assets dir. Run the server as
-            // the Fluid `api` function and serve assets from the CDN, falling
-            // through to the function on a miss (the CDN→origin model). This is what
-            // gives OpenNext/vinext apps Fluid compute (warm pool + concurrency).
             if let Some(mut m) =
                 adapter_manifest(project, plan.framework.slug, dir, runtime_override).await
             {
@@ -7435,9 +7080,6 @@ done' hive-delink {} +
                 m.framework = plan.framework.slug.to_string();
                 return Ok(m);
             }
-            // The selected application owns both command discovery and the runtime
-            // artifact base. Function cwd is normalized later relative to that base;
-            // it must not repeat the selected checkout path here.
             let mut start = if is_sveltekit && dir.join("build/index.js").exists() {
                 if runtime_override == Some(hive_core::Runtime::Bun) {
                     vec![
@@ -7451,13 +7093,6 @@ done' hive-delink {} +
             } else {
                 detect_start_cmd(dir, runtime_override).await
             };
-            // Fail-loud gate: a resolved `npm start`/`bun run start` whose
-            // OWN directory's package.json declares NO `scripts.start` is
-            // exactly the workspace-root-without-start bug — the catch-all in
-            // `detect_start_cmd` emitted `["npm","start"]` blindly, and the
-            // resulting manifest would cold-start a build script, never bind
-            // $PORT, and open the deployment circuit. Refuse NOW with a named
-            // error instead of registering a guaranteed-broken deployment.
             let catch_all_start = (!runtime_override.is_some_and(|r| r == hive_core::Runtime::Bun)
                 && start.len() == 2
                 && start[0] == "npm"
@@ -7477,13 +7112,6 @@ done' hive-delink {} +
                     .and_then(|v| v.get("scripts").and_then(|s| s.get("start")).map(|_| ()))
                     .is_some();
                 if !has_start {
-                    // Zero-config exported-app lane (Vercel Express parity):
-                    // no start script, but the app's entry module EXPORTS its
-                    // server (`export default app`) — serve it through the
-                    // platform launcher staged earlier this build. TypeScript
-                    // entries run under Node's own type stripping; the Bun
-                    // catch-all shape keeps the refusal below (Bun's own
-                    // `bun run <entry>` semantics are a separate lane).
                     let launcher_entry =
                         if runtime_override.is_some_and(|r| r == hive_core::Runtime::Bun) {
                             None
@@ -7521,13 +7149,6 @@ done' hive-delink {} +
                     }
                 }
             }
-            // CLOUDFLARE WORKER LANE. A Worker app's own start command runs the
-            // `wrangler` CLI, which needs workerd and an account and which our
-            // Node substrate refuses outright. When the shape is recognised,
-            // host the handler it exports through the platform's Worker adapter
-            // instead of trying to launch wrangler. The adapter was staged into
-            // this directory above; see `assets/worker-launcher.mjs` for what it
-            // does and does not emulate.
             if let Some(entry) = discover_worker_entry(dir) {
                 let mut cmd = vec!["node".to_string()];
                 if entry.ends_with(".ts") || entry.ends_with(".mts") {
@@ -7546,11 +7167,6 @@ done' hive-delink {} +
                 "Provisioning serverless server: `{}`.",
                 start.join(" ")
             ));
-            // Per-route bundle splitting (Issue: SHADOW_NEXT_PER_ROUTE) — DISCOVERY
-            // ONLY for now. When enabled and this is a Next.js app, classify each
-            // route from the .next manifests + file traces and write a per-route
-            // build manifest. The serve path is UNCHANGED (still `next start`); the
-            // runtime dispatcher consumes this manifest separately and falls back.
             let mut route_policies: Vec<fluid_core::RoutePolicy> = Vec::new();
             if std::env::var("SHADOW_NEXT_PER_ROUTE")
                 .map(|v| v == "1" || v == "true")
@@ -7563,10 +7179,6 @@ done' hive-delink {} +
                         "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
                         prm.routes.len(), prm.eligible_count(), prm.fallback_count()
                     ));
-                    // Map build-time classification -> runtime policy (#16), persisted
-                    // into the manifest so the serve path can apply route-type-aware
-                    // caching/retry. The `next start` fallback still serves every
-                    // route; this only enriches responses, it doesn't change routing.
                     route_policies = prm
                         .routes
                         .iter()
@@ -7585,13 +7197,6 @@ done' hive-delink {} +
             let mut m = function_manifest(project, start, runtime_override);
             m.framework = plan.framework.slug.to_string();
             m.route_policies = route_policies;
-            // after()/waitUntil runtime support for Node-runtime deployments: drop
-            // the platform shim into the build dir and inject it via NODE_OPTIONS
-            // so Next.js `after()` (which funnels into the platform waitUntil at
-            // globalThis[Symbol.for('@next/request-context')].get().waitUntil) keeps
-            // the instance warm for background work via the existing
-            // x-fluid-wait-until-ms keep-alive convention. Skipped for Bun (doesn't
-            // honor NODE_OPTIONS --require); harmless no-op if after() is never used.
             if runtime_override != Some(hive_core::Runtime::Bun) {
                 wire_after_shim(&mut m);
             }
@@ -7605,38 +7210,26 @@ done' hive-delink {} +
 const AFTER_SHIM_JS: &str = include_str!("../assets/after-shim.cjs");
 const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
 
-/// The exported-app launcher (Vercel zero-config Express parity): wraps an
-/// entry module that `export default`s its app instead of binding $PORT. Same
-/// staging pattern as the after shim; consumed only by the no-start-script
-/// fallback in `build_via_fdi`.
+/// The exported-app launcher (Vercel zero-config Express parity): wraps an entry module that
+/// `export default`s its app instead of binding $PORT; staged like the after shim and consumed only
+/// by the no-start-script fallback in `build_via_fdi`.
 const EXPRESS_LAUNCHER_JS: &str = include_str!("../assets/express-launcher.mjs");
 const EXPRESS_LAUNCHER_FILE: &str = ".hive-express-launcher.mjs";
 const WORKER_LAUNCHER_JS: &str = include_str!("../assets/worker-launcher.mjs");
 const WORKER_LAUNCHER_FILE: &str = ".hive-worker-launcher.mjs";
 
-/// Recognise a Cloudflare Worker application: a wrangler config plus an entry
-/// module whose default export is (or owns) a `fetch` handler.
-///
-/// These repos cannot be started the way their own template starts them — every
-/// `scripts.start` runs the `wrangler` CLI, which needs the Workers runtime
-/// (workerd) and a Cloudflare account, and our Node substrate refuses that
-/// ("command wrangler is not a dir"). Recognising the shape lets us host the
-/// SAME exported handler on Node instead (see `assets/worker-launcher.mjs`).
+/// Recognises a Cloudflare Worker application: a wrangler config plus an entry module whose default
+/// export is (or owns) a `fetch` handler. Such repos cannot start the way their template does
+/// (every `scripts.start` runs the `wrangler` CLI, which needs workerd and a Cloudflare account
+/// that the Node substrate refuses), so the SAME exported handler is hosted on Node instead
+/// (`assets/worker-launcher.mjs`).
 fn discover_worker_entry(dir: &Path) -> Option<String> {
-    // No wrangler config, no Worker: the conventional stems below (`index.js`,
-    // `main.ts`, …) are ordinary Node entry names too, and probing them without
-    // the config hijacked plain Node apps into the Worker adapter (which then
-    // exited 1 "entry exported no Worker fetch handler").
     let wrangler_config = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
         .iter()
         .find(|name| dir.join(name).is_file())?;
     let configured = std::fs::read_to_string(dir.join(wrangler_config))
         .ok()
         .and_then(|raw| {
-            // `main` names the Worker entry. The JSON flavour can carry comments
-            // (jsonc), so scan for the key rather than parsing strictly; a
-            // missing/unreadable value just falls through to the conventional
-            // stems below.
             for line in raw.lines() {
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("main") else {
@@ -7666,10 +7259,9 @@ fn discover_worker_entry(dir: &Path) -> Option<String> {
         .find(|rel| !rel.contains("..") && !rel.starts_with('/') && dir.join(rel).is_file())
 }
 
-/// Find an entry module that plausibly exports the app's server, for the
-/// no-start-script launcher lane. `package.json` `main`/`module` win, then the
-/// conventional stems Vercel's zero-config Node lane recognizes. Returns a
-/// checkout-relative path; never follows `..`.
+/// Finds an entry module that plausibly exports the app's server, for the no-start-script launcher
+/// lane: `package.json` `main`/`module` win, then the conventional stems Vercel's zero-config Node
+/// lane recognizes; a checkout-relative path, never following `..`.
 fn discover_exported_server_entry(dir: &Path) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     if let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) {
@@ -7696,15 +7288,14 @@ fn discover_exported_server_entry(dir: &Path) -> Option<String> {
         .find(|rel| !rel.contains("..") && !rel.starts_with('/') && dir.join(rel).is_file())
 }
 
-/// Wire the already-sealed after()-support shim into the first function's serve
-/// environment. The bytes themselves are staged inside `IsolatedBuild` before
-/// sealing; this function must remain metadata-only.
+/// Wires the already-sealed after()-support shim into the first function's serve environment; the
+/// bytes are staged inside `IsolatedBuild` before sealing, so this function must remain
+/// metadata-only.
 fn wire_after_shim(m: &mut Manifest) {
     let Some(f) = m.functions.first_mut() else {
         return;
     };
     let max_ms = (f.max_duration_secs.max(1) as u64).saturating_mul(1000);
-    // Append to any NODE_OPTIONS the project already set, don't clobber it.
     let require = format!("--require ./{AFTER_SHIM_FILE}");
     f.env
         .entry("NODE_OPTIONS".to_string())
@@ -7756,10 +7347,6 @@ fn build_output_manifest(
         static_manifest(project, ".vercel/output/static")
     };
 
-    // Project each checked-in Build Output API v3 function into a real
-    // FunctionConfig with a start_cmd that points into the pre-built function
-    // directory. The evaluator (build_output_v3_evaluator) validates each
-    // projection against the descriptor before the deployment is registered.
     for function in &descriptor.functions {
         let runtime = function.runtime().ok_or_else(|| {
             build_output_contract_error(
@@ -7770,12 +7357,6 @@ fn build_output_manifest(
                 ),
             )
         })?;
-        // Exact allowlist — never a loose "nodejs*.x" pattern. Mirrors
-        // fluid_gateway::SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES, the real
-        // enforcement point (`is_supported_build_output_runtime`, applied
-        // again just below via `build_output_v3_evaluator`); duplicated here
-        // ONLY so an unsupported runtime fails fast with a Build Contract
-        // error before a FunctionConfig is even constructed.
         if !matches!(runtime, "nodejs20.x" | "nodejs22.x" | "nodejs24.x") {
             return Err(build_output_contract_error(
                 "provision Build Output API v3 functions",
