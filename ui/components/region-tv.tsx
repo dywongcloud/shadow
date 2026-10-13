@@ -1,13 +1,8 @@
 "use client";
 
-// World TV overlay — the dial.wtf atlas TV logic on THIS dashboard's world
-// map, now covering EVERY country iptv-org has a playable stream for, not just
-// the fleet's serving regions. Each country with channels gets a flag marker at
-// its geographic centroid; the serving regions keep the brighter green "OLED"
-// glassmorphic label. Clicking any marker (or a row in the searchable list
-// below the map) opens that place's live TV. Plots use the SAME static
-// projection the choropleth paints with (projectGeo/MAP_VIEW), as percentage
-// offsets over the SVG box — correct at any rendered size.
+// World TV overlay (the dial.wtf atlas TV logic on this dashboard's world map): every country iptv-org has a playable stream for gets a flag marker
+// at its centroid, serving regions keep the brighter green "OLED" label, and a marker or a row of the searchable list opens that place's live TV.
+// Plots use the SAME static projection the choropleth paints with (projectGeo/MAP_VIEW) as percentage offsets over the SVG box.
 
 import { ChevronDown, ChevronUp, Circle, HardDrive, Square, Tv, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -29,8 +24,6 @@ import {
 } from "@/lib/dvr";
 import { usePoll, type Deployment } from "@/lib/api";
 
-// Lazy hls.js, the StreamViewer pattern from the atlas: native HLS on
-// Safari/iOS, hls.js everywhere else, loaded only in the browser on demand.
 let HlsModule: typeof import("hls.js").default | null = null;
 let hlsLoad: Promise<void> | null = null;
 function loadHls(): Promise<void> {
@@ -56,8 +49,6 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
     () => (catalog ? regionTv(catalog, liveRegions) : []),
     [catalog, liveRegions],
   );
-  // Every OTHER country (serving-region countries already have their bright
-  // label) that has a placeable centroid — a small flag marker each.
   const world = useMemo(() => {
     if (!catalog) return [];
     const serving = new Set(regions.map((r) => r.country));
@@ -68,8 +59,6 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
 
   return (
     <>
-      {/* World coverage: one flag per country at its centroid. Small + dim so
-          the map stays readable; hover scales it up and reveals name + count. */}
       {world.map((c) => {
         const p = projectGeo(c.lon, c.lat);
         if (!p) return null;
@@ -86,7 +75,6 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
           </button>
         );
       })}
-      {/* Serving-region plots: brighter OLED text, drawn above the flags. */}
       {regions.map((r) => {
         const p = projectGeo(r.lon, r.lat);
         if (!p) return null;
@@ -123,9 +111,8 @@ export function RegionTvLayer({ liveRegions }: { liveRegions: string[] }) {
   );
 }
 
-/** Collapsible statistics strip — mounted by the page BELOW the map card. A
- *  searchable directory of EVERY country with channels; a row opens that
- *  country's TV. Shares the layer's catalog through the module-cached hook. */
+/** Collapsible statistics strip mounted BELOW the map card: a searchable directory of EVERY country with channels, where a row opens that country's TV;
+ *  it shares the layer's catalog through the module-cached hook. */
 export function RegionTvStats() {
   const { catalog } = useTvCatalog();
   const [open, setOpen] = useState(false);
@@ -185,23 +172,27 @@ export function RegionTvStats() {
   );
 }
 
-/** The TV: full-viewport lightbox with the target's channels, hls.js playback
- *  with native-HLS fallback, fault-recovery, prev/next channel switching. */
+const MAX_NET_RETRIES = 8;
+const MAX_MEDIA_RETRIES = 3;
+const NET_RETRY_STEP_MS = 1000;
+const NET_RETRY_MAX_MS = 5000;
+const WATCHDOG_TICK_S = 3;
+const NUDGE_TO_LIVE_AFTER_STALLED_S = 6;
+const RELOAD_AFTER_STALLED_S = 12;
+
+/** The TV: full-viewport lightbox with the target's channels, hls.js playback with a native-HLS fallback, in-place fault recovery (live IPTV
+ *  streams are flaky: tokens expire, CDNs blip, segments time out) and prev/next channel switching. */
 function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => void }) {
   const [idx, setIdx] = useState(0);
   const [err, setErr] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const channel = target.channels[idx] ?? null;
 
-  // Switching country/region resets to its first channel.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- resets channel index whenever the target prop changes, a derived-reset-on-change sync
     setIdx(0);
   }, [target]);
 
-  // ---- Virtual DVR ----------------------------------------------------
-  // Drive is per-PROJECT, so a recording needs a destination project. Same
-  // convention the Drive page uses: the tenant's deployed projects.
   const { data: deps } = usePoll<Deployment[]>("/deployments", 15000);
   const projects = useMemo(
     () => Array.from(new Set((deps ?? []).map((d) => d.project))).sort(),
@@ -234,7 +225,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
     const rec: DvrRecording = {
       id: `${Date.now()}`,
       project,
-      region: target.country, // ISO code — safe as the Drive path segment (tv/<cc>/…)
+      region: target.country,
       channel: channel.name,
       startAt: Date.now(),
       durationMs: mins * 60_000,
@@ -261,7 +252,6 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
     handleRef.current = null;
   }
 
-  // Never leave a recorder running when the TV closes.
   useEffect(() => () => handleRef.current?.stop(), []);
 
   useEffect(() => {
@@ -271,18 +261,8 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
     if (!video || !channel) return;
     let cancelled = false;
     let hls: import("hls.js").default | null = null;
-    // Same-origin proxy so hls.js's playlist+segment fetches pass the app's
-    // CSP (`connect-src 'self'`); arbitrary IPTV hosts can never be allowlisted.
     const src = proxiedStreamUrl(channel.url);
 
-    // Live IPTV is inherently flaky: the auth token embedded in the stream URL
-    // expires, ad-stitchers emit discontinuities, CDNs blip, and a single
-    // proxied segment can time out. Each of those surfaces to the player as a
-    // FATAL error, and with no recovery every one is a permanent freeze — the
-    // reported symptom. So recover in place: reload the source on network
-    // errors (which also re-mints an expired token via the upstream redirect),
-    // recoverMediaError on media errors, and run a stall watchdog that nudges a
-    // wedged element back to the live edge. Give up only after bounded retries.
     let netRetries = 0;
     let mediaRetries = 0;
     let lastTime = -1;
@@ -301,9 +281,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           video.src = src;
         }
         video.play().catch(() => {});
-      } catch {
-        /* torn down mid-recover */
-      }
+      } catch {}
     };
 
     const nudgeToLive = () => {
@@ -316,9 +294,7 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           const end = video.seekable.end(video.seekable.length - 1);
           if (end - video.currentTime > 6) video.currentTime = end - 1;
         }
-      } catch {
-        /* seeking not permitted yet */
-      }
+      } catch {}
     };
 
     const startWatchdog = () => {
@@ -328,11 +304,9 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           return;
         }
         if (video.currentTime === lastTime) {
-          // Wedged while it should be playing: nudge to the live edge first,
-          // then escalate to a full reload if that didn't unstick it.
-          stalledFor += 3;
-          if (stalledFor === 6) nudgeToLive();
-          else if (stalledFor >= 12) {
+          stalledFor += WATCHDOG_TICK_S;
+          if (stalledFor === NUDGE_TO_LIVE_AFTER_STALLED_S) nudgeToLive();
+          else if (stalledFor >= RELOAD_AFTER_STALLED_S) {
             stalledFor = 0;
             reload();
           }
@@ -340,12 +314,10 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           stalledFor = 0;
           lastTime = video.currentTime;
         }
-      }, 3000);
+      }, WATCHDOG_TICK_S * 1000);
     };
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      // Native HLS (Safari/iOS): the engine recovers most stalls itself; an
-      // error->reload plus the watchdog cover the cases where it wedges.
       video.src = src;
       video.play().catch(() => {});
       video.addEventListener("error", reload);
@@ -369,8 +341,6 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
         hls.loadSource(src);
         hls.attachMedia(video);
         hls.on(HlsModule.Events.FRAG_BUFFERED, () => {
-          // Progressing again — forget past failures so a later blip gets its
-          // full retry budget, and clear any stale error banner.
           netRetries = 0;
           mediaRetries = 0;
           setErr(null);
@@ -379,16 +349,16 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           if (!data.fatal || cancelled || !HlsModule || !hls) return;
           switch (data.type) {
             case HlsModule.ErrorTypes.NETWORK_ERROR:
-              if (netRetries < 8) {
+              if (netRetries < MAX_NET_RETRIES) {
                 window.clearTimeout(recoverTimer);
-                recoverTimer = window.setTimeout(reload, Math.min(1000 * (netRetries + 1), 5000));
+                recoverTimer = window.setTimeout(reload, Math.min(NET_RETRY_STEP_MS * (netRetries + 1), NET_RETRY_MAX_MS));
                 netRetries += 1;
               } else {
                 setErr("stream error: network");
               }
               break;
             case HlsModule.ErrorTypes.MEDIA_ERROR:
-              if (mediaRetries < 3) {
+              if (mediaRetries < MAX_MEDIA_RETRIES) {
                 mediaRetries += 1;
                 hls.recoverMediaError();
               } else {
@@ -437,8 +407,6 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
             <X className="h-4 w-4" />
           </button>
         </div>
-        {/* The screen itself stays a real black rectangle — it is a TV; the
-            chrome around it is the transparent glass. */}
         <div className="relative aspect-video w-full overflow-hidden rounded bg-black">
           {channel ? (
             <video ref={videoRef} className="h-full w-full" controls playsInline muted autoPlay />
@@ -461,7 +429,6 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
           </button>
         </div>
 
-        {/* ---- VIRTUAL DVR: the cable-box deck ---- */}
         <div className={`mt-2 ${GLASS} p-2`}>
           <div className={`mb-2 flex items-center gap-2 ${OLED}`}>
             <HardDrive className="h-3.5 w-3.5" />

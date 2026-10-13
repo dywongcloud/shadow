@@ -28,8 +28,6 @@ import { RedeployModal } from "@/components/redeploy-modal";
 import { CreateDeploymentModal } from "@/components/create-deployment-modal";
 import { AttachedDomains } from "@/components/attached-domains";
 
-// Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
-// only fetched when the Service Graph tab is actually opened.
 const ServiceGraph = dynamic(
   () => import("@/components/service-graph").then((m) => m.ServiceGraph),
   {
@@ -48,10 +46,8 @@ import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RawPortConnections } from "@/components/raw-port-connections";
 
-// The project sub-tabs now live in the TOP NAV (breadcrumb-tabs model, issue 3);
-// they drive this page via `?tab=`. The page reads that param REACTIVELY so a tab
-// click in the header switches the in-page view without a remount. Wrapped in
-// Suspense (useSearchParams requirement) at the export.
+const PROJECT_METRICS_WINDOW_MINUTES = 180;
+
 export function ProjectDetail({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
   return (
@@ -67,19 +63,9 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const searchParams = useSearchParams();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
-  // The project's own inventory row: the one source that still knows a project
-  // whose builds never produced a deployment (its last build and error live
-  // there). An older backend answers 404 here and the page keeps working on
-  // deployments alone.
   const { data: summaryRows, refresh: refreshSummary } = usePoll<ProjectSummary[]>(SUMMARY_PATH, 5000);
   const summary = (summaryRows ?? []).find((row) => row.project === name) ?? null;
-  // Per-project observability comes from the TENANT-SCOPED metrics endpoint, not
-  // /v1/overview: overview's counters (requests/cdn/concurrency) are platform-wide
-  // and operator-only — regular team members receive a stripped response without
-  // them, which both crashed the old unguarded read and would otherwise pin this
-  // card to permanent zeros. /v1/metrics?project= is member-accessible and filtered
-  // to this project. (180 is the backend's max window.)
-  const { data: pm } = usePoll<Metrics>(`/v1/metrics?minutes=180&project=${encodeURIComponent(name)}`, 8000);
+  const { data: pm } = usePoll<Metrics>(`/v1/metrics?minutes=${PROJECT_METRICS_WINDOW_MINUTES}&project=${encodeURIComponent(name)}`, 8000);
   const tabParam = searchParams.get("tab");
   const tab: "overview" | "graph" | "workflows" | "resources" | "deployments" =
     tabParam === "graph" || tabParam === "deployments" || tabParam === "workflows" || tabParam === "resources"
@@ -88,42 +74,23 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const setTab = (t: "overview" | "graph" | "workflows" | "resources" | "deployments") =>
     router.replace(`/projects/${encodeURIComponent(name)}?tab=${t}`, { scroll: false });
   const [busy, setBusy] = useState("");
-  // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [retryError, setRetryError] = useState("");
-  // A redeploy doesn't create a deployment row until its build FINISHES (the live
-  // version keeps serving meanwhile). The in-flight "Building" rows come from a
-  // PERSISTENT store (localStorage) so they survive navigating away + reload — the
-  // global PendingBuildsProvider polls each build and removes it on completion, at
-  // which point the REAL deployment row (a different id from the build id) appears.
   const rawPending = usePendingBuilds({ project: name });
 
   const mine = (deps ?? []).filter((d) => d.project === name);
-  // MERGE, never replace: a pending row is dropped only once the real deployment
-  // record for it is actually present in `mine`. Removing it the instant the build
-  // reported ready left a visible gap, because the record is created on whichever
-  // node ran the build while this page polls through round-robin DNS.
   const pendingRows = mergePending(rawPending, mine);
 
-  // When a pending build completes (dropped from the store), pull the finished
-  // deployment in immediately instead of waiting for the next poll tick.
   const pendingCount = pendingRows.length;
   useEffect(() => {
     refresh();
     refreshSummary();
   }, [pendingCount, refresh, refreshSummary]);
   const prod = mine.find((d) => d.production) ?? mine[0];
-  // The overview card's URL. When no production exists and `prod` fell back to
-  // a PREVIEW record, its own alias is the honest URL — `prod.alias` is the
-  // project's production host, which that preview may or may not be claiming.
-  // For a real production record deploymentSelfAlias returns d.alias verbatim.
   const prodAlias = prod ? (deploymentSelfAlias(prod) || prod.alias) : undefined;
-  const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
-  // A project with no deployment at all (its builds failed, were cancelled or
-  // are still running): the row exists and the name is reserved, so the page
-  // must offer retry and delete instead of a production card that never loads.
-  const empty = deps !== null && mine.length === 0;
+  const rollbackTarget = mine.find((d) => !d.production);
+  const hasNoDeployment = deps !== null && mine.length === 0;
   const lastBuild = summary?.last_build ?? null;
   const building = summary?.building ?? null;
   const retrySource = lastBuild?.repo_url && !lastBuild.repo_url.startsWith("upload://") && !lastBuild.repo_url.startsWith("image://")
@@ -137,28 +104,15 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     try { await apiSend("POST", `/v1/deployments/${id}/promote`); await refresh(); }
     catch (e) { alert(String(e)); } finally { setBusy(""); }
   }
-  // Redeploy now goes through the confirmation modal (environment + build cache).
-  // Opening it for a specific deployment makes that the source/current build.
   async function removeDeployment(id: string) {
     if (!confirm(`Delete deployment ${id}?`)) return;
     setBusy(id);
     try { await apiSend("DELETE", `/v1/deployments/${id}`); await refresh(); }
     catch (e) { alert(String(e)); } finally { setBusy(""); }
   }
-  /**
-   * Cancel an IN-FLIGHT build (queued/building only — see the `canCancel` gate
-   * on each row's menu). The id is the BUILD id: the same key `/deploy/:id`
-   * renders and `/v1/builds/:id` is stored under, which is what is actually
-   * still running — a finished deployment artifact is deleted, not cancelled.
-   *
-   * Two row kinds reach here and both must end in a truthful state:
-   *   * a REAL deployment row still building — the server owns it, so a failure
-   *     is surfaced and `refresh()` re-reads the authoritative state after.
-   *   * an OPTIMISTIC pending row — it lives in localStorage and may not be
-   *     server-registered yet, so a failed call there is EXPECTED (404) rather
-   *     than an error worth shouting about; the local entry is dropped either
-   *     way so a "Building" row can never outlive its own cancel.
-   */
+  /** Cancels an IN-FLIGHT build by its BUILD id (the key `/deploy/:id` and `/v1/builds/:id` use). A real deployment row's failure is
+   *  surfaced and `refresh()` re-reads the server state; an optimistic localStorage row may not be server-registered yet (a 404 is
+   *  expected), and its local entry is dropped either way so a "Building" row cannot outlive its cancel. */
   async function cancelBuild(id: string, optimistic: boolean) {
     if (!confirm(`Cancel the in-progress build ${id}?`)) return;
     setBusy(id);
@@ -206,7 +160,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
 
   return (
     <div>
-      {/* Project header */}
       <div className="mb-6 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Triangle />
@@ -220,7 +173,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 {deploymentHost(prodAlias, prod.region_code)} <ExternalLink className="inline h-3 w-3" />
               </a>
             )}
-            {!prod && empty && (
+            {!prod && hasNoDeployment && (
               <div className="text-sm text-muted">
                 {building ? "First build running…" : lastBuild ? `Last build ${lastBuild.state} — no deployment yet` : "No deployments yet"}
               </div>
@@ -228,7 +181,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           </div>
         </div>
         <div className="flex gap-2">
-          {empty ? (
+          {hasNoDeployment ? (
             <Button variant="outline" onClick={retryBuild} disabled={!retrySource || !!busy || !!building}>
               {busy === "retry" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Retry build
             </Button>
@@ -249,8 +202,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               target="_blank"
               rel="noreferrer"
               onClick={(e) => {
-                // With the zkauth experiment on, mint an anonymous proof + bootstrap
-                // the preview instead of a plain open. Otherwise the link proceeds.
                 if (zkEnabled && prod) {
                   e.preventDefault();
                   openDeployment(prodAlias || prod.alias, name, prod.region_code);
@@ -263,23 +214,17 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
         </div>
       </div>
 
-      {/* Sub-tabs moved to the top nav (breadcrumb-tabs model, issue 3) — the
-          header's row-2 now carries Overview/Service Graph/Workflows/Resources/
-          Deployments/Logs/Settings for the selected project. */}
       <div className="mb-6" />
 
       {tab === "graph" ? (
         <ServiceGraph project={name} prod={prod} />
       ) : tab === "workflows" ? (
-        /* The LITERAL upstream @workflow/web console, project-scoped (the
-           iframe name carries the scope; its own Runs/Hooks/Workflows
-           segmented control replaces the old ?wf= sub-tabs). */
         <WfConsoleFrame project={name} />
       ) : tab === "resources" ? (
         <DeploymentResources deploymentId={prod?.id} />
       ) : tab === "overview" ? (
         <>
-          {empty ? (
+          {hasNoDeployment ? (
             <EmptyProjectCard
               name={name}
               summary={summary}
@@ -290,7 +235,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               onDelete={deleteProject}
             />
           ) : (
-          /* Production Deployment */
           <Card className="mb-6 p-0">
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
@@ -354,7 +298,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           </Card>
           )}
 
-          {/* Lower cards */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <Card className="p-5">
               <div className="mb-4 flex items-center justify-between">
@@ -396,8 +339,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
         </>
       ) : (
         <div className="space-y-3">
-        {/* Deployments toolbar: per-deployment actions (rollback / redeploy / delete)
-            now live in the "⋯" menu at the end of each row. */}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-secondary">{mine.length + pendingRows.length} deployment{mine.length + pendingRows.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
@@ -409,8 +350,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
             <tr><Th className="px-2">Deployment</Th><Th className="px-2">Status</Th><Th className="px-2">Environment</Th><Th className="px-2 hidden md:table-cell">Source</Th><Th className="px-2 hidden sm:table-cell">Created</Th><Th className="px-2 hidden lg:table-cell">By</Th><Th className="px-2"></Th></tr>
           </thead>
           <tbody>
-            {/* Optimistic "Building" rows for in-flight redeploys (immediate
-                feedback). Replaced by the real row once the build finishes. */}
             {pendingRows.map((p) => (
               <tr key={p.id} className="animate-pulse">
                 <Td className="px-2 font-mono text-xs">
@@ -427,10 +366,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 </Td>
                 <Td className="px-2 text-secondary hidden sm:table-cell">just now</Td>
                 <Td className="px-2 text-secondary hidden lg:table-cell">you</Td>
-                {/* An in-flight build's only meaningful action is stopping it,
-                    so this row gets the same "⋯" menu carrying Cancel alone —
-                    it previously rendered an empty cell, leaving a build that
-                    is actively burning CPU with no way to stop it from here. */}
                 <Td className="px-2">
                   <DeploymentRowMenu
                     canRollback={false}
@@ -451,8 +386,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 className="cursor-pointer transition-colors hover:bg-subtle/50"
                 title="View deployment details"
               >
-                {/* Click the row → deployment detail (logs, status, domains). The id
-                    link opens the LIVE deployment URL (stops row navigation). */}
                 <Td className="px-2 font-mono text-xs">
                   <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias), d.region_code)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{d.id}</a>
                 </Td>
@@ -463,8 +396,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                   </span>
                 </Td>
                 <Td className="px-2">
-                  {/* Immutable build environment + a marker for the deployment
-                      currently promoted to the production domain. */}
                   {(() => {
                     const env = d.target || (d.production ? "production" : "preview");
                     return (
@@ -489,9 +420,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                     <DeploymentRowMenu
                       canRollback={!d.production}
                       canRedeploy={!!d.git}
-                      /* Cancel is offered ONLY while the build is genuinely in
-                         flight — a ready/error deployment has nothing left to
-                         stop, and offering it there would be a dead action. */
                       canCancel={d.state === "building" || d.state === "queued"}
                       busy={busy === d.id}
                       onRollback={() => promote(d.id)}
@@ -523,8 +451,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           prodAlias={prod?.alias || `${name}.localhost`}
           onClose={() => setRedeployFor(null)}
           onDone={() => {
-            // The modal already persisted the in-flight build to the store (so its
-            // "Building" row survives navigation); just surface the deployments tab.
             setTab("deployments");
             refresh();
           }}
@@ -638,10 +564,6 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   const [pv, setPv] = useState<Preview | null>(null);
   const [imgError, setImgError] = useState(false);
 
-  // Reset when the deployment identity changes — adjusted during render
-  // (React's "adjusting state when a prop changes" pattern) instead of an
-  // effect, so the stale preview/image-error never flashes before the fetch
-  // below replaces it.
   const identity = `${project}:${prod?.id ?? ""}`;
   const [prevIdentity, setPrevIdentity] = useState(identity);
   if (identity !== prevIdentity) {
@@ -653,8 +575,6 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   useEffect(() => {
     let stop = false;
     if (!prod) return;
-    // Fetch-on-mount/identity-change: setPv is called only after the awaited
-    // request resolves, syncing external (server) preview data into React.
     apiGet<Preview>(`/v1/projects/${encodeURIComponent(project)}/preview`)
       .then((d) => { if (!stop) setPv(d); })
       .catch(() => { if (!stop) setPv({ kind: "none" }); });
@@ -692,7 +612,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   if (pv.kind === "json" || pv.kind === "text") {
     let body = pv.body ?? "";
     if (pv.kind === "json") {
-      try { body = JSON.stringify(JSON.parse(body), null, 2); } catch { /* keep raw */ }
+      try { body = JSON.stringify(JSON.parse(body), null, 2); } catch {}
     }
     return (
       <div className={`${box} bg-[#0b0b0b]`}>

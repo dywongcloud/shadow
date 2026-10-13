@@ -15,21 +15,10 @@ export async function currentUserId(): Promise<string | null> {
   }
 }
 
-/**
- * First-party GitHub App OAuth (user-to-server) — the platform's OWN GitHub App
- * (org-level permissions), fixing private-repo/org access that Composio's managed
- * OAuth app couldn't grant. Flow:
- *
- *   /api/github/connect  → https://github.com/login/oauth/authorize (signed state)
- *   GitHub redirects to  → /oauth/github/callback (registered on the App)
- *   callback exchanges the code → user token stored ENCRYPTED in an httpOnly
- *   cookie (never readable by the browser, never persisted server-side), and all
- *   GitHub reads/writes/deploy-clones prefer this token via the lib/github facade.
- *
- * GitHub Apps do NOT use OAuth scopes — capabilities come from the App's
- * permissions plus which accounts/orgs it's INSTALLED on. Org access = the org
- * admin installs the app (see the install CTA in the Integrations card).
- */
+/** First-party GitHub App OAuth (user-to-server): the platform's OWN GitHub App (org-level permissions), fixing the private-repo/org access
+ *  Composio's managed app could not grant. `/api/github/connect` -> GitHub authorize (signed state) -> `/oauth/github/callback` exchanges the code
+ *  and stores the user token ENCRYPTED in an httpOnly cookie (never readable by the browser, never persisted server-side); GitHub reads, writes
+ *  and deploy clones prefer it through the lib/github facade. An App has no OAuth scopes: capability = its permissions + where it is INSTALLED. */
 
 const AUTHORIZE = "https://github.com/login/oauth/authorize";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -54,11 +43,8 @@ export function githubAppRedirectUri(): string {
   return process.env.GITHUB_APP_REDIRECT_URI || "https://shadw.cloud/oauth/github/callback";
 }
 
-// ---------------------------------------------------------------------------
-// Cookie crypto — AES-256-GCM, key derived from the client secret. The token
-// is never at rest in plaintext anywhere (browser sees only ciphertext in an
-// httpOnly cookie; the server stores nothing).
-// ---------------------------------------------------------------------------
+/** AES-256-GCM key derived from the App's client secret: the token is never at rest in plaintext (the browser holds only ciphertext in an httpOnly
+ *  cookie, the server nothing). */
 
 function key(): Buffer {
   return createHash("sha256").update(`gh-app-cookie:${clientSecret()}`).digest();
@@ -83,7 +69,6 @@ export function openToken(sealed: string): GhAppTokenBundle | null {
     const j = JSON.parse(pt);
     return typeof j?.at === "string" && j.at ? (j as GhAppTokenBundle) : null;
   } catch {
-    // Tampered/garbage/rotated-secret cookie → treated as disconnected, never a crash.
     return null;
   }
 }
@@ -101,23 +86,17 @@ export interface GhAppTokenBundle {
   login?: string;
   /** cached app slug (from /user/installations) for the install CTA */
   slug?: string;
-  /** Clerk userId the connection belongs to — a shared-browser/sign-out safety:
-   *  a different signed-in user (or a signed-out request) never sees or can
-   *  disconnect another user's connection. Absent in local no-Clerk mode. */
+  /** Clerk userId the connection belongs to: a different signed-in user (or a signed-out request) never sees or disconnects another user's
+   *  connection from a shared browser; absent in local no-Clerk mode. */
   uid?: string;
 }
 
 /** True when the bundle belongs to the CURRENT Clerk user (or Clerk is off). */
 async function bundleAuthorized(b: GhAppTokenBundle): Promise<boolean> {
   if (!clerkEnabled) return true;
-  if (!b.uid) return false; // Clerk on but unbound bundle (pre-binding/foreign) — refuse
+  if (!b.uid) return false;
   return (await currentUserId()) === b.uid;
 }
-
-// ---------------------------------------------------------------------------
-// State (CSRF) — HMAC-signed payload carried in the `state` param, bound to a
-// nonce in a short-lived httpOnly cookie.
-// ---------------------------------------------------------------------------
 
 function sign(data: string): string {
   return createHmac("sha256", key()).update(data).digest("base64url");
@@ -161,11 +140,6 @@ export function authorizeUrl(state: string): string {
   return u.toString();
 }
 
-// ---------------------------------------------------------------------------
-// Token exchange / refresh — handles BOTH expiring (access+refresh) and
-// non-expiring (access only) App configurations.
-// ---------------------------------------------------------------------------
-
 interface TokenResponse {
   access_token?: string;
   expires_in?: number;
@@ -185,14 +159,15 @@ async function tokenRequest(params: Record<string, string>): Promise<TokenRespon
   return (await r.json().catch(() => ({}))) as TokenResponse;
 }
 
+const EXPIRY_SAFETY_MARGIN_SECS = 60;
+
 function bundleFrom(t: TokenResponse, prev?: GhAppTokenBundle): GhAppTokenBundle | null {
   if (!t.access_token) return null;
   const now = Date.now();
   return {
     at: t.access_token,
     rt: t.refresh_token || prev?.rt,
-    // 60s safety margin so we refresh before the hard expiry.
-    exp: t.expires_in ? now + (t.expires_in - 60) * 1000 : undefined,
+    exp: t.expires_in ? now + (t.expires_in - EXPIRY_SAFETY_MARGIN_SECS) * 1000 : undefined,
     rexp: t.refresh_token_expires_in ? now + t.refresh_token_expires_in * 1000 : prev?.rexp,
     login: prev?.login,
     slug: prev?.slug,
@@ -211,17 +186,14 @@ export async function refreshBundle(b: GhAppTokenBundle): Promise<GhAppTokenBund
   return bundleFrom(t, b);
 }
 
-// ---------------------------------------------------------------------------
-// Request-scoped accessors (route handlers only — they may set cookies).
-// ---------------------------------------------------------------------------
+const REFRESH_TOKEN_LIFETIME_SECS = 180 * 24 * 3600;
 
 const COOKIE_OPTS = {
   httpOnly: true as const,
   secure: true as const,
   sameSite: "lax" as const,
   path: "/" as const,
-  // Match the refresh token's 6-month lifetime; non-expiring tokens just live long.
-  maxAge: 180 * 24 * 3600,
+  maxAge: REFRESH_TOKEN_LIFETIME_SECS,
 };
 
 /** Persist a token bundle into the encrypted cookie (route-handler context). */
@@ -233,9 +205,7 @@ export async function clearTokenCookie(): Promise<void> {
   (await cookies()).set(GH_APP_COOKIE, "", { ...COOKIE_OPTS, maxAge: 0 });
 }
 
-/** Read the current bundle (no refresh) — ONLY if it belongs to the current
- *  Clerk user (shared-browser / sign-out safety). Foreign/unbound bundles read
- *  as disconnected rather than exposing another user's connection. */
+/** Reads the current bundle (no refresh), only when it belongs to the current Clerk user: foreign or unbound bundles read as disconnected. */
 export async function readTokenBundle(): Promise<GhAppTokenBundle | null> {
   const c = (await cookies()).get(GH_APP_COOKIE)?.value;
   const b = c ? openToken(c) : null;
@@ -243,47 +213,23 @@ export async function readTokenBundle(): Promise<GhAppTokenBundle | null> {
   return (await bundleAuthorized(b)) ? b : null;
 }
 
-/**
- * The live first-party access token for this request, auto-refreshing an expired
- * one (cookie updated in place — route-handler context required). Returns null
- * when not connected / refresh impossible, so callers fall back to Composio.
- *
- * CALL THIS ONLY FROM A ROUTE HANDLER (or another mutable-cookie context), and
- * treat that as a real invariant rather than a style preference. GitHub rotates
- * refresh tokens SINGLE-USE: a successful refresh invalidates the token that
- * bought it and returns the replacement exactly once, in this response. The
- * `setTokenCookie` below is therefore the only thing that keeps the chain
- * alive, and its `catch` swallows a read-only-context failure — so a refresh
- * driven from a Server Component or middleware would burn the old refresh token,
- * hand back a working access token for that ONE request, and persist nothing,
- * leaving the cookie holding a refresh token GitHub has already retired. Every
- * later refresh then fails and the user is told to reconnect, on a cadence set
- * by the access token's 8h life — indistinguishable from a revoked App.
- *
- * Audited 2026-08-08: every caller reaches this through `app/api/**\/route.ts`
- * or `app/oauth/github/callback/route.ts`, all Route Handlers, so the branch is
- * currently unreachable. The comment exists so the next caller added outside
- * that set is a deliberate decision instead of a silent regression.
- */
+/** The live first-party access token for this request, refreshing an expired one (cookie updated in place); null when not connected or the refresh is
+ *  impossible, so callers fall back to Composio. Call ONLY from a Route Handler (a mutable-cookie context): GitHub rotates refresh tokens SINGLE-USE, so
+ *  a refresh from a Server Component or middleware would burn the old token and persist nothing, and every later refresh would fail like a revoked App. */
 export async function getGithubAppToken(): Promise<string | null> {
   const b = await readTokenBundle();
   if (!b) return null;
   if (!b.exp || Date.now() < b.exp) return b.at;
-  // Expired → refresh (or give up and clear, so status honestly shows reconnect).
   const next = await refreshBundle(b).catch(() => null);
   if (next) {
     try {
       await setTokenCookie(next);
-    } catch {
-      /* outside a mutable-cookie context — still return the fresh token */
-    }
+    } catch {}
     return next.at;
   }
   try {
     await clearTokenCookie();
-  } catch {
-    /* read-only context */
-  }
+  } catch {}
   return null;
 }
 

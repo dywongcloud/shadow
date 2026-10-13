@@ -8,16 +8,8 @@ import { MarketingShell } from "@/components/marketing-shell";
 import { GlobeWireframe } from "@/components/globe-wireframe";
 import Image from "next/image";
 
-/* ------------------------------------------------------------------ *
- * shadw — public landing page. Renders inside the shared MarketingShell
- * (top nav + footer) and forces a dark palette regardless of app theme.
- * ------------------------------------------------------------------ */
-
-/** The rotating aurora glow ring from the reference video: a conic
- *  rose→violet→teal gradient (violet at top/bottom, rose left, teal right —
- *  sampled from the recording) masked into a soft ring and heavily blurred.
- *  Rotating the element spins the gradient, so the visible arc cycles color
- *  every ~2s exactly like the video. Size/position it via `className`. */
+/** The rotating aurora glow ring: a conic rose-violet-teal gradient masked into a soft ring and heavily blurred; rotating the element
+ *  cycles the visible arc's color (~2 s). */
 function GlowRing({
   className = "",
   duration = 2.2,
@@ -27,8 +19,6 @@ function GlowRing({
   duration?: number;
   style?: React.CSSProperties;
 }) {
-  // Soft-feathered ring mask + heavy blur — the video's arc is diffuse, not a
-  // hard band, so the mask ramps gently on both edges.
   const ring = "radial-gradient(closest-side, transparent 48%, rgba(0,0,0,0.55) 62%, black 72%, rgba(0,0,0,0.55) 84%, transparent 96%)";
   return (
     <div
@@ -47,64 +37,44 @@ function GlowRing({
   );
 }
 
-// Whether the intro already played during THIS page load. Module scope — reset
-// only by a real navigation/reload, never by a React remount. The landing↔
-// dashboard flip is decided by CLIENT auth state (see home-client.tsx), so
-// <Landing> can unmount and REMOUNT within a single page load — and does so
-// repeatedly when Clerk's auth state cannot settle (the mobile split-brain
-// cookie state). Replaying a 2.75s full-screen black overlay plus a
-// documentElement scroll-lock on every remount amplified that thrash into the
-// reported "flickers endlessly"; this flag makes the intro strictly
-// once-per-page-load. The server never sets it (only the client effect does),
-// so SSR always renders the overlay and hydration stays consistent.
+/** Module scope on purpose: `<Landing>` can remount within one page load (an auth flip), and the intro must play once per page load; only
+ *  the client effect sets it, so SSR always renders the overlay and hydration agrees. */
 let introPlayed = false;
 
-/** Intro loading animation (reference video 1): a full-screen black overlay with
- *  the shadw ghost logo centered inside the rotating GlowRing. ~2s of spin, then
- *  the overlay fades to reveal the hero. Plays once per PAGE LOAD (a client-side
- *  remount of <Landing> — e.g. an auth-state flip — must NOT replay it); skipped
- *  entirely for prefers-reduced-motion. Rendered from first paint (SSR) so
- *  there's no pre-hydration flash of the hero. All layout is inline styles —
- *  deterministic, no class-generation dependency. */
+const INTRO_FADE_AT_MS = 2000;
+const INTRO_DONE_AT_MS = 2750;
+const SLOW_EFFECTIVE_TYPES = ["slow-2g", "2g", "3g"];
+
+function connectionKnownSlow(): boolean {
+  const conn = (
+    navigator as Navigator & {
+      connection?: { effectiveType?: string; saveData?: boolean };
+    }
+  ).connection;
+  return (
+    conn?.saveData === true ||
+    (typeof conn?.effectiveType === "string" && SLOW_EFFECTIVE_TYPES.includes(conn.effectiveType))
+  );
+}
+
+/** Intro loading animation: a full-screen black overlay with the ghost logo inside the rotating GlowRing, ~2 s of spin then a fade; once per
+ *  PAGE LOAD, skipped for prefers-reduced-motion and on known-slow connections, and rendered from first paint (SSR, inline styles only). */
 function IntroLoader() {
-  // On a remount after the intro already ran this page load, start (and stay)
-  // done — no overlay frame at all. On the hydration mount `introPlayed` is
-  // still false on both server and client, so SSR and the first client render
-  // agree on "show".
   const [phase, setPhase] = useState<"show" | "fade" | "done">(() => (introPlayed ? "done" : "show"));
   useEffect(() => {
     if (introPlayed) {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- re-syncs against the module-level `introPlayed` flag, which can flip between this render and effect commit on a fast remount; the lazy initializer alone can't observe that
-      setPhase("done"); // no-op when the initializer already started at "done"
-      return;
-    }
-    introPlayed = true;
-    // Skip the intro outright on a connection that is already known to be
-    // slow. The overlay is a fixed ~2.75s of full-screen black, so on a slow
-    // link it was pure added latency on top of whatever the network was
-    // already costing — the visitor stared at black while the hero they had
-    // already downloaded sat underneath it. The hero is prerendered (see
-    // home-client.tsx), so skipping costs nothing but reveals it immediately.
-    // Deliberately conservative: only an explicitly slow/metered signal skips
-    // it, so the normal case keeps the designed intro.
-    const conn = (
-      navigator as Navigator & {
-        connection?: { effectiveType?: string; saveData?: boolean };
-      }
-    ).connection;
-    const slow =
-      conn?.saveData === true ||
-      (typeof conn?.effectiveType === "string" &&
-        ["slow-2g", "2g", "3g"].includes(conn.effectiveType));
-    if (slow || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
       setPhase("done");
       return;
     }
-    // Lock scrolling while the intro plays so the viewport-anchored overlay
-    // can't be scrolled away mid-animation.
+    introPlayed = true;
+    if (connectionKnownSlow() || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      setPhase("done");
+      return;
+    }
     document.documentElement.style.overflow = "hidden";
-    const t1 = setTimeout(() => setPhase("fade"), 2000); // ring + logo hold (~2s like the video)
-    const t2 = setTimeout(() => setPhase("done"), 2750); // overlay gone
+    const t1 = setTimeout(() => setPhase("fade"), INTRO_FADE_AT_MS);
+    const t2 = setTimeout(() => setPhase("done"), INTRO_DONE_AT_MS);
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
@@ -117,13 +87,6 @@ function IntroLoader() {
   if (phase === "done") return null;
   const size = "min(30rem, 86vw)";
   return (
-    // NOTE: `position:fixed` is a TRAP here — MarketingShell's page wrapper is
-    // CSS-transformed (`-translate-x-1/2`), which turns any fixed descendant
-    // into an absolute one against the PAGE-TALL wrapper: the overlay then spans
-    // the whole document and its centered children land thousands of px below
-    // the fold (the "just a black screen" bug). Anchor to the FIRST VIEWPORT
-    // instead (absolute + 100vh, page always loads at scroll-top) and center
-    // with flex.
     <div
       style={{
         position: "absolute",
@@ -174,43 +137,18 @@ function IntroLoader() {
 export function Landing() {
   return (
     <MarketingShell>
-      {/* Intro loading animation (once per page load): ring + logo, then fade. */}
       <IntroLoader />
-      {/* ---------------- Hero ---------------- */}
       <section className="relative overflow-hidden">
-        {/* Aurora glows: two equal sources on the left and right that bleed inward
-            and converge at the navbar centre (top) and a lower horizon band — all
-            layered BELOW the hero text (the navbar stays on top, z-20).
-
-            RESPONSIVE: every size / blur / rem-offset is `min(rem, N vw)` (or
-            `max(-rem, -N vw)` for negative offsets) against a 1280px reference
-            (1rem ↔ 1.25vw). At ≥1280px the `rem` wins → pixel-identical to the
-            desktop design; below 1280px the `vw` term wins, so the whole glow
-            field scales down proportionally — keeping the globe ringed by black on
-            phones/tablets instead of being washed out. The %-based positions are
-            already viewport-relative and stay as-is. */}
         <div className="pointer-events-none absolute inset-x-0 top-0 z-0 h-[min(32rem,40vw)]">
-          {/* Left source — leans toward centre. */}
           <div className="absolute top-[max(-8rem,-10vw)] left-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-teal-400/14 blur-[min(130px,10.16vw)]" />
           <div className="absolute top-[max(-6rem,-7.5vw)] left-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-indigo-600/14 blur-[min(140px,10.94vw)]" />
-          {/* Right source — mirror of the left, leans toward centre. */}
           <div className="absolute top-[max(-8rem,-10vw)] right-[6%] h-[min(26rem,32.5vw)] w-[min(26rem,32.5vw)] rounded-full bg-cyan-400/14 blur-[min(130px,10.16vw)]" />
           <div className="absolute top-[max(-6rem,-7.5vw)] right-[28%] h-[min(24rem,30vw)] w-[min(24rem,30vw)] rounded-full bg-fuchsia-600/14 blur-[min(140px,10.94vw)]" />
-          {/* Convergence into the navbar centre (top-centre blend of the two sides). */}
           <div className="absolute top-[max(-7rem,-8.75vw)] left-1/2 h-[min(20rem,25vw)] w-[min(42rem,52.5vw)] -translate-x-1/2 rounded-full bg-indigo-500/12 blur-[min(150px,11.72vw)]" />
-          {/* Lower-horizon convergence — a wide, flat band the two sides melt into. */}
           <div className="absolute bottom-0 left-1/2 h-[min(8rem,10vw)] w-[72%] -translate-x-1/2 rounded-[100%] bg-sky-500/12 blur-[min(130px,10.16vw)]" />
         </div>
 
-        {/* Solutions-page hero glows, copied 1:1 from <MarketingHero>: a left
-            violet/pink cluster and a right cyan/sky cluster. Made responsive with
-            the same `min(rem, vw)` / `max(-rem, -vw)` scheme (1280px reference) so
-            they shrink and pull inward on small screens while staying pixel-exact
-            to the Solutions hero at ≥1280px. */}
         <div className="pointer-events-none absolute inset-0">
-          {/* Leftmost glow = the reference video's animated ring: a big rotating
-              conic ring anchored off-screen top-left so only its lower-right arc
-              sweeps the corner, its colors cycling rose↔violet↔teal as it spins. */}
           <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
           <div className="absolute right-[max(-10rem,-12.5vw)] top-[min(10rem,12.5vw)] h-[min(34rem,42.5vw)] w-[min(34rem,42.5vw)] rounded-full bg-cyan-500/15 blur-[min(140px,10.94vw)]" />
           <div className="absolute right-[max(-4rem,-5vw)] top-[min(13rem,16.25vw)] h-[min(20rem,25vw)] w-[min(20rem,25vw)] rounded-full bg-sky-400/30 blur-[min(110px,8.59vw)]" />
@@ -234,10 +172,6 @@ export function Landing() {
             >
               Start Now <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
-            {/* Opens the product walkthrough in a new tab rather than scrolling to
-                the on-page device showcase: the operator asked for the Demo button
-                to go straight to the video. `target="_blank"` + `rel` because it
-                leaves the origin, and the href is a plain external URL. */}
             <a
               href="https://www.youtube.com/watch?v=qp_lhPioZF4"
               target="_blank"
@@ -249,15 +183,11 @@ export function Landing() {
           </div>
         </div>
 
-        {/* Animated globe wireframe directly below the hero text + buttons. The blue
-            circuit pulses stay frozen until the visitor first interacts. */}
         <GlobeWireframe className="mx-auto mt-4 w-full max-w-6xl px-4" />
       </section>
 
-      {/* ---------------- Scrolling "Own Your Cloud." banner (after the globe) ---------------- */}
       <MarqueeBanner />
 
-      {/* ---------------- Device showcase (dead space above for contrast) ---------------- */}
       <section id="demo" className="relative scroll-mt-20 px-6 pb-28 pt-36 sm:pt-44">
         <div className="pointer-events-none absolute inset-0">
           <div className="absolute left-0 top-1/3 h-[30rem] w-[30rem] rounded-full bg-violet-700/20 blur-[150px]" />

@@ -23,8 +23,6 @@ import {
 } from "./db-model";
 import { BrowserDbConfigForm, emptyPolicy, saveBrowserDb } from "./browser-db-panel";
 
-// Every primitive the platform provisions itself. SQLite sits in this list, not
-// in a section of its own: it is a database, created the same way as the rest.
 const NATIVE: { kind: UnifiedKind; name: string; desc: string }[] = [
   { kind: "postgres", name: "Postgres", desc: "Managed Postgres — instant, branchable." },
   { kind: "supabase", name: "Supabase", desc: "Supabase Studio + Postgres — dashboard URL, sign-in and DSN included." },
@@ -38,11 +36,6 @@ const NATIVE: { kind: UnifiedKind; name: string; desc: string }[] = [
   { kind: "realtime", name: "Realtime", desc: "Secure WebSocket streaming channels." },
 ];
 
-// Marketplace providers → backed by a native kind. Each entry names the engine it
-// actually provisions; a provider whose product the platform cannot really stand
-// in for does not belong here (Turso was listed as "Serverless SQLite" while
-// provisioning a Postgres container — the native SQLite entry above is the
-// honest version of that offer).
 interface Provider { id: string; name: string; desc: string; kind: DbKind; color: string }
 const MARKETPLACE: Provider[] = [
   { id: "neon", name: "Neon", desc: "Serverless Postgres", kind: "postgres", color: "#00e599" },
@@ -58,22 +51,12 @@ const MARKETPLACE: Provider[] = [
   { id: "mongodb", name: "MongoDB Atlas", desc: "Database for developers", kind: "blob", color: "#13aa52" },
 ];
 
-/**
- * Both halves of the tenant's database list, in one hook so the page never has
- * to know which backend a row came from.
- *
- * The managed list is one endpoint. The SQLite list is assembled from the two
- * replicated sources that actually decide whether a project HAS one: the
- * deployment manifests (gossiped `DeploymentInfo.browser_db`, what the fleet
- * reconciles against) and the dashboard-managed `ProjectSettings.browser_db`
- * mirror. See `sqliteDatabases`.
- */
+/** Both halves of the tenant's database list in one hook: the managed list is one endpoint, the SQLite list comes from the two replicated sources
+ *  that decide whether a project HAS one (gossiped `DeploymentInfo.browser_db` manifests and the `ProjectSettings.browser_db` mirror), see `sqliteDatabases`. */
 function useDatabases() {
   const [provisioning, setProvisioning] = useState(false);
   const { data: managed, error, refresh } = usePoll<Database[]>("/v1/databases", provisioning ? 3000 : 12000);
   useEffect(() => {
-    // Feeds back into usePoll's own interval above (adaptive polling), so it
-    // must persist as state across renders -- not a pure inline derivation.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setProvisioning((managed ?? []).some((d) => d.status === "provisioning"));
   }, [managed]);
@@ -84,15 +67,6 @@ function useDatabases() {
     [deployments],
   );
 
-  // The SQLite lane is ONE request, exactly like the managed half.
-  //
-  // It used to be one `/v1/projects/<p>/settings` fetch PER project, assembled
-  // client-side, with every failure swallowed. That made a database's presence
-  // in the list depend on N independent requests all succeeding, and promptly —
-  // witnessed live as the same tenant's SQLite row rendering in one page load
-  // and missing from the next. Two halves of one list should not have two
-  // different failure modes, so the backend now answers the whole lane at once
-  // (`browser_db::browser_db_projects_http`, tenant-filtered server-side).
   const { data: browserDb, refresh: refreshBrowserDb } =
     usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy; rest?: { libsql_url: string; sql_url: string } }[] }>(
       "/v1/browser-db/projects",
@@ -108,15 +82,11 @@ function useDatabases() {
     for (const entry of browserDb?.projects ?? []) if (entry.rest) out[entry.project] = entry.rest;
     return out;
   }, [browserDb]);
-  // Identity is the project, but the lane is fetched whole — so re-reading it
-  // after a save is one refresh, not a per-project one.
   const refreshProject = useCallback(async (_project?: string) => { await refreshBrowserDb(); }, [refreshBrowserDb]);
 
   const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings, restUrls), [deployments, settings, restUrls]);
   const rows = useMemo(() => unifiedDatabases(managed ?? [], sqlite), [managed, sqlite]);
 
-  // `managed` null AND no sqlite row = still loading / genuinely nothing. The
-  // page distinguishes those with `error`.
   return { rows, error, refresh, refreshProject, projects, deployments: deployments ?? [], loaded: managed !== null };
 }
 
@@ -125,12 +95,7 @@ export default function StoragePage() {
   const [open, setOpen] = useState(false);
   const [redeployTarget, setRedeployTarget] = useState<Deployment | null>(null);
 
-  // Deep-link: /storage?browse opens the Browse Storage panel directly.
   useEffect(() => {
-    // window.location.search is client-only; a lazy initializer would return
-    // true on the client's first render but false on the server's, causing a
-    // hydration mismatch. Deferring to after mount (open starts false on both
-    // server and client) avoids that.
     if (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("browse")) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setOpen(true);
@@ -246,15 +211,9 @@ function StatusBadge({ row }: { row: UnifiedDb }) {
   return <Badge tone="green">Ready{row.statusNote ? ` · ${row.statusNote}` : ""}</Badge>;
 }
 
-/**
- * The connection cell — the one place the SQLite lane genuinely differs, and it
- * says so rather than showing a DSN that connects to nothing.
- *
- * For a managed engine the ADDRESS shown comes from the unmasked `host`/`port`
- * keys; the copy button fetches the real credential from
- * `/v1/databases/:id/credentials` (the list poll masks anything url/token/secret,
- * so copying the polled value would yield "••••" junk).
- */
+/** The connection cell, the one place the SQLite lane genuinely differs: a managed engine shows the address from the unmasked `host`/`port` keys
+ *  and its copy button fetches the real credential from `/v1/databases/:id/credentials` (the list poll masks url/token/secret keys), while
+ *  `browser_sqlite` says so instead of showing a DSN that connects to nothing. */
 function ConnectionCell({ row }: { row: UnifiedDb }) {
   const [copied, setCopied] = useState(false);
 
@@ -271,8 +230,6 @@ function ConnectionCell({ row }: { row: UnifiedDb }) {
     e.preventDefault();
     e.stopPropagation();
     try {
-      // browser_sqlite has no credentials endpoint — its address IS the full
-      // value (the libsql base URL is not secret; the minted token is).
       const value = row.source === "sqlite"
         ? row.sqlite?.restUrls?.libsql_url ?? ""
         : await (async () => {
@@ -326,21 +283,16 @@ function BrowseStorage({
   const [q, setQ] = useState("");
   const [sel, setSel] = useState<{ kind: UnifiedKind; provider: string } | null>(null);
   const [step, setStep] = useState<"browse" | "configure">("browse");
-  // managed-engine configure step
   const [name, setName] = useState("");
   const [project, setProject] = useState("");
   const [region, setRegion] = useState("san-jose");
   const [replicas, setReplicas] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  // sqlite configure step
   const [sqliteProject, setSqliteProject] = useState("");
   const [policy, setPolicy] = useState<BrowserDbPolicy>(emptyPolicy());
-  // The browser-replicated lane is configured by a deployment block, not by
-  // POST /v1/databases — the managed `sqlite` kind takes the ordinary path.
   const isSqlite = sel?.kind === "browser_sqlite";
 
-  // Live mesh regions for the replica selector (falls back to the known set).
   const { data: catalog } = usePoll<Record<string, { id: string; label: string }[]>>("/v1/regions/catalog", 30000);
   const allRegions: string[] = catalog
     ? Array.from(new Set(Object.values(catalog).flat().map((r) => r.id)))
@@ -385,7 +337,6 @@ function BrowseStorage({
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={onClose}>
       <div className="flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-pop" onClick={(e) => e.stopPropagation()}>
-        {/* header */}
         <div className="flex items-start justify-between border-b border-border p-6">
           <div>
             <h2 className="text-xl font-semibold">{step === "browse" ? "Browse Storage" : "Configure"}</h2>
@@ -400,7 +351,6 @@ function BrowseStorage({
           <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-5 w-5" /></button>
         </div>
 
-        {/* body */}
         <div className="flex-1 overflow-y-auto p-6">
           {step === "browse" ? (
             <>
@@ -537,7 +487,6 @@ function BrowseStorage({
           )}
         </div>
 
-        {/* footer */}
         <div className="flex items-center justify-between border-t border-border p-4">
           {step === "configure"
             ? <Button variant="ghost" onClick={() => setStep("browse")}><ArrowLeft className="h-4 w-4" /> Back</Button>

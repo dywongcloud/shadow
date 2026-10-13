@@ -4,9 +4,6 @@ import { useState } from "react";
 import dynamic from "next/dynamic";
 import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide-react";
 
-// Lazy-load Tremor charts so the heavy charting bundle is split out of the page.
-// A `loading` skeleton at the chart's real footprint keeps the async chunk load
-// from leaving an empty gap / shifting layout while the bundle streams in.
 const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), {
   ssr: false,
   loading: () => <div className="h-72 animate-pulse rounded-lg bg-subtle" aria-label="Loading chart" />,
@@ -19,9 +16,8 @@ import { Card } from "@/components/ui";
 import { usePoll, type FunctionStats, type BillingInfo, type Metrics } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-// A flat sparkline at the real current level — used for metrics we track as a
-// running total but NOT as a time-series (CPU/memory/instances). Honest: it shows
-// the real magnitude without fabricating a growth curve we don't have data for.
+/** A flat sparkline at the real current level, for metrics tracked as a running total rather than a time series (CPU/memory/instances): it shows
+ *  the real magnitude without fabricating a growth curve. */
 function flat(value: number, n: number) {
   return Array.from({ length: n }, () => Math.round(value));
 }
@@ -34,23 +30,14 @@ function fmt(n: number) {
 
 type Gran = "Daily" | "Weekly" | "Monthly";
 
-// Each granularity maps to a real backend window + bucket resolution
-// (crates/hive-cloud/src/metrics.rs's Granularity enum/MAX_*_BUCKETS) — NOT a
-// client-side relabeling of the same 3-hour fetch. `minutes` is the span
-// requested; `apiGran` selects which ring buffer the backend reads from
-// (minute/hour/day); `pollMs` matches how often that resolution can actually
-// change (polling an hourly rollup every 15s wastes a request 239/240 times).
+/** Each granularity maps to a real backend window + bucket resolution (`crates/hive-cloud/src/metrics.rs` `Granularity`), not a client relabel:
+ *  `apiGran` selects the ring buffer (minute/hour/day) and `pollMs` matches how often that resolution can change. */
 const GRAN: Record<Gran, { minutes: number; apiGran: "minute" | "hour" | "day"; pollMs: number }> = {
   Daily: { minutes: 1440, apiGran: "minute", pollMs: 60_000 },
   Weekly: { minutes: 10_080, apiGran: "hour", pollMs: 300_000 },
   Monthly: { minutes: 43_200, apiGran: "day", pollMs: 300_000 },
 };
 
-// Bucket label formatting keyed on granularity — an hourly bucket over 7 days
-// needs a weekday+hour label, a daily bucket over 30 days needs a month/day
-// label; both would otherwise render via the Daily hour:minute formatter and
-// (for Monthly specifically) collapse to the SAME "12:00 AM" label on every
-// point, since a day-floored t_ms always lands on local midnight.
 function bucketLabel(gran: Gran, t_ms: number) {
   const d = new Date(t_ms);
   if (gran === "Daily") return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
@@ -59,49 +46,21 @@ function bucketLabel(gran: Gran, t_ms: number) {
 }
 
 export default function UsageView() {
-  // `/v1/functions` is measured at 0.7-6.1s against the live fleet (it fans
-  // out across nodes), so a 3s interval kept overlapping requests in flight;
-  // the list only changes on deploy. Billing is slow-moving and already
-  // de-duped to one read per 20s by the shared GET cache TTL.
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 15000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 30000);
-  // Default to Monthly on first load (billing-cycle-level view is the most useful
-  // landing granularity); the Daily/Weekly toggles narrow the window on demand.
   const [gran, setGran] = useState<Gran>("Monthly");
   const [cumulative, setCumulative] = useState(true);
   const { minutes: granMinutes, apiGran, pollMs } = GRAN[gran];
-  // Real per-tenant traffic time-series, bucketed at the resolution the active
-  // Daily/Weekly/Monthly toggle selects. The scoped `/v1/metrics` backs the
-  // consumption chart with ACTUAL requests/cache/blocked over time — not a
-  // fabricated curve — at whichever of the three real backend resolutions
-  // (crates/hive-cloud/src/metrics.rs) `gran` is currently set to. usePoll fires
-  // after hydration, so this heavy fleet-fanned-out fetch never blocks first paint.
   const { data: metrics } = usePoll<Metrics>(`/v1/metrics?minutes=${granMinutes}&gran=${apiGran}`, pollMs);
 
-  // Sourced from /v1/metrics (tenant-scoped + fleet-fanned-out), NOT
-  // /v1/overview — that endpoint's non-operator response omits requests/
-  // blocked/cdn entirely (operator-only fields), so every non-owner team
-  // member previously saw these as permanently 0 here.
   const requests = metrics?.totals?.requests ?? 0;
   const blocked = metrics?.totals?.blocked ?? 0;
   const cacheHits = (metrics?.series ?? []).reduce((a, b) => a + b.cache_hits, 0);
   const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
-  // Active CPU pricing (Vercel Fluid convention): bill ACTIVE CPU time + provisioned
-  // MEMORY GB-hrs, not idle instance wall-time. `active_cpu_ms` excludes I/O-idle
-  // keep-warm time — that's where the headline savings come from.
   const activeCpuMs = (fns ?? []).reduce((a, f) => a + (f.active_cpu_ms ?? 0), 0);
   const memGbHrs = (fns ?? []).reduce((a, f) => a + (f.memory_gb_hrs ?? 0), 0);
-  // Real tenant-scoped instance count (now that /v1/functions is tenant-
-  // scoped, not operator-only — see fns above); previously sourced from
-  // /v1/overview's operator-only `instances` field, permanently 0 for anyone
-  // but the platform owner.
   const instances = (fns ?? []).reduce((a, f) => a + f.instances, 0);
 
-  // Charges are computed from the AUTHORITATIVE rate card the billing API returns
-  // (crates/hive-cloud/src/billing.rs RATE_CARD) — never hardcoded multipliers.
-  // rate_card cents are: per active-CPU-hour, per memory-GB-hour, per 1M requests,
-  // per 1M WAF-blocked. Fall back to 0 (shows $0.00) until the card loads, rather
-  // than inventing a price.
   const rc = billing?.rate_card;
   const edgeCharge = (requests / 1_000_000) * ((rc?.requests_per_million_cents ?? 0) / 100);
   const cpuCharge = (activeCpuMs / 1000 / 3600) * ((rc?.active_cpu_hr_cents ?? 0) / 100);
@@ -115,10 +74,6 @@ export default function UsageView() {
   const creditBalance = acc ? acc.balance_cents / 100 : 0;
   const planName = acc?.plan ?? "hobby";
 
-  // REAL per-tenant time-series from the metrics buckets (per-minute). Edge
-  // requests, cache hits and blocked requests are tracked over time, so their
-  // charts + sparklines are actual data. Invocations/CPU/memory/instances are
-  // running totals with no time-series → flat sparks at the real level.
   const buckets = metrics?.series ?? [];
   const perBucketEdge = buckets.map((b) => b.requests);
   const perBucketCache = buckets.map((b) => b.cache_hits);
@@ -127,7 +82,6 @@ export default function UsageView() {
     let acc = 0;
     return arr.map((v) => (acc += v));
   };
-  // Sparklines mirror the chart mode; cumulative = running sum of the real buckets.
   const edgeS = cumulative ? cum(perBucketEdge) : perBucketEdge;
   const cacheS = cumulative ? cum(perBucketCache) : perBucketCache;
   const blockedS = cumulative ? cum(perBucketBlocked) : perBucketBlocked;
@@ -146,7 +100,6 @@ export default function UsageView() {
     <div>
       <h1 className="mb-5 text-2xl font-semibold capitalize tracking-tight">{planName} Plan Usage</h1>
 
-      {/* Filter row */}
       <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
         <Pill icon={<ChevronDown className="h-4 w-4" />}>Current Billing Cycle</Pill>
         <Pill icon={<Calendar className="h-4 w-4" />}>{billingRange()}</Pill>
@@ -156,7 +109,6 @@ export default function UsageView() {
         <button className="rounded-md border border-border px-2 py-2 text-secondary hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
       </div>
 
-      {/* Credit + on-demand */}
       <Card className="mb-4">
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
@@ -184,7 +136,6 @@ export default function UsageView() {
         </div>
       </Card>
 
-      {/* Consumption breakdown */}
       <Card>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-lg font-semibold">Consumption Breakdown</h2>
@@ -219,7 +170,6 @@ export default function UsageView() {
           className="h-72"
         />
 
-        {/* Product table */}
         <div className="mt-6">
           <div className="grid grid-cols-[1fr_auto_auto] gap-4 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted">
             <span>Product</span><span className="text-right">Usage</span><span className="text-right">Charge</span>
@@ -263,7 +213,6 @@ function Row({ color, name, spark, usage, charge }: { color: string; name: strin
         <span className="truncate">{name}</span>
       </span>
       <span className="flex items-center justify-end gap-3">
-        {/* Decorative sparkline — hidden on phones to keep the row within the viewport. */}
         <SparkAreaChart data={data} index="i" categories={["v"]} colors={["slate"]} className="hidden h-7 w-28 sm:block" />
         <span className="w-20 text-right text-sm tabular-nums text-secondary sm:w-28">{usage}</span>
       </span>

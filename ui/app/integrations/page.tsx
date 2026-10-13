@@ -7,15 +7,21 @@ import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/u
 import { cachedJson, invalidate } from "@/lib/cache";
 import { currentTeam } from "@/lib/api";
 
+const TOOLKIT_CATALOG_TTL_MS = 60 * 60_000;
+
+/** An unconfigured or empty answer describes server config, not data: caching it would keep the page insisting the key is unset after an operator sets it. */
+const isRealCatalog = (d: { configured: boolean; toolkits: Toolkit[] }) =>
+  !!d.configured && Array.isArray(d.toolkits) && d.toolkits.length > 0;
+
 /** Enriched, HONEST GitHub connection detail (matches githubConnectionDetail). */
 interface GhDetail {
   configured: boolean;
-  connected: boolean; // ACTIVE in Composio AND the token actually works
+  connected: boolean;
   entity?: string | null;
   login?: string | null;
   scopes?: string[];
-  hasPrivateAccess?: boolean; // `repo`
-  hasOrgScope?: boolean; // `read:org`
+  hasPrivateAccess?: boolean;
+  hasOrgScope?: boolean;
   live?: boolean;
   /** Which auth path serves this connection: the first-party GitHub App (org-level
    *  permissions) or the legacy Composio-managed OAuth app. */
@@ -29,7 +35,6 @@ interface GhDetail {
 interface GhOrg { login: string; name?: string }
 
 function Logo({ kind }: { kind: string }) {
-  // White tile behind every icon (glyphs forced dark so they read on white in dark mode).
   const wrap = "flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-white text-neutral-800 shadow-sm";
   if (kind === "github") return <span className={wrap}><Github className="h-5 w-5" /></span>;
   if (kind === "postgres") return <span className={wrap}><Database className="h-5 w-5" /></span>;
@@ -50,13 +55,10 @@ interface Toolkit {
 }
 
 const PER_PAGE = 24;
-// Already represented in the Connected section — never duplicate in the grid.
 const HIDDEN_SLUGS = new Set(["github"]);
 
 function ToolkitLogo({ tk }: { tk: Toolkit }) {
   const [broken, setBroken] = useState(false);
-  // White circular tile behind the logo image (Vercel-style), so transparent
-  // PNGs/SVGs always sit on white in both light and dark mode.
   const wrap = "flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-white shadow-sm";
   if (tk.logo && !broken) {
     return (
@@ -80,16 +82,13 @@ function ToolkitCard({ tk, configured, onConnect, connecting }: { tk: Toolkit; c
       disabled={!configured || connecting}
       className="group relative flex h-44 w-full flex-col rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-border-strong hover:bg-subtle/40 disabled:cursor-default"
     >
-      {/* Category badge, top-left */}
       <span className="self-start rounded-md bg-subtle px-2 py-0.5 text-[11px] font-medium capitalize text-secondary">
         {tk.categories[0] || "Integration"}
       </span>
-      {/* Centered logo + name */}
       <div className="flex flex-1 flex-col items-center justify-center gap-2.5">
         <ToolkitLogo tk={tk} />
         <div className="max-w-full truncate text-center text-[15px] font-semibold" title={tk.name}>{tk.name}</div>
       </div>
-      {/* Description */}
       <p className="line-clamp-2 min-h-[2.25rem] text-center text-xs leading-snug text-secondary">
         {connecting ? "Connecting…" : tk.description || tk.slug}
       </p>
@@ -118,8 +117,6 @@ export default function IntegrationsPage() {
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [ghOrgs, setGhOrgs] = useState<GhOrg[]>([]);
 
-  // Refetch the enriched GitHub status + accessible orgs, bypassing the short
-  // client cache (called after connect/disconnect/reconnect so the card is fresh).
   const refreshGh = useCallback(async () => {
     invalidate("/api/github/status");
     invalidate("/api/github/orgs");
@@ -132,12 +129,9 @@ export default function IntegrationsPage() {
       } else {
         setGhOrgs([]);
       }
-    } catch {
-      /* leave last-known state */
-    }
+    } catch {}
   }, []);
 
-  // Marketplace catalog (loaded inline).
   const [toolkits, setToolkits] = useState<Toolkit[]>([]);
   const [tkConfigured, setTkConfigured] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -147,8 +141,6 @@ export default function IntegrationsPage() {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [linkMsg, setLinkMsg] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
 
-  // On return from a toolkit OAuth (`?connected=<slug>`), link the connection as a
-  // consumable platform resource and auto-inject its env vars into deployments.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const slug = params.get("connected");
@@ -156,12 +148,7 @@ export default function IntegrationsPage() {
     params.delete("connected");
     const qs = params.toString();
     window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
-    // GitHub is a Git integration, not a resource toolkit — it's managed by the
-    // GitHub card (status/scopes/orgs), never credential-linked into deployments.
-    // Just refresh the card so a completed OAuth reflects immediately.
     if (slug === "github") {
-      // One-time reaction to the OAuth-callback URL param on mount — not a
-      // subscription, a genuine external-system (browser URL) sync.
       // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time OAuth-callback URL handling on mount, not a subscription
       setLinkMsg({ tone: "ok", text: "GitHub connected." });
       refreshGh();
@@ -194,26 +181,17 @@ export default function IntegrationsPage() {
   }, [refreshGh]);
 
   useEffect(() => {
-    // Enriched GitHub status + accessible orgs (short cache; reflects connection state).
-    // Fetch-on-mount: refreshGh sets state only after its internal awaits resolve,
-    // syncing external (server) GitHub connection state into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount; state is set only after an internal await, not synchronously
     refreshGh();
   }, [refreshGh]);
 
   useEffect(() => {
     let cancelled = false;
-    // Catalog: cached for an hour client-side (and on the server route) so the
-    // 1,000+ toolkit list isn't refetched every visit — but ONLY when the
-    // answer is a real catalog. An unconfigured/empty response describes server
-    // config, not data: cache it and the page keeps insisting the key is unset
-    // for an hour after an operator actually sets it (exactly what happened on
-    // 2026-08-08, while the route itself was already returning 1,088 toolkits).
     cachedJson<{ configured: boolean; toolkits: Toolkit[] }>(
       "/api/composio/toolkits",
-      60 * 60_000,
+      TOOLKIT_CATALOG_TTL_MS,
       undefined,
-      (d) => !!d.configured && Array.isArray(d.toolkits) && d.toolkits.length > 0,
+      isRealCatalog,
     )
       .then((d) => {
         if (cancelled) return;
@@ -241,9 +219,6 @@ export default function IntegrationsPage() {
   const safePage = Math.min(page, pageCount - 1);
   const shown = filtered.slice(safePage * PER_PAGE, safePage * PER_PAGE + PER_PAGE);
 
-  // Reset to page 0 whenever the search changes — adjusted during render
-  // (React's "adjusting state when a prop changes" pattern) instead of an
-  // effect, avoiding an extra render on every keystroke.
   const [prevQ, setPrevQ] = useState(q);
   if (q !== prevQ) {
     setPrevQ(q);
@@ -265,8 +240,6 @@ export default function IntegrationsPage() {
     }
   }
 
-  // The managed hive-cloud data services (always active). GitHub is rendered by the
-  // dedicated <GithubCard/> which carries full connection/scope/org management.
   const otherConnected = [
     { kind: "postgres", name: "OpenEdge Postgres", desc: "Serverless SQL database built for the edge", active: true },
     { kind: "kv", name: "OpenEdge KV", desc: "Durable Redis database for caching", active: true },
@@ -317,7 +290,6 @@ export default function IntegrationsPage() {
         ))}
       </div>
 
-      {/* Marketplace search — type to find any of the 1,000+ integrations. */}
       <div className="relative mb-5 max-w-xl">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
         <Input
@@ -366,29 +338,16 @@ export default function IntegrationsPage() {
   );
 }
 
-/**
- * The GitHub connection management card — the literal ask: view what's granted,
- * reconnect/adjust scopes, request org approval, disconnect+reconnect.
- *
- * Renders the HONEST connection state (ACTIVE *and* live), the granted scopes as
- * badges (private-repo access via `repo`, org enumeration via `read:org`), the
- * accessible organizations, and wires the previously-dead Disconnect / Configure
- * buttons to real actions. A dead-but-ACTIVE token surfaces a red "reconnect
- * needed" banner instead of a false green.
- */
+/** The GitHub connection management card: the HONEST state (ACTIVE and live), granted scopes as badges, accessible organizations, and real
+ *  Disconnect/Configure actions; a dead-but-ACTIVE token shows a red "reconnect needed" banner, never a false green. */
 function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRefresh: () => void }) {
   const [busy, setBusy] = useState<null | "connect" | "reconnect" | "disconnect">(null);
   const scopes = gh.scopes ?? [];
-  // A revoked-but-ACTIVE connection: Composio still lists an account (so scopes are
-  // known) but the token no longer works against GitHub (live=false) → reconnect.
   const needsReconnect = gh.configured && !gh.connected && scopes.length > 0;
 
   async function connect(kind: "connect" | "reconnect") {
     setBusy(kind);
     try {
-      // Reconnect = disconnect the stale/limited connection first, so re-consent binds
-      // a fresh account with the current scopes (incl. read:org) rather than reusing
-      // the old grant. Plain connect just runs OAuth.
       if (kind === "reconnect") await fetch("/api/github/disconnect", { method: "POST" }).catch(() => {});
       const r = await fetch("/api/github/connect", {
         method: "POST",
@@ -442,7 +401,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
         </Badge>
       </div>
 
-      {/* Not configured: no OAuth path — point at the PAT / public-URL fallback. */}
       {!gh.configured ? (
         <>
           <p className="mb-4 text-sm text-secondary">
@@ -457,7 +415,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
         <>
           <p className="mb-3 text-sm text-secondary">Deploy projects automatically with Git integration.</p>
 
-          {/* Reconnect-needed banner for a dead-but-ACTIVE token. */}
           {needsReconnect ? (
             <div className="mb-3 flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -465,7 +422,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {/* Granted scopes → capability badges (only when live). */}
           {active ? (
             <div className="mb-3 flex flex-wrap gap-1.5">
               <Badge tone={gh.hasPrivateAccess ? "green" : "default"}>
@@ -477,7 +433,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {/* Accessible organizations (needs read:org). */}
           {active && gh.hasOrgScope && orgs.length > 0 ? (
             <div className="mb-3 text-xs text-secondary">
               <span className="text-muted">Organizations: </span>
@@ -486,9 +441,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {/* Missing org access → a NON-disruptive prompt (private content still works).
-              github-app: org access = INSTALL the App on the org (no scopes involved).
-              composio: org enumeration needs the read:org scope via reconnect. */}
           {active && !gh.hasOrgScope ? (
             <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -506,7 +458,6 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {/* App provider: always offer the install/configure surface (adding more orgs). */}
           {active && gh.provider === "github-app" && gh.hasOrgScope ? (
             <div className="mb-3 text-xs text-secondary">
               <a href={gh.installUrl || "https://github.com/settings/installations"} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-fg">

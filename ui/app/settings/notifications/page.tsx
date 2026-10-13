@@ -20,16 +20,11 @@ import { timeAgo } from "@/lib/utils";
 const CHANNELS = [
   { key: "web", icon: <Bell className="h-4 w-4" />, title: "Web", desc: "Receive notifications in the OpenEdge dashboard." },
   { key: "email", icon: <AtSign className="h-4 w-4" />, title: "Email", desc: "" },
-  // push + sms descriptions/toggles are DERIVED from the real push backend at
-  // render time (see NotificationsPage) — not static — so this row always
-  // reflects the actual registered devices / verified number.
   { key: "push", icon: <Smartphone className="h-4 w-4" />, title: "Push", desc: "" },
   { key: "sms", icon: <Phone className="h-4 w-4" />, title: "SMS", desc: "" },
 ];
 
-/** Mask a phone number for display: keep the country prefix + last 4, dot the
- *  rest (e.g. "+1··········4567") so the settings summary never prints the full
- *  number in the always-visible channel list. */
+/** Masks a phone number for display: country prefix + last 4, the rest dotted, so the summary never prints the full number. */
 function maskPhone(p: string): string {
   const digits = p.replace(/[^\d]/g, "");
   if (digits.length < 5) return p;
@@ -57,9 +52,6 @@ export default function NotificationsPage() {
     const s = localStorage.getItem("hive_notif");
     if (s) try {
       const v = JSON.parse(s);
-      // Functional updates read the latest chan/grid without needing them in
-      // the dep array -- this effect only runs once, on mount, to hydrate
-      // from localStorage (a browser-only API unavailable during SSR).
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setChan((c) => v.chan ?? c);
       setGrid(v.grid ?? {});
@@ -70,10 +62,6 @@ export default function NotificationsPage() {
   }
   function setChannel(k: string, v: boolean) { const n = { ...chan, [k]: v }; setChan(n); persist(n, grid); }
 
-  // Real push/SMS state — SHARED by the Channels summary rows above and the
-  // detailed PushSmsDelivery section below (one poll, deduped by the api
-  // cache) so the two never contradict each other. This is the single source
-  // of truth for the push/sms channel rows (no more static "No phone number").
   const { data: pushData, refresh: refreshPush } = usePoll<PushSettings>("/v1/push/settings", 15000);
   const [ownEndpoint, setOwnEndpoint] = useState<string | null>(null);
   useEffect(() => { currentPushSubscription().then((s) => setOwnEndpoint(s?.endpoint ?? null)); }, []);
@@ -85,7 +73,6 @@ export default function NotificationsPage() {
   const sms = pushData?.sms ?? null;
   const pushSupportedHere = pushSupported();
 
-  // Channel summary text derived from real state.
   function channelDesc(k: string): React.ReactNode {
     if (k === "push") {
       if (!pushSupportedHere) return "Not supported in this browser.";
@@ -100,7 +87,6 @@ export default function NotificationsPage() {
     return "";
   }
 
-  // Real toggle actions for the push/sms channel rows.
   async function togglePushChannel(on: boolean) {
     setChanBusy("push"); setChanErr(null);
     try {
@@ -108,7 +94,6 @@ export default function NotificationsPage() {
         const sub = await subscribePush();
         setOwnEndpoint(sub.endpoint);
       } else {
-        // Turn OFF = unsubscribe THIS browser (the row the user is looking at).
         const sub = await currentPushSubscription();
         if (sub) { await apiSend("DELETE", "/v1/push/subscribe", { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe().catch(() => {}); setOwnEndpoint(null); }
       }
@@ -118,8 +103,6 @@ export default function NotificationsPage() {
     } finally { setChanBusy(null); }
   }
   async function toggleSmsChannel(on: boolean) {
-    // Only a VERIFIED number can be toggled here; unverified/none routes the
-    // user to the delivery section below to add + verify a number.
     if (!sms?.verified) { setChanErr("Add and verify a phone number below to enable SMS."); return; }
     setChanBusy("sms"); setChanErr(null);
     try {
@@ -138,7 +121,7 @@ export default function NotificationsPage() {
   }
   function cell(rowKey: string, col: string) {
     const k = `${rowKey}.${col}`;
-    return grid[k] ?? true; // default checked, like the screenshot
+    return grid[k] ?? true;
   }
   function setCell(rowKey: string, col: string, v: boolean) {
     const n = { ...grid, [`${rowKey}.${col}`]: v }; setGrid(n); persist(chan, n);
@@ -150,7 +133,6 @@ export default function NotificationsPage() {
       <h1 className="text-2xl font-semibold tracking-tight">Notifications</h1>
       <p className="mb-6 mt-1 text-sm text-secondary">Manage your personal notification settings for this team.</p>
 
-      {/* Channels */}
       <Card className="p-0">
         {CHANNELS.map((c, i) => (
           <div key={c.key} className={`flex items-center justify-between px-5 py-4 ${i ? "border-t border-border" : ""}`}>
@@ -159,7 +141,6 @@ export default function NotificationsPage() {
               <div>
                 <div className="flex items-center gap-2 text-sm font-medium">
                   {c.title}
-                  {/* Live push badge: reflects THIS browser's real subscription. */}
                   {c.key === "push" && (thisDeviceSubscribed
                     ? <Badge tone="green">This device</Badge>
                     : <Badge tone="amber">Subscribe device</Badge>)}
@@ -195,10 +176,8 @@ export default function NotificationsPage() {
         </div>
       </Card>
 
-      {/* Push & SMS delivery */}
       <PushSmsDelivery data={pushData} refresh={refreshPush} ownEndpoint={ownEndpoint} setOwnEndpoint={setOwnEndpoint} />
 
-      {/* Matrix */}
       <div className="mt-8 space-y-8">
         {MATRIX.map((m) => (
           <div key={m.group}>
@@ -239,18 +218,14 @@ export default function NotificationsPage() {
 /** E.164: leading +, then 7–15 digits, no leading zero (e.g. +15551234567). */
 const E164_RE = /^\+[1-9]\d{6,14}$/;
 
-/** Push & SMS delivery management — registered push devices (from the
- *  backend, caller-scoped for the current tenant), SMS number config, and a
- *  real end-to-end test send. Enrollment reuses the exact `subscribePush`
- *  flow the notification bell's banner uses (lib/push). */
+/** Push & SMS delivery management: registered push devices (caller-scoped to the current tenant), SMS number config and a real end-to-end test
+ *  send; enrollment reuses `subscribePush` from lib/push. */
 function PushSmsDelivery({
   data,
   refresh,
   ownEndpoint,
   setOwnEndpoint,
 }: {
-  // Shared with the Channels summary rows above — one poll, one source of
-  // truth, so the two sections never contradict each other.
   data: PushSettings | null;
   refresh: () => void;
   ownEndpoint: string | null;
@@ -262,20 +237,14 @@ function PushSmsDelivery({
   const [enabling, setEnabling] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
 
-  // SMS form, seeded ONCE from the first settings response so a poll tick
-  // never clobbers an in-progress edit.
   const [phone, setPhone] = useState("");
   const [smsEnabled, setSmsEnabled] = useState(false);
   const [smsBusy, setSmsBusy] = useState(false);
   const [smsSaved, setSmsSaved] = useState(false);
-  // OTP verification: after saving a new/changed number, the backend texts a
-  // code and this section prompts for it before delivery is enabled.
   const [codeSent, setCodeSent] = useState(false);
   const [code, setCode] = useState("");
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [smsVerified, setSmsVerified] = useState(false);
-  // Operator SMS provider key (platform-wide; backend enforces platform_admin —
-  // the section is only shown to the owner client-side as a courtesy).
   const [smsKey, setSmsKey] = useState("");
   const [smsKeyBusy, setSmsKeyBusy] = useState(false);
   const [smsKeyMsg, setSmsKeyMsg] = useState<string | null>(null);
@@ -286,8 +255,6 @@ function PushSmsDelivery({
     setSmsKeyMsg(null);
     try {
       const r = await apiSend<SmsKeyPutResult>("POST", "/v1/push/sms-key", { key: smsKey.trim() });
-      // Immediate funded/unfunded feedback: the response carries the NEW
-      // key's live quota, so a paste of an unfunded key is visible instantly.
       setSmsKeyMsg(
         r.sms_key_source === "env"
           ? "Override cleared — using the server-configured key."
@@ -308,10 +275,6 @@ function PushSmsDelivery({
     if (!data || smsSeeded.current) return;
     smsSeeded.current = true;
     if (data.sms) {
-      // One-time seed of locally-editable state (phone input, switch) from
-      // the first async poll response -- `data` isn't available at mount for
-      // a lazy initializer, and the ref guard deliberately prevents later
-      // poll ticks from clobbering in-progress user edits.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setPhone(data.sms.phone);
       setSmsEnabled(data.sms.enabled);
@@ -349,9 +312,6 @@ function PushSmsDelivery({
     try {
       await apiSend("DELETE", "/v1/push/subscribe", { endpoint });
       if (endpoint === ownEndpoint) {
-        // Also drop the BROWSER-side subscription so this device genuinely
-        // stops being pushable (best-effort: the server registration is
-        // already gone either way, and re-enabling re-upserts).
         const sub = await currentPushSubscription();
         if (sub && sub.endpoint === endpoint) await sub.unsubscribe().catch(() => {});
         setOwnEndpoint(null);
@@ -371,12 +331,10 @@ function PushSmsDelivery({
     try {
       const r = await apiSend<SmsPutResult>("PUT", "/v1/push/sms", { phone: phone.trim(), enabled: smsEnabled });
       if (r.verified) {
-        // Toggled an already-verified number — done, no code needed.
         setSmsVerified(true);
         setSmsSaved(true);
         setTimeout(() => setSmsSaved(false), 2500);
       } else if (r.code_sent) {
-        // New/changed number — a code was texted; prompt for it.
         setCodeSent(true);
         setSmsVerified(false);
       } else if (r.note) {
@@ -431,7 +389,6 @@ function PushSmsDelivery({
       </div>
 
       <Card className="p-0">
-        {/* Registered push devices */}
         <div className="px-5 py-4">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -479,7 +436,6 @@ function PushSmsDelivery({
           )}
         </div>
 
-        {/* SMS */}
         <div className="border-t border-border px-5 py-4">
           <div className="flex items-center gap-3">
             <span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary">
@@ -541,7 +497,6 @@ function PushSmsDelivery({
           )}
         </div>
 
-        {/* Test send */}
         <div className="border-t border-border px-5 py-4">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -564,9 +519,6 @@ function PushSmsDelivery({
               {(() => {
                 const wp = test.web_push;
                 const pruned = wp.pruned ?? 0;
-                // Sent something → success. Nothing sent but we pruned expired
-                // devices → informational (self-healed), not a failure. Nothing
-                // registered → neutral hint. A genuine error → failure.
                 const ok = wp.sent > 0;
                 const onlyPruned = wp.sent === 0 && wp.failed === 0 && pruned > 0;
                 return (
@@ -608,10 +560,6 @@ function PushSmsDelivery({
           )}
         </div>
 
-        {/* Operator: platform-wide SMS provider key. Textbelt purchases fund a
-            SPECIFIC key — paste the funded one here and it activates on every
-            node immediately (no server env changes). Backend is platform-admin
-            gated; shown only to the owner. */}
         {isOwner && data?.sms_key_source && (
           <div className="border-t border-border px-5 py-4">
             <div className="flex items-center gap-3">

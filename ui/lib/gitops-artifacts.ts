@@ -1,14 +1,6 @@
-// Minimal, dependency-free YAML emitter + the OpenEdge org-config builder.
-//
-// PURE: builds the OpenEdge artifact tree for the SERVER-side GitOps sync routes
-// (`/api/gitops/sync` + `/api/gitops/init`, via `gitops-server.ts`). `gitops-yaml.ts`
-// re-exports this under a `server-only` guard for those consumers — this file is the
-// single source of truth for the committed artifact tree.
-//
-// Supports exactly what the config needs: nested maps, scalars, **simple YAML
-// lists** (arrays of scalars rendered as `- item`) and lists of maps. This keeps
-// the committed `openedge.yaml` human-readable and round-trippable without adding
-// a YAML dependency to the dashboard.
+// Minimal dependency-free YAML emitter + the OpenEdge org-config builder: PURE, building the artifact tree for the server-side GitOps sync
+// routes (`/api/gitops/sync`, `/api/gitops/init` via `gitops-server.ts`; `gitops-yaml.ts` re-exports it under a `server-only` guard). Supports
+// exactly what the config needs: nested maps, scalars, simple lists and lists of maps.
 
 type Y = string | number | boolean | null | undefined | Y[] | { [k: string]: Y };
 
@@ -18,9 +10,8 @@ function scalar(v: string | number | boolean | null | undefined): string {
   if (v === null || v === undefined) return "";
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   const s = String(v);
-  // Quote strings that could be misread as YAML syntax or other types.
   if (s === "" || NEEDS_QUOTE.test(s) || /^[+-]?\d/.test(s)) {
-    return JSON.stringify(s); // double-quoted, properly escaped
+    return JSON.stringify(s);
   }
   return s;
 }
@@ -32,10 +23,9 @@ function isMap(v: Y): v is { [k: string]: Y } {
 function emit(value: Y, indent: number, out: string[]) {
   const pad = "  ".repeat(indent);
   if (Array.isArray(value)) {
-    if (value.length === 0) return; // caller renders `key: []`
+    if (value.length === 0) return;
     for (const item of value) {
       if (isMap(item)) {
-        // List of maps: first key on the `- ` line, rest indented under it.
         const entries = Object.entries(item).filter(([, v]) => v !== undefined);
         if (entries.length === 0) {
           out.push(`${pad}- {}`);
@@ -43,8 +33,6 @@ function emit(value: Y, indent: number, out: string[]) {
         }
         entries.forEach(([k, v], i) => {
           const prefix = i === 0 ? `${pad}- ` : `${pad}  `;
-          // Item keys sit at column (indent*2 + 2); nested values go one level
-          // deeper than that, i.e. indent + 2.
           renderKey(prefix, k, v, indent + 2, out);
         });
       } else if (Array.isArray(item)) {
@@ -91,11 +79,9 @@ export function toYaml(value: Y): string {
   return out.join("\n") + "\n";
 }
 
-// ---- OpenEdge config model ----
-
 export interface OrgConfigInput {
   org: { name: string; slug: string; plan?: string };
-  generatedAt: string; // ISO timestamp (passed in — server can't use Date.now in some contexts)
+  generatedAt: string;
   projects: Array<{
     project: string;
     settings?: any;
@@ -105,9 +91,8 @@ export interface OrgConfigInput {
     /** Enterprise deployment protection (mode/scope only — never the password). */
     protection?: { mode?: string; scope?: string } | null;
   }>;
-  /** Raw database records (e.g. straight off `GET /v1/databases`) — may carry
-   *  a `connection` map of credentials. Only databaseNode()'s explicit
-   *  allowlist (name/kind/region/mode) below ever reaches the emitted YAML. */
+  /** Raw database records (e.g. straight off `GET /v1/databases`) that may carry a `connection` credentials map; only databaseNode()'s allowlist
+   *  (name/kind/region/mode) reaches the YAML. */
   databases?: Array<{
     name: string;
     kind?: string;
@@ -157,14 +142,8 @@ export function projectNode(p: ProjectInput): { [k: string]: Y } {
   return node;
 }
 
-/**
- * The declarative spec for a single database (shared by the org file). Explicit
- * field allowlist — NEVER spreads the raw record — so `connection` (the
- * credentials/connection-string map returned by `GET /v1/databases`) and any
- * other credential-shaped field can never reach the committed YAML, matching
- * the no-secrets-in-git discipline `projectNode()` above already follows for
- * project env values.
- */
+/** The declarative spec for one database: an explicit field allowlist, NEVER a spread of the raw record, so `connection` (credentials) and any
+ *  other credential-shaped field cannot reach the committed YAML (the no-secrets-in-git rule `projectNode()` follows for env values). */
 export function databaseNode(d: DatabaseInput): { [k: string]: Y } {
   return {
     name: d.name,
@@ -174,12 +153,8 @@ export function databaseNode(d: DatabaseInput): { [k: string]: Y } {
   };
 }
 
-/**
- * Build the declarative OpenEdge config. Mirrors the live platform objects:
- * the org/team meta plus a `projects:` array (a simple YAML list). Env values are
- * intentionally NOT serialized (only their keys + which targets) so secrets never
- * land in git — the config is reproducible infra, not a secret store.
- */
+/** Builds the declarative OpenEdge config: org/team meta plus a `projects:` list. Env values are NOT serialized (only keys and targets) so
+ *  secrets never land in git. */
 export function buildOrgConfig(input: OrgConfigInput): Y {
   return {
     apiVersion: "openedge.dev/v1",
@@ -191,9 +166,7 @@ export function buildOrgConfig(input: OrgConfigInput): Y {
       generatedAt: input.generatedAt,
       managedBy: "OpenEdge GitOps",
     },
-    // Always present — an empty/minimal meta state is valid when no projects exist.
     projects: (input.projects || []).map(projectNode),
-    // Declarative shape only (name/kind/region/mode) — see databaseNode().
     databases: (input.databases || []).map(databaseNode),
   };
 }
@@ -204,7 +177,7 @@ function slugFile(s: string): string {
 
 export interface ArtifactInput extends OrgConfigInput {
   region?: string;
-  rootPath?: string; // canonical config file name (default openedge.yaml)
+  rootPath?: string;
   /** Platform-level declarative config (CDN routing, enterprise governance).
    *  Secrets are NEVER included — counts/modes only. */
   platform?: {
@@ -219,17 +192,8 @@ export interface ArtifactInput extends OrgConfigInput {
   };
 }
 
-/**
- * The full GitOps artifact tree committed to the config repo — not just one file,
- * but the platform's declarative spec/config/meta set, suitable for `git add .`:
- *
- *   openedge.yaml                         org spec (projects[] as a YAML list)
- *   README.md                             human overview (auto-managed)
- *   .openedge/meta.yaml                   platform meta state
- *   projects/<name>.yaml                  per-project spec (one file each)
- *   .github/workflows/openedge-deploy.yml CI that pings the OpenEdge webhook
- *   .gitignore
- */
+/** The full GitOps artifact tree for the config repo: `openedge.yaml` (org spec, projects[] list), `README.md`, `.openedge/meta.yaml`,
+ *  `projects/<name>.yaml` (one per project), `.github/workflows/openedge-deploy.yml` (CI that pings the OpenEdge webhook) and `.gitignore`. */
 export function buildArtifacts(input: ArtifactInput): { path: string; content: string }[] {
   const rootPath = input.rootPath || "openedge.yaml";
   const projects = input.projects || [];
@@ -264,8 +228,6 @@ export function buildArtifacts(input: ArtifactInput): { path: string; content: s
     });
   }
 
-  // Platform-level config (routing + enterprise governance) — committed whenever
-  // present so those dashboard changes reflect in git too.
   if (input.platform && (input.platform.routing || input.platform.enterprise)) {
     files.push({
       path: ".openedge/platform.yaml",
@@ -331,22 +293,6 @@ _Plan: ${input.org.plan || "pro"} · Generated ${input.generatedAt}_
 
 /** The OpenEdge deploy GitHub Actions workflow (also installed into project repos). */
 export function deployWorkflowContent(): string {
-  // Raw string (GitHub Actions \${{ }} expressions must not be YAML-quoted).
-  //
-  // The webhook URL is read from a repo *variable* (set automatically by OpenEdge,
-  // not sensitive) with a secret fallback. Safe-by-default: if it's not set the job
-  // *skips* (exit 0) instead of failing, and a webhook error is non-fatal — so a
-  // fresh repo never shows a red ✗. OPENEDGE_WEBHOOK_SIG (optional) is a secret —
-  // the SAME shared secret as the node's GITHUB_WEBHOOK_SECRET, HMAC-SHA256'd over
-  // the exact payload bytes into `sha256=<hex>` (matches GitHub's own scheme, and
-  // what the node's `verify_github_sig` requires). Sending the raw secret as the
-  // header value (as this workflow used to) always fails verification when the
-  // node has a secret configured, so the fallback path silently never deployed.
-  //
-  // Also triggers on `pull_request` (opened/synchronize/reopened) so PRs on repos
-  // without a real GitHub webhook installed (e.g. GitHub App/OAuth not connected)
-  // still get PREVIEW deployments — previously only `push` was wired, so preview
-  // deploys never started for any repo running on this fallback.
   return `# Auto-generated by OpenEdge GitOps — repos become deployable workflows.
 # OPENEDGE_WEBHOOK_URL is auto-set as a repo variable by OpenEdge (the public URL
 # of your node). Optionally add an OPENEDGE_WEBHOOK_SIG secret if the node sets

@@ -1,11 +1,7 @@
 "use client";
 
-// The authenticated dashboard half of the root route. Split out of
-// `home-client.tsx` so it is its OWN webpack chunk: the public landing (the
-// overwhelmingly common first visit to `/`) is `Landing` plus the auth guard
-// only, and must not download the dashboard's component tree, its polling
-// hooks or its icon/UI imports. `home-client.tsx` reaches this module through
-// `next/dynamic`, so the chunk is fetched only once auth resolves signed-in.
+// The authenticated dashboard half of the root route, split out of `home-client.tsx` into its OWN chunk so the public landing (the common first
+// visit) downloads only `Landing` plus the auth guard; `home-client.tsx` reaches it through `next/dynamic` once auth resolves signed-in.
 
 import Link from "next/link";
 import {
@@ -27,24 +23,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 type View = "grid" | "list";
 
+const LIST_VIEW_PAGE_SIZE = 12;
+const GRID_VIEW_PAGE_SIZE = 6;
+
 const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
 export function Dashboard() {
-  // Poll intervals raised from 3s/8s: measured against the live fleet, every
-  // one of these lands on a node 40-360ms away (round-robin DNS, handler cost
-  // under 1ms), and `/v1/billing/ledger` currently costs a flat ~10s because
-  // its relational mirror table is wedged — polling that every 8s kept a
-  // request permanently in flight. These are all slow-moving lists; a write
-  // still invalidates the shared GET cache and pages keep their own `refresh`.
   const { projects: entries, deployments: deps, loading, refresh } = useProjects(15000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 30000);
   const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 120000);
   const { data: notifications } = usePoll<NotificationFeed>("/v1/notifications", 30000);
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
-  // Lazy initializer: reads the saved card/list preference synchronously on
-  // mount. SSR-safe — `typeof window === "undefined"` on the server matches
-  // the "grid" default, so no hydration mismatch.
   const [view, setView] = useState<View>(() => {
     const v = typeof window !== "undefined" ? localStorage.getItem("oe_projects_view") : null;
     return v === "grid" || v === "list" ? v : "grid";
@@ -54,18 +44,10 @@ export function Dashboard() {
     if (typeof window !== "undefined") localStorage.setItem("oe_projects_view", v);
   }
 
-  // Favorites (starred projects) — persisted client-side; collapsible section.
-  // Lazy initializers: read localStorage synchronously on mount. SSR-safe —
-  // `typeof window === "undefined"` on the server matches each default
-  // ([] / false), so no hydration mismatch.
   const [favorites, setFavorites] = useState<string[]>(() => {
     if (typeof window === "undefined") return [];
     try { const f = localStorage.getItem("oe_favorites"); return f ? JSON.parse(f) : []; } catch { return []; }
   });
-  // COLLAPSED by default for everyone; only an explicit expand (persisted as
-  // oe_fav_open="1") re-opens it on later visits. The old polarity (default
-  // open, only "0" collapsed) had every end user start with the section
-  // expanded whether or not they ever used favorites.
   const [favOpen, setFavOpen] = useState(() => typeof window !== "undefined" && localStorage.getItem("oe_fav_open") === "1");
   function toggleFav(project: string) {
     setFavorites((prev) => {
@@ -82,23 +64,17 @@ export function Dashboard() {
     });
   }
 
-  // Every project the tenant owns — deployed or not (a failed first build
-  // leaves a project with no deployment; it must still be listed, retried or
-  // deleted from here). `useProjects` merges the deployment list with the
-  // backend's project inventory, deployment first.
   const list = entries.filter((p) => p.project.toLowerCase().includes(q.toLowerCase()));
 
   const favoriteProjects = list.filter((p) => favorites.includes(p.project));
 
-  // Paginate so large fleets stay navigable.
-  const PAGE = view === "list" ? 12 : 6;
-  const pageCount = Math.max(1, Math.ceil(list.length / PAGE));
+  const pageSize = view === "list" ? LIST_VIEW_PAGE_SIZE : GRID_VIEW_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(list.length / pageSize));
   const safePage = Math.min(page, pageCount - 1);
-  const shown = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
+  const shown = list.slice(safePage * pageSize, safePage * pageSize + pageSize);
 
   return (
     <div className="pb-24">
-      {/* Toolbar */}
       <div className="mb-6 flex items-center gap-2">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
@@ -108,7 +84,6 @@ export function Dashboard() {
             onChange={(e) => { setQ(e.target.value); setPage(0); }}
             className="pl-9 pr-14"
           />
-          {/* Doubles as the platform command bar — open with ⌘K or by clicking. */}
           <button
             type="button"
             onClick={() => window.dispatchEvent(new Event("open-command-bar"))}
@@ -129,18 +104,14 @@ export function Dashboard() {
         <AddNewMenu />
       </div>
 
-      {/* Left column slimmed ~15% (340 → 290). */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[290px_1fr]">
-        {/* LEFT: Vercel-style dashboard boxes */}
         <div className="order-2 flex flex-col gap-6 lg:order-1">
           <UsageBox billing={billing} ledger={ledger ?? []} />
           <AlertsBox notifications={notifications} />
           <RecentPreviewsBox deps={deps ?? []} />
         </div>
 
-        {/* RIGHT: projects */}
         <div className="order-1 lg:order-2">
-          {/* Your Favorites — collapsible, aligned adjacent to Usage. */}
           <button onClick={toggleFavOpen} className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
             <ChevronDown className={`h-4 w-4 transition-transform ${favOpen ? "" : "-rotate-90"}`} /> Your Favorites
           </button>
@@ -159,10 +130,6 @@ export function Dashboard() {
           )}
 
           {loading ? (
-            // Data not loaded yet (initial mount OR a team/account switch that
-            // cleared the previous tenant's data). Show a skeleton, NOT the empty
-            // state — otherwise "Deploy your first project" flashes for a frame
-            // before the new tenant's cards arrive.
             <div className={view === "grid" ? "grid grid-cols-1 gap-4 sm:grid-cols-2" : "overflow-hidden rounded-xl border border-border bg-card"}>
               {Array.from({ length: view === "grid" ? 4 : 6 }).map((_, i) => (
                 <div key={i} className={view === "grid" ? "h-28 animate-pulse rounded-xl border border-border bg-card" : "h-14 animate-pulse border-b border-border bg-card last:border-0"} />
@@ -203,8 +170,6 @@ export function Dashboard() {
   );
 }
 
-/* ---------- Vercel-style dashboard boxes (left column) ---------- */
-
 function BoxLabel({ children }: { children: React.ReactNode }) {
   return <div className="mb-2 text-sm font-semibold">{children}</div>;
 }
@@ -214,18 +179,11 @@ function BoxLabel({ children }: { children: React.ReactNode }) {
 function UsageBox({ billing, ledger }: { billing: BillingInfo | null; ledger: LedgerEntry[] }) {
   const [expanded, setExpanded] = useState(false);
   const acc = billing?.account;
-  // Date.now() read directly during render is flagged as impure by the
-  // react-compiler-era rule, but this is a "current time for a countdown
-  // display" case: the value only needs to be approximately fresh (it
-  // re-renders every billing poll, 8s via usePoll) and turning it into real
-  // state would require a ticking interval, changing behavior beyond this
-  // display. Deliberate, targeted exception.
   // eslint-disable-next-line react-hooks/purity -- Date.now() for an approximate countdown display; see comment above
   const days = acc ? Math.max(0, Math.ceil((acc.period_end_ms - Date.now()) / 86_400_000)) : 0;
   const pct = acc && acc.included_cents ? Math.min(1, acc.used_cents / acc.included_cents) : 0;
   const onDemand = acc ? Math.max(0, -acc.balance_cents) : 0;
 
-  // Real line items: charges grouped by description.
   const items = useMemo(() => {
     const m = new Map<string, number>();
     for (const e of ledger) if (e.kind === "charge") m.set(e.note, (m.get(e.note) || 0) + Math.abs(e.amount_cents));
@@ -394,9 +352,7 @@ function repoLabel(url: string): string {
     .replace(/\.git$/, "");
 }
 
-/** Absolute short date like Vercel's project list: "May 28" for the current
- *  year, "2/22/25" for a prior year. (Vercel shows absolute dates here, not a
- *  relative "Xh ago".) */
+/** Absolute short date like Vercel's project list: "May 28" for the current year, "2/22/25" for a prior year. */
 function shortDate(ms: number): string {
   if (!ms) return "";
   const d = new Date(ms);
@@ -409,17 +365,13 @@ function shortDate(ms: number): string {
   );
 }
 
-/** Vercel-style deployment-status ring: a light track with a colored progress
- *  arc, and a double-check (or an activity pulse while building / a cross on
- *  error / a dashed circle for a project with no deployment yet) in the center. */
+/** Deployment-status ring: a colored progress arc on a light track, with a check, activity pulse, cross or dashed circle (never deployed) in the center. */
 function StatusRing({ state }: { state: string }) {
   const tone =
     state === "ready" ? "text-blue-500"
     : state === "building" || state === "queued" ? "text-amber-500"
     : state === "error" ? "text-red-500"
     : "text-muted";
-  // Arc length on a 0–100 path scale: a small accent for steady states, a
-  // longer sweep while building, none for a project that never deployed.
   const arc = state === "building" || state === "queued" ? "60 100" : state === "empty" ? "0 100" : "26 100";
   return (
     <span className={`relative flex h-8 w-8 shrink-0 items-center justify-center ${tone}`} title={state === "empty" ? "no deployments yet" : state}>
@@ -555,7 +507,6 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: ProjectEntry; onCh
       />
       <div className="pointer-events-none relative z-10 flex flex-1 items-center gap-4">
         <FrameworkLogo framework={f.framework} kind={f.kind} />
-        {/* Name + production domain (or why there is none). */}
         <div className="min-w-0 shrink-0 basis-56 lg:basis-72">
           <div className="truncate font-semibold">{p.project}</div>
           <div className="flex min-w-0 items-center gap-1.5">
@@ -565,7 +516,6 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: ProjectEntry; onCh
             {f.d && <RawPortsBadge deployment={f.d} />}
           </div>
         </div>
-        {/* Deploy info: commit message / last error / connect-git (top) + date (bottom). */}
         <div className="hidden min-w-0 flex-1 flex-col justify-center md:flex">
           {f.git ? (
             <div className={`truncate text-sm ${f.state === "error" && !f.d ? "text-red-500" : ""}`}>{f.line}</div>
@@ -585,14 +535,12 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: ProjectEntry; onCh
             )}
           </div>
         </div>
-        {/* GitHub repository badge. */}
         {f.git && (
           <span className="pointer-events-none hidden max-w-[200px] items-center gap-1.5 truncate rounded-md bg-subtle px-2 py-1 text-xs text-secondary lg:inline-flex">
             <Github className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{repoLabel(f.git.repo_url)}</span>
           </span>
         )}
-        {/* Actions: star (hover-reveal, like Vercel's hidden default) · status · ⋯ */}
         <div className="pointer-events-auto z-20 ml-auto flex shrink-0 items-center gap-1.5">
           <StarBtn isFav={isFav} onToggle={onToggleFav} className={`transition-opacity focus:opacity-100 group-hover:opacity-100 ${isFav ? "" : "opacity-0"}`} />
           <StatusRing state={f.state} />

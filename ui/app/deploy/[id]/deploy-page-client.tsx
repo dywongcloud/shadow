@@ -20,17 +20,10 @@ import { apiGet, cancelBuild, type Build } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
-// After this many consecutive failed polls (~800ms apart ⇒ ~32s), stop
-// spinning forever and tell the user instead. Without this, a build record
-// this node can never find (evicted from the snapshot, hosted on a node this
-// read never reaches, or created under a control-plane leader that has since
-// failed over — see AGENTS.md's round-robin-reads-vs-leader-forwarded-writes
-// note) rendered as an infinite, un-actionable "Deployment started Xs ago…"
-// spinner with 0 log lines forever — indistinguishable from a genuinely
-// hung build, and with no escape (Cancel had no effect on it either).
+const BUILD_POLL_MS = 500;
+const BUILD_POLL_RETRY_MS = 800;
 const UNREACHABLE_AFTER_FAILS = 40;
 
-// `https://github.com/owner/repo(.git)` (or scp-style) → `owner/repo` for display.
 function ownerRepo(url: string): string {
   if (!url) return "";
   return url
@@ -46,7 +39,6 @@ function fmtTime(ms: number) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
-// Wrap occurrences of `q` (case-insensitive) in the given string with a <mark>.
 function withFindMarks(text: string, q: string): React.ReactNode {
   if (!q) return text;
   const needle = q.toLowerCase();
@@ -70,7 +62,6 @@ function withFindMarks(text: string, q: string): React.ReactNode {
   return <>{parts}</>;
 }
 
-// Highlight URLs and *.localhost aliases inside a chunk of text, then apply find-marks.
 function highlightInline(text: string, q: string): React.ReactNode {
   const re = /(https?:\/\/[^\s]+|[a-z0-9_-]+\.localhost)/gi;
   const parts: React.ReactNode[] = [];
@@ -92,12 +83,11 @@ function highlightInline(text: string, q: string): React.ReactNode {
   return <>{parts}</>;
 }
 
-// Determine the base text color class for a log line by its content. First match wins.
+/** Base text color class for a log line by its content; first match wins. */
 function lineColor(line: string): string {
   const t = line.trim();
   const lower = t.toLowerCase();
 
-  // npm/pnpm/yarn progress noise.
   if (
     /^(npm|pnpm|yarn) /.test(lower) ||
     lower.startsWith("added ") ||
@@ -107,7 +97,6 @@ function lineColor(line: string): string {
     return "text-muted";
   }
 
-  // Error / failure.
   if (
     lower.includes("error") ||
     lower.includes("err!") ||
@@ -118,12 +107,10 @@ function lineColor(line: string): string {
     return "text-red-500";
   }
 
-  // Warning.
   if (lower.includes("warning") || lower.includes("warn") || lower.includes("deprecated")) {
     return "text-amber-500";
   }
 
-  // Success / ready.
   if (
     lower.includes("ready") ||
     lower.includes("completed") ||
@@ -136,7 +123,6 @@ function lineColor(line: string): string {
     return "text-emerald-500";
   }
 
-  // Detected-framework / info lines.
   if (/^(detected|cloning|mapped|loaded|uploading|running build in|build machine)/i.test(t)) {
     return "text-sky-400";
   }
@@ -144,15 +130,12 @@ function lineColor(line: string): string {
   return "text-fg";
 }
 
-// Render a single log line with content-aware syntax highlighting.
 function HighlightLine({ line, q }: { line: string; q: string }) {
-  // Preserve the backend's leading indentation (some lines are prefixed with two spaces).
   const indentMatch = line.match(/^(\s*)/);
   const indent = indentMatch ? indentMatch[1] : "";
   const body = line.slice(indent.length);
   const trimmed = body.trim();
 
-  // Command lines: `Running "npm install"`, or lines starting with `$` / `> `.
   const running = trimmed.match(/^Running\s+"(.+)"\s*$/);
   if (running) {
     return (
@@ -203,18 +186,15 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
           setUnreachable(false);
         }
         if (!stop && (b.state === "building" || b.state === "queued")) {
-          setTimeout(tick, 500);
+          setTimeout(tick, BUILD_POLL_MS);
         }
       } catch {
         fails += 1;
         if (!stop && fails >= UNREACHABLE_AFTER_FAILS) {
-          // Give up polling — nothing left to learn by retrying forever, and
-          // an eternal spinner reads as "still building" when it may in fact
-          // be long finished, just unreachable from here.
           setUnreachable(true);
           return;
         }
-        if (!stop) setTimeout(tick, 800);
+        if (!stop) setTimeout(tick, BUILD_POLL_RETRY_MS);
       }
     }
     tick();
@@ -237,7 +217,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
     }
   }
 
-  // Auto-scroll logs while building.
   useEffect(() => {
     if (build?.state === "building" && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -260,7 +239,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
       </Link>
 
       <Card className="p-0">
-        {/* Status header */}
         <div className="flex items-center gap-2 px-5 py-4 sm:px-6">
           {ready ? (
             <Check className="h-4 w-4 text-green" />
@@ -282,10 +260,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
           </span>
         </div>
 
-        {/* A build this page can never find (evicted, hosted on an
-            unreachable node, or created under a control-plane leader that has
-            since failed over) — an honest terminal state instead of an
-            infinite, un-actionable spinner. */}
         {unreachable && !build && (
           <div className="border-t border-border bg-amber-500/5 px-5 py-3 text-sm text-amber-600 sm:px-6">
             Can&apos;t find this build right now — it may already have finished on a node this
@@ -297,7 +271,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
           </div>
         )}
 
-        {/* Build Logs */}
         <div className="border-t border-border">
           <button
             onClick={() => setLogsOpen((o) => !o)}
@@ -315,7 +288,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
 
           {logsOpen && (
             <div className="border-t border-border">
-              {/* toolbar */}
               <div className="flex items-center gap-3 px-4 py-2">
                 <button
                   className="text-muted hover:text-fg"
@@ -335,7 +307,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
                   />
                 </div>
               </div>
-              {/* log lines */}
               <div ref={logRef} className="max-h-80 overflow-auto border-t border-border bg-subtle/50 px-4 py-3 font-mono text-xs">
                 {lines.map((l, i) => (
                   <div key={i} className="flex gap-3 py-px leading-relaxed">
@@ -354,11 +325,9 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
           )}
         </div>
 
-        {/* Pending / done steps */}
         <Step label="Deployment Summary" done={ready} pending={!settled} />
         <Step label="Assigning Custom Domains" done={ready} pending={!settled} />
 
-        {/* Footer */}
         <div className="flex flex-col gap-3 border-t border-border px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <div className="flex min-w-0 items-center gap-2 text-sm text-secondary">
             {build?.commit_message ? (
@@ -383,10 +352,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
               </Link>
             </div>
           ) : (errored || cancelled) && build?.project ? (
-            // The project exists even though this build produced no deployment
-            // (its name is reserved for this team): the project page holds the
-            // retry and the delete — never send the user back to a "new
-            // project" form that would answer 409 for the same name.
             <div className="flex shrink-0 gap-2">
               <Link href="/new"><Button variant="outline">New project</Button></Link>
               <Link href={`/projects/${encodeURIComponent(build.project)}`}>
@@ -411,9 +376,6 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
         </div>
       </Card>
 
-      {/* Totem-pole: the source-clone card sits UNDERNEATH the build/deploy logs,
-          idle (no animation) showing the already-successful clone. Standard
-          padding (mt-6) separates the stacked cards. Only for git-backed builds. */}
       {build?.repo_url && (
         <CloneCard
           idle

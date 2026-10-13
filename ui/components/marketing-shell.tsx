@@ -9,13 +9,6 @@ import Image from "next/image";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
 
-/* ------------------------------------------------------------------ *
- * Shared chrome for the public marketing pages (Product, Solutions,
- * Features, Pricing, Blog, Case Studies, …). Full-bleed dark brand
- * surface with the top nav + footer, so every marketing page matches the
- * landing page. The landing page renders its own hero inside this shell.
- * ------------------------------------------------------------------ */
-
 export const MARKETING_NAV: { label: string; href: string }[] = [
   { label: "Product", href: "/product" },
   { label: "Solutions", href: "/solutions" },
@@ -57,53 +50,39 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
 ];
 
 function Logo({ className = "h-7" }: { className?: string }) {
-  // Wordmark is 1826×407 (≈ 4.49:1). Sized by height so it always fits the nav row
-  // and scales responsively; `w-auto` preserves the aspect ratio. `priority` because
-  // it is the above-the-fold brand LCP on every marketing page.
   return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto select-none`} />;
+}
+
+const MARKETING_SURFACE_COLOR = "#0c0d10";
+
+/** Forces the dark brand surface on the document root while mounted (overscroll, gutters and native scrollbars match, and `overflow-x: clip`
+ *  removes the horizontal scrollbar the full-bleed `w-screen` shell induces). Background and overflow revert to "" rather than a snapshot, because a
+ *  fast logout-login remount would capture the forced values; only the color-scheme next-themes owns is handed back. */
+function useForcedDarkRoot() {
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    const prevScheme = html.style.colorScheme;
+    html.style.backgroundColor = MARKETING_SURFACE_COLOR;
+    body.style.backgroundColor = MARKETING_SURFACE_COLOR;
+    html.style.colorScheme = "dark";
+    body.style.overflowX = "clip";
+    return () => {
+      html.style.backgroundColor = "";
+      body.style.backgroundColor = "";
+      html.style.colorScheme = prevScheme;
+      body.style.overflowX = "";
+    };
+  }, []);
 }
 
 export function MarketingShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
-  // The marketing/landing surface is ALWAYS the dark brand surface (#0c0d10),
-  // independent of the platform light/dark theme. Force the ROOT (html/body)
-  // background to match so the overscroll/rubber-band area and any gutter show the
-  // same dark — not the theme background (white in light mode). `color-scheme:dark`
-  // makes native scrollbars (and their corner) render dark, and `overflow-x:clip`
-  // removes the horizontal scrollbar the full-bleed `w-screen` shell would induce
-  // (which is what produced the tiny white scrollbar-corner square). All restored
-  // on unmount so the dashboard keeps its themed background.
-  useEffect(() => {
-    const html = document.documentElement;
-    const body = document.body;
-    // Capture ONLY the color-scheme next-themes owns, to hand it back on unmount.
-    // Background + overflow overrides are reverted to "" (the stylesheet/theme
-    // value) DETERMINISTICALLY rather than to a captured snapshot.
-    //
-    // Why not snapshot-and-restore the background too: on a fast logout→login the
-    // shell can re-mount while the forced dark values are still applied, so a
-    // snapshot would capture `#0c0d10` and then "restore" it onto the dashboard —
-    // leaving the dashboard on a dark body (looks unstyled/broken) until a manual
-    // refresh. Clearing to "" reverts to `--background` every time, regardless of
-    // mount ordering / StrictMode double-invoke.
-    const prevScheme = html.style.colorScheme;
-    html.style.backgroundColor = "#0c0d10";
-    body.style.backgroundColor = "#0c0d10";
-    html.style.colorScheme = "dark";
-    body.style.overflowX = "clip";
-    return () => {
-      html.style.backgroundColor = "";
-      body.style.backgroundColor = "";
-      html.style.colorScheme = prevScheme; // never inherit our forced "dark"
-      body.style.overflowX = "";
-    };
-  }, []);
+  useForcedDarkRoot();
 
-  // Mobile nav menu (below lg, where the inline nav is hidden).
   const [menuOpen, setMenuOpen] = useState(false);
-  // Close the menu on navigation.
   // eslint-disable-next-line react-hooks/set-state-in-effect -- resets menu-open state whenever the route changes, a derived-reset-on-change sync
   useEffect(() => setMenuOpen(false), [pathname]);
   useEffect(() => {
@@ -111,7 +90,6 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-  // Lock background scroll while the full-screen menu overlay is open.
   useEffect(() => {
     if (!menuOpen) return;
     const prev = document.body.style.overflow;
@@ -126,7 +104,6 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-[#0c0d10] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
-      {/* Top nav — blue lining matches the SVG globe's blue streaks (#218CFF). */}
       <header className="relative z-30 border-b border-[#218cff]/50 bg-[#0c0d10]/80 backdrop-blur">
         <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
           <Link href="/" className="shrink-0"><Logo className="h-7 sm:h-8" /></Link>
@@ -141,7 +118,6 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               </Link>
             ))}
           </nav>
-          {/* Desktop: Login. Mobile/tablet: a hamburger toggling the menu below. */}
           <div className="flex items-center gap-3">
             <Link
               href="/sign-in"
@@ -163,15 +139,10 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
       </header>
 
-      {/* Mobile/tablet menu — FULL-SCREEN overlay with a close (X) top-right.
-          Portaled to <body> so it escapes the shell's `transform` ancestor (which
-          would otherwise make `position: fixed` resolve to the shell, not the
-          viewport) and covers the entire screen. */}
       {menuOpen &&
         typeof document !== "undefined" &&
         createPortal(
           <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
-            {/* Top bar: logo + close button (mirrors the navbar). */}
             <div className="flex items-center justify-between border-b border-[#218cff]/50 px-6 py-4">
               <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
                 <Logo className="h-7" />
@@ -185,7 +156,6 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
                 <X className="h-5 w-5" />
               </button>
             </div>
-            {/* Links fill the rest of the screen. */}
             <nav className="flex flex-1 flex-col overflow-y-auto px-6 py-6">
               <ul className="flex flex-col">
                 {MARKETING_NAV.map((n) => (
@@ -216,18 +186,13 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
       {children}
 
-      {/* Footer */}
       <footer className="relative overflow-hidden bg-[#0c0d10]">
-        {/* Aurora glows rising from the bottom edge — light blue, aqua, turquoise,
-            indigo and pink fuchsia. Dimmer + slightly larger radii for softer wash. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]">
           <div className="absolute -bottom-44 left-[6%] h-[25.2rem] w-[25.2rem] rounded-full bg-teal-400/36 blur-[126px]" />
           <div className="absolute -bottom-52 left-[33%] h-[31.5rem] w-[31.5rem] rounded-full bg-indigo-600/45 blur-[137px]" />
           <div className="absolute -bottom-44 left-[55%] h-[25.2rem] w-[25.2rem] rounded-full bg-fuchsia-600/30 blur-[126px]" />
           <div className="absolute -bottom-48 right-[6%] h-[27.3rem] w-[27.3rem] rounded-full bg-cyan-400/30 blur-[126px]" />
         </div>
-        {/* Giant brand watermark — sits at the very bottom of the page, bleeding off
-            the bottom edge, behind the footer content and lit by the glows. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center overflow-hidden">
           <span
             className="select-none whitespace-nowrap bg-clip-text font-bold leading-[0.78] tracking-tighter text-transparent"
@@ -274,16 +239,12 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               <a href="#" aria-label="Dribbble" className="transition-colors hover:text-white"><Dribbble className="h-4 w-4" /></a>
             </div>
           </div>
-          {/* Reserve vertical space below the content so the watermark wordmark
-              has room to show at the bottom of the page. */}
           <div className="h-40 sm:h-56" />
         </div>
       </footer>
     </div>
   );
 }
-
-/* ---- Small shared marketing primitives (dark theme) ---- */
 
 export function MarketingHero({ eyebrow, title, subtitle, children }: { eyebrow?: string; title: React.ReactNode; subtitle?: string; children?: React.ReactNode }) {
   return (

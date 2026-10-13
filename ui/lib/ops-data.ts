@@ -1,45 +1,21 @@
 import "server-only";
 import { cookies } from "next/headers";
 
-// Server-side counterpart to lib/api.ts's opsGet -- used by admin ops pages'
-// server components to fetch an initial paint of live operational data before
-// streaming, avoiding the blank-shell-then-client-fetch round trip. Reads the
-// SAME env vars as next.config.mjs's ADMIN_OPS rewrite target, so a server
-// fetch here hits exactly what the browser's /ops/* proxy would have hit.
+// Server-side counterpart to lib/api.ts's opsGet for admin server components: an initial paint of live ops data without a client round trip, reading
+// the SAME env vars as next.config.mjs's ADMIN_OPS rewrite so it hits exactly what the browser's /ops proxy would.
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
-// One address, not the list: the backend compares this claim against a single
-// `admin_emails` entry when it derives `platform_admin`. The FIRST entry is the
-// backend-authoritative owner address (see the opsBearer note below).
-const OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
+const FIRST_OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
+const OPS_REQUEST_TIMEOUT_MS = 10_000;
+const TOKEN_TTL_FALLBACK_SECS = 3600;
+const RETIRE_BEFORE_EXPIRY_SECS = 120;
+const MIN_TOKEN_TTL_SECS = 60;
 
-/* ---- The ops console's own credential -------------------------------------
- *
- * HIVE_INTERNAL_TOKEN authorizes TOKEN MINTING (`POST /v1/token`, proved by
- * `x-hive-internal`), not data reads: presenting it as a bearer (or as
- * `x-hive-internal`) on a data GET still answers 401 "missing or invalid bearer
- * token" (measured on the live DevHub admin listener, 2026-10-12). Forwarding
- * the operator's session cookie helped only when a request scope existed AND
- * that session carried `platform_admin` — with no cookie (or a tenant-scoped
- * one) every server-rendered ops read 401/403'd, so admin pages painted empty
- * shells and only the client poll ever showed data.
- *
- * So this process exchanges its internal token for a REAL platform JWT and
- * sends that as `Authorization: Bearer …`, falling back to the session cookie
- * when minting is unavailable. The mint is server-to-server only; this module is
- * `server-only` and the token never appears in a rendered payload, a client
- * bundle, or a response header — it exists solely in the headers of the fetch
- * below. The pages that call it are already gated on the platform-owner
- * allow-list by proxy.ts, so minting operator authority here grants nothing a
- * non-owner can reach.
- *
- * Cache invalidation is a TIMER, never a clock read: these pages are partially
- * prerendered (Cache Components), and `Date.now()` inside that prerender makes
- * Next fail the route with "encountered the unstable value Date.now() while
- * prerendering" (live-witnessed on /admin/nodes, /admin/databases, /admin/teams
- * and /admin, 2026-10-12).
- */
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  (timer as unknown as { unref?: () => void }).unref?.();
+}
+
 type Minted = { token: string };
 let minted: Minted | null = null;
 let expiry: ReturnType<typeof setTimeout> | null = null;
@@ -55,34 +31,35 @@ async function mintOpsBearer(): Promise<string | null> {
         sub: "ui-ops-server",
         tenant: "personal",
         role: "owner",
-        email: OWNER_EMAIL || undefined,
+        email: FIRST_OWNER_EMAIL || undefined,
       }),
       cache: "no-store",
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(OPS_REQUEST_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     const d = (await r.json()) as { token?: string; expires_in?: number };
     if (!d.token) return null;
-    // Retire the token well before the backend's own expiry so a read never
-    // races its death. `unref` keeps a pending timer from holding a build
-    // worker open for the token's whole TTL.
-    const ttl = Math.max(60, (typeof d.expires_in === "number" ? d.expires_in : 3600) - 120);
+    const ttl = Math.max(
+      MIN_TOKEN_TTL_SECS,
+      (typeof d.expires_in === "number" ? d.expires_in : TOKEN_TTL_FALLBACK_SECS) - RETIRE_BEFORE_EXPIRY_SECS,
+    );
     minted = { token: d.token };
     if (expiry) clearTimeout(expiry);
     expiry = setTimeout(() => {
       minted = null;
       expiry = null;
     }, ttl * 1000);
-    (expiry as unknown as { unref?: () => void }).unref?.();
+    unrefTimer(expiry);
     return d.token;
   } catch {
     return null;
   }
 }
 
-/** Cached operator bearer. `force` re-mints (used after a 401/403, i.e. the
- *  cached JWT expired or the backend rotated its secret); concurrent callers
- *  share one in-flight mint instead of stampeding the token endpoint. */
+/** The ops console's own credential: HIVE_INTERNAL_TOKEN authorizes token MINTING only (`POST /v1/token`, `x-hive-internal`), not data GETs (as a
+ *  bearer it still 401s), so this server-only module exchanges it for a real platform JWT sent as `Authorization: Bearer` (the session cookie is the
+ *  fallback); the token never reaches a rendered payload, client bundle or response header. Cached; `force` re-mints after a 401/403, concurrent
+ *  callers share one in-flight mint, and expiry is a TIMER, never a `Date.now()` read (which fails a Cache Components prerender). */
 function opsBearer(force = false): Promise<string | null> {
   if (!force && minted) return Promise.resolve(minted.token);
   if (!minting) {
@@ -93,9 +70,6 @@ function opsBearer(force = false): Promise<string | null> {
   return minting;
 }
 
-// Bounded: an unreachable admin host must fail FAST with an honest error, never
-// hang the server component's render indefinitely — previously a bare fetch with
-// no timeout at all (ui-cloud-proxy-admin-fallback).
 function opsFetch(path: string, bearer: string | null, cookie: string | null): Promise<Response> {
   const headers: Record<string, string> = {};
   if (bearer) headers.authorization = `Bearer ${bearer}`;
@@ -103,28 +77,17 @@ function opsFetch(path: string, bearer: string | null, cookie: string | null): P
   return fetch(`${ADMIN_OPS}${path}`, {
     cache: "no-store",
     headers,
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(OPS_REQUEST_TIMEOUT_MS),
   });
 }
 
-/**
- * Fetch ops/admin data directly from the backend, server-side, AS AN OPERATOR.
- * Intentionally uncached (no-store): ops data is live operational state,
- * matching the existing no-store policy at the browser cache-control layer
- * (next.config.mjs headers()) -- never `"use cache"`.
- */
+/** Fetches ops/admin data server-side AS AN OPERATOR, uncached (no-store: live operational state, matching the browser cache-control layer; never
+ *  `"use cache"`). It carries real operator authority, so call it only from pages behind proxy.ts's owner allow-list (`/admin`, `/ops`). */
 export async function fetchOpsServer<T>(path: string): Promise<T> {
-  // Fallback credential: the operator's own session cookie, read inside the
-  // request scope when there is one (a build-time prerender has none). The
-  // minted bearer is preferred — it carries `platform_admin`, which a
-  // tenant-scoped session cookie does not (witnessed 2026-10-01: 84
-  // operator-403 lines in 2 h on the leader, all from this loopback caller).
   let cookie: string | null = null;
   try {
     cookie = (await cookies()).get("hive_jwt")?.value ?? null;
-  } catch {
-    /* outside a request scope: nothing to forward */
-  }
+  } catch {}
   let bearer = await opsBearer();
   let r = await opsFetch(path, bearer, cookie);
   if ((r.status === 401 || r.status === 403) && bearer) {
@@ -135,17 +98,8 @@ export async function fetchOpsServer<T>(path: string): Promise<T> {
   return (await r.json()) as T;
 }
 
-/**
- * `fetchOpsServer` that hands the failure back instead of throwing.
- *
- * Every admin server component used to write `.catch(() => null)`, which made a
- * REFUSED ops read indistinguishable from an empty one: with
- * `/v1/admin/databases` answering 403 the Databases page rendered "0 provisioned
- * · No databases provisioned" and no operator could tell a broken gate from an
- * empty fleet (2026-10-12). One primitive returns `{ data, error }` so every
- * page surfaces the refusal; callers that genuinely want to ignore a failure
- * still can, but they now have to say so.
- */
+/** `fetchOpsServer` returning `{ data, error }` instead of throwing, so a REFUSED ops read is never rendered as an empty one (a bare
+ *  `.catch(() => null)` made a 403 look like "0 provisioned"); a caller that wants to ignore a failure has to say so. */
 export type OpsResult<T> = { data: T | null; error: string | null };
 
 export async function fetchOpsResult<T>(path: string): Promise<OpsResult<T>> {

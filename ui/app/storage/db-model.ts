@@ -1,35 +1,12 @@
-/**
- * The Storage page's ONE database model.
- *
- * Two backends feed it and neither is a special case in the UI:
- *
- *  * **Managed engines** — `GET /v1/databases` (`crates/hive-cloud/src/databases.rs`).
- *    Postgres/Redis get a real external wire endpoint at `<slug>.{HIVE_DB_DOMAIN}`
- *    (TLS-SNI proxied by `db_gateway.rs`); blob/queue/vector/pubsub/realtime are
- *    HTTP kinds served by the platform API.
- *  * **Browser-replicated SQLite** — the `browser_db` contract
- *    (`docs/browser-db-contract.md`). Database identity IS the project, the spec
- *    rides the deployment manifest, and the fleet keeps one cr-sqlite replica per
- *    project on every node.
- *
- * A SQLite database is a database. It gets the same row, the same detail page and
- * the same affordances as the rest. The browser-replicated lane's difference is
- * HOW clients connect: browsers sync a local replica (no DSN), while servers use
- * its libsql/Hrana + Upstash-style REST endpoint (`browser_db_rest`) with a
- * minted per-project token — see `sqliteConnectivity()`.
- */
+/** The Storage page's ONE database model, fed by two backends that are no special case in the UI: managed engines (`GET /v1/databases`)
+ *  and browser-replicated SQLite (the `browser_db` contract, `docs/browser-db-contract.md`: identity IS the project, one cr-sqlite replica per
+ *  project on every node). A SQLite database gets the same row and detail page as the rest; only HOW clients connect differs (browsers sync
+ *  a local replica, servers use the libsql/Hrana + REST endpoint with a minted per-project token), see `sqliteConnectivity()`. */
 
 import type { Database, DbKind, Deployment, BrowserDbPolicy } from "@/lib/api";
 
-/**
- * Two genuinely different SQLite objects, never collapsed into one kind:
- *  * `sqlite` — the MANAGED engine (`DbKind::Sqlite`). One file per database on
- *    its owning node, spoken over libsql/Hrana, with a real DSN.
- *  * `browser_sqlite` — the `browser_db` contract. One cr-sqlite CRDT replica
- *    per PROJECT, replicated into admitted browsers over `Op::CrrSync`, with no
- *    query endpoint at all.
- * They share the word SQLite and nothing else, so a row must state which it is.
- */
+/** `sqlite` (the MANAGED engine: one file per database, libsql/Hrana, a real DSN) and `browser_sqlite` (the `browser_db` cr-sqlite replica per
+ *  PROJECT, no query endpoint) are different objects that share only the word, so a row states which it is. */
 export type UnifiedKind = DbKind | "browser_sqlite";
 
 export const KIND_LABEL: Record<UnifiedKind, string> = {
@@ -44,10 +21,6 @@ export const KIND_LABEL: Record<UnifiedKind, string> = {
   browser_sqlite: "SQLite (browser)",
   supabase: "Supabase",
 };
-
-// ---------------------------------------------------------------------------
-// Endpoint reachability — an honest label on every published address.
-// ---------------------------------------------------------------------------
 
 /** Where a published address can actually be reached FROM. */
 export type Reach =
@@ -89,10 +62,6 @@ export const REACH_NOTE: Record<Reach, string> = {
   unknown: "Address published by the backend; reachability could not be classified here.",
 };
 
-// ---------------------------------------------------------------------------
-// Managed-engine endpoints
-// ---------------------------------------------------------------------------
-
 export interface EndpointInfo {
   /** The env key the platform publishes this under (DATABASE_URL / REDIS_URL / endpoint). */
   key: string;
@@ -103,12 +72,8 @@ export interface EndpointInfo {
   protocol: string;
 }
 
-/**
- * The primary connection endpoint of a managed database, derived from the
- * ALWAYS-UNMASKED `host`/`port`/`endpoint` keys (`Database::masked()` only masks
- * keys containing url/password/token/secret, so the address is safe to read from
- * the list poll while the DSN itself is fetched on demand from `/credentials`).
- */
+/** The primary connection endpoint of a managed database, from the ALWAYS-UNMASKED `host`/`port`/`endpoint` keys (`Database::masked()`
+ *  masks only url/password/token/secret keys); the DSN itself is fetched on demand from `/credentials`. */
 export function managedEndpoint(db: Database): EndpointInfo | null {
   const c = db.connection ?? {};
   const host = c.host ?? "";
@@ -129,9 +94,6 @@ export function managedEndpoint(db: Database): EndpointInfo | null {
       protocol: "redis wire (TLS)",
     };
   }
-  // Managed SQLite publishes `libsql://<host>` — the DSN a libsql/Turso client
-  // takes verbatim. The token rides separately (`LIBSQL_AUTH_TOKEN`), so the
-  // address shown here stays non-secret like every other kind's.
   if (db.kind === "sqlite") {
     const url = c.endpoint ?? "";
     const shown = host || endpointHost(url);
@@ -144,9 +106,6 @@ export function managedEndpoint(db: Database): EndpointInfo | null {
       };
     }
   }
-  // Supabase: the per-database hostname serves the Studio dashboard (HTTPS,
-  // basic-auth — the credentials live behind /credentials like every secret).
-  // The Postgres wire rides the same host:5432 SNI splice as managed Postgres.
   if (db.kind === "supabase" && host) {
     return {
       key: "STUDIO_URL",
@@ -182,17 +141,8 @@ export function managedNoEndpointReason(db: Database): string {
   return `${KIND_LABEL[db.kind]} is served by the platform API under this database's token — see the connection details.`;
 }
 
-// ---------------------------------------------------------------------------
-// Browser-replicated SQLite (browser_db)
-// ---------------------------------------------------------------------------
-
-/**
- * Mirrors `crate::git::sanitize_tag` (hive-cloud) — the platform-controlled
- * template that turns a project name into the replica file stem. Kept here so
- * the page can SHOW the real file name (`hive-browserdb-<tag>.db`) without ever
- * letting a tenant string become a path: this is display-only, the fleet derives
- * its own name server-side and refuses a mismatch.
- */
+/** Display-only mirror of hive-cloud's `git::sanitize_tag` (the replica file stem `hive-browserdb-<tag>.db`): a tenant string never becomes
+ *  a path, and the fleet derives its own name server-side and refuses a mismatch. */
 export function sanitizeTag(s: string): string {
   let out = s
     .toLowerCase()
@@ -248,11 +198,8 @@ export const SQLITE_NO_DSN =
   "local replica and queries it in-process. Servers, CI and curl use this " +
   "database's libsql/REST endpoint with a minted access token (below).";
 
-/**
- * The honest capability statement for the SQLite lane. Every clause is a fact
- * from `docs/browser-db-contract.md` / `crates/hive-cloud/src/browser_db.rs` /
- * `crates/hive-cloud/src/browser_db_rest.rs`, not a roadmap promise.
- */
+/** The capability statement for the SQLite lane: every clause is a fact from `docs/browser-db-contract.md`, `browser_db.rs` and
+ *  `browser_db_rest.rs`, not a roadmap promise. */
 export function sqliteConnectivity(): { how: string[]; missing: string[] } {
   return {
     how: [
@@ -269,18 +216,10 @@ export function sqliteConnectivity(): { how: string[]; missing: string[] } {
   };
 }
 
-/**
- * Server-side pooling, stated exactly as it is for the managed engines. The
- * SQL-over-HTTP surface (`db_rest.rs`) opens a FRESH connection per request and
- * bounds concurrency with a per-database semaphore; it is an admission cap, not
- * a pooler, and the code says so.
- */
+/** Server-side pooling as it is for the managed engines: the SQL-over-HTTP surface (`db_rest.rs`) opens a FRESH connection per request under
+ *  a per-database semaphore, an admission cap and not a pooler. */
 export const POOLING_NOTE =
   "Postgres/Redis: no server-side pooler — the wire endpoints proxy straight to the engine, and the SQL-over-HTTP surface opens a fresh connection per request behind a per-database concurrency cap (16), so pool in your client. Managed SQLite is different: it has a real per-database pool (bounded live connections, a bounded idle set and a wait queue), so a burst queues instead of being refused.";
-
-// ---------------------------------------------------------------------------
-// The unified row
-// ---------------------------------------------------------------------------
 
 export interface UnifiedDb {
   id: string;
@@ -324,16 +263,8 @@ function newestAny(deployments: Deployment[]): Deployment | null {
   return best;
 }
 
-/**
- * Every SQLite database the tenant has, from BOTH truthful sources:
- *   * a Ready deployment whose gossiped manifest carries `browser_db` (live), and
- *   * the dashboard-managed `ProjectSettings.browser_db` mirror (configured).
- *
- * The old panel listed only the second, so a project whose fluid.json declares
- * the block by hand — the documented primary opt-in — was invisible in the
- * dashboard while being fully live on the fleet. The manifest wins on a tie: it
- * is what the fleet actually reconciles against.
- */
+/** Every SQLite database the tenant has, from BOTH sources: a Ready deployment whose gossiped manifest carries `browser_db` (live) and the
+ *  dashboard-managed `ProjectSettings.browser_db` mirror (configured); the manifest wins on a tie because the fleet reconciles against it. */
 export function sqliteDatabases(
   deployments: Deployment[],
   settings: Record<string, BrowserDbPolicy | null | undefined>,
@@ -362,8 +293,6 @@ export function sqliteDatabases(
       const policy = liveDeployment?.browser_db ?? settings[project] ?? null;
       return {
         project,
-        // A project can only reach this list with a policy from one source or the
-        // other; the fallback keeps the type total without inventing caps.
         policy: policy ?? { max_bytes: 0, max_value_bytes: 0, public_read: false, schema: [] },
         live: !!liveDeployment,
         configured: !!settings[project],
@@ -376,8 +305,6 @@ export function sqliteDatabases(
 }
 
 export function sqliteRow(db: SqliteDb): UnifiedDb {
-  // The libsql base URL is shown host-only, exactly like the managed kinds
-  // show host:port — the address is not the secret, the minted token is.
   const restHost = db.restUrls ? endpointHost(db.restUrls.libsql_url) : "";
   return {
     id: sqliteRouteId(db.project),

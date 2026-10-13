@@ -2,17 +2,10 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ABC Diatype — the platform typeface (https://abcdinamo.com/typefaces/diatype).
-   It's a licensed font that is NOT bundled; the Tailwind stack falls back to
-   Geist automatically. The @font-face block lives in /public/fonts/README.md —
-   paste it back here after dropping the woff2 files in. Declaring the faces
-   without the files made every visitor's console log four font 404s. */
-
-/* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {
-  --background: 0 0% 98%; /* #FAFAFA — root page background */
+  --background: 0 0% 98%;
   --subtle: 0 0% 98%;
-  --card: 0 0% 100%; /* cards/components stay pure white */
+  --card: 0 0% 100%;
   --foreground: 0 0% 4%;
   --secondary: 0 0% 40%;
   --muted: 0 0% 56%;
@@ -39,18 +32,6 @@
   --green: 145 65% 49%;
 }
 
-/* High-contrast mode (bn-ui-accessibility): the OS-level `forced-colors`
-   media feature (Windows High Contrast) already overrides colors
-   unconditionally and needs no help here — this targets the OTHER real
-   signal, `prefers-contrast: more` (macOS "Increase contrast" / a browser
-   accessibility setting), which forced-colors does NOT cover. Overrides
-   only the LOW-CONTRAST tokens (border/border-strong/muted/secondary — the
-   ones deliberately subtle by design for the normal theme) toward the
-   extremes; foreground/background/accent are already near-maximum contrast
-   in both themes and are left untouched. Composes with `.dark` via normal
-   CSS cascade (both selectors can match at once), never a separate
-   duplicated theme to keep in sync.
-*/
 @media (prefers-contrast: more) {
   :root {
     --secondary: 0 0% 20%;
@@ -66,9 +47,6 @@
   }
 }
 
-/* De-zoom ~13%, plus an additional 5% default zoom-out on top: rem-based
-   spacing & type scale down proportionally so the whole dashboard reads
-   sleeker / less zoomed-in. (87.5% * 0.95 = 83.125%, 90% * 0.95 = 85.5%.) */
 html {
   font-size: 83.125%;
 }
@@ -86,8 +64,6 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Very faint large-square grid canvas behind the whole dashboard. Uses the
-   foreground channel at a tiny alpha so it adapts to light & dark automatically. */
 body {
   background-image:
     linear-gradient(to right, hsl(var(--foreground) / 0.01) 1px, transparent 1px),
@@ -106,7 +82,6 @@ body {
   border-color: hsl(var(--border));
 }
 
-/* Sleeker, quicker theme + hover transitions. */
 button,
 a,
 input,
@@ -121,7 +96,6 @@ select {
   color: hsl(var(--background));
 }
 
-/* Prevent theme flash + smooth the swap. */
 html {
   color-scheme: light;
 }
@@ -138,25 +112,18 @@ html.dark {
   border-radius: 8px;
   border: 2px solid hsl(var(--background));
 }
-/* The corner where a horizontal + vertical scrollbar meet. Without this it
-   renders as the browser default (a light/white square) — the "tiny white square
-   in the bottom-right corner" on the dark landing (whose full-bleed w-screen shell
-   can induce a horizontal scrollbar). Transparent → it shows the page bg instead. */
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-/* Scrollable but with no visible scrollbar (still scrolls via wheel/touch). */
 .no-scrollbar {
-  -ms-overflow-style: none; /* IE / old Edge */
-  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 .no-scrollbar::-webkit-scrollbar {
-  display: none; /* Chrome / Safari / WebKit */
+  display: none;
 }
 
-/* ---- "Preparing Git Repository" clone animation (New Project → Deploy) ---- */
-/* Radar ripple emanating from the GitHub source badge. */
 @keyframes clone-ripple {
   0% {
     transform: scale(0.85);
@@ -167,7 +134,6 @@ html.dark {
     opacity: 0;
   }
 }
-/* A packet of data traveling along the dashed connector from source → build env. */
 @keyframes clone-flow {
   0% {
     left: 100%;
@@ -184,7 +150,6 @@ html.dark {
     opacity: 0;
   }
 }
-/* Gentle breathing on the destination (build environment) folder. */
 @keyframes clone-breathe {
   0%,
   100% {
@@ -195,8 +160,6 @@ html.dark {
   }
 }
 
-/* Infinite horizontal marquee (landing "Own Your Cloud." ticker). The track holds
-   two identical copies, so translating by -50% loops seamlessly. */
 @keyframes marquee {
   from {
     transform: translateX(0);
@@ -206,12 +169,6 @@ html.dark {
   }
 }
 
-/* Rotating aurora glow ring (landing intro loader + hero left glow): the element
-   carries a conic rose→violet→teal gradient masked into a ring; rotating the
-   element spins the gradient so the visible arc cycles color — matching the
-   reference video's ~2s hue rotation. */
-/* Intro loader logo: pan up/down while growing/shrinking (the "breathing" motion
-   from the reference video) — one full cycle over the ~2s hold. */
 @keyframes intro-logo-pan {
   0% {
     transform: translateY(9%) scale(0.86);
@@ -224,9 +181,6 @@ html.dark {
   }
 }
 
-/* Hide Clerk's development-instance floating badge (the white rounded box pinned
-   bottom-right on a dev key). It's injected async into a body portal, so a CSS
-   catch-all across the class variants + the clerk.com link is the robust removal. */
 .cl-badge,
 .cl-internal-badge,
 [class*="cl-internal"][class*="badge"],
@@ -244,7 +198,6 @@ a[aria-label="Clerk logo"][target="_blank"] {
   }
 }
 
-/* Toast slide-up + fade-in (bottom-right notifications). */
 @keyframes toast-in {
   from {
     opacity: 0;

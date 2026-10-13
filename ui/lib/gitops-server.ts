@@ -4,24 +4,9 @@ import { buildArtifacts } from "@/lib/gitops-yaml";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 
-/**
- * Call the backend admin API scoped to a tenant.
- *
- * `authToken` (the signed-in user's platform JWT) is forwarded as
- * `Authorization: Bearer …` so MUTATIONS pass the backend's `require_auth`
- * (when `HIVE_JWT_SECRET` is set). A Next server route that POSTs to the backend
- * on the user's behalf (deploy, redeploy, GitOps writes) MUST pass it — unlike
- * the `/cloud` rewrite proxy, a server→backend `fetch()` does not carry the
- * browser's `hive_jwt` cookie automatically, so omitting it 401s with
- * "missing or invalid bearer token". Reads (no token) stay unauthenticated, and
- * the backend derives the tenant from the JWT claim (not the spoofable
- * `x-hive-team` header), so forwarding the user's token scopes writes correctly.
- */
-// Mirrors lib/api.ts's fetchWithTimeout: an unbounded server->backend fetch()
-// here (GitHub API calls in commitFiles() share the same failure shape) can
-// stall the whole /api/gitops/sync request indefinitely on a hung backend or
-// far region, which surfaces client-side as a raw "Failed to fetch" instead of
-// a clean, retryable HTTP error. 20s matches apiGet's own default timeout.
+/** Calls the backend admin API scoped to a tenant. `authToken` (the user's platform JWT) is forwarded as `Authorization: Bearer` so MUTATIONS pass
+ *  `require_auth`: a Next route's server->backend `fetch()` does not carry the browser's `hive_jwt` cookie the way the `/cloud` proxy does, so a route
+ *  that writes on the user's behalf MUST pass it. The backend derives the tenant from the JWT claim, not `x-hive-team`. */
 const BACKEND_TIMEOUT_MS = 20_000;
 
 export async function backend(path: string, team: string, init?: RequestInit, authToken?: string | null) {
@@ -57,20 +42,10 @@ export function authTokenFrom(req: {
   return null;
 }
 
-/**
- * Read the live platform objects for a tenant and render the full GitOps artifact
- * tree. Returns the files plus a content hash (ignoring the volatile generatedAt
- * stamps) so callers can skip a redundant commit when nothing changed.
- *
- * `failures` lists CORE reads that failed (non-2xx). Only `/v1/gitops/projects`
- * is core: committing a tree built without it would omit every project — and,
- * because sync commits with the `projects/` managed prefix, TOMBSTONE every
- * real project file in the repo. Callers must refuse to commit when `failures`
- * is non-empty. The remaining reads degrade to absent-by-design: a personal
- * namespace legitimately has no team row, and the enterprise endpoints are
- * optional features — treating those as fatal would break tenants that simply
- * don't use them.
- */
+/** Reads the live platform objects for a tenant and renders the full GitOps artifact tree plus a content hash (ignoring volatile timestamps) so callers
+ *  can skip a redundant commit. `failures` lists CORE reads that failed (only `/v1/gitops/projects` is core): committing a tree without projects would
+ *  TOMBSTONE every real project file under the `projects/` managed prefix, so callers must refuse to commit when it is non-empty; the other reads
+ *  degrade to absent-by-design (a personal namespace has no team row, the enterprise endpoints are optional). */
 export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml", authToken?: string | null) {
   const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes, dbRes] = await Promise.all([
     backend("/v1/gitops/projects", team, undefined, authToken),
@@ -82,9 +57,6 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     backend("/v1/enterprise/saml", team, undefined, authToken),
     backend("/v1/enterprise/scim", team, undefined, authToken),
     backend("/v1/enterprise/microfrontends", team, undefined, authToken),
-    // Same tenant-scoped endpoint the Storage dashboard page polls
-    // (ui/app/storage/page.tsx: usePoll<Database[]>("/v1/databases", …)) —
-    // reused here rather than a bespoke gitops-only route.
     backend("/v1/databases", team, undefined, authToken),
   ]);
   const failures: string[] = [];
@@ -110,9 +82,6 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     region: ov?.region,
     rootPath,
     projects: Array.isArray(projects) ? projects : [],
-    // Raw records pass through — declarative-shape extraction (name/kind/region/
-    // mode only, never `connection`/credentials) happens in buildArtifacts's
-    // databaseNode(), mirroring how projectNode() shapes `projects` above.
     databases: Array.isArray(databases) ? databases : [],
     platform: {
       routing: routing ? { redirects: routing.redirects || [], rewrites: routing.rewrites || [] } : undefined,
@@ -132,15 +101,12 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     },
   });
 
-  // Hash over all files with volatile timestamps neutralized so an unchanged
-  // config doesn't re-commit on every poll. Strip BOTH the YAML `generatedAt:`
-  // lines AND any ISO-8601 timestamp anywhere (e.g. the README "Generated …").
-  const stable = files
+  const contentWithoutTimestamps = files
     .map((f) => `${f.path}\n${f.content}`)
     .join("\n")
     .replace(/^\s*generatedAt:.*$/gm, "")
     .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "");
-  const hash = createHash("sha256").update(stable).digest("hex").slice(0, 16);
+  const hash = createHash("sha256").update(contentWithoutTimestamps).digest("hex").slice(0, 16);
 
   return { files, hash, projectCount: Array.isArray(projects) ? projects.length : 0, failures };
 }

@@ -1,24 +1,9 @@
-// Public URL for a deployment.
-//
-// Deployments are routed by their SUBDOMAIN (the first host label), so the same
-// deployment is reachable at both `<sub>.localhost:8787` locally and
-// `<sub>.<public-domain>` over a tunnel — the gateway treats them identically.
-//
-// The domain is resolved per-SESSION at runtime, not just at build time:
-//   • When the dashboard itself is opened over localhost (e.g. localhost:3002),
-//     deployment links point at the local gateway: `<sub>.localhost:8787`.
-//   • When the dashboard is opened on the public platform host (shadw.cloud),
-//     links use NEXT_PUBLIC_DEPLOYMENT_DOMAIN so they open from anywhere:
-//     `<sub>.shadw.app`.
-// This way one build serves both contexts correctly — a localhost session never
-// hands out tunnel URLs and vice-versa.
+// Public URL for a deployment. Deployments are routed by their SUBDOMAIN (the first host label), so one deployment is reachable at
+// `<sub>.localhost:8787` locally and `<sub>.<public-domain>` publicly. The domain is resolved per SESSION at runtime: a dashboard opened over
+// localhost targets the local gateway, any other host uses NEXT_PUBLIC_DEPLOYMENT_DOMAIN, so one build serves both contexts.
 
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
 
-// Ingress mode (mirrors the node's HIVE_INGRESS): "dns" (default — ngrok is
-// retired) emits plain `<sub>.<apps-domain>` — Vercel-DNS wildcards match ONE
-// label, and regional steering happens inside the edge after connect, not in
-// the hostname. "ngrok"/"dual" remain accepted as explicit break-glass values.
 const INGRESS = (process.env.NEXT_PUBLIC_INGRESS || "dns").trim().toLowerCase();
 
 /** True for any host that is the local machine (localhost, *.localhost, loopback IPs). */
@@ -34,23 +19,12 @@ function isLocalHostname(h: string): boolean {
   );
 }
 
-/**
- * The deployment domain to use for the CURRENT session. In the browser this is
- * decided from the dashboard's own hostname: a localhost session always targets
- * the local gateway (empty domain), while any other host (a tunnel) uses the
- * configured public domain. During SSR (no `window`) we fall back to the
- * build-time domain; the dashboards load deployment data client-side, so links
- * are produced after hydration when `window` is available.
- */
+/** The deployment domain for the CURRENT session: a localhost dashboard targets the local gateway (empty domain), any other host the configured
+ *  public domain (SSR falls back to the build-time domain; links are produced after hydration). */
 function activeDeployDomain(): string {
   if (typeof window !== "undefined") {
     const h = window.location.hostname;
     if (isLocalHostname(h)) return "";
-    // Tunnel/public session: prefer the configured public domain. If it didn't
-    // get inlined into this chunk (NEXT_PUBLIC_* are baked at compile time, and a
-    // dev server can serve a chunk compiled before the env was set), derive it
-    // from the dashboard's own apex host so links never wrongly fall back to a
-    // localhost gateway URL on a public session.
     return DEPLOY_DOMAIN || `deployment.${h}`;
   }
   return DEPLOY_DOMAIN;
@@ -61,16 +35,12 @@ function subOf(alias: string): string {
   return alias.replace(/\.localhost$/i, "").split(".")[0];
 }
 
-/**
- * Region-affinity ingress: when a deployment carries a region code (iad/sin/sfo/lax),
- * its PRIMARY public URL is `<sub>.<code>.ngrok.pizza` so the request enters directly
- * on a node in that region (no cross-region entry hop). Falls back to the legacy
- * region-agnostic zone for empty/unknown codes, and to localhost on a local session.
- */
+/** Region-affinity ingress: a deployment with a region code (iad/sin/sfo/lax) gets `<sub>.<code>.ngrok.pizza` so the request enters on a node in
+ *  that region; empty or unknown codes use the region-agnostic zone, and a localhost session never encodes a region. */
 function publicDeployDomain(regionCode?: string | null): string {
   const domain = activeDeployDomain();
-  if (!domain) return ""; // localhost session — never region-encode
-  if (INGRESS !== "ngrok") return domain; // real-DNS ingress: single-label alias on the apps domain
+  if (!domain) return "";
+  if (INGRESS !== "ngrok") return domain;
   const code = (regionCode || "").trim().toLowerCase();
   return code ? `${code}.ngrok.pizza` : domain;
 }
@@ -93,47 +63,31 @@ export function deploymentUrl(alias: string | undefined | null, regionCode?: str
 /** Whether a public deployment domain (tunnel) is configured at build time. */
 export const hasPublicDeployDomain = !!DEPLOY_DOMAIN;
 
-/** The public host (no port) for a deployment on the CURRENT session — the
- *  same domain resolution `deploymentHost`/`deploymentUrl` use, but without
- *  the HTTP gateway's own `:8787` suffix, since a raw TCP/UDP/gRPC binding
- *  listens on its OWN allocated port (`raw_ports[i].public_port`), never the
- *  shared HTTP gateway port. */
+/** The public host (no port) for a deployment on the CURRENT session: the same domain resolution as `deploymentHost`/`deploymentUrl` without the
+ *  HTTP gateway's `:8787`, because a raw TCP/UDP/gRPC binding listens on its OWN allocated port (`raw_ports[i].public_port`). */
 function rawPortHost(alias: string | undefined | null, regionCode?: string | null): string {
   if (!alias) return "";
   const domain = publicDeployDomain(regionCode);
   return domain ? `${subOf(alias)}.${domain}` : `${subOf(alias)}.localhost`;
 }
 
-/**
- * A ready-to-copy `host:port` connection address for one raw port binding
- * (`Deployment.raw_ports[i]`) — the literal format every raw client accepts
- * (psql's "host:port", redis-cli's `-h host -p port`, a Minecraft client's
- * "Server Address" field). Every fleet node binds every allocated raw port,
- * so this is reachable through the SAME domain/alias resolution HTTP
- * deployment links already use — no separate DNS story needed.
- */
+/** A ready-to-copy `host:port` connection address for one raw port binding (`Deployment.raw_ports[i]`), the literal form every raw client
+ *  accepts; every fleet node binds every allocated raw port, so the normal domain/alias resolution applies. */
 export function rawPortAddress(alias: string | undefined | null, publicPort: number, regionCode?: string | null): string {
   const host = rawPortHost(alias, regionCode);
   return host ? `${host}:${publicPort}` : "";
 }
 
-// ---- EXPERIMENT: anonymous preview access (NEXT_PUBLIC_ZKAUTH=1) ----
-
 /** Whether the anonymous-membership preview flow is enabled in the UI. */
 export const zkEnabled = process.env.NEXT_PUBLIC_ZKAUTH === "1";
 
-/**
- * Open a deployment. With the zkauth experiment on, this first asks the home node
- * to mint an anonymous membership proof and routes through the gateway's bootstrap
- * endpoint (which drops a short-lived access cookie) so a protected preview opens
- * without leaking identity to the serving node. Falls back to a plain open if the
- * flag is off, no proof is available, or anything fails.
- */
+/** Opens a deployment. With the zkauth experiment on it first asks the home node for an anonymous membership proof and routes through the
+ *  gateway's bootstrap endpoint (which drops a short-lived access cookie) so a protected preview opens without leaking identity to the serving
+ *  node; any failure falls back to a plain open. */
 export async function openDeployment(alias: string | undefined | null, project: string, regionCode?: string | null) {
   const base = deploymentUrl(alias, regionCode).replace(/\/$/, "");
   if (zkEnabled && alias) {
     try {
-      // Imported lazily to avoid pulling the api client into pure-URL callers.
       const { apiSend, currentTeam } = await import("@/lib/api");
       const userId = typeof window !== "undefined" ? localStorage.getItem("hive_uid") || "" : "";
       if (userId) {
@@ -147,22 +101,14 @@ export async function openDeployment(alias: string | undefined | null, project: 
           return;
         }
       }
-    } catch {
-      /* fall through to a normal open */
-    }
+    } catch {}
   }
   window.open(`${base}/`, "_blank", "noopener");
 }
 
-/**
- * The alias a deployment ITSELF answers on — never someone else's URL.
- * Production deployments own the project alias. A preview's own hosts are its
- * commit / branch / per-deployment aliases (commit first: it is minted on
- * every fanout target, so it routes through pooled ingress; the per-node id
- * alias only resolves on its host node). Returns "" when a preview has none
- * of them — callers render a disabled/pending state, because the one thing a
- * preview must NEVER display is the production URL.
- */
+/** The alias a deployment ITSELF answers on, never someone else's URL: production owns the project alias; a preview uses its commit, branch or
+ *  per-deployment alias (commit first: it is minted on every fanout target, while the id alias resolves only on its host node). "" when a
+ *  preview has none: callers render a pending state, because a preview must NEVER display the production URL. */
 export function deploymentSelfAlias(d: {
   production: boolean;
   alias: string;

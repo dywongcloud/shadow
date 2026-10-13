@@ -1,32 +1,16 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { auth, clerkClient } from "@clerk/nextjs/server";
 
-// SECURITY + TRUST BOUNDARY. The /preview-unlock page (which shows the ZK-proof
-// animation) calls this route. It verifies, server-side via Clerk, that the
-// signed-in user is actually a MEMBER of the deployment's team (Clerk org) before
-// enrolling them in the ZK roster and minting an access proof on the node. The
-// node can't verify Clerk itself, so the node's zkauth endpoints are kept off the
-// public proxy (next.config) — only this server reaches them. Returns JSON so the
-// page can stage the proof visualization and then redirect to `url`.
+// Trust boundary: verifies via Clerk that the signed-in user is a MEMBER of the deployment's team before enrolling them in the ZK roster and
+// minting a proof on the node (the node cannot verify Clerk, so its zkauth endpoints stay off the public proxy).
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 const PERSONAL = new Set(["personal", "__personal__", ""]);
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
 
-/**
- * Is `host` a platform-issued deployment domain? Blocks the open-redirect /
- * ZK-proof-exfiltration vector where an attacker sets `?host=attacker.example`
- * on a crafted link — the real proof/message minted for a legitimate member
- * would otherwise be shipped straight to that arbitrary external origin.
- *
- * Covers every STANDARD alias shape (`.localhost` dev and the configured
- * `NEXT_PUBLIC_DEPLOYMENT_DOMAIN` apps wildcard; ngrok hosts are retired).
- * KNOWN GAP: a project's own CUSTOM domain (the Domains feature) is not in
- * this list — this check intentionally only defends against a truly
- * arbitrary third-party host; a stronger fix would resolve the deployment's
- * exact registered host(s) for `project` server-side and require an exact
- * match, which needs new backend plumbing beyond this pass's scope.
- */
+/** Whether `host` is a platform-issued deployment domain (the `.localhost` dev shapes and the NEXT_PUBLIC_DEPLOYMENT_DOMAIN apps wildcard):
+ *  blocks an open redirect that would ship the minted proof to an arbitrary origin. A project's own CUSTOM domain is NOT matched, so a proof
+ *  for one is refused here. */
 function isKnownDeploymentHost(host: string): boolean {
   const h = host.toLowerCase();
   if (h === "localhost" || h.endsWith(".localhost")) return true;
@@ -34,14 +18,7 @@ function isKnownDeploymentHost(host: string): boolean {
   return false;
 }
 
-/**
- * Honest, cause-specific copy for an unlock failure.
- *
- * Every backend status used to be rendered as "The deployment may still be
- * starting", which was actively misleading: the deployment was healthy and the
- * real cause was an access-service fault. Telling someone to wait for a thing
- * that already finished sends them into a retry loop that can never succeed.
- */
+/** Cause-specific copy for an unlock failure (an access-service fault is not "the deployment may still be starting"). */
 function unlockError(status: number, stage: "enroll" | "mint"): string {
   if (status === 403) return "This platform rejected the unlock request. The dashboard is not authorized to grant preview access.";
   if (status === 404) return "The preview access service is unavailable on this node. Please try again.";
@@ -49,16 +26,7 @@ function unlockError(status: number, stage: "enroll" | "mint"): string {
   return `Could not ${stage === "enroll" ? "enroll you for" : "grant"} preview access (${status}).`;
 }
 
-/**
- * The configured platform owner(s).
- *
- * `HIVE_OWNER_EMAIL` is a COMMA-SEPARATED list (ansible's
- * `hive_owner_email` is `"ops@{{ hive_platform_domain }},dylanwong007@gmail.com"`),
- * and `/api/token` already reads it that way (`OWNER_EMAILS`). Treating it as one
- * address here made the whole string the only accepted value, so the list form
- * matched nobody and EVERY personal-namespace unlock was denied — previews
- * broken for the owner. Parse it into a set exactly like `/api/token` does.
- */
+/** The configured platform owner(s): HIVE_OWNER_EMAIL is a COMMA-SEPARATED list, parsed into a set exactly like `/api/token` does. */
 function ownerEmails(): Set<string> {
   return new Set(
     (process.env.HIVE_OWNER_EMAIL || "")
@@ -69,18 +37,8 @@ function ownerEmails(): Set<string> {
   );
 }
 
-/**
- * A personal namespace belongs to exactly ONE user, so membership in it can be
- * checked directly rather than through Clerk orgs.
- *
- * This closes a real hole: the personal sentinels used to skip the membership
- * check entirely, which meant ANY signed-in user could unlock a preview whose
- * team was `personal` — including another person's private deployments.
- * Per-user namespaces (`u_<clerkUid>`) are matched exactly. The legacy shared
- * `personal` tenant belongs to the platform owner(s), so it's checked against
- * HIVE_OWNER_EMAIL when that is configured; with no owner configured we keep
- * the previous permissive behavior rather than locking everyone out.
- */
+/** A personal namespace belongs to exactly ONE user, so membership is checked directly rather than through Clerk orgs: `u_<clerkUid>` must match
+ *  exactly, and the legacy shared `personal` belongs to the platform owner(s) by HIVE_OWNER_EMAIL (permissive when none is configured). */
 async function personalAccessOk(team: string, userId: string): Promise<boolean> {
   if (team.startsWith("u_")) return team === `u_${userId}`;
   const owners = ownerEmails();
@@ -91,7 +49,6 @@ async function personalAccessOk(team: string, userId: string): Promise<boolean> 
     const emails: string[] = (u?.emailAddresses ?? []).map((e: any) => String(e?.emailAddress || "").toLowerCase());
     return emails.some((e) => owners.has(e));
   } catch {
-    // Never convert an identity-service hiccup into a lockout.
     return true;
   }
 }
@@ -125,12 +82,6 @@ export async function GET(req: NextRequest) {
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ ok: false, signin: true, error: "sign in required" }, { status: 401 });
 
-  // AUTHORITATIVE ownership: never trust the `team` query param the edge
-  // redirect carried — a project whose team tag was lost/empty arrived here as
-  // `team=` (falsy -> "personal"), which is the OWNER-ONLY namespace, so the
-  // project's real owner was denied with "belongs to another user's personal
-  // workspace". Resolve the owning team server-side on the node; the param is
-  // only a fallback when the node can't answer.
   let team = paramTeam;
   try {
     const th: Record<string, string> = {};
@@ -141,19 +92,11 @@ export async function GET(req: NextRequest) {
       const resolved = String(td?.team || "").trim();
       if (resolved && resolved !== "__untagged__") team = resolved;
     } else if (tr.status === 403) {
-      // The node is reachable but REFUSING (missing/mismatched
-      // HIVE_INTERNAL_TOKEN) — an operator misconfiguration, not a network
-      // blip. Falling back to the untrusted query param here would silently
-      // reopen the exact spoofing surface server-side resolution closes.
       console.error(`[preview-unlock] project-team resolution refused (403) for ${project}; check HIVE_INTERNAL_TOKEN`);
       return NextResponse.json({ ok: false, error: unlockError(403, "enroll") }, { status: 502 });
     }
-  } catch {
-    // Node unreachable: fall back to the param rather than locking everyone out.
-  }
+  } catch {}
 
-  // Org-team previews require verified Clerk org membership; personal
-  // namespaces require being the user that namespace belongs to.
   const personal = PERSONAL.has(team) || team.startsWith("u_");
   const allowed = personal ? await personalAccessOk(team, userId) : await isOrgMember(userId, team);
   if (!allowed) {
@@ -168,13 +111,9 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // Verified member — enroll (idempotent) + mint a proof on the node.
   const headers: Record<string, string> = { "content-type": "application/json", "x-hive-team": team };
   if (TOKEN) headers["x-hive-internal"] = TOKEN;
   try {
-    // Enrollment failures used to be discarded, so a rejected enrollment only
-    // ever surfaced later as a confusing error from the mint call. Surface it
-    // where it actually happens.
     const reg = await fetch(`${ADMIN}/v1/zkauth/register`, {
       method: "POST",
       headers,
@@ -185,10 +124,6 @@ export async function GET(req: NextRequest) {
       console.error(`[preview-unlock] member ${userId} of ${team}: enrollment failed ${reg.status}: ${detail}`);
       return NextResponse.json({ ok: false, error: unlockError(reg.status, "enroll") }, { status: 502 });
     }
-    // `host` lets the backend mint the proof on the node that actually serves
-    // this preview — the same node that will verify it. Without it the mint can
-    // land on any node in the round-robin pool and be signed over a different
-    // ring than the verifier rebuilds, which fails as "invalid membership proof".
     const r = await fetch(`${ADMIN}/v1/zkauth/preview-proof`, {
       method: "POST",
       headers,
@@ -202,8 +137,6 @@ export async function GET(req: NextRequest) {
     const d = await r.json();
     const scheme = host.includes("localhost") ? "http" : "https";
     const url = `${scheme}://${host}/_shadw/zk?p=${encodeURIComponent(d.proof)}&m=${encodeURIComponent(d.message)}&t=${encodeURIComponent(d.team)}&next=${encodeURIComponent(next)}`;
-    // Expose proof metadata so the page can visualize it (the proof itself stays
-    // server↔deployment; we only surface a short fingerprint + size).
     const proof: string = d.proof || "";
     return NextResponse.json({
       ok: true,

@@ -1,27 +1,8 @@
-// GitHub App SERVER-TO-SERVER auth for the dashboard — the App's own identity
-// (RS256 JWT from GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY), NOT the per-browser
-// user-to-server OAuth cookie (./github-app) and NOT Composio (./composio).
-//
-// This is the dashboard's half of the SAME credential + flow the hive-cloud
-// node's webhook/token-resolution path uses
-// (crates/hive-cloud/src/github_app_auth.rs — same env var names, same claim
-// shape, same two GitHub endpoints). The node uses it to clone private repos
-// on a webhook delivery with no user session; the dashboard uses it for the
-// two things the per-browser cookie could never be the source of truth for:
-//
-//   1. CONNECT STATE — `GET /app/installations` answers "is the GitHub App
-//      installed on any account" from GitHub's own record, so a fresh browser
-//      (no gh_app_tok cookie) still shows the real connection state instead of
-//      wrongly prompting to connect. The cookie degrades to a cache.
-//   2. OUTBOUND WRITES — `POST /app/installations/{id}/access_tokens` mints a
-//      short-lived installation token so the GitOps writers (config-repo sync,
-//      project CI webhook/workflow install) actually apply even when the
-//      triggering request carries no user token, instead of silently no-op'ing
-//      on "github-not-connected".
-//
-// SECURITY (mirrors the Rust module): never log or return the private key, a
-// signed JWT, or a minted installation token — errors carry GitHub's HTTP
-// status + message only (GitHub error bodies never echo credentials back).
+// GitHub App SERVER-TO-SERVER auth for the dashboard: the App's own identity (an RS256 JWT from GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY), not the
+// per-browser OAuth cookie (./github-app) and not Composio. It is the dashboard's half of the credential the hive-cloud node's webhook path uses
+// (crates/hive-cloud/src/github_app_auth.rs: same env names, claims and endpoints), serving `listAppInstallations()` (the platform-wide installation
+// record, a diagnostic that never says a given user is connected) and `installationTokenForRepo()` (a short-lived token so GitOps writes apply
+// without a user session). Never log or return the private key, a signed JWT or an installation token: errors carry GitHub's status + message only.
 import "server-only";
 import { createSign } from "crypto";
 
@@ -29,9 +10,6 @@ const API_BASE = "https://api.github.com";
 const API_VERSION = "2022-11-28";
 const USER_AGENT = "shadw-cloud";
 const TIMEOUT_MS = 10_000;
-// GitHub caps App JWTs at 10 minutes; stay comfortably under. `iat` is
-// backdated 60s to tolerate clock drift (GitHub's own recommendation, and the
-// same values the node's github_app_auth uses).
 const JWT_BACKDATE_SECS = 60;
 const JWT_TTL_SECS = 9 * 60;
 
@@ -65,9 +43,7 @@ function signAppJwt(): string {
   return `${body}.${sig}`;
 }
 
-/** One authenticated call against the GitHub API with the App JWT. NEVER
- *  throws — network failure surfaces as status 0 so callers get one uniform
- *  typed-error path. */
+/** One authenticated call against the GitHub API with the App JWT; never throws (a network failure is status 0) so callers get one typed-error path. */
 async function appFetch(
   jwt: string,
   path: string,
@@ -116,15 +92,8 @@ export type InstallationsResult =
   | { ok: true; installations: AppInstallation[] }
   | { ok: false; error: string };
 
-/**
- * The App's REAL installation record (`GET /app/installations`) — every
- * account (user or org) this GitHub App is installed on, per GitHub itself.
- * This is the connect-state source of truth the per-browser cookie replaced:
- * an installation here is valid regardless of any browser's cookie state.
- * An empty list is a REAL "not installed anywhere" answer; `{ok:false}` means
- * the question couldn't be asked (bad/absent key, GitHub down) and callers
- * must treat the state as UNKNOWN, never as disconnected-or-connected.
- */
+/** The App's REAL installation record (`GET /app/installations`): every account the App is installed on, platform-wide. An empty list is a real
+ *  "not installed anywhere"; `{ok:false}` means the question could not be asked (bad key, GitHub down) and the state is UNKNOWN. */
 export async function listAppInstallations(): Promise<InstallationsResult> {
   if (!installationAuthConfigured()) {
     return { ok: false, error: "GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY not set" };
@@ -155,13 +124,8 @@ export type InstallationTokenResult =
   | { ok: true; /** null = the App simply isn't installed on this repo (not an error). */ token: string | null }
   | { ok: false; error: string };
 
-/**
- * Mint a short-lived (~1h) installation access token scoped to `owner/repo` —
- * the same two-step the node's webhook clone path runs. `token: null` (with
- * ok) means "App not installed on this repo", the caller's cue to fall back
- * to another credential; `{ok:false}` is a real auth/transport failure that
- * must surface loudly, never silently downgrade to a skipped write.
- */
+/** Mints a short-lived (~1h) installation token scoped to `owner/repo` (the node's webhook clone path runs the same two steps). `token: null` with
+ *  ok means "App not installed on this repo" (the cue to fall back to another credential); `{ok:false}` is a real failure that must surface loudly. */
 export async function installationTokenForRepo(
   owner: string,
   repo: string

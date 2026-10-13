@@ -12,8 +12,7 @@ import { RegionsCommandBar } from "@/components/regions-command-bar";
 import { useNodeEventLog } from "@/lib/node-event-log";
 import type { BrowserPresence } from "@/lib/run-node-client";
 
-// Coarse continent classifier — mirrors hive_edge::continent_of so the UI labels
-// match what the backend assigns from a node's lat/lon.
+/** Coarse continent classifier mirroring `hive_edge::continent_of`, so the UI labels match what the backend assigns from a node's lat/lon. */
 function continentOf(lat: number, lon: number): string {
   if (lat < -60) return "Antarctica";
   if (lat < 0 && lon >= 110 && lon <= 180) return "Oceania";
@@ -25,19 +24,15 @@ function continentOf(lat: number, lon: number): string {
   return "Other";
 }
 
-// A GPU node (gpu_count > 0) always reads as GPU_COLOR — never a round-robin
-// palette slot — both on the map marker and the table color swatch, so blue
-// means "this node has a GPU" fleet-wide. Non-GPU nodes keep the neutral
-// round-robin palette (which deliberately excludes blue).
+/** A GPU node (`gpu_count > 0`) always uses `GPU_COLOR` (map marker and table swatch alike), so blue means "has a GPU" fleet-wide; other nodes use the
+ *  round-robin palette, which excludes blue. */
 function isGpuNode(n: NodeInfo): boolean {
   return (n.gpu_count ?? 0) > 0;
 }
 function hasRelay(n: NodeInfo): boolean {
   return Boolean(n.relay_url && n.relay_url.trim());
 }
-// GuardianDB's own iroh address is only meaningful for a currently-healthy
-// node — an address configured on a node that's down isn't a service you can
-// actually reach right now.
+/** GuardianDB's iroh address counts only for a healthy node: an address configured on a node that is down is not a service reachable now. */
 function hasGuardian(n: NodeInfo): boolean {
   return Boolean(n.guardian_iroh_addr && n.guardian_iroh_addr.trim() && n.healthy !== false);
 }
@@ -45,24 +40,18 @@ function nodeColor(n: NodeInfo, i: number): string {
   return isGpuNode(n) ? GPU_COLOR : PALETTE[i % PALETTE.length];
 }
 
-// The backend's hardcoded fallback (region_id_from_geo, main.rs) when
-// boot-time geolocation fails (offline node) is the literal string "local" —
-// display-only relabel so an operator doesn't read that as a real region;
-// grouping/filtering/color-lookup below must keep comparing on the raw value.
+/** "local" is the backend's fallback region when boot-time geolocation fails (`region_id_from_geo`): a display-only relabel, grouping, filtering and
+ *  color lookup keep the raw value. */
 const displayRegion = (r: string) => (r === "local" ? "Unknown location" : r);
+
+/** Region does not imply locality: a same-region peer at or past this RTT lives in another datacenter and is flagged. */
+const CROSS_DC_RTT_MS = 20;
 
 export default function RegionsPage() {
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
-  // Low-trust browser-node presence (constellation satellites) — a SEPARATE
-  // feed from `/v1/nodes`, never merged into the fleet marker list: browser
-  // peers must never be countable as fleet nodes anywhere in this view.
   const { data: presenceFeed } = usePoll<{ presence: BrowserPresence[] }>("/v1/browser/presence", 8000);
   const list = nodes ?? [];
   const presence = presenceFeed?.presence ?? [];
-  // "Now", as REACT STATE rather than a Date.now() read during render (which
-  // is impure and can produce hydration mismatches) — ticked on an interval,
-  // only ever mutated from that timer callback, never synchronously in an
-  // effect body.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 30_000);
@@ -70,21 +59,11 @@ export default function RegionsPage() {
   }, []);
   const regions = Array.from(new Set(list.map((n) => n.region))).sort();
 
-  // Command bar: a region-pill filter and a free-text search that highlights
-  // (never hides) a match on the map — matching the reference design's
-  // filter pills + search box, adapted onto real region/node data.
   const [query, setQuery] = useState("");
   const [activeRegion, setActiveRegion] = useState<string | null>(null);
   const [connectFlash, setConnectFlash] = useState(false);
-  // Pressing Enter in the search box reveals which countries have a real
-  // live node (green fill on the map) — matches the reference design's
-  // press-Enter-to-search behavior. Clearing the query resets it, so the
-  // map doesn't stay stuck "activated" once the search is abandoned.
   const [activated, setActivated] = useState(false);
   const scopedList = activeRegion ? list.filter((n) => n.region === activeRegion) : list;
-  // browser peers carry no region label, so a region filter hides them all —
-  // memoized so it's not a fresh [] reference on every render (it feeds the
-  // highlightId useMemo below).
   const scopedPresence = useMemo(
     () => (activeRegion ? [] : (presenceFeed?.presence ?? [])),
     [activeRegion, presenceFeed],
@@ -92,11 +71,6 @@ export default function RegionsPage() {
 
   const eventLog = useNodeEventLog(nodes);
 
-  // One colored marker per node, placed at its REAL reported coordinates. Nodes
-  // sharing a location are fanned out + uniquely colored by the map component.
-  // GPU nodes are pinned to GPU_COLOR; capability flags drive the small
-  // relay/GuardianDB badges so the constellation shows which nodes provide
-  // which mesh services, not just where they are located.
   const markers: MapMarker[] = scopedList
     .filter((n) => typeof n.lat === "number" && typeof n.lon === "number")
     .map((n, i) => ({
@@ -110,12 +84,9 @@ export default function RegionsPage() {
       hasGuardian: hasGuardian(n),
     }));
 
-  // Color lookup so the table swatches match the map markers.
   const colorByNode: Record<string, string> = {};
   scopedList.forEach((n, i) => { colorByNode[n.id] = nodeColor(n, i); });
 
-  // Satellites: only records with a shared (non-null) location — a browser
-  // that declined location sharing still runs, it just never gets a dot.
   const satellites: SatelliteMarker[] = scopedPresence
     .filter((p) => typeof p.lat === "number" && typeof p.lon === "number")
     .map((p) => ({
@@ -127,9 +98,6 @@ export default function RegionsPage() {
       ageMs: p.located_ms ? now - p.located_ms : undefined,
     }));
 
-  // First node or browser peer whose name/id/city/region matches the search
-  // box — drawn with an emphasis ring on the map, never used to hide anything
-  // else (a wrong/partial query should never make the fleet look smaller).
   const highlightId = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return null;
@@ -165,7 +133,6 @@ export default function RegionsPage() {
         {!regions.length && <span className="text-sm text-muted">discovering…</span>}
       </div>
 
-      {/* Command bar + live geographic choropleth of the mesh. */}
       <Card className="mb-5 overflow-hidden p-0">
         <RegionsCommandBar
           query={query}
@@ -181,8 +148,6 @@ export default function RegionsPage() {
         />
         <div className="relative overflow-hidden bg-white dark:bg-black">
           <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} activated={activated} />
-          {/* Live-TV plots: green OLED text on transparent glass, one per
-              serving region, aligned via the map's own projection. */}
           <RegionTvLayer liveRegions={regions} />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
@@ -191,8 +156,6 @@ export default function RegionsPage() {
               <span className="text-muted"> · {satellites.length} browser node{satellites.length === 1 ? "" : "s"}</span>
             )}
           </div>
-          {/* Legend: what a marker's color/badges mean, so the constellation
-              reads as "which nodes provide which mesh services" at a glance. */}
           <div className="absolute bottom-2 right-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-secondary">
             <span className="inline-flex items-center gap-1">
               <span className="h-2 w-2 rounded-full" style={{ background: GPU_COLOR }} />
@@ -213,9 +176,6 @@ export default function RegionsPage() {
           </div>
         </div>
         <RegionTvStats />
-        {/* Log — real, live-derived join/leave/health transitions diffed from
-            the /v1/nodes poll (see lib/node-event-log.ts); never fabricated
-            lines. Matches the reference design's log panel below the map. */}
         <div className="max-h-40 overflow-y-auto border-t border-border px-4 py-2 font-mono text-[11px] leading-5 text-secondary">
           {eventLog.length === 0 && <div className="text-muted">No mesh events observed yet this session.</div>}
           {eventLog.map((e) => (
@@ -249,14 +209,9 @@ export default function RegionsPage() {
             const gpu = isGpuNode(n);
             const relay = hasRelay(n);
             const guardian = hasGuardian(n);
-            // Region no longer implies locality: two "san-jose" nodes turned
-            // out to live 65ms away in another datacenter, silently degrading
-            // every same-region decision (pooling, placement). A same-region
-            // peer with a cross-DC RTT gets flagged amber so that mislabel is
-            // visible here instead of discovered from a 2-hour model load.
             const selfRegion = list.find((m) => m.is_self)?.region;
             const rtt = n.is_self ? 0 : (n.latency_ms ?? 0);
-            const crossDcSameRegion = !n.is_self && n.region === selfRegion && rtt >= 20;
+            const crossDcSameRegion = !n.is_self && n.region === selfRegion && rtt >= CROSS_DC_RTT_MS;
             return (
               <tr key={n.id}>
                 <Td className="font-medium">

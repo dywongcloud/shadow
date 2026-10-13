@@ -8,31 +8,10 @@ import "@xterm/xterm/css/xterm.css";
 
 type ConnState = "connecting" | "open" | "wrong-node" | "closed" | "error";
 
-/**
- * Interactive sandbox terminal (Vercel-Sandbox-parity) — a real pty over
- * `GET .../sandboxes/:id/shell` (see `crates/hive-cloud/src/sandboxes_api.rs`):
- * raw byte frames both directions, so `vim`/`less`/`^C`/tab-completion all
- * work exactly as they would over SSH, unlike the Run Command panel above
- * (one-shot, line-buffered, no stdin after launch).
- *
- * xterm.js is loaded eagerly (no dynamic import) but only ever TOUCHES the
- * DOM/websocket inside `useEffect` — safe under SSR since this whole file is
- * a client component and the effect never runs server-side.
- *
- * A browser `WebSocket` hides the handshake: a refused upgrade (403 wrong
- * tenant, 404 deleted sandbox, an anonymous request because the session
- * cookie never reached the api host) surfaces only as `onerror` + `onclose`
- * with no status, and the console line "WebSocket connection … failed:" says
- * nothing (2026-09-02, `sbx_86001c0447a14171`). So a close BEFORE open runs
- * `diagnoseHandshake`: the same sandbox is read through the same-origin
- * `/cloud` proxy, which exercises the identical tenant + record gate minus
- * the upgrade and DOES return a status. 200 there means the record and the
- * caller are fine and only the direct api-host hop refused — the one thing
- * that differs is the credential the browser attached, i.e. the `hive_jwt`
- * cookie was not sent cross-subdomain — so the session is re-minted (which
- * sets the parent-domain cookie) and the connect is retried once. Anything
- * else is written into the pane verbatim instead of a silent "disconnected".
- */
+/** Interactive sandbox terminal: a real pty over `GET .../sandboxes/:id/shell` (sandboxes_api.rs), raw byte frames both ways so vim/less/^C/tab-completion
+ *  work as over SSH. A browser WebSocket hides the handshake status, so a close BEFORE open runs `diagnoseHandshake`: it reads the same sandbox through the
+ *  same-origin `/cloud` proxy (identical tenant + record gate, but with a status); a 200 there means only the direct api-host hop refused, i.e. the `hive_jwt`
+ *  cookie was not sent cross-subdomain, so the session is re-minted (parent-domain cookie) and the connect retried once; anything else is written into the pane. */
 export function TerminalPanel({ project, sandboxId }: { project: string; sandboxId: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<import("@xterm/xterm").Terminal | null>(null);
@@ -106,9 +85,6 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
     const el = containerRef.current;
     if (!el) return;
 
-    // Lazy module import (not a lazy DOM attach) — keeps xterm's ~250KB out
-    // of the initial sandbox-detail bundle since most visits never open the
-    // terminal, without deferring the actual browser APIs this effect needs.
     const [{ Terminal }, { FitAddon }] = await Promise.all([
       import("@xterm/xterm"),
       import("@xterm/addon-fit"),
@@ -146,8 +122,6 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
     };
     socket.onclose = () => {
       setState((s) => (s === "wrong-node" ? s : "closed"));
-      // Closed before it ever opened = the handshake itself was refused; the
-      // browser gives no status, so go and get one.
       if (!opened && !disposed) void diagnoseHandshake(term);
     };
     socket.onerror = () => setState("error");
@@ -157,12 +131,6 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
           const msg = JSON.parse(ev.data);
           if (msg.type === "wrong_node") {
             setWrongNodeOwner(msg.owner ?? null);
-            // The server's own reason wins. Cross-node sessions are TUNNELED
-            // over the mesh (there is no cert-covered per-node hostname to
-            // redirect a browser to), so "reconnect from a session against
-            // that node" was never actionable advice — the owner's refusal
-            // (not the owner, unsupported build, or a shell it could not open)
-            // is the only honest thing to show.
             const reason =
               typeof msg.message === "string" && msg.message.length > 0
                 ? msg.message
@@ -208,10 +176,6 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
     };
   }, [connect, connectNonce]);
 
-  // Resize the pty when the terminal element's box changes (container
-  // resize, expand/collapse toggle, window resize) — ResizeObserver instead
-  // of a window `resize` listener so a layout-only change (the expand
-  // toggle) is also caught.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
