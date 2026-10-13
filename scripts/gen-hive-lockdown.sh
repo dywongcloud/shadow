@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Regenerates scripts/hive-lockdown.sh's PEERS line from
-# ansible/inventory/hosts.ini -- SOURCE OF TRUTH, matching the same
-# awk-derivation style scripts/deploy-ui-fleet.sh already uses for its host
-# list, so the peer roster is never hand-copied (and never drifts) again.
+# Regenerate the PEERS and PRIVATE_PEERS lines of scripts/hive-lockdown.sh from ansible/inventory/hosts.ini (the source
+# of truth), so the peer roster is never hand-copied.
 #
 # Usage: scripts/gen-hive-lockdown.sh   (rewrites scripts/hive-lockdown.sh in place)
 set -euo pipefail
@@ -12,13 +10,9 @@ INVENTORY="$REPO_ROOT/ansible/inventory/hosts.ini"
 TARGET="$REPO_ROOT/scripts/hive-lockdown.sh"
 [ -f "$INVENTORY" ] || { echo "inventory not found: $INVENTORY" >&2; exit 1; }
 
-# A host marked `hive_retired=true` (its instance no longer exists) is left
-# OUT: a cloud provider re-issues a released public IP to other customers, so
-# keeping it would hand a stranger peer-level access through every node's
-# firewall. Witnessed 2026-09-30: 18 of 24 trusted IPs belonged to instances
-# the account no longer held.
-roster() { # $1 = inventory var holding the address to emit
-  awk -v key="$1" '
+live_host_values() {
+  local inventory_key="$1"
+  awk -v key="$inventory_key" '
     /^[[:space:]]*#/ { next }
     /ansible_host=/ {
       addr = ""; retired = 0
@@ -31,8 +25,8 @@ roster() { # $1 = inventory var holding the address to emit
     }
   ' "$INVENTORY"
 }
-mapfile -t PEER_IPS < <(roster ansible_host)
-mapfile -t PRIVATE_IPS < <(roster hive_private_ip)
+mapfile -t PEER_IPS < <(live_host_values ansible_host)
+mapfile -t PRIVATE_IPS < <(live_host_values hive_private_ip)
 [ ${#PEER_IPS[@]} -gt 0 ] || { echo "no live ansible_host entries parsed from $INVENTORY" >&2; exit 1; }
 
 PEERS_LINE="${PEER_IPS[*]}"

@@ -6,11 +6,6 @@ set -uo pipefail
 VM="${FC_VM:-hive}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Clear warm-up pressure: remove stopped/leaked (e.g. "Created") host containers
-# so a fresh boot doesn't inherit a saturated podman lock pool / process table.
-# `container prune` only touches NON-running containers — live deployment cells
-# (hive-cell-*/hive-db-*) are left alone. Runs every boot + on the lima agent's
-# StartInterval, so leaks can never accumulate to the point of fork starvation.
 if command -v podman >/dev/null 2>&1; then
   pruned="$(podman container prune -f 2>/dev/null | grep -c .)" || true
   [ "${pruned:-0}" != 0 ] && echo "$(date '+%H:%M:%S') pruned ${pruned} stopped/leaked containers"

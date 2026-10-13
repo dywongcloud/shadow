@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# mint-operator-jwt.sh — mint a short-lived platform-operator JWT for a
-# hive-cloud node, reading the signing secret from the RUNNING process's
-# environment (never from a unit file — AGENTS.md's drop-in gotcha: the file
-# can lie, /proc cannot).
+# Mint a short-lived platform-operator JWT for a hive-cloud node. The signing secret is read from the RUNNING process's
+# environment (/proc/<pid>/environ), never from a unit file: the file can lie, /proc cannot.
 #
 # Usage:
 #   scripts/mint-operator-jwt.sh <host>            # ssh root@<host> for the secret
 #   scripts/mint-operator-jwt.sh --local           # read the local hive-cloud process
 #   scripts/mint-operator-jwt.sh <host> <ttl_secs> # custom TTL (default 300)
 #
-# The token carries platform_admin:true, which is what require_operator actually
-# checks (crates/hive-cloud/src/admin.rs operator_allowed). Prior ad-hoc mints
-# kept failing two ways: (1) nested-quoting inline python through ssh mangled it
-# (str/bytes concat errors), and (2) a {"role":"operator"}-only token is 403 —
-# the full claim set is {sub, tenant, role, iat, exp, platform_admin}. This
-# script exists so neither mistake is ever re-derived by hand. The secret is
-# fetched over the ssh channel and the HMAC mint happens locally — nothing
-# nested, nothing printed but the token.
+# The token carries the full claim set `operator_allowed` checks (platform_admin:true, crates/hive-cloud/src/admin.rs); a
+# {"role":"operator"}-only token is 403. The secret travels over the ssh channel and the HMAC is minted locally, so only
+# the token is printed.
 set -euo pipefail
 
 HOST="${1:?usage: mint-operator-jwt.sh <host>|--local [ttl_secs]}"

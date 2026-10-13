@@ -1,15 +1,9 @@
-# Lima VM that can run Firecracker microVMs (Hive "cells") on Apple Silicon.
-#
-# The trick from the Medium write-up: Apple M3/M4 added hardware *nested*
-# virtualization, so a Linux guest run through Apple's Virtualization.framework
-# ("vz") can expose /dev/kvm — and Firecracker (aarch64) runs natively inside.
-#
-# Requirements: macOS 13+ on an M3 or M4, Lima >= 1.0.
+# Lima VM that runs Firecracker microVMs (Hive "cells") on Apple Silicon: nested virtualization through vz (M3+, macOS 15+,
+# Lima >= 1.0) exposes /dev/kvm to the guest.
 # Start with:   limactl start --name=hive ./scripts/lima-hive.yaml
 # Shell in:     limactl shell hive
 
 vmType: "vz"
-# The golden ticket: exposes KVM to the guest so Firecracker can use it.
 nestedVirtualization: true
 
 cpus: 6
@@ -20,7 +14,6 @@ images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
     arch: "aarch64"
 
-# Mount the repo read-only so we can build the Rust binaries inside the guest.
 mounts:
   - location: "~/fluid/hive"
     writable: false
@@ -35,7 +28,6 @@ provision:
       apt-get update
       apt-get install -y curl ca-certificates e2fsprogs git build-essential \
         pkg-config docker.io acl
-      # Let the default lima user drive docker + kvm.
       usermod -aG docker,kvm "${LIMA_CIDATA_USER}" || true
       modprobe vhost_vsock || true
 

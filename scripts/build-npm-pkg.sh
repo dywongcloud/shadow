@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
-# Build ONE binary for ONE target and stage it into an npm platform package
-# (the esbuild/swc/turbo pattern: a tiny dispatcher package with per-platform
-# `optionalDependencies`, each scoped by `os`/`cpu` so npm only ever installs
-# the one that matches). This script is the SINGLE source of truth for that
-# staging step — both a local build (this machine, darwin only) and CI (every
-# platform) call it, so the package shape can never drift between them.
+# Stage ONE binary for ONE target into an npm platform package (npm/<pkg-base>-<os>-<cpu>/), an optionalDependency of
+# the dispatcher package that npm selects by its os/cpu fields. Local builds and CI both call this script, so the
+# package shape cannot drift between them.
 #
 # Usage:
 #   scripts/build-npm-pkg.sh <crate> <bin-name> <npm-pkg-base> <target-triple> <npm-os> <npm-cpu>
-#
-# Example (what this script's own local run below invokes):
+# Example (builds target/aarch64-apple-darwin/release/shadw, stages npm/shadw-cli-darwin-arm64/{package.json,bin/shadw}):
 #   scripts/build-npm-pkg.sh shadw-cli shadw shadw-cli aarch64-apple-darwin darwin arm64
-#   -> builds target/aarch64-apple-darwin/release/shadw
-#   -> stages npm/shadw-cli-darwin-arm64/{package.json, bin/shadw}
 set -euo pipefail
 
 CRATE="${1:?crate name, e.g. shadw-cli}"
@@ -41,11 +35,6 @@ mkdir -p "${PKG_DIR}/bin"
 cp "$BUILT_BIN" "${PKG_DIR}/bin/${BIN}"
 chmod 0755 "${PKG_DIR}/bin/${BIN}"
 
-# `os`/`cpu` are what make this SAFE as an optionalDependency: npm refuses to
-# even ATTEMPT installing a package whose os/cpu does not match the current
-# machine, before any network call — a Linux user's `npm install shadw` never
-# touches this darwin package at all, and a failure to publish this specific
-# platform package later cannot break an install on a DIFFERENT platform.
 cat > "${PKG_DIR}/package.json" <<EOF
 {
   "name": "${PKG_NAME}",
