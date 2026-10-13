@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-10-13 — san-jose builds died on a dead resolver behind the provider npm mirror
+
+Every uncached `npm ci` / `npm install` on fc-sanjose failed: `npm ci` with
+npm 10's `Exit handler never called!` after ~70 s, `npm install` with
+`ENOTFOUND mirrors.tencentyun.com`. Root cause: the node's `/etc/resolv.conf`
+had been overwritten four days earlier (`nameserver 1.1.1.1`, a litebox
+guest-DNS probe-session leftover) while `/root/.npmrc` points npm at
+`https://mirrors.tencentyun.com/npm`, a name only the provider's resolvers
+answer. The host build lane forwards HOME (the isolated lane does not), so the
+mirror configured every host-lane install; installs whose dependency set was
+warm in `~/.npm/_cacache` kept passing, which hid it. Reproduced red in a
+private mount namespace (host file untouched) and green after
+`nmcli general reload dns-rc`; real platform builds of vercel/vercel
+`examples/nextjs` and `examples/node` reached Ready on san-jose.
+
+- **Host-lane registry guard** (`build_registry.rs`, wired in
+  `IsolatedBuild::run_host`): the host registry is probed once per build; only
+  a KNOWN public-mirror host that is dark while registry.npmjs.org answers
+  switches that build to the public registry (`npm_config_registry`, verified
+  for npm 10, pnpm 10, yarn 1). A tenant-owned registry (env key, command text,
+  repo `.npmrc`/`.yarnrc*`/`bunfig.toml`/`pnpm-workspace.yaml`) always wins, an
+  unknown/private registry is never replaced (dependency confusion), and the
+  build-log URL is redacted. `HIVE_BUILD_REGISTRY_GUARD=0` disables it.
+- **Node-server detection** (`fluid_build::framework::detect`): Vercel's
+  generic `node` preset — `server.{cjs,js,mjs,mts,ts,cts}` at the root or
+  `src/` — so `examples/node` (a bare `http.createServer`, no framework
+  dependency, no start script) is served instead of shipped as a Static site
+  that answered `NOT_FOUND` after a successful install.
+- **Audits**: new `scripts/audit-build-registry.sh` (DNS/TCP/HTTP of each
+  node's configured registry plus its resolvers); `audit-public-listeners.sh`
+  no longer reports `NONE!` for a live nft-adopted `ip filter HIVE_LOCKDOWN`
+  chain (iptables refuses the whole table once a native nft rule is in it),
+  skips `hive_retired` hosts (matching the roster generator) and reports
+  non-root-ssh hosts as SKIPPED. Findings still open: all five live nodes
+  enforce a 6-peer lockdown roster against 7 expected (fc-orlando missing),
+  and the nft-first `hive-lockdown.sh` does not retire a legacy `ip filter`
+  chain when it rolls.
+- Needs a fleet roll to take effect (backend only; `ui/` is unaffected).
+
 ## 2026-09-24 — CS-7 gossip rounds never wait on dead peers
 
 fc-virginia's gossip round was `join_all` over every target, so it lasted as

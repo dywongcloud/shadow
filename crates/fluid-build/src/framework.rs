@@ -761,11 +761,43 @@ fn detect_with_package(
         {
             return preset("node").unwrap();
         }
+        // A conventional server entry => the generic Node preset. Vercel's own
+        // `node` preset (packages/frameworks, `slug: 'node'`) detects exactly
+        // these twelve paths and nothing else. vercel/vercel's examples/node —
+        // `src/server.ts` on a bare `http.createServer`, no framework
+        // dependency, no start script — otherwise fell through to the static
+        // preset and shipped its source tree as a website: the install
+        // succeeded, the deployment went Ready, and every request answered
+        // NOT_FOUND (witnessed 2026-10-13). Ordered after every framework and
+        // server-dependency check, so it only names apps nothing else claimed.
+        if GENERIC_NODE_ENTRIES
+            .iter()
+            .any(|entry| repo.join(entry).is_file())
+        {
+            return preset("node").unwrap();
+        }
     }
 
     // 3) Plain static site (has an index.html) or unknown -> static.
     preset("static").unwrap()
 }
+
+/// Vercel's generic `node` preset detectors, verbatim: `server.*` at the root
+/// or under `src/`, in every module flavour.
+const GENERIC_NODE_ENTRIES: [&str; 12] = [
+    "server.cjs",
+    "server.js",
+    "server.mjs",
+    "server.mts",
+    "server.ts",
+    "server.cts",
+    "src/server.cjs",
+    "src/server.js",
+    "src/server.mjs",
+    "src/server.mts",
+    "src/server.ts",
+    "src/server.cts",
+];
 
 fn has_dep(pkg: &serde_json::Value, name: &str) -> bool {
     for key in ["dependencies", "devDependencies"] {

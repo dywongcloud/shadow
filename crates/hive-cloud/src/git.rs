@@ -8572,7 +8572,10 @@ done' hive-delink {} +
                         };
                     if let Some(entry) = launcher_entry {
                         let mut cmd = vec!["node".to_string()];
-                        if entry.ends_with(".ts") || entry.ends_with(".mts") {
+                        if entry.ends_with(".ts")
+                            || entry.ends_with(".mts")
+                            || entry.ends_with(".cts")
+                        {
                             cmd.push("--experimental-strip-types".to_string());
                         }
                         cmd.push(EXPRESS_LAUNCHER_FILE.to_string());
@@ -8758,7 +8761,7 @@ fn discover_exported_server_entry(dir: &Path) -> Option<String> {
     }
     for prefix in ["", "src/", "api/", "server/"] {
         for stem in ["index", "server", "app", "main"] {
-            for ext in [".js", ".mjs", ".cjs", ".ts", ".mts"] {
+            for ext in [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"] {
                 candidates.push(format!("{prefix}{stem}{ext}"));
             }
         }
@@ -10132,6 +10135,9 @@ struct IsolatedBuild {
     /// backend. Firecracker keeps `host_build = false` and stays
     /// isolated-executor-only.
     host_build: bool,
+    /// This build's verdict on the host's package registry, assessed lazily by
+    /// the first host command (`registry_fallback`). `None` = not assessed yet.
+    registry: Option<crate::build_registry::Plan>,
 }
 
 impl IsolatedBuild {
@@ -10151,6 +10157,7 @@ impl IsolatedBuild {
             root: root.to_path_buf(),
             session: Some(session),
             host_build: false,
+            registry: None,
         })
     }
 
@@ -10163,7 +10170,61 @@ impl IsolatedBuild {
             root: root.to_path_buf(),
             session: None,
             host_build: true,
+            registry: None,
         }
+    }
+
+    /// The registry environment this host command should run with, if any.
+    /// The host registry is probed once per build (`build_registry`); a dark
+    /// mirror with a live public registry yields the public-registry override,
+    /// unless the repository or the command already chose its own registry.
+    async fn registry_fallback(
+        &mut self,
+        dir: &Path,
+        command: &str,
+        env: &std::collections::BTreeMap<String, String>,
+        home: &Path,
+        cloud: &Arc<CloudState>,
+        bid: &str,
+    ) -> Option<(&'static str, &'static str)> {
+        use crate::build_registry::{assess, tenant_owns_registry, Plan, GLOBAL_NPMRC, PUBLIC_REGISTRY};
+        if self.registry.is_none() {
+            let plan = assess(home, Path::new(GLOBAL_NPMRC)).await;
+            match &plan {
+                Plan::Fallback { configured, reason } => {
+                    cloud.builds.log(
+                        bid,
+                        format!(
+                            "WARN: BUILD_REGISTRY_FALLBACK: this node's package registry {configured} is \
+                             unreachable ({reason}); commands without repository-owned registry settings \
+                             use {PUBLIC_REGISTRY} instead. Operator: this build host is degraded — \
+                             restore its resolver or mirror."
+                        ),
+                    );
+                    tracing::warn!(build = %bid, %configured, %reason, "BUILD_REGISTRY_FALLBACK: host registry unreachable, using the public registry");
+                }
+                Plan::Dark { configured, reason } => {
+                    cloud.builds.log(
+                        bid,
+                        format!(
+                            "WARN: BUILD_REGISTRY_DARK: neither this node's package registry {configured} \
+                             nor registry.npmjs.org is reachable ({reason}); installs can only succeed \
+                             for dependencies already in the local package cache."
+                        ),
+                    );
+                    tracing::warn!(build = %bid, %configured, %reason, "BUILD_REGISTRY_DARK: no package registry reachable from this build host");
+                }
+                Plan::Unchanged => {}
+            }
+            self.registry = Some(plan);
+        }
+        if !matches!(self.registry, Some(Plan::Fallback { .. })) {
+            return None;
+        }
+        if tenant_owns_registry(command, dir, &self.root, env).await {
+            return None;
+        }
+        Some(crate::build_registry::FALLBACK_ENV)
     }
 
     fn workspace_path(&self, dir: &Path) -> anyhow::Result<crate::build_executor::WorkspacePath> {
@@ -10297,11 +10358,18 @@ impl IsolatedBuild {
             &std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
         );
         cmd.env("PATH", path_value);
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
-        );
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        cmd.env("HOME", &home);
         cmd.env("CI", "1");
+        // HOME carries the host user's `~/.npmrc` (a provider mirror on the
+        // fleet's images); a dark mirror must not fail the build. Set BEFORE
+        // the tenant's variables so an explicit tenant value always wins.
+        if let Some((key, value)) = self
+            .registry_fallback(dir, command, env, Path::new(&home), cloud, bid)
+            .await
+        {
+            cmd.env(key, value);
+        }
         for (key, value) in env {
             cmd.env(key, value);
         }

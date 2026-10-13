@@ -23,6 +23,7 @@ mod browser_metering;
 mod browser_presence;
 mod build_coordinates;
 mod build_executor;
+mod build_registry;
 mod cloudflare_dns;
 mod cluster;
 mod coi;

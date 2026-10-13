@@ -288,6 +288,26 @@ memories/notes whose durable content it absorbed.
   a row. A preview's URL is `commit_alias || branch_alias || id_alias`, and the
   ledger's checksum is verified over the payload bytes AS STORED
   (`Box<RawValue>`), never over a re-serialization.
+- **The host build lane's package registry is part of the node's health.**
+  `run_host` clears the env but forwards HOME, so `/root/.npmrc` (Tencent images:
+  `https://mirrors.tencentyun.com/npm`, answerable only by the provider's
+  resolvers) configures every host-lane install. A dead resolver fails every
+  uncached install (npm 10: `Exit handler never called!` after ~70 s) yet hides
+  while the npm cache is warm. `build_registry::assess` probes once per build and,
+  only for a KNOWN public-mirror host that is dark while registry.npmjs.org
+  answers, sets `npm_config_registry` (verified: npm 10, pnpm 10, yarn 1). Never
+  fall back from an unknown/private registry (dependency confusion); a
+  tenant-owned registry — env key, command text, any repo `.npmrc`/`.yarnrc*`/
+  `bunfig.toml`/`pnpm-workspace.yaml` naming one — always wins (env beats a
+  project `.npmrc`). `HIVE_BUILD_REGISTRY_GUARD=0` disables it,
+  `HIVE_BUILD_REGISTRY_MIRRORS` extends the mirror list;
+  `scripts/audit-build-registry.sh` is the fleet check. Never hand-edit a node's
+  `/etc/resolv.conf`: reproduce DNS faults in `unshare -m` + a bind mount, and
+  `nmcli general reload dns-rc` restores the file.
+- `fluid_build::framework::detect` mirrors Vercel's generic `node` preset: a
+  `package.json` repo that no framework marker, dependency or start script
+  claimed, with `server.{cjs,js,mjs,mts,ts,cts}` at its root or `src/`, takes the
+  Node lane (a self-listening entry runs through the express launcher).
 
 ## Placement & capacity
 
