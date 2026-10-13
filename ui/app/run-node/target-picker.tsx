@@ -1,41 +1,5 @@
 "use client";
 
-// browser-run-node-target-picker: the authenticated target picker for the
-// /run-node page. Lists what this node can OPTIONALLY attach itself to in the
-// current tenant (derived from the replicated deployment descriptor metadata
-// the /cloud deployments endpoint already serves — local with leader/owner
-// fallback handled server-side): browser-eligible functions with their runtime
-// limits, and deployments whose only browser contribution is a replicated
-// database. Artifact source and digests are never shown and never asked for.
-//
-// browser-auto-serve-eligible-set: this picker is no longer how work REACHES a
-// node. The first, default option is automatic — the fleet derives this
-// tenant's whole browser-eligible set server-side
-// (`browser_artifacts::eligible_for_tenant`) and re-derives it on every
-// admission renewal, so a function deployed after the node started begins being
-// served without anyone touching this page. What remains here is pinning ONE
-// function or database on purpose, which is exactly as narrow as it looks.
-//
-// bn-picker-drop-capacity-only: there is deliberately NO "serve nothing" option
-// any more. It described a node that served no function AND replicated no
-// database — a state the platform no longer produces for an admitted node:
-// `eligible_for_tenant` hands over the whole serve set unasked, and
-// `browser_db::auto_db_deployment_for_tenant` now rendezvous-hashes the
-// tenant's browser_db projects by endpoint id instead of refusing whenever
-// there is more than one. Offering opt-in-to-uselessness was describing a
-// node shape that had stopped existing, so the option was removed rather than
-// relabelled: every node that starts contributes.
-//
-// browser-node-optional-serve-target: this picker is still NOT a gate — every
-// option, INCLUDING an empty list, starts a working node. Start never depends
-// on anything chosen here. An empty eligible set is not an error and not a
-// choice: it is a tenant that has nothing browser-eligible YET, and the node
-// begins serving on the next lease renewal with no restart.
-//
-// Keyboard: a plain radio group, so arrow keys move between options and Tab
-// enters/leaves the group — no custom key handling to get wrong. The whole
-// card is the <label>, which keeps the click/tap target large on mobile.
-
 import { Database, RadioTower, Sparkles } from "lucide-react";
 import type { ExcludedDeployment, RunNodeTarget } from "@/lib/run-node-targets";
 
@@ -44,10 +8,7 @@ export interface TargetSelection {
   fn: string;
 }
 
-/** What the picker can be set to: the automatic eligible set (the default —
- *  the fleet decides, live) or ONE deliberately pinned target. Both serve
- *  and/or replicate something; there is no third "contributes nothing" shape
- *  (see bn-picker-drop-capacity-only above). */
+/** The automatic eligible set (the fleet decides, live) or ONE deliberately pinned target; both serve and/or replicate something. */
 export type PickerSelection = TargetSelection | "auto";
 
 export function targetKey(t: TargetSelection): string {
@@ -81,26 +42,15 @@ export function TargetPicker({
   disabled,
 }: {
   targets: RunNodeTarget[];
-  /** Whether this tenant has ANY ready deployment carrying a `browser_db`
-   *  block. Deliberately not derivable from `targets`, which lists a database
-   *  target only for deployments with no browser-eligible function — a project
-   *  that has both contributes a function target and would make the automatic
-   *  option under-describe what this node actually holds. The fleet assigns the
-   *  replica itself (`browser_db::auto_db_deployment_for_tenant`), so this only
-   *  decides whether the copy MENTIONS replication, never which database. */
+  /** Whether this tenant has ANY ready deployment carrying a `browser_db` block — read off the
+   *  deployment list, since `targets` lists a database target only for deployments with no
+   *  browser-eligible function. Decides only whether replication is mentioned. */
   hasDatabase: boolean;
-  /** Deployments contributing no selectable target because they aren't ready,
-   *  or expose neither a browser-eligible function nor a browser database —
-   *  each with the REASON. A bare count told the one person who cared least
-   *  ("something is excluded") and the one who cared most ("which of my 14, and
-   *  why?") exactly the same nothing, and its single blanket sentence was wrong
-   *  for every deployment that simply predates eligibility evaluation. */
+  /** Deployments contributing no selectable target (not ready, or neither a browser-eligible function nor a browser database), each with its reason. */
   excluded: ExcludedDeployment[];
   loading: boolean;
   fetchError: string | null;
-  /** `"auto"` = the automatic eligible set (the default and the only unpinned
-   *  shape), an object = one pinned target. Both are real, supported ways to
-   *  run a node — never an unfinished form. */
+  /** `"auto"` = the automatic eligible set (the only unpinned shape), an object = one pinned target. */
   selected: PickerSelection;
   onSelect: (sel: PickerSelection) => void;
   /** True while the node is running — the attached target is fixed for the
@@ -122,10 +72,6 @@ export function TargetPicker({
           title="Everything this team can run in a browser"
           detail={
             <>
-              {/* The count is what the picker can SEE right now; the node is
-                  admitted for whatever the fleet resolves at admission time and
-                  re-resolves on every renewal, so this never claims to be the
-                  authoritative set — it describes it. */}
               {loading && !fetchError
                 ? "Checking what this team has…"
                 : eligible === 0
@@ -226,11 +172,7 @@ export function TargetPicker({
   );
 }
 
-/** The per-deployment "why isn't mine here?" disclosure. Collapsed by default
- *  (it is a diagnostic, not the primary flow) but every reason is one click
- *  away and none of them is invented in this file: a ready deployment's reason
- *  is the BUILD's own verdict, stamped on the manifest and gossiped, so the
- *  sentence shown here is the sentence the build log printed. */
+/** The per-deployment "why isn't mine here?" disclosure, collapsed by default; a ready deployment's reason is the build's own verdict, gossiped with the manifest. */
 function ExcludedList({ excluded, className }: { excluded: ExcludedDeployment[]; className?: string }) {
   if (excluded.length === 0) return null;
   return (

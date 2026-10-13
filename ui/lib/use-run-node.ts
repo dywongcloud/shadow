@@ -6,40 +6,13 @@ import { resolveTargetFresh } from "./run-node-targets";
 import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
 import { presenceState, readPresenceGeo, upsertPresence } from "./run-node-client";
 
-/* The ABI version is part of the worker's IDENTITY, not just something it
- * reports. A SharedWorker is keyed by (url, name) and OUTLIVES page reloads
- * for as long as any tab holds it — so before this, shipping a new worker
- * build did nothing for anyone with a tab already open: every reload
- * re-attached to the OLD instance, which kept requesting the old
- * `?v=<WASM_BUNDLE_VERSION>` wasm (cache-first in sw.js) and kept throwing an
- * error string that no longer exists in the deployed binary. The only
- * documented remedy was "close every tab first", which no user will discover.
- * Versioning the url + name makes a post-deploy page attach to a genuinely
- * new worker immediately; the stale one simply dies with its last tab. */
 const WORKER_URL = `/run-node-worker.js?abi=${HOST_ABI_VERSION}`;
 const WORKER_NAME = `shadw-run-node-v${HOST_ABI_VERSION}`;
 /** Well inside the backend's 90s presence TTL, so one missed publish never
  *  de-orbits a live node from the constellation. */
 const PRESENCE_REFRESH_MS = 45_000;
-/** Claimed by whichever mounted `useRunNode` instance publishes presence, so
- *  /run-node (page + sidebar control, two instances) doesn't double the POST
- *  rate for one node. Module scope = per document, which is the right grain:
- *  the node is per-document too (one SharedWorker per origin, surfaced into
- *  each tab). */
+/** The one mounted `useRunNode` instance that publishes presence (module scope = per document). */
 let presenceOwner: object | null = null;
-// bn-impl-relay-tls: real WSS relays now exist (deployed + live-witnessed
-// 2026-08-01 on fc-bangkok/fc-virginia/fc-sanjose) -- before this, an unset
-// NEXT_PUBLIC_HIVE_BROWSER_RELAY meant `boot()` always received an empty
-// string, which fails RelayUrl parsing immediately (see
-// crates/hive-browser/src/lib.rs's `boot`), so a browser node was never
-// actually functional in any deployment that hadn't separately configured
-// this var. `BrowserNode.boot()` now takes a COMMA-SEPARATED relay list
-// (same convention as the fleet's own HIVE_RELAY_URLS) and builds a real
-// iroh RelayMap covering all of them, so this hands all 3 real relays by
-// default -- iroh's own relay-client picks and fails over between entries in
-// a RelayMap on its own; this is real multi-relay coverage, not just one
-// static URL. NEXT_PUBLIC_HIVE_BROWSER_RELAY still overrides the whole list
-// when set (e.g. a deployment that wants to pin to a subset).
 const DEFAULT_RELAYS = [
   "https://fc-sanjose.relay.shadw.app:3343",
   "https://fc-bangkok.relay.shadw.app:3343",
@@ -47,41 +20,15 @@ const DEFAULT_RELAYS = [
 ].join(",");
 const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || DEFAULT_RELAYS;
 
-/** The page half of the browser↔browser direct lane (bn-browser-peer-webrtc-mesh).
- *
- *  `RTCPeerConnection` is `[Exposed=Window]` — it exists in NEITHER worker
- *  context this file drives (SharedWorker, and the Web Locks fallback's
- *  dedicated Worker), so the run-node worker, which owns the node, the
- *  admission and every capability, structurally cannot open a peer connection
- *  itself. It brokers one through a connected page exactly like the sqlite
- *  DedicatedWorker above:
- *
- *    worker -> page : { type: "meshPeerRequest", requestId }
- *    page  -> worker: { type: "meshPeerPort", requestId } + transfer [port]
- *    worker -> page : { type: "meshPeerDone", requestId }
- *
- *  THE PAGE IS NOT TRUSTED WITH POLICY and this broker is deliberately the
- *  thinnest possible thing: it constructs the agent, hands back a port and
- *  stops the agent on request or teardown. It never learns a peer id, never
- *  chooses an ICE server, never sees a capability, an artifact byte or a
- *  database grant — all of those stay in the worker, which received them
- *  server-derived over the authenticated admission path. The agent module
- *  itself (peer-mesh-agent.js) does the one check a page IS uniquely placed to
- *  make: that a remote SDP's fingerprint is the one the worker verified an
- *  ed25519 signature over, before the description reaches the DTLS stack.
- *
- *  NOT hosting is a fully supported state, and every failure here lands in it:
- *  no RTCPeerConnection, an unpublished module, a blocked import — the worker's
- *  own broker timeout fires, `status.mesh` says so honestly, and every byte
- *  keeps riding the relay. The lane is an optimisation, never a dependency. */
+/** Page half of the browser↔browser direct lane: `RTCPeerConnection` is Window-only, so the
+ *  run-node worker brokers a peer connection through a connected page (`meshPeerRequest` →
+ *  `meshPeerPort` + transferred port → `meshPeerDone`). The page never learns a peer id, ICE
+ *  server, capability or grant; not hosting is a supported state the worker's broker timeout
+ *  reports. */
 type MeshAgentModule = { startMeshAgent: (port: MessagePort) => { stop: () => void } };
 
 function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[]) => void) {
   let agent: { stop: () => void; requestId: number } | null = null;
-  // Monotonic, so an in-flight import whose request has already been
-  // superseded (or whose page is unmounting) never installs a stale agent —
-  // an orphaned agent holds live PeerConnections after the admission that
-  // authorized them is gone.
   let generation = 0;
 
   const end = (requestId?: number) => {
@@ -100,10 +47,6 @@ function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[
     end();
     if (typeof RTCPeerConnection !== "function") return;
     const mine = generation;
-    // Loaded from the deployed origin at RUNTIME, never bundled: the module is
-    // a hand-written source published by ui/scripts/sync-browser-node.mjs
-    // alongside the wasm bundle, and the worker imports the same file the same
-    // way. Bundling it here would fork one contract into two builds.
     const url = `${window.location.origin}/browser-node/peer-mesh-agent.js`;
     void (import(/* webpackIgnore: true */ /* turbopackIgnore: true */ url) as Promise<MeshAgentModule>)
       .then((module) => {
@@ -114,33 +57,16 @@ function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[
         post({ type: "meshPeerPort", requestId }, [channel.port2]);
       })
       .catch(() => {
-        /* unpublished or blocked: the worker's broker timeout reports it */
       });
   };
 
   return { host, end };
 }
 
-/** The page half of node-worker's synchronous-`fs` bridge
- *  (bn-node-worker-service-worker-sync-fs).
- *
- *  `navigator.serviceWorker` is `[Exposed=Window]` — it exists in NEITHER
- *  worker context this file drives — so the run-node worker cannot register
- *  node-worker's sw.js itself, and without that registration there is no
- *  synchronous `fs` and therefore no working `require` inside a guest app.
- *  It brokers the registration through a connected page exactly like the mesh
- *  agent above:
- *
- *    worker -> page : { type: "syncFsRegisterRequest", requestId,
- *                       swUrl, workerUrl, agentUrl }
- *    page  -> worker: { type: "syncFsRegisterResult", requestId, ok, ... | error }
- *
- *  The page is trusted with nothing here either: it registers, reports what it
- *  registered (scope / scriptURL / prefix) and stops. It never sees a mount, a
- *  capability or a byte — all of that stays in the worker. THE REGISTRATION
- *  LOGIC ITSELF lives in the published module, not here, for the same reason
- *  peer-mesh-agent.js does: one contract, one build, loaded from the deployed
- *  origin at runtime. */
+/** Page half of node-worker's synchronous-`fs` bridge: `navigator.serviceWorker` is Window-only,
+ *  so the run-node worker brokers the sw.js registration through a connected page
+ *  (`syncFsRegisterRequest` → `syncFsRegisterResult`); the registration logic lives in the
+ *  published agent module, loaded from the deployed origin at runtime. */
 type SyncFsAgentModule = {
   registerNodeWorkerSyncFs: (options: {
     swUrl: string;
@@ -150,15 +76,10 @@ type SyncFsAgentModule = {
 };
 
 function createSyncFsBroker(post: (message: unknown) => void) {
-  // Monotonic: an in-flight import whose request was superseded (or whose page
-  // is unmounting) never reports a stale registration.
   let generation = 0;
 
   const host = (requestId: number, swUrl: string, workerUrl: string, agentUrl?: string) => {
     const mine = ++generation;
-    // The worker is the authority on where these assets live (it resolves them
-    // against its own import.meta.url); the origin fallback keeps an older
-    // worker's request working.
     const url = agentUrl || `${window.location.origin}/browser-node/sync-fs-agent.js`;
     void (import(/* webpackIgnore: true */ /* turbopackIgnore: true */ url) as Promise<SyncFsAgentModule>)
       .then((module) =>
@@ -177,9 +98,6 @@ function createSyncFsBroker(post: (message: unknown) => void) {
       })
       .catch((error: unknown) => {
         if (mine !== generation) return;
-        // The reason is already a named `sync_fs_<reason>: <fix>` string from
-        // the agent; passing it through verbatim is what makes the failure
-        // actionable in the worker's status instead of a bare DOMException.
         post({
           type: "syncFsRegisterResult",
           requestId,
@@ -192,35 +110,16 @@ function createSyncFsBroker(post: (message: unknown) => void) {
   return { host };
 }
 
-/** The page half of the node-worker EXECUTION lane
- *  (bn-node-worker-substrate / execution-path-swap-off-quickjs).
- *
- *  Browser artifacts run in a vendored node-worker Worker — not in QuickJS, and
- *  not in the run-node worker: node-worker's module resolver is synchronous end
- *  to end, so its synchronous `fs` is a blocking XHR that only a service worker
- *  can answer, and `navigator.serviceWorker` is `[Exposed=Window]`. A
- *  SharedWorker global scope additionally has no `Worker` constructor, so the
- *  run-node worker cannot even start the guest — it asks a connected page to
- *  HOST it and bridge a MessageChannel to it:
- *
- *    worker -> page : { type: "nodeWorkerRequest", requestId }
- *    page  -> worker: { type: "nodeWorkerPort", requestId } + transfer [port]
- *    worker -> page : { type: "nodeWorkerDone", requestId }
- *
- *  The agent module (browser-node/node-worker-agent.js) is the thinnest
- *  possible thing, exactly like peer-mesh-agent.js: it boots the substrate and
- *  translates the runner protocol. It learns the artifact's source bytes —
- *  they have to be written into the guest filesystem — and nothing else: which
- *  artifact runs and which host ops its `allowed_ops` permit stay in the
- *  worker. */
+/** Page half of the node-worker EXECUTION lane: a SharedWorker scope has no `Worker`
+ *  constructor and the substrate's synchronous `fs` needs a service worker, so the run-node
+ *  worker asks a connected page to host the guest and bridge a MessageChannel
+ *  (`nodeWorkerRequest` → `nodeWorkerPort` + port → `nodeWorkerDone`). The agent learns the
+ *  artifact's source bytes and nothing else. */
 type NodeWorkerAgentModule = {
   startNodeWorkerAgent: (port: MessagePort) => { stop: () => void };
 };
 
 function createNodeWorkerBroker(post: (message: unknown, transfer?: Transferable[]) => void) {
-  // Monotonic, so an in-flight import whose request was superseded (or whose
-  // page is unmounting) never installs a stale agent — an orphaned agent holds
-  // a real node-worker Worker alive.
   let generation = 0;
   let agent: { stop: () => void; requestId: number } | null = null;
 
@@ -249,28 +148,12 @@ function createNodeWorkerBroker(post: (message: unknown, transfer?: Transferable
         post({ type: "nodeWorkerPort", requestId }, [channel.port2]);
       })
       .catch(() => {
-        /* unpublished or blocked: the worker's broker timeout reports it */
       });
   };
 
   return { host, end };
 }
 
-// Web-Locks-fallback owner handoff (bn-ui-sharedworker-owner): unlike a real
-// SharedWorker (which outlives any single tab), a Web Locks re-election spawns
-// a BRAND NEW dedicated Worker with no memory of what was running before —
-// the crashed/closed owner's node silently never comes back unless something
-// tells the fresh worker to start again. Persisted (not just in-memory) so it
-// survives the owner tab actually closing, which is exactly the case that
-// needs it. `relay`/`team` are deliberately NOT persisted here — they're
-// re-derived fresh (RELAY from env, team via currentTeam()) at replay time
-// rather than trusting a stale snapshot.
-// browser-run-node-target-picker: the DIGEST is no longer persisted either —
-// only the stable deployment+function selection. The digest is re-derived
-// from fresh deployment descriptor metadata at replay time (see
-// replayLastStart), so a target rotation (redeploy → new policy_digest under
-// the same name) replays the CURRENT artifact, and a stale/deleted/ineligible
-// selection fails visibly and clears instead of replaying forever.
 const LAST_START_KEY = "hive_run_node_last_start";
 function persistLastStart(args: StartArgs) {
   try {
@@ -280,11 +163,6 @@ function persistLastStart(args: StartArgs) {
         deployment: args.deployment,
         fn: args.fn,
         scope: args.scope ?? "team",
-        // browser-auto-serve-eligible-set: WHICH serve lane, persisted
-        // alongside the (still digest-free) selection. Nothing about the
-        // eligible set itself is persisted — it is re-derived server-side on
-        // every admission, so a replay after a redeploy serves what the fleet
-        // believes now, never a snapshot.
         serveMode: args.serveMode ?? "auto",
       }),
     );
@@ -312,56 +190,23 @@ function clearLastStart() {
 }
 
 export interface StartArgs {
-  /** browser-node-optional-serve-target: EMPTY means this node attaches to
-   *  nothing — it joins the mesh, holds its relay identity and publishes
-   *  presence, with no serve lane and no database. A donor whose deployments
-   *  are all long-running servers or containers starts exactly this way. */
+  /** Empty = attach to nothing: mesh, relay identity and presence only, no serve lane and no database. */
   deployment: string;
-  /** Empty alongside a non-empty `deployment` = a database-only node (the
-   *  project's `browser_db` replica, nothing served). Empty alongside an empty
-   *  `deployment` = no target at all. */
+  /** Empty with a non-empty `deployment` = database-only node; empty with an empty `deployment` = no target. */
   fn: string;
-  /** The descriptor's policy digest, resolved from fresh deployment metadata
-   *  by the picker (or the handoff replay) — never a donor-typed value. Empty
-   *  whenever there is no function to serve. */
+  /** Policy digest resolved from fresh deployment metadata by the picker or the handoff replay; empty when nothing is served. */
   digest: string;
-  /** browser-auto-serve-eligible-set: what to serve when NO deployment is
-   *  pinned above. `"auto"` (the default) asks the fleet to derive this
-   *  tenant's whole browser-eligible set and refresh it on every renewal — the
-   *  node never names what lands in it. Ignored whenever `deployment` is set:
-   *  an explicit pin is exactly as narrow as it looks, and the worker derives
-   *  `"pinned"` from the non-empty deployment regardless of this field.
-   *
-   *  bn-picker-drop-capacity-only: `"none"` (serve nothing, replicate nothing)
-   *  is RETIRED as a request — nothing in the UI produces it any more. The
-   *  union still carries it because `readLastStart` parses records written by
-   *  older builds that could, and those are upgraded to `"auto"` on replay
-   *  rather than resurrecting a node that contributes nothing. The wire value
-   *  itself stays valid for the worker (`serve_mode`), so this is a UI
-   *  retirement, not a protocol change. */
+  /** What to serve when no deployment is pinned: `"auto"` lets the fleet derive this tenant's
+   *  eligible set on every renewal; `"none"` is retired and only read back from older persisted
+   *  records, which replay as `"auto"`. Ignored whenever `deployment` is set. */
   serveMode?: "auto" | "none";
   scope?: "team" | "public";
 }
 
-/** Owns (or attaches to) the single per-origin `run-node` SharedWorker and
- *  exposes its live status + control actions. Multiple mounted consumers
- *  (navbar control + the /run-node page open in another tab) share the SAME
- *  worker instance — the browser's own SharedWorker semantics give us the
- *  "exactly one owner" property for free; this hook is just a typed port. */
-/** Network Information API's `saveData` flag (bn-ui-mobile-lifecycle's
- *  network-policy item): the one broadly-supported, EXPLICIT signal a user
- *  actually chose ("Data Saver" in Chrome/Android settings) — unlike
- *  `effectiveType`/`downlink`, which are heuristic estimates that vary
- *  minute to minute and would make this policy flap. Deliberately does NOT
- *  attempt battery-based policy: the Battery Status API this row's text
- *  names has been removed from Firefox/Safari and is fingerprinting-gated
- *  even in Chrome, so a battery check would only ever fire on a shrinking
- *  slice of browsers while silently no-op'ing everywhere else — a real
- *  signal with universal support beats a nominally-broader one with none.
- *  `navigator.connection` itself is Chromium-only; every read here is
- *  optional-chained and this returns `false` (never block) where it's
- *  absent, matching every other progressive-feature-detection pattern in
- *  this file (hasSharedWorker/hasLocksFallback above). */
+/** Owns (or attaches to) the single per-origin `run-node` SharedWorker and exposes its live
+ *  status + control actions; every mounted consumer shares the same worker. */
+/** Network Information API `saveData` — the one explicit, broadly supported user signal;
+ *  `false` wherever `navigator.connection` is absent. */
 function dataSaverActive(): boolean {
   if (typeof navigator === "undefined") return false;
   const nav = navigator as Navigator & { connection?: { saveData?: boolean; addEventListener?: (type: string, listener: () => void) => void; removeEventListener?: (type: string, listener: () => void) => void } };
@@ -370,23 +215,7 @@ function dataSaverActive(): boolean {
 
 export function useRunNode() {
   const [status, setStatusState] = useState<RunNodeStatus>(initialRunNodeStatus());
-  // Stable per-instance identity for the presence-publisher claim below.
-  // useState (not useRef().current) because reading a ref's .current during
-  // render is unsafe (react-hooks/refs) — useState's lazy initializer runs
-  // once and yields the same stable object on every render without a
-  // render-time ref read.
   const [ownerToken] = useState<object>(() => ({}));
-  // Network policy (bn-ui-mobile-lifecycle): distinct from `status.lastError`
-  // (a worker-reported failure) — this is a CLIENT-SIDE policy refusal that
-  // never reaches the worker at all, so it needs its own state rather than
-  // overloading RunNodeStatus's wire shape with a field the worker itself
-  // has no way to produce.
-  // SSR-safe: starts false (the server has no `navigator`, so it must render as
-  // "not blocked" to match), and the real value + live updates land in the
-  // effect below. Reading dataSaverActive() in the initializer diverged the
-  // first client render from the SSR HTML for any data-saver user (React #418,
-  // the same hydration-mismatch class as the run-node page's persisted state),
-  // and it also never updated when the connection changed mid-session.
   const [dataSaverBlocked, setDataSaverBlocked] = useState(false);
   useEffect(() => {
     const update = () => setDataSaverBlocked(dataSaverActive());
@@ -399,35 +228,13 @@ export function useRunNode() {
     conn?.addEventListener?.("change", update);
     return () => conn?.removeEventListener?.("change", update);
   }, []);
-  // Environment capability check as a lazy initializer (runs once, during
-  // this component's own render) rather than an effect-time setState — SSR
-  // has no `window`/`SharedWorker`, so it starts `true` there and the real
-  // client-side answer lands on the client's own first render, no extra
-  // effect-driven re-render in between. A SharedWorker constructor that
-  // throws DESPITE the capability check passing (e.g. a CSP blocking module
-  // workers) is a distinct runtime failure, not a feature-detection result,
-  // and is handled by the try/catch below.
   const hasSharedWorker = typeof window !== "undefined" && "SharedWorker" in window;
   const hasLocksFallback =
     typeof window !== "undefined" && "Worker" in window && typeof navigator !== "undefined" && "locks" in navigator;
   const [supported, setSupported] = useState(
     () => typeof window === "undefined" || hasSharedWorker || hasLocksFallback,
   );
-  // Every control action (start/stop/geoConsent) goes through this ref rather
-  // than a fixed `portRef`, because WHERE it needs to go differs by path: the
-  // SharedWorker port directly, the owner tab's own dedicated Worker
-  // directly, or (a non-owner tab under the Web Locks fallback) a
-  // BroadcastChannel the lock-holding tab is listening on. Callers never need
-  // to know which.
   const sendRef = useRef<(msg: object) => void>(() => {});
-  // Stable per-TAB (not per-worker) identity (bn-ui-sharedworker-owner, the
-  // multi-tab-visibility item): under the Web Locks fallback several tabs
-  // share ONE real transport to the worker (`self`, owned by whichever tab
-  // won the lock) — tagging this tab's own control/visibility messages with
-  // an id lets the worker track each tab's contribution independently
-  // instead of every message colliding on the single shared channel. Lazily
-  // created once per hook mount; SSR has no `crypto`, so it's created only
-  // when first needed (inside the client-only effect below), never here.
   const tabIdRef = useRef<string | null>(null);
   function tabId(): string {
     if (!tabIdRef.current) {
@@ -438,47 +245,13 @@ export function useRunNode() {
     }
     return tabIdRef.current;
   }
-  // Worker crash recovery (bn-ui-sharedworker-owner, the row's last remaining
-  // item): a background worker dying mid-session — an OOM reclaim, a wasm
-  // panic that takes the whole global scope with it, anything short of the
-  // owning tab itself closing (already handled by Web Locks re-election / a
-  // fresh SharedWorker connection) — previously had no detector at all; the
-  // node would just silently stop responding until a human noticed and
-  // manually reloaded. lastHeartbeatMs is bumped on EVERY inbound status
-  // message (the one chokepoint every transport already funnels through —
-  // same "count where every caller converges" reasoning as this repo's own
-  // request-cancellation guidance), so a live worker's periodic broadcasts
-  // (and this hook's own watchdog pings, below) both count as proof of life.
-  // Seeded 0 (not Date.now()) -- calling an impure function as a useRef
-  // initializer runs during render, which react-hooks/purity correctly flags.
-  // The real timestamp is stamped in the connection effect below instead,
-  // which runs post-render; a 0 default briefly read by the watchdog before
-  // that effect commits would just look "very stale", never worse than a
-  // harmless, no-op-on-a-fresh-mount reconnect attempt.
   const lastHeartbeatRef = useRef<number>(0);
   const reconnectRef = useRef<() => void>(() => {});
-  // Owner-handoff replay failure (browser-run-node-target-picker): when a
-  // persisted selection no longer resolves against fresh deployment metadata
-  // (deleted deployment, no-longer-ready, function no longer browser-eligible)
-  // the replay is dropped, the persisted start is cleared, and the reason is
-  // surfaced here for the page to render — "fail visibly and clear", never a
-  // silent skip that would replay forever on the next handoff.
   const [replayError, setReplayError] = useState<string | null>(null);
 
-  // Owner-handoff replay, revalidated: a persisted selection is never replayed
-  // verbatim — the digest is re-derived from FRESH descriptor metadata, so a
-  // rotated target (redeploy → new policy_digest under the same
-  // deployment+function) picks up the CURRENT artifact instead of a stale one.
-  // A fetch failure is transient: the persisted start is left alone for the
-  // next handoff/reload to retry, and nothing is cleared or reported.
   const replayLastStart = useCallback((post: (msg: object) => void) => {
     const last = readLastStart();
     if (!last) return;
-    // Target-less replay (browser-node-optional-serve-target): there is
-    // nothing to revalidate — no deployment, no function, no digest — so it
-    // replays directly. Routing it through resolveTargetFresh would fail the
-    // lookup for a deployment id of "" and silently drop a perfectly valid
-    // node from every owner handoff.
     if (!last.deployment) {
       setReplayError(null);
       post({
@@ -487,14 +260,6 @@ export function useRunNode() {
         deployment: "",
         fn: "",
         digest: "",
-        // browser-auto-serve-eligible-set: an unpinned node replays automatic.
-        // bn-picker-drop-capacity-only: deliberately NOT `last.serveMode` any
-        // more. A record persisted by an older build can say "none", and
-        // replaying that verbatim would silently hand back a node that serves
-        // no function and replicates no database — after the picker's own
-        // persisted selection had already been migrated to "auto", so the page
-        // would claim automatic while the handoff ran capacity-only. One
-        // meaning for an unpinned node, on both persisted records.
         serveMode: "auto",
         scope: last.scope ?? "team",
         team: currentTeam(),
@@ -520,17 +285,11 @@ export function useRunNode() {
         });
       })
       .catch(() => {
-        /* transient fetch failure — leave the persisted start for the next handoff */
       });
   }, []);
 
   const applyIncomingStatus = useCallback((raw: RunNodeStatus & { abiVersion?: number }) => {
     lastHeartbeatRef.current = Date.now();
-    // hostAbiStale is derived HERE, not carried by the worker: the worker can
-    // only report its OWN abiVersion, never whether it's stale relative to
-    // what THIS page build expects. Absent entirely means a pre-versioning
-    // worker instance (still running from before this field existed) — also
-    // stale by definition.
     const hostAbiStale = (raw.abiVersion ?? 0) < HOST_ABI_VERSION;
     setStatusState((prev) =>
       applyStatus(prev, { ...raw, hostAbiStale, tabCount: raw.tabCount ?? 1, sessionStale: !!raw.sessionStale }),
@@ -543,21 +302,9 @@ export function useRunNode() {
 
     if (hasSharedWorker) {
       let worker: SharedWorker;
-      // Definite-assignment assertion: `port` is written inside connect()/wire()
-      // (nested functions, so TS's linear control-flow analysis can't see the
-      // assignment from here) but is always assigned before reportVisibility/
-      // onPageHide/cleanup below ever run — `if (!connect()) return;`
-      // guarantees connect() succeeded (and therefore wire() assigned `port`)
-      // before any of those closures are even registered.
       let port!: MessagePort;
       let reconnecting = false;
 
-      // db-worker broker (bn-dashboard-db-worker-broker-hook): a SharedWorker
-      // global scope has no `Worker` constructor, so the run-node worker's db
-      // lane asks a connected page to host the sqlite DedicatedWorker and
-      // bridge a MessageChannel to it (protocol spec in run-node-worker.js's
-      // header). One broker per page — a fresh request supersedes; the worker
-      // re-asks another page if this one dies (OPFS + watermarks survive).
       let dbBridge: { worker: Worker; requestId: string } | null = null;
       const endDbBridge = (requestId?: string) => {
         if (!dbBridge) return;
@@ -565,19 +312,8 @@ export function useRunNode() {
         dbBridge.worker.terminate();
         dbBridge = null;
       };
-      // peer-mesh agent broker — same shape as the db bridge above, and for
-      // the same structural reason (a worker global scope lacks the
-      // constructor). Re-created per wired port so a reconnect never posts a
-      // transferred port into a dead channel.
       let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
-      // synchronous-fs registration broker — same shape as the two above and
-      // for the same structural reason (a worker global scope has no
-      // navigator.serviceWorker). Re-created per wired port so a reconnect
-      // never answers into a dead channel.
       let syncFsBroker: ReturnType<typeof createSyncFsBroker> | null = null;
-      // node-worker host broker (bn-node-worker-substrate): the same shape and
-      // the same structural reason — the substrate needs a page. Re-created per
-      // wired port so a reconnect never answers into a dead channel.
       let nodeWorkerBroker: ReturnType<typeof createNodeWorkerBroker> | null = null;
 
       const wire = (p: MessagePort) => {
@@ -594,8 +330,6 @@ export function useRunNode() {
           else if (msg && msg.type === "syncFsRegisterRequest") {
             syncFsBroker?.host(msg.requestId, msg.swUrl, msg.workerUrl, msg.agentUrl);
           } else if (msg && msg.type === "nodeWorkerRequest") {
-            // One host per request: a fresh request supersedes (an orphaned
-            // agent holds a real Worker alive).
             nodeWorkerBroker?.host(msg.requestId);
           } else if (msg && msg.type === "nodeWorkerDone") {
             nodeWorkerBroker?.end(msg.requestId);
@@ -604,15 +338,11 @@ export function useRunNode() {
             try {
               const w = new Worker("/browser-node/sqlite/sqlite-worker.js", { type: "module" });
               const chan = new MessageChannel();
-              // Two-way bridge: everything the worker posts to its end goes to
-              // the sqlite worker and vice versa (plain JSON envelopes only).
               chan.port1.onmessage = (ev) => w.postMessage(ev.data);
               w.onmessage = (ev) => chan.port1.postMessage(ev.data);
               dbBridge = { worker: w, requestId: msg.requestId };
               p.postMessage({ type: "dbWorkerPort", requestId: msg.requestId }, [chan.port2]);
             } catch {
-              // Unanswered request: the worker's own timeout surfaces an
-              // honest status.db error — never pretend a broker exists.
             }
           } else if (msg && msg.type === "dbWorkerDone") {
             endDbBridge(msg.requestId);
@@ -620,20 +350,6 @@ export function useRunNode() {
         };
         p.start();
         p.postMessage({ type: "status" });
-        // Owner handoff replay (bn-ui-mobile-lifecycle, OS-process-kill item):
-        // the Web Locks fallback branch below has always done this, but this
-        // SharedWorker branch never did -- if the browser's whole SharedWorker
-        // process is reclaimed under memory pressure (real on mobile Chrome,
-        // and the reason the Locks fallback exists at all; also reachable on
-        // desktop under genuine OOM), the NEXT `new SharedWorker(...)` this
-        // page issues (on reload, or via reconnectRef's crash-recovery retry
-        // above) spawns a genuinely fresh worker with no memory of anything,
-        // and it would otherwise sit at "stopped" until a human noticed.
-        // Harmless when the worker is already alive and running: the worker's
-        // own `start()` guard (`if (node || status.lifecycle === "starting")
-        // return;`) makes a replay against an ALREADY-running node a no-op,
-        // so every ordinary tab connecting to an already-live SharedWorker
-        // (the common case) costs one ignored message, never a duplicate boot.
         replayLastStart((msg) => p.postMessage(msg));
       };
 
@@ -641,25 +357,11 @@ export function useRunNode() {
         try {
           worker = new SharedWorker(WORKER_URL, { type: "module", name: WORKER_NAME });
         } catch {
-          // Real, pre-existing eslint react-hooks/set-state-in-effect violation,
-          // fixed while touching this file for the host-ABI-versioning change
-          // above: a setState call synchronous within the effect body risks
-          // cascading renders per the rule's own rationale. queueMicrotask defers
-          // it by one microtask turn (functionally instantaneous, no visible
-          // delay) without changing behavior -- this DOES need to set state (a
-          // SharedWorker constructor throwing despite the capability check
-          // passing is a real runtime failure the UI must reflect), so the fix is
-          // deferral, not removal.
           queueMicrotask(() => setSupported(false));
           return false;
         }
         port = worker.port;
         wire(port);
-        // Worker crash recovery (bn-ui-sharedworker-owner): an ErrorEvent on
-        // the SharedWorker object itself (distinct from the port) is the
-        // browser's own signal that the shared worker's global scope threw
-        // uncaught — reconnect immediately rather than waiting out the
-        // watchdog's slower silence-based detection below.
         worker.onerror = () => reconnectRef.current();
         return true;
       };
@@ -674,58 +376,20 @@ export function useRunNode() {
         } catch {
           /* already gone */
         }
-        // Optimistic reset: don't let the watchdog re-trigger on its very
-        // next tick before this fresh connection has had a chance to prove
-        // itself — the `new SharedWorker(...)` call below either attaches to
-        // the same still-alive process (a transient in-worker error) or the
-        // browser spins up a fresh one (the process genuinely died); either
-        // way a real status response lands within one heartbeat interval.
         lastHeartbeatRef.current = Date.now();
         connect();
         reconnecting = false;
       };
 
-      // Page Lifecycle: tell the worker whether THIS tab can currently promise
-      // foreground reliability, so it can report "suspended" honestly instead
-      // of claiming "online" while every connected tab is hidden/frozen/gone.
-      // The SharedWorker itself is not subject to page lifecycle (it keeps the
-      // real connection alive across a bfcache entry, which is the point of a
-      // shared owner) — only the STATUS communicated to the user changes.
       const reportVisibility = () => {
         const visible = document.visibilityState === "visible";
         port.postMessage({ type: "visibility", visible });
       };
       const onPageHide = (e: PageTransitionEvent) => {
-        // persisted=true: entering bfcache, may resume — report hidden, keep
-        // the worker connection running. persisted=false: this tab is truly
-        // going away — best-effort tell the worker so a last-tab-closed
-        // detection isn't the only signal (real close is unload-adjacent and
-        // unreliable to detect from the worker side alone).
         port.postMessage({ type: "visibility", visible: false, unloading: !e.persisted });
       };
       const onPageShow = () => reportVisibility();
 
-      // Keep a BACKGROUNDED tab alive on mobile, where the platform otherwise
-      // stops this node outright.
-      //
-      // What the platforms actually do, and why a timer alone cannot win:
-      // Chrome throttles background timers to ~1/minute and freezes a tab after
-      // ~5 minutes backgrounded; iOS Safari suspends on background or screen
-      // lock. The worker renews every 60s against a 90s server presence TTL, so
-      // one throttled tick already risks expiry.
-      //
-      // A silently PLAYING audio element is the one widely-supported signal
-      // that keeps a mobile browser treating the page as active — it is how
-      // every background-audio web app stays alive. It is not a hack around a
-      // security boundary: the user explicitly started a node, playback is
-      // silent (gain 0), and it stops the moment the node stops.
-      //
-      // Deliberately best-effort and never load-bearing: autoplay policy can
-      // refuse until a user gesture, WebAudio may be unavailable, and iOS can
-      // still suspend on hard memory pressure. A failure here costs background
-      // longevity, never correctness — the worker's renew-on-resume path
-      // recovers the node either way. So every call is wrapped and nothing
-      // above it ever sees a rejection.
       let audioCtx: AudioContext | null = null;
       const startKeepAlive = () => {
         if (audioCtx) return;
@@ -737,12 +401,10 @@ export function useRunNode() {
           const ctx = new Ctor();
           const osc = ctx.createOscillator();
           const gain = ctx.createGain();
-          gain.gain.value = 0; // inaudible — presence, not sound
+          gain.gain.value = 0;
           osc.connect(gain).connect(ctx.destination);
           osc.start();
           audioCtx = ctx;
-          // Autoplay policy may park it in "suspended" until a gesture; the
-          // node was started BY a gesture, so this usually resolves.
           void ctx.resume().catch(() => {});
         } catch {
           audioCtx = null;
@@ -758,8 +420,6 @@ export function useRunNode() {
       document.addEventListener("visibilitychange", reportVisibility);
       window.addEventListener("pagehide", onPageHide);
       window.addEventListener("pageshow", onPageShow);
-      // freeze/resume (Page Lifecycle API) — narrower than visibilitychange on
-      // browsers that support it (e.g. a visible-but-discarded background tab).
       document.addEventListener("freeze", reportVisibility);
       document.addEventListener("resume", reportVisibility);
       reportVisibility();
@@ -770,20 +430,9 @@ export function useRunNode() {
         window.removeEventListener("pageshow", onPageShow);
         document.removeEventListener("freeze", reportVisibility);
         document.removeEventListener("resume", reportVisibility);
-        // Release the silent keepalive with the rest of this tab's resources —
-        // an AudioContext outliving its page is a real leak, and on mobile it
-        // is exactly the thing that would keep a dead node's tab alive.
         stopKeepAlive();
         endDbBridge();
-        // An agent left running after its host page unmounts keeps
-        // PeerConnections (and their ICE) alive for a node that may already be
-        // gone. The worker also sends `meshPeerDone` on its own teardown; this
-        // covers the direction the worker cannot see.
         meshBroker?.end();
-        // An agent left running after its host page unmounts keeps a real
-        // node-worker Worker alive for a node that may already be gone — the
-        // worker sends `nodeWorkerDone` on its own teardown; this covers the
-        // direction it cannot see.
         nodeWorkerBroker?.end();
         port.postMessage({ type: "visibility", visible: false, unloading: true });
         port.close();
@@ -793,20 +442,6 @@ export function useRunNode() {
     }
 
     if (hasLocksFallback) {
-      // Web Locks fallback (bn-ui-sharedworker-owner): no SharedWorker in this
-      // browser (an older engine, or a context whose SharedWorker constructor
-      // exists but cannot spawn). NOT "Safari private mode": Safari 26 HAS
-      // SharedWorker in normal AND private windows (witnessed live on Safari
-      // 26.3.1), so modern Safari takes the SharedWorker branch above — its
-      // remaining context quirk (a CryptoKey is not structured-cloneable
-      // inside a SharedWorker) is handled by identity.js's memory-custody
-      // mode (bn-safari-sharedworker-cryptokey-dataclone), not by routing
-      // here. Exactly one tab per origin wins the `shadw-run-node-owner`
-      // exclusive lock and runs a plain dedicated Worker hosting the SAME
-      // run-node-worker.js script (see its own SharedWorkerGlobalScope-
-      // detection branch) — every other tab relays control through
-      // BroadcastChannel and mirrors status from it, never running a second
-      // Worker/BrowserNode instance of its own.
       const statusChannel = new BroadcastChannel("shadw-run-node-status");
       const controlChannel = new BroadcastChannel("shadw-run-node-control");
       let dedicatedWorker: Worker | null = null;
@@ -814,22 +449,8 @@ export function useRunNode() {
       let cancelled = false;
       const myTabId = tabId();
 
-      // Every tab (owner or not) mirrors relayed status immediately — cheap,
-      // and correct even for the owner tab itself (its own relayed broadcast
-      // is a strict duplicate of what applyIncomingStatus already applied
-      // directly, and applyStatus's generation fencing drops the duplicate).
       statusChannel.onmessage = (e: MessageEvent) => applyIncomingStatus(e.data);
 
-      // Page Lifecycle (bn-ui-sharedworker-owner, the row's 2nd remaining
-      // item): previously wired ONLY for the SharedWorker branch above —
-      // under this fallback neither the owner tab nor any observer tab ever
-      // reported visibility, so online<->suspended toggling never happened
-      // here at all. Every tab (owner or not) reports through `sendRef`,
-      // which already resolves to whichever transport is live for THIS tab
-      // (direct to the worker once owned, controlChannel otherwise) — tagged
-      // with this tab's own id so several tabs sharing the owner's single
-      // real `self` channel are tracked independently by the worker's
-      // per-tabId onPortVisibility path instead of colliding on one key.
       const reportVisibility = () => {
         const visible = document.visibilityState === "visible";
         sendRef.current({ type: "visibility", tabId: myTabId, visible });
@@ -839,25 +460,8 @@ export function useRunNode() {
       };
       const onPageShow = () => reportVisibility();
 
-      // The peer-mesh agent broker is needed HERE TOO, and this is the one
-      // place the two lanes differ: the db lane's sqlite worker nests directly
-      // in a dedicated Worker (which has `Worker`), so this branch never
-      // brokered one — but `RTCPeerConnection` is Window-only, so a dedicated
-      // Worker cannot host a peer connection any more than a SharedWorker can.
-      // Only the OWNER tab wires this, because only it holds the real Worker
-      // reference; a non-owner tab has no channel to receive the request on.
       let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
-      // The synchronous-fs registration broker is needed HERE TOO — unlike the
-      // db lane, which nests directly in a dedicated Worker, there is no
-      // nested fallback for a service worker registration: no worker global
-      // scope has `navigator.serviceWorker`, this one included. Only the OWNER
-      // tab wires it (only it holds the real Worker reference, so only it can
-      // receive the request).
       let syncFsBroker: ReturnType<typeof createSyncFsBroker> | null = null;
-      // The node-worker HOST broker is needed here for exactly the reasons the
-      // two above are: the substrate needs a page (navigator.serviceWorker),
-      // and the run-node worker — SharedWorker or this dedicated Worker — is
-      // not one. Only the OWNER tab wires it.
       let nodeWorkerBroker: ReturnType<typeof createNodeWorkerBroker> | null = null;
 
       const wireOwnerWorker = (worker: Worker) => {
@@ -882,49 +486,31 @@ export function useRunNode() {
             nodeWorkerBroker?.end(msg.requestId);
           }
         };
-        // Worker crash recovery (bn-ui-sharedworker-owner, the row's 3rd
-        // remaining item): mirrors the SharedWorker branch's onerror handler
-        // above — only the OWNER tab can see this (only it holds the real
-        // Worker reference), and only the owner can act on it (spawn a
-        // replacement). A non-owner tab has nothing to reconnect itself; if
-        // the owner TAB is what died (not just its worker), that's already
-        // covered by the Web Locks re-election electing a different tab.
         worker.onerror = () => reconnectRef.current();
         worker.postMessage({ type: "status" });
-        // Forward control messages non-owner tabs couldn't send directly.
         controlChannel.onmessage = (e: MessageEvent) => worker.postMessage(e.data);
         sendRef.current = (msg) => worker.postMessage(msg);
-        reportVisibility(); // this tab's own visibility, now that it owns a direct channel
+        reportVisibility();
       };
 
       const spawnOwnerWorker = (replay: boolean) => {
         const worker = new Worker(WORKER_URL, { type: "module" });
         dedicatedWorker = worker;
         wireOwnerWorker(worker);
-        // Owner handoff replay: this fresh worker boots at lifecycle
-        // "stopped" with no memory of anything — if the LAST thing this
-        // origin was doing was running a node (persisted by start(),
-        // cleared by stop()), replay it now instead of silently staying
-        // stopped until a human notices and re-clicks Start. Harmless
-        // no-op on a normal first-ever start (nothing persisted yet), and
-        // the SAME replay a genuine crash-recovery restart needs — a worker
-        // that died mid-session should come back serving the same thing.
-        // The replay is revalidated against fresh deployment metadata
-        // (browser-run-node-target-picker) — see replayLastStart.
         if (replay) {
           replayLastStart((msg) => worker.postMessage(msg));
         }
       };
 
       reconnectRef.current = () => {
-        if (!dedicatedWorker) return; // not the owner — nothing here to restart
+        if (!dedicatedWorker) return;
         const dead = dedicatedWorker;
         try {
           dead.terminate();
         } catch {
           /* already gone */
         }
-        lastHeartbeatRef.current = Date.now(); // same optimistic-reset reasoning as the SharedWorker branch
+        lastHeartbeatRef.current = Date.now();
         spawnOwnerWorker(true);
       };
 
@@ -936,10 +522,6 @@ export function useRunNode() {
         });
       });
 
-      // Until (or unless) this tab wins the lock above, and for every OTHER
-      // tab for this dedicated Worker's whole lifetime, control goes out over
-      // the broadcast channel instead of a direct reference — the effect
-      // above overwrites this the instant this tab itself wins ownership.
       if (!dedicatedWorker) {
         sendRef.current = (msg) => controlChannel.postMessage(msg);
       }
@@ -960,24 +542,12 @@ export function useRunNode() {
         sendRef.current({ type: "visibility", tabId: myTabId, visible: false, unloading: true });
         cancelled = true;
         meshBroker?.end();
-        // An agent left running after its host page unmounts keeps a real
-        // node-worker Worker (and its service-worker session) alive for a node
-        // that may already be gone. The worker also sends `nodeWorkerDone` on
-        // its own teardown; this covers the direction it cannot see.
         nodeWorkerBroker?.end();
         statusChannel.close();
         controlChannel.close();
         reconnectRef.current = () => {};
         if (dedicatedWorker) {
           const worker = dedicatedWorker;
-          // Give the worker a chance to see this as its last connection and
-          // self-stop (releasing its backend admission) via the SAME
-          // unloading-visibility path the SharedWorker branch above already
-          // uses (connectPort/onPortVisibility in run-node-worker.js is
-          // shared code, not a reimplementation) — a bare terminate() with no
-          // signal leaves the admission to live out its full lease
-          // unnecessarily. Bounded: stop() does an awaited network DELETE,
-          // which terminate() would otherwise cut off mid-flight regardless.
           try {
             worker.postMessage({ type: "visibility", visible: false, unloading: true });
           } catch {
@@ -992,25 +562,9 @@ export function useRunNode() {
 
     queueMicrotask(() => setSupported(false));
     return;
-    // hasSharedWorker/hasLocksFallback are derived from `window`/`navigator`
-    // once per module evaluation (both read a global that doesn't change
-    // within a single page load), so they're intentionally excluded from the
-    // dependency array — including them would be redundant, never wrong.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyIncomingStatus]);
 
-  // Worker crash recovery watchdog (bn-ui-sharedworker-owner, the row's last
-  // remaining item): periodically pings whatever transport is currently live
-  // and, if no status response — direct or relayed, both flow through
-  // applyIncomingStatus which bumps lastHeartbeatRef — has landed within
-  // HEARTBEAT_TIMEOUT_MS, treats the worker as gone and reconnects via
-  // reconnectRef (assigned by whichever branch of the connection effect
-  // above is active). A separate effect, same reasoning as the network
-  // online/offline effect below: no cleanup dependency on which transport is
-  // active, it only needs sendRef/reconnectRef to exist. The timeout is
-  // deliberately generous relative to the interval — a legitimately busy
-  // worker (mid cold-boot wasm init, a slow admission round-trip) must never
-  // be mistaken for a crash and torn down mid-operation.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -1024,16 +578,6 @@ export function useRunNode() {
     return () => clearInterval(id);
   }, []);
 
-  // Network policy (bn-ui-mobile-lifecycle): watch for Data Saver turning ON
-  // WHILE a node is running, not just at start-gate time — a user can enable
-  // it from OS settings mid-session without this tab ever reloading. Auto-
-  // stops rather than merely degrading the displayed status: continuing to
-  // relay OTHER tenants' invocation traffic over a connection the user has
-  // explicitly told the OS to conserve is the one case this feature must
-  // never do silently, matching the row's own "never promising continuous
-  // serving where the platform cannot provide it" framing — here inverted to
-  // "never CONSUMING what the user asked to conserve," the donor-side
-  // analogue of the same honesty requirement.
   useEffect(() => {
     if (typeof window === "undefined" || typeof navigator === "undefined") return;
     const nav = navigator as Navigator & {
@@ -1044,12 +588,12 @@ export function useRunNode() {
       };
     };
     const conn = nav.connection;
-    if (!conn?.addEventListener) return; // Network Information API unsupported — nothing to watch
+    if (!conn?.addEventListener) return;
     const onChange = () => {
       const active = !!conn.saveData;
       setDataSaverBlocked(active);
       if (active) {
-        clearLastStart(); // don't let owner-handoff replay resurrect a node this policy just stopped
+        clearLastStart();
         sendRef.current({ type: "stop" });
       }
     };
@@ -1059,14 +603,11 @@ export function useRunNode() {
 
   const start = useCallback((args: StartArgs) => {
     if (dataSaverActive()) {
-      // Refuse at the source rather than starting then immediately being
-      // stopped by the change-listener above — Data Saver already being on
-      // BEFORE the user clicks Start never fires a "change" event to catch.
       setDataSaverBlocked(true);
       return;
     }
     persistLastStart(args);
-    setReplayError(null); // an explicit manual start supersedes any stale handoff-replay failure
+    setReplayError(null);
     sendRef.current({
       type: "start",
       relay: RELAY,
@@ -1079,13 +620,6 @@ export function useRunNode() {
     });
   }, []);
 
-  // Reconnect machine (bn-p2p-reconnect-state, one real slice of it): real
-  // network drop/restore events, reported through the SAME sendRef used by
-  // every other control action — works unchanged whether the SharedWorker or
-  // Web Locks fallback path is live, since both assign sendRef.current to
-  // whatever the correct live transport is. A separate effect (not folded
-  // into the connection effect above) because it has no cleanup dependency
-  // on which transport is active; it just needs sendRef to exist.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const report = () => sendRef.current({ type: "network", online: navigator.onLine });
@@ -1098,24 +632,11 @@ export function useRunNode() {
     };
   }, []);
 
-  // PRESENCE HEARTBEAT — lives here, in the hook, because the hook is mounted
-  // app-wide by the sidebar's run-node control while the node itself is owned
-  // by a SharedWorker that outlives any single page. It used to be a
-  // `useEffect` inside the /run-node PAGE, whose cleanup cleared the interval
-  // on unmount: navigating to /network to LOOK at the constellation was itself
-  // what stopped the heartbeat, and the server's 90s presence TTL then expired
-  // the satellite off the very map the user had just opened. The record is
-  // republished well inside that TTL (PRESENCE_REFRESH_MS) for as long as the
-  // node reports a publishable lifecycle, from whatever page is open.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const endpointId = status.endpointId;
     const state = presenceState(status.lifecycle);
     if (!endpointId || !state) return;
-    // One publisher per document: /run-node mounts this hook alongside the
-    // sidebar control, and both would otherwise POST the same record on the
-    // same interval. The upsert is idempotent, so this is purely about not
-    // doubling the request rate.
     if (presenceOwner !== null && presenceOwner !== ownerToken) return;
     presenceOwner = ownerToken;
     const publish = () => {
@@ -1127,9 +648,6 @@ export function useRunNode() {
         relay_hint: status.relay ?? "",
         state,
       }).catch(() => {
-        // Transient publish failures are recovered by the next tick; the
-        // server TTL is 2x this interval, so a single miss never de-orbits
-        // a live node.
       });
     };
     publish();

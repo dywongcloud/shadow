@@ -18,42 +18,14 @@ import { clearPresence, GEO_CONSENT_KEY, GEO_COORDS_KEY } from "@/lib/run-node-c
 import { usePoll, sessionMintStatus, type Deployment } from "@/lib/api";
 import { excludedDeployments, resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
 import { TargetPicker, type PickerSelection, type TargetSelection } from "./target-picker";
-// browser-run-node-target-picker: the persisted selection is the STABLE
-// deployment+function pair only — never a digest. The digest is re-derived
-// from fresh descriptor metadata on every render/start/replay, so a redeploy
-// that rotates the policy digest under the same name keeps working and a
-// deleted/ineligible target fails visibly and clears instead of replaying.
-// browser-node-optional-serve-target: an EMPTY deployment is the persisted
-// form of "nothing pinned", which is a real state a node runs on — not an
-// absent one.
-// browser-auto-serve-eligible-set: the persisted shape carries `mode`
-// ("auto" | "target").
-// bn-picker-drop-capacity-only: `mode: "none"` was the third value and is
-// RETIRED — the node it described (serves no function, replicates no database)
-// is not a shape the platform produces any more, now that
-// `browser_artifacts::eligible_for_tenant` derives the serve set unasked and
-// `browser_db::auto_db_deployment_for_tenant` assigns a replica instead of
-// refusing when a tenant has several browser_db projects. Any persisted record
-// with an empty deployment — written by an older build as "none", or by this
-// one as "auto" — restores as "auto". Reading it back as a mode that can no
-// longer be chosen would leave the page unable to render its own selection.
 const TARGET_KEY = "hive_run_node_target";
-const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
-// Re-derive the fix well before the browser's own 10-minute cache
-// (`maximumAge` below) goes stale, so a long-running tab's dot on the
-// constellation map tracks a laptop that changed networks instead of
-// freezing at wherever it was when the tab was first opened.
+const GEO_QUANT_DEGREES = 0.5;
 const GEO_REFRESH_MS = 8 * 60_000;
 
 function quantize(v: number): number {
   return Math.round(v / GEO_QUANT_DEGREES) * GEO_QUANT_DEGREES;
 }
 
-// Surfaces fix age once it's well past a fresh reading, rather than trusting
-// the dot silently — `requestLocation`'s own retry (GEO_REFRESH_MS) keeps it
-// from ever running too far past this in practice, but a laptop that's been
-// asleep or a permission that started silently failing both leave `coords`
-// holding an old value with no other visible signal.
 function staleSuffix(locatedMs: number | null): string {
   if (locatedMs === null) return "";
   const ageMin = Math.floor((Date.now() - locatedMs) / 60_000);
@@ -64,104 +36,38 @@ function staleSuffix(locatedMs: number | null): string {
 export default function RunNodePage() {
   const { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError } = useRunNode();
   const dbStatus = (status as RunNodeStatus & { db?: DbLaneStatus | null }).db ?? null;
-  // bn-node-worker-service-worker-sync-fs (additive worker field): whether the
-  // node-worker substrate's one hard prerequisite is actually in place. A node
-  // that reports `unavailable` still relays, replicates and serves under the
-  // QuickJS lane, so this is surfaced as a fact with its own named reason
-  // rather than folded into the lifecycle.
   const syncFsStatus = (status as RunNodeStatus & { syncFs?: SyncFsLaneStatus | null }).syncFs ?? null;
-  // Additive worker field (browser-node-optional-serve-target): whether a
-  // function artifact is actually PINNED right now, derived worker-side from
-  // the runtime rather than from what was requested — so the page can state
-  // plainly that a running node is not serving anything.
   const serving = (status as RunNodeStatus & { serving?: boolean }).serving === true;
-  // browser-auto-serve-eligible-set (additive worker fields): WHICH functions
-  // are actually pinned right now, and which authorized artifact the worker
-  // could not load. Both describe the live runtime, not the selection — a node
-  // in automatic mode is carrying whatever the fleet last authorized, which the
-  // page cannot derive on its own.
   const widened = status as RunNodeStatus & {
     serveMode?: ServeMode;
     functions?: FunctionLaneStatus | null;
   };
   const serveMode: ServeMode = widened.serveMode ?? "none";
-  // Whether the worker REPORTED a serve lane at all. The `?? "none"` above is a
-  // safe default for every comparison, but it collapses two different worlds:
-  // a session that genuinely asked for the retired capacity-only mode, and a
-  // background worker so old it has no `serveMode` field to report. Telling the
-  // second "you started in serve-nothing mode" is a plain falsehood about a
-  // choice the person never made, so the idle copy below tells them apart.
   const serveModeReported = widened.serveMode !== undefined;
   const servingList = widened.functions?.serving ?? [];
   const pinnedCount = widened.functions?.pinned.length ?? 0;
   const functionFailures = widened.functions?.failed ?? [];
-  // Eligible serve targets come from the same authenticated /deployments list
-  // the rest of the dashboard polls — served locally with leader/owner
-  // fallback server-side (admin_ingress + the /cloud proxy), so this page
-  // never needs a node-specific endpoint. Re-polled live so rotation,
-  // deletion, and team switches are revalidated against current metadata.
   const { data: deployments, error: deploymentsError, loading: deploymentsLoading } =
     usePoll<Deployment[]>("/deployments", 5000);
   const targets = useMemo(() => targetsFromDeployments(deployments ?? []), [deployments]);
-  // Not a count: the REASON each excluded deployment is excluded. A bare number
-  // answered the one question nobody asks ("are some hidden?") and none of the
-  // question every report actually asks ("which of mine, and why?").
   const excluded = useMemo(() => excludedDeployments(deployments ?? []), [deployments]);
-  // Persisted selection + scope are hydrated AFTER mount (the effect below),
-  // NOT in a lazy useState initializer. Reading localStorage during the first
-  // render makes the client's initial tree diverge from the SSR HTML (the
-  // server has no `window`, so it renders the defaults), and React aborts
-  // hydration with #418 — regenerating the whole tree and, witnessed live,
-  // leaving "Start" dead on any returning device. Initial state is the
-  // SSR-safe default; the one-frame restore flash is the correct tradeoff.
-  // Default "auto" (browser-auto-serve-eligible-set): a node serves whatever
-  // this team has, with no choice required. SSR-safe — the same value renders
-  // on the server, and the persisted restore happens in the mount effect below.
   const [selection, setSelection] = useState<PickerSelection>("auto");
   const explicit: TargetSelection | null = typeof selection === "object" ? selection : null;
   const [scope, setScope] = useState<"team" | "public">("team");
-  // Auth-window guard (bn-picker-auth-window-empty-list-clears-selection):
-  // while the session mint is in backoff/failed, requests proceed
-  // unauthenticated and /deployments answers a REAL 200 scoped to an
-  // anonymous/empty tenant — an [] that is indistinguishable from a genuinely
-  // empty tenant. Judging the selection against THAT [] wiped the persisted
-  // target permanently. Only the two KNOWN-degraded mint states hold
-  // judgment: "ok" is authoritative, "unattempted" covers Clerk-off dev, and
-  // a non-empty list is real data by construction.
   const mintState = sessionMintStatus().state;
   const authWindow =
     deployments !== null &&
     deployments.length === 0 &&
     (mintState === "backoff" || mintState === "failed");
-  // The digest handed to Start is resolved from the CURRENT snapshot on every
-  // render — never from the persisted selection — so a target rotated between
-  // page load and click starts the current artifact, not a stale digest.
-  // A null selection is the explicit "attach to nothing" choice and resolves
-  // to nothing, which is not a failure and never blocks Start.
   const resolved =
     explicit && deployments && !authWindow
       ? resolveTarget(deployments, explicit.deployment, explicit.fn)
       : null;
   const selectedTarget = resolved && resolved.ok ? resolved.target : null;
-  // Revalidation failure, derived per render: while the list is still loading
-  // (including the team-switch window, where usePoll drops data to null)
-  // nothing is judged; the moment real data lands, a selection that no longer
-  // resolves produces its reason immediately — no effect round trip.
   const revalidationFailure = explicit && resolved && !resolved.ok ? resolved.reason : null;
-  // …and its STICKY counterpart: the clear below un-sets the selection, which
-  // makes the derived reason vanish on the very next render — a one-frame
-  // flash, not "fails visibly". So the reason is copied into state at the
-  // moment of failure and survives the clear until the user picks a new
-  // target (choose) or starts one (which clears replayError the same way).
   const [clearedError, setClearedError] = useState<string | null>(null);
   const selectionError = revalidationFailure ?? clearedError;
 
-  // A failed revalidation must also CLEAR (state + localStorage) so the dead
-  // selection can never replay forever — "fail visibly and clear". This is a
-  // genuine sync from an external system (the polled deployments list) into
-  // state, so per react-hooks/set-state-in-effect's own rationale the fix is
-  // deferral (one microtask turn, invisible), not removal — same precedent as
-  // the SharedWorker-constructor failure path in use-run-node.ts.
   useEffect(() => {
     if (!revalidationFailure) return;
     queueMicrotask(() => {
@@ -171,9 +77,6 @@ export default function RunNodePage() {
         /* ignore */
       }
       setClearedError(revalidationFailure);
-      // A pin that no longer resolves falls back to AUTOMATIC, not to serving
-      // nothing: the deployment it named is gone, but the rest of the team's
-      // eligible work still exists and this node can still carry it.
       setSelection("auto");
     });
   }, [revalidationFailure]);
@@ -194,8 +97,6 @@ export default function RunNodePage() {
     }
   }
 
-  // Every mode is a real, supported way to run a node; the choice (and the
-  // scope beside it) survives a reload exactly like a real target does.
   function choose(sel: PickerSelection) {
     setSelection(sel);
     setClearedError(null);
@@ -207,27 +108,14 @@ export default function RunNodePage() {
     persistChoice(selection, next);
   }
 
-  // Also hydrated after mount (the effect below), same #418 reason as
-  // selection/scope above. geoDecision swaps ENTIRE subtrees (the consent
-  // prompt vs the granted/denied block), so a lazy-initializer read of
-  // GEO_CONSENT_KEY was the loudest of the three SSR≠client mismatches.
   const [geoDecision, setGeoDecision] = useState<"undecided" | "granted" | "denied">("undecided");
 
-  // The ONE place persisted UI state is read from localStorage on load, run
-  // once AFTER the first render has already committed the SSR-identical
-  // defaults above — this is what keeps the hydrated tree byte-identical to the
-  // server's HTML (no #418). Malformed/absent entries leave the defaults.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(TARGET_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.deployment === "string" && typeof parsed.fn === "string") {
-          // An empty deployment is a MODE, never a target named "". The only
-          // unpinned mode left is "auto", so a record persisting the retired
-          // "none" restores as "auto" too (see TARGET_KEY's note) — the node it
-          // named would contribute nothing, which is exactly what this build
-          // stopped offering.
           // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate post-mount hydration to avoid an SSR/CSR mismatch (#418, see comment above); a lazy initializer would read localStorage during the server render and diverge from the client's first paint
           setSelection(parsed.deployment ? { deployment: parsed.deployment, fn: parsed.fn } : "auto");
           if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
@@ -247,19 +135,8 @@ export default function RunNodePage() {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [locatedMs, setLocatedMs] = useState<number | null>(null);
   const geoTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Focus restoration (bn-ui-accessibility): the "Don't share"/"Share" and
-  // "Reset" buttons each unmount the moment they're clicked (the whole block
-  // they're in swaps for a different one), which drops focus to <body> with
-  // no browser-default landing spot — silently stranding a keyboard/screen-
-  // reader user. Moved explicitly to the newly-mounted control that replaces
-  // the one just clicked.
   const geoResetBtnRef = useRef<HTMLButtonElement>(null);
   const geoShareBtnRef = useRef<HTMLButtonElement>(null);
-  // Focus moves ONLY in response to a real click (Share / Don't share / Reset),
-  // never on mount and never on the post-mount localStorage hydration above —
-  // both set geoDecision without user intent and must not steal focus. The old
-  // first-render-skip guard only skipped ONE settle; hydration adds a second
-  // non-interactive settle, so gate on user action instead.
   const geoUserActed = useRef(false);
   useEffect(() => {
     if (!geoUserActed.current) return;
@@ -267,12 +144,6 @@ export default function RunNodePage() {
     else geoResetBtnRef.current?.focus();
   }, [geoDecision]);
 
-  // Ask the browser's Geolocation API for a fresh fix. Split from `decideGeo`
-  // so it can also run (a) on mount, when consent was already granted in a
-  // PRIOR session — restoring `geoDecision` from localStorage alone never
-  // called this, so a returning user's "waiting for a location fix" message
-  // never cleared until they hit Reset — and (b) on a recurring timer, so a
-  // long-lived tab's dot doesn't go stale.
   const requestLocation = useRef(() => {
     if (typeof navigator === "undefined" || !navigator.geolocation) {
       setGeoError("This browser has no Geolocation API — location will show as unknown.");
@@ -281,20 +152,10 @@ export default function RunNodePage() {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setGeoError(null);
-        // Quantized client-side too, before it ever leaves the tab — the
-        // server re-quantizes unconditionally regardless, but a client that
-        // never transmits a precise fix is a real (not merely cosmetic)
-        // privacy improvement against a network observer.
         setCoords({ lat: quantize(pos.coords.latitude), lon: quantize(pos.coords.longitude) });
         setLocatedMs(Date.now());
       },
       (err) => {
-        // PERMISSION_DENIED (code 1) is a hard, durable block — the OS/browser
-        // will refuse every future call identically until the user changes a
-        // site setting, so treating it as "granted but erroring" would retry
-        // forever against a wall. Revoke consent for real (and persist the
-        // revocation) so the UI matches what's actually happening, and stop
-        // publishing a location that's frozen at its last value.
         if (err.code === err.PERMISSION_DENIED) {
           localStorage.setItem(GEO_CONSENT_KEY, "denied");
           setGeoDecision("denied");
@@ -303,10 +164,6 @@ export default function RunNodePage() {
           setGeoError("Location permission was denied in your browser — location sharing turned off. Re-enable it in your browser's site settings to share again.");
           return;
         }
-        // POSITION_UNAVAILABLE (2) / TIMEOUT (3) are transient — a GPS/Wi-Fi
-        // fix that failed once often succeeds on the next periodic retry, so
-        // consent and any already-published coords are left alone rather than
-        // flickering the satellite dot on and off the map.
         setGeoError(
           err.code === err.POSITION_UNAVAILABLE
             ? "Location temporarily unavailable — will keep retrying."
@@ -317,10 +174,6 @@ export default function RunNodePage() {
     );
   });
 
-  // Fire once whenever sharing is (or becomes) granted — covers both a fresh
-  // "Share" click and a returning tab whose consent was restored from
-  // localStorage — and keep re-firing on a timer while it stays granted so a
-  // long session's fix doesn't go stale.
   useEffect(() => {
     if (geoDecision !== "granted") {
       if (geoTimer.current) {
@@ -339,13 +192,6 @@ export default function RunNodePage() {
     };
   }, [geoDecision]);
 
-  // The heartbeat itself now lives in `useRunNode` (mounted app-wide by the
-  // sidebar's run-node control). It used to be an effect HERE, and this
-  // page's unmount cleanup cleared its interval — so navigating to /network
-  // to look at the constellation was itself what stopped refreshing this
-  // node's satellite, which the server's 90s TTL then expired off the map.
-  // What remains here is the half only this page can do: persist the
-  // consented fix so the app-wide heartbeat can publish it from any route.
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (geoDecision === "granted" && coords) {
@@ -353,10 +199,6 @@ export default function RunNodePage() {
     } else if (geoDecision !== "granted") {
       localStorage.removeItem(GEO_COORDS_KEY);
     }
-    // Deliberately depend on the primitive lat/lon, not the `coords` object
-    // reference: requestLocation() below can produce a new object with
-    // identical values, and depending on the object would re-run this
-    // (harmless but wasteful) localStorage write on every such tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally narrowed to primitives; see comment above
   }, [geoDecision, coords?.lat, coords?.lon]);
 
@@ -371,9 +213,6 @@ export default function RunNodePage() {
       setGeoError(null);
       return;
     }
-    // The mount/consent-change effect above fires `requestLocation` whenever
-    // `geoDecision` becomes "granted", including this transition — no direct
-    // call needed here.
   }
 
   async function onStop() {
@@ -383,47 +222,19 @@ export default function RunNodePage() {
     }
   }
 
-  // browser-node-optional-serve-target: running a node NEVER depends on having
-  // something to serve. A donor whose deployments are all long-running servers
-  // (Next.js, Express), containers, TypeScript or Python/Go has nothing a
-  // browser engine can execute — a real engine constraint, not a policy — and
-  // used to be locked out of the whole feature by this one boolean. The serve
-  // lane is now the optional part; the node itself is not.
   const canStart = status.lifecycle === "stopped" && !dataSaverBlocked;
 
-  // Explicit reason the Start button is disabled, so it is NEVER a silent dead
-  // end — the "works on my other device but not this one" report was a node
-  // that couldn't start with no visible cause. Both remaining causes have
-  // their own banner above, so this stays null for them rather than saying the
-  // same thing twice; a missing/failed TARGET is deliberately not a cause any
-  // more, it just leaves the serve lane idle (see `serveNotice`).
   const startDisabledReason =
     status.lifecycle !== "stopped" || canStart
       ? null
       : !supported
-        ? null // covered by the SharedWorker banner above
+        ? null
         : dataSaverBlocked
-          ? null // covered by the Data Saver banner above
+          ? null
           : null;
 
-  // What this node will actually do, stated before it starts — the honest
-  // counterpart to no longer gating Start. Never implies a browser can run
-  // something it cannot: with nothing eligible the serve lane is simply idle,
-  // and the reason (an all-servers/containers tenant, a session still landing)
-  // is named rather than left to be inferred from a disabled button.
   const eligibleCount = targets.filter((t) => t.kind === "function").length;
-  // Whether this tenant has ANY ready deployment with a `browser_db` block —
-  // read straight off the deployment list rather than off `targets`, which
-  // surfaces a database target only for deployments that have no
-  // browser-eligible function. The fleet picks WHICH replica this endpoint
-  // holds (`auto_db_deployment_for_tenant` rendezvous-hashes by endpoint id);
-  // this only decides whether replication is mentioned at all.
   const hasDatabase = (deployments ?? []).some((d) => d.state === "ready" && !!d.browser_db);
-  // bn-picker-drop-capacity-only: no "serve nothing" branch, because there is
-  // no such selection any more. Every unpinned node is automatic, and automatic
-  // with an empty eligible set is a STATE (nothing eligible yet), not a choice
-  // to be useless — so the copy says what happens next instead of describing a
-  // node that contributes nothing.
   const serveNotice =
     selection !== "auto"
       ? null
@@ -520,16 +331,6 @@ export default function RunNodePage() {
             <select
               value={scope}
               onChange={(e) => chooseScope(e.target.value as "team" | "public")}
-              // Visibility decides who may INVOKE what this node serves (and,
-              // for a database grant, whether an anonymous donor gets a
-              // read-only replica). It used to be force-disabled for the
-              // retired "serve nothing" selection, where offering "Public"
-              // would have sent a non-admin into a guaranteed FORBIDDEN
-              // (`public_scope_forbidden`) for a node that exposed nothing.
-              // Every remaining selection exposes something — "public +
-              // automatic" means every browser-eligible function this team has,
-              // invokable by anyone — so lifecycle is the only thing that
-              // disables it.
               disabled={status.lifecycle !== "stopped"}
               className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
             >
@@ -619,15 +420,6 @@ export default function RunNodePage() {
           <dd className="truncate font-mono text-secondary">{status.relay ?? "—"}</dd>
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
-          {/* browser-node-optional-serve-target: a running node with an idle
-              serve lane is a supported state, so it says WHY plainly here
-              instead of leaving a blank where a function name would be.
-              `serving` is derived by the worker from what is actually PINNED,
-              never from what was requested — and the idle causes
-              (database-only pin, a pin still loading, a retired capacity-only
-              session, a worker too old to report its lane, nothing eligible
-              yet, and nothing handed over yet) are genuinely different things
-              to tell someone, so none is collapsed into the others. */}
           <dt className="text-muted">Serving</dt>
           <dd className="text-secondary">
             {status.lifecycle === "stopped"
@@ -638,24 +430,11 @@ export default function RunNodePage() {
                     ? "no function — this node is pinned to a database replica only"
                     : "pinned function not loaded yet — retrying on the next renewal"
                   : serveMode === "none"
-                    ? // bn-picker-drop-capacity-only: unreachable from THIS
-                      // build's picker. Two distinct pasts land here and the
-                      // remedy is the same, but the cause is not: a session an
-                      // older page really did start capacity-only, versus a
-                      // background worker predating the field entirely (the
-                      // `?? "none"` default above), for which the
-                      // outdated-worker banner further down is the real story.
-                      // Naming the fix beats leaving a running node
-                      // permanently idle with no explanation — but not at the
-                      // cost of blaming someone for a mode they never picked.
+                    ?
                       serveModeReported
                       ? "capacity only — started in the retired serve-nothing mode; Stop and Start it to carry this team's work"
                       : "serve lane unreported — this node's background worker predates automatic serving; Stop and Start it to carry this team's work"
-                    : // Two different causes, and this page can tell them apart from
-                    // the deployment list it already polls: the team genuinely has
-                    // nothing eligible, versus it does and the fleet hasn't handed
-                    // any over yet (a mid-rollout node, a lease still settling).
-                    // Never assert the first when the second is what's happening.
+                    :
                     eligibleCount === 0
                     ? "nothing yet — no browser-eligible function exists in this team; this node starts serving on its own when one does"
                     : "nothing yet — waiting for the fleet to hand work over, retrying automatically"
@@ -673,9 +452,6 @@ export default function RunNodePage() {
           {functionFailures.length > 0 && (
             <>
               <dt className="text-muted">Not loaded</dt>
-              {/* Honest per-artifact reporting: one artifact this browser could
-                  not verify/fetch never blanks the ones it IS serving, and is
-                  never silently swallowed — the next renewal retries it. */}
               <dd className="text-amber-600 dark:text-amber-400">
                 {functionFailures.map((f) => f.error).join(" · ")}
               </dd>
@@ -707,9 +483,6 @@ export default function RunNodePage() {
           {syncFsStatus && (
             <>
               <dt className="text-muted">Sync fs</dt>
-              {/* The named reason is rendered verbatim: it is the only thing
-                  that turns "the guest app just stopped" into a fix. Nothing
-                  here is fatal to the node under the QuickJS lane. */}
               <dd className={syncFsStatus.state === "unavailable" ? "text-amber-600 dark:text-amber-400" : "text-secondary"}>
                 {syncFsStateLabel(syncFsStatus)}
                 {syncFsStatus.state === "ready" && syncFsStatus.prefix && (
@@ -737,16 +510,6 @@ export default function RunNodePage() {
           </div>
         )}
         {status.lifecycle === "suspended" && (
-          // Background/suspension honesty (bn-ui-mobile-lifecycle): "suspended"
-          // means every tab that could observe this node is currently hidden —
-          // the underlying admission is still held (so a backgrounded tab
-          // brought back to the foreground resumes instantly), but no traffic is
-          // actually being served right now. On mobile especially, a backgrounded
-          // browser tab is not a reliable long-running server: the OS can freeze
-          // or fully discard it at any time with no further warning from this
-          // page, so this never claims "still working in the background" — the
-          // one thing this feature must not promise where the platform can't
-          // actually provide it.
           <div className="mt-3 rounded-md bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400" role="status">
             Not currently serving — every tab is in the background. Traffic resumes the instant you bring one back to
             the foreground, but a backgrounded browser tab (especially on mobile) can be frozen or fully closed by
@@ -780,9 +543,6 @@ export default function RunNodePage() {
             <span>This node hasn&apos;t finished a rolling upgrade yet — retrying automatically, no action needed.</span>
           </div>
         ) : status.sessionStale ? (
-          // Auth-renewal input (bn-p2p-reconnect-state): calm, not alarming —
-          // this self-heals the moment the platform session cookie refreshes
-          // in the background, unlike protocolMismatch === "outdated" above.
           <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400" role="status">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>Waiting for your platform session to refresh before this node can renew — retrying automatically, no action needed.</span>
@@ -795,13 +555,6 @@ export default function RunNodePage() {
             </div>
           )
         )}
-        {/* coop-coep-fleet-wide: async-only is its OWN banner, deliberately
-            outside the error chain above — it is not an error and must not
-            displace one (a node can be both isolated-less and failing), and
-            it must not be rendered as a red alert: nothing here is broken.
-            Only shown once the worker has actually reported (null = not
-            connected yet), and only while a node is running, so a stopped
-            page doesn't lead with a limitation the user hasn't hit. */}
         {status.isolation && !status.isolation.syncBridge && status.lifecycle !== "stopped" ? (
           <div className="mt-3 flex items-start gap-2 rounded-md bg-sky-500/10 p-2 text-xs text-sky-700 dark:text-sky-300" role="status">
             <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -812,25 +565,11 @@ export default function RunNodePage() {
           {status.lifecycle === "stopped" ? (
             <button
               onClick={() => {
-                // browser-auto-serve-eligible-set: with no PIN this starts an
-                // automatic node — empty deployment/fn/digest plus
-                // `serveMode: "auto"`, and the server derives the whole
-                // eligible set itself from this tenant's Ready deployments.
-                // bn-picker-drop-capacity-only: `serveMode` is now ALWAYS
-                // "auto". With a pin the worker overrides it to "pinned" from
-                // the non-empty deployment anyway (run-node-worker.js's start
-                // handler), so this is the one honest value: nothing the page
-                // can send asks the fleet for a node that carries nothing.
-                // That also covers the one-render window where a persisted pin
-                // has failed revalidation and the fallback-to-auto effect has
-                // not committed yet — it starts automatic, not empty.
                 start({
                   deployment: selectedTarget?.deployment ?? "",
                   fn: selectedTarget?.fn ?? "",
                   digest: selectedTarget?.policyDigest ?? "",
                   serveMode: "auto",
-                  // Every startable selection now exposes something, so the
-                  // chosen scope always applies (see the Visibility field).
                   scope,
                 });
               }}
