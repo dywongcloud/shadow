@@ -1,15 +1,6 @@
-//! Persistent connection tunnels to function instances.
-//!
-//! Vercel's Functions router keeps **persistent TCP tunnels** to instances and
-//! reuses them across requests (the `compute-resolver` routes a function's
-//! requests back to a router that already has an open connection, giving >99%
-//! reuse). Here we model that with a per-instance keep-alive connection pool:
-//! a request reuses an idle connection to the chosen instance when one exists,
-//! otherwise it opens a new one and returns it to the pool when done.
-//!
-//! Reuse requires knowing where a response ends without closing the socket, so
-//! we only pool **content-length, keep-alive** responses. Streaming / explicitly
-//! `Connection: close` responses are read to EOF and not reused.
+//! Persistent connection tunnels to function instances: a per-instance keep-alive pool reuses an
+//! idle connection when one exists. Only content-length, keep-alive responses are pooled;
+//! streaming / `Connection: close` responses are read to EOF and not reused.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use hive_backend::{connect_endpoint, CellEndpoint, DuplexStream};
@@ -74,7 +65,11 @@ impl ConnPool {
         let o = self.opened.load(Ordering::Relaxed);
         let r = self.reused.load(Ordering::Relaxed);
         let total = o + r;
-        let pct = if total > 0 { r as f64 / total as f64 } else { 0.0 };
+        let pct = if total > 0 {
+            r as f64 / total as f64
+        } else {
+            0.0
+        };
         (o, r, pct)
     }
 }
@@ -189,9 +184,10 @@ pub async fn read_head(conn: &mut Conn) -> anyhow::Result<Head> {
             {
                 continue; // not forwarded verbatim
             }
-            if let (Ok(name), Ok(val)) =
-                (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-            {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
                 headers.append(name, val);
             }
         }
@@ -214,7 +210,11 @@ pub async fn read_head(conn: &mut Conn) -> anyhow::Result<Head> {
 }
 
 /// Read exactly `len` body bytes (some may already be in `leftover`).
-pub async fn read_body_exact(conn: &mut Conn, mut have: Vec<u8>, len: usize) -> anyhow::Result<Vec<u8>> {
+pub async fn read_body_exact(
+    conn: &mut Conn,
+    mut have: Vec<u8>,
+    len: usize,
+) -> anyhow::Result<Vec<u8>> {
     have.truncate(len.min(have.len()));
     let mut buf = have;
     let mut tmp = [0u8; 16 * 1024];

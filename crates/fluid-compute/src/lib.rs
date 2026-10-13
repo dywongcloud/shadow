@@ -1,28 +1,8 @@
-//! `fluid-compute` — the Fluid pool: "serverless servers".
-//!
-//! Per function it keeps a pool of long-lived instances (cells running the
-//! function server). The routing/scaling rules follow Vercel's Fluid writeups:
-//!
-//! * **In-function concurrency** — one instance handles up to
-//!   `max_concurrency` simultaneous requests.
-//! * **Reuse before provision** — a request is routed to an already-running
-//!   instance with a free slot, choosing the one with the *fewest* in-flight
-//!   requests (least-loaded), which Vercel found beats round-robin.
-//! * **Cold-start on saturation** — only when every instance is full do we
-//!   provision a new one, up to `max_instances`.
-//! * **Keep-warm** — `min_instances` are kept ready.
-//! * **Scale-to-zero** — idle instances beyond `min_instances` are drained
-//!   after `idle_ttl`.
-//! * **`waitUntil`** — an instance's lease is held for a declared post-response
-//!   window (`x-fluid-wait-until-ms`) so background work runs after the response
-//!   (see `fluid-gateway`).
-//! * **Active CPU pricing** — metering reports active CPU time (ms) + provisioned
-//!   memory (GB-hrs), not idle wall-time (`FunctionStats`), matching Fluid's
-//!   billing convention where I/O-idle time isn't CPU-billed.
-//!
-//! Concurrency discipline matches the control plane: one `parking_lot::Mutex`
-//! over the registry, never held across an `.await`; backend provisioning and
-//! teardown happen outside the lock.
+//! The Fluid pool ("serverless servers"): per function, a pool of long-lived instances with
+//! in-function concurrency (`max_concurrency`), least-loaded reuse before provisioning, cold start
+//! only on saturation (up to `max_instances`), keep-warm (`min_instances`), scale-to-zero after
+//! `idle_ttl`, `waitUntil` lease holds, and active-CPU + provisioned-memory metering. One
+//! `parking_lot::Mutex` over the registry, never held across an `.await`.
 
 use fluid_core::FunctionConfig;
 use hive_backend::{
@@ -42,12 +22,8 @@ struct Instance {
     cell_id: CellId,
     handle: hive_backend::CellHandle,
     endpoint: CellEndpoint,
-    /// Loopback UDP publishes of this instance's container (container_port →
-    /// host_port), chosen at cold start. This is the "instance registry" surface
-    /// hive-cloud's UDP relay resolves the LOCAL datagram leg from (via
-    /// [`Lease::udp_host_port`]) — datagrams cannot ride the TCP tunnel
-    /// `endpoint`, so they go straight at `127.0.0.1:<host_port>`. Empty for
-    /// non-container functions and containers with no declared UDP specs.
+    /// Loopback UDP publishes of this instance's container (container_port → host_port), chosen at
+    /// cold start — the surface the UDP relay resolves its LOCAL datagram leg from ([`Lease::udp_host_port`]).
     udp_ports: Vec<hive_core::UdpPublish>,
     /// TCP twin of `udp_ports` (includes the primary; see `TcpPublish`).
     tcp_ports: Vec<hive_core::TcpPublish>,
@@ -55,15 +31,12 @@ struct Instance {
     started_at_ms: u64,
     last_active_ms: u64,
     draining: bool,
-    /// Lifetime request count — drives request-based recycling (no runtime heap
-    /// signal needed). A long-lived warm instance that has served many requests is
-    /// recycled to bound memory drift / leaks (#13).
+    /// Lifetime request count — drives request-based recycling, so a long-lived warm instance is
+    /// recycled to bound memory drift without a runtime heap signal.
     requests_served: u64,
 }
 
-/// Is this instance due for recycling? Pure (testable) policy over the signal-free
-/// inputs we DO have: lifetime request count and wall-clock age. (Heap-growth /
-/// GC-pause recycling needs a runtime-emitted signal — left as a hook.)
+/// Is this instance due for recycling? Pure policy over lifetime request count and wall-clock age.
 fn instance_recyclable(
     requests_served: u64,
     age_ms: u64,
@@ -74,9 +47,8 @@ fn instance_recyclable(
         || (max_age_ms > 0 && requests_served > 0 && age_ms >= max_age_ms)
 }
 
-/// Complete launch authority for one function pool. A deployment builds every
-/// member before [`Fluid::register_many`] takes the registry lock, so duplicate
-/// keys or malformed batches cannot leave a partially registered deployment.
+/// Complete launch authority for one function pool, built before [`Fluid::register_many`] takes the
+/// registry lock so a malformed batch cannot leave a partially registered deployment.
 #[derive(Clone, Debug)]
 pub struct PoolSpec {
     pub key: String,
@@ -89,9 +61,8 @@ pub struct PoolSpec {
 /// Everything needed to (re)launch instances of one function.
 struct FunctionPool {
     cfg: FunctionConfig,
-    /// Owning team/tenant (normalized; empty => "personal"). Every cell this pool
-    /// spawns is tagged with it, and per-tenant instance quotas sum across all
-    /// pools sharing this tenant.
+    /// Owning team/tenant (normalized; empty => "personal"); every cell this pool spawns is tagged with
+    /// it, and per-tenant instance quotas sum across pools sharing it.
     tenant: String,
     /// Image / rootfs name for cells of this function.
     image: String,
@@ -100,91 +71,51 @@ struct FunctionPool {
     instances: Vec<Instance>,
     /// Cold starts currently in flight (counts toward max_instances).
     provisioning: u32,
-    // ---- cost metering ----
     /// Total requests served.
     requests: u64,
     /// Sum of per-request active durations. This is what *traditional* 1:1
     /// serverless would bill (one dedicated instance per concurrent request).
     served_ms_sum: u64,
-    /// Alive-time of instances already scaled down. Combined with live
-    /// instances' alive-time, this is what *Fluid* bills (instance-time,
-    /// shared across concurrent requests).
+    /// Alive-time of instances already scaled down; with live instances' alive-time, what Fluid bills
+    /// (instance-time shared across concurrent requests).
     instance_ms_retired: u64,
     /// Instances reaped because they became unreachable (health/nack).
     dead_reaped: u64,
-    /// Requests served by a donated browser node instead of fleet compute
-    /// (`fluid-gateway::try_browser`'s success path never calls `lease()`, so
-    /// without this counter browser-served traffic is invisible to billing).
+    /// Requests served by a donated browser node instead of fleet compute (`try_browser`'s success
+    /// path never calls `lease()`, so without this counter browser traffic is invisible to billing).
     browser_requests: u64,
-    /// Sum of per-request active durations for browser-served requests —
-    /// tracked alongside `browser_requests` for a future distinct rate, kept
-    /// separate from `served_ms_sum` since it isn't fleet instance-time.
+    /// Sum of per-request active durations for browser-served requests, kept apart from `served_ms_sum`.
     browser_served_ms: u64,
-    /// Keep-warm failure backoff: the autoscaler won't attempt to warm this
-    /// pool again until `now_ms()` reaches this. Prevents a pool whose cold
-    /// starts keep failing (e.g. host out of locks/processes) from retrying
-    /// every autoscaler tick and pinning the host.
+    /// Keep-warm failure backoff: the autoscaler will not warm this pool again before this, so failing
+    /// cold starts cannot retry every tick and pin the host.
     warm_backoff_until_ms: u64,
     /// Consecutive keep-warm failures; drives the exponential backoff above.
     warm_fail_streak: u32,
-    /// `now_ms()` of the last keep-warm cold start that RETURNED Ok. A successful
-    /// `cold_start` only means the backend accepted the launch — it says nothing
-    /// about whether the instance stayed up. Paired with `crash_streak` below to
-    /// tell "warmed and healthy" apart from "warmed and died seconds later".
+    /// `now_ms()` of the last keep-warm cold start that RETURNED Ok — the backend accepted the launch,
+    /// nothing more; paired with `crash_streak` to tell "warmed and healthy" from "died seconds later".
     last_warm_ok_ms: u64,
-    /// Consecutive times an instance this pool successfully warmed VANISHED
-    /// inside `CRASH_LOOP_WINDOW_MS`. This is the crash-loop signal the plain
-    /// `warm_fail_streak` cannot see: a container that starts fine and then
-    /// exits on its own (bad entrypoint, unaccepted licence prompt, missing env)
-    /// takes the `Ok` branch, so without this the streak reset every tick and
-    /// keep-warm relaunched it forever — one misconfigured app churning the host
-    /// and, before the volume leak was fixed, draining podman's shared lock pool
-    /// until EVERY other deployment on the node failed with CAPACITY_EXHAUSTED.
+    /// Consecutive times an instance this pool successfully warmed VANISHED inside
+    /// `CRASH_LOOP_WINDOW_MS` — the crash-loop signal `warm_fail_streak` cannot see (a container that
+    /// starts fine and exits takes the `Ok` branch).
     crash_streak: u32,
-    /// Circuit half-open gate: while `now_ms()` is under this, a pool whose
-    /// failure streak has crossed the threshold fails leases FAST; once past it,
-    /// exactly one request is allowed through as a probe (which re-arms this on
-    /// failure, or clears the streak on success).
-    ///
-    /// Deliberately SEPARATE from `warm_backoff_until_ms`. That one is tuned for
-    /// how often to re-warm (seconds), and reusing it made the circuit useless:
-    /// a failing cold start takes far longer than its own 2-8s backoff, so every
-    /// arriving request found the window already expired and paid the full
-    /// startup cost again. The gate has to outlast the failure it is guarding.
+    /// Circuit half-open gate: under this, a pool past its failure threshold fails leases FAST; past it,
+    /// exactly one request is let through as a probe. SEPARATE from `warm_backoff_until_ms`, whose
+    /// seconds-scale backoff is shorter than a failing cold start — the gate must outlast the failure.
     circuit_probe_after_ms: u64,
-    /// The `hive_core::fault` marker of the most recent cold-start failure, when
-    /// that failure was a NODE fault (missing rootfs/kernel, no hypervisor,
-    /// exhausted lock pool) rather than anything about this deployment.
-    ///
-    /// Load-bearing for honest reporting, not observability. A node fault fails
-    /// EVERY cold start, so the pool's `warm_fail_streak` crosses the circuit
-    /// threshold and the circuit's own message then tells the user to "check the
-    /// deployment's logs, entrypoint and required env" — blaming their app for a
-    /// host the operator has to reprovision. Witnessed on fc-sanjose-cvm-2: a
-    /// missing `default.ext4` produced 13 failed cold starts, and the user-visible
-    /// code alternated between CAPACITY_EXHAUSTED and DEPLOYMENT_CIRCUIT_OPEN,
-    /// neither of which named the real fault. Carrying the marker through the
-    /// circuit bail keeps the node fault visible for as long as it is the cause.
-    /// Cleared by any successful start, so a genuinely broken app circuits
-    /// normally.
+    /// The `hive_core::fault` marker of the most recent cold-start failure when it was a NODE fault
+    /// (missing rootfs/kernel, no hypervisor, exhausted lock pool), carried through the circuit bail so
+    /// the user-visible code names the node, not their app. Cleared by any successful start.
     last_node_fault: Option<&'static str>,
-    /// Instances removed because the request path proved they had STOPPED
-    /// ANSWERING (the tunnel closed after N requests got no reply at all, or a
-    /// connect was refused) during the current sustained-failure run. This is
-    /// the health signal an instance-count gate cannot see, and it is what
-    /// opens the circuit while instances are still PRESENT — see
-    /// [`UNHEALTHY_CIRCUIT_THRESHOLD`].
+    /// Instances removed because the request path proved they STOPPED ANSWERING during the current
+    /// sustained-failure run — the health signal that opens the circuit while instances are still
+    /// PRESENT ([`UNHEALTHY_CIRCUIT_THRESHOLD`]).
     unhealthy_reaps: u32,
     /// `now_ms()` of the most recent such removal; the run's window anchor
     /// (see [`UNHEALTHY_REAP_WINDOW_MS`]).
     unhealthy_reap_ms: u64,
-    /// Dynamic per-instance safe-concurrency ceiling. `None` = use
-    /// `cfg.max_concurrency`. A pressure monitor LOWERS this (CPU-heavy / event-loop
-    /// lag / memory pressure) so the scheduler scales out earlier instead of piling
-    /// onto a hot instance; an I/O-heavy function keeps the full ceiling. The
-    /// effective reuse limit is `min(cfg.max_concurrency, safe_concurrency)`.
+    /// Dynamic per-instance safe-concurrency ceiling (`None` = `cfg.max_concurrency`), LOWERED by the
+    /// pressure monitor so the scheduler scales out earlier; effective reuse limit is the min of the two.
     safe_concurrency: Option<u32>,
-    // ---- scheduler observability ----
     /// NACKs because all instances were at the safe-concurrency ceiling.
     nack_concurrency: u64,
     /// NACKs because the tenant hit its cross-pool instance quota.
@@ -196,14 +127,12 @@ struct FunctionPool {
     coldstart_deduped: u64,
     /// Instances recycled (request-count / age based) to bound memory drift (#13).
     recycled: u64,
-    // ---- cold-start phase decomposition (#12) ----
     /// Last cold start's backend `provision` time (boot/microVM/container) in ms.
     last_provision_ms: u64,
     /// Last cold start's `start_function` time (runtime init + tunnel attach) in ms.
     last_runtime_init_ms: u64,
-    /// Most recent CPU sample (% of allocated vCPU, max across live instances) that
-    /// drove the adaptive-concurrency controller (#2). 0 when never sampled / the
-    /// backend can't report CPU.
+    /// Most recent CPU sample (% of allocated vCPU, max across live instances) that drove the adaptive
+    /// controller; 0 when never sampled.
     last_cpu_pct: f32,
 }
 
@@ -268,7 +197,6 @@ pub struct FunctionStats {
     pub max_instances: u32,
     /// Owning team/tenant (normalized; "personal" when unset).
     pub tenant: String,
-    // ---- cost metering ----
     pub requests: u64,
     /// What traditional 1:1 serverless would bill (instance-seconds).
     pub traditional_ms: u64,
@@ -278,10 +206,8 @@ pub struct FunctionStats {
     pub savings_pct: f64,
     /// Instances reaped as unhealthy/unreachable and replaced.
     pub dead_reaped: u64,
-    /// Of those, how many were reaped because the instance was REGISTERED but
-    /// STOPPED ANSWERING, within the current sustained-failure run. Non-zero at
-    /// or above `UNHEALTHY_CIRCUIT_THRESHOLD` is why this deployment's circuit
-    /// is open while instances are still present.
+    /// Of those, how many were reaped because the instance was REGISTERED but STOPPED ANSWERING in the
+    /// current run; at or above `UNHEALTHY_CIRCUIT_THRESHOLD` the circuit is open with instances present.
     #[serde(default)]
     pub unhealthy_reaps: u32,
     /// Requests served by a donated browser node instead of fleet compute.
@@ -290,10 +216,6 @@ pub struct FunctionStats {
     /// Sum of active durations for browser-served requests.
     #[serde(default)]
     pub browser_ms: u64,
-    // ---- Active CPU pricing (Vercel Fluid convention) -------------------------
-    // Fluid bills the ACTIVE CPU time used (ms) plus the PROVISIONED MEMORY
-    // (GB-hrs) — NOT idle wall-time. While an instance waits on I/O (DB, API, LLM)
-    // it isn't billed for CPU, which is where the "90%+ savings" come from.
     /// Active CPU time across all requests (ms) — the time instances were actually
     /// processing, excluding idle keep-warm time.
     pub active_cpu_ms: u64,
@@ -302,7 +224,6 @@ pub struct FunctionStats {
     /// Additional savings of Active-CPU billing vs paying for full instance-time
     /// (fluid_ms), 0.0–1.0 — the "Active CPU pricing" story on top of multiplexing.
     pub active_cpu_savings_pct: f64,
-    // ---- scheduler observability ----
     /// Effective per-instance safe-concurrency ceiling currently in force
     /// (min(max_concurrency, pressure-hook value)).
     pub safe_concurrency: u32,
@@ -332,14 +253,10 @@ pub struct FluidConfig {
     pub autoscaler_interval: Duration,
     /// How long `lease` waits for a slot before giving up (backpressure).
     pub lease_timeout: Duration,
-    /// Max total live instances ONE tenant may hold across all of its function
-    /// pools (multi-tenant fairness — stops a single team monopolizing a node).
-    /// 0 = unlimited. Over-quota leases get backpressure (Saturated), never a
-    /// cross-tenant eviction.
+    /// Max total live instances ONE tenant may hold across all of its pools (0 = unlimited); over-quota
+    /// leases get backpressure (Saturated), never a cross-tenant eviction.
     pub max_instances_per_tenant: u32,
-    /// Recycle a warm instance after it has served this many requests (0 = never).
-    /// Bounds memory drift / leaks for long-lived hot instances WITHOUT needing a
-    /// runtime heap signal — recycling is graceful (drain, then keep-warm replaces).
+    /// Recycle a warm instance after this many requests (0 = never), gracefully (drain, keep-warm replaces).
     pub max_requests_per_instance: u64,
     /// Recycle a warm instance once it reaches this age in seconds (0 = never).
     pub max_instance_age_secs: u64,
@@ -351,8 +268,6 @@ impl Default for FluidConfig {
             autoscaler_interval: Duration::from_millis(500),
             lease_timeout: Duration::from_secs(20),
             max_instances_per_tenant: 0,
-            // Conservative recycle ceilings: a continuously-hot instance is replaced
-            // after ~10k requests or ~1h, so leaks/drift can't accumulate unbounded.
             max_requests_per_instance: 10_000,
             max_instance_age_secs: 3_600,
         }
@@ -368,81 +283,51 @@ type TerminationResult = Result<(), String>;
 
 struct PendingTermination {
     handle: CellHandle,
-    /// Integrity-chain identity for this cell, when the caller had it —
-    /// `None` on paths that only hold a bare `CellHandle` (e.g. the final
-    /// shutdown-drain retry loop, which re-collects `terminating`'s own
-    /// handles after everything else has already unregistered). A `None`
-    /// here just means no `ExecutionEnded` entry is recorded for that one
-    /// termination, never a hard failure.
+    /// Integrity-chain identity for this cell when the caller had it; `None` only means no
+    /// `ExecutionEnded` entry is recorded for that one termination.
     execution: Option<ExecutionEndContext>,
     in_progress: bool,
     waiters: Vec<tokio::sync::oneshot::Sender<TerminationResult>>,
 }
 
-/// What `ExecutionObserver::on_ended` needs, carried alongside a
-/// `CellHandle` from whichever call site actually knows it (the registry
-/// entry being removed) through to the one owned termination worker that
-/// calls `backend.terminate`.
+/// What `ExecutionObserver::on_ended` needs, carried with a `CellHandle` from the call site that
+/// knows it to the one owned termination worker.
 #[derive(Clone)]
 struct ExecutionEndContext {
     deployment_id: String,
     requests_served: u64,
-    /// "drained" | "crashed" | "killed" — the caller's own classification of
-    /// why this cell is being terminated, decided at the scheduling call
-    /// site (which knows WHY: a health-check nack, a normal scale-down, a
-    /// shutdown drain), never re-derived from the termination outcome
-    /// itself (a clean `backend.terminate()` doesn't distinguish those).
+    /// "drained" | "crashed" | "killed" — the caller's own classification, decided at the scheduling
+    /// call site, never re-derived from the termination outcome.
     outcome: String,
 }
 
 pub struct Fluid {
     backend: Arc<dyn CellBackend>,
-    /// Records deployment-lifecycle facts (cell started/ended) into the
-    /// tamper-evidence chain (`hive_core::integrity`). Unset when the
-    /// caller doesn't want integrity tracking (e.g. a bare dev invocation).
-    /// Injected rather than called directly because `fluid-compute` must
-    /// never depend on `hive-cloud` (the crate DAG is one-directional:
-    /// `hive-cloud` depends on `fluid-compute`) — same "coordinator injects,
-    /// backend implements" shape `backend` above already uses. A
-    /// `OnceLock`, not a constructor parameter: `hive-cloud`'s boot order
-    /// constructs `Fluid` BEFORE `deployment_ledger` (the real observer's
-    /// backing store, itself inside `CloudState::new`, which takes `Fluid`
-    /// as an input) — late-binding via `set_execution_observer` breaks that
-    /// chicken-and-egg without reordering boot.
+    /// Records cell started/ended into the tamper-evidence chain (`hive_core::integrity`); injected
+    /// because `fluid-compute` must never depend on `hive-cloud`, and a `OnceLock` because hive-cloud
+    /// constructs `Fluid` BEFORE the `deployment_ledger` that backs the real observer.
     execution_observer: std::sync::OnceLock<Arc<dyn hive_core::ExecutionObserver>>,
     cfg: FluidConfig,
     registry: Mutex<HashMap<String, FunctionPool>>,
-    /// Bounds how many cold starts run concurrently across ALL pools. A burst of
-    /// keep-warm reconciles (e.g. every deployment warming at once on boot) or a
-    /// traffic spike would otherwise spawn unbounded backend containers in
-    /// parallel and saturate the host's process table / container lock pool.
+    /// Bounds how many cold starts run concurrently across ALL pools, so a keep-warm burst or traffic
+    /// spike cannot saturate the host's process table / container lock pool.
     cold_start_sem: Arc<tokio::sync::Semaphore>,
     cold_start_capacity: u32,
     shutdown_state: AtomicU8,
     shutdown_result: Mutex<Option<Result<usize, String>>>,
     shutdown_notify: tokio::sync::Notify,
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// A cell removed from the registry stays here until the one owned
-    /// termination worker has completed backend teardown. Cancellation can drop
-    /// an async caller at any await; this map remains the authoritative owner
-    /// that shutdown drains after joining that worker.
+    /// A cell removed from the registry stays here until the one owned termination worker finishes
+    /// backend teardown; the authoritative owner shutdown drains after joining that worker.
     terminating: Mutex<HashMap<CellId, PendingTermination>>,
     termination_notify: tokio::sync::Notify,
     termination_closing: AtomicBool,
     termination_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-/// Max cold starts in flight at once across the whole node (ALL pools share this
-/// one ceiling — it exists to bound process-table/container-lock pressure on the
-/// HOST, not to throttle any single function). Was a flat `4` regardless of the
-/// node's actual capacity, which head-of-line-blocks a multi-tenant burst (many
-/// DIFFERENT functions cold-starting at once, e.g. on a fleet node serving dozens
-/// of projects) to 4-at-a-time even on a 96-core bare-metal box. Scales with the
-/// host's core count instead, floored at the original conservative `4` (small/mock
-/// nodes keep today's exact behavior) and capped at `32` (still a real ceiling —
-/// this bounds HOST pressure, not per-function throughput, so it must not grow
-/// unbounded on very large boxes). `HIVE_MAX_COLD_STARTS` overrides both ends when
-/// a node operator has measured a different safe number for their hardware.
+/// Max cold starts in flight across the whole node (a HOST-pressure bound, not per-function
+/// throughput): scales with core count, floored at 4 and capped at 32; `HIVE_MAX_COLD_STARTS`
+/// overrides both ends.
 fn max_concurrent_cold_starts() -> usize {
     if let Ok(v) = std::env::var("HIVE_MAX_COLD_STARTS") {
         if let Ok(n) = v.trim().parse::<usize>() {
@@ -462,20 +347,9 @@ pub fn func_key(deployment: &str, function: &str) -> String {
     format!("{deployment}/{function}")
 }
 
-/// Runtime-specific concurrency policy (#5). Different runtimes tolerate very
-/// different in-instance concurrency before a new instance is warranted, so the
-/// initial safe-concurrency BASELINE is runtime-aware (the adaptive hook can still
-/// move it within bounds later):
-///   * node / bun / edge isolate — single-threaded but I/O-friendly event loop:
-///     keep the full configured concurrency (multiplexing I/O waits is the whole
-///     point; Bun's own event loop has the identical characteristic).
-///   * python — the GIL serializes CPU work, so cap concurrency lower (scale out).
-///   * container / microVM — process/cgroup-level pressure varies; moderate cap.
-///   * wasm / wasmer / unknown — trust the configured value (sandbox limits
-///     already apply; a single `wasmer run --net` guest is single-process
-///     like Node, so no reason to cap it lower by default).
-/// Only ever LOWERS toward a runtime-appropriate ceiling; never raises above the
-/// deployment's configured `max_concurrency`.
+/// Runtime-aware initial safe-concurrency baseline: node/bun/edge keep the configured value (I/O
+/// event loops), python is capped (the GIL), container/microVM moderate, wasm/unknown trusted. Only
+/// ever LOWERS toward a runtime ceiling, never above the configured `max_concurrency`.
 pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
     let cap = match runtime.trim().to_ascii_lowercase().as_str() {
         "node" | "nodejs" | "js" | "bun" | "edge" | "isolate" | "edge-isolate" => configured_max,
@@ -514,17 +388,15 @@ impl Drop for UnpublishedCell {
     }
 }
 
-/// Releases a cold start's `provisioning` reservation and records the failure if
-/// the cold start did not produce an instance — including when the future is
-/// simply DROPPED because the caller gave up. See [`Fluid::cold_start`].
+/// Releases a cold start's `provisioning` reservation and records the failure if no instance was
+/// produced — including when the future is DROPPED because the caller gave up.
 struct ColdStartGuard {
     fluid: Arc<Fluid>,
     key: String,
     /// Cleared on success; while armed, Drop treats this as a failed cold start.
     armed: bool,
-    /// `None` while armed means the future was cancelled rather than returning an
-    /// error — worth distinguishing in the log, since an abandoned cold start
-    /// points at a caller/proxy deadline rather than a broken deployment.
+    /// `None` while armed means the future was cancelled rather than returning an error — an abandoned
+    /// cold start points at a caller deadline, not a broken deployment.
     error: Option<String>,
 }
 
@@ -533,36 +405,7 @@ impl Drop for ColdStartGuard {
         if !self.armed {
             return;
         }
-        // A NODE fault (missing rootfs/kernel, no hypervisor, empty lock pool)
-        // fails every cold start for every deployment on this node. Remember it
-        // on the pool so the circuit that these failures are about to open still
-        // names the node instead of telling the user to check their entrypoint.
         let node_fault = self.error.as_deref().and_then(node_fault_marker);
-        // An ABANDONED cold start (the caller's deadline fired first) is not
-        // evidence the deployment is broken, and must not drive the circuit.
-        //
-        // This was self-reinforcing and it took a real deployment down:
-        // shoomoo.shadw.app is a heavy Node app whose cold start outlives an
-        // impatient client, so every request abandoned mid-start, each
-        // abandonment grew `warm_fail_streak`, the streak opened the circuit at
-        // 3, and an open circuit then answers 503 INSTANTLY (measured: 0.35s)
-        // without attempting a start at all — so the app could never finish
-        // booting and could never clear the streak. Measured live on
-        // fc-virginia: fail_streak=54, every single one
-        // `abandoned=true, error="caller gave up before the cold start
-        // finished"`. Not one was an application fault.
-        //
-        // Safe because a genuinely broken deployment still opens the circuit
-        // through the REAL error path: `wait_tcp_ready` has its own bounded
-        // budget and returns `DEPLOYMENT_START_FAILED` (an `Err`, so
-        // `self.error` is `Some`) when the process never listens. Abandonment
-        // means only that the CALLER stopped waiting, which is a statement
-        // about the caller's deadline, not the app.
-        //
-        // The reservation release and a backoff still happen unconditionally:
-        // the `provisioning` decrement is the leak fix this guard exists for
-        // (AGENTS.md, "Request cancellation is a failure mode"), and the
-        // backoff still prevents a stampede of concurrent cold starts.
         let abandoned = self.error.is_none();
         let mut streak = 0u32;
         if let Some(p) = self.fluid.registry.lock().get_mut(&self.key) {
@@ -571,34 +414,14 @@ impl Drop for ColdStartGuard {
                 p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
                 p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
             }
-            // Back off either way (a stampede of cold starts helps nobody), but
-            // an abandoned attempt backs off on the CURRENT streak rather than
-            // growing it.
             p.warm_backoff_until_ms = now_ms() + (1000u64 << p.warm_fail_streak.min(6));
             streak = p.warm_fail_streak;
-            // Only overwrite on a fault we could classify: an abandoned cold
-            // start (error = None) says nothing about the node, and must not
-            // erase a real node fault an earlier attempt proved.
-            //
-            // A cold start that failed for some OTHER reason DOES clear it: the
-            // artifact/hypervisor checks are the first thing `provision` does, so
-            // getting past them and dying later proves the node fault is gone.
-            // Witnessed live: after the missing `default.ext4` was restored, the
-            // half-open probe booted the microVM and then failed on the app
-            // itself — and without this the pool kept reporting the stale
-            // NODE_IMAGE_MISSING, blaming a node the operator had already fixed.
-            // That is the original bug pointed the other way, so it clears here.
-            // The failure direction is deliberate: clearing too eagerly costs one
-            // request the sharper label (the next attempt re-records it), while
-            // keeping it too long mislabels a healthy node indefinitely.
             if let Some(marker) = node_fault {
                 p.last_node_fault = Some(marker);
             } else if self.error.is_some() {
                 p.last_node_fault = None;
             }
         }
-        // The line to read first when a deployment will not start: it names the
-        // streak driving the circuit and whether the caller waited for the answer.
         warn!(
             func = %self.key,
             fail_streak = streak,
@@ -610,13 +433,8 @@ impl Drop for ColdStartGuard {
     }
 }
 
-/// The `hive_core::fault` marker a backend error carries, if any.
-///
-/// These markers are how a NODE fault survives the type erasure of the lease
-/// path: everything reaching here is a flat `anyhow` string, and whatever this
-/// does not recognise is reported to the user as capacity exhaustion. Keep it in
-/// step with `fluid-gateway::classify_lease_error`, which maps the same markers
-/// onto public `FailureClass` codes.
+/// The `hive_core::fault` marker a backend error carries, if any — how a NODE fault survives the
+/// lease path's `anyhow` string; kept in step with `fluid-gateway::classify_lease_error`.
 fn node_fault_marker(es: &str) -> Option<&'static str> {
     for marker in [
         hive_core::fault::NODE_IMAGE_MISSING,
@@ -631,62 +449,32 @@ fn node_fault_marker(es: &str) -> Option<&'static str> {
     None
 }
 
-/// CPU thresholds (% of a cell's allocated vCPU budget) for the adaptive
-/// concurrency controller (#2). Above HIGH we back off; below LOW we recover; the
-/// band between is hysteresis so we don't oscillate.
+/// CPU thresholds (% of a cell's vCPU budget) for the adaptive concurrency controller: above HIGH
+/// back off, below LOW recover, the band between is hysteresis.
 pub const AIMD_CPU_HIGH: f32 = 85.0;
 pub const AIMD_CPU_LOW: f32 = 60.0;
 
-/// An instance that disappears within this long of a SUCCESSFUL warm did not get
-/// scaled down — it exited on its own. Wide enough to catch a container that dies
-/// on its entrypoint (the observed case died in ~2s) without mistaking a genuine
-/// idle-drain for a crash.
+/// An instance that disappears within this long of a SUCCESSFUL warm exited on its own; wide enough
+/// for a container dying on its entrypoint without mistaking an idle-drain for a crash.
 pub const CRASH_LOOP_WINDOW_MS: u64 = 30_000;
 /// Consecutive crash-loop deaths after which the pool's circuit OPENS and leases
 /// fail fast instead of cold-starting into the same immediate death.
 pub const CRASH_CIRCUIT_THRESHOLD: u32 = 3;
-/// How long an open circuit stays open before letting ONE probe request through.
-/// Must comfortably exceed how long a failing cold start takes (observed ~20s for
-/// a container that exits before listening), or arriving requests keep finding the
-/// gate expired and pay the full failure cost every time.
+/// How long an open circuit stays open before ONE probe request is let through; must comfortably
+/// exceed a failing cold start (~20 s observed).
 pub const CIRCUIT_PROBE_INTERVAL_MS: u64 = 30_000;
 
-/// Consecutive INSTANCE failures within [`UNHEALTHY_REAP_WINDOW_MS`] after
-/// which the pool's circuit OPENS although instances are still PRESENT.
-///
-/// This is the gap an instance-count gate leaves open. `warm_fail_streak` and
-/// `crash_streak` are START failures — a cold start that never listened, an
-/// instance that exited — so both need an empty pool to mean anything. An
-/// instance that is registered, holds its slot, and never REPLIES is neither:
-/// it is present the whole time, so the pool was never circuited, never reaped,
-/// and every request against it was reported as overload (`FUNCTION_NO_RESPONSE`
-/// / `CAPACITY_EXHAUSTED`) instead of `DEPLOYMENT_CIRCUIT_OPEN`. Health, not
-/// count, is what decides this arm.
+/// Consecutive INSTANCE failures within [`UNHEALTHY_REAP_WINDOW_MS`] after which the circuit OPENS
+/// although instances are PRESENT — health, not count, decides this arm.
 pub const UNHEALTHY_CIRCUIT_THRESHOLD: u32 = 3;
-/// How far apart two instance failures may be and still count as ONE sustained
-/// run. Past this with no further failure the run is over: a guest that wedged
-/// once and was replaced is not a broken deployment.
+/// How far apart two instance failures may be and still count as ONE sustained run.
 pub const UNHEALTHY_REAP_WINDOW_MS: u64 = 300_000;
-/// How long the unhealthy-instance circuit stays open. It must outlast the
-/// failure it guards: one probe can pay the tunnel's whole response deadline
-/// (`fluid-tunnel`'s `LOCAL_RESPONSE_DEADLINE`, 60s today) on each of up to 5
-/// tunnel-level attempts, so ~300s worst case. It is ALSO re-armed at the
-/// instant the probe lease is handed out (see `lease`), which is what actually
-/// guarantees the window outlasts the attempt however long the attempt really
-/// takes: exactly one request per window pays that cost, and every request
-/// arriving behind it fails fast.
+/// How long the unhealthy-instance circuit stays open: ~300 s worst case for one probe (the tunnel's
+/// `LOCAL_RESPONSE_DEADLINE` × up to 5 attempts), and re-armed when the probe lease is handed out.
 pub const UNHEALTHY_CIRCUIT_PROBE_MS: u64 = 300_000;
 
-/// One AIMD step for a function's per-instance safe-concurrency ceiling (#2), given
-/// the most-pressured instance's CPU utilization (% of allocated vCPU). Classic
-/// additive-increase / multiplicative-decrease driven by a REAL CPU signal (not
-/// latency, which would penalize I/O-bound functions):
-///   * CPU at/above HIGH  → halve the ceiling (multiplicative decrease) so new
-///     requests scale OUT to another instance instead of piling onto a hot one.
-///   * CPU at/below LOW    → +1 (additive increase) to reclaim headroom, so an
-///     I/O-bound function (low CPU even when busy) climbs back to its full max.
-///   * in between          → hold (hysteresis).
-/// Result is clamped to `[1, max]`. Pure + deterministic for unit testing.
+/// One AIMD step for a pool's per-instance safe-concurrency ceiling from the most-pressured
+/// instance's CPU: at/above HIGH halve, at/below LOW +1, between hold; clamped to `[1, max]`.
 pub fn aimd_step(cpu_pct: f32, current: u32, max: u32) -> u32 {
     let next = if cpu_pct >= AIMD_CPU_HIGH {
         (current / 2).max(1)
@@ -707,16 +495,16 @@ fn norm_tenant(t: String) -> String {
     }
 }
 
-    /// Outcome of a speculative (request-less) warm attempt.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum WarmVerdict {
-        /// A cold start was admitted and completed; one instance is up.
-        Started,
-        /// Nothing to do: an instance already exists or a start is in flight.
-        AlreadyWarm,
-        /// Refused without side effects (no reservation taken).
-        Refused,
-    }
+/// Outcome of a speculative (request-less) warm attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmVerdict {
+    /// A cold start was admitted and completed; one instance is up.
+    Started,
+    /// Nothing to do: an instance already exists or a start is in flight.
+    AlreadyWarm,
+    /// Refused without side effects (no reservation taken).
+    Refused,
+}
 
 impl Fluid {
     pub fn start(backend: Arc<dyn CellBackend>, cfg: FluidConfig) -> Arc<Fluid> {
@@ -753,12 +541,7 @@ impl Fluid {
         self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_RUNNING
     }
 
-    /// Late-bind the integrity-chain observer once `hive-cloud`'s
-    /// `deployment_ledger` exists (see `execution_observer`'s doc for why
-    /// this can't be a constructor parameter). Idempotent: a second call is
-    /// a silent no-op rather than a panic, so a defensive double-call from
-    /// two boot paths can never crash the node over an ordering detail this
-    /// unimportant.
+    /// Late-bind the integrity-chain observer once hive-cloud's `deployment_ledger` exists; idempotent.
     pub fn set_execution_observer(&self, observer: Arc<dyn hive_core::ExecutionObserver>) {
         let _ = self.execution_observer.set(observer);
     }
@@ -852,15 +635,15 @@ impl Fluid {
                 for waiter in waiters {
                     let _ = waiter.send(outcome.clone());
                 }
-                // Record ExecutionEnded only on a successful teardown — a
-                // FAILED terminate means the cell may still be live and this
-                // same loop retries it, so recording "ended" now would be a
-                // false integrity-chain entry; the eventual successful retry
-                // records it once, correctly.
                 if let (true, Some(observer), Some(ctx)) =
                     (outcome.is_ok(), self.execution_observer.get(), &execution)
                 {
-                    observer.on_ended(&ctx.deployment_id, id.as_str(), ctx.requests_served, &ctx.outcome);
+                    observer.on_ended(
+                        &ctx.deployment_id,
+                        id.as_str(),
+                        ctx.requests_served,
+                        &ctx.outcome,
+                    );
                 }
                 if let Err(error) = outcome {
                     warn!(cell = %id, %error, "backend cell termination failed; shutdown retains it for retry");
@@ -955,12 +738,6 @@ impl Fluid {
                     .entry(handle.id.clone())
                     .or_insert_with(|| PendingTermination {
                         handle,
-                        // Node-shutdown drain collapses the WHOLE registry at
-                        // once (`std::mem::take`) — recovering each
-                        // instance's deployment/requests_served here isn't
-                        // worth the complexity for a once-per-process-exit
-                        // path; those entries just get no ExecutionEnded
-                        // record (see PendingTermination.execution's doc).
                         execution: None,
                         in_progress: false,
                         waiters: Vec::new(),
@@ -969,9 +746,6 @@ impl Fluid {
             ids.len()
         };
 
-        // All internal producers are now stopped and every cold-start guard has
-        // run. Join the sole running termination writer before shutdown becomes
-        // the sole writer for the final retry/drain.
         self.stop_termination_worker(deadline).await?;
 
         let mut last_errors = Vec::new();
@@ -1029,10 +803,9 @@ impl Fluid {
         )
     }
 
-    /// Stop admission and background work, wait for every cold start to leave
-    /// the provisioning boundary, then terminate every backend handle. The first
-    /// caller starts one bounded teardown task; concurrent and repeated callers
-    /// observe the same terminal result.
+    /// Stop admission and background work, wait for every cold start to leave the provisioning
+    /// boundary, then terminate every backend handle; concurrent and repeated callers observe the
+    /// same terminal result.
     pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<usize> {
         if self
             .shutdown_state
@@ -1129,14 +902,6 @@ impl Fluid {
             "Fluid shutdown began before function-pool registration committed"
         );
         for (key, pool) in &mut pools {
-            // Draining is only correct when the deployment actually CHANGED.
-            // `register_many` is also how a node re-announces pools it already
-            // has (reconcile / re-registration paths), and draining there threw
-            // away warm cells, forcing every in-flight request onto a fresh cold
-            // start. Measured on fc-sanjose 2026-10-08: 41 cold starts in 20
-            // minutes, each paying the litebox tar extraction (tar_ms up to
-            // 24 s) plus ~2 s of spawn readiness. An identical spec means the
-            // same deployment — carry the instances over untouched.
             let (orphans, kept_warm) = match reg.get_mut(key) {
                 Some(old)
                     if old.cfg == pool.cfg
@@ -1180,26 +945,17 @@ impl Fluid {
         Ok(())
     }
 
-    /// Set a pool's dynamic safe-concurrency ceiling (the CPU/IO-pressure hook). A
-    /// pressure monitor calls this to LOWER reuse for CPU-heavy / lagging functions
-    /// (scale out earlier) or raise it back for I/O-bound ones. Clamped to ≥1 and to
-    /// `cfg.max_concurrency`; `None` restores the static ceiling. No-op if unknown.
+    /// Set a pool's dynamic safe-concurrency ceiling (the pressure hook); clamped to `[1,
+    /// cfg.max_concurrency]`, `None` restores the static ceiling, no-op if unknown.
     pub fn set_safe_concurrency(&self, key: &str, n: Option<u32>) {
         if let Some(p) = self.registry.lock().get_mut(key) {
             p.safe_concurrency = n.map(|v| v.clamp(1, p.cfg.max_concurrency));
         }
     }
 
-    /// Replace an existing pool's function config IN PLACE, keeping its live
-    /// instances — the no-redeploy settings-edit hook (ports/protocol changes
-    /// from the dashboard's Network page, via `Gateway::update_manifest`).
-    /// [`Fluid::register`] is NOT usable for this: it replaces the whole
-    /// [`FunctionPool`] (fresh `instances: Vec::new()`), which would orphan
-    /// every running cell untracked. The new config applies to FUTURE instance
-    /// launches (e.g. `cold_start`'s per-launch UDP port publishes); instances
-    /// already running keep their launch-time shape until recycled.
-    /// Recomputes the runtime-aware safe-concurrency baseline the same way
-    /// `register` does. No-op if the pool isn't registered.
+    /// Replace an existing pool's function config IN PLACE, keeping its live instances (the
+    /// no-redeploy settings edit via `Gateway::update_manifest`); `register` would replace the whole
+    /// pool and orphan every running cell. Applies to FUTURE launches; recomputes the runtime baseline.
     pub fn update_config(&self, key: &str, cfg: FunctionConfig) {
         let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
         let safe_concurrency = if rec < cfg.max_concurrency {
@@ -1213,10 +969,8 @@ impl Fluid {
         }
     }
 
-    /// Set a pool's keep-warm floor. Setting it to 0 lets the autoscaler drain the
-    /// pool's idle instances to zero (scale-to-zero) — used to stop keeping
-    /// superseded (non-production) deployments warm while still allowing a cold
-    /// start if their immutable URL is hit. No-op if the pool isn't registered.
+    /// Set a pool's keep-warm floor; 0 lets the autoscaler drain it to zero (superseded deployments)
+    /// while a cold start stays possible. No-op if unknown.
     pub fn set_min_instances(&self, key: &str, n: u32) {
         if let Some(p) = self.registry.lock().get_mut(key) {
             p.cfg.min_instances = n;
@@ -1233,9 +987,8 @@ impl Fluid {
         self.backend.name()
     }
 
-    /// Derive both serving locations from one sealed descriptor. Static files
-    /// use the verified host application root; function launch uses the
-    /// backend-specific cwd. Every backend must explicitly consume the seal.
+    /// Derive both serving locations from one sealed descriptor: static files use the verified host
+    /// application root, function launch the backend-specific cwd.
     pub fn runtime_artifact_paths(
         &self,
         artifact: &SealedRuntimeArtifact,
@@ -1304,7 +1057,6 @@ impl Fluid {
         let mut out: Vec<FunctionStats> = reg
             .iter()
             .map(|(k, p)| {
-                // Fluid bill = retired instance-time + live instances' alive-time.
                 let live_alive: u64 = p
                     .instances
                     .iter()
@@ -1317,13 +1069,9 @@ impl Fluid {
                 } else {
                     0.0
                 };
-                // Active CPU pricing (Vercel convention): bill active processing
-                // time + provisioned memory GB-hrs, not idle instance wall-time.
                 let active_cpu_ms = p.served_ms_sum;
                 let memory_gb_hrs =
                     (p.cfg.memory_mib as f64 / 1024.0) * (fluid_ms as f64 / 3_600_000.0);
-                // Active-CPU billing only charges processing time, so on top of the
-                // multiplexing win it saves the idle keep-warm portion of fluid_ms.
                 let active_cpu_savings_pct = if fluid_ms > 0 {
                     (1.0 - (active_cpu_ms as f64 / fluid_ms as f64)).clamp(0.0, 1.0)
                 } else {
@@ -1379,17 +1127,7 @@ impl Fluid {
             !self.is_shutting_down(),
             "Fluid is shutting down; new function leases are closed"
         );
-        // Open circuit: this deployment's instances keep dying seconds after they
-        // start, so cold-starting another one just dies the same way while the
-        // caller waits out the whole lease timeout (the observed symptom was a
-        // request hanging ~90s). Fail fast and name the REAL cause —
-        // `classify_lease_error` maps this to DEPLOYMENT_CIRCUIT_OPEN so a broken
-        // app stops masquerading as host CAPACITY_EXHAUSTED. Reconcile keeps
-        // retrying on its backoff curve, so a fixed deployment recovers on its own.
         if let Some(p) = self.registry.lock().get_mut(key) {
-            // Why a struggling pool did or did not circuit. Gated on a non-zero
-            // streak so a healthy pool logs nothing, which also makes this the
-            // first thing to read when a deployment is failing in production.
             if p.warm_fail_streak > 0 || p.crash_streak > 0 || p.unhealthy_reaps > 0 {
                 warn!(
                     func = %key,
@@ -1401,18 +1139,7 @@ impl Fluid {
                     "lease against a failing pool"
                 );
             }
-            // Only with NO live instance: a pool serving traffic is never circuited.
             if p.instances.is_empty() {
-                // A NODE fault fails every cold start here, so the streaks below
-                // are ALSO crossed on a node whose rootfs is missing — and the
-                // deployment-blaming text would then be the user's only clue.
-                // Report the node fault first, with its marker intact so the
-                // gateway classifies it as a node fault rather than as a circuit
-                // (which would name the app) or as capacity (which would name the
-                // host's space). This is the second half of the fc-sanjose-cvm-2
-                // outage: 13 failed cold starts flipped the visible code between
-                // CAPACITY_EXHAUSTED and DEPLOYMENT_CIRCUIT_OPEN while the actual
-                // fault was one absent file.
                 if let Some(marker) = p.last_node_fault {
                     if p.warm_fail_streak >= CRASH_CIRCUIT_THRESHOLD
                         && now_ms() < p.circuit_probe_after_ms
@@ -1427,7 +1154,6 @@ impl Fluid {
                         );
                     }
                 }
-                // (a) Instances come up and then die on their own.
                 if p.crash_streak >= CRASH_CIRCUIT_THRESHOLD {
                     let n = p.crash_streak;
                     anyhow::bail!(
@@ -1437,15 +1163,6 @@ impl Fluid {
                         CRASH_LOOP_WINDOW_MS / 1000
                     );
                 }
-                // (b) Instances never reach a listening state at all (the witnessed
-                // "exited before listening on 127.0.0.1:PORT" shape). Keep-warm
-                // already backs off on this, but the REQUEST path did not: every
-                // incoming request re-ran the doomed cold start and then burned the
-                // reroute budget on top, so the caller waited ~45s to be told
-                // CAPACITY_EXHAUSTED. Fail fast for the duration of the backoff the
-                // failures already armed — when it expires the next request probes
-                // again (half-open), so a fixed deployment recovers with no operator
-                // action.
                 if p.warm_fail_streak >= CRASH_CIRCUIT_THRESHOLD
                     && now_ms() < p.circuit_probe_after_ms
                 {
@@ -1457,15 +1174,6 @@ impl Fluid {
                     );
                 }
             }
-            // (c) Instances are PRESENT but have STOPPED ANSWERING.
-            //
-            // Every arm above is a START failure and needs an empty pool, so an
-            // instance that is registered, holds its slot and never replies
-            // reached NONE of them: it was never reaped, never circuited, and
-            // the deployment read as overload (504 FUNCTION_NO_RESPONSE /
-            // 503 CAPACITY_EXHAUSTED) forever. AGENTS.md: "A broken deployment
-            // reports DEPLOYMENT_CIRCUIT_OPEN, never CAPACITY_EXHAUSTED".
-            // Decay the run first, then decide on HEALTH, never on count.
             let now = now_ms();
             if now.saturating_sub(p.unhealthy_reap_ms) > UNHEALTHY_REAP_WINDOW_MS {
                 p.unhealthy_reaps = 0;
@@ -1480,11 +1188,6 @@ impl Fluid {
                          deployment's logs, entrypoint and required env (DeploymentCircuitOpen)"
                     );
                 }
-                // HALF-OPEN: hand this ONE request through as the probe and
-                // re-arm the window FROM NOW, so the window always outlasts
-                // however long the failing attempt actually takes. Without the
-                // re-arm, a probe slower than the window would let every
-                // request arriving behind it pay the full deadline too.
                 p.circuit_probe_after_ms = now + UNHEALTHY_CIRCUIT_PROBE_MS;
                 warn!(
                     func = %key,
@@ -1495,9 +1198,6 @@ impl Fluid {
             }
         }
         let deadline = tokio::time::Instant::now() + self.cfg.lease_timeout;
-        // Coalesce window: how long a request waits for an in-flight cold start
-        // (singleflight) before it's allowed to launch its own. Bounded so a slow
-        // startup never blocks scale-out beyond this; capped by the lease timeout.
         let coalesce_until =
             tokio::time::Instant::now() + Duration::from_millis(800).min(self.cfg.lease_timeout);
         let mut counted_dedupe = false;
@@ -1516,9 +1216,6 @@ impl Fluid {
                     });
                 }
                 LeaseDecision::WaitForWarm => {
-                    // Singleflight: a cold start is already coming online — wait for it
-                    // and reuse it rather than booting a duplicate. Counts as one cold
-                    // start avoided. Bails at the overall lease deadline.
                     if !counted_dedupe {
                         if let Some(p) = self.registry.lock().get_mut(key) {
                             p.coldstart_deduped += 1;
@@ -1532,15 +1229,10 @@ impl Fluid {
                 }
                 LeaseDecision::ColdStart => match self.cold_start(key).await {
                     Ok((cell_id, endpoint)) => {
-                        // Started fine — close the circuit. A pool with
-                        // min_instances=0 is never warmed by the autoscaler, so this
-                        // is the ONLY place its failure streak can be cleared.
                         if let Some(p) = self.registry.lock().get_mut(key) {
                             p.warm_fail_streak = 0;
                             p.warm_backoff_until_ms = 0;
                             p.circuit_probe_after_ms = 0;
-                            // The node clearly CAN boot a cell now, so whatever
-                            // node fault an earlier attempt recorded is stale.
                             p.last_node_fault = None;
                         }
                         return Ok(Lease {
@@ -1553,23 +1245,10 @@ impl Fluid {
                         });
                     }
                     Err(e) => {
-                        // Release the provisioning reservation, and record the failure
-                        // against the SAME streak/backoff keep-warm uses. Without this
-                        // a request-driven pool (min_instances=0, so keep-warm never
-                        // runs) could fail its cold start on every single request
-                        // forever, each caller paying the full startup timeout plus the
-                        // reroute budget, with nothing anywhere counting the failures.
-                        // The reservation release AND the failure count both
-                        // happen in `cold_start`'s Drop guard, so that a client
-                        // who gives up mid-cold-start is handled identically to
-                        // an explicit error. Doing it here too would double-count.
                         return Err(e);
                     }
                 },
                 LeaseDecision::Saturated(reason) => {
-                    // Backpressure: briefly wait for a slot to free, then NACK so the
-                    // caller (router) can fail over to another peer/region. The reason
-                    // is recorded in the pool's counters for observability.
                     if tokio::time::Instant::now() >= deadline {
                         anyhow::bail!("function '{key}' saturated ({reason:?})");
                     }
@@ -1586,9 +1265,6 @@ impl Fluid {
             "Fluid is shutting down; cold-start admission is closed"
         );
         let mut reg = self.registry.lock();
-        // Existence + per-function knobs. The EFFECTIVE reuse ceiling is the lower of
-        // the static `max_concurrency` and the dynamic `safe_concurrency` (lowered by
-        // the pressure hook for CPU-heavy / lagging functions so we scale out sooner).
         let (max_c, max_instances) = match reg.get(key) {
             Some(p) => (
                 p.cfg
@@ -1599,8 +1275,6 @@ impl Fluid {
             ),
             None => return Ok(LeaseDecision::NotFound),
         };
-        // Reuse the least-loaded healthy instance with a free slot (beats round-robin
-        // — Vercel's finding). Draining instances are never reused.
         {
             let pool = reg.get_mut(key).expect("key present under held lock");
             if let Some(inst) = pool
@@ -1617,23 +1291,14 @@ impl Fluid {
                 });
             }
         }
-        // Singleflight: if a cold start is ALREADY in flight for this pool (demand or
-        // keep-warm), coalesce onto it — wait briefly + reuse it — instead of booting
-        // a duplicate instance. Self-correcting: once it's up (provisioning→0) and
-        // still full, the next pass scales out. `coalesce` is false once the caller's
-        // short wait window elapses, so a slow startup never blocks scale-out forever.
         if coalesce && reg.get(key).expect("present").provisioning > 0 {
             return Ok(LeaseDecision::WaitForWarm);
         }
-        // All full: this pool must be under its OWN ceiling to cold-start (scale out).
         if reg.get(key).expect("present").live_count() >= max_instances {
             let pool = reg.get_mut(key).expect("present");
             pool.nack_concurrency += 1;
             return Ok(LeaseDecision::Saturated(NackReason::ConcurrencyLimit));
         }
-        // ...and the owning tenant must be under its cross-pool instance quota.
-        // Backpressure (Saturated), never a cross-tenant eviction, so one team
-        // can't starve another off a shared node.
         if self.cfg.max_instances_per_tenant > 0 {
             let tenant = reg.get(key).expect("present").tenant.clone();
             let tenant_live: u32 = reg
@@ -1652,20 +1317,10 @@ impl Fluid {
         Ok(LeaseDecision::ColdStart)
     }
 
-    /// Speculatively bring one instance of `key` up AHEAD of any request.
-    ///
-    /// This is the ONE entry point for warming: the autoscaler's keep-warm path
-    /// and any speculative caller (a prewarm hint) share it, so they share the
-    /// crash-loop circuit, the warm backoff and the provisioning reservation
-    /// semantics instead of re-deriving them — a second copy would silently
-    /// relaunch a start-then-die function forever, which is exactly the failure
-    /// the circuit exists to stop.
-    ///
-    /// Never duplicates work: refuses (taking no reservation) when the pool is
-    /// already warm, already starting, saturated, in backoff, behind an open
-    /// circuit, or shutting down. A speculative instance is drained by the
-    /// ordinary scale-to-zero rule once idle, so a wrong guess costs an idle
-    /// instance for `idle_ttl`, never a permanent one.
+    /// Speculatively bring one instance of `key` up AHEAD of any request — the ONE warming entry point
+    /// shared by keep-warm and prewarm hints, so they share the crash-loop circuit, backoff and
+    /// reservation semantics. Refuses without a reservation when the pool is warm, starting, saturated,
+    /// in backoff, circuited or shutting down; a wrong guess costs one idle instance for `idle_ttl`.
     pub async fn warm(self: &Arc<Self>, key: &str) -> anyhow::Result<WarmVerdict> {
         let now = now_ms();
         {
@@ -1676,8 +1331,6 @@ impl Fluid {
             if self.is_shutting_down() {
                 return Ok(WarmVerdict::Refused);
             }
-            // The same three gates keep-warm respects — a hint must never spend
-            // a reservation behind them.
             if pool.crash_streak >= CRASH_CIRCUIT_THRESHOLD {
                 return Ok(WarmVerdict::Refused);
             }
@@ -1685,7 +1338,6 @@ impl Fluid {
                 return Ok(WarmVerdict::Refused);
             }
             if !pool.instances.iter().any(|i| !i.draining) && pool.provisioning == 0 {
-                // Genuinely cold: fall through and take the reservation.
             } else {
                 return Ok(WarmVerdict::AlreadyWarm);
             }
@@ -1700,29 +1352,19 @@ impl Fluid {
         }
     }
 
-    /// Run one cold start for an already-reserved pool and apply the shared
-    /// success/failure bookkeeping (inflight reset, backoff clear, node-fault
-    /// clear, `last_warm_ok_ms`). Used by keep-warm and by [`Self::warm`].
+    /// Run one cold start for an already-reserved pool and apply the shared success/failure bookkeeping;
+    /// used by keep-warm and by [`Self::warm`].
     pub async fn warm_instance(self: &Arc<Self>, key: &str) -> anyhow::Result<()> {
         match self.cold_start(key).await {
             Ok((cell_id, _)) => {
-                // Warm instance: it was created with inflight=1; reset to 0.
                 if let Some(pool) = self.registry.lock().get_mut(key) {
                     if let Some(inst) = pool.instances.iter_mut().find(|i| i.cell_id == cell_id) {
                         inst.inflight = 0;
                         inst.last_active_ms = now_ms();
                     }
-                    // The backend accepted the launch — clear the hard-failure
-                    // backoff. `crash_streak` is deliberately NOT cleared here:
-                    // Ok only means it STARTED, and clearing it on start is
-                    // exactly what let a start-then-die container relaunch
-                    // forever. Reconcile clears it once the instance has
-                    // actually survived CRASH_LOOP_WINDOW_MS.
                     pool.warm_fail_streak = 0;
                     pool.warm_backoff_until_ms = 0;
                     pool.circuit_probe_after_ms = 0;
-                    // A launch the backend accepted proves the node's
-                    // artifacts + hypervisor are usable again.
                     pool.last_node_fault = None;
                     pool.last_warm_ok_ms = now_ms();
                 }
@@ -1730,42 +1372,16 @@ impl Fluid {
                 Ok(())
             }
             Err(e) => {
-                // Reservation release, backoff (2s, 4s, 8s … capped ~64s)
-                // and the circuit gate are all armed by `cold_start`'s Drop
-                // guard, so a pool that keeps failing stops storming no
-                // matter which caller drove the attempt.
                 debug!(func = %key, error = %e, "keep-warm cold start failed");
                 Err(e)
             }
         }
     }
 
-    /// Provision a cell and start the function in it. `provisioning` was already
-    /// incremented by the caller; on success we add the instance with inflight=1.
-    /// Count EVERY failing cold start here, CANCELLATION-SAFELY — the one point
-    /// all callers funnel through (keep-warm, a request-path lease, any future
-    /// caller).
-    ///
-    /// Two distinct bugs made the earlier per-caller counting useless, both
-    /// witnessed live:
-    ///
-    /// 1. Only the caller that actually RUNS the cold start reaches its own error
-    ///    branch. Every request that coalesced behind an in-flight one bailed with
-    ///    "cold-start coalesce timed out" and counted nothing — and those waiters
-    ///    are the majority under load.
-    /// 2. Worse, when the CLIENT gives up (curl timeout, browser navigation away,
-    ///    an upstream proxy deadline), axum drops the request future mid-await. A
-    ///    dropped future never returns `Err` at all, so no error branch anywhere
-    ///    runs: the failure went uncounted AND the `provisioning` reservation
-    ///    taken in `decide_lease` was never released. A leaked reservation is the
-    ///    expensive half — `live_count()` includes `provisioning`, so it both makes
-    ///    every later request coalesce until the lease deadline instead of trying,
-    ///    and convinces keep-warm the pool is already at `min_instances` so it
-    ///    stops warming. The pool wedges permanently with nothing running.
-    ///
-    /// A Drop guard is the only correct shape here: it fires on success-with-error,
-    /// on early return, AND on cancellation, which is exactly the set of ways a
-    /// cold start can fail to produce an instance.
+    /// Provision a cell and start the function in it (`provisioning` already incremented by the
+    /// caller; on success the instance is added with inflight=1). EVERY failing cold start is counted
+    /// here, cancellation-safely, by a Drop guard: a request whose client gave up is dropped mid-await
+    /// and never returns `Err`, so an error branch would leak the reservation and wedge the pool.
     async fn cold_start(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
         let mut guard = ColdStartGuard {
             fluid: self.clone(),
@@ -1775,8 +1391,6 @@ impl Fluid {
         };
         let r = self.cold_start_inner(key).await;
         match &r {
-            // `cold_start_inner` already released the reservation and pushed the
-            // instance on this path, so there is nothing for the guard to undo.
             Ok(_) => guard.armed = false,
             Err(e) => guard.error = Some(e.to_string()),
         }
@@ -1787,8 +1401,6 @@ impl Fluid {
         self: &Arc<Self>,
         key: &str,
     ) -> anyhow::Result<(CellId, CellEndpoint)> {
-        // Bound concurrent provisioning so a burst can't saturate the host. Held
-        // for the whole provision+start; dropped when this fn returns.
         anyhow::ensure!(
             !self.is_shutting_down(),
             "Fluid shutdown began before cold-start admission"
@@ -1809,12 +1421,6 @@ impl Fluid {
                 .get(key)
                 .ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
             let port = free_port()?;
-            // CONTAINER functions publish every declared UDP port spec on its own
-            // loopback host port (`-p 127.0.0.1:<host>:<container>/udp`) so the
-            // UDP relay has a local datagram leg — datagrams cannot ride the TCP
-            // tunnel. Host ports are probed as real UDP binds; a failed probe
-            // skips that spec LOUDLY (the app's other ports still serve) rather
-            // than failing the whole cold start over an auxiliary publish.
             let udp_ports: Vec<hive_core::UdpPublish> = if pool
                 .cfg
                 .start_cmd
@@ -1838,14 +1444,6 @@ impl Fluid {
             } else {
                 Vec::new()
             };
-            // TCP twin of the UDP block above: every raw/published TCP-transport
-            // spec gets its own loopback host port so the raw proxy's resolver
-            // can splice DIRECTLY into that container port (`Lease::
-            // tcp_host_port`). The primary spec rides with host = the launch's
-            // assigned `port` — that mapping already exists, recording it here
-            // just makes it resolvable per container port. Extra specs probe a
-            // fresh host port each; a failed probe skips that spec LOUDLY, same
-            // policy as UDP.
             let tcp_ports: Vec<hive_core::TcpPublish> = if pool
                 .cfg
                 .start_cmd
@@ -1874,13 +1472,6 @@ impl Fluid {
                             });
                         }
                         match free_port() {
-                            // A fresh probe returning EXACTLY the launch's own
-                            // primary host port would collide with the primary
-                            // `-p` pairing (the emitters dedupe on host ==
-                            // launch.port, so the extra spec would be
-                            // advertised in tcp_ports yet published nowhere —
-                            // its traffic spliced into the PRIMARY container
-                            // port). Skip it; the next cold start re-probes.
                             Ok(hp) if hp == port => {
                                 warn!(func = %key, container_port = s.container_port, "loopback TCP probe returned the primary host port; skipping this publish for this instance");
                                 None
@@ -1903,31 +1494,16 @@ impl Fluid {
                 start_cmd: pool.cfg.start_cmd.clone(),
                 env: pool.cfg.env.clone(),
                 workdir: Some(pool.workdir.clone()),
-                // Populated after this registry snapshot, before provision, from
-                // the backend's committed delivery identity. It cannot be resolved
-                // while the parking_lot registry lock is held because the proof
-                // lookup is async.
                 runtime_artifact: None,
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
-                // Carry the container memory/cpus/pids ceilings to the backend's
-                // podman path (cpus/pids ignored for microVM/process functions).
                 memory_mib: pool.cfg.memory_mib,
                 cpus: pool.cfg.cpus,
                 pids: pool.cfg.pids,
-                // The single resolved runtime signal for this launch — explicit
-                // config wins, else inferred from argv. Every backend/guest agent
-                // reads THIS instead of re-sniffing start_cmd independently.
                 runtime: hive_core::Runtime::resolve(&pool.cfg.runtime, &pool.cfg.start_cmd),
-                // Non-HTTP protocol (gRPC/TCP/UDP): the backend must front this
-                // function's local tunnel hop with a RAW byte splice, never the
-                // HTTP-framed tunnel path (which would corrupt e.g. Postgres /
-                // Minecraft wire bytes by HTTP-parsing them).
                 raw_proxy: pool.cfg.needs_raw_proxy(),
                 udp_ports,
                 tcp_ports,
-                // Serverless GPU: the backend's podman path passes the host
-                // GPUs through (CDI) when set.
                 gpu: pool.cfg.gpu,
             };
             (
@@ -1939,15 +1515,6 @@ impl Fluid {
             )
         };
 
-        // A platform-published isolated artifact is named `dpl-*` at the one
-        // delivery boundary. Resolve its committed identity BEFORE provision and
-        // carry that exact H1 through the launch. The backend then compares H1
-        // with the bytes it actually attached (H2); it must never self-authorize
-        // whatever publication happens to be current after this decision.
-        //
-        // Same-host functions and OCI containers do not attach this artifact and
-        // deliberately retain `None`. A dpl-* launch with no identity is neither
-        // of those legacy shapes, so fail before booting or executing tenant code.
         let is_container = launch.start_cmd.first().map(String::as_str) == Some("__container__");
         let needs_runtime_artifact = image.starts_with("dpl-")
             && !is_container
@@ -1986,17 +1553,10 @@ impl Fluid {
             launch.runtime_artifact = None;
         }
 
-        // A CONTAINER deployment (`["__container__", image, port]`) is run via host
-        // podman by the backend (mock OR firecracker), not as a microVM/process —
-        // surface that on the CellSpec so the backend skips booting a microVM.
         let container =
             if launch.start_cmd.first().map(String::as_str) == Some("__container__") {
                 Some(hive_backend::ContainerSpec {
                     image: launch.start_cmd.get(1).cloned().unwrap_or_default(),
-                    // Single TCP entry (the common shape): container port from
-                    // start_cmd[2], host port = the launch's assigned free port —
-                    // same (container, host) pairing the backends build from
-                    // `func.start_cmd`/`func.port` in their podman paths.
                     ports: {
                         let mut ports = vec![hive_backend::ContainerPort::tcp(
                             launch
@@ -2006,8 +1566,6 @@ impl Fluid {
                                 .unwrap_or(8080),
                             launch.port,
                         )];
-                        // Declared UDP specs publish alongside the primary TCP port
-                        // (same mapping the backends emit from `launch.udp_ports`).
                         ports.extend(launch.udp_ports.iter().map(|u| {
                             hive_backend::ContainerPort {
                                 container_port: u.container_port,
@@ -2015,9 +1573,6 @@ impl Fluid {
                                 protocol: hive_backend::ContainerProtocol::Udp,
                             }
                         }));
-                        // Extra raw/published TCP specs likewise — minus the
-                        // primary, whose pairing is ports[0] already (a duplicate
-                        // `-p` for the same pair would fail the podman run).
                         ports.extend(launch.tcp_ports.iter().filter_map(|t| {
                             if t.host_port == launch.port {
                                 return None;
@@ -2048,9 +1603,6 @@ impl Fluid {
             container,
         };
         debug!(func = %key, cell = %spec.id, "cold-starting function instance");
-        // Cold-start phase decomposition (#12): time provision (boot/microVM/container)
-        // and start_function (runtime init + tunnel attach) separately so a slow cold
-        // start is explainable, not a single opaque number.
         let t_prov = now_ms();
         let handle = self
             .backend
@@ -2111,11 +1663,8 @@ impl Fluid {
         }
     }
 
-    /// Called by `fluid-gateway::try_browser` on a successful browser-served
-    /// response — the ONLY metering chokepoint for that path, since it never
-    /// calls `lease()` and so never reaches `release()` above. No-op if the
-    /// pool is unknown (a browser target can outlive the pool that would
-    /// otherwise back it, e.g. before any fleet cold start has ever run).
+    /// Called by `fluid-gateway::try_browser` on a successful browser-served response — the ONLY
+    /// metering chokepoint for that path, which never calls `lease()`. No-op for an unknown pool.
     pub fn record_browser_request(&self, key: &str, active_ms: u64) {
         if let Some(pool) = self.registry.lock().get_mut(key) {
             pool.browser_requests += 1;
@@ -2123,9 +1672,8 @@ impl Fluid {
         }
     }
 
-    /// Remove an instance the router/health-check found unreachable, terminate
-    /// it, and account its time. Keep-warm/cold-start will replace it. This is
-    /// our analogue of an instance `nack` → router drops it.
+    /// Remove an instance the router/health check found unreachable, terminate it and account its
+    /// time; keep-warm/cold-start replaces it.
     pub async fn mark_dead(self: &Arc<Self>, key: &str, cell_id: &CellId) {
         let (handle, requests_served) = {
             let mut reg = self.registry.lock();
@@ -2135,10 +1683,6 @@ impl Fluid {
             };
             let inst = pool.instances.remove(pos);
             pool.dead_reaped += 1;
-            // Instance HEALTH, not instance count: a reap proves the request
-            // path found this instance unreachable while it was still
-            // REGISTERED. Counting the run here is what lets a present-but-
-            // not-answering instance open the circuit (see `lease`).
             let now = now_ms();
             if now.saturating_sub(pool.unhealthy_reap_ms) > UNHEALTHY_REAP_WINDOW_MS {
                 pool.unhealthy_reaps = 0; // previous failure aged out of the run
@@ -2158,7 +1702,11 @@ impl Fluid {
             }
             (inst.handle, inst.requests_served)
         };
-        let deployment_id = key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+        let deployment_id = key
+            .split_once('/')
+            .map(|(d, _)| d)
+            .unwrap_or(key)
+            .to_string();
         let execution = Some(ExecutionEndContext {
             deployment_id,
             requests_served,
@@ -2172,9 +1720,8 @@ impl Fluid {
         self.unregister_many(&[key.to_string()]).await;
     }
 
-    /// Remove a deployment's complete pool set under one lock, then terminate
-    /// every detached cell outside the lock. An in-flight cold start cannot
-    /// publish into only part of the removed set.
+    /// Remove a deployment's complete pool set under one lock, then terminate every detached cell
+    /// outside it, so an in-flight cold start cannot publish into part of the removed set.
     pub async fn unregister_many(self: &Arc<Self>, keys: &[String]) -> usize {
         let mut unique: Vec<&str> = keys.iter().map(String::as_str).collect();
         unique.sort_unstable();
@@ -2186,8 +1733,11 @@ impl Fluid {
             for key in unique {
                 if let Some(pool) = reg.remove(key) {
                     removed += 1;
-                    let deployment_id =
-                        key.split_once('/').map(|(d, _)| d).unwrap_or(key).to_string();
+                    let deployment_id = key
+                        .split_once('/')
+                        .map(|(d, _)| d)
+                        .unwrap_or(key)
+                        .to_string();
                     handles.extend(pool.instances.into_iter().map(|instance| {
                         (
                             instance.handle,
@@ -2208,12 +1758,9 @@ impl Fluid {
         removed
     }
 
-    // ---- health checks ------------------------------------------------
-
     async fn health_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            // Probe idle instances only (don't disturb in-flight requests).
             let candidates: Vec<(String, CellId, CellEndpoint)> = {
                 let reg = self.registry.lock();
                 reg.iter()
@@ -2235,8 +1782,6 @@ impl Fluid {
         }
     }
 
-    // ---- autoscaler: keep-warm + scale-to-zero ------------------------
-
     async fn autoscaler_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(self.cfg.autoscaler_interval).await;
@@ -2245,23 +1790,13 @@ impl Fluid {
     }
 
     async fn reconcile(self: Arc<Self>) {
-        // Decide scale-up (keep-warm) and scale-down (idle) under the lock.
         let mut to_warm: Vec<String> = Vec::new();
         let mut to_drain: Vec<(String, CellId, hive_backend::CellHandle, u64)> = Vec::new();
         let now = now_ms();
         {
             let mut reg = self.registry.lock();
             for (key, pool) in reg.iter_mut() {
-                // Keep-warm: bring live count up to min_instances — unless this
-                // pool is in failure backoff (its cold starts keep failing, so
-                // don't hammer the host every tick).
                 let live = pool.live_count();
-                // Crash-loop detection, BEFORE the keep-warm decision below so an
-                // armed backoff suppresses this very tick. Nothing in this loop
-                // drains a pool below `min_instances` (scale-to-zero explicitly
-                // keeps min; recycling needs an age/request count a seconds-old
-                // instance cannot have), so an instance missing this soon after a
-                // successful warm exited on its own.
                 if live < pool.cfg.min_instances
                     && pool.last_warm_ok_ms != 0
                     && now.saturating_sub(pool.last_warm_ok_ms) < CRASH_LOOP_WINDOW_MS
@@ -2280,7 +1815,6 @@ impl Fluid {
                     && pool.last_warm_ok_ms != 0
                     && now.saturating_sub(pool.last_warm_ok_ms) >= CRASH_LOOP_WINDOW_MS
                 {
-                    // Stayed up past the window — genuinely healthy, close the circuit.
                     pool.crash_streak = 0;
                 }
                 let live = pool.live_count();
@@ -2290,11 +1824,6 @@ impl Fluid {
                         to_warm.push(key.clone());
                     }
                 }
-                // Scale-to-zero: drain idle instances above min_instances.
-                // Plus instance recycling (#13): retire instances that have served
-                // too many requests / lived too long, GRACEFULLY — mark draining (no
-                // new requests via decide_lease), terminate once idle; keep-warm
-                // brings up a replacement next tick. Safe even for hot instances.
                 let ttl_ms = pool.cfg.idle_ttl_secs * 1000;
                 let max_req = self.cfg.max_requests_per_instance;
                 let max_age_ms = self.cfg.max_instance_age_secs.saturating_mul(1000);
@@ -2303,10 +1832,13 @@ impl Fluid {
                 let mut recycled_add = 0u64;
                 for inst in pool.instances.iter_mut() {
                     if inst.draining {
-                        // Already draining (e.g. recycled while busy) — terminate once
-                        // its in-flight requests have all completed.
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
+                            to_drain.push((
+                                key.clone(),
+                                inst.cell_id.clone(),
+                                inst.handle.clone(),
+                                inst.requests_served,
+                            ));
                         }
                         continue;
                     }
@@ -2316,7 +1848,12 @@ impl Fluid {
                         recycled_add += 1;
                         retired_add += age_ms;
                         if inst.inflight == 0 {
-                            to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
+                            to_drain.push((
+                                key.clone(),
+                                inst.cell_id.clone(),
+                                inst.handle.clone(),
+                                inst.requests_served,
+                            ));
                         }
                         continue;
                     }
@@ -2326,7 +1863,12 @@ impl Fluid {
                         inst.draining = true;
                         live_after -= 1;
                         retired_add += age_ms;
-                        to_drain.push((key.clone(), inst.cell_id.clone(), inst.handle.clone(), inst.requests_served));
+                        to_drain.push((
+                            key.clone(),
+                            inst.cell_id.clone(),
+                            inst.handle.clone(),
+                            inst.requests_served,
+                        ));
                     }
                 }
                 pool.instance_ms_retired += retired_add;
@@ -2334,9 +1876,6 @@ impl Fluid {
             }
         }
 
-        // Execute outside the lock, but keep every operation owned by this
-        // autoscaler task. Shutdown aborts and joins that one owner; no detached
-        // cold start or termination can outlive the Fluid lifecycle.
         let warm = futures::future::join_all(to_warm.into_iter().map(|key| {
             let f = self.clone();
             async move {
@@ -2347,8 +1886,11 @@ impl Fluid {
             |(key, cell_id, handle, requests_served)| {
                 let f = self.clone();
                 async move {
-                    let deployment_id =
-                        key.split_once('/').map(|(d, _)| d).unwrap_or(&key).to_string();
+                    let deployment_id = key
+                        .split_once('/')
+                        .map(|(d, _)| d)
+                        .unwrap_or(&key)
+                        .to_string();
                     let execution = ExecutionEndContext {
                         deployment_id,
                         requests_served,
@@ -2364,22 +1906,12 @@ impl Fluid {
         ));
         tokio::join!(warm, drain);
 
-        // ---- #2 adaptive concurrency (CPU-driven AIMD) --------------------
-        // Sample the REAL CPU of each pool's live instances and AIMD-adjust the
-        // per-instance safe-concurrency ceiling. Snapshot the handles under the
-        // lock, then sample + apply OUTSIDE it (cpu_percent is async and must not
-        // be awaited while holding the parking_lot registry lock).
         self.adapt_concurrency().await;
     }
 
-    /// CPU-driven adaptive concurrency controller (#2). For every pool with live
-    /// instances, take the MAX CPU across its instances (the most-pressured one)
-    /// and step the safe-concurrency ceiling via [`aimd_step`]. A pool whose
-    /// backend can't report CPU (all samples `None`) is left untouched — we never
-    /// fall back to a latency proxy.
+    /// CPU-driven adaptive concurrency: per pool, the MAX CPU across live instances steps the
+    /// safe-concurrency ceiling via [`aimd_step`]; a backend that cannot report CPU is left untouched.
     async fn adapt_concurrency(&self) {
-        // Snapshot (key, handles, current-ceiling, max) without holding the lock
-        // across the async CPU sampling.
         let targets: Vec<(String, Vec<hive_backend::CellHandle>, u32, u32)> = {
             let reg = self.registry.lock();
             reg.iter()
@@ -2399,17 +1931,6 @@ impl Fluid {
                 .collect()
         };
 
-        // Sample EVERY instance of EVERY pool concurrently, then fold.
-        //
-        // This was a nested serial `for`: one awaited `cpu_percent` per live
-        // instance, per 500ms tick, on the same task that runs keep-warm — so
-        // sampling latency directly delays the next warm/drain decision, and a
-        // single backend call that blocks (each takes the backend's cell-map
-        // mutex, which `terminate` used to hold across `podman rm`) stalls the
-        // whole autoscaler. Cost was N serial awaits x 120 ticks/min.
-        // Concurrency here is bounded by the instance count of one node, and
-        // each call is a cheap sampler read, so a plain `join_all` per pool
-        // with the pools themselves joined is enough — no semaphore needed.
         let sampled_pools = futures::future::join_all(targets.into_iter().map(
             |(key, handles, current, max)| async move {
                 let samples =
@@ -2435,8 +1956,6 @@ impl Fluid {
             let next = aimd_step(max_cpu, current, max);
             if let Some(pool) = self.registry.lock().get_mut(&key) {
                 pool.last_cpu_pct = max_cpu;
-                // `None` means "no dynamic cap" (full max); only store Some when we've
-                // actually backed off below max.
                 pool.safe_concurrency = if next >= pool.cfg.max_concurrency {
                     None
                 } else {
@@ -2450,11 +1969,8 @@ impl Fluid {
     }
 }
 
-/// Why a warm instance / pool could not immediately accept a request (a NACK).
-/// Surfaced so the router can react (retry → scale-out → peer → region) and so the
-/// reason is observable. (Per-instance CPU / memory / event-loop-lag / tunnel
-/// reasons require runtime-emitted signals — see `set_safe_concurrency`, the hook
-/// a pressure monitor lowers to express those as a reduced safe concurrency.)
+/// Why a warm instance / pool could not immediately accept a request (a NACK), so the router can
+/// react (retry → scale-out → peer → region) and the reason is observable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NackReason {
@@ -2470,9 +1986,8 @@ enum LeaseDecision {
         endpoint: CellEndpoint,
     },
     ColdStart,
-    /// Singleflight: a cold start is already in flight for this pool, so this request
-    /// should briefly WAIT for it (and reuse it) instead of launching a duplicate —
-    /// avoids a cold-start storm where N concurrent requests each boot an instance.
+    /// Singleflight: a cold start is already in flight for this pool, so this request briefly WAITS for
+    /// it instead of launching a duplicate.
     WaitForWarm,
     Saturated(NackReason),
     NotFound,
@@ -2493,12 +2008,8 @@ impl Lease {
         &self.cell_id
     }
 
-    /// The loopback host port THIS lease's instance publishes `container_port`
-    /// over UDP on (`127.0.0.1:<host_port>`, podman `-p …/udp`) — the local
-    /// datagram leg the UDP relay sends to while holding the lease (so inflight
-    /// accounting keeps the instance alive for the session). `None` when the
-    /// instance publishes no such UDP port (non-container function, or the spec
-    /// wasn't declared/published).
+    /// The loopback host port THIS lease's instance publishes `container_port` over UDP on — the local
+    /// datagram leg the UDP relay sends to while holding the lease; `None` when not published.
     pub fn udp_host_port(&self, container_port: u16) -> Option<u16> {
         let reg = self.fluid.registry.lock();
         reg.get(&self.key)?
@@ -2511,10 +2022,8 @@ impl Lease {
             .map(|u| u.host_port)
     }
 
-    /// The loopback host port THIS lease's instance publishes `container_port`
-    /// over TCP on — the direct local splice leg for raw/published TCP ports
-    /// (extra Tcp/Grpc specs, compose-published Http ports, and the primary).
-    /// Same contract as [`Lease::udp_host_port`].
+    /// The loopback host port THIS lease's instance publishes `container_port` over TCP on — the direct
+    /// local splice leg for raw/published TCP ports; same contract as [`Lease::udp_host_port`].
     pub fn tcp_host_port(&self, container_port: u16) -> Option<u16> {
         let reg = self.fluid.registry.lock();
         reg.get(&self.key)?
@@ -2552,10 +2061,8 @@ fn free_port() -> anyhow::Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-/// Grab a free UDP port by binding a UDP socket to :0 — a port free for TCP is
-/// not necessarily free for UDP, so UDP publishes get their own probe. (Same
-/// probe-then-release TOCTOU window as [`free_port`]; podman's own bind fails
-/// loudly in the rare race and keep-warm relaunches.)
+/// Grab a free UDP port by binding to :0 — a port free for TCP is not necessarily free for UDP
+/// (same probe-then-release window as [`free_port`]; podman's own bind fails loudly in the race).
 fn free_udp_port() -> anyhow::Result<u16> {
     let s = std::net::UdpSocket::bind("127.0.0.1:0")?;
     Ok(s.local_addr()?.port())

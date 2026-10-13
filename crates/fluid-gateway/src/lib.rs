@@ -1,14 +1,6 @@
-//! `fluid-gateway` — the public router.
-//!
-//! This is the Vercel "Functions router" analogue. For each incoming request it:
-//! 1. selects the target deployment (by `Host` subdomain, else the default),
-//! 2. resolves the path to a route (static asset vs function),
-//! 3. serves the file, or leases a Fluid instance and proxies the request to it.
-//!
-//! Each instance is reached over a single **multiplexed tunnel**
-//! ([`fluid_tunnel::TunnelClient`]): one persistent connection carries many
-//! concurrent requests (stream-id framing) plus in-band metrics and nack. The
-//! gateway keeps one tunnel per instance and reuses it for every request.
+//! The public router: select the target deployment (by `Host`, else the default), resolve the path
+//! to a static asset or a function, then serve the file or lease a Fluid instance and proxy over its
+//! single multiplexed tunnel ([`fluid_tunnel::TunnelClient`], one per instance, reused).
 
 mod static_files;
 
@@ -50,11 +42,8 @@ struct GwState {
     static_roots: HashMap<DeploymentId, static_files::StaticRoot>,
     /// project name -> current deployment id.
     aliases: HashMap<String, DeploymentId>,
-    /// FULL hostname (lowercased, e.g. `numo.gg`, `www.numo.gg`) -> deployment
-    /// id, for tenant-attached custom domains. Checked BEFORE the label map in
-    /// every resolution path: an attached domain must route its exact host and
-    /// nothing else — first-label keying would also serve `numo.attacker.tld`
-    /// and let `www.numo.gg` shadow the platform's own `www` label.
+    /// FULL hostname (lowercased) → deployment id for tenant-attached custom domains, checked BEFORE the
+    /// label map in every resolution path (first-label keying would also serve `numo.attacker.tld`).
     aliases_full: HashMap<String, DeploymentId>,
     /// Compiled, authoritative Build Output v3 route state. A refusal is retained
     /// beside the deployment so no request can fall through to legacy routing.
@@ -96,9 +85,8 @@ impl Default for BrowserScope {
     }
 }
 
-/// One short-lived browser serving registration. The tenant and exact
-/// deployment/function are part of the key; a content digest alone is never an
-/// authorization capability.
+/// One short-lived browser serving registration; tenant and exact deployment/function are part of
+/// the key — a content digest alone is never an authorization capability.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserTarget {
     pub tenant: String,
@@ -112,11 +100,8 @@ pub struct BrowserTarget {
     pub scope: BrowserScope,
 }
 
-/// Hard ceiling on serving registrations one browser endpoint may hold
-/// (browser-auto-serve-eligible-set). The admission side bounds its own
-/// eligible set well below this; this is the gateway's own independent refusal
-/// so a bug (or a future caller) upstream can never make one tab's routing
-/// table unbounded.
+/// Hard ceiling on serving registrations one browser endpoint may hold — the gateway's own refusal,
+/// independent of the admission side's smaller eligible set.
 pub const MAX_BROWSER_TARGETS_PER_ENDPOINT: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -128,13 +113,8 @@ pub struct BrowserInvokeFailure {
 pub type BrowserInvokeFuture =
     Pin<Box<dyn Future<Output = Result<Vec<u8>, BrowserInvokeFailure>> + Send>>;
 pub type BrowserInvoker = Arc<dyn Fn(BrowserTarget, String) -> BrowserInvokeFuture + Send + Sync>;
-/// Resolves the caller's authenticated tenant from the request's own headers
-/// (platform JWT bearer / cookie / API key — whichever hive-cloud's own
-/// `auth` module already accepts elsewhere), or `None` if unauthenticated.
-/// fluid-gateway has no knowledge of hive-cloud's Clerk/platform-JWT auth
-/// system (it's the lower-level, generic crate hive-cloud embeds, never the
-/// other way — see `rum`'s doc comment above for the same asymmetry), so this
-/// is injected exactly like `BrowserInvoker` rather than implemented here.
+/// Resolves the caller's authenticated tenant from the request headers, or `None`; injected because
+/// fluid-gateway knows nothing of hive-cloud's auth (hive-cloud embeds this crate, never the reverse).
 pub type BrowserClaimsResolver = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
 #[derive(Default)]
@@ -143,20 +123,13 @@ struct BrowserRoutes {
     claims_resolver: Option<BrowserClaimsResolver>,
     by_function: HashMap<String, Vec<BrowserTarget>>,
     circuit_until: HashMap<String, u64>,
-    /// Per-endpoint invocation quota (bn-p2p-heartbeat-lease): a fixed
-    /// window `(window_start_ms, count_in_window)` keyed on `endpoint_id`.
-    /// An admitted-but-unrevoked browser has an unbounded invoke rate today
-    /// otherwise — a lease bounds HOW LONG it can be invoked, never how
-    /// OFTEN, and that's a real abuse surface a compromised or careless
-    /// caller can hit (volunteer-compute-trust-admission-models research:
-    /// borrowed from BOINC's `max_results_day`-style throttle, quota-shaped
-    /// rather than a binary revoke).
+    /// Per-endpoint invocation quota, a fixed window `(window_start_ms, count)` keyed on `endpoint_id`:
+    /// a lease bounds how LONG a browser may be invoked, this bounds how OFTEN.
     invoke_quota: HashMap<String, (u64, u32)>,
 }
 
-/// Validate and compile a manifest's authoritative Build Output v3 route table.
-/// This is public so the build planner can fail before registration and direct
-/// executable witnesses can exercise the same capability gate as deployment.
+/// Validate and compile a manifest's authoritative Build Output v3 route table; public so the build
+/// planner can fail before registration.
 pub fn build_output_v3_evaluator(
     manifest: &Manifest,
 ) -> Result<Option<BuildOutputV3Evaluator>, BuildOutputV3Refusal> {
@@ -216,10 +189,8 @@ pub fn build_output_v3_evaluator(
     Ok(Some(evaluator))
 }
 
-/// Exact, closed allowlist — never a pattern match. Vercel's own currently
-/// supported Node.js Lambda runtimes are 20.x/22.x/24.x; any other value
-/// (an EOL Node line, a not-yet-released one, or a typo) is an unsupported
-/// capability, not merely "not yet tested".
+/// Exact, closed allowlist (Vercel's currently supported Node.js Lambda runtimes); any other value is
+/// an unsupported capability, never a pattern match.
 pub const SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES: &[&str] =
     &["nodejs20.x", "nodejs22.x", "nodejs24.x"];
 
@@ -452,20 +423,11 @@ fn supported_build_output_image_path_pattern(pattern: &str) -> bool {
         })
 }
 
-/// Resolve the CWD a function actually launches from. Every existing
-/// runtime shares one deployment-wide `base` (unchanged behavior); a
-/// function carrying [`fluid_core::FunctionConfig::cwd_relative`] — today,
-/// only Build Output API v3 Node `.func` bundles — launches from its OWN
-/// subdirectory instead, so sibling functions in the same deployment can
-/// never resolve each other's relative `import()`s.
+/// The CWD a function launches from: the deployment-wide `base`, or its own subdirectory when it
+/// carries [`fluid_core::FunctionConfig::cwd_relative`] (Build Output v3 `.func` bundles). Only
+/// `Normal` path components are joined, so a `.` app-root spelling never yields `<base>/.`, which
+/// the backend's exact equality against the sealed workdir would refuse.
 fn function_launch_workdir(base: &str, function: &fluid_core::FunctionConfig) -> String {
-    // `cwd_relative` rides the wire in normalized form whose app-root spelling
-    // is a literal "." (build_coordinates::FunctionCwd::wire). `Path::join`
-    // preserves `.` components verbatim, so a naive join emits "<base>/." —
-    // which then fails the backend's exact string equality against the sealed
-    // artifact's workdir (witnessed live: litebox refused launch "/workspace/
-    // apps/web/." vs artifact "/workspace/apps/web"). Push only Normal
-    // components so every spelling of the same directory joins identically.
     let mut path = std::path::PathBuf::from(base);
     if let Some(rel) = function.cwd_relative.as_deref() {
         for component in Path::new(rel).components() {
@@ -585,19 +547,13 @@ pub struct Gateway {
     /// Image/rootfs used for function cells (matters for the firecracker backend).
     image: String,
     state: Mutex<GwState>,
-    /// One multiplexed tunnel per instance (cell), reused for all its requests.
-    /// Async mutex so creation is serialized per gateway (no duplicate/orphan
-    /// tunnels race) — held only briefly across the connect.
+    /// One multiplexed tunnel per instance, reused for all its requests; async mutex so creation is
+    /// serialized (no duplicate tunnels), held only across the connect.
     tunnels: tokio::sync::Mutex<HashMap<CellId, Arc<TunnelClient>>>,
     tunnels_opened: AtomicU64,
     tunnels_reused: AtomicU64,
-    /// Real User Monitoring samples from the `@vercel/speed-insights` beacon
-    /// (see `handle_public`'s `/_vercel/speed-insights/vitals` handling). Lives
-    /// here (not in hive-cloud's CloudState) because `Deployment.tenant` — the
-    /// only tenant attribution available at the point the beacon is received —
-    /// is resolved via `Gateway::select`, and `handle_public` has no CloudState
-    /// access at all (fluid-gateway is a lower-level crate hive-cloud embeds,
-    /// never the other way around).
+    /// Real User Monitoring samples from the `@vercel/speed-insights` beacon; lives here because
+    /// `Deployment.tenant` is the only tenant attribution available where the beacon lands.
     rum: RumStore,
     browser: RwLock<BrowserRoutes>,
     runtime_artifact_store: PathBuf,
@@ -626,9 +582,8 @@ pub struct DeploymentReadinessReceipt {
     pub static_response_truncated: bool,
 }
 
-/// Cancellation-safe handle for a hidden deployment candidate. Dropping it
-/// synchronously removes the candidate record and atomically detaches its whole
-/// pool set; cell termination continues outside the registry lock.
+/// Cancellation-safe handle for a hidden deployment candidate: dropping it removes the record and
+/// atomically detaches its whole pool set; cell termination continues outside the registry lock.
 pub struct StagedDeployment {
     gateway: Arc<Gateway>,
     info: DeploymentInfo,
@@ -679,42 +634,42 @@ impl Drop for StagedDeployment {
     }
 }
 
-    /// Outcome of one speculative warm for a host, for logging and metrics.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum WarmHost {
-        /// A cold start ran and one instance is now up.
-        Started,
-        /// The pool already had an instance or a start in flight.
-        AlreadyWarm,
-        /// The pool exists but refused (circuit, backoff, saturation, shutdown).
-        Refused,
-        /// The cold start was admitted and failed.
-        Failed,
-        /// No alias for this host on this node.
-        NotServed,
-        /// Alias exists but the deployment is not `Ready`.
-        NotReady,
-        /// Static deployment — no function to warm.
-        NothingToWarm,
-        /// More than one function: the request's target is not knowable yet.
-        Ambiguous,
-    }
+/// Outcome of one speculative warm for a host, for logging and metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmHost {
+    /// A cold start ran and one instance is now up.
+    Started,
+    /// The pool already had an instance or a start in flight.
+    AlreadyWarm,
+    /// The pool exists but refused (circuit, backoff, saturation, shutdown).
+    Refused,
+    /// The cold start was admitted and failed.
+    Failed,
+    /// No alias for this host on this node.
+    NotServed,
+    /// Alias exists but the deployment is not `Ready`.
+    NotReady,
+    /// Static deployment — no function to warm.
+    NothingToWarm,
+    /// More than one function: the request's target is not knowable yet.
+    Ambiguous,
+}
 
-    impl WarmHost {
-        /// Stable log/metric token for the outcome.
-        pub fn as_str(self) -> &'static str {
-            match self {
-                WarmHost::Started => "started",
-                WarmHost::AlreadyWarm => "already-warm",
-                WarmHost::Refused => "refused",
-                WarmHost::Failed => "failed",
-                WarmHost::NotServed => "not-served",
-                WarmHost::NotReady => "not-ready",
-                WarmHost::NothingToWarm => "static",
-                WarmHost::Ambiguous => "ambiguous",
-            }
+impl WarmHost {
+    /// Stable log/metric token for the outcome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WarmHost::Started => "started",
+            WarmHost::AlreadyWarm => "already-warm",
+            WarmHost::Refused => "refused",
+            WarmHost::Failed => "failed",
+            WarmHost::NotServed => "not-served",
+            WarmHost::NotReady => "not-ready",
+            WarmHost::NothingToWarm => "static",
+            WarmHost::Ambiguous => "ambiguous",
         }
     }
+}
 
 impl Gateway {
     pub fn new(fluid: Arc<Fluid>, image: String) -> Arc<Gateway> {
@@ -747,9 +702,8 @@ impl Gateway {
         })
     }
 
-    /// Close direct-deploy admission, stop the compatibility worker, release
-    /// gateway tunnels, and wait for Fluid to terminate every owned cell. Safe
-    /// to call repeatedly or concurrently.
+    /// Close direct-deploy admission, stop the compatibility worker, release gateway tunnels, and wait
+    /// for Fluid to terminate every owned cell; safe to call repeatedly or concurrently.
     pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<usize> {
         self.shutting_down.store(true, Ordering::Release);
         self.state.lock().accepting = false;
@@ -780,23 +734,15 @@ impl Gateway {
         }
     }
 
-    /// Record one `/_vercel/speed-insights/vitals` beacon payload
-    /// (`{"href":"...","vitals":{"FCP":...,"LCP":...,"CLS":...,"INP":...,"TTFB":...}}`)
-    /// under `tenant`. Malformed bodies are silently dropped (a beacon is
-    /// best-effort telemetry, never worth a request failure).
+    /// Record one `/_vercel/speed-insights/vitals` beacon payload under `tenant`; malformed bodies are
+    /// silently dropped (best-effort telemetry).
     pub fn record_vitals(&self, tenant: &str, device: RumDevice, body: &[u8]) {
         self.rum.record(tenant, device, body);
     }
 
-    /// Real-User-Monitoring summary for `tenant` over the last `minutes`,
-    /// optionally narrowed to one device class — p75/p90/p95/p99 per vital,
-    /// a computed Real Experience Score, real top routes, and the true sample
-    /// count (so the dashboard can show an honest "collecting" state at 0
-    /// rather than the previous permanently-empty stub). LOCAL to this node
-    /// only — hive-cloud's `/v1/speed-insights` handler fans this out across
-    /// the fleet via `rum_raw` + `RumRaw::merge` before calling `summarize()`,
-    /// same reason `/v1/metrics` fans out (a tenant's visitors can land on
-    /// any node).
+    /// RUM summary for `tenant` over the last `minutes` (p75/p90/p95/p99 per vital, Real Experience
+    /// Score, top routes, true sample count) — LOCAL to this node; hive-cloud's `/v1/speed-insights`
+    /// fans out via `rum_raw` + `RumRaw::merge` before `summarize()`.
     pub fn rum_summary(
         &self,
         tenant: &str,
@@ -816,40 +762,24 @@ impl Gateway {
         self.browser.write().invoker = Some(invoker);
     }
 
-    /// Wires the caller-tenant resolver used to gate `BrowserScope::Team`
-    /// targets in `try_browser` — see `BrowserClaimsResolver`'s doc comment.
-    /// `Public`-scoped targets are unaffected: they remain reachable by any
-    /// caller regardless of whether this is ever set.
+    /// Wires the caller-tenant resolver that gates `BrowserScope::Team` targets in `try_browser`;
+    /// `Public` targets are unaffected.
     pub fn set_browser_claims_resolver(&self, resolver: BrowserClaimsResolver) {
         self.browser.write().claims_resolver = Some(resolver);
     }
 
-    /// Insert or replace the one target owned by an endpoint for a function.
-    /// Replacement is atomic: stale digest/address data cannot survive renewal.
-    ///
-    /// Thin wrapper over [`Gateway::set_browser_targets`] — a one-element set —
-    /// kept because the single-target shape is still the explicit-pin case.
+    /// Insert or replace the one target an endpoint owns for a function (atomic replacement) — a
+    /// one-element [`Gateway::set_browser_targets`].
     pub fn upsert_browser_target(&self, target: BrowserTarget) -> Result<(), &'static str> {
         let endpoint_id = target.endpoint_id.clone();
         self.set_browser_targets(&endpoint_id, vec![target])
     }
 
-    /// Replace the COMPLETE set of serving registrations owned by one endpoint,
-    /// atomically (browser-auto-serve-eligible-set).
-    ///
-    /// One browser endpoint may serve SEVERAL (deployment, function) pairs — a
-    /// donor is admitted for every browser-eligible function its tenant owns,
-    /// not one hand-picked target — but it still owns exactly ONE registration
-    /// per function key, and a renewal replaces the whole set under a single
-    /// write lock. That is what keeps the original invariant intact: a target
-    /// dropped from the set (redeploy rotated its digest, deployment deleted,
-    /// tenant/scope moved) is unreachable the instant the new set lands, never
-    /// left behind as a stale sibling.
-    ///
-    /// Every member is validated independently and identically to the
-    /// single-target path — empty tenant/deployment/function, a non-64-hex
-    /// endpoint id or digest, or a member naming a DIFFERENT endpoint than the
-    /// one being replaced all reject the whole call without mutating anything.
+    /// Replace the COMPLETE set of serving registrations owned by one endpoint atomically: one
+    /// registration per function key, a renewal replaces the whole set under one write lock so a
+    /// dropped target is unreachable the instant the new set lands. Every member is validated
+    /// (non-empty tenant/deployment/function, 64-hex endpoint id and digest, same endpoint) or the
+    /// whole call rejects without mutating anything.
     pub fn set_browser_targets(
         &self,
         endpoint_id: &str,
@@ -880,8 +810,6 @@ impl Gateway {
                 return Err("invalid browser serving target");
             }
             let key = func_key(&target.deployment, &target.function);
-            // One registration per function key per endpoint: a duplicated
-            // pair in the incoming set is caller confusion, never two routes.
             if validated.iter().any(|(existing, _)| *existing == key) {
                 return Err("duplicate browser serving target for one function");
             }
@@ -942,9 +870,8 @@ impl Gateway {
         out
     }
 
-    /// Get the live tunnel for an instance, opening one if needed. Creation is
-    /// serialized under the async lock so concurrent first-requests to the same
-    /// instance share ONE tunnel (no orphan connections).
+    /// Get the live tunnel for an instance, opening one if needed; creation is serialized so concurrent
+    /// first requests share ONE tunnel.
     async fn tunnel_for(
         &self,
         cell: &CellId,
@@ -968,9 +895,8 @@ impl Gateway {
         self.tunnels.lock().await.remove(cell);
     }
 
-    /// Compatibility seam for synchronous library callers. The bounded worker
-    /// owns a persistent Tokio runtime, so tunnel and backend tasks spawned by a
-    /// successful deployment survive this method returning.
+    /// Compatibility seam for synchronous library callers; the bounded worker owns a persistent Tokio
+    /// runtime, so tasks spawned by a successful deployment survive this returning.
     pub fn deploy(self: &Arc<Self>, root: String, manifest: Manifest) -> DeploymentInfo {
         let request = DeployRequest {
             root: root.clone(),
@@ -1028,9 +954,8 @@ impl Gateway {
             .map_err(|_| anyhow::anyhow!("deployment runtime stopped without a result"))?
     }
 
-    /// Seal one local source snapshot, commit its exact runtime identity, stage it
-    /// hidden, and publish immutable aliases only after a bounded real response.
-    /// Production alias movement remains a separate durable transaction.
+    /// Seal one local source snapshot, commit its exact runtime identity, stage it hidden, and publish
+    /// immutable aliases only after a bounded real response.
     pub async fn deploy_local_request(
         self: &Arc<Self>,
         request: DeployRequest,
@@ -1170,10 +1095,8 @@ impl Gateway {
         self.fluid.runtime_artifact_identity(image).await
     }
 
-    /// Full deploy for callers that do not hold sealed runtime authority.
-    /// Such callers may register static/container deployments, but a function
-    /// deployment fails closed rather than inferring execution authority from
-    /// a mutable host path.
+    /// Full deploy for callers without sealed runtime authority: static/container deployments register,
+    /// a function deployment fails closed rather than inferring execution authority from a host path.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full(
         &self,
@@ -1217,11 +1140,9 @@ impl Gateway {
         )
     }
 
-    /// Register one deployment with distinct host-static and function-runtime
-    /// locations. `host_static_root` is pinned for the deployment lifetime;
-    /// `runtime_workdir` is passed only to function pools and persisted for restore.
-    /// `None` is static-only and never authorizes an isolated backend to infer a
-    /// guest path from the host path.
+    /// Register one deployment with distinct host-static and function-runtime locations;
+    /// `host_static_root` is pinned for the deployment lifetime, `runtime_workdir` goes only to the
+    /// function pools. `None` is static-only.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full_with_runtime(
         &self,
@@ -1248,9 +1169,8 @@ impl Gateway {
         )
     }
 
-    /// Register a deployment owned by one server-issued project incarnation.
-    /// Production demotion and alias movement are scoped to the same identity,
-    /// so a delayed record from a deleted incarnation cannot become current.
+    /// Register a deployment owned by one server-issued project incarnation, so a delayed record from
+    /// a deleted incarnation cannot become current.
     #[allow(clippy::too_many_arguments)]
     pub fn deploy_full_with_runtime_exact(
         &self,
@@ -1278,9 +1198,8 @@ impl Gateway {
         )
     }
 
-    /// Register a complete candidate as `Building` without publishing any alias.
-    /// The returned guard owns rollback until a bounded runtime proof is recorded
-    /// and the caller explicitly publishes the ready deployment.
+    /// Register a complete candidate as `Building` without publishing any alias; the returned guard
+    /// owns rollback until a bounded runtime proof is recorded and the caller publishes.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_full_with_runtime_exact(
         self: &Arc<Self>,
@@ -1362,8 +1281,6 @@ impl Gateway {
         project_incarnation: Option<ProjectIncarnation>,
         publish_routes: bool,
     ) -> DeploymentInfo {
-        // Normalize the owner once at the boundary so the stored record, the
-        // function pools, and every cell agree on the tenant (empty => "personal").
         let tenant = if tenant.trim().is_empty() {
             "personal".to_string()
         } else {
@@ -1429,8 +1346,6 @@ impl Gateway {
             creator,
             git,
             production: production && publish_routes && state == fluid_core::DeployState::Ready,
-            // The requested build lane is immutable; production alias ownership
-            // is committed separately after readiness.
             target: if production {
                 "production".into()
             } else {
@@ -1439,14 +1354,6 @@ impl Gateway {
             tenant,
         };
         let info = view_of(&dep);
-        // A typed Build Contract refusal (including one caught HERE, at deploy
-        // time, by a re-check the settings/vercel.json overlay pipeline can
-        // invalidate after `build_output_manifest` already validated the
-        // manifest once) must register NEITHER a Ready NOR an Error deployment
-        // record, and must never claim the project's production alias — a
-        // refused build leaves the CURRENT production deployment (if any)
-        // exactly as it was. `info` above already carries `state: Error` for
-        // the caller's own logging; nothing below this point may be persisted.
         if build_output_refused {
             return info;
         }
@@ -1462,10 +1369,6 @@ impl Gateway {
             st.deployments.insert(id, dep);
             return info;
         }
-        // Does this project already have a (different) production deployment? If
-        // not, this deploy claims the bare production domain even when it isn't
-        // itself a production deploy — so the very first deploy and the "Building…"
-        // placeholder are reachable at <project>.<host> right away.
         let has_production = st.deployments.values().any(|d| {
             d.project == project
                 && d.production
@@ -1474,10 +1377,6 @@ impl Gateway {
                 && project_incarnation
                     .is_none_or(|incarnation| d.project_incarnation == Some(incarnation))
         });
-        // Invariant: at most ONE production deployment per project. Promoting this
-        // one to production demotes any prior production deployment of the same
-        // project, so the production alias can't later resolve to a stale deployment
-        // after a restart (which would serve the OLD build).
         if production {
             for d in st.deployments.values_mut() {
                 if d.project == project
@@ -1489,17 +1388,8 @@ impl Gateway {
             }
         }
         st.deployments.insert(id.clone(), dep);
-        // Vercel's 3 URL types: the immutable per-deployment + commit URLs and the
-        // mutable branch URL (latest on that branch).
         insert_deploy_aliases(&mut st, &id);
-        // Production domain (<project>) + default fallback move only on a production
-        // deploy — a preview deploy of an existing project must NOT hijack prod.
-        // Exception: the project's first-ever deploy claims it so the URL resolves.
         if production || !has_production {
-            // Custom domains follow the project's production deployment —
-            // their whole point is to be the production URL, so a redeploy or
-            // promote must not strand them on the superseded build. The old
-            // production id is simply the project alias's previous target.
             let old_production = st.aliases.get(&project).cloned().filter(|old| {
                 project_incarnation.is_none_or(|incarnation| {
                     st.deployments.get(old).is_some_and(|deployment| {
@@ -1615,14 +1505,6 @@ impl Gateway {
                 .map(str::to_string);
             let acceptable = match (response.status(), platform_code.as_deref()) {
                 (status, None) if status.is_success() || status.is_redirection() => true,
-                // An ordinary content miss at "/" is a LEGAL static site (no
-                // root index.html — Vercel deploys these fine and serves 404
-                // at the root); only genuine platform fault codes
-                // (STATIC_UNAVAILABLE, STATIC_FORBIDDEN, BUILD_OUTPUT_*) may
-                // fail readiness. This exact conflation refused a healthy
-                // zero-command deployment with the opaque "returned a
-                // platform error" — the code the probe saw is now always
-                // named.
                 (StatusCode::NOT_FOUND, Some("NOT_FOUND")) => true,
                 _ => false,
             };
@@ -1760,12 +1642,9 @@ impl Gateway {
         })
     }
 
-    /// Re-stamp a deployment's creation time — the causal-stamp seam for
-    /// project-delete generations: a deployment registered over a fresh
-    /// tombstone must dominate it (`remove_project_through` sweeps
-    /// `created_at_ms <= deleted_ms`), so hive-cloud floors the stamp at
-    /// tombstone+1 right after registration. Gossiped copies carry the same
-    /// value, so every node classifies the record identically.
+    /// Re-stamp a deployment's creation time — the causal-stamp seam for project-delete generations
+    /// (`remove_project_through` sweeps `created_at_ms <= deleted_ms`, so hive-cloud floors a fresh
+    /// registration at tombstone+1).
     pub fn restamp_created(&self, id: &str, created_at_ms: u64) {
         let mut st = self.state.lock();
         if let Some(d) = st.deployments.get_mut(&DeploymentId::from(id.to_string())) {
@@ -1779,27 +1658,16 @@ impl Gateway {
         self.select(Some(host)).map(|d| d.project.clone())
     }
 
-    /// The full deployment a request `host` resolves to (same alias resolution the
-    /// public router uses). Exposes `target`/`production` so the preview gate can
-    /// decide protection by the deployment's ACTUAL environment — not by guessing
-    /// from the subdomain (which wrongly flags a production deployment's commit/id
-    /// URLs as previews).
+    /// The full deployment a request `host` resolves to, so the preview gate decides protection by the
+    /// deployment's ACTUAL environment rather than guessing from the subdomain.
     pub fn deployment_for_host(&self, host: &str) -> Option<DeploymentInfo> {
         self.select(Some(host)).map(|d| view_of(&d))
     }
 
-    /// Attach a custom domain to a project. The FULL lowercased hostname is
-    /// keyed to the project's current PRODUCTION deployment (never its first
-    /// label — label keying would also serve every root sharing that label).
-    /// Returns true if a local production deployment exists.
-    ///
-    /// A custom domain is the project's production URL: pinning it to the
-    /// bare project alias would serve a first-ever PREVIEW deploy as
-    /// production (a preview claims the project alias when no production
-    /// exists yet) and never move — the follow logic only tracks the
-    /// production alias target. No local production deployment = false, so
-    /// activation forwards to a node that really hosts one (adversarial
-    /// finding).
+    /// Attach a custom domain to a project: the FULL lowercased hostname is keyed to the project's
+    /// current PRODUCTION deployment (never the bare project alias, which a first-ever preview claims).
+    /// Returns false when no local production deployment exists, so activation forwards to a node that
+    /// hosts one.
     pub fn add_alias(&self, domain: &str, project: &str) -> bool {
         let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let mut st = self.state.lock();
@@ -1812,16 +1680,6 @@ impl Gateway {
             .map(|d| d.id.clone());
         if let Some(id) = target {
             st.aliases_full.insert(host.clone(), id.clone());
-            // `www.<domain>` routes too. Every layer above the gateway already
-            // treats it as platform-owned: `dns.rs` creates the `www` CNAME and
-            // `acme.rs` orders the `www` SAN, but the alias map was the one
-            // layer that only ever learned the bare apex — so a delegated zone
-            // served `www` as a certified 404 (`DEPLOYMENT_NOT_FOUND`) while
-            // the apex served the project. Adding it here fixes all five
-            // activation paths at once, since they all funnel through this.
-            // Not a hijack: an alias only answers requests that DNS already
-            // sent to our edge, and both the CNAME and the SAN above are
-            // created the same way for every attached domain.
             if !host.starts_with("www.") {
                 st.aliases_full.insert(format!("www.{host}"), id);
             }
@@ -1831,21 +1689,12 @@ impl Gateway {
         }
     }
 
-    /// Detach a custom domain from the resolution map (idempotent). The
-    /// LABEL map is deliberately untouched: it holds only platform aliases
-    /// (project names, per-deploy/commit/branch labels) and pre-gate
-    /// grandfathered attaches, none of which belong to this full-host entry —
-    /// dropping any of them would sever unrelated routing (adversarial
-    /// finding: an attach/detach pair on `numo.evil.com` wiped a victim's
-    /// grandfathered `numo` label). Grandfathered labels already die with
-    /// their deployment via `remove()`'s retain.
+    /// Detach a custom domain from the resolution map (idempotent); the LABEL map is untouched because
+    /// it holds only platform aliases and grandfathered attaches that die with their deployment.
     pub fn remove_alias(&self, domain: &str) {
         let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let mut st = self.state.lock();
         st.aliases_full.remove(&host);
-        // Mirror of `add_alias`: detach drops the `www` twin too, or a detach
-        // would leave a routable `www` behind pointing at a project that no
-        // longer owns the domain.
         if !host.starts_with("www.") {
             st.aliases_full.remove(&format!("www.{host}"));
         }
@@ -1857,12 +1706,8 @@ impl Gateway {
         self.promote_incarnation(id, None)
     }
 
-    /// Update the project→deployment alias WITHOUT requiring the deployment
-    /// record to exist in this node's local gateway state. Used when a promote
-    /// was proxied to the host node — the host already owns the record, and this
-    /// node only needs the alias so mesh routing can forward project-hostname
-    /// requests to the host. Idempotent: calling it on a node that already has
-    /// the deployment record is harmless (the alias is already correct).
+    /// Update the project→deployment alias WITHOUT requiring the record locally — the proxied-promote
+    /// case, where this node only needs the alias for mesh routing. Idempotent.
     pub fn set_project_alias(&self, project: &str, deployment_id: &str) {
         let did = DeploymentId::from(deployment_id.to_string());
         let mut st = self.state.lock();
@@ -1889,7 +1734,6 @@ impl Gateway {
         }
         let project = selected.project.clone();
         let incarnation = selected.project_incarnation;
-        // Flip production flags only within the selected incarnation.
         for d in st.deployments.values_mut() {
             if d.project == project && expected.is_none_or(|_| d.project_incarnation == incarnation)
             {
@@ -1905,7 +1749,6 @@ impl Gateway {
         });
         st.aliases.insert(project, did.clone());
         st.default = Some(did.clone());
-        // Custom domains follow the promote too (see deploy_full's note).
         if let Some(old) = old_production {
             if old != did {
                 for v in st.aliases_full.values_mut() {
@@ -1918,16 +1761,10 @@ impl Gateway {
         st.deployments.get(&did).map(view_of)
     }
 
-    /// Mutate an existing deployment's manifest IN PLACE (same record id — no
-    /// new deployment, no rebuild) and sync every function's updated config
-    /// into the Fluid pool so FUTURE instance launches see it (running
-    /// instances keep their launch-time shape until recycled). The
-    /// settings-edit hook behind hive-cloud's `PUT /v1/projects/:project/network`
-    /// (exposing raw TCP/UDP ports without a redeploy). Pool sync goes through
-    /// [`Fluid::update_config`] — never `register`, which would replace the
-    /// whole pool and orphan its live instances. Lock order (state, then fluid
-    /// registry) matches `reconcile_keepwarm`. Returns the updated view, or
-    /// `None` for an unknown id.
+    /// Mutate an existing deployment's manifest IN PLACE and sync each function's config into the
+    /// Fluid pool through [`Fluid::update_config`] (never `register`, which orphans live instances);
+    /// the settings-edit hook behind `PUT /v1/projects/:project/network`. Lock order: state, then
+    /// fluid registry.
     pub fn update_manifest(
         &self,
         id: &str,
@@ -1957,11 +1794,8 @@ impl Gateway {
         Some(info)
     }
 
-    /// Keep-warm reconciliation: only the PRODUCTION deployment of each project
-    /// keeps its configured `min_instances` warm; every superseded (non-production)
-    /// deployment is drained to zero. Without this, each redeploy left an old
-    /// deployment pinning an idle warm instance (N warm microVMs per project).
-    /// Idempotent — safe to call on a timer and after deploy/promote.
+    /// Keep-warm reconciliation: only each project's PRODUCTION deployment keeps `min_instances` warm,
+    /// every superseded deployment drains to zero. Idempotent.
     pub fn reconcile_keepwarm(&self) {
         let st = self.state.lock();
         for d in st.deployments.values() {
@@ -1977,14 +1811,9 @@ impl Gateway {
         }
     }
 
-    /// Bring one instance of the function `host` will invoke up AHEAD of the
-    /// request. Returns immediately with what happened; never blocks a request
-    /// path for long and never creates a permanent instance (an unused one is
-    /// drained by the ordinary scale-to-zero rule).
-    ///
-    /// Refuses without side effects unless the deployment is `Ready` and the
-    /// function is unambiguous, so a prewarm can never resurrect a dead
-    /// placeholder or spend a cell on a host this node does not serve.
+    /// Bring one instance of the function `host` will invoke up AHEAD of the request; never blocks for
+    /// long, never creates a permanent instance, and refuses without side effects unless the deployment
+    /// is `Ready` and the function unambiguous.
     pub async fn warm_host(&self, host: &str) -> WarmHost {
         if !self.serves_host(host) {
             return WarmHost::NotServed;
@@ -1998,16 +1827,18 @@ impl Gateway {
         let names: Vec<String> = {
             let st = self.state.lock();
             match st.deployments.get(&fluid_core::DeploymentId(did.clone())) {
-                Some(d) => d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
+                Some(d) => d
+                    .manifest
+                    .functions
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect(),
                 None => return WarmHost::NotReady,
             }
         };
         match names.len() {
             0 => return WarmHost::NothingToWarm,
             1 => {}
-            // Multi-function: which one the request hits depends on the path,
-            // which a ClientHello does not carry. Warming all of them would
-            // spend N cells on a guess, so wait for the request.
             _ => return WarmHost::Ambiguous,
         }
         let key = func_key(&did, &names[0]);
@@ -2039,7 +1870,6 @@ impl Gateway {
         st.deployments.remove(&did);
         st.static_roots.remove(&did);
         st.build_output_v3.remove(&did);
-        // Drop any aliases that pointed at this deployment.
         st.aliases.retain(|_, v| *v != did);
         st.aliases_full.retain(|_, v| *v != did);
         if st.default.as_ref() == Some(&did) {
@@ -2050,7 +1880,6 @@ impl Gateway {
                 .max_by_key(|d| d.created_at_ms)
                 .map(|d| d.id.clone());
         }
-        // Re-point the project alias to its newest remaining deployment.
         if let Some(newest) = st
             .deployments
             .values()
@@ -2063,10 +1892,8 @@ impl Gateway {
         Some(project)
     }
 
-    /// Stamp only legacy records whose exact platform-issued ids were captured
-    /// while an existing settings row was upgraded under the lifecycle writer.
-    /// Names and timestamps are deliberately insufficient: either can overlap a
-    /// deleted predecessor or a prefix-sharing tenant.
+    /// Stamp only legacy records whose exact platform-issued ids were captured while a settings row was
+    /// upgraded under the lifecycle writer; names and timestamps are deliberately insufficient.
     pub fn adopt_legacy_deployments(
         &self,
         project: &str,
@@ -2093,9 +1920,8 @@ impl Gateway {
         adopted
     }
 
-    /// Delete one deployment only when it still belongs to `expected`. The
-    /// identity is re-checked after async pool teardown, before any gateway
-    /// mutation, so a stale request cannot remove a same-id replacement.
+    /// Delete one deployment only when it still belongs to `expected`, re-checked after async pool
+    /// teardown so a stale request cannot remove a same-id replacement.
     pub async fn remove_exact(
         &self,
         id: &str,
@@ -2164,10 +1990,8 @@ impl Gateway {
             .collect()
     }
 
-    /// Remove only deployments owned by `incarnation`, then clear every route
-    /// still pointing at this project. The caller holds the project lifecycle
-    /// writer and has proved this is the active incarnation, so a legacy record
-    /// may be retained for safety but can never remain reachable by accident.
+    /// Remove only deployments owned by `incarnation`, then clear every route still pointing at this
+    /// project; a legacy record may be retained but can never remain reachable by accident.
     pub async fn remove_project_incarnation(
         &self,
         project: &str,
@@ -2203,19 +2027,10 @@ impl Gateway {
         records
     }
 
-    /// Rename a project IN PLACE across this node's deployment table.
-    ///
-    /// Every routing identity that is DERIVED from the project name moves with
-    /// it: `Deployment.project`, `Manifest.project` and the label aliases built
-    /// from the name (`<project>`, `<project>-<sha>`, `<project>-git-<branch>`).
-    /// Every identity that is not derived from it is left byte-identical —
-    /// notably `id_alias` (`<deployment-id>.<domain>`) and the `aliases_full`
-    /// custom-domain entries, both of which key on something else entirely, so
-    /// a rename can never break a per-deployment URL or an attached domain.
-    ///
-    /// The caller holds the project lifecycle writer; this is a single
-    /// critical section under the gateway lock, so no request can observe a
-    /// half-renamed project. Returns the number of deployments rewritten.
+    /// Rename a project IN PLACE: every name-derived routing identity (`Deployment.project`,
+    /// `Manifest.project`, the `<project>`/`<project>-<sha>`/`<project>-git-<branch>` labels) moves,
+    /// while `id_alias` and `aliases_full` custom domains stay byte-identical. One critical section
+    /// under the gateway lock; returns the number of deployments rewritten.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;
@@ -2238,10 +2053,6 @@ impl Gateway {
                 }
             }
         }
-        // Drop every name-derived alias pointing at one of these deployments.
-        // The per-deployment alias (`id -> id`) is keyed by the deployment's own
-        // id and is deliberately preserved: `id_alias` is what makes old
-        // per-deployment links survive a rename untouched.
         let owned = |target: &DeploymentId| ids.iter().any(|id| id == target);
         st.aliases.retain(|label, target| {
             !(owned(target) && !ids.iter().any(|id| id.as_str() == label.as_str()))
@@ -2249,8 +2060,6 @@ impl Gateway {
         for id in &ids {
             insert_deploy_aliases(&mut st, id);
         }
-        // The bare `<project>` production alias follows the newest production
-        // deployment, matching what a fresh production deploy would install.
         if let Some(newest) = st
             .deployments
             .values()
@@ -2271,17 +2080,9 @@ impl Gateway {
             .any(|deployment| deployment.manifest.image.as_deref() == Some(image))
     }
 
-    /// Delete every deployment for a project. Returns the removed deployment ids.
-    /// Relocation-scoped removal: drop this node's PRODUCTION-lane deployment
-    /// records for a project (target != "preview"; empty target = pre-target
-    /// legacy = production lane) and KEEP every preview. The relocation reaper
-    /// runs after every promotable production build against every non-target
-    /// node — using the full [`Registry::remove_project`] there destroyed
-    /// preview deployments hosted on nodes the new production placement did
-    /// not pick (preview URL 404, row gone from the table), and vice versa.
-    /// A preview is not a "stale copy" of anything: it was placed where it
-    /// was placed, and only a user delete or preview-retention policy may
-    /// remove it.
+    /// Relocation-scoped removal: drop this node's PRODUCTION-lane deployment records for a project
+    /// (empty target = legacy production lane) and KEEP every preview — a preview was placed where it
+    /// was placed and only a user delete or retention policy may remove it. Returns the removed ids.
     pub async fn remove_project_superseded(&self, project: &str) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock();
@@ -2297,10 +2098,8 @@ impl Gateway {
         ids
     }
 
-    /// Delete every deployment for a project whose creation is not newer than
-    /// `deleted_ms`. A causal recreation gets a strictly newer creation stamp
-    /// and survives an old deletion generation, including a retry racing that
-    /// redeploy. Returns the removed deployment ids.
+    /// Delete every deployment for a project whose creation is not newer than `deleted_ms`; a causal
+    /// recreation carries a strictly newer stamp and survives an old deletion generation.
     pub async fn remove_project_through(&self, project: &str, deleted_ms: u64) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock();
@@ -2320,12 +2119,8 @@ impl Gateway {
         self.remove_project_through(project, u64::MAX).await
     }
 
-    /// The git source of a project's newest deployment (for "redeploy"), skipping
-    /// any deployment whose `git` is a synthetic `upload://`/`image://` pseudo-
-    /// source rather than a real git remote (see `GitSource::is_real_git`) — a
-    /// zip-upload or prebuilt-image "New Deployment" becoming the project's
-    /// newest record must not shadow its actual git repo for callers matching
-    /// future GitHub pushes.
+    /// The git source of a project's newest deployment (for "redeploy"), skipping synthetic
+    /// `upload://`/`image://` pseudo-sources (`GitSource::is_real_git`).
     pub fn git_for_project(&self, project: &str) -> Option<fluid_core::GitSource> {
         let st = self.state.lock();
         st.deployments
@@ -2436,7 +2231,6 @@ impl Gateway {
             creator: rec.creator,
             git: rec.git,
             production: rec.production,
-            // Old snapshots have no target — derive it from the production flag.
             target: if rec.target.is_empty() {
                 if rec.production {
                     "production".into()
@@ -2446,11 +2240,6 @@ impl Gateway {
             } else {
                 rec.target
             },
-            // Unlike `deploy_full`'s own empty=>"personal" default (a deliberate,
-            // generic single-tenant convenience for callers that don't use
-            // tenancy at all), a RESTORED record's empty tag is tag LOSS — a
-            // pre-tenancy snapshot, or one written by a stale/rolling-upgrade
-            // binary. Fail closed: never adopt it into a live tenant.
             tenant: restored_tenant,
         };
         let project = dep.project.clone();
@@ -2470,19 +2259,10 @@ impl Gateway {
         }
     }
 
-    /// Pick the deployment for a request: `<project>.<host>` subdomain, else the
-    /// most recent deployment.
-    /// Resolve the function a request `path` routes to for the deployment
-    /// served by `host` — the SAME resolution `handle_public`/`proxy_function`
-    /// use for an ordinary request — and lease its instance. Exposed
-    /// (`select` and the lease pool are otherwise private to this crate) for
-    /// hive-cloud's edge layer to splice a raw WebSocket-upgrade connection
-    /// directly into a LOCALLY-hosted instance, instead of replaying the
-    /// upgrade back through this same node's own public router over the mesh
-    /// (which would needlessly self-dial and re-evaluate routing a second
-    /// time). Returns `None` for no matching deployment, a Static route (no
-    /// function to upgrade to), or a lease failure (cold-start/capacity) —
-    /// the caller falls back to its normal mesh path on a miss.
+    /// Resolve the function a request `path` routes to for the deployment served by `host` (the same
+    /// resolution `handle_public`/`proxy_function` use) and lease its instance — for hive-cloud's edge
+    /// to splice a raw WebSocket upgrade into a LOCALLY hosted instance. `None` for no deployment, a
+    /// Static route, or a lease failure; the caller falls back to its mesh path.
     pub async fn lease_for_path(&self, host: Option<&str>, path: &str) -> Option<Lease> {
         let dep = self.select(host)?;
         let name = match dep.build_output_v3.as_ref() {
@@ -2529,9 +2309,7 @@ impl Gateway {
         st.default.as_ref().and_then(selected)
     }
 
-    /// The deployment id a request `host` resolves to (its subdomain alias), if
-    /// any. Exposes the same alias resolution `select` uses — handy for debugging
-    /// and for asserting which deployment a project host points at.
+    /// The deployment id a request `host` resolves to (its subdomain alias), if any.
     pub fn host_deployment_id(&self, host: &str) -> Option<String> {
         let h = host.split(':').next().unwrap_or(host);
         let st = self.state.lock();
@@ -2542,13 +2320,8 @@ impl Gateway {
         st.aliases.get(sub).map(|id| id.as_str().to_string())
     }
 
-    /// Does this node's full-host alias for `domain` resolve to a deployment
-    /// of `project`? The detach rule: an alias must die when it names a
-    /// deployment of the DETACHED project (the rebind case — a domain moved
-    /// to a different project otherwise leaves the previous project's binding
-    /// live forever, serving the OLD version on every node that held it),
-    /// never when it names a deployment of a project still attached (the
-    /// two-projects-one-domain case, where the live attachment must survive).
+    /// Does this node's full-host alias for `domain` resolve to a deployment of `project`? The detach
+    /// rule: an alias dies when it names the DETACHED project's deployment, never one still attached.
     pub fn alias_points_at_project(&self, domain: &str, project: &str) -> bool {
         let h = domain
             .split(':')
@@ -2562,15 +2335,8 @@ impl Gateway {
             .is_some_and(|d| d.project == project)
     }
 
-    /// EXACT host attribution for event/log tagging: the `(deployment id,
-    /// project)` the host's subdomain alias actually names — with NO
-    /// default-deployment fallback. `select`'s fallback is correct for SERVING
-    /// (an unmatched host still gets an answer) but wrong for ATTRIBUTION: it
-    /// stamps every unmatched host (bot probes on the platform apex, other
-    /// tenants' DB hosts, peer-hosted projects routed through this node) with
-    /// whatever project happens to be this node's default deployment — which is
-    /// how foreign requests leaked into that project's log view. Unresolved
-    /// hosts return `None` and must be recorded UNATTRIBUTED.
+    /// EXACT host attribution for event/log tagging: the `(deployment id, project)` the subdomain alias
+    /// names, with NO default-deployment fallback; unresolved hosts are recorded UNATTRIBUTED.
     pub fn attribution_for_host(&self, host: &str) -> Option<(String, String)> {
         let h = host.split(':').next().unwrap_or(host);
         let st = self.state.lock();
@@ -2583,9 +2349,8 @@ impl Gateway {
         Some((id.as_str().to_string(), project))
     }
 
-    /// Does THIS node actually have a deployment aliased for `host`'s subdomain?
-    /// Exact alias match (no default fallback) — used by mesh routing to decide
-    /// whether to serve locally or proxy to the peer that really hosts it.
+    /// Does THIS node have a deployment aliased for `host`'s subdomain? Exact match, no default
+    /// fallback — mesh routing's serve-locally-or-proxy decision.
     pub fn serves_host(&self, host: &str) -> bool {
         let h = host.split(':').next().unwrap_or(host);
         let st = self.state.lock();
@@ -2596,17 +2361,9 @@ impl Gateway {
         st.aliases.contains_key(sub)
     }
 
-    /// The state of the deployment this host's subdomain alias EXACTLY names —
-    /// no default-deployment fallback, and `None` for both "no alias here" and a
-    /// DANGLING alias (one whose deployment record is gone).
-    ///
-    /// `serves_host` answers "is there an alias", which is not the same question
-    /// as "can this node serve it": an orphaned `Building…` placeholder (its
-    /// build's task died before it could be removed, then reconciled to `Error`
-    /// on the next boot) keeps the project alias forever, and because the edge
-    /// treated any alias as authoritative, that node served the dead placeholder
-    /// locally and never proxied to the peer holding the project's READY
-    /// deployment. Witnessed live on `archive-zip.shadw.app` (2026-08-05).
+    /// The state of the deployment this host's alias EXACTLY names; `None` for no alias and for a
+    /// DANGLING alias. `serves_host` answers "is there an alias", not "can this node serve it": an
+    /// orphaned `Building…` placeholder keeps the alias forever.
     pub fn host_deploy_state(&self, host: &str) -> Option<fluid_core::DeployState> {
         let h = host.split(':').next().unwrap_or(host);
         let st = self.state.lock();
@@ -2618,9 +2375,8 @@ impl Gateway {
         st.deployments.get(id).map(|d| d.state)
     }
 
-    /// All host subdomains this node serves (project aliases + deployment ids
-    /// + full custom-domain hosts), published to peers so the mesh knows where
-    /// each deployment lives.
+    /// All host subdomains this node serves (project aliases, deployment ids, custom-domain hosts),
+    /// published to peers.
     pub fn served_hosts(&self) -> Vec<String> {
         let st = self.state.lock();
         st.aliases
@@ -2630,15 +2386,8 @@ impl Gateway {
             .collect()
     }
 
-    /// Every alias LABEL or full host that resolves to a deployment of
-    /// `project` — the project's own name, its per-commit/branch/deployment
-    /// labels, and any custom domain attached to it (custom domains are keyed
-    /// by FULL hostname; platform aliases by first label).
-    ///
-    /// Exists so a tenant-controlled surface can be scoped to exactly the
-    /// hostnames it legitimately speaks for: the raw-port TLS terminator used
-    /// the fleet-wide SNI resolver, which holds every platform and every other
-    /// tenant's certificate.
+    /// Every alias LABEL or full host that resolves to a deployment of `project`, so a tenant-controlled
+    /// surface (the raw-port TLS terminator) can be scoped to exactly the hostnames it speaks for.
     pub fn alias_labels_for_project(&self, project: &str) -> Vec<String> {
         let st = self.state.lock();
         let ids: std::collections::HashSet<&DeploymentId> = st
@@ -2655,13 +2404,8 @@ impl Gateway {
             .collect()
     }
 
-    /// The subset of [`Gateway::served_hosts`] whose deployment is actually
-    /// `Ready`. Anything that steers traffic to ONE node (DNS affinity records)
-    /// must use this, not `served_hosts`: a specific A record beats the
-    /// wildcard, so publishing a label at a node holding only a failed build or
-    /// an orphaned placeholder pins every client to the one node that cannot
-    /// answer. `served_hosts` itself stays state-blind — the mesh route table
-    /// legitimately wants to know a node holds the label at all.
+    /// The subset of [`Gateway::served_hosts`] whose deployment is `Ready`; anything that steers traffic
+    /// to ONE node (DNS affinity records) must use this, since a specific A record beats the wildcard.
     pub fn served_hosts_ready(&self) -> Vec<String> {
         let st = self.state.lock();
         st.aliases
@@ -2676,9 +2420,8 @@ impl Gateway {
             .collect()
     }
 
-    /// Projects this node hosts that are **container** deployments (a function with
-    /// the `container` runtime) — these are the stateful workloads coordinated by a
-    /// single-owner lease. Functions/static sites are excluded (stateless).
+    /// Projects this node hosts as **container** deployments — the stateful workloads coordinated by a
+    /// single-owner lease.
     pub fn container_projects(&self) -> Vec<String> {
         let st = self.state.lock();
         let mut out: Vec<String> = st
@@ -2920,8 +2663,6 @@ fn static_dir_path(dep: &Deployment) -> PathBuf {
     PathBuf::from(path)
 }
 
-// ---- routers ---------------------------------------------------------------
-
 pub fn public_router(gw: Arc<Gateway>) -> Router {
     Router::new().fallback(handle_public).with_state(gw)
 }
@@ -3041,8 +2782,6 @@ async fn admin_stats(State(gw): State<Arc<Gateway>>) -> Json<Vec<FunctionStats>>
     Json(gw.fluid.stats())
 }
 
-// ---- public request handling ----------------------------------------------
-
 fn build_output_v3_refusal_response(refusal: &BuildOutputV3Refusal) -> Response {
     let status = match refusal {
         BuildOutputV3Refusal::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -3100,15 +2839,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    // Vercel analytics / speed-insights compatibility: the `@vercel/analytics`
-    // and `@vercel/speed-insights` packages load a same-origin script and beacon
-    // their data here. Handle these before deployment routing so any deployed app
-    // using the official packages works unchanged.
     if path.starts_with("/_vercel/") {
-        // The vitals beacon is the one `/_vercel/` path that needs tenant
-        // attribution (to store the sample under the right tenant) — resolve
-        // the deployment here (vercel_insights itself is a pure fn with no
-        // Gateway access) rather than plumbing Gateway through it for one path.
         if parts.method == Method::POST && path == "/_vercel/speed-insights/vitals" {
             if let Some(dep) = gw.select(host.as_deref()) {
                 let device = parts
@@ -3138,8 +2869,6 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         None => return (StatusCode::NOT_FOUND, "no deployment").into_response(),
     };
 
-    // Image Optimization API (`vercel.json` `images`). Next.js' `<Image>` loader
-    // hits `/_next/image`; the Vercel runtime endpoint is `/_vercel/image`.
     if path == "/_vercel/image" || path == "/_next/image" {
         if dep.manifest.build_output_v3.is_some() {
             match dep.build_output_v3.as_ref() {
@@ -3167,7 +2896,6 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         return serve_optimized_image(&dep, parts.uri.query().unwrap_or(""), &parts.headers).await;
     }
 
-    // Request context for `has`/`missing` conditions + host-scoped matching.
     let query = parts.uri.query().unwrap_or("").to_string();
     let with_query = |loc: String| -> String {
         if query.is_empty() {
@@ -3189,8 +2917,6 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             .collect(),
         query: query.clone(),
     };
-    // The original path drives `headers` matching (Vercel matches the incoming
-    // path, before any rewrite).
     let orig_path = path.clone();
     let redirect = |status: u16, location: String| -> Response {
         let code = StatusCode::from_u16(status).unwrap_or(StatusCode::TEMPORARY_REDIRECT);
@@ -3202,12 +2928,9 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             .into_response()
     };
 
-    // 1) trailingSlash normalization (308 add/remove the trailing slash).
     if let Some(newp) = dep.manifest.trailing_slash_redirect(&path) {
         return redirect(308, with_query(newp));
     }
-    // 2) cleanUrls: a request for `/about.html` 308-redirects to `/about`
-    //    (the extensionless form is served directly — see serve_static).
     if dep.manifest.clean_urls && path.ends_with(".html") {
         let mut clean = path.trim_end_matches(".html").to_string();
         if clean.ends_with("/index") {
@@ -3220,21 +2943,9 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             return redirect(308, with_query(clean));
         }
     }
-    // 3) Redirects (vercel.json + framework), honoring has/missing + :param.
     if let Some((location, status)) = dep.manifest.redirect_for_ctx(&path, &ctx) {
         return redirect(status, location);
     }
-    // 4) Rewrites map the public path to an internal one (client URL unchanged).
-    // A SPA's own catch-all rewrite (typically `/(.*) -> /index.html`, needed so
-    // deep-links into client-side routes work) must not shadow a real static
-    // asset at the ORIGINAL path — Vercel's own Build Output v3 routes encode
-    // this explicitly via `{"handle": "filesystem"}` before any regex route
-    // runs; the legacy `rewrites` list has no such precedence built in, so
-    // `/release.json` (or any other real file) silently rewrote to the SPA
-    // shell instead of being served. Only the exact original path is checked
-    // (matching `serve_static`'s own "try the literal file first" order) —
-    // this never suppresses a rewrite whose SOURCE pattern is more specific
-    // than "everything", since those don't collide with real asset paths.
     let relative = PathBuf::from(path.trim_start_matches('/'));
     let skip_rewrite_for_real_asset = !relative.as_os_str().is_empty()
         && match dep.static_root.as_ref() {
@@ -3247,13 +2958,8 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         dep.manifest.rewrite_path_ctx(&path, &ctx)
     };
 
-    // 5) Response headers from `vercel.json` `headers` (matched on the incoming
-    //    path) are injected onto whatever the route produces.
     let extra_headers = dep.manifest.headers_for(&orig_path, &ctx);
 
-    // A Build Output v3 descriptor is authoritative. Evaluate its ordered regex
-    // routes and exact output inventory directly; a miss/refusal never falls
-    // through to longest-prefix legacy routing or the SPA index fallback.
     if dep.manifest.build_output_v3.is_some() {
         let resolution = match dep.build_output_v3.as_ref() {
             Some(BuildOutputV3RouteState::Ready(evaluator)) => {
@@ -3279,8 +2985,6 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             ..
         } = resolution;
         let mut response_headers: Vec<(String, String)> = route_headers.into_iter().collect();
-        // Explicit vercel.json overlays are applied by the caller into the
-        // legacy header layer and win duplicate names by being inserted last.
         response_headers.extend(extra_headers);
         let response = match target {
             Some(BuildOutputV3Target::Static { path, content_type }) => {
@@ -3325,32 +3029,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
 
     let resp = match dep.manifest.resolve(&path) {
         RouteTarget::Static => {
-            // Adapter frameworks (OpenNext / vinext): immutable assets serve from
-            // `static_dir`; on a MISS the request falls through to the origin/SSR
-            // function (the CDN→function model) so dynamic routes still render.
-            // When no `origin_function` is set (the common case) this is exactly
-            // the previous behavior — `serve_static` with its SPA/404 fallback.
             let enc = accepted_encodings(&parts.headers);
-            // UNROUTABLE-BUT-FUNCTIONAL deployment: a manifest that declares
-            // function(s) but NO routes and NO static_dir resolves every path
-            // to `Static` (see `Manifest::resolve`'s fallback), then finds no
-            // file to serve and answers 404 NO_ROUTE_MATCHED — for a project
-            // whose whole purpose is the function. Measured live:
-            // `shoomoo.shadw.app` had a Ready production deployment on
-            // fc-virginia with `functions:[{name:"web",runtime:"node",
-            // start_cmd:["node","server.js"]}]`, `routes: []`,
-            // `static_dir: null` — and 404'd every request. `route_matched`
-            // exists precisely because `resolve` cannot distinguish "a route
-            // said static" from "nothing matched at all"; this is the arm that
-            // finally acts on that distinction.
-            //
-            // Deliberately narrow so a genuine static site is untouched: only
-            // when NOTHING matched, the manifest declares no static_dir, and
-            // there IS a function to serve. A static site either has a
-            // static_dir, or has no functions, and takes the unchanged path
-            // below. Fixing it here rather than only at build time also
-            // rescues deployments ALREADY on disk with this manifest shape,
-            // which would otherwise stay dark until someone redeployed them.
             let implicit_fn = (!dep.manifest.route_matched(&path)
                 && dep.manifest.static_dir.is_none()
                 && dep.manifest.origin_function.is_none())
@@ -3368,8 +3047,6 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                     Ok(b) => b,
                     Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
                 };
-                // Falls through to the same post-match route-policy + header
-                // injection every other arm gets.
                 proxy_function(
                     &gw,
                     &dep,
@@ -3427,31 +3104,21 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             .await
         }
     };
-    // Per-route policy (#16): when this deployment carries Next.js per-route
-    // classification, apply route-type-aware caching to the response. Matched on
-    // the ORIGINAL request path (route patterns are user-facing, pre-rewrite).
-    // No-op when `route_policies` is empty (the common case) -> byte-identical.
     let resp = apply_route_policy(resp, &dep, &orig_path);
     inject_headers(resp, &extra_headers)
 }
 
-/// Apply a deployment's per-route policy (#16) to a response: tag it with the
-/// matched route class for observability, and — for Static/ISR routes whose
-/// origin didn't set its own `Cache-Control` — synthesize the route-type cache
-/// header (Static => immutable, ISR => `s-maxage=revalidate, SWR`). Purely
-/// additive: returns the response untouched when no policy matches, when the
-/// origin already set caching, or for non-success statuses.
+/// Apply a deployment's per-route policy to a response: tag the matched route class, and for
+/// Static/ISR routes whose origin set no `Cache-Control` synthesize the route-type cache header.
+/// Purely additive.
 fn apply_route_policy(mut resp: Response, dep: &Deployment, path: &str) -> Response {
     let Some(policy) = dep.manifest.route_policy(path) else {
         return resp;
     };
-    // Observability: surfaces which class served the request (enables live verify).
     resp.headers_mut().insert(
         "x-hive-route-class",
         HeaderValue::from_static(policy.class.name()),
     );
-    // Only synthesize caching for cacheable (2xx) responses that don't already
-    // carry a Cache-Control from the origin (don't override the app's intent).
     if !resp.status().is_success() || resp.headers().contains_key(header::CACHE_CONTROL) {
         return resp;
     }
@@ -3480,20 +3147,8 @@ fn inject_headers(mut resp: Response, extra: &[(String, String)]) -> Response {
     resp
 }
 
-// ============================ Real User Monitoring ============================
-//
-// Storage + percentile/RES scoring for the `@vercel/speed-insights` beacon
-// (see `vercel_insights`'s SPEED_JS below for what it collects). Previously
-// the beacon fired and was received (202 Accepted) but the payload was
-// discarded entirely — the dashboard's Speed Insights page was hardcoded to
-// an empty "no RUM ingest yet" stub because there was, in fact, no ingest at
-// all. This closes that gap: real samples in, real percentiles + a real
-// score out.
-
-/// Coarse device class, sniffed server-side from the beacon POST's
-/// `User-Agent` header (the beacon itself sends no device field — adding one
-/// would mean shipping new client JS; a UA regex is a one-line, no-client-
-/// change alternative that's plenty accurate for the Desktop/Mobile toggle).
+/// Coarse device class, sniffed server-side from the beacon's `User-Agent` (the beacon sends no
+/// device field).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RumDevice {
@@ -3512,9 +3167,7 @@ impl RumDevice {
     }
 }
 
-/// One beacon's worth of vitals (all optional — a real page load may not
-/// populate every observer, e.g. a page with zero layout shift never fires
-/// the CLS `PerformanceObserver` callback at all).
+/// One beacon's worth of vitals, all optional (a page with zero layout shift never fires CLS).
 #[derive(Clone, serde::Deserialize)]
 struct VitalsIn {
     #[serde(default)]
@@ -3545,14 +3198,8 @@ struct VitalSample {
     v: VitalsPayload,
 }
 
-/// Bounded ring buffer per tenant (newest-N samples, not a time-bucketed
-/// rollup like `MetricsStore` — percentiles need the raw distribution, not a
-/// sum/count, and a capped buffer bounds memory without a separate eviction
-/// policy per resolution). Not persisted: RUM is a live-window UX signal
-/// (Vercel's own dashboard only ever shows a rolling window too), and a
-/// restart refilling within minutes of real traffic is an acceptable
-/// trade-off here — unlike the hour/day usage rollups, there's no billing or
-/// long-term-trend consumer relying on this surviving a restart.
+/// Bounded ring buffer per tenant (newest-N raw samples — percentiles need the distribution); not
+/// persisted, RUM is a live-window signal.
 const RUM_CAP_PER_TENANT: usize = 5_000;
 
 #[derive(Default)]
@@ -3583,17 +3230,9 @@ impl RumStore {
         }
     }
 
-    /// This node's LOCAL samples only, grouped by route — the mergeable unit
-    /// for a fleet-wide read. Percentiles can't be meaningfully averaged
-    /// across nodes (the average of two p75s is not the true p75 of the
-    /// combined population), so a fleet-wide caller merges these raw
-    /// per-route arrays (`RumRaw::merge`) and computes percentiles ONCE on
-    /// the combined, fully-sorted set — same "merge raw, compute once" shape
-    /// as `metrics.rs`'s `Bucket::add`, applied to a distribution instead of
-    /// a sum. Grouping by route (rather than one flat pool) is what lets the
-    /// dashboard's Poor/Needs Improvement/Great route buckets carry a REAL
-    /// per-route score instead of dumping every route into one bucket
-    /// regardless of its actual performance.
+    /// This node's LOCAL samples grouped by route — the mergeable unit: percentiles cannot be averaged
+    /// across nodes, so a fleet-wide caller merges raw per-route arrays (`RumRaw::merge`) and computes
+    /// percentiles ONCE on the combined set.
     fn raw(&self, tenant: &str, minutes: usize, device: Option<RumDevice>, now_ms: u64) -> RumRaw {
         let cutoff = now_ms.saturating_sub((minutes as u64) * 60_000);
         let map = self.by_tenant.read();
@@ -3645,9 +3284,8 @@ impl RumStore {
     }
 }
 
-/// One route's sorted-ascending vital-sample arrays + count — sorted so a
-/// merge across nodes is a cheap concatenate-then-resort, and so percentiles
-/// are computed once, on the final (possibly fleet-merged) set.
+/// One route's sorted-ascending vital-sample arrays + count, so a cross-node merge is
+/// concatenate-then-resort.
 #[derive(Clone, Default, Serialize, serde::Deserialize)]
 pub struct RouteRaw {
     pub fcp: Vec<f64>,
@@ -3709,15 +3347,11 @@ pub struct RumRaw {
     pub sample_count: usize,
 }
 
-/// Real Experience Score: each Core Web Vital scored 0-100 against
-/// Google/Vercel's published good/poor thresholds (linear between them),
-/// weighted LCP 25 / INP 25 / CLS 25 / FCP 15 / TTFB 10 — the commonly-
-/// published breakdown for Vercel's RES. `None` when none of the weighted
-/// vitals have data (honest "collecting"), never a fabricated score.
+/// Real Experience Score: each Core Web Vital scored 0–100 against the published good/poor
+/// thresholds, weighted LCP 25 / INP 25 / CLS 25 / FCP 15 / TTFB 10; `None` without data.
 fn res_score(p75: &VitalPercentiles) -> Option<u32> {
     let score_of = |value: Option<f64>, good: f64, poor: f64| -> Option<f64> {
         let v = value?;
-        // Every one of these 5 vitals is "lower is better".
         let frac = ((poor - v) / (poor - good)).clamp(0.0, 1.0);
         Some(frac * 100.0)
     };
@@ -3791,10 +3425,8 @@ pub struct VitalPercentiles {
     pub ttfb: Option<f64>,
 }
 
-/// One route's own p75 + Real Experience Score — what actually justifies
-/// classifying a route into the dashboard's Poor/Needs Improvement/Great
-/// buckets (rather than every route landing in the same bucket regardless of
-/// its real performance, which a per-route-count-only breakdown would do).
+/// One route's own p75 + Real Experience Score, which classifies it into the dashboard's
+/// Poor/Needs Improvement/Great buckets.
 #[derive(Serialize)]
 pub struct RouteScore {
     pub route: String,
@@ -3833,12 +3465,8 @@ fn path_of_href(href: &str) -> String {
         .to_string()
 }
 
-/// Vercel Web Analytics + Speed Insights endpoints.
-///
-/// * `GET  /_vercel/insights/script.js`        — analytics loader (sends pageviews/events)
-/// * `POST /_vercel/insights/view|event`       — beacon sink (202)
-/// * `GET  /_vercel/speed-insights/script.js`  — web-vitals collector
-/// * `POST /_vercel/speed-insights/vitals`     — beacon sink (202)
+/// Vercel Web Analytics + Speed Insights endpoints: the `script.js` loaders under
+/// `/_vercel/insights/` and `/_vercel/speed-insights/`, and the `view|event`/`vitals` beacon sinks (202).
 fn vercel_insights(method: &Method, path: &str) -> Option<Response> {
     const ANALYTICS_JS: &str = r#"(function(){function send(t,d){try{navigator.sendBeacon('/_vercel/insights/'+t,JSON.stringify(d||{}))}catch(e){}}
 function va(){var a=[].slice.call(arguments),k=a[0];if(k==='event')send('event',a[1]||{});else send('view',a[1]||{})}
@@ -3880,18 +3508,13 @@ addEventListener('visibilitychange',function(){if(document.visibilityState==='hi
         (&Method::POST, "/_vercel/insights/view")
         | (&Method::POST, "/_vercel/insights/event")
         | (&Method::POST, "/_vercel/speed-insights/vitals") => Some(accepted()),
-        // Image Optimization is handled per-deployment after selection.
         (_, "/_vercel/image") => None,
-        // Unknown _vercel path: 204 so the client never sees a hard 404.
         _ => Some((StatusCode::NO_CONTENT, "").into_response()),
     }
 }
 
-/// Vercel-standard `Cache-Control` for a served static asset. Content-hashed
-/// build assets (Next.js `/_next/static/**`, or Vite/webpack `name.<hex>.ext`)
-/// are immutable and cached for a year; everything else uses Vercel's default
-/// (`public, max-age=0, must-revalidate`) — which our CDN treats as
-/// non-storable, so a redeploy never serves stale non-hashed content.
+/// Vercel-standard `Cache-Control` for a static asset: content-hashed build assets are immutable for
+/// a year, everything else `public, max-age=0, must-revalidate` (non-storable for the CDN).
 fn static_cache_control(path: &str) -> &'static str {
     let file = path.rsplit('/').next().unwrap_or("");
     if path.contains("/_next/static/") || is_hashed_asset(file) {
@@ -3901,9 +3524,8 @@ fn static_cache_control(path: &str) -> &'static str {
     }
 }
 
-/// Which content encodings the client accepts, best-first. Honors an explicit
-/// `q=0` (RFC 9110's "not acceptable"), which is the one case where naive
-/// substring matching would hand a client bytes it told us it cannot decode.
+/// Which content encodings the client accepts, best-first; honors an explicit `q=0` (RFC 9110
+/// "not acceptable").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AcceptedEncodings {
     pub br: bool,
@@ -3919,7 +3541,6 @@ fn accepted_encodings(headers: &HeaderMap) -> AcceptedEncodings {
     for part in raw.split(',') {
         let mut it = part.split(';');
         let name = it.next().unwrap_or("").trim().to_ascii_lowercase();
-        // `;q=0` (and `q=0.0`) means explicitly NOT acceptable.
         let refused = it.any(|p| {
             let p = p.trim().to_ascii_lowercase();
             p.strip_prefix("q=")
@@ -3942,9 +3563,8 @@ fn accepted_encodings(headers: &HeaderMap) -> AcceptedEncodings {
     out
 }
 
-/// Is this content type worth compressing? Already-compressed binary formats
-/// (png/jpeg/webp/woff2/zip/video) get nothing but wasted CPU from a second
-/// pass — Vercel draws the same line.
+/// Is this content type worth compressing? Already-compressed binary formats get nothing but
+/// wasted CPU from a second pass.
 fn is_compressible(ctype: &str) -> bool {
     let c = ctype.split(';').next().unwrap_or("").trim();
     c.starts_with("text/")
@@ -3972,9 +3592,8 @@ const MIN_COMPRESS_BYTES: usize = 1024;
 /// compression; a pre-generated `.br`/`.gz` sibling can still cover large assets.
 const MAX_INLINE_COMPRESS_BYTES: usize = 8 * 1024 * 1024;
 
-/// Is `relative` a usable precompressed copy of `src`? The sidecar must be at
-/// least as new, and the source is reopened after the sidecar read to prove it
-/// still names the generation whose identity bytes we selected.
+/// Is `relative` a usable precompressed copy of `src`? The sidecar must be at least as new, and the
+/// source is reopened after the sidecar read to prove it still names the selected generation.
 async fn fresh_sibling(
     root: &static_files::StaticRoot,
     static_dir: &Path,
@@ -4000,8 +3619,6 @@ fn compress_bytes(bytes: &[u8], br: bool) -> Option<Vec<u8>> {
     if br {
         let mut out = Vec::with_capacity(bytes.len() / 3);
         {
-            // q6/lgwin22: the knee of the ratio-vs-time curve for text served
-            // once and then cached as a sibling.
             let mut w = brotli::CompressorWriter::new(&mut out, 4096, 6, 22);
             w.write_all(bytes).ok()?;
             w.flush().ok()?;
@@ -4014,15 +3631,9 @@ fn compress_bytes(bytes: &[u8], br: bool) -> Option<Vec<u8>> {
     }
 }
 
-/// Build the response for a static asset, negotiating `Content-Encoding`.
-///
-/// An on-disk precompressed sibling (`<file>.br`, then `<file>.gz`) is
-/// preferred. Failing that, the response is compressed inline. The request path
-/// never writes into a tenant checkout: doing so safely under concurrent tenant
-/// mutation requires the same directory-fd boundary as reads, and a cache is an
-/// optimization rather than a reason to widen the filesystem authority here.
-/// `Vary: Accept-Encoding` is always set, including on identity responses,
-/// because the same URL genuinely varies by request header.
+/// Build the response for a static asset, negotiating `Content-Encoding`: an on-disk precompressed
+/// sibling (`.br`, then `.gz`) is preferred, else inline compression; the request path never writes
+/// into a tenant checkout. `Vary: Accept-Encoding` is always set.
 async fn static_asset_response(
     root: &static_files::StaticRoot,
     static_dir: &Path,
@@ -4044,9 +3655,6 @@ async fn static_asset_response(
     let want_br = enc.br;
     let want_gz = enc.gzip;
     if (want_br || want_gz) && is_compressible(ctype) && source.bytes.len() >= MIN_COMPRESS_BYTES {
-        // 1) Precompressed sibling, bound to the source generation selected above.
-        // Descriptor-authoritative v3 serving disables this probe: only an output
-        // selected by the compiled descriptor may supply bytes.
         if allow_precompressed {
             for (want, ext, label) in [(want_br, "br", "br"), (want_gz, "gz", "gzip")] {
                 if !want {
@@ -4061,14 +3669,12 @@ async fn static_asset_response(
                 }
             }
         }
-        // 2) Compress inline without mutating the tenant checkout.
         if source.bytes.len() <= MAX_INLINE_COMPRESS_BYTES {
             let use_br = want_br;
             let src = source.bytes.clone();
             if let Ok(Some(out)) =
                 tokio::task::spawn_blocking(move || compress_bytes(&src, use_br)).await
             {
-                // Only worth serving if it actually got smaller.
                 if out.len() < source.bytes.len() {
                     headers.insert(
                         header::CONTENT_ENCODING,
@@ -4142,9 +3748,8 @@ async fn serve_build_output_v3_asset(
     }
 }
 
-/// Try to read a concrete static asset for `path` from the deployment's
-/// `static_dir`. Only `Ok(None)` is an origin fallthrough; authorization and
-/// availability failures retain their type.
+/// Try to read a concrete static asset for `path` from the deployment's `static_dir`; only
+/// `Ok(None)` is an origin fallthrough, authorization and availability failures keep their type.
 async fn read_static_file(
     dep: &SelectedDeployment,
     path: &str,
@@ -4222,16 +3827,8 @@ fn static_read_error(error: static_files::ReadError) -> Response {
     response
 }
 
-/// The 404 for "no static file here", made to distinguish its two very
-/// different causes.
-///
-/// A bare `not found` is honest for a static site missing a file. It is a lie
-/// for a deployment whose `routes` never matched the request at all: nothing
-/// was ever going to serve that path — not the fleet function, not a browser
-/// donor (`try_browser` hangs off the `RouteTarget::Function` branch alone) —
-/// and the response read identically to an unknown host, so the deployment
-/// looked healthy from every angle while serving nothing. Name the miss and the
-/// patterns that produced it instead.
+/// The 404 for "no static file here", naming whether the deployment's `routes` never matched the
+/// request at all (then nothing would ever serve it) instead of a bare `not found`.
 fn no_static_file(dep: &Deployment, path: &str) -> Response {
     if dep.manifest.functions.is_empty() || dep.manifest.route_matched(path) {
         let mut resp = (StatusCode::NOT_FOUND, "not found").into_response();
@@ -4308,7 +3905,6 @@ async fn serve_static(dep: &SelectedDeployment, path: &str, enc: AcceptedEncodin
         Err(error) => return static_read_error(error),
     }
 
-    // cleanUrls: serve `about.html` for a request to `/about`.
     if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
         let relative = PathBuf::from(format!("{rel}.html"));
         match static_files::read(root, &static_dir, &relative).await {
@@ -4334,7 +3930,6 @@ async fn serve_static(dep: &SelectedDeployment, path: &str, enc: AcceptedEncodin
         }
     }
 
-    // SPA-ish fallback: try index.html at the static root only after typed misses.
     let index = Path::new("index.html");
     match static_files::read(root, &static_dir, index).await {
         Ok(source) => match static_asset_response(
@@ -4357,10 +3952,9 @@ async fn serve_static(dep: &SelectedDeployment, path: &str, enc: AcceptedEncodin
     }
 }
 
-/// Vercel Image Optimization API (`/_vercel/image`, also `/_next/image`).
-/// Validates the request against the deployment's `images` config, fetches the
-/// source (local asset or allow-listed remote), and re-encodes it at the
-/// requested width/quality. Resizing uses the pure-Rust `image` crate.
+/// Vercel Image Optimization API (`/_vercel/image`, `/_next/image`): validate against the
+/// deployment's `images` config, fetch the source (local or allow-listed remote), re-encode at the
+/// requested width/quality with the pure-Rust `image` crate.
 async fn serve_optimized_image(
     dep: &SelectedDeployment,
     query: &str,
@@ -4368,7 +3962,6 @@ async fn serve_optimized_image(
 ) -> Response {
     let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string()).into_response();
 
-    // ---- parse query ----
     let mut url = String::new();
     let mut w: Option<u32> = None;
     let mut q: u32 = 75;
@@ -4395,7 +3988,6 @@ async fn serve_optimized_image(
     }
 
     let cfg = dep.manifest.images.as_ref();
-    // Enforce the allow-lists when configured.
     if let Some(c) = cfg {
         if !c.sizes.is_empty() && !c.sizes.contains(&width) {
             return bad("`w` not in images.sizes");
@@ -4406,10 +3998,8 @@ async fn serve_optimized_image(
     }
     let q = q.clamp(1, 100) as u8;
 
-    // ---- resolve + fetch the source ----
     let is_remote = url.starts_with("http://") || url.starts_with("https://");
     let (bytes, is_svg): (Vec<u8>, bool) = if is_remote {
-        // Remote sources require an allow-list (no open proxy / SSRF).
         let allowed = cfg.map(|c| remote_allowed(c, &url)).unwrap_or(false);
         if !allowed {
             return bad("remote url not allowed by images.remotePatterns/domains");
@@ -4439,9 +4029,6 @@ async fn serve_optimized_image(
             _ => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
         }
     } else {
-        // Local asset: validate localPatterns (when set), preserving the v3
-        // distinction between undefined (allow all) and an explicit empty array
-        // (deny all), which the legacy manifest vector cannot represent alone.
         let v3_local_allowed = dep
             .manifest
             .build_output_v3
@@ -4507,7 +4094,6 @@ async fn serve_optimized_image(
         }
     };
 
-    // ---- SVG: not rasterized; passthrough only when explicitly allowed ----
     if is_svg {
         let allow_svg = cfg.and_then(|c| c.dangerously_allow_svg).unwrap_or(false);
         if !allow_svg {
@@ -4516,7 +4102,6 @@ async fn serve_optimized_image(
         return image_response(bytes, "image/svg+xml", cfg);
     }
 
-    // ---- decode → resize → encode (CPU-bound: off the async runtime) ----
     let accept_webp = req_headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -4524,22 +4109,10 @@ async fn serve_optimized_image(
         .unwrap_or(false);
     let formats = cfg.map(|c| c.formats.clone()).unwrap_or_default();
 
-    // CONTENT-ADDRESSED CACHE, checked before any CPU is spent. Vercel's
-    // optimizer is a cache keyed on (source, width, quality, output format);
-    // without one, every single request re-fetched, re-decoded, Lanczos3-
-    // resized and re-encoded the same image — ~100-800ms of blocking CPU per
-    // request for a 1-4 MP source, and a trivially self-inflicted DoS on the
-    // node serving a popular page (the response's own `max-age` is only 60s by
-    // default, so browsers come back for it). The key covers the SOURCE BYTES
-    // (not its URL), so a changed asset is a different entry with no
-    // invalidation step, and the negotiated output format, so a webp-accepting
-    // and a jpeg-only client never read each other's bytes.
     let key = image_cache_key(&bytes, width, q, accept_webp, &formats);
     let cache_dir = image_cache_dir();
     let cache_file = cache_dir.join(&key);
     if let Ok(hit) = tokio::fs::read(&cache_file).await {
-        // Stored as `<ctype>\n<bytes>` so the negotiated content type survives
-        // the round trip without a second sidecar file to keep in sync.
         if let Some(nl) = hit.iter().position(|b| *b == b'\n') {
             let (ct, body) = hit.split_at(nl);
             if let Ok(ct) = std::str::from_utf8(ct) {
@@ -4554,8 +4127,6 @@ async fn serve_optimized_image(
     .await;
     match encoded {
         Ok(Some((out, ctype))) => {
-            // Persist for next time (tmp+rename so a concurrent reader never
-            // sees a partial file). Best-effort and off the response path.
             let payload = {
                 let mut v = Vec::with_capacity(ctype.len() + 1 + out.len());
                 v.extend_from_slice(ctype.as_bytes());
@@ -4577,17 +4148,15 @@ async fn serve_optimized_image(
     }
 }
 
-/// Where optimized-image bytes are cached on this node. Node-local derived
-/// data, so it lives under the node's data dir and never rides replicated
-/// state (the `dns_geo.json` precedent).
+/// Where optimized-image bytes are cached on this node — node-local derived data under the data
+/// dir, never replicated state.
 fn image_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HIVE_DATA").unwrap_or_else(|_| "/var/lib/hive".into()))
         .join("image-cache")
 }
 
-/// Content-address an optimizer result. Keyed on the SOURCE BYTES plus every
-/// input that changes the output, so it is correct by construction: a
-/// re-deployed or edited image hashes differently and simply misses.
+/// Content-address an optimizer result: keyed on the SOURCE BYTES plus every output-changing input,
+/// so an edited image simply misses.
 fn image_cache_key(
     src: &[u8],
     width: u32,
@@ -4595,9 +4164,6 @@ fn image_cache_key(
     accept_webp: bool,
     formats: &[String],
 ) -> String {
-    // FNV-1a over the source bytes + parameters. Not a security boundary (the
-    // inputs are already trusted, server-derived), just a collision-resistant
-    // enough content address for a local cache.
     let mut h: u64 = 0xcbf29ce484222325;
     let mut mix = |b: &[u8]| {
         for x in b {
@@ -4653,8 +4219,6 @@ fn optimize_bytes(
         img
     };
 
-    // Prefer WebP when the client accepts it and config permits (image 0.25's
-    // WebP encoder is lossless; fall back to JPEG/PNG on any error).
     let want_webp =
         accept_webp && (formats.is_empty() || formats.iter().any(|f| f == "image/webp"));
     if want_webp {
@@ -4717,7 +4281,6 @@ fn pct_decode(s: &str) -> String {
 
 /// Is a remote image URL permitted by `images.remotePatterns` / `images.domains`?
 fn remote_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
-    // Parse scheme://host[:port]/path?query without a url crate.
     let after = url.splitn(2, "://").nth(1).unwrap_or("");
     let (authority, rest) = after
         .split_once('/')
@@ -4788,8 +4351,6 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 /// Match a remotePattern `pathname` (supports a trailing `/**` and a `^...$`
 /// regex-ish form via simple prefix/glob) against a path. Best-effort.
 fn pattern_matches(pattern: &str, value: &str) -> bool {
-    // Treat an anchored regex like `^/account123/.*$` as a prefix on the literal
-    // segment before `.*`.
     let pat = pattern.trim_start_matches('^').trim_end_matches('$');
     if let Some(prefix) = pat.strip_suffix(".*") {
         return value.starts_with(prefix);
@@ -4898,13 +4459,6 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 fn browser_response(bytes: &[u8]) -> Result<Response, String> {
     let envelope: BrowserHttpEnvelope =
         serde_json::from_slice(bytes).map_err(|e| format!("malformed browser response: {e}"))?;
-    // `StatusCode::from_u16` alone is NOT the 100..599 check this error message
-    // claims -- the `http` crate accepts any value up to 999 (reserved for
-    // extension codes), so a browser peer returning e.g. 999 sailed straight
-    // through to a real client with no error, verbatim, live-witnessed via
-    // `crates/hive-p2p/examples/fake_browser_peer.rs` returning
-    // `{"status":999,...}` and curl receiving a literal `HTTP/1.1 999 <none>`
-    // response. The explicit range bound is the actual enforcement point.
     if !(100..=599).contains(&envelope.status) {
         return Err("browser response status is outside 100..599".to_string());
     }
@@ -4967,11 +4521,6 @@ async fn try_browser(
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(60_000);
-    // 10 req/s average sustained over the window — generous for a real
-    // owner-served app, well below what would meaningfully burden a single
-    // browser tab, and the actual protection this exists for: an
-    // admitted-but-unrevoked endpoint otherwise has NO invoke-rate bound at
-    // all for the rest of its lease.
     let quota_max = std::env::var("HIVE_BROWSER_INVOKE_QUOTA_PER_WINDOW")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -4985,13 +4534,6 @@ async fn try_browser(
         let Some(targets) = browser.by_function.get(&key) else {
             return BrowserAttempt::None;
         };
-        // Team-scoped targets require the CALLER to be an authenticated
-        // member of the owning tenant — resolved once here (only matters if
-        // a Team-scoped candidate actually exists below) rather than per
-        // candidate, since it's the same answer for every one of them. `None`
-        // (no resolver wired, or the caller presented no valid session) means
-        // no Team-scoped target is reachable; Public-scoped targets are
-        // completely unaffected either way.
         let caller_tenant = browser
             .claims_resolver
             .as_ref()
@@ -5020,9 +4562,6 @@ async fn try_browser(
         };
         (target, invoker)
     };
-    // Record this invocation against the endpoint's quota window — a brief
-    // separate write lock, same pattern as the circuit-opening write below
-    // (never held across the actual network invoke).
     {
         let mut browser = gw.browser.write();
         let entry = browser
@@ -5039,12 +4578,6 @@ async fn try_browser(
     let forwarded: HashMap<String, String> = headers
         .iter()
         .filter(|(name, _)| {
-            // authorization/cookie/proxy-authorization MUST NOT reach the
-            // browser tab: Team-scoped targets are admittable by any
-            // authenticated member (no owner/admin gate), so forwarding the
-            // caller's live bearer JWT / hive_ API key handed it straight to
-            // a low-trust peer -- an in-tenant privilege escalation. Every
-            // other header is fine to forward as request context.
             !matches!(
                 name.as_str(),
                 "connection"
@@ -5077,9 +4610,6 @@ async fn try_browser(
     let failure = match result {
         Ok(bytes) => match browser_response(&bytes) {
             Ok(response) => {
-                // The ONLY metering chokepoint for browser-served traffic:
-                // this path never calls gw.fluid.lease(), so release() (which
-                // increments FunctionPool::requests) never runs for it.
                 gw.fluid
                     .record_browser_request(&key, now_ms().saturating_sub(invoke_started));
                 return BrowserAttempt::Response(response);
@@ -5122,28 +4652,6 @@ async fn proxy_function(
 ) -> Response {
     let key = func_key(dep.id.as_str(), name);
 
-    // Collect forwardable request headers once.
-    //
-    // `host` is deliberately DROPPED here and re-added below together with the
-    // `x-forwarded-*` set, because the platform is the only party that knows
-    // the public origin and the function has no other way to learn it.
-    //
-    // Previously `host` was dropped and nothing replaced it, so
-    // `fluid_tunnel`'s server fell back to its hardcoded `host:
-    // fluid.internal` and no `x-forwarded-*` header was ever sent. A tenant app
-    // therefore had NOTHING to build an absolute URL from, and every framework
-    // that emits one — an auth redirect, an OAuth callback, a canonical link,
-    // a `Location` on a 30x — fell back to its own bind address. Measured live:
-    // `https://hive.shadw.app/` answered `302 Location:
-    // http://0.0.0.0:3000/ui/login?next=%2F`, i.e. it sent the browser to the
-    // container's own listen address. `dashboard_proxy` in hive-cloud already
-    // sets `x-forwarded-host`/`x-forwarded-proto` for exactly this reason; the
-    // tenant-facing path simply never did, which is the inconsistency.
-    //
-    // Scheme is hardcoded `https`: every public entry point to a deployment is
-    // TLS-terminated (the edge listener, the anycast front, the apps zone), so
-    // an app that trusts `x-forwarded-proto` builds `https://` URLs — the only
-    // correct answer for a link a browser will follow back in.
     let mut hvec: Vec<(String, String)> = headers
         .iter()
         .filter(|(k, _)| {
@@ -5151,9 +4659,6 @@ async fn proxy_function(
             n != "connection"
                 && n != "content-length"
                 && n != "host"
-                // Re-derived below from THIS hop; never trust a client-supplied
-                // value (a spoofed x-forwarded-host is a cache-poisoning and
-                // password-reset-link primitive).
                 && n != "x-forwarded-host"
                 && n != "x-forwarded-proto"
         })
@@ -5168,9 +4673,6 @@ async fn proxy_function(
         .and_then(|v| v.to_str().ok())
         .filter(|h| !h.trim().is_empty())
     {
-        // Preserve the ORIGINAL Host so frameworks that read it (Next.js and
-        // most Node servers do) generate correct absolute URLs by default,
-        // and add the explicit forwarded pair for everything that prefers it.
         hvec.push(("host".into(), public_host.to_string()));
         hvec.push(("x-forwarded-host".into(), public_host.to_string()));
         hvec.push(("x-forwarded-proto".into(), "https".into()));
@@ -5181,9 +4683,6 @@ async fn proxy_function(
         BrowserAttempt::Failed(failure)
             if failure.sent && method != Method::GET && method != Method::HEAD =>
         {
-            // The browser may already have executed this mutation. Replaying it
-            // on fleet compute would turn a transport failure into a duplicate
-            // side effect, so fail explicitly instead of lying about capacity.
             let mut response =
                 (StatusCode::BAD_GATEWAY, "BROWSER_EXECUTION_UNCERTAIN").into_response();
             response.headers_mut().insert(
@@ -5192,31 +4691,18 @@ async fn proxy_function(
             );
             return response;
         }
-        BrowserAttempt::Failed(_) | BrowserAttempt::None => {
-            // Pre-send failures are safe for every method; GET/HEAD remain safe
-            // after send. The normal Fluid path is the hard fallback.
-        }
+        BrowserAttempt::Failed(_) | BrowserAttempt::None => {}
     }
 
-    // Per-function max duration (Vercel default 300s) — bounds the whole
-    // invocation; on timeout we return 504 without affecting other requests
-    // sharing the instance (error isolation).
     let max_dur = Duration::from_secs(gw.fluid.max_duration_secs(&key).unwrap_or(300).max(1));
 
     const MAX_REROUTES: usize = 3;
     let mut last_err = String::from("unknown");
-    // WHICH SHAPE the last attempt failed in. Both shapes used to report
-    // RUNTIME_TUNNEL_FAILED, and that single label is why the shoomoo outage was
-    // chased through vsock/tunnel plumbing for multiple sessions: the real
-    // `last_err` was "timed out waiting for response head", i.e. the tunnel had
-    // connected fine and the app never answered. Keep them apart.
     let mut upstream_silent = false;
     for attempt in 0..MAX_REROUTES {
         let lease = match gw.fluid.lease(&key).await {
             Ok(l) => l,
             Err(e) => {
-                // Structured failure (#18): classify, return a STABLE public code +
-                // correct status — never leak the internal error to the caller.
                 let es = e.to_string();
                 let class = classify_lease_error(&es);
                 warn!(func = %key, error = %es, code = class.code(), "lease failed");
@@ -5245,18 +4731,9 @@ async fn proxy_function(
         };
 
         tracing::debug!(cell = %cell, reused, attempt, "dispatching request over tunnel");
-        // `head_timeout` MUST equal `max_dur`: the inner tunnel wait and this
-        // outer `tokio::time::timeout` guard the SAME budget, and if the inner
-        // one is ever shorter it fires first, turning a legitimately-slow
-        // (but within-budget) invocation into a spurious "upstream_silent"
-        // retry below instead of the correct, no-retry FUNCTION_INVOCATION_TIMEOUT
-        // 504 at line ~2550. See client.rs's `request` doc for the incident
-        // this caused.
         let req_fut = client.request(method.as_str(), path_q, hvec.clone(), &body, max_dur);
         match tokio::time::timeout(max_dur, req_fut).await {
             Err(_) => {
-                // Exceeded max duration — 504, do not reroute (the instance is
-                // fine; only this invocation is over budget).
                 drop(lease);
                 return (StatusCode::GATEWAY_TIMEOUT, "FUNCTION_INVOCATION_TIMEOUT")
                     .into_response();
@@ -5269,27 +4746,12 @@ async fn proxy_function(
                 last_err = e.to_string();
                 tracing::debug!(cell = %cell, reused, attempt, error = %last_err, "request failed");
                 drop(lease);
-                // Tunnel-level failure: if it's closed the instance is gone.
                 if client.is_closed() {
                     upstream_silent = false;
                     gw.fluid.mark_dead(&key, &cell).await;
                     gw.drop_tunnel(&cell).await;
                 } else {
-                    // The tunnel is still OPEN and the request failed anyway —
-                    // response-head timeout, nack, overload. The transport is
-                    // fine; the function is what didn't answer.
                     upstream_silent = true;
-                    // The instance may already be MID-EXECUTION (it received
-                    // the request over the still-open tunnel; we just gave up
-                    // waiting for a response). Looping back to `lease()` and
-                    // retrying a non-idempotent method here is the exact
-                    // "BROWSER_EXECUTION_UNCERTAIN" hazard this function
-                    // already refuses to risk for the browser path above
-                    // (lines ~2477-2490) — replaying a POST/PUT/PATCH/DELETE
-                    // risks a second LLM call, a second Telegram send, a
-                    // second charge. Fail explicitly instead of silently
-                    // duplicating a side effect; GET/HEAD are always safe to
-                    // retry and fall through to the loop as before.
                     if method != Method::GET && method != Method::HEAD {
                         break;
                     }
@@ -5297,8 +4759,6 @@ async fn proxy_function(
             }
         }
     }
-    // Reroute budget exhausted. Public code only; the internal `last_err`
-    // stays in the log (#18) — but the CLASS now matches which half broke.
     let class = if upstream_silent {
         fluid_core::FailureClass::FunctionNoResponse
     } else {
@@ -5320,81 +4780,35 @@ async fn proxy_function(
     resp
 }
 
-/// Classify a `Fluid::lease` error into a stable public [`FailureClass`] (#18).
-/// A tenant hitting its cross-pool instance quota is a 429 (back off, you're
-/// throttled); a broken deployment circuits; a NODE that is missing artifacts or
-/// a hypervisor, or whose container lock pool is empty, names itself as a node
-/// fault; only genuine saturation / cold-start-cap failures are a 503 capacity
-/// problem. Coupled to the `NackReason` Debug name surfaced by `fluid-compute`'s
-/// `bail!("... ({reason:?})")` and to the `hive_core::fault` markers backends
-/// embed — the `classify_lease_error_*` tests lock that contract so a format
-/// change can't silently downgrade quota throttles to generic capacity errors.
-///
-/// The `else` arm is a CATCH-ALL, and every fault that reaches it is published to
-/// the user as "the host is out of capacity". That is a lie for anything that is
-/// not saturation, so a new backend failure mode belongs in a class of its own
-/// with its own `hive_core::fault` marker — never left to fall through here.
+/// Classify a `Fluid::lease` error into a stable public [`FailureClass`]: a tenant quota is a 429,
+/// a broken deployment circuits, a NODE missing artifacts/hypervisor/locks names itself, only
+/// genuine saturation is a 503. The `else` arm is a CATCH-ALL published as "out of capacity", so
+/// a new backend failure mode belongs in its own class with its own `hive_core::fault` marker.
 fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
     if es.contains("TenantQuota") {
         fluid_core::FailureClass::TenantThrottled
     } else if es.contains(hive_core::fault::NODE_IMAGE_MISSING) {
-        // THIS NODE is missing a base/per-image rootfs or its guest kernel. Not
-        // the app, not capacity — witnessed on fc-sanjose-cvm-2, where a missing
-        // `/var/lib/hive/rootfs/default.ext4` was published as
-        // CAPACITY_EXHAUSTED while the node held 923 GB free and 2046 free
-        // podman locks, and the operator went looking for space. Checked BEFORE
-        // the circuit arm below because the failing cold starts ALSO open the
-        // pool's circuit, so both markers can be live on the same error — and of
-        // the two only the node fault names the remedy.
         fluid_core::FailureClass::NodeImageMissing
     } else if es.contains(hive_core::fault::NODE_BACKEND_UNAVAILABLE) {
-        // No `/dev/kvm` / no firecracker binary on this node.
         fluid_core::FailureClass::NodeBackendUnavailable
     } else if es.contains(hive_core::fault::NODE_LOCK_POOL_EXHAUSTED) {
-        // podman's per-HOST lock pool is empty with nothing reclaimable: a host
-        // resource fault whose only remedy is `num_locks` + `podman system
-        // renumber`, which no amount of free disk or memory substitutes for.
         fluid_core::FailureClass::NodeLockPoolExhausted
     } else if es.contains(hive_core::fault::NODE_RUNTIME_MISSING) {
-        // The declared interpreter is not on the filesystem this node execs
-        // cells against. Checked BEFORE the circuit arm below for the same
-        // reason NODE_IMAGE_MISSING is: the failing cold starts also open the
-        // pool's circuit, so both markers ride the same error string, and only
-        // this one names a remedy the operator can act on. Left to fall
-        // through it would tell the tenant to debug an entrypoint that works.
         fluid_core::FailureClass::NodeRuntimeMissing
     } else if es.contains("DeploymentCircuitOpen")
         || es.contains(hive_core::fault::DEPLOYMENT_START_FAILED)
     {
-        // The DEPLOYMENT is broken (its instances keep exiting right after start),
-        // not the host. Reporting this as CAPACITY_EXHAUSTED sent users hunting a
-        // platform capacity problem that did not exist while their container was
-        // dying on a missing env var.
-        //
-        // `DEPLOYMENT_START_FAILED` joins it because the circuit only opens on the
-        // THIRD consecutive failure: witnessed live, the first two failures of an
-        // app that never bound its port still reported CAPACITY_EXHAUSTED. Same
-        // class, same remedy (read the app's logs), so the very first one now says
-        // so instead of blaming the host.
         fluid_core::FailureClass::DeploymentCircuitOpen
     } else if es.contains("no such function") {
-        // The pool is not registered on this node at all, so no cold start was
-        // ever attempted and no capacity was ever consumed. It used to report
-        // CAPACITY_EXHAUSTED, which points an operator at the host while the
-        // truth is that this node has no such deployment (mid-deploy
-        // registration, an unregistered pool, a stale mesh route).
         fluid_core::FailureClass::DeploymentNotFound
     } else {
         fluid_core::FailureClass::CapacityExhausted
     }
 }
 
-/// Turn a tunnel response into an axum response.
-///
-/// Normal responses are **buffered** and returned with a correct content-length
-/// (always terminates cleanly). Streaming responses (`text/event-stream`) are
-/// passed through chunked. The lease is held for the body (and any `waitUntil`
-/// window) before the instance slot is released.
+/// Turn a tunnel response into an axum response: sized bodies are buffered with a correct
+/// content-length, unsized ones stream through chunked; the lease is held for the body (and any
+/// `waitUntil` window).
 async fn build_response(
     lease: fluid_compute::Lease,
     cell: CellId,
@@ -5404,12 +4818,6 @@ async fn build_response(
     max_dur: Duration,
 ) -> Response {
     let mut hdrs = HeaderMap::new();
-    // Stream incrementally for ANY response the function didn't declare a fixed
-    // length for — matching Vercel streaming-functions behavior. That covers SSE
-    // (text/event-stream), React Server Component streaming (text/x-component,
-    // chunked HTML), and AI-SDK/ReadableStream responses (chunked, no
-    // content-length). A response WITH a content-length is a finished, sized body
-    // → buffer it (sized, clean termination), exactly as before.
     let mut has_content_length = false;
     let mut forced_stream = false;
     for (k, v) in &resp.headers {
@@ -5458,7 +4866,6 @@ async fn build_response(
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let wait_until_ms = resp.wait_until_ms;
 
-    // Helper to release the lease, honoring waitUntil.
     let release = move |lease: fluid_compute::Lease| {
         if wait_until_ms > 0 {
             tokio::spawn(async move {
@@ -5471,7 +4878,6 @@ async fn build_response(
     };
 
     if is_stream {
-        // Pass-through streaming (chunked) for event streams.
         let st = BodyState {
             body: resp.body,
             lease: Some(lease),
@@ -5502,12 +4908,6 @@ async fn build_response(
         return out;
     }
 
-    // Buffered path: collect the whole body, return a sized response. Bounded by
-    // the deployment's OWN max_duration_secs (default 300s), matching the head
-    // wait above — a fixed 30s here truncated any legitimately slow-but-within-
-    // budget non-streaming response (e.g. a large buffered JSON body assembled
-    // from a slow upstream call) the exact same way the old fixed 30s head
-    // timeout did for the head itself.
     let mut buf = Vec::new();
     let drained = tokio::time::timeout(max_dur, async {
         while let Some(chunk) = resp.body.recv().await {
@@ -5530,10 +4930,8 @@ struct BodyState {
     wait_until_ms: u64,
 }
 
-/// Build a `DeploymentInfo` view from a stored deployment.
-/// DNS-safe subdomain slug: lowercase, only `[a-z0-9-]`, no leading/trailing or
-/// repeated dashes. Used to build branch/commit alias labels from arbitrary
-/// branch names (e.g. `feature/Login` -> `feature-login`).
+/// DNS-safe subdomain slug: lowercase `[a-z0-9-]`, no leading/trailing/repeated dashes
+/// (`feature/Login` -> `feature-login`).
 fn slug(s: &str) -> String {
     let mapped: String = s
         .chars()
@@ -5552,19 +4950,12 @@ fn slug(s: &str) -> String {
         .join("-")
 }
 
-/// A DNS label is capped at 63 bytes (RFC 1035 2.3.4). Vercel rejects a longer
-/// one outright, so an over-long alias is never created and the DNS reconciler
-/// reports the name as DARK on every single pass. Witnessed live:
-/// `defense-network-ui-lib-git-copilot-dynamic-history-viewer-updates` (65
-/// chars, from project `defense-network-ui-lib` + branch
-/// `copilot-dynamic-history-viewer-updates`) failed `vercel create` forever.
+/// A DNS label is capped at 63 bytes (RFC 1035 2.3.4); Vercel rejects a longer alias outright and
+/// the DNS reconciler then reports the name DARK on every pass.
 const MAX_DNS_LABEL: usize = 63;
 
-/// FNV-1a, dependency-free: only used to keep two long names from colliding
-/// onto one hostname after truncation, never for security. Truncated to 32
-/// bits so the suffix is 8 hex chars — long enough to avoid collisions, short
-/// enough to leave most of the original name intact, and still inside the
-/// 6..=12 hex-digit tail that `vercel_dns::is_commit_alias` matches on.
+/// FNV-1a, dependency-free, truncated to 32 bits (8 hex chars) — only keeps two long names from
+/// colliding after truncation, inside the 6..=12 hex tail `vercel_dns::is_commit_alias` matches.
 fn label_digest(label: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in label.as_bytes() {
@@ -5574,11 +4965,8 @@ fn label_digest(label: &str) -> String {
     format!("{:08x}", hash as u32)
 }
 
-/// Shorten an over-long label to <= 63 BYTES (the limit is bytes, not chars),
-/// appending a digest of the FULL desired label so distinct long names stay
-/// distinct. The cut is taken on a char boundary so a multi-byte name can
-/// never panic or split a character, and a trailing '-' is trimmed because a
-/// label may not end with one.
+/// Shorten an over-long label to <= 63 BYTES on a char boundary, appending a digest of the FULL
+/// label so distinct long names stay distinct; a trailing '-' is trimmed.
 fn clamp_dns_label(label: &str) -> String {
     if label.len() <= MAX_DNS_LABEL {
         return label.to_string();
@@ -5607,18 +4995,11 @@ fn commit_alias(project: &str, commit: &str) -> String {
 /// Branch URL label: `<project>-git-<branch>` — always points at the latest
 /// deployment on that branch (Vercel's per-branch URL).
 fn branch_alias(project: &str, branch: &str) -> String {
-    // The `-git-` marker is load-bearing downstream: `vercel_dns::is_commit_alias`
-    // reads it to tell this stable per-branch URL apart from a per-commit one,
-    // so it must survive the clamp. Truncating the built label achieves that
-    // whenever the project name is reasonably sized; a pathologically long
-    // project name may still lose it, which is harmless (it only affects an
-    // affinity optimisation, never routing).
     clamp_dns_label(&format!("{}-git-{}", slug(project), slug(branch)))
 }
 
-/// Point `key` at deployment `id` only if `id` is "newer" than whatever the alias
-/// currently resolves to — ranked by (production, created_at). Keeps branch/commit
-/// aliases tracking the right deployment even when records restore out of order.
+/// Point `key` at deployment `id` only if `id` is newer than the alias's current target (ranked by
+/// (production, created_at)), so branch/commit aliases track correctly when records restore out of order.
 fn set_alias_if_newer(st: &mut GwState, key: &str, id: &DeploymentId) {
     let Some(cand) = st
         .deployments
@@ -5654,26 +5035,12 @@ fn insert_deploy_aliases(st: &mut GwState, id: &DeploymentId) {
     }
 }
 
-/// The public wildcard domain user deployments are actually reachable on
-/// (`*.{apps_domain}`), published once at startup by the node.
-///
-/// The reported aliases used to be hardcoded `format!("{project}.localhost")`,
-/// a local-dev default that outlived local dev: a PRODUCTION deployment
-/// reported "Aliased to shoomoo.localhost" while genuinely serving on
-/// shoomoo.shadw.app, sending anyone who trusted the deploy log to a dead
-/// hostname.
-///
-/// This is display/reporting only and CANNOT affect routing — every host
-/// lookup (`host_deployment_id`, `serves_host`, `attribution_for_host`,
-/// `select`) keys on the FIRST LABEL of the host (`h.split('.').next()`), so
-/// the alias map is keyed by bare subdomain and the suffix here is never
-/// matched against anything. Changing it corrects what users are told without
-/// touching what the router does.
+/// The public wildcard domain user deployments are reachable on (`*.{apps_domain}`), published once
+/// at startup — display/reporting only; every host lookup keys on the host's FIRST LABEL.
 static PUBLIC_APPS_DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Publish the node's apps domain for deployment-URL reporting. Idempotent;
-/// the first non-empty value wins. Unset (local dev, tests) keeps the previous
-/// `.localhost` behavior byte-for-byte.
+/// Publish the node's apps domain for deployment-URL reporting; idempotent, first non-empty value
+/// wins, unset keeps the `.localhost` dev default.
 pub fn set_public_apps_domain(domain: &str) {
     let d = domain.trim().trim_matches('.');
     if !d.is_empty() {
@@ -5697,8 +5064,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         (false, true) => "function",
         _ => "static",
     };
-    // Vercel's 3 URL types, surfaced so the dashboard can link each deployment to
-    // its own immutable commit URL + branch URL (not just the production domain).
     let commit_alias = d
         .git
         .as_ref()
@@ -5726,7 +5091,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         commit_alias,
         branch_alias,
         id_alias: public_host(d.id.as_str()),
-        // Immutable build environment (a superseded prod build stays "production").
         target: if d.target.is_empty() {
             if d.production {
                 "production".into()
@@ -5755,15 +5119,8 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
                 .count(),
         },
         tenant: d.tenant.clone(),
-        // Stamped public raw-port bindings, so the fleet-deployments gossip
-        // carries the `public_port` → deployment mapping to every edge node
-        // (the generic raw proxy's routing table).
         raw_ports: d.manifest.raw_port_bindings(),
-        // Dedicated public IPv4, hoisted the same way as `raw_ports` above.
         dedicated_ipv4: d.manifest.dedicated_ipv4_binding(),
-        // Browser-eligible functions + their artifact descriptors, so the
-        // admission-validating leader can tie a donor's digest to a real build
-        // artifact for deployments hosted on OTHER nodes.
         browser_functions: d
             .manifest
             .functions
@@ -5777,12 +5134,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
                     })
             })
             .collect(),
-        // …and the negative half: every function the build evaluated and
-        // declined, with the reason. Without this a deployment that is ready
-        // but unlisted is indistinguishable from one that was never evaluated,
-        // which is exactly the "my opted-in function just isn't there" report.
-        // Filtered on `browser_artifact.is_none()` so a function that later
-        // became eligible can never report both.
         browser_ineligible: d
             .manifest
             .functions
@@ -5797,9 +5148,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
                     })
             })
             .collect(),
-        // The browser-database opt-in block, verbatim (raw policy, resolved at
-        // the point of use) — same cross-node resolution reason as
-        // `browser_functions` above.
         browser_db: d.manifest.browser_db.clone(),
     }
 }
