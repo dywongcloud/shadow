@@ -1,43 +1,22 @@
-//! Browser-replicated databases: the fleet half of the browser↔fleet live
-//! CRR exchange (bn-browser-fleet-crr-exchange, contract:
-//! `docs/browser-db-contract.md`; CRR semantics are `hive-crsql`'s contract,
-//! named here, never redefined).
-//!
-//! Per project with a `browser_db` opt-in this module:
-//!
-//! * owns the fleet replica file
-//!   (`$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db` —
-//!   platform-templated name, a tenant string never becomes a path
-//!   component, the `hive-vol-{project}` discipline) and keeps its schema
-//!   applied from the deployment's spec (cr-sqlite v0.17 does not replicate
-//!   schema, so both halves derive it from the SAME replicated spec);
-//! * serves `Op::CrrSync` rounds to granted browser peers over the
-//!   `hive/browser/0` ALPN (installed as hive-p2p's [`BrowserCrrHandler`]):
-//!   every request is re-checked against THIS node's own replicated
-//!   admission view (live, unexpired, carrying a `db` grant for exactly this
-//!   tenant+deployment) AND against the live deployment descriptor still
-//!   carrying the block — the `proxy_to_owner` re-check precedent; a foreign
-//!   tenant and an unknown project are the identical refusal, no existence
-//!   leak;
-//! * enforces the caps with typed refusal + whole-batch rollback
-//!   (`max_value_bytes` per change, `max_bytes` per replica, both from the
-//!   RESOLVED spec — never truncated, which in an LWW store is silent
-//!   permanent divergence);
-//! * runs the replica GC with the `browser_artifacts::gc` /
-//!   `gc_rootfs_images` blast-radius guards verbatim: an empty keep-set
-//!   refuses the pass, a reap set over `HIVE_BROWSER_DB_GC_MAX_REAP_FRACTION`
-//!   refuses, and only files older than the inert grace window
-//!   (`HIVE_BROWSER_DB_INERT_GRACE_SECS`, default 30 days — one bad deploy
-//!   removing the block must not nuke production data) AND
-//!   `HIVE_BROWSER_DB_GC_GRACE_SECS` reap.
-//!
-//! Bytes, site ids and watermarks replicate ONLY through the CRR protocol —
-//! never `PlatformSnapshot`, never `store_sync`, never a gossip snapshot arm
-//! (the `dns_geo.json` precedent), and there is deliberately NO owner-proxy
-//! HTTP arm: a file copy is not a merge. The replica file is opened per sync
-//! round inside `spawn_blocking` (rusqlite connections are !Send and the
-//! work is bounded local disk IO), so this module holds no live connection
-//! state between rounds.
+//! Browser-replicated databases: the fleet half of the browser<->fleet live CRR exchange (contract
+//! `docs/browser-db-contract.md`; CRR semantics are `hive-crsql`'s, never redefined here). Per
+//! project with a `browser_db` opt-in this module owns the fleet replica file
+//! (`$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db`: a platform-templated name,
+//! a tenant string never becomes a path component) and keeps its schema applied from the deployment
+//! spec (cr-sqlite v0.17 does not replicate schema, so both halves derive it from the SAME
+//! replicated spec); serves `Op::CrrSync` rounds to granted browser peers over the `hive/browser/0`
+//! ALPN (hive-p2p's [`BrowserCrrHandler`]), re-checking every request against THIS node's
+//! replicated admission view (live, unexpired, a `db` grant for exactly this tenant+deployment) AND
+//! the live descriptor still carrying the block (a foreign tenant and an unknown project are the
+//! identical refusal); enforces the caps with typed refusal and whole-batch rollback
+//! (`max_value_bytes` per change, `max_bytes` per replica, from the RESOLVED spec; never truncated,
+//! which in an LWW store is silent permanent divergence); and runs the replica GC with the
+//! `browser_artifacts::gc`/`gc_rootfs_images` blast-radius guards.
+//! Bytes, site ids and watermarks replicate ONLY through the CRR protocol, never
+//! `PlatformSnapshot`, `store_sync` or a gossip snapshot arm, and there is deliberately NO
+//! owner-proxy HTTP arm (a file copy is not a merge). The replica file is opened per sync round
+//! inside `spawn_blocking` (rusqlite connections are !Send), so no connection state is held between
+//! rounds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -55,38 +34,34 @@ use crate::state::CloudState;
 /// opted-in project, named by [`replica_file_name`].
 const STORE_DIR_NAME: &str = "browser-dbs";
 
-/// A block-removed project's replica files stay INERT this long before the
-/// GC may reap them (contract §5: one bad deploy must not nuke production
-/// data). Project deletion rides the same clock — the file's mtime freezes
-/// at its last sync either way.
+/// A block-removed project's replica files stay INERT this long before the GC may reap them (one
+/// bad deploy must not nuke production data); project deletion rides the same clock, since the
+/// file's mtime freezes at its last sync either way.
 const DEFAULT_INERT_GRACE_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_GC_GRACE_SECS: u64 = 600;
 const DEFAULT_GC_MAX_REAP_FRACTION: f64 = 0.5;
 const DEFAULT_RECONCILE_SECS: u64 = 30;
 
-/// Soft budget for the export half of one reply: keep the reply comfortably
-/// under the wire frame cap after the fixed envelope and the (bounded)
-/// watermark advertisement. A batch that cannot fit ANY frame is named in
-/// the reply message and stays in the replica (loud, never truncated).
+/// Soft budget for the export half of one reply: keeps the reply under the wire frame cap after the
+/// fixed envelope and the bounded watermark advertisement. A batch that cannot fit ANY frame is
+/// named in the reply message and stays in the replica (loud, never truncated).
 const EXPORT_BUDGET_HEADROOM: usize = 64 * 1024;
 
 pub fn store_dir() -> PathBuf {
     crate::persist::data_dir().join(STORE_DIR_NAME)
 }
 
-/// The platform-templated replica file name for a project — the ONLY name
-/// the exchange ever opens. `sanitize_tag` maps every character outside
-/// `[a-z0-9._-]` to `-` and trims separators, so even a project called `/`
-/// or `../../etc` yields a plain file name; the wire carries no file field
-/// at all (the name is derived from the server-resolved grant, contract §6).
+/// The platform-templated replica file name for a project, the ONLY name the exchange opens:
+/// `sanitize_tag` maps every character outside `[a-z0-9._-]` to `-` and trims separators, so even a
+/// project called `/` or `../../etc` yields a plain file name, and the wire carries no file field
+/// at all.
 pub fn replica_file_name(project: &str) -> String {
     format!("hive-browserdb-{}.db", crate::git::sanitize_tag(project))
 }
 
-/// The server-derived `db` capability a granted browser reconciles from
-/// (admit/renewal response) — see `browser_admission::capability_json`. The
-/// browser learns its OPFS file name, its caps, its schema and its dialable
-/// fleet peers here and nowhere else; nothing in it is client input.
+/// The server-derived `db` capability a granted browser reconciles from (see
+/// `browser_admission::capability_json`): its OPFS file name, caps, schema and dialable fleet
+/// peers; nothing in it is client input.
 pub fn capability_db_json(
     cloud: &Arc<CloudState>,
     tenant: &str,
@@ -107,12 +82,9 @@ pub fn capability_db_json(
     })
 }
 
-/// The fleet peers a browser may dial for sync rounds: every HEALTHY node's
-/// proven iroh identity + dialable address, from the live registry — the
-/// exact `trusted_caller_ids` discipline (health-filtered, never node names,
-/// never browser ids, never client input), plus the `addr_json` the
-/// browser's wasm needs to dial. Bounded: a browser needs a handful of
-/// peers, not the whole roster.
+/// The fleet peers a browser may dial for sync rounds: every HEALTHY node's proven iroh identity
+/// and dialable address from the live registry (the `trusted_caller_ids` discipline:
+/// health-filtered, never node names, browser ids or client input), bounded to a handful.
 fn sync_peers(cloud: &Arc<CloudState>) -> Vec<Value> {
     let mut peers = Vec::new();
     for n in cloud.registry.nodes() {
@@ -133,12 +105,10 @@ fn sync_peers(cloud: &Arc<CloudState>) -> Vec<Value> {
     peers
 }
 
-/// Resolve the deployment descriptor's `browser_db` spec under `tenant`'s
-/// ownership — `browser_artifacts::descriptor_for`'s exact two-source shape
-/// (local gw records first, then the gossiped `peer_deployments` view).
-/// `None` covers BOTH "no such deployment under this tenant" and "not
-/// opted-in": callers must never distinguish them to a peer (no existence
-/// leak across tenant boundaries).
+/// Resolves the deployment descriptor's `browser_db` spec under `tenant`'s ownership, with
+/// `browser_artifacts::descriptor_for`'s two-source shape (local gw records, then the gossiped
+/// `peer_deployments`). `None` covers BOTH "no such deployment under this tenant" and "not opted
+/// in": callers must never distinguish them to a peer (no existence leak across tenants).
 pub fn db_descriptor_for(
     cloud: &Arc<CloudState>,
     tenant: &str,
@@ -172,29 +142,18 @@ pub fn db_descriptor_for(
     None
 }
 
-/// The deployment whose `browser_db` block a node with NO explicitly chosen
-/// target should replicate (browser-auto-serve-eligible-set) — `None` unless
-/// the tenant's answer is UNAMBIGUOUS.
-///
-/// A browser holds exactly ONE replica (one OPFS file, one lane), so "serve
-/// everything automatically" has an honest automatic answer for databases only
-/// when the tenant has exactly one project carrying a block. With two or more
-/// the platform would be choosing, on recency, WHICH of a tenant's databases
-/// gets copied into a donor's browser — and for a Public-scope donor, which
-/// one strangers get a read-only replica of. That is a decision the picker
-/// must keep making explicitly, so this returns `None` and the node runs with
-/// no database grant rather than an arbitrary one.
-///
-/// Within the single opted-in project the newest Ready deployment wins (its
-/// spec is the current one). Same two replicated sources and the same tenant
-/// gate as [`db_descriptor_for`].
+/// The deployment whose `browser_db` block a node with NO explicitly chosen target replicates;
+/// `None` only when the tenant has no project carrying a block. A browser holds exactly ONE
+/// replica, so with several candidate projects the choice is a rendezvous hash (`lease::hrw_owner`
+/// over the sorted project set) of the browser's own proven endpoint id: deterministic (every node
+/// agrees with no coordinator), stable across renewals (the OPFS replica stays warm), self-sharding
+/// across the tenant's databases and minimal-churn when a project is removed. Within the chosen
+/// project the newest Ready deployment wins (its spec is the current one).
 pub fn auto_db_deployment_for_tenant(
     cloud: &Arc<CloudState>,
     tenant: &str,
     endpoint_id: &str,
 ) -> Option<String> {
-    // project -> (created_at_ms, deployment id) of the newest Ready deployment
-    // carrying a block.
     let mut by_project: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut note = |project: String, created: u64, id: String| {
         let entry = by_project.entry(project).or_insert((created, id.clone()));
@@ -226,46 +185,18 @@ pub fn auto_db_deployment_for_tenant(
             note(info.project.clone(), info.created_at_ms, info.id.0.clone());
         }
     }
-    // Nothing to replicate is the only honest "no grant" — the tenant has no
-    // project carrying a browser_db block.
     if by_project.is_empty() {
         return None;
     }
-    // With MORE than one candidate this used to refuse outright (`len() != 1 ->
-    // None`), on the reasoning that a browser holds a single replica so the
-    // picker must choose. In practice that meant a browser node on a tenant with
-    // two or more browser_db projects replicated NOTHING AT ALL, permanently and
-    // silently — the common case, and the opposite of the intent.
-    //
-    // A single replica per browser is a real constraint, but it argues for
-    // CHOOSING deterministically, not for declining. Rendezvous-hash the
-    // candidate projects by the browser's own proven endpoint id, the same
-    // FNV-over-sorted-set rule container placement and the inference coordinator
-    // already use (`lease::hrw_owner`):
-    //   * deterministic — every node computes the same answer for a given
-    //     browser with no coordinator and no election;
-    //   * stable — a browser keeps its project across renewals, so its OPFS
-    //     replica stays warm instead of being re-seeded each lease tick;
-    //   * self-sharding — distinct browsers hash to distinct projects, so N
-    //     browser nodes spread across the tenant's databases rather than all
-    //     piling onto whichever one happened to be alphabetically first;
-    //   * minimal churn — removing a project moves only the browsers that held
-    //     it, which is the property rendezvous hashing exists for.
-    //
-    // BTreeMap keys are already sorted, which is what makes the input set
-    // order-independent across nodes.
     let projects: Vec<String> = by_project.keys().cloned().collect();
     let chosen = crate::lease::hrw_owner(endpoint_id, &projects)?;
     by_project.remove(&chosen).map(|(_, id)| id)
 }
 
-/// The resolved-source-of-truth `browser_db` opt-in for a project — the exact
-/// two-source (local Ready records + gossiped peer view), Ready-deployment-
-/// derived resolution [`opted_in_projects`] already performs for the
-/// reconcile loop and the fleet-fleet sync grant, exposed here so the
-/// libsql/Hrana + Upstash REST surface (`browser_db_rest`) can never observe
-/// a DIFFERENT spec than the CRR sync protocol does for the identical
-/// project — one opt-in source, every consumer.
+/// The resolved-source-of-truth `browser_db` opt-in for a project: the two-source (local Ready
+/// records + gossiped peer view) resolution [`opted_in_projects`] performs for the reconcile loop
+/// and the fleet sync grant, exposed so the libsql/Hrana + Upstash REST surface (`browser_db_rest`)
+/// can never see a DIFFERENT spec than the CRR sync protocol for the same project.
 pub(crate) fn policy_for_project(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -273,27 +204,15 @@ pub(crate) fn policy_for_project(
     opted_in_projects(cloud).remove(project)
 }
 
-/// Deterministic REST-owner election for `browser_db_rest`'s libsql/Hrana +
-/// Upstash REST surface (bn-browser-db-rest): every node computes the SAME
-/// answer from the gossiped registry, so cold-starting a REST request needs
-/// no coordinator and no election round trip — the identical
-/// `inference::coordinator_for` / `lease::hrw_owner` rendezvous-hashing
-/// pattern this file already reuses above for
-/// [`auto_db_deployment_for_tenant`] and [`hrw_rank`].
-///
-/// Unlike GPU-coordinator election there is no capability filter: any
-/// healthy node can hold (or lazily create) a `browser_db` replica file, so
-/// the roster is every healthy node's name — deduped and SORTED (`BTreeSet`)
-/// so the input is order-independent across nodes, which is what makes the
-/// hash agree fleet-wide. An election landing on a node with no local
-/// replica yet self-heals on its first request (`browser_db_rest`'s local
-/// serve path opens-or-creates via `hive_crsql::open` + [`ensure_schema`]),
-/// exactly mirroring how [`reconcile_replicas`] backfills a fresh node.
-///
-/// Falls back to THIS node when the registry has no healthy peer yet (a
-/// single just-booted node has not gossiped itself healthy on its very
-/// first tick) — the failure direction is "serve it locally", never "500
-/// with nobody to serve it".
+/// Deterministic REST-owner election for `browser_db_rest`: every node computes the SAME answer
+/// from the gossiped registry (`lease::hrw_owner`, the pattern the inference coordinator and
+/// [`auto_db_deployment_for_tenant`] reuse), so cold-starting a REST request needs no coordinator
+/// or election round trip. There is no capability filter (any healthy node can hold or lazily
+/// create a replica): the roster is every healthy node's name, deduped and SORTED so the hash
+/// agrees fleet-wide, and an owner without a local replica self-heals on its first request
+/// (`hive_crsql::open` + [`ensure_schema`], as `reconcile_replicas` backfills a fresh node). With
+/// no healthy peer yet it falls back to THIS node: the failure direction is "serve it locally",
+/// never a 500.
 pub fn rest_owner_for_project(cloud: &Arc<CloudState>, project: &str) -> Option<String> {
     let members: BTreeSet<String> = cloud
         .registry
@@ -317,12 +236,12 @@ struct RoundGrant {
     read_only: bool,
 }
 
-/// The exchange-side grant re-check (contract §3): the LIVE admission for
-/// this endpoint (this node's own replicated store view — unexpired), a `db`
-/// grant riding it, and the deployment descriptor STILL carrying the block.
-/// Team scope syncs read+write; Public scope syncs read-only and only while
-/// the LIVE spec still says `public_read` — a redeploy flipping it off cuts
-/// public grants on the next request, not the next renewal.
+/// The exchange-side grant re-check: the LIVE admission for this endpoint (this node's replicated
+/// view, unexpired), a `db` grant riding it, and the deployment descriptor STILL carrying the
+/// block; no admission, no grant, a foreign tenant and a removed block are the identical refusal (a
+/// browser peer learns nothing about what exists). Team scope syncs read+write; Public scope syncs
+/// read-only and only while the LIVE spec still says `public_read`, so a redeploy flipping it off
+/// cuts public grants on the next request, not the next renewal.
 fn resolve_round_grant(cloud: &Arc<CloudState>, endpoint_id: &str) -> Option<RoundGrant> {
     let admission = cloud
         .browser_admissions
@@ -360,10 +279,6 @@ async fn handle_crr_sync(
     remote_id: &str,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, u32> {
-    // Grant re-check against THIS node's own replicated admission view +
-    // live descriptor. No-admission, no-grant, foreign-tenant and
-    // block-removed all collapse to the identical refusal — a browser peer
-    // learns nothing about what exists (contract §3).
     let Some(grant) = resolve_round_grant(cloud, remote_id) else {
         tracing::warn!(remote = %remote_id, "browser db sync refused: no live db grant");
         return Err(browser_reset::FORBIDDEN);
@@ -371,11 +286,6 @@ async fn handle_crr_sync(
     let request =
         hive_browser_proto::split_crr_sync_request(&payload).map_err(|e| e.reset_code())?;
     let path = store_dir().join(replica_file_name(&grant.project));
-    // The wire `db_file` is a grant IDENTIFIER, never a path: it must equal
-    // the name this node derived from its own server-resolved grant, or a
-    // stale capability (the endpoint was re-admitted to a different
-    // deployment since) would contaminate another project's replica. The
-    // refusal is the identical FORBIDDEN — no existence leak either way.
     if request.db_file != replica_file_name(&grant.project) {
         tracing::warn!(
             remote = %remote_id,
@@ -393,11 +303,12 @@ async fn handle_crr_sync(
     Ok(hive_browser_proto::encode_crr_sync_reply(&reply))
 }
 
-/// One full anti-entropy round against the replica file: apply the
-/// requester's push batches (typed refusals, whole-batch rollback), then
-/// export everything the requester advertised it is missing, bounded to the
-/// reply frame. Runs synchronously on a blocking thread — rusqlite
-/// connections are !Send and this is bounded local disk IO.
+/// One full anti-entropy round against the replica file: applies the requester's push batches
+/// (typed refusals, whole-batch rollback; a read-only grant never applies a change but is still
+/// served the export half), then exports everything the requester advertised it is missing, bounded
+/// to the reply frame (an oversized value stays in the replica and is named, never truncated: the
+/// receiver's watermark still advances past it). Runs synchronously on a blocking thread (rusqlite
+/// connections are !Send; bounded local disk IO).
 fn sync_round(
     path: &std::path::Path,
     grant: &RoundGrant,
@@ -410,8 +321,6 @@ fn sync_round(
         })?;
     }
     let conn = hive_crsql::open(path).map_err(|e| {
-        // The loadable extension missing on this host is an OPERATOR story
-        // (fleet packaging, HIVE_CRSQL_EXTENSION_PATH) — name it loudly.
         tracing::warn!(error = %e, file = %path.display(), "browser db: replica open failed (cr-sqlite extension present?)");
         browser_reset::HANDLER_FAILED
     })?;
@@ -423,12 +332,8 @@ fn sync_round(
     let mut status = CrrStatus::Ok;
     let mut message = String::new();
 
-    // ---- apply half (write direction) ----
     if !request.batches.is_empty() {
         if grant.read_only {
-            // Contract §3: read-only means the fleet NEVER applies a change
-            // originating from this grant. Typed refusal; the export half
-            // below is still served.
             status = CrrStatus::ReadOnly;
             message = "grant is read-only; push batches refused".to_string();
         } else {
@@ -439,13 +344,11 @@ fn sync_round(
         }
     }
 
-    // ---- watermark acknowledgement ----
     let watermarks = hive_crsql::known_sites(&conn).map_err(|e| {
         tracing::warn!(error = %e, file = %path.display(), "browser db: watermark read failed");
         browser_reset::HANDLER_FAILED
     })?;
 
-    // ---- export half (read direction) ----
     let advertised: BTreeMap<&[u8], i64> = request
         .watermarks
         .iter()
@@ -472,11 +375,6 @@ fn sync_round(
             browser_reset::HANDLER_FAILED
         })?;
         for mut batch in site_batches {
-            // Value cap at the export boundary too (contract §4, both
-            // directions): an oversized value stays in this replica and is
-            // named loudly — never truncated, never wedging the rest of the
-            // batch. Anchors (since/max) are unchanged, so the receiver's
-            // watermark still advances past the skipped value.
             let before = batch.changes.len();
             batch.changes.retain(|c| {
                 let over = hive_crsql::val_payload_bytes(&c.val) > grant.resolved.max_value_bytes;
@@ -488,10 +386,6 @@ fn sync_round(
             skipped_oversized += before - batch.changes.len();
             let encoded = batch.encode();
             if encoded.len() > budget {
-                // Frame-full: the requester re-requests and its freshly
-                // applied watermarks are the resume cursor. A batch that
-                // cannot fit ANY frame (one giant commit) stays local,
-                // named — it can never travel this wire.
                 more = true;
                 if batches.is_empty() {
                     message = format!(
@@ -530,13 +424,12 @@ fn sync_round(
     })
 }
 
-/// The apply half shared by the browser-dialed round ([`sync_round`]) and
-/// the fleet-dialed operator pull ([`operator_sync_round`]): decode each
-/// batch (an undecodable frame is a typed `BatchRefused`, not a crash),
-/// enforce the value cap and the replica quota BEFORE each apply (typed
-/// refusal, whole-batch rollback — never truncation), apply per batch
-/// through `hive_crsql::apply_batch` (gap/replay semantics intact), stop at
-/// the first typed refusal. `Ok` means every batch applied or replayed.
+/// The apply half shared by the browser-dialed round ([`sync_round`]) and the fleet-dialed operator
+/// pull ([`operator_sync_round`]): decodes each batch (an undecodable frame is a typed
+/// `BatchRefused`, not a crash), enforces the value cap and the replica quota BEFORE each apply
+/// (typed refusal, whole-batch rollback, never truncation), applies through
+/// `hive_crsql::apply_batch` (gap/replay semantics intact) and stops at the first typed refusal.
+/// `Ok` means every batch applied or replayed.
 fn apply_push_batches(
     conn: &hive_crsql::rusqlite::Connection,
     path: &std::path::Path,
@@ -607,17 +500,12 @@ fn apply_push_batches(
     (CrrStatus::Ok, String::new())
 }
 
-/// The fleet-DIALED direction of the exchange: one bounded pull round
-/// against an admitted browser, driven by an operator. The fleet sends its
-/// watermark advertisement with an EMPTY push (a pure pull: the browser's
-/// responder exports everything the fleet is missing, bounded to one
-/// frame), then applies the reply's batches to the replica with the same
-/// caps and grant checks as the browser-dialed path. v1 sync cadence is
-/// browser-driven; this exists so the fleet-initiated arm
-/// (`hive_p2p::BrowserPool::crr_sync`) has a real, witnessed caller — and
-/// as the operator's on-demand anti-entropy poke. The HTTP response carries
-/// METADATA only (counts, watermarks, status) — DB bytes never leave the
-/// CRR protocol (contract §2: no HTTP arm serves DB bytes).
+/// The fleet-DIALED direction: one bounded pull round against an admitted browser, driven by an
+/// operator (a watermark advertisement with an EMPTY push; the browser's responder exports what the
+/// fleet is missing, bounded to one frame), applied with the same caps and grant checks as the
+/// browser-dialed path. v1 sync cadence is browser-driven; this is the on-demand anti-entropy poke
+/// and the caller of `hive_p2p::BrowserPool::crr_sync`. The HTTP response carries METADATA only
+/// (counts, watermarks, status): DB bytes never leave the CRR protocol.
 async fn operator_sync_round(
     cloud: &Arc<CloudState>,
     endpoint_id: &str,
@@ -636,8 +524,6 @@ async fn operator_sync_round(
     ))?;
     let path = store_dir().join(replica_file_name(&grant.project));
     let resolved = grant.resolved.clone();
-    // This node's watermarks, read off its own replica — the pull selector
-    // the browser's responder exports against.
     let watermarks = {
         let path = path.clone();
         tokio::task::spawn_blocking(
@@ -737,20 +623,14 @@ async fn operator_sync_round(
     }))
 }
 
-/// `POST /v1/browser/dbs/sync/:endpoint_id` (operator-only fleet-initiated
-/// pull round, see [`operator_sync_round`]) plus the Storages page's
-/// tenant-scoped live-status read (see [`project_db_status_http`]) and the
-/// global-state shard planner's three operator reads (see [`shard_plan`]).
-///
-/// Round-robin-reads declaration (AGENTS.md) for the shard routes: every one
-/// of them is a pure function of state that is ALREADY replicated to every
-/// node — `store_sync::REGISTRY` snapshots and the `browser_presence` /
-/// `browser_admissions` stores — so there is no node-local write for a GET to
-/// miss and no owner to proxy to. Two nodes can disagree for one convergence
-/// window (their store snapshots differ by a gossip round, so their fragment
-/// digests differ); that is the same per-observer caveat as a health verdict,
-/// and the `digest` guard on [`shard_fragment_http`] turns it into a loud 409
-/// instead of a silently wrong byte range.
+/// `POST /v1/browser/dbs/sync/:endpoint_id` (operator-only fleet-initiated pull,
+/// [`operator_sync_round`]), the Storages page's tenant-scoped live-status read
+/// ([`project_db_status_http`]) and the shard planner's three operator reads ([`shard_plan`]). The
+/// shard routes are pure functions of state ALREADY replicated to every node
+/// (`store_sync::REGISTRY` snapshots, `browser_presence`, `browser_admissions`), so there is no
+/// node-local write for a GET to miss and no owner to proxy to; two nodes can disagree for one
+/// convergence window (the per-observer caveat), which the `digest` guard on
+/// [`shard_fragment_http`] turns into a loud 409 instead of a wrong byte range.
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     axum::Router::new()
         .route(
@@ -776,22 +656,11 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         )
 }
 
-/// `GET /v1/browser-db/projects` — every project in the CALLER'S tenant that
-/// carries a `browser_db` opt-in, with its raw policy, in ONE request.
-///
-/// The Storage page renders one list from two backends, and the managed half
-/// is a single endpoint that cannot partially fail. The SQLite half had no
-/// equivalent, so the page fanned out one `/v1/projects/<p>/settings` request
-/// per project and assembled the lane client-side — which made a database's
-/// presence in the list depend on N independent requests all succeeding, and
-/// promptly. Witnessed: the same tenant's SQLite row present in one load and
-/// absent from the next. This is that missing endpoint; the two halves of one
-/// list now have the same failure mode.
-///
-/// Tenant-filtered per project through the same `project_owned_by` guard the
-/// per-project route uses, so this can only ever widen to what the caller
-/// already owns — a project belonging to another team is simply omitted, which
-/// is also why an unknown project and a foreign one are indistinguishable here.
+/// `GET /v1/browser-db/projects`: every project in the CALLER'S tenant carrying a `browser_db`
+/// opt-in, with its raw policy, in ONE request (the Storage page renders one list from two
+/// backends, and a per-project fan-out made a database's presence depend on N requests all
+/// succeeding). Tenant-filtered per project through `project_owned_by`, so a foreign project is
+/// simply omitted and an unknown one is indistinguishable.
 async fn browser_db_projects_http(
     axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
     headers: axum::http::HeaderMap,
@@ -804,14 +673,10 @@ async fn browser_db_projects_http(
         .into_iter()
         .filter(|(project, _)| crate::admin::project_owned_by(&cloud, project, &tenant))
         .collect();
-    // Deterministic order so a re-poll never reshuffles the rendered list.
     owned.sort_by(|a, b| a.0.cmp(&b.0));
     let projects: Vec<Value> = owned
         .into_iter()
         .map(|(project, policy)| {
-            // The REST/Hrana URLs ride along (server-derived from `api_base()`)
-            // so the storage LIST can show the endpoint without one status
-            // fetch per row.
             let (libsql_url, sql_url) = crate::browser_db_rest::rest_urls(&cloud, &project);
             json!({ "project": project, "browser_db": policy, "rest": { "libsql_url": libsql_url, "sql_url": sql_url } })
         })
@@ -819,22 +684,11 @@ async fn browser_db_projects_http(
     Ok(axum::Json(json!({ "projects": projects })))
 }
 
-/// `GET /v1/projects/:project/browser-db/status` — the Storages page's live
-/// status panel: resolved caps plus THIS node's own local replica figures
-/// (byte usage, distinct site count, file mtime as a last-write proxy).
-///
-/// Declaring which side of the round-robin-reads-vs-leader-writes split this
-/// is on (AGENTS.md): the replica FILE is node-local storage, which is
-/// usually exactly the footgun that rule warns about (write lands on one
-/// node, GET served by whichever node round-robin DNS/admin_ingress's
-/// local-GET rule picks). It does not apply here — `spawn_reconcile` runs on
-/// EVERY node and the descriptor it reconciles from
-/// (`DeploymentInfo::browser_db`) is gossiped fleet-wide, so every node that
-/// has ever heard of this project's opt-in already maintains its OWN replica
-/// of it (see this file's module docs). Whichever node answers this request
-/// has real, local data — never a stale zero. Figures can disagree slightly
-/// node-to-node until the next anti-entropy round; that is the CRR model
-/// converging, not a bug (the same per-observer caveat as health verdicts).
+/// `GET /v1/projects/:project/browser-db/status`: the Storages page's live status panel: resolved
+/// caps plus THIS node's own replica figures (byte usage, distinct site count, file mtime as a
+/// last-write proxy). The replica FILE is node-local, but `spawn_reconcile` runs on EVERY node from
+/// a fleet-gossiped descriptor, so whichever node answers has real local data, never a stale zero;
+/// figures can differ slightly until the next anti-entropy round (the per-observer caveat).
 async fn project_db_status_http(
     axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
     headers: axum::http::HeaderMap,
@@ -869,15 +723,8 @@ async fn project_db_status_http(
                 .map(|d| d.as_millis() as u64);
             (true, meta.len(), sites, last_modified_ms)
         }
-        // Not-yet-reconciled (first `HIVE_BROWSER_DB_RECONCILE_SECS` tick
-        // hasn't run on this node yet) or genuinely never opened — either
-        // way, an honest "no replica here yet", never a fabricated zero-cap.
         Err(_) => (false, 0u64, 0usize, None),
     };
-    // The REST/Hrana surface (`browser_db_rest`) is published here too so the
-    // dashboard never reconstructs a URL client-side: `api_base()` is the
-    // authority, and the token fields disclose only EXISTENCE + mint time —
-    // the plaintext is shown once at mint and only its hash is stored.
     let (libsql_url, sql_url) = crate::browser_db_rest::rest_urls(&cloud, &project);
     Ok(axum::Json(json!({
         "opted_in": true,
@@ -910,11 +757,10 @@ async fn operator_sync_http(
     let value = operator_sync_round(&cloud, &endpoint_id).await?;
     Ok(axum::Json(value))
 }
-/// Idempotent schema bring-up for a replica: every spec table's DDL, then
-/// `crsql_as_crr`. cr-sqlite v0.17 does not replicate schema inside
-/// `crsql_changes`, so both replica halves derive it from the SAME
-/// replicated spec — this is the fleet half (the browser half gets it
-/// verbatim in the admission's `db` capability block).
+/// Idempotent schema bring-up for a replica: every spec table's DDL, then `crsql_as_crr`. cr-sqlite
+/// v0.17 does not replicate schema inside `crsql_changes`, so both halves derive it from the SAME
+/// replicated spec: this is the fleet half, the browser half gets it verbatim in the admission's
+/// `db` block.
 pub(crate) fn ensure_schema(
     conn: &hive_crsql::rusqlite::Connection,
     resolved: &ResolvedBrowserDbPolicy,
@@ -926,31 +772,15 @@ pub(crate) fn ensure_schema(
     Ok(())
 }
 
-/// Every opted-in project visible to this node: local Ready records whose
-/// manifest carries the block, plus the gossiped peer view — the same two
-/// sources [`db_descriptor_for`] consults. Keyed by project (database
-/// identity IS the project, contract §1).
-///
-/// A project accumulates MULTIPLE Ready deployment records permanently — a
-/// superseded deployment stays `Ready`, servable via its own preview alias;
-/// `production: bool` is the only field distinguishing the live one. Picking
-/// "whichever Ready record the iteration happens to visit last" (the
-/// previous behavior: peer loop `or_insert_with` = first-peer-wins, local
-/// loop unconditional `insert` = always overwrites) resolves the wrong spec
-/// as soon as a project has been redeployed even once — the normal,
-/// permanent steady state for any active project. A stale non-production
-/// record's schema silently overriding the current production one corrupts
-/// the on-disk replica (`CREATE TABLE IF NOT EXISTS` is a permanent no-op
-/// once any version of the table exists), and a stale `public_read: true`
-/// left in effect after a redeploy disabled it keeps minting working public
-/// tokens indefinitely — directly undermining this module's own "re-checked
-/// live on every request" security claim.
-///
-/// Precedence, encoded as a linear priority so a single max-by-priority pass
-/// captures it: PRODUCTION always beats non-production regardless of source
-/// (peer vs local), and within the same production-ness the LOCAL record
-/// wins (fresher than the gossiped peer view) — priority 0/1/2/3 for
-/// peer-non-prod / local-non-prod / peer-prod / local-prod respectively.
+/// Every opted-in project visible to this node: local Ready records whose manifest carries the
+/// block plus the gossiped peer view (the two sources [`db_descriptor_for`] consults), keyed by
+/// project (database identity IS the project). A project accumulates MULTIPLE Ready records (a
+/// superseded deployment stays Ready via its preview alias), so precedence is a linear priority:
+/// PRODUCTION beats non-production regardless of source, and within the same production-ness the
+/// LOCAL record beats the gossiped peer view (0/1/2/3 = peer-non-prod / local-non-prod / peer-prod
+/// / local-prod). Picking whichever Ready record was visited last would let a stale non-production
+/// schema or `public_read: true` override the current production one (`CREATE TABLE IF NOT EXISTS`
+/// is a permanent no-op once any version exists).
 fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolicy> {
     let mut out: BTreeMap<String, (BrowserDbPolicy, u8)> = BTreeMap::new();
     let mut consider = |project: String, spec: &BrowserDbPolicy, priority: u8| {
@@ -987,11 +817,10 @@ fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolic
         .collect()
 }
 
-/// Periodic reconcile: for every opted-in project, ensure the replica file
-/// exists with its schema applied (creating an empty replica is also how a
-/// replacement node starts its backfill — browsers then carry it up to
-/// watermark via the normal protocol). Every node runs this (the replica is
-/// per-host, like the podman lock pool / browser-artifact GC precedent).
+/// Periodic reconcile: for every opted-in project ensures the replica file exists with its schema
+/// applied (an empty replica is also how a replacement node starts its backfill; browsers carry it
+/// up to watermark). Every node runs this (the replica is per-host, like the podman lock pool and
+/// the browser-artifact GC).
 fn reconcile_replicas(cloud: &Arc<CloudState>) {
     for (project, spec) in opted_in_projects(cloud) {
         let path = store_dir().join(replica_file_name(&project));
@@ -1020,19 +849,12 @@ fn reconcile_replicas(cloud: &Arc<CloudState>) {
     }
 }
 
-/// Replica GC, contract §5 with the `browser_artifacts::gc` /
-/// `gc_rootfs_images` blast-radius discipline verbatim:
-///
-/// * keep-set = every live opted-in project's replica file name. An EMPTY
-///   keep-set refuses the pass outright — a state-vs-caller-bug ambiguity no
-///   GC may resolve by deleting (drain the store dir by hand if a full,
-///   deliberate teardown is ever wanted).
-/// * a candidate reaps only when it is NOT in the keep-set AND its mtime is
-///   older than BOTH the inert grace window (block-removed/project-deleted
-///   retention) and `HIVE_BROWSER_DB_GC_GRACE_SECS`.
-/// * a reap set over `HIVE_BROWSER_DB_GC_MAX_REAP_FRACTION` of the store
-///   refuses the whole pass — a bug and an unrecoverable one differ by
-///   exactly this check.
+/// Replica GC with the `browser_artifacts::gc`/`gc_rootfs_images` blast-radius discipline verbatim:
+/// keep-set = every live opted-in project's replica file name; an EMPTY keep-set refuses the pass
+/// outright (a state-vs-caller-bug ambiguity no GC may resolve by deleting); a candidate reaps only
+/// when NOT in the keep-set AND its mtime is older than BOTH the inert grace window and
+/// `HIVE_BROWSER_DB_GC_GRACE_SECS`; a reap set over `HIVE_BROWSER_DB_GC_MAX_REAP_FRACTION` of the
+/// store refuses the whole pass.
 fn gc_replicas(cloud: &Arc<CloudState>) {
     let keep: BTreeSet<String> = opted_in_projects(cloud)
         .keys()
@@ -1113,10 +935,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Registered in main.rs next to the other reconcile loops. The first real
-/// pass runs a full interval after boot (persisted deployments are long
-/// restored by then — the same double-skip discipline as
-/// `browser_artifacts::spawn_gc_loop`).
+/// Registered in main.rs beside the other reconcile loops; the first real pass runs a full interval
+/// after boot (persisted deployments are long restored by then), the double-skip discipline of
+/// `browser_artifacts::spawn_gc_loop`.
 pub fn spawn_reconcile(cloud: Arc<CloudState>) {
     let interval_secs = env_u64("HIVE_BROWSER_DB_RECONCILE_SECS", DEFAULT_RECONCILE_SECS);
     tokio::spawn(async move {
@@ -1132,45 +953,23 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Fleet <-> fleet anti-entropy (direct, no browser carrier)
-// ---------------------------------------------------------------------------
-//
-// v1 converged FLEET replicas only through browser CARRIERS: a Team browser
-// that pulled node A's changes later pushed them to node B. That satisfies the
-// browser-facing contract, but it makes the fleet replica set — which the
-// contract calls the system of record — depend on somebody's tab being open.
-// Two consequences, both real:
-//
-//   * a project whose browsers are all closed stops converging between nodes,
-//     silently, for as long as that lasts; and
-//   * `reconcile_replicas` creates an EMPTY replica on a node that never held
-//     one, and with no fleet-side source that emptiness is only ever filled by
-//     a browser. A node that just joined therefore answers for a database it
-//     holds nothing of — which is exactly what makes an owner-pinned SQL
-//     endpoint unsafe to build on top of the browser-carrier model.
-//
-// This is the direct arm the contract names as the deliberate follow-up. It is
-// PULL-ONLY and reuses the exchange verbatim: same `Op::CrrSync` encodings,
-// same `sync_round` responder, same caps, same whole-batch rollback. Pull-only
-// is what keeps it reasonable — each node periodically asks a peer "what do you
-// have that I do not", which is textbook anti-entropy and needs no write-
-// permission model beyond the peer authentication the mesh already performs.
-// It is also strictly additive: a peer running a pre-upgrade binary has no
-// dispatch arm for the path and simply fails the round, which is the same
-// no-op as an unreachable peer.
-
+/// Fleet-to-fleet anti-entropy, direct with no browser carrier. v1 converged fleet replicas only
+/// through browser carriers (a Team browser that pulled node A's changes later pushed them to node
+/// B), which made the system-of-record replica set depend on someone's tab being open and left a
+/// freshly joined node answering for a database it holds nothing of. This arm is PULL-ONLY and
+/// verbatim the exchange (same `Op::CrrSync` encodings, `sync_round` responder, caps and
+/// whole-batch rollback): each node periodically asks a peer what it has that this node lacks,
+/// needing no write-permission model beyond mesh peer authentication. Strictly additive: a
+/// pre-upgrade peer has no dispatch arm and the round fails like an unreachable peer.
 const DEFAULT_FLEET_SYNC_SECS: u64 = 45;
 const FLEET_SYNC_TIMEOUT_SECS: u64 = 20;
 /// Peers pulled per project per tick. Bounded so the round cost stays O(1) in
 /// fleet size per tick while the ROTOR still reaches every peer over time.
 const FLEET_SYNC_PEERS_PER_TICK: usize = 2;
 
-/// The grant a FLEET peer syncs under. Peers are node-authenticated by the mesh
-/// transport and hold the same system-of-record role this node does, so the
-/// grant is read+write over any project this node knows to be opted in. An
-/// unknown project yields `None` — the identical refusal shape the browser path
-/// uses, so a caller learns nothing about what exists here.
+/// The grant a FLEET peer syncs under: peers are node-authenticated by the mesh transport and hold
+/// the same system-of-record role as this node, so it is read+write over any project this node
+/// knows to be opted in; an unknown project yields `None`, the browser path's identical refusal.
 fn fleet_round_grant(cloud: &Arc<CloudState>, project: &str) -> Option<RoundGrant> {
     let spec = opted_in_projects(cloud).remove(project)?;
     Some(RoundGrant {
@@ -1180,11 +979,10 @@ fn fleet_round_grant(cloud: &Arc<CloudState>, project: &str) -> Option<RoundGran
     })
 }
 
-/// Responder half, dispatched from `gossip::dispatch`'s
-/// `/v1/browser-db/mesh-sync/` POST arm. Request and reply are the SAME
-/// `Op::CrrSync` encodings the browser lane uses, so one wire format and one
-/// `sync_round` serve both callers. An empty reply is the refusal; the dialer
-/// treats empty/malformed as a failed round and simply retries next tick.
+/// Responder half, dispatched from `gossip::dispatch`'s `/v1/browser-db/mesh-sync/` POST arm:
+/// request and reply are the SAME `Op::CrrSync` encodings as the browser lane, so one wire format
+/// and one `sync_round` serve both. An empty reply is the refusal; the dialer treats empty or
+/// malformed as a failed round and retries next tick.
 pub async fn mesh_crr_sync(cloud: &Arc<CloudState>, project: &str, body: &[u8]) -> Vec<u8> {
     let Some(grant) = fleet_round_grant(cloud, project) else {
         tracing::debug!(%project, "fleet db sync refused: project is not opted in on this node");
@@ -1194,8 +992,6 @@ pub async fn mesh_crr_sync(cloud: &Arc<CloudState>, project: &str, body: &[u8]) 
         tracing::warn!(%project, "fleet db sync: malformed request");
         return Vec::new();
     };
-    // Same rule as the browser path: `db_file` is a grant IDENTIFIER, never a
-    // path, and must equal the name THIS node derives from its own grant.
     if request.db_file != replica_file_name(&grant.project) {
         tracing::warn!(%project, "fleet db sync refused: db_file does not match the derived name");
         return Vec::new();
@@ -1215,9 +1011,9 @@ pub async fn mesh_crr_sync(cloud: &Arc<CloudState>, project: &str, body: &[u8]) 
     }
 }
 
-/// One PULL round against `peer`: advertise this node's per-site watermarks
-/// with an empty push, then apply whatever the peer exports that this node is
-/// missing. Returns the number of batches applied.
+/// One PULL round against `peer`: advertises this node's per-site watermarks with an empty push,
+/// then applies whatever the peer exports that this node lacks; returns the number of batches
+/// applied.
 async fn fleet_pull_round(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -1274,8 +1070,6 @@ async fn fleet_pull_round(
         ensure_schema(&conn, &resolved).map_err(|e| e.to_string())?;
         let (status, message) = apply_push_batches(&conn, &path, &resolved, &reply.batches);
         if !matches!(status, CrrStatus::Ok) {
-            // Typed refusals (quota, oversized value) are the SAME rollback the
-            // browser path takes — never a partial apply.
             return Err(message);
         }
         Ok(())
@@ -1285,11 +1079,10 @@ async fn fleet_pull_round(
     Ok(applied)
 }
 
-/// Registered in `main.rs` beside [`spawn_reconcile`]. Every node runs it: the
-/// replica is per-host, so this is peer-to-peer anti-entropy, not a leader job.
-/// `HIVE_BROWSER_DB_FLEET_SYNC=0` disables the DIALING half (the responder arm
-/// stays, so a disabled node still serves peers) — the `HIVE_BROWSER_DB_LISTEN`
-/// precedent for having an ops-side off switch that degrades to a no-op.
+/// Registered in `main.rs` beside [`spawn_reconcile`]. Every node runs it (the replica is per-host:
+/// peer-to-peer anti-entropy, not a leader job); each tick pulls from a bounded, rotating sample of
+/// peers. `HIVE_BROWSER_DB_FLEET_SYNC=0` disables the DIALING half only (the responder arm stays,
+/// so a disabled node still serves peers).
 pub fn spawn_fleet_sync(cloud: Arc<CloudState>) {
     if std::env::var("HIVE_BROWSER_DB_FLEET_SYNC")
         .map(|v| v.trim() == "0")
@@ -1303,8 +1096,6 @@ pub fn spawn_fleet_sync(cloud: Arc<CloudState>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         tick.tick().await;
         tick.tick().await;
-        // Rotates so the bounded per-tick peer sample still covers the whole
-        // fleet over successive ticks instead of hammering the same two peers.
         let mut rotor: usize = 0;
         loop {
             let projects: Vec<String> = opted_in_projects(&cloud).into_keys().collect();
@@ -1338,89 +1129,6 @@ pub fn spawn_fleet_sync(cloud: Arc<CloudState>) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Global-state shards (bn-browser-state-shards)
-// ---------------------------------------------------------------------------
-//
-// A browser cannot hold the platform's replicated state — so it holds SMALL
-// FRAGMENTS of it, and which fragments is a question every node answers
-// identically with no coordinator.
-//
-// The pieces, in the order they compose:
-//
-//  1. FRAGMENTS. Every entry in `store_sync::REGISTRY` already produces
-//     CANONICAL, deterministic bytes for equal state (that is the contract
-//     the follower's byte-compare change-gate depends on). Those bytes are
-//     the global CRDT/GuardianDB state as this platform actually stores it,
-//     so they are what gets fragmented: each store's snapshot is cut into
-//     `fragment_bytes`-sized pieces on UTF-8 boundaries, and each piece is
-//     content-addressed by BLAKE3 (`fluid_core::browser_source_digest`, the
-//     same digest the browser-artifact pins use — literally
-//     `blake3::hash(bytes)`).
-//
-//  2. ASSIGNMENT. Rendezvous/HRW hashing over the membership set, reusing
-//     `lease::hrw_owner` — the SAME function container placement and the
-//     inference coordinator election already agree through, called
-//     repeatedly against a shrinking pool to get a ranked top-R rather than a
-//     single owner. Placement keys on the fragment KEY (`<store>/<index>`),
-//     never on its digest, so a state change does not move fragments and a
-//     membership change moves only the fragments the departed peer held.
-//
-//  3. BOUND. A hard per-browser byte cap, defaulted SMALL (4 MiB). A
-//     fragment that would push a holder over its cap is a TYPED REFUSAL
-//     naming the holder and the fragment — never a truncated fragment, never
-//     a partial one, and never silently re-homed onto a peer HRW did not
-//     rank (which would trade a visible shortfall for an invisible
-//     order-dependent placement). The shortfall surfaces honestly as
-//     `under_replicated_fragments`. This is `apply_push_batches`' cap
-//     discipline — typed refusal, whole unit rolled back, loud message —
-//     applied to placement instead of to a write.
-//
-//  4. RE-DERIVATION. `shard_plan` holds no state at all: it is recomputed
-//     from the live membership every call, so a join/leave/expiry is picked
-//     up by construction. `membership_digest` exists so a caller can tell
-//     cheaply that the answer it is holding is stale, and
-//     [`reconcile_shards`] logs the transition.
-//
-// TRUST — what is implemented and what is NOT. See [`shard_trust_json`],
-// which returns this same statement to every API caller so it cannot drift
-// away from the code:
-//
-//  * IMPLEMENTED: content-addressed fragments. A fragment's identity IS the
-//    BLAKE3 of its bytes, and [`verify_fragment`] re-checks exact length and
-//    digest before any byte is used. A browser that returns WRONG bytes is
-//    therefore caught deterministically, without trusting the browser at all.
-//
-//  * NOT IMPLEMENTED, AND NOT CLAIMED: this proves nothing about continued
-//    possession. A browser that stores nothing, discards a fragment the
-//    moment it is assigned, or serves it back by re-fetching it from another
-//    node, is indistinguishable from one honestly holding it — until the
-//    moment it is asked and fails. Content addressing bounds CORRUPTION, not
-//    AVAILABILITY. It also gives no confidentiality: a fragment handed to a
-//    browser is readable by that browser.
-//
-//  * WHY THE BAR IS PLATFORM-ADMIN TODAY. Because of the two gaps above,
-//    eligibility is gated on `browser_presence`'s server-derived
-//    `shard_eligible`, set only from a `platform_admin` session. A platform
-//    admin can already read this state through the operator console, so
-//    handing them a fragment of it discloses nothing new. Opening this to
-//    non-admin donors needs BOTH halves the current design lacks:
-//    confidentiality (encrypt fragments at rest on the donor, so a fragment
-//    is opaque to its holder) and a real possession argument.
-//
-//  * THE HONEST OPTIONS for that second half, none of them implemented here,
-//    none to be hand-rolled: (a) accept the weaker guarantee and rely on
-//    over-replication plus audit challenges — cheap, standard, and it only
-//    detects loss after the fact; (b) proof-of-retrievability / provable
-//    data possession (Juels–Kaliski PoR, Ateniese PDP, or a Merkle-tree
-//    challenge–response over erasure-coded fragments), which is what
-//    actually proves continued possession and is a scheme to ADOPT from the
-//    literature with its published parameters, never to invent; (c) do not
-//    ask browsers to prove anything and treat every browser replica as a
-//    cache with replication factor zero — exactly the posture
-//    `docs/browser-db-contract.md` already takes for browser DB replicas.
-//    (c) is the cheapest correct answer and the current default.
-
 /// Per-browser hard ceiling on held fragment bytes. Deliberately SMALL: a
 /// donor's browser tab is not storage, and the whole premise is fragments.
 const DEFAULT_SHARD_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -1438,14 +1146,13 @@ const SHARD_MAX_TOTAL_FRAGMENTS: usize = 100_000;
 /// always carries the true number.
 const SHARD_MAX_REPORTED_REFUSALS: usize = 64;
 
-/// One content-addressed fragment of one replicated store's canonical
-/// snapshot. `key` is the PLACEMENT identity (stable across content changes);
-/// `digest` is the CONTENT identity (changes with every write).
+/// One content-addressed fragment of one replicated store's canonical snapshot: `key` is the
+/// PLACEMENT identity (stable across content changes), `digest` the CONTENT identity (changes with
+/// every write).
 #[derive(Clone, Debug, Serialize)]
 pub struct StateFragment {
-    /// `<store>/<zero-padded index>` — zero-padded so lexical order over keys
-    /// is numeric order over fragments, which is what makes the cap
-    /// accounting below deterministic on every node.
+    /// `<store>/<zero-padded index>`: zero-padded so lexical order over keys is numeric order over
+    /// fragments, which makes the cap accounting deterministic on every node.
     pub key: String,
     pub store: String,
     pub index: u32,
@@ -1464,9 +1171,8 @@ pub struct ShardRefusal {
     pub detail: String,
 }
 
-/// What one browser peer is responsible for. `fragments` is bounded by
-/// construction: `max_bytes / fragment_bytes` entries at most (64 at the
-/// defaults), so this is always a renderable list, never a firehose.
+/// What one browser peer is responsible for: `fragments` is bounded by construction (`max_bytes /
+/// fragment_bytes` entries, 64 at the defaults), so always a renderable list.
 #[derive(Clone, Debug, Serialize)]
 pub struct ShardHolding {
     pub endpoint_id: String,
@@ -1522,10 +1228,8 @@ fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .clamp(min, max)
 }
 
-/// `HIVE_BROWSER_SHARDS=0` turns the planner off entirely (the
-/// `HIVE_BROWSER_DB_LISTEN=0` precedent): the plan still renders, with an
-/// empty membership and `enabled: false`, so an operator sees WHY there are
-/// no assignments rather than an ambiguous empty list.
+/// `HIVE_BROWSER_SHARDS=0` turns the planner off (the plan still renders with an empty membership
+/// and `enabled: false`, so an operator sees WHY there are no assignments).
 fn shard_params() -> ShardParams {
     let enabled = std::env::var("HIVE_BROWSER_SHARDS")
         .map(|v| !matches!(v.trim(), "0" | "false" | "off"))
@@ -1536,10 +1240,6 @@ fn shard_params() -> ShardParams {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    // REGISTRY order is a source-code fact and therefore already identical on
-    // identical builds; sorting makes it identical across a MIXED-version
-    // fleet too, which is exactly when a placement disagreement would be
-    // hardest to see.
     let mut stores: Vec<String> = crate::store_sync::REGISTRY
         .iter()
         .map(|s| s.name.to_string())
@@ -1570,17 +1270,11 @@ fn shard_params() -> ShardParams {
     }
 }
 
-/// The eligible membership set: browser peers that are `shard_eligible`
-/// (server-stamped from a `platform_admin` session), currently `online`, and
-/// STILL carrying a live admission on this node's own replicated view.
-///
-/// The admission re-check is not redundant with presence. Presence is issued
-/// alongside an admission and torn down with it
-/// (`browser_presence::remove_for_endpoint`), but the two stores replicate
-/// independently and a presence record can outlive a revocation by one gossip
-/// round — the `proxy_to_owner` / `resolve_round_grant` re-check precedent:
-/// authorization is re-derived at the point of use, from proven identity,
-/// every time.
+/// The eligible membership set: browser peers that are `shard_eligible` (server-stamped from a
+/// `platform_admin` session), currently `online`, and STILL carrying a live admission on this
+/// node's replicated view. The admission re-check is not redundant: presence and admission
+/// replicate independently, and a presence record can outlive a revocation by one gossip round
+/// (authorization is re-derived at the point of use, from proven identity, every time).
 pub fn shard_members(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
     let now = hive_core::now_ms();
     cloud
@@ -1597,15 +1291,10 @@ pub fn shard_members(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Ranked rendezvous hashing: the top `take` preferred holders of `key`.
-///
-/// Built ONLY out of `lease::hrw_owner` — the same weight function container
-/// placement and the inference-coordinator election agree through — applied
-/// to a shrinking pool. Removing the winner and re-running is exactly HRW
-/// rank order, so the top-1 here is by construction the same node those
-/// callers would pick, and the minimal-churn property carries: a member
-/// leaving promotes each fragment's next-ranked holder and moves nothing
-/// else.
+/// Ranked rendezvous hashing: the top `take` preferred holders of `key`, built ONLY from
+/// `lease::hrw_owner` (the weight function container placement and the inference coordinator agree
+/// through) applied to a shrinking pool, so the top-1 is the node those callers pick and a member
+/// leaving promotes each fragment's next-ranked holder and moves nothing else.
 fn hrw_rank(key: &str, members: &[String], take: usize) -> Vec<String> {
     let mut pool: Vec<String> = members.to_vec();
     let mut ranked: Vec<String> = Vec::with_capacity(take.min(pool.len()));
@@ -1619,11 +1308,9 @@ fn hrw_rank(key: &str, members: &[String], take: usize) -> Vec<String> {
     ranked
 }
 
-/// Cut `text` into `target`-byte pieces that never split a UTF-8 character.
-///
-/// The walk-back can move at most 3 bytes and `target` is floored at 4 KiB,
-/// so a piece can never be empty and the loop always advances — no zero-length
-/// fragment, no spin.
+/// Cuts `text` into `target`-byte pieces that never split a UTF-8 character; the walk-back moves at
+/// most 3 bytes and `target` is floored at 4 KiB, so a piece is never empty and the loop always
+/// advances.
 fn utf8_chunks(text: &str, target: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -1638,12 +1325,10 @@ fn utf8_chunks(text: &str, target: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Enumerate every fragment of every selected store, in stable
-/// `(store, index)` order, alongside any store-level refusals.
-///
-/// Fragment CONTENT is not retained here — only its descriptor. The bytes are
-/// re-derived on demand by [`shard_fragment_http`], which is why the plan can
-/// be recomputed on every call without holding a copy of platform state.
+/// Enumerates every fragment of every selected store in stable `(store, index)` order, with any
+/// store-level refusals. Only the descriptor is kept: the bytes are re-derived on demand by
+/// [`shard_fragment_http`], so the plan recomputes on every call without holding a copy of platform
+/// state.
 fn fragment_table(
     cloud: &Arc<CloudState>,
     params: &ShardParams,
@@ -1655,9 +1340,6 @@ fn fragment_table(
         if bytes.is_empty() {
             continue;
         }
-        // Every REGISTRY snapshot is serde_json output and therefore UTF-8;
-        // this arm exists so a future non-JSON store is named loudly instead
-        // of silently vanishing from the shard set.
         let Ok(text) = std::str::from_utf8(&bytes) else {
             refusals.push(ShardRefusal {
                 reason: "store_not_utf8",
@@ -1698,13 +1380,18 @@ fn fragment_table(
     (fragments, refusals)
 }
 
-/// The whole assignment, recomputed from live state on every call.
-///
-/// Determinism: fragments are walked in lexical key order and members are
-/// sorted, so the cap accounting below visits identical inputs in an
-/// identical order on every node — the plan is a pure function of (fragment
-/// table, membership, params) with no clock, no counter and no local history
-/// in it.
+/// The whole assignment, recomputed from live state on every call (no stored state;
+/// `membership_digest` tells a caller its answer is stale and [`reconcile_shards`] logs the
+/// transition). It is a pure function of (fragment table, membership, params) with no clock,
+/// counter or local history: fragments are walked in lexical key order and members and store names
+/// are sorted (REGISTRY order is a source-code fact, so sorting keeps a mixed-version fleet in
+/// agreement). Each store's canonical snapshot is cut into `fragment_bytes` pieces
+/// content-addressed by BLAKE3 (`fluid_core::browser_source_digest`) and assigned by ranked
+/// rendezvous hashing keyed on the fragment KEY (a state change moves no fragment, a membership
+/// change only the departed holder's) under a hard per-browser byte cap: a fragment that would
+/// overflow a holder is a TYPED REFUSAL surfaced as `under_replicated_fragments`, never truncated,
+/// split or re-homed outside its HRW ranking. Trust model: [`shard_trust_json`] (content addressing
+/// bounds corruption only, so eligibility is gated on the server-stamped `shard_eligible`).
 pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
     let params = shard_params();
     let (fragments, mut refusals) = fragment_table(cloud, &params);
@@ -1752,10 +1439,6 @@ pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
     let mut under_replicated = 0usize;
     let mut unplaced = 0usize;
     for fragment in &fragments {
-        // A fragment bigger than the per-browser cap can never be placed
-        // ANYWHERE — the same shape as browser_db's "a batch that cannot fit
-        // any frame stays local, named". Splitting it further to make it fit
-        // would silently change the fragment identity every consumer pins.
         if fragment.bytes > params.max_bytes {
             unplaced += 1;
             refusals.push(ShardRefusal {
@@ -1789,12 +1472,6 @@ pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
             let Some(holding) = holdings.get_mut(holder) else {
                 continue;
             };
-            // Cap check BEFORE the assignment, whole fragment or nothing.
-            // Note what does NOT happen on refusal: the fragment is not
-            // trimmed to fit, and it is not re-homed onto a member outside
-            // its HRW top-R. Re-homing would make placement depend on
-            // iteration order and destroy the minimal-churn property; the
-            // shortfall is reported instead.
             if holding.held_bytes.saturating_add(fragment.bytes) > holding.max_bytes {
                 refusals.push(ShardRefusal {
                     reason: "browser_cap_exceeded",
@@ -1819,9 +1496,6 @@ pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
         }
     }
 
-    // Bounded in what is REPORTED, never in what is COUNTED: `refusals_total`
-    // is taken before the truncation, so a plan with 900 refusals says 900 and
-    // shows 64 rather than quietly looking like a plan with 64.
     let refusals_total = refusals.len();
     refusals.truncate(SHARD_MAX_REPORTED_REFUSALS);
     ShardPlan {
@@ -1841,15 +1515,11 @@ pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
     }
 }
 
-/// The gate every fragment byte must pass before it is used — the one piece
-/// of the trust story that is actually implemented.
-///
-/// Exact length first (a truncated body can never be "close enough"), then
-/// UTF-8, then BLAKE3 against the descriptor's `digest`. A browser that
-/// returns wrong bytes is caught here deterministically without trusting the
-/// browser at all. What this does NOT do is establish that the browser was
-/// holding the bytes rather than fetching them on demand, or that it will
-/// still have them next time — see this section's TRUST notes.
+/// The gate every fragment byte must pass before use, the one piece of the trust story actually
+/// implemented: exact length first (a truncated body is never "close enough"), then UTF-8, then
+/// BLAKE3 against the descriptor's `digest`. It catches a browser returning wrong bytes without
+/// trusting it, but not whether it was holding the bytes rather than fetching them on demand (see
+/// [`shard_trust_json`]).
 pub fn verify_fragment(fragment: &StateFragment, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() as u64 != fragment.bytes {
         return Err(format!(
@@ -1895,19 +1565,11 @@ fn shard_trust_json() -> Value {
     })
 }
 
-/// Re-derivation driver. The plan itself is stateless — it is recomputed from
-/// live membership on every read, so nothing here has to *cause* the
-/// re-derivation. This loop's job is purely to NOTICE, so a fleet that quietly
-/// stopped being able to place fragments shows up in the log and not only in
-/// an operator's browser.
-///
-/// The membership digest is computed FIRST, on its own, and the loop returns
-/// on no change. That ordering is the whole point: [`shard_plan`] serializes
-/// every replicated store to build its fragment table, and this runs on every
-/// node every `HIVE_BROWSER_DB_RECONCILE_SECS`. Building a full plan per tick
-/// just to compare one digest would spend that serialization on nothing in the
-/// steady state, which is exactly the shape of cost that is invisible until a
-/// store grows.
+/// Re-derivation driver: the plan is stateless and recomputed from live membership on every read,
+/// so this loop only NOTICES (a fleet that quietly stopped being able to place fragments shows up
+/// in the log). The membership digest is computed FIRST, on its own, and the loop returns on no
+/// change: [`shard_plan`] serializes every replicated store, and this runs on every node every
+/// `HIVE_BROWSER_DB_RECONCILE_SECS`.
 fn reconcile_shards(cloud: &Arc<CloudState>) {
     static LAST_MEMBERSHIP: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
     let members: Vec<String> = if shard_params().enabled {
@@ -1960,19 +1622,12 @@ async fn shard_plan_http(
     ))
 }
 
-/// `GET /v1/browser/shards/fragment/:store/:index[?digest=<hex>]` —
-/// operator-only. The fragment's actual bytes, re-derived from this node's
-/// own copy of the store.
-///
-/// `store` is matched against `store_sync::REGISTRY` by exact name and
-/// `index` parses as an integer, so neither path segment can become a file
-/// path or a query — the same "validate before it is ever a path component"
-/// rule `browser_artifacts` applies to a digest.
-///
-/// The optional `digest` is the anti-skew guard: state moves, and two nodes
-/// can be one gossip round apart. Passing the digest the plan advertised
-/// turns "this node's bytes have since changed" into a loud 409 instead of a
-/// body that silently fails the caller's own verification later.
+/// `GET /v1/browser/shards/fragment/:store/:index[?digest=<hex>]` (operator-only): the fragment's
+/// bytes re-derived from this node's own copy of the store. `store` matches `store_sync::REGISTRY`
+/// by exact name and `index` parses as an integer, so neither segment can become a path or query
+/// (the `browser_artifacts` digest rule). The optional `digest` is the anti-skew guard: two nodes
+/// can be one gossip round apart, and passing the advertised digest turns "this node's bytes have
+/// since changed" into a loud 409.
 async fn shard_fragment_http(
     axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -2028,22 +1683,18 @@ struct ShardVerifyRequest {
     /// The bytes being verified — a browser's answer, or an operator's
     /// deliberately corrupted copy of one.
     content: String,
-    /// Optional: verify against THIS digest rather than the one this node
-    /// currently derives, so a fragment captured earlier can still be checked
-    /// after local state has moved.
+    /// Optional: verify against THIS digest rather than the one this node derives now, so a
+    /// fragment captured earlier can still be checked after local state moved.
     #[serde(default)]
     digest: Option<String>,
 }
 
-/// `POST /v1/browser/shards/verify` — operator-only. Runs
-/// [`verify_fragment`] against caller-supplied bytes.
-///
-/// This is the verification GATE, exposed so the one property that is
-/// actually proved can be exercised end-to-end today: post a fragment's real
-/// content and it verifies; flip one character and it fails with the exact
-/// digest mismatch. It stands in for the retrieval path deliberately — there
-/// is no arm that fetches a fragment back from a browser yet, and pretending
-/// otherwise is exactly the overclaim this module refuses to make.
+/// `POST /v1/browser/shards/verify` (operator-only): runs [`verify_fragment`] on caller-supplied
+/// bytes; the expected descriptor comes from this node's own state or the pinned digest, never the
+/// body's own claim (which would be circular). It exposes the verification GATE so the one proven
+/// property can be exercised end to end (post real content and it verifies; flip a character and it
+/// fails with the digest mismatch); it stands in for the retrieval path deliberately, since no arm
+/// fetches a fragment back from a browser yet.
 async fn shard_verify_http(
     axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -2057,9 +1708,6 @@ async fn shard_verify_http(
             "unknown or unsharded store".to_string(),
         ));
     }
-    // The descriptor to verify AGAINST is derived here, from this node's own
-    // state (or from the caller's pinned digest) — never from the submitted
-    // body's own claim about itself, which would make verification circular.
     let bytes = crate::store_sync::serve(&cloud, &request.store);
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         (
@@ -2075,9 +1723,6 @@ async fn shard_verify_http(
     let piece = &text[start..end];
     let local_digest = fluid_core::browser_source_digest(piece);
     let (expected_digest, expected_bytes) = match &request.digest {
-        // Verifying against a pinned digest: the length is the SUBMITTED
-        // length, so a digest match is the whole proof. Against local state,
-        // the local length is an independent second check.
         Some(pinned) => (pinned.clone(), request.content.len() as u64),
         None => (local_digest.clone(), piece.len() as u64),
     };

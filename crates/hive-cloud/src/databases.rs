@@ -1,19 +1,9 @@
-//! Serverless data services — provisioned per project, billed by usage, like
-//! Vercel Storage / Railway plugins / Upstash / Prisma Postgres.
-//!
-//! Five kinds:
-//! * **Postgres** — a managed Postgres instance. When a container runtime is
-//!   available we boot a real `postgres` (the same "instant Postgres" experience
-//!   Prisma Postgres ships, which runs each database as its own lightweight VM /
-//!   unikernel — see prisma.io & nanovms.com). Otherwise a connection record is
-//!   provisioned in simulated mode.
-//! * **Redis** — managed key/value, Upstash-style (TCP + REST token).
-//! * **Blob** — S3-compatible object storage.
-//! * **Queue** — a durable FIFO message queue.
-//! * **Vector** — an embeddings index for AI workloads.
-//!
-//! Blob/Queue/Vector are backed by in-process stores exposed over the admin API,
-//! so they are immediately usable without external services.
+//! Serverless data services provisioned per project and billed by usage. Kinds: Postgres (a real
+//! `postgres` container when a container runtime is available, else a connection record in
+//! simulated mode), Redis (Upstash-style TCP + REST token), Sqlite (a file served over libsql
+//! Hrana), Supabase (a Studio mini-stack) and the platform-native Blob (S3-compatible), Queue
+//! (durable FIFO), Vector (embeddings index), Pub/Sub and Realtime services, backed by in-process
+//! stores exposed over the admin API.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -24,26 +14,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 
-/// Teardown requests observed for database ids whose provisioning may still be
-/// in flight. A delete's teardown can legitimately run BEFORE the backing
-/// container exists (the record's `container` field is stamped only when
-/// provisioning completes), and the template `rm` then no-ops while the
-/// in-flight provision starts the container AFTERWARDS — orphaned, with no
-/// record left for any reconcile to key on (witnessed live 2026-08-21:
-/// `hive-db-bbd13406` on fc-bangkok started ~65s after its delete and outlived
-/// the catalog entry; same shape twice). Noting the request here lets the
-/// provision completion path tear the fresh backing down instead of marking a
-/// deleted database Ready. Ids are uuids and never reused; the TTL only bounds
-/// the map's size.
+/// Teardown requests observed for database ids whose provisioning may still be in flight: a
+/// delete's teardown can run BEFORE the backing container exists (the record's `container` is
+/// stamped only when provisioning completes), the template `rm` then no-ops and the provision
+/// starts the container AFTERWARDS, orphaned with no record to reconcile. Noting the request lets
+/// the provision completion path tear the fresh backing down instead of marking a deleted database
+/// Ready. Ids are never reused; the TTL only bounds the map.
 static TEARDOWN_REQUESTS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, u64>>> =
     std::sync::OnceLock::new();
 
 const TEARDOWN_REQUEST_TTL_MS: u64 = 15 * 60 * 1000;
 
-/// Record that a delete's teardown ran for `id` on THIS node. Called from
-/// every teardown entry point (`teardown_db_backing` and the blind template
-/// arm in admin.rs) so the provision completion guard can see it regardless
-/// of which transport or arm handled the delete.
+/// Records that a delete's teardown ran for `id` on THIS node; called from every teardown entry
+/// point (`teardown_db_backing` and the blind template arm in admin.rs) so the provision completion
+/// guard sees it whichever arm handled the delete.
 pub fn note_teardown_request(id: &str) {
     let m = TEARDOWN_REQUESTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let now = now_ms();
@@ -74,28 +58,14 @@ pub enum DbKind {
     Pubsub,
     /// Secure WebSocket streaming channels (rooms) for realtime apps.
     Realtime,
-    /// Managed SQLite, spoken over the libsql **Hrana** protocol
-    /// (`crate::hrana`) so `@libsql/client` / Turso-compatible drivers connect
-    /// with no adapter. The engine is a FILE on the owning node, not a
-    /// container — there is no port to publish and no process to keep warm.
-    ///
-    /// Distinct from the `browser_db` lane (`crate::browser_db`), which is a
-    /// cr-sqlite CRDT replica per PROJECT, replicated to browsers over
-    /// `Op::CrrSync` and carrying no query endpoint. The two share nothing but
-    /// the word SQLite: different directory, different file name template,
-    /// different identity (database id vs project), and this lane never loads
-    /// the cr-sqlite extension — a direct writer inside a CRR file would
-    /// bypass the clock tables and silently diverge every replica.
+    /// Managed SQLite over libsql Hrana (`crate::hrana`), so `@libsql/client` and Turso-compatible
+    /// drivers connect with no adapter. The engine is a FILE on the owning node: no container, port
+    /// or keep-warm. It shares nothing with the `browser_db` lane (a cr-sqlite CRDT replica per
+    /// PROJECT) but the word: never load cr-sqlite or touch a `browser-dbs` file here.
     Sqlite,
-    /// Supabase Studio as a managed database option: a dedicated per-database
-    /// mini-stack (`supabase/postgres` + `postgres-meta` + `studio`
-    /// containers) provisioned like any managed engine. Studio's REQUIRED
-    /// dependency set only (upstream compose evidence: Studio needs db +
-    /// pg-meta + a router doing path-routing and basic-auth — the router's
-    /// two jobs are served by this platform's own edge, so no Kong container
-    /// runs). GoTrue/PostgREST/Realtime/Storage are deliberately deferred:
-    /// Studio's Authentication/Data-API pages degrade, everything else
-    /// (table editor, SQL editor, schema views) is fully functional.
+    /// Supabase Studio as a managed database: a dedicated per-database stack provisioned like any
+    /// managed engine (see `provision_supabase`), whose functional dependencies run while the
+    /// platform edge plays the router's roles (no Kong).
     Supabase,
 }
 impl DbKind {
@@ -114,48 +84,36 @@ impl DbKind {
     }
 }
 
-// ---- Managed SQLite (libsql/Hrana) file layout ------------------------------
-
-/// Store layout: `$HIVE_DATA/sqlite-dbs/` — one file per managed SQLite
-/// database, named by [`sqlite_file_name`]. Deliberately NOT
-/// `$HIVE_DATA/browser-dbs/`: those files are cr-sqlite CRRs owned by the
-/// `Op::CrrSync` exchange, and a direct SQL writer in one of them would write
-/// rows the clock tables never see.
+/// Store layout `$HIVE_DATA/sqlite-dbs/`: one file per managed SQLite database, named by
+/// [`sqlite_file_name`]. Deliberately NOT `$HIVE_DATA/browser-dbs/`: those files are cr-sqlite CRRs
+/// owned by the `Op::CrrSync` exchange, and a direct SQL writer there writes rows the clock tables
+/// never see.
 pub fn sqlite_store_dir() -> std::path::PathBuf {
     crate::persist::data_dir().join("sqlite-dbs")
 }
 
-/// The platform-templated file name for a managed SQLite database.
-///
-/// The template's input is the PLATFORM-ISSUED database id (`db_<hex>`), never
-/// the tenant's project or database NAME — the tenant-volume-isolation rule
-/// applied to a file path. `sqlite_file_path` additionally proves the id has
-/// the issued shape before it is allowed to become a path component, so a
-/// crafted id can never traverse out of the store directory even if one
-/// reached this far.
+/// The platform-templated file name for a managed SQLite database, from the PLATFORM-ISSUED id
+/// (`db_<hex>`), never the tenant's project or database NAME (the volume-isolation rule applied to
+/// a file path); `sqlite_file_path` also proves the id has the issued shape before it becomes a
+/// path component.
 pub fn sqlite_file_name(id: &str) -> String {
     format!("hive-sqlite-{}.db", crate::git::sanitize_tag(id))
 }
 
-/// The platform-templated file STEM for a managed SQLite database — identical
-/// for both engines, because musqld's `-dir` mode routes by the file name's
-/// first label and the two engines must agree on which file belongs to which
-/// database id.
+/// The platform-templated file STEM, identical for both engines because musqld's `-dir` mode routes
+/// by the file name's first label.
 pub fn sqlite_musql_stem(id: &str) -> String {
     format!("hive-sqlite-{}", crate::git::sanitize_tag(id))
 }
 
-/// Name of a database's musql file. Rust side: the engine writes
-/// `.musq`; SQLite's own `-wal`/`-shm` do not exist for it (musql keeps a
-/// 0-byte `.musq.lock` and, transiently, a `.musq.delta` instead — see
-/// `crate::musql_migrate`, which backs up all three).
+/// Name of a database's musql file: the engine writes `.musq` (plus a 0-byte `.musq.lock` and a
+/// transient `.musq.delta`, not SQLite's `-wal`/`-shm`; `crate::musql_migrate` backs up all three).
 pub fn sqlite_musql_file_name(id: &str) -> String {
     format!("{}.musq", sqlite_musql_stem(id))
 }
 
-/// Absolute path of a database's musql file, `None` for a non-platform id.
-/// Same id-shape proof as [`sqlite_file_path`] — a crafted id must never become
-/// a path component in either engine's store.
+/// Absolute path of a database's musql file, `None` for a non-platform id (the same id-shape proof
+/// as [`sqlite_file_path`]).
 pub fn sqlite_musql_path(id: &str) -> Option<std::path::PathBuf> {
     let hex = id.strip_prefix("db_")?;
     if !(8..=64).contains(&hex.len())
@@ -168,12 +126,11 @@ pub fn sqlite_musql_path(id: &str) -> Option<std::path::PathBuf> {
     Some(sqlite_store_dir().join(sqlite_musql_file_name(id)))
 }
 
-/// Absolute path of a database's SQLite file, or `None` when `id` is not
-/// a platform-issued database id (`db_` + 8..=64 lowercase hex).
+/// Absolute path of a database's SQLite file, or `None` when `id` is not a platform-issued database
+/// id (`db_` + 8..=64 lowercase hex: `sanitize_tag` lowercases, so mixed case would map two ids onto
+/// one file).
 pub fn sqlite_file_path(id: &str) -> Option<std::path::PathBuf> {
     let hex = id.strip_prefix("db_")?;
-    // Lowercase hex ONLY: `sanitize_tag` lowercases, so accepting mixed case
-    // would map two distinct ids onto one file.
     if !(8..=64).contains(&hex.len())
         || !hex
             .bytes()
@@ -207,7 +164,8 @@ pub struct Database {
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
-    pub mode: String, // "live" (real backing service) | "simulated"
+    /// `"live"` (a real backing service) or `"simulated"`.
+    pub mode: String,
     #[serde(default)]
     pub created_ms: u64,
     /// Connection details. Sensitive values are masked by `masked()`.
@@ -218,9 +176,10 @@ pub struct Database {
     pub container: Option<String>,
     #[serde(default)]
     pub note: String,
-    // ---- Cross-region replication ----
-    /// Extra regions this database is replicated to (empty = single-region). The
-    /// primary lives in `region`; a read-scalable replica is kept in each of these.
+    /// Extra regions this database is replicated to (empty = single-region). The primary lives in
+    /// `region`; a read-scalable replica is kept in each of these. Sqlite and Supabase never
+    /// replicate (a second file or stack elsewhere is a divergent database, not a replica), so
+    /// requested regions are dropped rather than silently "provisioned".
     #[serde(default)]
     pub replicas: Vec<String>,
     /// "primary" (the writable instance) | "replica" (a region read replica).
@@ -230,14 +189,13 @@ pub struct Database {
     /// from / mirror against). Empty for a lone single-region database.
     #[serde(default)]
     pub primary_node: String,
-    /// The external DB-gateway hostname `<slug>.{db_domain}` (e.g.
-    /// `db-ab12.downstash.xyz`) — the TLS-SNI endpoint external clients connect to.
-    /// Empty when the gateway is disabled (no HIVE_DB_DOMAIN).
+    /// The external DB-gateway hostname `<slug>.{db_domain}`, the TLS-SNI endpoint external clients
+    /// connect to; empty when the gateway is disabled (no `HIVE_DB_DOMAIN`).
     #[serde(default)]
     pub db_host: String,
-    /// The node whose podman actually runs this DB's container — the reconciler
-    /// points `db_host`'s A record at THIS node's public IP so the SNI proxy that
-    /// receives the connection has the container locally.
+    /// The node whose podman runs this DB's container: the reconciler points `db_host`'s A record
+    /// at THIS node's public IP so the SNI proxy that receives the connection has the container
+    /// locally.
     #[serde(default)]
     pub host_node: String,
 }
@@ -299,8 +257,6 @@ fn merge_studio_replay_state(local: &Database, remote: &mut Database) {
         studio_replay_state(&local.connection),
         studio_replay_state(&remote.connection),
     ) else {
-        // Corrupt replay state is a fail-closed condition. Preserve a bounded
-        // marker instead of letting either side's malformed value erase facts.
         let state =
             std::collections::BTreeMap::from([(STUDIO_REPLAY_OVERFLOW.to_string(), u64::MAX)]);
         remote.connection.insert(
@@ -332,8 +288,6 @@ fn merge_studio_replay_state(local: &Database, remote: &mut Database) {
 impl Database {
     fn masked(&self) -> Database {
         let mut d = self.clone();
-        // Replay facts are internal protocol state, not a connection field. Do
-        // not expose even their key or masked shape through list/detail APIs.
         d.connection.remove(STUDIO_REPLAY_STATE_KEY);
         for (k, v) in d.connection.iter_mut() {
             let kl = k.to_lowercase();
@@ -357,11 +311,8 @@ fn mask(v: &str) -> String {
     format!("••••••••{tail}")
 }
 
-// ---- In-process backing stores for Blob / Queue / Vector ----
-
-/// DURABLE blob store: objects are written to disk (content survives restarts),
-/// under `$HIVE_DATA/blob/<bucket>/<hex(key)>.bin` with atomic temp+rename writes.
-/// (Replaces the old in-memory map that was labelled "live" but lost on restart.)
+/// DURABLE blob store: objects are written to disk under `$HIVE_DATA/blob/<bucket>/<hex(key)>.bin`
+/// with atomic temp+rename writes, so content survives restarts.
 struct BlobStore {
     root: std::path::PathBuf,
 }
@@ -421,9 +372,8 @@ impl BlobStore {
         }
         out
     }
-    /// Permanently remove every object in `bucket` (the deleting-database's own
-    /// bucket dir). Best-effort — an I/O error here must not fail the caller's
-    /// broader delete flow.
+    /// Permanently removes every object in `bucket` (the deleting database's own bucket dir);
+    /// best-effort, since an I/O error must not fail the caller's delete flow.
     fn delete_bucket(&self, bucket: &str) {
         let _ = std::fs::remove_dir_all(self.bucket_dir(bucket));
     }
@@ -453,22 +403,15 @@ fn hex_decode(s: &str) -> Option<String> {
 }
 #[derive(Default)]
 struct QueueStore {
-    // queue -> messages
     msgs: RwLock<HashMap<String, std::collections::VecDeque<String>>>,
 }
 #[derive(Default)]
 struct VectorStore {
-    // index -> id -> (vector, metadata)
     items: RwLock<HashMap<String, HashMap<String, (Vec<f32>, serde_json::Value)>>>,
 }
 
-/// Pub/Sub + Realtime broker. Each named channel (topic or room) is a tokio
-/// broadcast bus: publishers fan out to every live subscriber in O(1).
-///
-/// Mesh note: to fan out across nodes we deliberately do NOT re-dial the iroh
-/// DHT per message (that would rate-limit fast). Instead we ride the already-
-/// established peer connections ("trunks") — the same long-lived QUIC tunnels /
-/// keep-alive HTTP pool the gossip loop uses — and replicate over those.
+/// Pub/Sub + Realtime broker: each named channel (topic or room) is a tokio broadcast bus, so
+/// publishers fan out to every live subscriber in O(1).
 struct Broker {
     channels: RwLock<HashMap<String, tokio::sync::broadcast::Sender<String>>>,
     published: RwLock<HashMap<String, u64>>,
@@ -504,20 +447,20 @@ pub struct DataSnapshot {
     pub vectors: HashMap<String, HashMap<String, (Vec<f32>, serde_json::Value)>>,
 }
 
-/// How long a deletion is remembered. Long enough that every node — including
-/// one that was down or OOM-cycling for hours — sees the tombstone before it is
-/// collected, because a tombstone dropped too early lets a peer that still holds
-/// the record resurrect it.
+/// How long a deletion is remembered: long enough that every node, including one down or
+/// OOM-cycling for hours, sees the tombstone before it is collected (a tombstone dropped too early
+/// lets a peer that still holds the record resurrect it).
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-/// The replicated payload for the `databases` store: records PLUS the deletions.
-///
-/// Deletions must travel explicitly. When absence-means-deleted, a node that
-/// simply has not heard about a record yet is indistinguishable from one that
-/// knows it was removed — and the replicated store then propagates the loss.
+/// One-use Studio ticket facts: database id -> (ticket digest -> expiry ms), independent of the
+/// resource record.
 pub type StudioReplaySnapshot =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>;
 
+/// The replicated payload for the `databases` store: records PLUS the deletions. Deletions must
+/// travel explicitly: with absence-means-deleted, a node that has not heard of a record is
+/// indistinguishable from one that knows it was removed, and the replicated store would propagate
+/// the loss.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SyncedDatabases {
     pub dbs: Vec<Database>,
@@ -558,7 +501,6 @@ impl DatabaseStore {
         }
     }
 
-    // ---- Pub/Sub + Realtime broker ----
     /// Publish a message to a channel; returns the number of live subscribers
     /// that received it.
     pub fn publish(&self, channel: &str, msg: String) -> usize {
@@ -610,9 +552,9 @@ impl DatabaseStore {
             .map(|x| x.masked())
     }
 
-    /// UNMASKED lookup by the external DB-gateway hostname (`db_host`), for the SNI
-    /// proxy — it needs the real `local_port` + credentials to splice the wire.
-    /// Case-insensitive (SNI names arrive lowercased).
+    /// UNMASKED lookup by the external DB-gateway hostname (`db_host`) for the SNI proxy, which
+    /// needs the real `local_port` and credentials to splice the wire; case-insensitive (SNI names
+    /// arrive lowercased).
     pub fn by_db_host(&self, db_host: &str) -> Option<Database> {
         let h = db_host.trim().to_ascii_lowercase();
         self.dbs
@@ -635,11 +577,10 @@ impl DatabaseStore {
         Some(database)
     }
 
-    /// NON-SECRET directory of gateway-addressable DBs hosted on THIS node — the
-    /// mesh-shareable subset the DNS reconciler needs to publish per-DB A records
-    /// for DBs hosted on OTHER nodes (DBs provision on the control-plane leader,
-    /// the DNS leader is a different node, and DB records are not gossiped).
-    /// Deliberately excludes connection/credentials: routing metadata only.
+    /// NON-SECRET directory of gateway-addressable DBs hosted on THIS node: the mesh-shareable
+    /// subset the DNS reconciler needs to publish per-DB A records for DBs on OTHER nodes (DBs
+    /// provision on the control-plane leader, the DNS leader is another node, and DB records are
+    /// not gossiped). Routing metadata only, never connection or credentials.
     pub fn directory(&self) -> Vec<serde_json::Value> {
         self.dbs
             .read()
@@ -705,9 +646,8 @@ impl DatabaseStore {
         }
     }
 
-    /// Durable snapshot of the in-process data stores (queue + vector) so they
-    /// survive a node restart like the disk-backed blob store + DB records.
-    /// (Pub/sub + realtime are ephemeral streaming channels — nothing to persist.)
+    /// Durable snapshot of the in-process queue and vector stores, so they survive a restart like
+    /// the disk-backed blob store and the DB records (pub/sub and realtime are ephemeral).
     pub fn data_snapshot(&self) -> DataSnapshot {
         DataSnapshot {
             queues: self
@@ -753,30 +693,15 @@ impl DatabaseStore {
 
     pub fn remove_db(&self, id: &str) {
         self.dbs.write().retain(|d| d.id != id);
-        // Record the deletion so it can REPLICATE. Without this the removal is
-        // invisible to `merge_synced`, and a peer still holding the record would
-        // hand it straight back on the next sync tick.
         self.tombstones.write().insert(id.to_string(), now_ms());
     }
 
-    // ---- Replicated snapshot / merge -------------------------------------
-    //
-    // Adoption MERGES; it must never replace. This store previously adopted the
-    // leader's snapshot with `*self.dbs.write() = data`, guarded only against a
-    // fully-empty payload, which makes "the leader has not got this record" and
-    // "this record was deleted" the same event. Witnessed end to end: a managed
-    // SQLite database was created through the leader (HTTP 200, reached `ready`),
-    // existed on 6 of 11 nodes, and then vanished from ALL of them — the leader
-    // was OOM-killed before its debounced save ran (a SIGKILL bypasses
-    // `flush_blocking`), came back without the record, and every follower dutifully
-    // adopted that and erased its own copy. A replicated store must not be able to
-    // destroy data by omission.
-
-    /// Snapshot for replication: records plus the tombstones that explain absences.
+    /// Snapshot for replication: records, sorted by id so equal state serializes to equal bytes
+    /// (the store_sync contract), plus the tombstones that explain absences.
     pub fn snapshot_synced(&self) -> SyncedDatabases {
         let studio_replay = self.studio_replay_snapshot();
         let mut dbs = self.dbs.read().clone();
-        dbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic bytes (store_sync contract)
+        dbs.sort_by(|a, b| a.id.cmp(&b.id));
         SyncedDatabases {
             dbs,
             tombstones: self.tombstones.read().clone(),
@@ -784,18 +709,16 @@ impl DatabaseStore {
         }
     }
 
-    /// Merge a peer's snapshot into this store. Returns the resulting record count.
-    ///
-    /// Rules, in order:
-    ///   * tombstones union, keeping the LATEST deletion time for an id;
-    ///   * records union by id, the remote copy winning a collision (the leader is
-    ///     authoritative for field updates such as status transitions) — except
-    ///     that a `simulated` copy never overwrites a local `live` one of the same
-    ///     record (see the guard below);
-    ///   * any record whose id carries a tombstone at-or-after its `created_ms` is
-    ///     dropped — so a delete propagates, while a database RE-created under a
-    ///     fresh id (or later timestamp) survives;
-    ///   * tombstones older than [`TOMBSTONE_RETENTION_MS`] are collected.
+    /// Merges a peer's snapshot and returns the resulting record count. Adoption MERGES, never
+    /// replaces: a replace made "the leader lacks this record" and "this record was deleted" the
+    /// same event, so a record the leader lost to an unsaved debounce vanished from every follower.
+    /// Tombstones union keeping the LATEST deletion time per id; records union by id with the
+    /// remote copy winning (the leader is authoritative for field updates), except that a
+    /// `simulated` copy never overwrites a local `live` one (the promotion happens only on the host
+    /// node, and a stale simulated copy made the reconcile treat the running database as an
+    /// orphan); a record whose id has a tombstone at or after its `created_ms` is dropped (a
+    /// database re-created under a fresh id survives); tombstones older than
+    /// [`TOMBSTONE_RETENTION_MS`] are collected.
     pub fn merge_synced(&self, remote: SyncedDatabases) -> usize {
         let SyncedDatabases {
             dbs: mut remote_dbs,
@@ -837,15 +760,6 @@ impl DatabaseStore {
         for r in remote_dbs {
             match dbs.iter_mut().find(|d| d.id == r.id) {
                 Some(local) => {
-                    // A live backing is never demoted by a simulated copy of the
-                    // same record: `spawn_db_reconcile` promotes a stuck record
-                    // only on its host node, and nothing carries that promotion
-                    // back to the leader, so the leader's stale `simulated` copy
-                    // arrived on every sync, overwrote the promotion, and the
-                    // next reconcile tick treated the running database as an
-                    // orphan (`podman rm -f -v`) and provisioned an empty one
-                    // over it — every ~70 s (surveybot-db on fc-virginia-3: 283
-                    // container recreations in 6 h).
                     if local.mode == "live"
                         && r.mode == "simulated"
                         && local.created_ms == r.created_ms
@@ -876,15 +790,11 @@ impl DatabaseStore {
         *self.tombstones.write() = data;
     }
 
-    /// Remove a database record AND purge its actual payload data for the
-    /// platform-native kinds (Queue/Vector) that live in separate stores keyed
-    /// by a team-prefixed name (`"{team}::{connection[queue|index]}"`), not by
-    /// the database's own id — `remove_db` alone only ever removed the catalog
-    /// entry, leaving queue messages / vector embeddings (which may hold
-    /// customer PII in their metadata) orphaned in memory and re-persisted in
-    /// every subsequent snapshot forever. `team` is the OWNING team (from the
-    /// `Database` record itself, not attacker-suppliable), so this can't be
-    /// used to purge another tenant's namespace.
+    /// Removes a database record AND purges its payload for the platform-native kinds
+    /// (Queue/Vector), which live in stores keyed by `"{team}::{connection[queue|index]}"` rather
+    /// than the database id (`remove_db` alone left messages and embeddings, possibly customer PII,
+    /// orphaned and re-persisted in every snapshot). `team` is the owning team from the `Database`
+    /// record itself, so this cannot purge another tenant's namespace.
     pub fn remove_db_and_purge_data(&self, id: &str, team: &str) {
         if let Some(d) = self.get_raw(id) {
             if let Some(q) = d.connection.get("queue") {
@@ -911,16 +821,10 @@ impl DatabaseStore {
         }
     }
 
-    /// Flip one managed SQLite database's storage engine. This is the ONLY way
-    /// an `engine` value changes, so the record can never claim an engine whose
-    /// file does not exist: `crate::musql_migrate` verifies the converted file
-    /// first and calls this afterwards.
-    ///
-    /// The value rides the ordinary replicated record (it lives in `connection`,
-    /// which `snapshot_synced` carries), so every node sees the same engine for
-    /// the same database — which matters because every node PROXIES to the
-    /// owner, and a proxying node that disagreed about the engine would be
-    /// unable to say anything useful about the file.
+    /// Flips one managed SQLite database's storage engine: the ONLY way an `engine` value changes,
+    /// so a record can never claim an engine whose file does not exist (`crate::musql_migrate`
+    /// verifies the converted file first). The value rides the replicated record (`connection`) so
+    /// every node agrees, and every node PROXIES to the owner.
     pub fn set_engine(&self, id: &str, engine: crate::musql::Engine) {
         self.update(id, |d| {
             d.connection
@@ -936,10 +840,9 @@ impl DatabaseStore {
         });
     }
 
-    /// Rename a project's databases IN PLACE. The database's OWN identity (its
-    /// id, `db_host`, the SQLite file name) is keyed by id and never by project
-    /// name, so nothing on disk moves — only the ownership label the Storage
-    /// page filters on. Called under the project lifecycle writer.
+    /// Renames a project's databases IN PLACE: a database's identity (id, `db_host`, SQLite file
+    /// name) is keyed by id, never by project name, so nothing on disk moves, only the ownership
+    /// label the Storage page filters on. Called under the project lifecycle writer.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;
@@ -953,14 +856,12 @@ impl DatabaseStore {
         n
     }
 
-    /// Allocate a loopback port for a new DB container. The in-memory cursor RESETS
-    /// to 0 on restart, so a naive `base + cursor` re-hands `base` to a second DB
-    /// created post-restart — colliding with a pre-existing DB that already holds it
-    /// (the new container then can't publish its port and podman leaves it in a
-    /// broken "Up-but-dead" state, which the gateway sees as connection-refused).
-    /// Guard against that: skip ports already assigned to a live DB (persisted in
-    /// each DB's `connection`, so they survive restart) AND ports actually bound on
-    /// loopback (a leftover container), probing with a real bind.
+    /// Allocates a loopback port for a new DB container. The in-memory cursor RESETS on restart, so
+    /// a plain `base + cursor` would re-hand `base` to a second DB and collide with one that
+    /// already holds it (the container then cannot publish its port and podman leaves it
+    /// Up-but-dead): skip ports assigned to a live DB (persisted in `connection`) AND ports
+    /// actually bound on loopback, probing with a real bind (the probe listener is dropped at once
+    /// so podman can claim the port; a small TOCTOU is tolerated).
     fn next_port(&self, base: u32) -> u32 {
         let used: std::collections::HashSet<u32> = self
             .dbs
@@ -975,16 +876,12 @@ impl DatabaseStore {
             .collect();
         loop {
             let cand = base + self.port.fetch_add(1, Ordering::SeqCst);
-            // Safety valve: never exceed the valid TCP range — fall back to the raw
-            // candidate rather than loop forever (exhaustion is not expected).
             if cand > 65_000 {
                 return cand;
             }
             if used.contains(&cand) {
                 continue;
             }
-            // A successful bind proves the port is free right now; we drop the probe
-            // listener immediately so podman can claim it (small, tolerable TOCTOU).
             if std::net::TcpListener::bind(("127.0.0.1", cand as u16)).is_ok() {
                 return cand;
             }
@@ -997,9 +894,9 @@ impl DatabaseStore {
         }
     }
 
-    /// Atomically consume a one-use Studio ticket digest in a bounded sidecar
-    /// independent from the database resource record. The connection mirror keeps
-    /// mixed-version replication safe; only SHA-256 digests and expirations exist.
+    /// Atomically consumes a one-use Studio ticket digest in a bounded sidecar independent of the
+    /// database resource record; the connection mirror keeps mixed-version replication safe, and
+    /// only SHA-256 digests and expirations exist.
     pub(crate) fn consume_studio_ticket_digest(
         &self,
         id: &str,
@@ -1046,15 +943,11 @@ impl DatabaseStore {
         true
     }
 
-    /// UNMASKED reconcile view: every live-mode record with a named backing
-    /// container, plus the stored connection fields a re-create needs
-    /// (kind, local host port, raw password). Internal-only — never serialized
-    /// to a client.
-    /// Live records with a backing container, for `spawn_db_reconcile`. The
-    /// WHOLE record goes back so the loop can route multi-container kinds
-    /// (Supabase's comma-joined stack) and filter to records this node hosts
-    /// — checking a foreign node's record against the LOCAL podman reads
-    /// "GONE" forever and WARNs spuriously (witnessed fleet-wide 2026-08-18).
+    /// Live-mode records with a named backing container, for `spawn_db_reconcile`, plus the stored
+    /// connection fields a re-create needs (kind, local host port, raw password): internal, never
+    /// serialized to a client. The WHOLE record goes back so the loop can route multi-container
+    /// kinds (Supabase's comma-joined stack) and filter to records THIS node hosts: a foreign
+    /// node's record checked against the local podman reads GONE forever and WARNs spuriously.
     pub(crate) fn containers_to_reconcile(&self) -> Vec<Database> {
         self.dbs
             .read()
@@ -1064,16 +957,10 @@ impl DatabaseStore {
             .collect()
     }
 
-    /// Records stuck in "simulated" that this node's reconcile loop should
-    /// re-provision. Two witnessed stuck shapes (both permanent before this):
-    /// Ready+simulated — provision fell back on a transient failure (podman
-    /// down, image pull, container start) and `containers_to_reconcile`'s
-    /// mode=="live" filter excluded it from reconciliation forever; and a
-    /// STALE Provisioning+simulated — the async provision task was killed
-    /// (hive-node restart mid-provision; KillMode=process keeps any started
-    /// containers alive) before it ever wrote the record, witnessed live on
-    /// fc-sanjose-cvm-1 2026-08-23 with two full healthy Supabase stacks
-    /// running against records frozen at provisioning/container=None.
+    /// Records stuck in "simulated" that this node's reconcile loop should re-provision:
+    /// Ready+simulated (a transient provision failure fell back, and the live-mode filter excluded
+    /// it from reconciliation forever) and a STALE Provisioning+simulated (the async provision task
+    /// died, e.g. a hive-node restart mid-provision, before it wrote the record).
     pub(crate) fn simulated_to_retry(&self) -> Vec<Database> {
         const PROVISIONING_ORPHAN_GRACE_MS: u64 = 15 * 60 * 1000;
         let now = now_ms();
@@ -1095,7 +982,6 @@ impl DatabaseStore {
         self.dbs.write().push(d);
     }
 
-    // ---- Blob ops (durable, disk-backed) ----
     pub fn blob_put(&self, bucket: &str, key: &str, data: Vec<u8>) {
         self.blob.put(bucket, key, &data);
     }
@@ -1106,7 +992,6 @@ impl DatabaseStore {
         self.blob.list(bucket)
     }
 
-    // ---- Queue ops ----
     pub fn queue_push(&self, queue: &str, msg: String) -> usize {
         let mut m = self.queue.msgs.write();
         let q = m.entry(queue.to_string()).or_default();
@@ -1125,7 +1010,6 @@ impl DatabaseStore {
             .unwrap_or(0)
     }
 
-    // ---- Vector ops ----
     pub fn vector_upsert(&self, index: &str, id: &str, v: Vec<f32>, meta: serde_json::Value) {
         self.vector
             .items
@@ -1196,30 +1080,18 @@ pub struct ProvisionReq {
     pub replicas: Vec<String>,
 }
 
-/// The environment variables a database exposes to its owning project's
-/// deployments — the connection surface an app reads (Vercel-style). `api_base`
-/// is the public API origin (e.g. `https://api.shadw.cloud`) used to form
-/// absolute URLs for the platform-native (blob/queue/vector/pubsub/realtime)
-/// services, which are reached over the public API with the DB's token.
-///
-/// For Postgres/Redis, when the DB container joined the project's podman network
-/// (`net_host`/`net_port` present), the injected URL uses that in-network address
-/// so a SAME-NODE app container actually connects (a container's `127.0.0.1` is
-/// itself, not the host). Falls back to the loopback URL otherwise. Returns
-/// (KEY, VALUE) pairs; ALL are treated as sensitive.
+/// The environment variables a database exposes to its owning project's deployments, the connection
+/// surface an app reads; returns (KEY, VALUE) pairs, ALL treated as sensitive. `api_base` is the
+/// public API origin used to form absolute URLs for the platform-native services. The
+/// externally-routable `db_host` DSN is the canonical value: a per-node podman-bridge address in
+/// replicated project env would be unreachable from another node, or a DIFFERENT node's container
+/// (the project subnet is the same on every node), so the in-network form stays available only as
+/// INTERNAL_* for same-node containers. Supabase Studio's own sign-in (STUDIO_USERNAME/PASSWORD) is
+/// deliberately never exported (read on demand from /credentials).
 pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
     let c = &db.connection;
     let g = |k: &str| c.get(k).cloned().unwrap_or_default();
     let base = api_base.trim_end_matches('/');
-    // The per-node podman-bridge address is only valid ON the node running the
-    // engine. It was preferred UNCONDITIONALLY and written once into replicated
-    // project env consumed by every deployment on every node — so an app the
-    // scheduler placed anywhere else dialed a 10.x address that is either
-    // unreachable or (because the project subnet is derived from the project
-    // name identically on every node) a DIFFERENT node's container. The
-    // externally-routable `db_host` DSN is the canonical value; the in-network
-    // form stays available as INTERNAL_* for same-node containers, which is
-    // exactly the split the Supabase path already made for its own URL.
     let net_host = c
         .get("net_host")
         .filter(|s| !s.is_empty())
@@ -1299,12 +1171,6 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
                 format!("{base}/v1/ws/realtime/{}", g("room")),
             ),
         ],
-        // Managed SQLite over libsql/Hrana. Both the Turso-conventional pair
-        // and a plain `DATABASE_URL` (token folded in as `?authToken=`, which
-        // `@libsql/client` parses) so an app needs no code change either way.
-        // `LIBSQL_URL` is written by `with_external_endpoint`; when the DB
-        // gateway domain is off it is the platform-API form, which is why this
-        // reads the stored value instead of rebuilding a host here.
         DbKind::Sqlite => {
             let url = g("LIBSQL_URL");
             let token = g("DB_REST_TOKEN");
@@ -1321,11 +1187,6 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
                 ("DATABASE_URL".into(), dsn),
             ]
         }
-        // Supabase Studio stack: the app's own DSN (in-network when available)
-        // plus the public Supabase URL and JWT keys a supabase-js client takes.
-        // STUDIO_USERNAME/PASSWORD are deliberately NOT exported — those are
-        // the human's dashboard sign-in, not app configuration; they are read
-        // on demand from /credentials like every other secret.
         DbKind::Supabase => {
             let url = match net_host {
                 Some(h) => format!(
@@ -1368,15 +1229,15 @@ pub fn env_prefix(name: &str) -> String {
     p.trim_matches('_').to_string()
 }
 
-/// Rewrite a freshly-provisioned connection map so the PRIMARY, copyable URL is
-/// the EXTERNAL DB-gateway endpoint (`<db_host>:<gateway port>`, TLS-required),
-/// while preserving the node-local URL under `INTERNAL_*` (for on-node tooling)
-/// and the private `net_host`/`net_port` (for same-node app containers). No-op
-/// when the gateway is off (`db_host` empty) — the original 127.0.0.1 URLs stand.
-///
-/// The port is the one the gateway LISTENS on, not a hardcoded 5432/6379: a
-/// second hive-cloud instance on the same host already owns the defaults, so a
-/// moved gateway publishes a moved URL instead of a DSN that cannot connect.
+/// Rewrites a freshly provisioned connection map so the PRIMARY, copyable URL is the EXTERNAL
+/// DB-gateway endpoint (`<db_host>:<gateway port>`, TLS-required: credentials never cross in
+/// plaintext and the gateway routes by SNI), keeping the node-local URL under `INTERNAL_*`, the
+/// private `net_host`/`net_port` and the container's real `local_port` (the SNI proxy on the host
+/// node splices to `127.0.0.1:<local_port>`). A no-op when the gateway is off (`db_host` empty).
+/// The port is the one the gateway LISTENS on, not a hardcoded 5432/6379 (a second hive-cloud on
+/// the host owns the defaults). Managed SQLite's `libsql://<slug>.{db_domain}` is Hrana over HTTPS,
+/// so a bare host makes the client's relative `v2/pipeline` land where the server mounts it;
+/// Supabase's `studio_port` must survive untouched.
 fn with_external_endpoint(
     mut conn: HashMap<String, String>,
     kind: DbKind,
@@ -1387,9 +1248,6 @@ fn with_external_endpoint(
     }
     let pg_port = crate::db_gateway::published_pg_port();
     let redis_port = crate::db_gateway::published_redis_port();
-    // Preserve the container's REAL node-local host port BEFORE overwriting `port`
-    // with the public gateway port — the SNI proxy on the host node splices to
-    // 127.0.0.1:<local_port>, and the reconciler/router reads it back.
     if let Some(p) = conn.get("port").cloned() {
         conn.insert("local_port".into(), p);
     }
@@ -1404,14 +1262,10 @@ fn with_external_endpoint(
             if let Some(internal) = conn.remove("DATABASE_URL") {
                 conn.insert("INTERNAL_DATABASE_URL".into(), internal);
             }
-            // TLS-required so credentials never cross the wire in plaintext and the
-            // gateway can route by SNI.
             conn.insert(
                 "DATABASE_URL".into(),
                 format!("postgres://{user}:{pw}@{db_host}:{pg_port}/{dbname}?sslmode=require"),
             );
-            // SQL-over-HTTP (Neon-style) REST endpoint served by the same gateway
-            // host: POST {"query","params"} with `Authorization: Bearer <password>`.
             conn.insert("SQL_HTTP_URL".into(), format!("https://{db_host}/sql"));
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), pg_port.to_string());
@@ -1421,7 +1275,6 @@ fn with_external_endpoint(
             if let Some(internal) = conn.remove("REDIS_URL") {
                 conn.insert("INTERNAL_REDIS_URL".into(), internal);
             }
-            // `rediss://` = TLS.
             conn.insert(
                 "REDIS_URL".into(),
                 format!("rediss://default:{pw}@{db_host}:{redis_port}"),
@@ -1433,25 +1286,12 @@ fn with_external_endpoint(
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), redis_port.to_string());
         }
-        // Managed SQLite: the per-database hostname IS the libsql base URL.
-        // `libsql://` is Hrana-over-HTTPS (the scheme rewrites to https in
-        // every client) — NOT a websocket URL — and a bare host has no path,
-        // so the client's RELATIVE resolution of `v2/pipeline` lands exactly
-        // where this server mounts it. That is why the hostname form is the
-        // preferred DSN and the platform-API form (set at provision time)
-        // carries a mandatory trailing slash.
         DbKind::Sqlite => {
             conn.insert("LIBSQL_URL".into(), format!("libsql://{db_host}"));
             conn.insert("endpoint".into(), format!("https://{db_host}"));
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), "443".into());
         }
-        // Supabase: the postgres wire rides the same SNI splice as managed
-        // Postgres (`local_port` preserved above); the Studio URL is the same
-        // per-database hostname on plain HTTPS — the edge arm
-        // (`db_rest::supabase_studio_proxy`) terminates it with the
-        // basic-auth gate. `studio_port` is the edge's proxy target on the
-        // host node and must survive this rewrite untouched.
         DbKind::Supabase => {
             let pw = conn.get("password").cloned().unwrap_or_default();
             let dbname = conn
@@ -1470,8 +1310,6 @@ fn with_external_endpoint(
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), pg_port.to_string());
         }
-        // HTTP-REST kinds (blob/queue/vector/pubsub/realtime): expose the gateway
-        // host so their REST/WS URLs are externally reachable over TLS.
         _ => {
             conn.insert("endpoint".into(), format!("https://{db_host}"));
             conn.insert("host".into(), db_host.to_string());
@@ -1480,30 +1318,15 @@ fn with_external_endpoint(
     conn
 }
 
-/// Whether `host` can actually carry a managed database's public endpoint.
-///
-/// A managed database is reachable ONLY through its own `<slug>.{db_domain}`
-/// A record, and that record is published from `host_node`'s public address
-/// (the DB zone in `vercel_dns`). `db_gateway` then splices the connection to
-/// `127.0.0.1:<local_port>` on that SAME node with no forward hop, so a host
-/// that has left `registry.nodes()` strands the database permanently: there is
-/// no address left to publish and no node that can serve it. Measured
-/// 2026-10-09 — 4 of 18 databases sat on `fc-hongkong`, `fc-sanjose-2`,
-/// `fc-sanjose-cvm-1` and `fc-virginia-4`, none present in the registry any
-/// more (`hive_retired=true`: the instance no longer exists), each still
-/// advertising `status: ready` behind a stale A record.
-///
-/// A node that IS in the registry but advertises no public address is the same
-/// failure one step earlier (every macOS launchd node has `public_ip: None`),
-/// so it is inadmissible for the same reason — and that is why this is one
-/// predicate both `admin::database_create` and `vercel_dns` read, rather than
-/// a check each call site re-derives.
-///
-/// This answers reachability only. It says nothing about whether the bytes on
-/// `host` still exist, and nothing here may act on a false result beyond
-/// refusing to place NEW work there: re-hosting a stranded database under the
-/// same slug produces an EMPTY database the tenant's app happily reconnects
-/// to, which is a worse outcome than an honest failure.
+/// Whether `host` can carry a managed database's public endpoint. A managed database is reachable
+/// ONLY through its own `<slug>.{db_domain}` A record, published from `host_node`'s public address
+/// (the DB zone in `vercel_dns`), and `db_gateway` splices to `127.0.0.1:<local_port>` on that SAME
+/// node with no forward hop: a host that left `registry.nodes()`, or advertises no public address
+/// (every macOS launchd node), STRANDS the database (no address left to publish, no node that can
+/// serve it). One predicate shared by `admin::database_create` and `vercel_dns`. It answers
+/// reachability only: nothing may act on a false result beyond refusing NEW placement there, since
+/// re-hosting a stranded database under the same slug yields an EMPTY database the tenant's app
+/// reconnects to happily.
 pub fn db_host_admissible(cloud: &crate::state::CloudState, host: &str) -> bool {
     cloud
         .registry
@@ -1518,22 +1341,13 @@ pub fn provision(
     store: Arc<DatabaseStore>,
     region: String,
     req: ProvisionReq,
-    // The DB-gateway domain (empty = gateway off) and the node whose podman runs
-    // the container — used to assign the external `<slug>.{db_domain}` endpoint and
-    // route its DNS to this node.
     db_domain: String,
     host_node: String,
-    // The public API origin (`CloudState::api_base`). Only the SQLite kind uses
-    // it: with the DB gateway off there is no `<slug>.{db_domain}` hostname, and
-    // an addressless database is not a database — so its libsql base URL falls
-    // back to `{api_base}/v1/sqlite/{id}/`, which is served by the same handler.
     api_base: String,
     on_ready: impl Fn(Database) + Send + 'static,
 ) -> Database {
     let id = format!("db_{}", uuid::Uuid::new_v4().simple());
     let region = req.region.clone().unwrap_or(region);
-    // Hostname-safe slug from the id (`db_<hex>` -> `db-<12hex>`) — a valid single
-    // DNS/SNI label. `db_host` is the external endpoint; empty when the gateway is off.
     let slug = format!("db-{}", &id[3..15.min(id.len())]);
     let db_host = if db_domain.is_empty() {
         String::new()
@@ -1557,13 +1371,6 @@ pub fn provision(
         connection: HashMap::new(),
         container: None,
         note: String::new(),
-        // SQLite has no cross-region replication in this lane: the file is the
-        // system of record on one node, and a second file elsewhere is a
-        // DIVERGENT database, not a replica (the CRDT lane that does solve this
-        // is `browser_db`, and it solves it with cr-sqlite, not file copies).
-        // Supabase is the same shape: one self-contained stack per database —
-        // a second stack elsewhere is a second database, not a replica.
-        // Requested regions are dropped rather than silently "provisioned".
         replicas: if req.kind == DbKind::Sqlite || req.kind == DbKind::Supabase {
             Vec::new()
         } else {
@@ -1582,17 +1389,6 @@ pub fn provision(
 
     tokio::spawn(async move {
         let outcome = provision_backing(&store, &id, &req, &api_base, &db_host).await;
-        // A delete that landed while the backing was being created has already
-        // removed the catalog record — writing the Ready status into it is a
-        // no-op on a missing id, and the just-started backing would leak
-        // (witnessed live: the delete's teardown read `container` as still
-        // None, skipped, and the provision then started the container seconds
-        // later). The record being GONE here is one signal; the other is a
-        // teardown that already ran on this node against a record whose
-        // `container` was not yet stamped — its template `rm` no-op'd on a
-        // container that did not exist yet (`teardown_requested`, noted by
-        // every teardown entry point). Either way: tear the fresh backing
-        // down by name and skip the status write entirely.
         if store.get_raw(&id).is_none() || teardown_requested(&id) {
             if let Ok((_, _, container)) = &outcome {
                 if let Some(container) = container.as_deref() {
@@ -1635,9 +1431,6 @@ pub fn provision(
             match outcome {
                 Ok((mode, conn, container)) => {
                     d.status = DbStatus::Ready;
-                    // Make the fallback explicit: a "simulated" DB has no real
-                    // backing engine (e.g. podman unavailable). The record's `mode`
-                    // surfaces this in the UI; log it so it's never silent.
                     if mode == "simulated" {
                         tracing::warn!(db = %id, kind = ?req.kind, "database provisioned in SIMULATED mode (no live backing engine — install podman for a real instance)");
                         d.note = "Simulated: no live backing engine available (install podman for a real instance).".into();
@@ -1660,11 +1453,9 @@ pub fn provision(
     db
 }
 
-/// Regenerate a Blob database's access credentials in place (same bucket,
-/// same endpoint — only the auth material rotates). For when a credential
-/// leaked (e.g. into a log) and the fix is invalidating it without deleting
-/// the underlying data. Returns the updated, unmasked record so the caller
-/// gets the fresh credentials; `None` if the id is unknown or not a Blob DB.
+/// Regenerates a Blob database's access credentials in place (same bucket and endpoint, only the
+/// auth material rotates), for a leaked credential, without deleting the data; returns the updated,
+/// unmasked record, or `None` if the id is unknown or not a Blob DB.
 pub fn rotate_blob_credentials(store: &Arc<DatabaseStore>, id: &str) -> Option<Database> {
     let d = store.get_raw(id)?;
     if d.kind != DbKind::Blob {
@@ -1748,20 +1539,14 @@ async fn provision_backing(
     }
 }
 
-/// Ensure the per-project DNS-less podman network exists (idempotent) and return
-/// (net_name, static_ip) to attach a managed DB container so same-node app
-/// containers reach it BY IP (the network has no DNS). The IP is a deterministic
-/// high host (.200+) derived from the db id to avoid colliding with compose
-/// service IPs (.11+). Returns None if podman/network setup is unavailable.
-///
-/// Podman-only, unconditionally, even on macOS: every DB provision attaches to
-/// this static-IP network (never optional — see the two callers below), and
-/// Apple's `container` tool has no static-IP-assignment flag at all (verified
-/// live: no equivalent to `--ip`) — the same hard gap documented for
-/// multi-service compose deploys in `hive_backend::container_cli`'s module doc.
+/// Ensures the per-project DNS-less podman network exists (idempotent) and returns (net_name,
+/// static_ip) to attach a managed DB container, so same-node app containers reach it BY IP (the
+/// network has no DNS). The IP is a deterministic high host (.200+) derived from the db id, clear
+/// of compose service IPs (.11+). Podman-only, even on macOS: every DB provision attaches to this
+/// static-IP network and Apple's `container` tool has no static-IP flag. `None` when podman or the
+/// network setup is unavailable.
 async fn ensure_project_db_net(project: &str, id: &str) -> Option<(String, String)> {
     let (net, subnet, gw) = crate::git::project_net(project);
-    // subnet like "10.o2.o3.0/24" -> prefix "10.o2.o3"
     let prefix = subnet.rsplit_once('.').map(|(p, _)| p.to_string())?;
     let host: u32 = 200 + (fnv1a(id.as_bytes()) % 50);
     let ip = format!("{prefix}.{host}");
@@ -1781,7 +1566,6 @@ async fn ensure_project_db_net(project: &str, id: &str) -> Option<(String, Strin
         .stderr(Stdio::null())
         .status()
         .await;
-    // "already exists" is fine (idempotent).
     let _ = created;
     Some((net, ip))
 }
@@ -1795,11 +1579,12 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
     h
 }
 
-/// Provision the in-region backing for a REPLICA of `db` on this node. Postgres/
-/// Redis get a real local instance (so in-region reads are local); the
-/// platform-native kinds serve from this node's in-process store (data arrives
-/// via write-mirroring) and keep the record's connection. Returns
-/// (connection, container, mode).
+/// Provisions the in-region backing for a REPLICA of `db` on this node: Postgres/Redis get a real
+/// local instance (local in-region reads); the platform-native kinds serve from this node's
+/// in-process store (data arrives via write-mirroring) and keep the record's connection. Returns
+/// (connection, container, mode). Sqlite is unreachable by construction (`provision` clears its
+/// `replicas`) and kept explicit, so a future replication feature must decide here instead of
+/// inheriting the `_` arm, which would register a second EMPTY file as a live replica.
 pub async fn provision_replica_backing(
     store: Arc<DatabaseStore>,
     db: &Database,
@@ -1813,22 +1598,15 @@ pub async fn provision_replica_backing(
             Ok((mode, conn, container)) => (conn, container, mode),
             Err(_) => (db.connection.clone(), None, "simulated".into()),
         },
-        // Unreachable by construction (`provision` clears `replicas` for this
-        // kind) and kept explicit so a future replication feature has to make a
-        // deliberate decision here instead of inheriting the `_` arm, which
-        // would register a second EMPTY file as a live replica.
         DbKind::Sqlite => (db.connection.clone(), None, "simulated".into()),
-        // Blob/Queue/Vector/Pubsub/Realtime: in-process on every node; the replica
-        // serves from local state kept in sync by the primary's write-mirroring.
         _ => (db.connection.clone(), None, "live".into()),
     }
 }
 
-/// Poll a freshly-published loopback port until the container's engine accepts a
-/// TCP connection (postgres/redis take ~1-3s to start listening). Returns true once
-/// reachable, false if it never came up within the budget — a broken container that
-/// reports "Up" but doesn't actually publish its port (so the DB gateway would see
-/// connection-refused). Surfacing this beats a silent zombie.
+/// Polls a freshly published loopback port until the engine accepts a TCP connection
+/// (postgres/redis take ~1-3 s), returning false if it never comes up within the budget: a
+/// container that reports "Up" but does not publish its port would look like connection-refused to
+/// the DB gateway, so surface it rather than leave a silent zombie.
 async fn wait_tcp_ready(port: u32) -> bool {
     use tokio::net::TcpStream;
     for _ in 0..30 {
@@ -1840,14 +1618,14 @@ async fn wait_tcp_ready(port: u32) -> bool {
     false
 }
 
-/// Provision a managed SQLite database: create its file (so a broken data
-/// directory fails HERE, loudly, instead of on the tenant's first query) and
-/// mint the dedicated Hrana bearer.
-///
-/// There is no container, no port and no keep-warm: the engine is the file plus
-/// the pooled connections `crate::sqlite_pool` opens on demand. That also means
-/// there is no "simulated" mode to fall back to — a database whose file cannot
-/// be created is an ERROR, never a record that pretends to be live.
+/// Provisions a managed SQLite database: creates its file (so a broken data directory fails HERE,
+/// loudly, not on the tenant's first query) through whichever engine it will run on (a musql
+/// database gets a real `.musq` converted from an empty seed, never musqld's `-create`, which would
+/// invent one for any unknown name) and mints the dedicated Hrana bearer (`DB_REST_TOKEN`), the
+/// ONLY credential `db_rest::credential_matches` accepts for this lane, so it rotates without
+/// touching anything else. There is no container, port or keep-warm, hence no "simulated" fallback:
+/// a database whose file cannot be created is an ERROR. The API-form base URL ends in `/` because
+/// libsql clients resolve `v2/pipeline` relatively.
 async fn provision_sqlite(
     id: &str,
     api_base: &str,
@@ -1855,11 +1633,6 @@ async fn provision_sqlite(
     let path = sqlite_file_path(id).ok_or_else(|| {
         format!("refusing to derive a file path from a non-platform database id {id:?}")
     })?;
-    // The file is created through whichever engine this database will run on,
-    // so a broken data directory fails HERE, loudly, instead of on the tenant's
-    // first query. A musql database gets a real `.musq` (converted from an empty
-    // seed), never musqld's `-create`, which would happily invent one for any
-    // unknown name.
     if crate::musql::default_engine() == crate::musql::Engine::Musql {
         crate::musql_migrate::provision(id).await?;
     } else {
@@ -1889,8 +1662,6 @@ async fn provision_sqlite(
     let engine = crate::musql::default_engine();
     c.insert("provider".into(), "Hive SQLite (libsql/Hrana)".into());
     c.insert("engine".into(), engine.label().into());
-    // The file NAME is safe to show (the dashboard already shows the browser_db
-    // replica name); the absolute path is node-local detail and stays out.
     c.insert(
         "file".into(),
         if engine == crate::musql::Engine::Musql {
@@ -1899,16 +1670,7 @@ async fn provision_sqlite(
             sqlite_file_name(id)
         },
     );
-    // Dedicated, independently-revocable bearer — the same key `db_rest`'s
-    // `credential_matches` treats as the ONLY credential once present, so this
-    // lane never accepts an engine password (it has none) and the token can be
-    // rotated without touching anything else.
     c.insert("DB_REST_TOKEN".into(), token("dbt"));
-    // Base URL when the DB gateway domain is off. The TRAILING SLASH is
-    // mandatory: libsql clients resolve `v2/pipeline` relatively, so a base
-    // without it silently posts to the parent path (see `crate::hrana`).
-    // `with_external_endpoint` replaces this with `libsql://<slug>.{db_domain}`
-    // when the gateway is on.
     let base = api_base.trim_end_matches('/');
     if !base.is_empty() {
         let scheme_swapped = base
@@ -1924,6 +1686,13 @@ async fn provision_sqlite(
     Ok(("live".into(), c, None))
 }
 
+/// Provisions a managed Postgres: a real container on the project's DNS-less net with a static IP
+/// (so same-node app containers reach it by IP; also published on loopback for host tooling), else
+/// a record in simulated mode. The REST bearer (`DB_REST_TOKEN`) is distinct from the role
+/// password: once set, `credential_matches` accepts ONLY it for REST. The image is fully qualified
+/// (`docker.io/library/postgres:16-alpine`) because fleet podman enforces short-name resolution and
+/// cannot prompt without a TTY, stderr is captured so a failed provision is diagnosable, and a slow
+/// start keeps the DB live with a warning rather than demoting it to simulated.
 async fn provision_postgres(
     store: &Arc<DatabaseStore>,
     id: &str,
@@ -1935,7 +1704,6 @@ async fn provision_postgres(
     let user = "hive";
     let cname = format!("hive-db-{}", &id[3..11.min(id.len())]);
     let direct = format!("postgres://{user}:{password}@127.0.0.1:{port}/{dbname}?sslmode=disable");
-    // Prisma-Postgres-style pooled/accelerated URL (over the same instance).
     let pooled = format!(
         "prisma+postgres://127.0.0.1:{port}/{dbname}?api_key={}",
         token("ppg")
@@ -1946,18 +1714,11 @@ async fn provision_postgres(
     conn.insert("database".into(), dbname.into());
     conn.insert("user".into(), user.into());
     conn.insert("password".into(), password.clone());
-    // Dedicated, independently-revocable REST bearer for the SQL-over-HTTP
-    // surface — distinct from the engine `password`, mirroring Redis's
-    // UPSTASH_REDIS_REST_TOKEN. Once set, `credential_matches` accepts ONLY this
-    // token for REST (never the raw engine password), so REST access can be
-    // rotated without changing the Postgres role password.
     conn.insert("DB_REST_TOKEN".into(), token("pgrest"));
     conn.insert("DATABASE_URL".into(), direct);
     conn.insert("PRISMA_DATABASE_URL".into(), pooled);
 
     if podman_available().await {
-        // Attach to the project's DNS-less net with a static IP so same-node app
-        // containers reach the DB by IP; ALSO publish on loopback for host tooling.
         let net = ensure_project_db_net(project, id).await;
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -1979,16 +1740,10 @@ async fn provision_postgres(
             args.push(netname.clone());
             args.push("--ip".into());
             args.push(ip.clone());
-            // The in-network host:port an app container uses to reach this DB.
             conn.insert("net_host".into(), ip.clone());
             conn.insert("net_port".into(), "5432".into());
         }
-        // FULLY-QUALIFIED image ref: fleet podman enforces short-name resolution
-        // and can't prompt without a TTY, so a bare `postgres:16-alpine` errors and
-        // the DB silently fell back to "simulated" (no live engine). Qualify it.
         args.push("docker.io/library/postgres:16-alpine".into());
-        // Capture stderr (don't discard it) so a provision failure is diagnosable
-        // instead of silently degrading to "simulated".
         let out = Command::new("podman")
             .args(&args)
             .env("PATH", augmented_path())
@@ -1996,10 +1751,6 @@ async fn provision_postgres(
             .await;
         match out {
             Ok(o) if o.status.success() => {
-                // Confirm the published port actually accepts connections — a broken
-                // container reports "Up" but never publishes, which the gateway sees
-                // as connection-refused. Warn (don't silently claim health) but keep
-                // the DB live: a slow start shouldn't demote it to simulated forever.
                 if !wait_tcp_ready(port).await {
                     tracing::warn!(db = %id, %port, container = %cname, "postgres container up but loopback port not reachable — gateway may fail to connect");
                 }
@@ -2013,15 +1764,12 @@ async fn provision_postgres(
             }
         }
     }
-    // Fallback: record provisioned in simulated mode (no live engine available).
     Ok(("simulated".into(), conn, None))
 }
 
-/// A static Supabase API JWT (anon / service_role) — HS256 over
-/// `{role, iss:"supabase", iat, exp:+10y}` signed with the stack's JWT_SECRET,
-/// the exact derivation every Supabase service verifies symmetrically (the
-/// vendored supabase-docker / supahost mechanism). Static and long-lived by
-/// design: these identify the ROLE, not a session.
+/// A static Supabase API JWT (anon / service_role): HS256 over `{role, iss: "supabase", iat, exp:
+/// +10y}` signed with the stack's JWT_SECRET, the derivation every Supabase service verifies
+/// symmetrically. Static and long-lived by design: it identifies the ROLE, not a session.
 fn supabase_api_jwt(jwt_secret: &str, role: &str) -> String {
     #[derive(serde::Serialize)]
     struct Claims<'a> {
@@ -2045,37 +1793,8 @@ fn supabase_api_jwt(jwt_secret: &str, role: &str) -> String {
     .unwrap_or_default()
 }
 
-/// Provision a Supabase Studio mini-stack (`DbKind::Supabase`): three
-/// containers on the project's DNS-less podman net —
-///   db     `supabase/postgres:15.8.1.085`      (the engine; named volume, so
-///                                               data survives container
-///                                               replacement — unlike the
-///                                               managed-Postgres lane's
-///                                               anonymous layer)
-///   meta   `supabase/postgres-meta:v0.95.2`    (Studio's management API;
-///                                               internal only, reached by
-///                                               studio over the net)
-///   studio `supabase/studio:2026.02.16-…`      (the dashboard; published on
-///                                               loopback, proxied by the
-///                                               edge arm behind basic-auth)
-/// This is Studio's REQUIRED dependency set per the upstream compose (its
-/// only declared dep is analytics-as-startup-barrier, and its functional env
-/// deps are db + pg-meta + a router); GoTrue/PostgREST/Realtime/Storage are
-/// deliberately not run — the record's note says so.
-///
-/// The router's two upstream jobs are served by the platform itself: path
-/// routing is unnecessary (Studio's server side calls pg-meta directly), and
-/// the `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` basic-auth gate that Kong
-/// enforces on the `/` catch-all is enforced by our edge arm
-/// (`db_rest::supabase_studio_proxy`) against these generated credentials —
-/// the supahost working example, same enforcement semantics, no Kong
-/// container.
-/// `podman pull` with one retry — explicit, because a transient registry/
-/// transport flake inside `podman run`'s OWN pull phase otherwise surfaces
-/// as a failed provision while the server-side pull completes anyway
-/// (witnessed on fc-bangkok 2026-08-18: the CLI exited mid-pull, the
-/// container started 2s later, and the provision tore the stack down as
-/// "simulated").
+/// `podman pull` with one retry: a transient registry/transport flake inside `podman run`'s OWN
+/// pull phase otherwise surfaces as a failed provision while the server-side pull completes anyway.
 async fn podman_pull_retry(image: &str) -> bool {
     for attempt in 0..2 {
         let out = Command::new("podman")
@@ -2097,10 +1816,9 @@ async fn podman_pull_retry(image: &str) -> bool {
     false
 }
 
-/// `podman run -d` with adoption of the server-side completion race: when the
-/// CLI fails but the named container nevertheless came up (the pull-phase
-/// transport flake above), the run DID provision — adopting it beats tearing
-/// down a healthy container on a phantom failure.
+/// `podman run -d` that adopts the server-side completion race: when the CLI fails but the named
+/// container nevertheless came up (the pull-phase transport flake), the run DID provision, and
+/// adopting it beats tearing down a healthy container on a phantom failure.
 async fn podman_run_detached(args: &[String]) -> Result<(), String> {
     let name = args
         .iter()
@@ -2135,10 +1853,9 @@ async fn podman_run_detached(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Everything needed to (re)build one Supabase stack's three containers.
-/// Constructed with FRESH secrets at provision time and from the stored
-/// record at reconcile-rebuild time — the two paths must produce
-/// byte-identical args, so they share this one builder.
+/// Everything needed to (re)build one Supabase stack's containers: constructed with FRESH secrets
+/// at provision time and from the stored record at reconcile-rebuild time, so both paths share this
+/// one builder and produce byte-identical args.
 struct SupaStack {
     id: String,
     short: String,
@@ -2161,11 +1878,10 @@ struct SupaStack {
     volume: String,
 }
 
-/// The deterministic sibling IPs of a stack (meta, studio, auth, rest,
-/// storage), derived from the db id + the db container's IP — recomputed
-/// identically at provision and at rebuild. Bands are disjoint from each
-/// other and clear of the managed-DB `.200+` band: meta 150-194,
-/// studio 100-144, auth 50-64, rest 65-79, storage 80-94.
+/// The deterministic sibling IPs of a stack (meta, studio, auth, rest, storage), derived from the
+/// db id and the db container's IP and recomputed identically at provision and rebuild; the bands
+/// are disjoint and clear of the managed-DB `.200+` band (meta 150-194, studio 100-144, auth 50-64,
+/// rest 65-79, storage 80-94), and a collision fails the `podman run` loudly.
 fn supabase_ips(id: &str, db_ip: &str) -> (String, String, String, String, String) {
     let prefix = db_ip
         .rsplit_once('.')
@@ -2195,23 +1911,14 @@ fn supabase_ips(id: &str, db_ip: &str) -> (String, String, String, String, Strin
     )
 }
 
-/// (container-name, run-args) for each member of the stack, in start order.
-///
-/// Six members since 2026-08-22: db, meta, auth (GoTrue), rest (PostgREST),
-/// storage (storage-api), studio. The last three exist because "Studio's
-/// Authentication and Data-API pages degrade" turned out to mean hard 500s a
-/// real tenant hit on the Storage, API-docs and (partially) Edge Functions
-/// pages — the platform's edge proxy plays Kong's routing role for them
-/// (`db_rest`'s `/auth/v1` / `/rest/v1` / `/storage/v1` / `/graphql/v1`
-/// arms), and Studio's own server side reaches that same public base via an
-/// `--add-host` of the public hostname onto the podman bridge gateway (the
-/// project net is DNS-less, so the public name is otherwise unresolvable
-/// from inside — the witnessed `TypeError: fetch failed`). Deliberately
-/// still NOT run: realtime (heavy BEAM app for a rarely-used inspector
-/// page), analytics/Logflare (its own ingestion subsystem — the Log Drains
-/// settings page stays degraded), imgproxy (image transforms are toggled
-/// off on storage), edge-runtime (the Functions page lists/writes the
-/// management folder, but functions do not EXECUTE).
+/// (container-name, run-args) for each member of the stack, in start order: db, meta, auth, rest,
+/// storage, studio. The public hostname is mapped onto the podman bridge gateway (`--add-host`; the
+/// project net is DNS-less) so Studio's server side calls auth/rest/storage through the platform's
+/// own TLS edge, only when `HIVE_DB_DOMAIN` is set (otherwise those pages stay degraded).
+/// Pinned-image quirks: `EDGE_FUNCTIONS_MANAGEMENT_FOLDER` is required at module load (omitted,
+/// every request touching that module throws) and its directory must EXIST (the functions API
+/// scandirs with no mkdir), which the tmpfs mount guarantees on every rebuild; the snippets
+/// directory is real, writable container-lifetime state.
 fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
     let (meta_ip, studio_ip, auth_ip, rest_ip, storage_ip) = supabase_ips(&p.id, &p.db_ip);
     let c_db = format!("hive-supa-{}-db", p.short);
@@ -2220,11 +1927,6 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
     let c_auth = format!("hive-supa-{}-auth", p.short);
     let c_rest = format!("hive-supa-{}-rest", p.short);
     let c_storage = format!("hive-supa-{}-storage", p.short);
-    // The podman bridge gateway (`<subnet>.1`) reaches the HOST — including
-    // the edge's 0.0.0.0:443 TLS listener — from inside the DNS-less project
-    // net. Mapping the stack's own public hostname onto it lets Studio's
-    // server side (and storage's public-URL rendering) call the SAME
-    // public base browsers use, TLS/SNI and path-routing included.
     let gw_ip = p
         .db_ip
         .rsplit_once('.')
@@ -2317,31 +2019,10 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         format!("AUTH_JWT_SECRET={}", p.jwt_secret),
         "-e".into(),
         "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
-        // Required at MODULE-LOAD time by a shared config loader this pinned
-        // Studio image imports from unrelated API routes — omitting it threw
-        // `AssertionError: EDGE_FUNCTIONS_MANAGEMENT_FOLDER is required` on
-        // every request touching that module, including the SQL Editor's
-        // saved-query listing. The functions API additionally SCANDIRS the
-        // path with no mkdir (ENOENT = 500 on the Functions page), so it
-        // must EXIST: the tmpfs mount below guarantees that on every
-        // rebuild. Functions listed/created here do not EXECUTE — there is
-        // deliberately no edge-runtime container.
         "-e".into(),
         "EDGE_FUNCTIONS_MANAGEMENT_FOLDER=/srv/edge-functions".into(),
-        // Backs the SQL Editor's saved-query ("snippet") storage — unlike
-        // EDGE_FUNCTIONS_MANAGEMENT_FOLDER above, this one is actually read
-        // from/written to for a real, user-visible feature (the file the
-        // "content/folders" and "content/count" API routes list), so it
-        // must be a real writable directory inside the container, not a
-        // dummy placeholder. `/tmp` is writable by the studio image's
-        // default user and survives the container's own lifetime (which is
-        // all snippets need — they are not meant to survive a container
-        // replace any more than any other unpersisted container state).
         "-e".into(),
         "SNIPPETS_MANAGEMENT_FOLDER=/tmp/hive-supabase-snippets".into(),
-        // The functions API route scandirs this path with no mkdir (unlike
-        // the snippets route) — a tmpfs mount guarantees it EXISTS in every
-        // rebuild. Function files are container-lifetime state like snippets.
         "--tmpfs".into(),
         "/srv/edge-functions".into(),
         "-p".into(),
@@ -2355,11 +2036,6 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         "--add-host".into(),
         format!("meta:{meta_ip}"),
     ];
-    // Only meaningful with a real public hostname (HIVE_DB_DOMAIN set):
-    // map it onto the bridge gateway so Studio's server side can call
-    // auth/rest/storage through the platform's own TLS edge. Without a db
-    // domain the loopback-honest public_base stays, and those pages remain
-    // degraded exactly as before.
     if !public_host.is_empty() && !gw_ip.is_empty() {
         studio_args.push("--add-host".into());
         studio_args.push(format!("{public_host}:{gw_ip}"));
@@ -2401,8 +2077,6 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         format!("GOTRUE_JWT_SECRET={}", p.jwt_secret),
         "-e".into(),
         "GOTRUE_EXTERNAL_EMAIL_ENABLED=true".into(),
-        // No SMTP service in the stack: autoconfirm keeps email signup
-        // usable instead of stranding users waiting for mail nobody sends.
         "-e".into(),
         "GOTRUE_MAILER_AUTOCONFIRM=true".into(),
         "-e".into(),
@@ -2481,15 +2155,12 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
         "STORAGE_BACKEND=file".into(),
         "-e".into(),
         "FILE_STORAGE_BACKEND_PATH=/var/lib/storage".into(),
-        // "directory name when using 'file'" per upstream — and TENANT_ID /
-        // REGION are required-nonempty config, not meaningful here.
         "-e".into(),
         "GLOBAL_S3_BUCKET=stub".into(),
         "-e".into(),
         "TENANT_ID=stub".into(),
         "-e".into(),
         "REGION=stub".into(),
-        // No imgproxy container: transforms off, plain up/download full.
         "-e".into(),
         "ENABLE_IMAGE_TRANSFORMATION=false".into(),
         "-v".into(),
@@ -2517,23 +2188,20 @@ fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
     ]
 }
 
-/// The storage-api member's named volume — bucket bytes are customer data
-/// with the same lifecycle as the engine volume (survives rebuilds, removed
-/// explicitly at delete).
+/// The storage-api member's named volume: bucket bytes are customer data with the same lifecycle as
+/// the engine volume (survives rebuilds, removed explicitly at delete).
 fn storage_volume(short: &str) -> String {
     format!("hive-vol-supast-{short}")
 }
 
-/// Idempotently set the Supabase service-role passwords the sidecar services
-/// authenticate with. The supabase/postgres image BAKES the roles
-/// (supabase_auth_admin, supabase_storage_admin, authenticator) but their
-/// passwords come from a compose-mounted roles.sql this stack never mounts —
-/// without this, GoTrue/PostgREST/storage-api can never log in. Runs via
-/// `podman exec` as the in-container superuser (local trust), with retries
-/// because first-boot migrations keep initializing after the port answers.
+/// Idempotently sets the service-role passwords the sidecar services authenticate with: the
+/// supabase/postgres image BAKES the roles (supabase_auth_admin, supabase_storage_admin,
+/// authenticator) but their passwords come from a compose-mounted roles.sql this stack never
+/// mounts, so without this GoTrue/PostgREST/storage-api cannot log in. Runs via `podman exec` as
+/// `supabase_admin` (the supautils extension marks the sidecar roles RESERVED, so `postgres` is not
+/// enough; its password IS the stack's POSTGRES_PASSWORD), with retries because first-boot
+/// migrations keep initializing after the port answers.
 async fn supa_set_service_role_passwords(c_db: &str, pg_password: &str) -> bool {
-    // pg_password is always a uuid simple-format hex string (provision) —
-    // no quote-escaping hazard — but refuse anything else outright.
     if !pg_password.chars().all(|c| c.is_ascii_alphanumeric()) {
         return false;
     }
@@ -2544,12 +2212,6 @@ async fn supa_set_service_role_passwords(c_db: &str, pg_password: &str) -> bool 
         pg = pg_password
     );
     for _ in 0..10 {
-        // `supabase_admin`, not `postgres`: the supautils extension in the
-        // supabase/postgres image marks the sidecar roles RESERVED — "only
-        // superusers can modify" — and `postgres` there is a limited admin.
-        // supabase_admin's password IS the stack's POSTGRES_PASSWORD (the
-        // image entrypoint's superuser), and its local pg_hba line requires
-        // password auth, hence PGPASSWORD + TCP loopback.
         let out = Command::new("podman")
             .args([
                 "exec",
@@ -2579,9 +2241,10 @@ async fn supa_set_service_role_passwords(c_db: &str, pg_password: &str) -> bool 
     false
 }
 
-/// Rebuild a SupaStack from the stored record (reconcile rebuild path) —
-/// every value the containers need rides the connection map, so a vanished
-/// stack comes back identical, data included (the named volume survives).
+/// Rebuilds a SupaStack from the stored record (reconcile rebuild path): every value the containers
+/// need rides the connection map, so a vanished stack comes back identical, data included (the
+/// named volume survives). Records older than the sidecars lack `auth_port` and friends;
+/// `supa_backfill_sidecar_upgrade` adds them before any rebuild, so `?` is the completeness gate.
 fn supa_stack_from_record(d: &Database) -> Option<SupaStack> {
     let c = &d.connection;
     let get = |k: &str| c.get(k).cloned().filter(|v| !v.is_empty());
@@ -2590,9 +2253,6 @@ fn supa_stack_from_record(d: &Database) -> Option<SupaStack> {
         short: d.id[3..11.min(d.id.len())].to_string(),
         port_pg: get("local_port").or_else(|| get("port"))?,
         port_studio: get("studio_port")?,
-        // Pre-2026-08-22 records lack these three; the reconcile backfill
-        // (`supa_backfill_sidecar_ports`) adds them before any rebuild that
-        // needs them, so `?` is the correct completeness gate here.
         port_auth: get("auth_port")?,
         port_rest: get("rest_port")?,
         port_storage: get("storage_port")?,
@@ -2605,12 +2265,23 @@ fn supa_stack_from_record(d: &Database) -> Option<SupaStack> {
         public_base: get("SUPABASE_URL")?,
         project: d.project.clone(),
         db_name: d.name.clone(),
-        netname: String::new(), // filled by the caller (recomputed from project)
+        netname: String::new(),
         db_ip: get("net_host")?,
         volume: format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]),
     })
 }
 
+/// Provisions a Supabase Studio stack (`DbKind::Supabase`): six containers on the project's
+/// DNS-less podman net, in start order db (`supabase/postgres`, a NAMED volume so data survives
+/// container replacement), meta (postgres-meta, internal), auth (GoTrue), rest (PostgREST), storage
+/// (storage-api, its own named volume) and studio (published on loopback, proxied by the edge arm
+/// behind basic-auth). The platform edge plays Kong's roles (path routing for `/auth/v1`,
+/// `/rest/v1`, `/storage/v1`, `/graphql/v1` and the `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` gate
+/// in `db_rest::supabase_studio_proxy`), so no router container runs; realtime, analytics, imgproxy
+/// and edge-runtime are deliberately not run (their pages stay degraded; functions are listed and
+/// written but do not execute). Images are pulled concurrently, taken from the members themselves
+/// so the list cannot drift from `supabase_stack_args`, and only the db pull is awaited before the
+/// engine starts.
 async fn provision_supabase(
     store: &Arc<DatabaseStore>,
     id: &str,
@@ -2661,8 +2332,6 @@ async fn provision_supabase(
     conn.insert("STUDIO_URL".into(), public_base);
     conn.insert("STUDIO_USERNAME".into(), dashboard_user);
     conn.insert("STUDIO_PASSWORD".into(), dashboard_password);
-    // Stored so the reconcile rebuild recreates an IDENTICAL stack (they are
-    // already-secret material, same class as the engine password in this map).
     conn.insert("JWT_SECRET".into(), jwt_secret.clone());
     conn.insert("PG_META_CRYPTO_KEY".into(), crypto_key.clone());
 
@@ -2674,9 +2343,6 @@ async fn provision_supabase(
     };
     conn.insert("net_host".into(), db_ip.clone());
     conn.insert("net_port".into(), "5432".into());
-    // Sibling IPs are deterministic (see supabase_ips) in bands clear of the
-    // managed-DB .200+ band (and of compose's .11+ blocks in practice); a
-    // collision fails the `podman run` loudly below, never silently.
     let cleanup = |started: &[String]| {
         let names: Vec<String> = started.to_vec();
         async move {
@@ -2721,19 +2387,6 @@ async fn provision_supabase(
     let c_db = members[0].0.clone();
     let mut started: Vec<String> = Vec::new();
 
-    // Pull every member's image CONCURRENTLY — independent registry fetches
-    // sharing no state, so serializing them buys nothing but wall-clock. The
-    // image comes from `members` itself (each arg vec's last element) rather
-    // than a second hardcoded list, so this can never drift from what
-    // `supabase_stack_args` actually runs. Measured live 2026-08-22, cold
-    // (no cached layers), this exact 6-image ~5GB stack: sequential
-    // `podman pull` loop 95s wall, concurrent 74s wall (~22% off the pull
-    // phase alone) — and that is BEFORE the overlap below, which is the
-    // bigger win: only the db pull is awaited here; the rest keep
-    // downloading in the background while postgres does its own first-boot
-    // initdb + TCP-ready wait, work that previously only started after every
-    // single image (including the 1.1GB studio and 907MB storage-api images)
-    // had already finished downloading.
     let mut pulls: Vec<tokio::task::JoinHandle<bool>> = members
         .iter()
         .map(|(_, args)| {
@@ -2752,10 +2405,6 @@ async fn provision_supabase(
         return Ok(("simulated".into(), conn, None));
     }
 
-    // db first — the engine everything else authenticates against. The
-    // supabase/postgres image bakes the Supabase role set but NOT the
-    // sidecar roles' passwords (that is a compose-mounted roles.sql this
-    // stack replaces with the ALTERs below).
     match podman_run_detached(&members[0].1).await {
         Ok(()) => started.push(c_db.clone()),
         Err(e) => {
@@ -2775,10 +2424,6 @@ async fn provision_supabase(
     }
     tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), "supabase: db passwords set");
 
-    // Remaining members in builder order (meta, auth, rest, storage, studio).
-    // Each awaits only its OWN pull handle — kicked off above, overlapped
-    // with the db bring-up just finished — before starting; by now most are
-    // already done, so this rarely blocks at all.
     for ((cname, args), handle) in members[1..].iter().zip(pulls.into_iter()) {
         let pull_ok = handle.await.unwrap_or(false);
         if !pull_ok {
@@ -2796,8 +2441,6 @@ async fn provision_supabase(
         }
         tracing::info!(db = %id, elapsed_ms = %t0.elapsed().as_millis(), container = %cname, "supabase: sidecar started");
     }
-    // Studio (Next.js) takes a few seconds to come up; warn-only like the
-    // engine check — a slow boot must not demote the record to simulated.
     if !wait_tcp_ready(port_studio).await {
         tracing::warn!(db = %id, %port_studio, "supabase studio up but loopback port not reachable yet");
     }
@@ -2820,7 +2463,6 @@ async fn provision_redis(
     conn.insert("port".into(), port.to_string());
     conn.insert("password".into(), password.clone());
     conn.insert("REDIS_URL".into(), url);
-    // Upstash-style REST surface.
     conn.insert(
         "UPSTASH_REDIS_REST_URL".into(),
         format!("http://127.0.0.1:{port}"),
@@ -2846,7 +2488,7 @@ async fn provision_redis(
             conn.insert("net_host".into(), ip.clone());
             conn.insert("net_port".into(), "6379".into());
         }
-        args.push("docker.io/library/redis:7-alpine".into()); // qualify (see postgres)
+        args.push("docker.io/library/redis:7-alpine".into());
         args.push("redis-server".into());
         args.push("--requirepass".into());
         args.push(password.clone());
@@ -2873,28 +2515,22 @@ async fn provision_redis(
     Ok(("simulated".into(), conn, None))
 }
 
-/// Self-healing for provisioned DB backings. Two witnessed loss classes made
-/// this necessary (both took a project's live database — and everything above
-/// it, e.g. the WDK workflow world riding a provisioned Redis — down SILENTLY):
-///   1. `systemctl restart hive-node` SIGTERMs the whole service cgroup,
-///      which includes the conmon/db processes podman spawned from inside the
-///      service — every provisioned container exits (cleanly!) on every
-///      backend rollout, and nothing ever started them again.
-///   2. A podman machine reset (macOS) deletes the containers entirely.
-/// Every minute: `podman start` any exited backing; re-CREATE a vanished
-/// Redis backing from the record's own stored creds (same host port, same
-/// password — so injected env / gateway tokens keep working; data is
-/// acknowledged lost, service is restored); warn loudly for kinds we can't
-/// rebuild automatically rather than staying silent.
+/// Self-healing for provisioned DB backings, every minute: `podman start` any exited backing (a
+/// podman machine reset deletes macOS containers outright) and re-CREATE a vanished Redis backing
+/// from the record's own stored creds (same host port and password, so injected env and gateway
+/// tokens keep working; data is acknowledged lost); kinds that cannot be rebuilt warn loudly.
+/// Routing is by LOCAL EVIDENCE: records replicate fleet-wide, so a container is reconciled here
+/// only if the record names this node or it exists in this node's podman, and a GONE container is
+/// rebuilt only if it was SEEN running here (the `db-containers` marker) or the record names this
+/// node (a rebuild on the wrong node would spawn a rogue empty engine). Only the record's named
+/// host retries a `simulated` record (per-id backoff 2 min to 64 min: a Supabase retry pulls ~5 GB
+/// of images), and since a simulated record was never live, any same-name containers and volumes
+/// are orphans of a killed provision (secrets nobody recorded, never tenant data) and are scrubbed
+/// first.
 pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
     crate::supervise::spawn_supervised("db-reconcile", move || {
         let cloud = cloud.clone();
         async move {
-            // Per-id exponential backoff (2m -> 64m cap) for simulated-record
-            // re-provisioning: a Supabase retry pulls ~5GB of images, so a
-            // flat 60s cadence would hammer the registry on a persistent
-            // failure. In-process only; a restart resets the backoff, which
-            // is the safe direction (retry sooner, never never).
             let mut sim_retry: std::collections::HashMap<String, (u64, u32)> =
                 std::collections::HashMap::new();
             loop {
@@ -2905,9 +2541,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                 }
                 let now = now_ms();
                 for d in cloud.databases.simulated_to_retry() {
-                    // Only the record's named host retries: any other node
-                    // spawning the backing would create a rogue duplicate
-                    // engine the record's connection map doesn't point at.
                     if d.host_node.is_empty() || d.host_node != cloud.node_name {
                         continue;
                     }
@@ -2930,13 +2563,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     };
                     let id = d.id.clone();
                     let db_host = d.db_host.clone();
-                    // A currently-simulated record was never live (no code
-                    // path demotes live->simulated), so any same-name
-                    // containers/volumes are orphans of a killed provision
-                    // task holding secrets nobody recorded — never tenant
-                    // data. Scrub them so the fresh provision's `podman run`
-                    // cannot collide on names or inherit a volume initdb'd
-                    // with a lost password.
                     {
                         let short = &id[3..11.min(id.len())];
                         let mut orphans: Vec<String> = Vec::new();
@@ -2982,9 +2608,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     {
                         Ok((mode, conn, container)) if mode == "live" => {
                             if cloud.databases.get_raw(&id).is_none() || teardown_requested(&id) {
-                                // Deleted while the retry was in flight: the
-                                // fresh backing would leak (same race the
-                                // provision task guards against).
                                 if let Some(container) = container.as_deref() {
                                     for one in container
                                         .split(',')
@@ -3045,16 +2668,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     }
                 }
                 for d in cloud.databases.containers_to_reconcile() {
-                    // Route by LOCAL EVIDENCE, not just the record: records
-                    // replicate fleet-wide, so every node's store holds DBs it
-                    // never hosted, and a foreign record reads "GONE" against
-                    // the local podman forever (spurious WARNs — and worse, a
-                    // rebuild-on-GONE on the wrong node would spawn a rogue
-                    // empty engine). A container is reconciled here iff the
-                    // record names this node OR the container exists in the
-                    // local podman; a GONE container is rebuilt only when it
-                    // was SEEN running here before (the marker file) or the
-                    // record names this node.
                     let hosted_here = !d.host_node.is_empty() && d.host_node == cloud.node_name;
                     let id = d.id.clone();
                     let kind = d.kind;
@@ -3068,13 +2681,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     let Some(field) = d.container.clone() else {
                         continue;
                     };
-                    // Pre-2026-08-22 Supabase records know nothing of the
-                    // auth/rest/storage sidecars. Upgrade the record ONCE
-                    // (ports + container-field members + service-role
-                    // passwords on the live engine); the ordinary GONE
-                    // logic below then builds the new members from the
-                    // shared builder on the next pass. Gated on local
-                    // evidence exactly like the rebuild path.
                     if kind == DbKind::Supabase
                         && d.connection.get("auth_port").is_none()
                         && d.connection.get("JWT_SECRET").is_some()
@@ -3088,8 +2694,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                         supa_backfill_sidecar_upgrade(&cloud, &d).await;
                         continue;
                     }
-                    // A Supabase record carries its whole stack comma-joined;
-                    // every member is reconciled independently.
                     for cname in field.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                         let cname = cname.to_string();
                         let inspect = Command::new("podman")
@@ -3099,14 +2703,7 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                             .await;
                         match inspect {
                             Ok(o) if o.status.success() => {
-                                // It exists locally: this node hosts (or hosted) it.
                                 mark_db_container_local(&cname);
-                                // Pre-upgrade Supabase records lack the secrets the
-                                // rebuild path needs (JWT_SECRET/PG_META_CRYPTO_KEY
-                                // were not stored before). Backfill them ONCE from
-                                // the live studio container's env — the values are
-                                // identical by construction, and a rebuilt member
-                                // must match the rest of the running stack exactly.
                                 if kind == DbKind::Supabase
                                     && (d.connection.get("JWT_SECRET").is_none()
                                         || d.connection.get("PG_META_CRYPTO_KEY").is_none())
@@ -3133,8 +2730,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                                     }
                                 }
                             }
-                            // inspect failed -> no trace in the local podman. Rebuild
-                            // only with local evidence (or a record naming this node).
                             _ if hosted_here || db_container_seen_local(&cname) => {
                                 match (kind, local_port.as_deref(), password.as_deref()) {
                                     (DbKind::Redis, Some(port), Some(pw))
@@ -3172,11 +2767,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                                             }
                                         }
                                     }
-                                    // Supabase: rebuild the missing member from the record
-                                    // (identical args via the shared builder). The named
-                                    // volume survives a container loss, so a rebuilt db
-                                    // container comes back WITH its data — this is the
-                                    // fault-tolerance lane, not a data-loss event.
                                     (DbKind::Supabase, _, _) => {
                                         let rebuilt = match supa_stack_from_record(&d) {
                                             Some(mut stack) => {
@@ -3235,9 +2825,6 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                                     }
                                 }
                             }
-                            // No local trace and no local evidence — another node's
-                            // database; skip without a word (records replicate
-                            // fleet-wide, so this is the common case, not a fault).
                             _ => {}
                         }
                     }
@@ -3247,12 +2834,11 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
     });
 }
 
-/// Local-evidence markers for db-reconcile routing: `$HIVE_DATA/db-containers/`
-/// holds one empty file per backing container ever SEEN in this node's
-/// podman. Records replicate fleet-wide, so the record alone cannot tell
-/// "mine, vanished" from "another node's, never here" — the marker can.
-/// Container names are platform-templated (`hive-db-*`, `hive-supa-*`), so a
-/// record value can never become an arbitrary path.
+/// Local-evidence markers for db-reconcile routing: `$HIVE_DATA/db-containers/` holds one empty
+/// file per backing container ever SEEN in this node's podman. Records replicate fleet-wide, so the
+/// record alone cannot tell "mine, vanished" from "another node's, never here"; the marker can.
+/// Container names are platform-templated (`hive-db-*`, `hive-supa-*`), so a record value can never
+/// become an arbitrary path.
 fn db_container_marker_path(name: &str) -> Option<std::path::PathBuf> {
     if name.is_empty()
         || !name
@@ -3279,11 +2865,10 @@ fn db_container_seen_local(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// One-time upgrade-in-place for pre-2026-08-18 Supabase records: pull
-/// AUTH_JWT_SECRET / PG_META_CRYPTO_KEY out of the live studio container's
-/// env and store them on the record, so the rebuild path
-/// (`supa_stack_from_record`) has every field it needs. Self-eliminating —
-/// the caller gates on the fields being absent.
+/// One-time upgrade-in-place for old Supabase records: pulls AUTH_JWT_SECRET / PG_META_CRYPTO_KEY
+/// out of the live studio container's env onto the record, so the rebuild path
+/// (`supa_stack_from_record`) has every field. Self-eliminating: the caller gates on the fields
+/// being absent.
 async fn supa_backfill_record_secrets(
     cloud: &Arc<crate::state::CloudState>,
     id: &str,
@@ -3331,11 +2916,10 @@ async fn supa_backfill_record_secrets(
     tracing::info!(db = %id, "db-reconcile: backfilled supabase record secrets from the live stack (rebuild now possible)");
 }
 
-/// One-time in-place upgrade of a pre-sidecar Supabase record: allocate the
-/// three sidecar loopback ports, append the auth/rest/storage member names to
-/// the record's container field, and set the service-role passwords on the
-/// LIVE engine (idempotent ALTERs — the volume keeps them thereafter).
-/// Self-eliminating: the caller gates on `auth_port` being absent.
+/// One-time in-place upgrade of a pre-sidecar Supabase record: allocates the three sidecar loopback
+/// ports, appends the auth/rest/storage members to the record's container field, and sets the
+/// service-role passwords on the LIVE engine (idempotent ALTERs). Self-eliminating: the caller
+/// gates on `auth_port` being absent.
 async fn supa_backfill_sidecar_upgrade(cloud: &Arc<crate::state::CloudState>, d: &Database) {
     let short = d.id[3..11.min(d.id.len())].to_string();
     let c_db = format!("hive-supa-{short}-db");
