@@ -111,6 +111,12 @@ case "$hostport" in
   *)      host=$hostport; port="" ;;
 esac
 [ -n "$port" ] || { [ "$scheme" = http ] && port=80 || port=443; }
+# The host string comes from a config file and is interpolated into a shell
+# command below: anything but a hostname/IP literal is reported, never run.
+case "$host" in
+  *[!A-Za-z0-9.:-]*|"") echo "MALFORMED|-|-|-|-|${ns}"; exit 0 ;;
+esac
+case "$port" in *[!0-9]*|"") echo "MALFORMED|-|-|-|-|${ns}"; exit 0 ;; esac
 case "$host" in
   # An IP literal has nothing to resolve; getent returns 2 without a PTR.
   *[a-zA-Z]*) if getent hosts "$host" >/dev/null 2>&1; then dns=ok; else dns=FAIL; fi ;;
@@ -152,6 +158,8 @@ while IFS=$'\t' read -r name ip user; do
   flag=""
   if [ "$reg" = NO-NPM ]; then
     flag="  <-- NO npm ON THIS NODE: every host-lane install fails"; bad=1
+  elif [ "$reg" = MALFORMED ]; then
+    flag="  <-- MALFORMED registry URL in the host npmrc: not probed"; bad=1
   elif [ "$dns" = FAIL ] || [ "$tcp" != ok ] || ! answers "$http"; then
     flag="  <-- REGISTRY DARK"
     answers "$pub" || flag="  <-- REGISTRY DARK, PUBLIC ALSO DARK"

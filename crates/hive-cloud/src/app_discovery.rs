@@ -513,7 +513,17 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
     );
 
     let static_index = regular_marker(dir, relative, "index.html").await?;
-    if frameworks.is_empty() && !start && !static_index && contracts.is_empty() {
+    let server_entry = if package.is_some() {
+        fluid_build::framework::generic_node_server_entry(&dir.join(relative))
+    } else {
+        None
+    };
+    if frameworks.is_empty()
+        && !start
+        && !static_index
+        && contracts.is_empty()
+        && server_entry.is_none()
+    {
         return Ok(None);
     }
     let score = if !contracts.is_empty() {
@@ -522,7 +532,7 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
         4
     } else if !frameworks.is_empty() {
         3
-    } else if start {
+    } else if start || server_entry.is_some() {
         2
     } else {
         1
@@ -535,6 +545,9 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
     );
     if start {
         evidence.push("script:start".to_string());
+    }
+    if let Some(entry) = server_entry {
+        evidence.push(format!("server:{entry}"));
     }
     if static_index {
         evidence.push("static:index.html".to_string());

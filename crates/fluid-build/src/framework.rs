@@ -761,19 +761,7 @@ fn detect_with_package(
         {
             return preset("node").unwrap();
         }
-        // A conventional server entry => the generic Node preset. Vercel's own
-        // `node` preset (packages/frameworks, `slug: 'node'`) detects exactly
-        // these twelve paths and nothing else. vercel/vercel's examples/node —
-        // `src/server.ts` on a bare `http.createServer`, no framework
-        // dependency, no start script — otherwise fell through to the static
-        // preset and shipped its source tree as a website: the install
-        // succeeded, the deployment went Ready, and every request answered
-        // NOT_FOUND (witnessed 2026-10-13). Ordered after every framework and
-        // server-dependency check, so it only names apps nothing else claimed.
-        if GENERIC_NODE_ENTRIES
-            .iter()
-            .any(|entry| repo.join(entry).is_file())
-        {
+        if generic_node_server_entry(repo).is_some() {
             return preset("node").unwrap();
         }
     }
@@ -784,7 +772,7 @@ fn detect_with_package(
 
 /// Vercel's generic `node` preset detectors, verbatim: `server.*` at the root
 /// or under `src/`, in every module flavour.
-const GENERIC_NODE_ENTRIES: [&str; 12] = [
+pub const GENERIC_NODE_ENTRIES: [&str; 12] = [
     "server.cjs",
     "server.js",
     "server.mjs",
@@ -798,6 +786,35 @@ const GENERIC_NODE_ENTRIES: [&str; 12] = [
     "src/server.ts",
     "src/server.cts",
 ];
+
+/// What a file must contain to count as a server entry: a repo that merely
+/// ships a `server.js` next to its `index.html` (a dev preview, a library's
+/// exports module) stays on the static lane.
+const SERVER_MARKERS: [&str; 3] = ["listen(", "createServer(", "serve("];
+
+/// The repo's generic Node server entry (one of [`GENERIC_NODE_ENTRIES`]), or
+/// `None` when the repo declares static intent (a root `index.html`, or a
+/// `vercel.json` `outputDirectory`) or no candidate file actually serves.
+pub fn generic_node_server_entry(repo: &Path) -> Option<&'static str> {
+    if repo.join("index.html").is_file() || vercel_output_directory(repo).is_some() {
+        return None;
+    }
+    GENERIC_NODE_ENTRIES.iter().copied().find(|entry| {
+        std::fs::read_to_string(repo.join(entry))
+            .is_ok_and(|source| SERVER_MARKERS.iter().any(|marker| source.contains(marker)))
+    })
+}
+
+fn vercel_output_directory(repo: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(repo.join("vercel.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("outputDirectory")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
 
 fn has_dep(pkg: &serde_json::Value, name: &str) -> bool {
     for key in ["dependencies", "devDependencies"] {

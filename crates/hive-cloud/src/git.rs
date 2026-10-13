@@ -8576,7 +8576,7 @@ done' hive-delink {} +
                             || entry.ends_with(".mts")
                             || entry.ends_with(".cts")
                         {
-                            cmd.push("--experimental-strip-types".to_string());
+                            cmd.push("--experimental-transform-types".to_string());
                         }
                         cmd.push(EXPRESS_LAUNCHER_FILE.to_string());
                         cmd.push(entry.clone());
@@ -8611,7 +8611,7 @@ done' hive-delink {} +
             if let Some(entry) = discover_worker_entry(dir) {
                 let mut cmd = vec!["node".to_string()];
                 if entry.ends_with(".ts") || entry.ends_with(".mts") {
-                    cmd.push("--experimental-strip-types".to_string());
+                    cmd.push("--experimental-transform-types".to_string());
                 }
                 cmd.push(WORKER_LAUNCHER_FILE.to_string());
                 cmd.push(entry.clone());
@@ -8703,11 +8703,16 @@ const WORKER_LAUNCHER_FILE: &str = ".hive-worker-launcher.mjs";
 /// ("command wrangler is not a dir"). Recognising the shape lets us host the
 /// SAME exported handler on Node instead (see `assets/worker-launcher.mjs`).
 fn discover_worker_entry(dir: &Path) -> Option<String> {
-    let configured = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
+    // No wrangler config, no Worker: the conventional stems below (`index.js`,
+    // `main.ts`, …) are ordinary Node entry names too, and probing them without
+    // the config hijacked plain Node apps into the Worker adapter (which then
+    // exited 1 "entry exported no Worker fetch handler").
+    let wrangler_config = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
         .iter()
-        .find(|name| dir.join(name).is_file())
-        .and_then(|name| {
-            let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+        .find(|name| dir.join(name).is_file())?;
+    let configured = std::fs::read_to_string(dir.join(wrangler_config))
+        .ok()
+        .and_then(|raw| {
             // `main` names the Worker entry. The JSON flavour can carry comments
             // (jsonc), so scan for the key rather than parsing strictly; a
             // missing/unreadable value just falls through to the conventional
@@ -10174,30 +10179,30 @@ impl IsolatedBuild {
         }
     }
 
-    /// The registry environment this host command should run with, if any.
-    /// The host registry is probed once per build (`build_registry`); a dark
-    /// mirror with a live public registry yields the public-registry override,
-    /// unless the repository or the command already chose its own registry.
+    /// The `npm_config_userconfig` this host command should run with, if any:
+    /// the host registry is probed once per build (`build_registry`), and a
+    /// dark public mirror with a live public registry yields a user-config file
+    /// that names the public registry. A repository's own `.npmrc` still wins
+    /// by npm's config layering.
     async fn registry_fallback(
         &mut self,
-        dir: &Path,
-        command: &str,
-        env: &std::collections::BTreeMap<String, String>,
         home: &Path,
         cloud: &Arc<CloudState>,
         bid: &str,
-    ) -> Option<(&'static str, &'static str)> {
-        use crate::build_registry::{assess, tenant_owns_registry, Plan, GLOBAL_NPMRC, PUBLIC_REGISTRY};
+    ) -> Option<(&'static str, String)> {
+        use crate::build_registry::{assess, Plan, FALLBACK_ENV_KEY, GLOBAL_NPMRC, PUBLIC_REGISTRY};
         if self.registry.is_none() {
-            let plan = assess(home, Path::new(GLOBAL_NPMRC)).await;
+            let fallback_dir = crate::persist::data_dir();
+            let plan = assess(home, Path::new(GLOBAL_NPMRC), &fallback_dir).await;
             match &plan {
-                Plan::Fallback { configured, reason } => {
+                Plan::Fallback { configured, reason, .. } => {
                     cloud.builds.log(
                         bid,
                         format!(
                             "WARN: BUILD_REGISTRY_FALLBACK: this node's package registry {configured} is \
-                             unreachable ({reason}); commands without repository-owned registry settings \
-                             use {PUBLIC_REGISTRY} instead. Operator: this build host is degraded — \
+                             unreachable ({reason}); npm/pnpm/yarn use {PUBLIC_REGISTRY} for this build \
+                             unless the repository configures its own registry (a lockfile resolved \
+                             against {configured} still fails). Operator: this build host is degraded — \
                              restore its resolver or mirror."
                         ),
                     );
@@ -10218,13 +10223,12 @@ impl IsolatedBuild {
             }
             self.registry = Some(plan);
         }
-        if !matches!(self.registry, Some(Plan::Fallback { .. })) {
-            return None;
+        match &self.registry {
+            Some(Plan::Fallback { userconfig, .. }) => {
+                Some((FALLBACK_ENV_KEY, userconfig.to_string_lossy().into_owned()))
+            }
+            _ => None,
         }
-        if tenant_owns_registry(command, dir, &self.root, env).await {
-            return None;
-        }
-        Some(crate::build_registry::FALLBACK_ENV)
     }
 
     fn workspace_path(&self, dir: &Path) -> anyhow::Result<crate::build_executor::WorkspacePath> {
@@ -10364,10 +10368,7 @@ impl IsolatedBuild {
         // HOME carries the host user's `~/.npmrc` (a provider mirror on the
         // fleet's images); a dark mirror must not fail the build. Set BEFORE
         // the tenant's variables so an explicit tenant value always wins.
-        if let Some((key, value)) = self
-            .registry_fallback(dir, command, env, Path::new(&home), cloud, bid)
-            .await
-        {
+        if let Some((key, value)) = self.registry_fallback(Path::new(&home), cloud, bid).await {
             cmd.env(key, value);
         }
         for (key, value) in env {

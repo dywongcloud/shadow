@@ -16,18 +16,41 @@ private mount namespace (host file untouched) and green after
 `examples/nextjs` and `examples/node` reached Ready on san-jose.
 
 - **Host-lane registry guard** (`build_registry.rs`, wired in
-  `IsolatedBuild::run_host`): the host registry is probed once per build; only
-  a KNOWN public-mirror host that is dark while registry.npmjs.org answers
-  switches that build to the public registry (`npm_config_registry`, verified
-  for npm 10, pnpm 10, yarn 1). A tenant-owned registry (env key, command text,
-  repo `.npmrc`/`.yarnrc*`/`bunfig.toml`/`pnpm-workspace.yaml`) always wins, an
-  unknown/private registry is never replaced (dependency confusion), and the
-  build-log URL is redacted. `HIVE_BUILD_REGISTRY_GUARD=0` disables it.
-- **Node-server detection** (`fluid_build::framework::detect`): Vercel's
-  generic `node` preset — `server.{cjs,js,mjs,mts,ts,cts}` at the root or
-  `src/` — so `examples/node` (a bare `http.createServer`, no framework
-  dependency, no start script) is served instead of shipped as a Static site
-  that answered `NOT_FOUND` after a successful install.
+  `IsolatedBuild::run_host`): the host registry is probed once per build
+  (every address dialed concurrently, 3 s); only an EXACTLY allowlisted
+  public-mirror host that is dark while registry.npmjs.org answers changes the
+  build, and the change is a user-config file, not a registry variable: a 0600
+  copy of the host `~/.npmrc` with its registry replaced by the public one,
+  handed to the commands as `npm_config_userconfig`. That layer sits below a
+  repository's own `.npmrc`, so a tenant registry wins by npm's own layering
+  with no detection (the first cut detected tenant config by walking up from
+  the command cwd and failed OPEN for `cd server && npm i`, symlinked or
+  oversize configs; and pnpm 11+, which the fleet pins at 12.6.0, ignores
+  `npm_config_registry` altogether). Verified on fc-sanjose under a dark
+  mirror: npm 10 `install`/`ci` and pnpm 11 succeed against npmjs, a project
+  `.npmrc` naming a dead private registry still fails against THAT registry.
+  bun ignores user config (no fallback, by design); a lockfile resolved
+  against the dead mirror still fails `npm ci`. Build-log URL is scheme://host
+  only. `HIVE_BUILD_REGISTRY_GUARD=0` disables, `HIVE_BUILD_REGISTRY_MIRRORS`
+  extends the exact-host list.
+- **Node-server detection** (`fluid_build::framework::generic_node_server_entry`):
+  Vercel's generic `node` preset — `server.{cjs,js,mjs,mts,ts,cts}` at the
+  root or `src/` — when the file actually serves (`listen(`/`createServer(`/
+  `serve(`) and the repo shows no static intent (no root `index.html`, no
+  `vercel.json` `outputDirectory`), so `examples/node` (a bare
+  `http.createServer`, no framework dependency, no start script) is served
+  instead of shipped as a Static site that answered `NOT_FOUND`, while a
+  static site with a preview `server.js` or an exports-only library stays
+  Static. `app_discovery::classify` counts the same entry as evidence.
+- **Worker lane no longer hijacks Node apps**: `discover_worker_entry`
+  requires a wrangler config; without one it probed the same `index.*`/
+  `main.*` stems and sent plain Node apps through the Worker adapter (exit 1
+  "no Worker fetch handler"). TypeScript entries run under
+  `--experimental-transform-types` (enums, namespaces, parameter properties).
+- **Express launcher** (`assets/express-launcher.mjs`): never binds a second
+  time when the entry already listens (was `ERR_SERVER_ALREADY_LISTEN`), and a
+  self-listening entry that binds late is polled every 250 ms up to
+  `HIVE_LAUNCHER_LISTEN_DEADLINE_MS` (60 s) instead of a single probe at 1.5 s.
 - **Audits**: new `scripts/audit-build-registry.sh` (DNS/TCP/HEAD of each
   node's configured registry plus its resolvers — a HEAD, because the Tencent
   mirror ignores `Range` and a GET pulls the 21 MB packument; 2xx/3xx/401/403
