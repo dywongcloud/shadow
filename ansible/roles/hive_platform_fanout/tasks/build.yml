@@ -1,7 +1,5 @@
 ---
-# Runs only on the elected build host for one glibc group. It builds the
-# controller and guest agent from one source snapshot and fetches both exact
-# artifacts for fan-out; restart.yml publishes them serially.
+# Runs only on the elected build host for one glibc group: builds the controller and guest agent from one source snapshot and fetches both artifacts for fan-out (restart.yml publishes them serially).
 
 - name: Ensure the source directory exists on the build host
   ansible.builtin.file:
@@ -19,9 +17,6 @@
       - "--exclude=.git"
   register: _synced
 
-# rsync -a preserves local mtimes, so a build that finishes after a sync lands
-# can leave cargo fingerprints newer than the fresh sources and silently skip
-# rebuilding. Touch whenever the sync actually changed anything.
 - name: Touch synced sources so cargo cannot skip the rebuild
   ansible.builtin.command:
     cmd: find crates -name "*.rs" -exec touch {} +
@@ -47,9 +42,6 @@
     - Cargo.toml
     - Cargo.lock
 
-# Record what this host had before Cargo/packaging. The no-op detector must
-# count an agent-only release as real content movement even when hive-cloud's
-# own bytes happen not to change.
 - name: Record the controller this host had before the build
   ansible.builtin.stat:
     path: "{{ hive_binary_path }}"
@@ -69,9 +61,6 @@
     hive_pre_deploy_sha: "{{ _pre_build.stat.checksum | default('') }}"
     hive_pre_agent_sha: "{{ _pre_agent_build.stat.checksum | default('') }}"
 
-# Cargo overwrites hive_binary_path in place on the build host before the serial
-# restart phase. Followers get an .old-roll backup there, so snapshot this host
-# first too.
 - name: Back up the build host's current controller before cargo overwrites it
   ansible.builtin.copy:
     src: "{{ hive_binary_path }}"
@@ -90,11 +79,6 @@
   async: 1800
   poll: 15
 
-# Same reason as hive_platform's relink: /sbin/hive-cell-agent is the guest's
-# PID 1 and the guest glibc is the OCI base image's, not this lane host's. A
-# dynamic agent required GLIBC_2.39 against a bookworm (2.36) guest and panicked
-# every Firecracker cell on fc-orlando (2026-10-09). Only the agent is relinked;
-# hive-cloud keeps the host glibc it was built against.
 - name: Relink the cell agent statically on this glibc lane
   ansible.builtin.command:
     cmd: >-
@@ -176,9 +160,6 @@
     hive_group_cell_agent_sha256: "{{ _agent_bin.stat.checksum }}"
     hive_group_cell_agent_protocol_fact: "{{ _agent_protocol_fact.stdout | from_json }}"
 
-# Compress before either artifact crosses the operator's uplink. Integrity
-# remains over the uncompressed executable bytes and is rechecked after every
-# transfer and installation.
 - name: Compress the canonical controller for transport
   ansible.builtin.shell:
     cmd: "gzip -6 -c {{ hive_binary_path }} > {{ hive_binary_path }}.gz"
@@ -203,8 +184,6 @@
     dest: "{{ hive_artifact_root }}/hive-cell-agent-{{ hive_glibc_group }}.gz"
     flat: true
 
-# The cr-sqlite extension rides the same fan-out. It is built from the vendored
-# pin with the top-level make target and remains per-glibc-group.
 - name: Build the cr-sqlite loadable extension on the group's build host
   ansible.builtin.command:
     cmd: make

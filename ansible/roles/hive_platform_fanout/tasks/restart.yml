@@ -1,7 +1,5 @@
 ---
-# Runs serially. The controller and cell agent are one release pair: both
-# canonical digests must exist, both are verified in place before hive-node is
-# restarted, and the agent's prior bytes remain at hive-cell-agent.old.
+# Runs serially: the controller and cell agent are one release pair, both canonical digests must exist and both are verified in place before hive-node restarts; the agent's prior bytes stay at hive-cell-agent.old.
 
 - name: Require a canonical controller+agent pair for this glibc group
   ansible.builtin.assert:
@@ -81,9 +79,6 @@
     group: root
     mode: "0755"
 
-# The helper copies the candidate into the destination filesystem, verifies its
-# canonical SHA-256, then bounds and parses the CLI protocol probe. Only after
-# that preflight does it rotate .old and atomically rename the new executable.
 - name: Preflight and atomically publish the canonical cell agent
   vars:
     _candidate: >-
@@ -174,7 +169,6 @@
   diff: false
   register: _unit
 
-# Followers take the pushed cr-sqlite copy; the build host installs from dist.
 - name: Install the cr-sqlite extension when its content changed
   ansible.builtin.shell: |
     set -e

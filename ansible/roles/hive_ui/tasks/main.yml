@@ -1,11 +1,5 @@
 ---
-# Host the Next.js platform dashboard UI on this node (hive-ui.service,
-# next start on loopback :3002, fronted by the node's own admin ingress).
-# Every fleet node that should serve the dashboard runs this; the source is
-# pushed from the Ansible control host's own checkout of this repo (same as
-# hive_platform), then built on the node so its .next matches its own
-# node_modules (a rebuild's content-hashed assets must be produced where they
-# are served -- see the fleet's dashboard-ui-serving note).
+# Host the Next.js dashboard UI on this node (hive-ui.service, next start on loopback :3002, fronted by the node's own admin ingress): the source is pushed from the control host's checkout and built on the node, so its .next matches its own node_modules.
 
 - name: Ensure the ui directory exists on the target
   ansible.builtin.file:
@@ -29,17 +23,6 @@
     dest: "{{ hive_src_dir }}/ui/.env.local"
     mode: "0640"
 
-# Discover node's DIRECTORY so the systemd unit's PATH can include it.
-#
-# The build tasks below append `{{ ansible_env.PATH }}` (the login PATH), so npm
-# ci / npm run build succeed wherever node lives. The UNIT did not: it hardcoded
-# PATH=/usr/local/bin:/usr/bin:/bin, and `next` is launched through a
-# `#!/usr/bin/env node` shebang. On a host where node is only under nvm
-# (fc-virginia-3: /root/.nvm/versions/node/v22.23.0/bin/node, nothing in
-# /usr/bin or /usr/local/bin) the build therefore PASSED and the service then
-# crash-looped 62 times with "/usr/bin/env: 'node': No such file or directory",
-# status=127 — the dashboard down on that node while every deploy reported
-# success. Build-time and run-time must resolve node the same way.
 - name: Locate the node binary (for the unit's PATH)
   ansible.builtin.shell: |
     set -u

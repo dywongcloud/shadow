@@ -1,7 +1,5 @@
 ---
-# Runs SERIALLY (see playbooks/parallel-deploy.yml's serial: on this play) --
-# dashboard is never down fleet-wide, matching scripts/deploy-ui-fleet.sh's
-# comment ("Still one host at a time for the restart").
+# Runs serially (parallel-deploy.yml's serial: on this play) so the dashboard is never down fleet-wide.
 
 - name: Build host -- .next already canonical, nothing to extract
   ansible.builtin.debug:
@@ -66,14 +64,6 @@
   changed_when: false
   when: inventory_hostname != hive_ui_build_host
 
-# The shared unit template needs `hive_ui_node_dir`, and this role does NOT run
-# hive_ui/tasks/main.yml — it only borrows that role's template. Adding the
-# discovery there alone left this path templating an undefined var and failing
-# with "'hive_ui_node_dir' is undefined" on every host this role restarts
-# (witnessed: bkk, hk, va). Discover it here too rather than defaulting the
-# template, because a wrong default is exactly the bug being fixed: `next` runs
-# through a `#!/usr/bin/env node` shebang, so a PATH without node's real
-# directory exits 127 in a restart loop while the build still passes.
 - name: Locate the node binary (for the unit's PATH)
   ansible.builtin.shell: |
     set -u
@@ -132,11 +122,6 @@
   delay: 5
   until: _ui.status in [200, 307, 308]
 
-# `... is defined and <mismatch>` PASSED whenever the canonical build id was
-# absent -- i.e. precisely when the UI build play never ran and the deploy did
-# not happen. A check that disables itself in its own failure case reports
-# green on the non-event it exists to catch, so the missing fact is now the
-# first hard failure.
 - name: Confirm this host's BUILD_ID matches the canonical build
   ansible.builtin.command:
     cmd: cat .next/BUILD_ID

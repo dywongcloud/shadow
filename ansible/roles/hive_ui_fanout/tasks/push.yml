@@ -1,8 +1,5 @@
 ---
-# Runs on every platform host IN PARALLEL (build host excluded): syncs ui/
-# source (still needed for node_modules/package-lock on the follower) and
-# pushes the two canonical artifacts, but does not npm ci / extract /
-# restart -- that's restart.yml, serialized.
+# Runs on every platform host in parallel (build host excluded): syncs the ui/ source (a follower still needs node_modules/package-lock) and pushes the two canonical artifacts; npm ci, extract and restart are restart.yml's, serialized.
 
 - name: Skip push on the UI build host itself
   ansible.builtin.meta: end_host
@@ -23,7 +20,7 @@
       - "--exclude=node_modules"
       - "--exclude=.next"
       - "--exclude=.git"
-      - "--exclude=.gm"   # gm-tooling state, churns under a watcher; see build.yml
+      - "--exclude=.gm"
 
 - name: Template ui/.env.local
   ansible.builtin.template:
@@ -31,10 +28,6 @@
     dest: "{{ hive_src_dir }}/ui/.env.local"
     mode: "0640"
 
-# See hive_platform_fanout/tasks/push.yml's comment on why throttle (not
-# forks/serial) is the right knob here: it bounds this operator machine's
-# own uplink pushing potentially-large artifacts to every host at once,
-# independent of the play's forks (ansible.cfg forks=20).
 - name: Push the canonical .next artifact
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/.next-artifact.tar.gz"
