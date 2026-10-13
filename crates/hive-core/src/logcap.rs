@@ -109,7 +109,7 @@ pub fn read_capped_line_blocking<R: std::io::BufRead>(
         let (consume_n, line_done) = {
             let available = r.fill_buf()?;
             if available.is_empty() {
-                break; // EOF
+                break;
             }
             saw_input = true;
             let (seg, consume_n, line_done) = split_at_newline(available);
@@ -146,7 +146,7 @@ where
         let (consume_n, line_done) = {
             let available = r.fill_buf().await?;
             if available.is_empty() {
-                break; // EOF
+                break;
             }
             saw_input = true;
             let (seg, consume_n, line_done) = split_at_newline(available);

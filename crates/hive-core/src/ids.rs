@@ -1,8 +1,6 @@
-//! Strongly-typed identifiers for every level of the Hive hierarchy.
-//!
-//! Hive's topology is `Hive > Box > Cell`, with `Job`s flowing through it.
-//! Using newtypes keeps us from ever passing a `BoxId` where a `CellId` is
-//! expected.
+//! Strongly-typed identifiers for every level of the Hive hierarchy (`Hive > Box > Cell`, with
+//! `Job`s flowing through it): the newtypes keep a `BoxId` from ever being passed where a `CellId`
+//! is expected.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -1,20 +1,16 @@
-//! `hive-core` — shared vocabulary for the Hive reimplementation.
+//! `hive-core`: the shared vocabulary every other crate agrees on (ids, jobs, lifecycle states,
+//! wire messages), with no async/runtime dependencies on purpose. It maps 1:1 onto the concepts in
+//! Vercel's Hive write-up:
 //!
-//! This crate has no async/runtime dependencies on purpose: it is the set of
-//! types every other crate agrees on (ids, jobs, lifecycle states, wire
-//! messages). It maps 1:1 onto the concepts in Vercel's Hive write-up:
-//!
-//! * [`ids`]   — `Hive` > `Box` > `Cell`, plus `Job`.
-//! * [`job`]   — a `BuildJob` and its `ResourceSpec`.
-//! * [`state`] — the cell & job lifecycle state machines the control plane runs.
-//! * [`proto`] — messages exchanged between control plane / daemons / API / CLI.
-//! * [`logcap`] — bounded capture of tenant subprocess output (the one place
-//!   this crate touches I/O, and only through `std::io`/an optional
-//!   `tokio::io` trait — still no runtime, no executor).
-//! * [`integrity`] — the tamper-EVIDENCE hash-chain vocabulary (see its own
-//!   module doc for the honest scope limits) shared between `hive-cloud`
-//!   (the authoritative writer, via `deployment_ledger`) and `fluid-compute`
-//!   (which cannot depend on `hive-cloud` — see `ExecutionObserver`).
+//! - [`ids`]: `Hive` > `Box` > `Cell`, plus `Job`.
+//! - [`job`]: a `BuildJob` and its `ResourceSpec`.
+//! - [`state`]: the cell and job lifecycle state machines the control plane runs.
+//! - [`proto`]: messages exchanged between control plane, daemons, API and CLI.
+//! - [`logcap`]: bounded capture of tenant subprocess output, the one place this crate touches I/O
+//! (through `std::io` or an optional `tokio::io` trait: still no runtime, no executor).
+//! - [`integrity`]: the tamper-EVIDENCE hash-chain vocabulary (see its module doc for the honest
+//! scope limits), shared by `hive-cloud` (the authoritative writer, via `deployment_ledger`) and
+//! `fluid-compute` (which cannot depend on `hive-cloud`: see `ExecutionObserver`).
 
 pub mod error;
 pub mod ids;

@@ -50,9 +50,6 @@ pub const PRESETS: &[FrameworkPreset] = &[
         primitive: Primitive::Hybrid,
         emits_build_output: true,
     },
-    // OpenNext: builds a Next.js app into `.open-next/` (server functions +
-    // `assets/`). We run it with the `node` wrapper so the server function is a
-    // standalone HTTP server on $PORT (see git.rs), giving it Fluid compute.
     FrameworkPreset {
         slug: "opennext",
         name: "OpenNext",
@@ -63,8 +60,6 @@ pub const PRESETS: &[FrameworkPreset] = &[
         primitive: Primitive::Hybrid,
         emits_build_output: false,
     },
-    // vinext: Cloudflare's Vite reimplementation of the Next.js API. `vinext build`
-    // emits a Nitro `.output/` (server + public); `vinext start` serves it on $PORT.
     FrameworkPreset {
         slug: "vinext",
         name: "vinext",
@@ -657,14 +652,23 @@ pub fn detect(repo: &Path) -> &'static FrameworkPreset {
     detect_with_package(repo, package.as_ref())
 }
 
+/// Node server FRAMEWORK dependencies that make a repo a server app even with no start script.
+/// Without them a repo like vercel/vercel's examples/express (dependency `express`, no scripts) fell
+/// through to the static preset and shipped its raw source tree as a website, a silently wrong
+/// deployment; routed to the Node lane, a missing runnable entry instead fails LOUDLY with the
+/// existing "no usable production server entry" gate naming the real remedy (a start script).
+const NODE_SERVER_FRAMEWORKS: [&str; 5] = ["express", "fastify", "koa", "@nestjs/core", "hono"];
+
+/// Detection order: Next.js DEPLOYMENT ADAPTERS first (an OpenNext/vinext project still has `next`
+/// as a dependency and a `next.config.*`, so it would otherwise be misdetected as plain Next.js;
+/// `open-next.config.*` is unique to OpenNext and `vinext` is a dependency), then config-file
+/// markers (cheapest, most reliable), then package.json dependency sniffing (a
+/// [`NODE_SERVER_FRAMEWORKS`] dependency, a `start` script or a generic server entry means the Node
+/// lane), then a plain static site (an `index.html`) or unknown.
 fn detect_with_package(
     repo: &Path,
     package: Option<&serde_json::Value>,
 ) -> &'static FrameworkPreset {
-    // 0) Next.js DEPLOYMENT ADAPTERS take precedence — an OpenNext/vinext project
-    //    still has `next` as a dependency and a `next.config.*`, so they'd
-    //    otherwise be misdetected as plain Next.js. Check their marker deps/files
-    //    first. `open-next.config.*` is unique to OpenNext; `vinext` is a dep.
     for f in [
         "open-next.config.ts",
         "open-next.config.js",
@@ -683,7 +687,6 @@ fn detect_with_package(
         }
     }
 
-    // 1) Config-file markers (cheapest, most reliable).
     let markers: &[(&str, &str)] = &[
         ("next.config.js", "nextjs"),
         ("next.config.mjs", "nextjs"),
@@ -709,7 +712,6 @@ fn detect_with_package(
         }
     }
 
-    // 2) package.json dependency sniffing.
     if let Some(package) = package {
         let dep = |name: &str| has_dep(package, name);
         if dep("next") {
@@ -739,21 +741,11 @@ fn detect_with_package(
         if dep("@vue/cli-service") {
             return preset("vue").unwrap();
         }
-        // A Node server FRAMEWORK dependency => a server app even with no
-        // start script. Without this, a repo like vercel/vercel's
-        // examples/express (dependency `express`, no scripts at all) fell all
-        // the way through to the static preset and shipped its raw source tree
-        // as a website — a silently wrong deployment the readiness probe then
-        // refused with an unrelated-looking error. Detecting the server intent
-        // routes it to the Node lane, where a missing runnable entry fails
-        // LOUDLY with the existing "no usable production server entry" gate
-        // naming the real remedy (a start script) instead.
-        for server_dep in ["express", "fastify", "koa", "@nestjs/core", "hono"] {
+        for server_dep in NODE_SERVER_FRAMEWORKS {
             if dep(server_dep) {
                 return preset("node").unwrap();
             }
         }
-        // A server start script => treat as a Node serverless app.
         if package
             .get("scripts")
             .and_then(|scripts| scripts.get("start"))
@@ -766,7 +758,6 @@ fn detect_with_package(
         }
     }
 
-    // 3) Plain static site (has an index.html) or unknown -> static.
     preset("static").unwrap()
 }
 
@@ -825,18 +816,15 @@ fn has_dep(pkg: &serde_json::Value, name: &str) -> bool {
     false
 }
 
-/// Produce the build plan, honoring overrides the user set in project settings
-/// (empty string => use the framework default).
-/// Find a preset by slug or display name (case-insensitive), so an explicit
-/// framework choice in project settings can override auto-detection.
+/// Finds a preset by slug or display name (case-insensitive), so an explicit framework choice in
+/// project settings can override auto-detection. The dashboard label `node (express)` maps to the
+/// `node` slug (kept for settings rows written before canonical preset slugs).
 pub fn preset_by_name(name: &str) -> Option<&'static FrameworkPreset> {
     let n = name.trim().to_ascii_lowercase();
     if n.is_empty() {
         return None;
     }
     let n = match n.as_str() {
-        // Dashboard display label retained for compatibility with settings rows
-        // written before it used canonical preset slugs.
         "node (express)" => "node",
         _ => n.as_str(),
     };
@@ -845,6 +833,8 @@ pub fn preset_by_name(name: &str) -> Option<&'static FrameworkPreset> {
         .find(|p| p.slug.eq_ignore_ascii_case(n) || p.name.eq_ignore_ascii_case(n))
 }
 
+/// Produces the build plan, honoring overrides the user set in project settings (an empty string
+/// means the framework default).
 pub fn plan_build(
     repo: &Path,
     framework_override: Option<&str>,
