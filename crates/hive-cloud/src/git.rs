@@ -7366,13 +7366,6 @@ fn build_output_manifest(
                 )),
             ));
         }
-        // `descriptor.validate()` (called by `from_parser_value` above)
-        // already REQUIRES a non-empty `handler` string that names a real
-        // entry in this function's own `files` inventory — never defaulted.
-        // This lookup can only fail if that invariant were ever weakened, and
-        // must still fail the build loudly rather than silently guessing
-        // `index.js` (a guess that could point at a file the tenant never
-        // shipped, or shadow a same-named file in a sibling function).
         let handler = function
             .config
             .get("handler")
@@ -7391,9 +7384,6 @@ fn build_output_manifest(
             .get("memory")
             .and_then(|v| v.as_u64())
             .unwrap_or(1024) as u32;
-        // Platform default (5 minutes), matching `default_max_duration` — the
-        // prior `10` here was a Build-Output-only regression from that
-        // default, silently killing any handler that ran longer than 10s.
         let max_duration = function
             .config
             .get("maxDuration")
@@ -7403,12 +7393,6 @@ fn build_output_manifest(
         manifest.functions.push(FunctionConfig {
             name: function.name.clone(),
             runtime: "node".to_string(),
-            // Direct Node argv against the platform-owned launcher staged by
-            // `stage_build_output_node_launchers` right after this manifest is
-            // built from the fully materialized artifact — no shell, no
-            // package manager. The handler path passed as argv[1] is relative
-            // to the function's OWN `.func` CWD (`cwd_relative` below), the
-            // exact directory the launcher's `import()` resolves against.
             start_cmd: vec![
                 "node".to_string(),
                 BUILD_OUTPUT_NODE_LAUNCHER_FILE.to_string(),
@@ -7478,27 +7462,17 @@ fn build_output_manifest(
     Ok(manifest)
 }
 
-/// The ONE platform-owned Node HTTP bridge for Build Output API v3 `.func`
-/// bundles (build-output-immutable-launcher). Read at compile time from the
-/// crate's own source tree (the `AFTER_SHIM_JS` precedent above) and staged
-/// verbatim into every Node Build Output function's OWN `.func` directory —
-/// never into the deployment root, and never shared byte-for-byte with a
-/// tenant-writable path.
+/// The ONE platform-owned Node HTTP bridge for Build Output API v3 `.func` bundles, read at compile
+/// time from this crate's source tree and staged verbatim into each Node function's OWN `.func`
+/// directory: never the deployment root, never shared byte-for-byte with a tenant-writable path.
 const BUILD_OUTPUT_NODE_LAUNCHER_SRC: &str = include_str!("build-output-node-launcher.mjs");
 const BUILD_OUTPUT_NODE_LAUNCHER_FILE: &str = ".hive-build-output-launcher.mjs";
 
-/// Stage [`BUILD_OUTPUT_NODE_LAUNCHER_SRC`] into every Node Build Output
-/// function's own `.func` directory on the now-fully-materialized host
-/// checkout, ONLY after: (1) every repository-controlled install/build
-/// command has finished (`isolated.finish`/`finish_with_output` already ran),
-/// (2) the artifact has been parsed and validated
-/// (`fluid_build::resolve_build_output_checked` + `build_output_manifest`
-/// already succeeded, which is the only way this function is ever reached),
-/// and (3) the checks below — no symlinked `.func` directory, no existing
-/// entry at the reserved launcher path — pass for THIS function. Never called
-/// from the pre-materialization fast-fail check (that call site discards its
-/// `Manifest`; there is nothing to deploy and no host directory to write
-/// into yet).
+/// Stages [`BUILD_OUTPUT_NODE_LAUNCHER_SRC`] into every Node Build Output function's own `.func`
+/// directory on the fully materialized host checkout, only after the repository commands have
+/// finished, the artifact has been parsed and validated, and the per-function checks pass (no
+/// symlinked `.func` directory, nothing at the reserved launcher path). Never called from the
+/// pre-materialization fast-fail check, whose `Manifest` is discarded.
 fn stage_build_output_node_launchers(
     dir: &Path,
     manifest: &mut Manifest,
@@ -7529,12 +7503,6 @@ fn stage_build_output_node_launchers(
                 format!("function directory is not readable: {e}"),
             )
         })?;
-        // The parser already proved every FILE under this function is a
-        // portable relative regular-file path; the DIRECTORY CHAIN down to
-        // it is platform-controlled attack surface once we are about to
-        // write a new file into it, so it is checked independently here —
-        // a symlinked `.func` directory (or an ancestor of it) could
-        // otherwise redirect this write anywhere on the host.
         if !canonical_func_dir.starts_with(&canonical_root) {
             return Err(stage_error(
                 &function.name,
@@ -7542,10 +7510,8 @@ fn stage_build_output_node_launchers(
             ));
         }
         let launcher_path = canonical_func_dir.join(BUILD_OUTPUT_NODE_LAUNCHER_FILE);
-        // Collision refusal: this exact filename is platform-reserved inside
-        // every `.func` directory. `symlink_metadata` (not `metadata`) so an
-        // existing SYMLINK at this path is caught even if its target is
-        // missing/circular.
+        // symlink_metadata, not metadata: a symlink at the reserved path is caught even when its
+        // target is missing or circular.
         if std::fs::symlink_metadata(&launcher_path).is_ok() {
             return Err(stage_error(
                 &function.name,
@@ -7597,18 +7563,12 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
     }
 }
 
-/// Walk up from `dir` looking for `node_modules/next/dist/bin/next` as a
-/// regular file — Next's real CLI entry, independent of npm's `.bin/next`
-/// shim (see `detect_start_cmd`'s doc comment for why the shim path is
-/// broken on this platform's sealed runtime artifacts). Mirrors
-/// `litebox.rs`'s `next_entry_for` walk-up exactly, so both resolve the
-/// identical real path for the identical reason. Returns a path RELATIVE to
-/// `dir` (e.g. `node_modules/next/dist/bin/next` or, in a monorepo,
-/// `../../node_modules/next/dist/bin/next`) — `start_cmd[0]` is resolved
-/// against the deployed workdir at launch time
-/// (`Command::new(&func.start_cmd[0]).current_dir(&workdir)` in mock.rs),
-/// never against this build-time absolute path, which will not exist once
-/// the app is sealed into its own runtime-artifact directory.
+/// Walks up from `dir` looking for `node_modules/next/dist/bin/next` as a regular file: Next's real
+/// CLI entry. npm's `.bin/next` shim is unusable on sealed runtime artifacts, because sealing
+/// flattens symlinks into copies and Next's bin script requires `../server/require-hook`, valid
+/// only at its real location. Mirrors `litebox.rs`'s `next_entry_for` walk-up. Returns a path
+/// RELATIVE to `dir` (monorepos get `../../node_modules/...`), since `start_cmd[0]` is resolved
+/// against the deployed workdir at launch, never against this build-time absolute path.
 async fn find_next_dist_bin(dir: &Path) -> Option<String> {
     let mut up = PathBuf::new();
     let mut base = dir.to_path_buf();
@@ -7643,33 +7603,6 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
                 .and_then(|s| s.get("start"))
                 .and_then(|s| s.as_str())
             {
-                // A plain `next start` script resolves through `npm start` ->
-                // `node_modules/.bin/next`, and on every backend that runs this
-                // as a real host process (mock; litebox independently works
-                // around the identical problem at its own layer — see
-                // `litebox.rs`'s `next_entry_for`) `.bin/next` is NOT the npm-
-                // created symlink to `node_modules/next/dist/bin/next`: the
-                // runtime-artifact sealing step (`runtime_artifact.rs`,
-                // `materialize_entry`) dereferences every symlink into a flat
-                // byte-for-byte copy for its content-addressed integrity
-                // hashing, npm .bin shims included. Next's own `bin/next`
-                // script does `require("../server/require-hook")` — a path
-                // valid ONLY relative to its real location
-                // (`next/dist/bin/`) — so the flattened copy at `.bin/next`
-                // throws `Cannot find module '../server/require-hook'` on
-                // EVERY cold start, 100% reproducible, confirmed live against
-                // a real sealed artifact. Preserving symlinks through sealing
-                // is the deeper fix but touches security-critical,
-                // integrity-hashing code shared by every deployment on every
-                // backend; resolving the well-known `next start` shape to
-                // Next's real dist/bin entry here — mirroring the exact
-                // working pattern litebox already uses independently — fixes
-                // it without touching sealing at all. Text-matched, not
-                // shelled out to: `next start` / `next start -p $PORT` /
-                // `next start -p ${PORT}` are the only shapes recognized, so
-                // an app with extra flags or env prefixes (`NODE_ENV=x next
-                // start`) falls through unchanged to the ordinary npm-start
-                // path below.
                 if !bun {
                     let trimmed = start_script.trim();
                     let is_plain_next_start = trimmed == "next start"
@@ -7681,19 +7614,8 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
                         }
                     }
                 }
-                // Bun's own script-runner honors package.json#scripts.start
-                // identically to `npm start` (package.json-script INDIRECTION —
-                // the script's own text is executed as a shell command), so
-                // `--bun` is required here: a script like `"start": "node
-                // server.js"` (extremely common — it's what `npm init`/most
-                // hand-written package.jsons emit) would otherwise spawn REAL
-                // node, silently defeating the Bun runtime choice. Verified
-                // live: `bun run start` on such a script reported
-                // `process.versions.bun === null`; `bun run --bun start`
-                // reported the real Bun version. This does NOT apply to a
-                // direct-file invocation (`bun server.js`, no script-name
-                // indirection) below — there the top-level process is already
-                // Bun, so nothing to force.
+                // --bun: without it `bun run start` spawns real node for a
+                // `"start": "node server.js"` script, defeating the Bun runtime choice.
                 return if bun {
                     vec!["bun".into(), "run".into(), "--bun".into(), "start".into()]
                 } else {
@@ -7718,22 +7640,12 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
     }
 }
 
-/// Locate a Wasmer function's compiled `.wasm` entry module and build its
-/// `wasmer run` invocation. Conventional names first (`server.wasm` /
-/// `app.wasm` / `main.wasm`, mirroring the `server.js`/`app.py` convention
-/// above); otherwise a SINGLE `*.wasm` file at the project root is
-/// unambiguous. `--net` (live-verified against a real `cargo wasix build`
-/// axum server) grants the guest socket access — WASIX's own opt-in gate,
-/// analogous to a container needing `-p` published ports — and
-/// `--forward-host-env` carries the backend-assigned `$PORT` (and any
-/// project env vars) from the spawning process into the guest; the port is
-/// chosen at COLD-START time by fluid-compute, long after this build-time
-/// detection runs, so it can never be baked into `--env PORT=<literal>`
-/// here. Returns `None` (never a guess) when no `.wasm` entry is found or
-/// more than one sits at the root with no convention name to disambiguate —
-/// callers fall back to the generic Node/npm detection below, which will
-/// itself fail loudly (no server to start) rather than silently running the
-/// wrong module.
+/// Locates a Wasmer function's compiled `.wasm` entry module and builds its `wasmer run`
+/// invocation: `server.wasm`/`app.wasm`/`main.wasm` first, else a SINGLE `*.wasm` at the project
+/// root. `--net` is WASIX's opt-in socket gate and `--forward-host-env` carries the
+/// cold-start-assigned `$PORT` and project env into the guest, so the port is never baked into
+/// `--env PORT=<literal>`. Returns `None` (never a guess) when no entry exists or several are
+/// ambiguous, leaving the generic Node/npm detection to fail loudly.
 async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
     let wasmer_run = |entry: String| {
         vec![
@@ -7763,17 +7675,11 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
     found.map(wasmer_run)
 }
 
-/// Is `p` a real WebAssembly module — a regular file whose first four bytes are
-/// the `\0asm` magic? A `.wasm` NAME proves nothing: an unresolved Git-LFS
-/// pointer, a directory, a truncated download or an HTML error page saved by a
-/// fetch step all carry the extension and none of them can be executed.
-///
-/// Checked at BUILD time on purpose. This runtime's build path compiles nothing
-/// and runs nothing (a `.wasm` is already compiled), so without this check the
-/// first thing that ever opens the file is a cold start on some other node —
-/// turning a bad artifact into a green build, a Ready deployment and a
-/// permanent per-request crash loop, instead of one loud build failure. Cheap:
-/// a 4-byte read of a file already on local disk.
+/// Whether `p` is a real WebAssembly module: a regular file whose first four bytes are the `\0asm`
+/// magic. A `.wasm` NAME proves nothing (an unresolved Git-LFS pointer, a truncated download or a
+/// saved HTML error page all carry it), and the build compiles and runs nothing, so without this
+/// check a bad artifact becomes a green build and a Ready deployment that crash-loops on every
+/// request instead of one loud build failure.
 async fn is_wasm_module(p: &Path) -> bool {
     use tokio::io::AsyncReadExt;
     if !tokio::fs::metadata(p)
@@ -7790,9 +7696,9 @@ async fn is_wasm_module(p: &Path) -> bool {
     f.read_exact(&mut magic).await.is_ok() && &magic == b"\0asm"
 }
 
-/// Find a STABLE Node 20–24 bin dir, preferring it over an unstable system node
-/// (e.g. Homebrew's node v26 canary) so framework builds (SvelteKit, etc.) don't
-/// fail engine checks. Looks at nvm-installed versions first, then `node@NN` kegs.
+/// A STABLE Node 20–24 bin dir, preferred over an unstable system node (such as Homebrew's v26
+/// canary) so framework builds do not fail engine checks: nvm-installed versions first, then
+/// `node@NN` kegs.
 pub fn preferred_node_bin() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let nvm = PathBuf::from(&home).join(".nvm/versions/node");
@@ -7831,13 +7737,11 @@ pub fn preferred_node_bin() -> Option<String> {
     None
 }
 
-/// Node BINARY to use for the build-time compile-cache warm-up. The produced V8
-/// bytecode cache is keyed by the exact Node/V8 version + CPU arch — if the warm-up
-/// Node differs from the RUNTIME Node, the runtime silently ignores the cache and
-/// recompiles (the "cross-platform silent-miss"). On Firecracker the runtime is the
-/// microVM's baked-in Node, which is NOT the build host's Node, so each FC host sets
-/// `HIVE_WARMUP_NODE` to a copy of that exact binary. Elsewhere (Mac/mock backend,
-/// where build host == runtime) we fall back to the pinned stable Node directory.
+/// Node binary for the build-time compile-cache warm-up. V8's bytecode cache is keyed by the exact
+/// Node version and CPU arch, so the warm-up Node must match the RUNTIME Node or the runtime
+/// silently ignores the cache: each Firecracker host sets `HIVE_WARMUP_NODE` to a copy of the
+/// microVM's baked-in Node, and elsewhere (build host == runtime) the pinned stable Node directory
+/// is used.
 pub fn warmup_node_bin() -> Option<String> {
     if let Ok(p) = std::env::var("HIVE_WARMUP_NODE") {
         let pb = PathBuf::from(&p);
@@ -7870,13 +7774,10 @@ fn which_bun() -> Option<String> {
     None
 }
 
-/// Bun BINARY for the build-time bytecode warm-up. Like V8's compile cache, Bun's
-/// bytecode format is tied to a specific Bun build — mismatched builds mean the
-/// runtime silently ignores the cache (safe, just no speedup). `HIVE_WARMUP_BUN`
-/// pins the exact RUNTIME Bun (set on Firecracker hosts to a copy of the microVM's
-/// baked-in Bun), mirroring `HIVE_WARMUP_NODE`/`warmup_node_bin`. Falls back to
-/// whatever `bun` the build host has (correct when build host == runtime host,
-/// e.g. the Mac/mock backend).
+/// Bun binary for the build-time bytecode warm-up. Like V8's, Bun's bytecode is tied to a specific
+/// Bun build (a mismatch is safe, just no speedup), so `HIVE_WARMUP_BUN` pins the RUNTIME Bun on
+/// Firecracker hosts, mirroring `warmup_node_bin`; otherwise it is whatever `bun` the build host
+/// has.
 pub fn warmup_bun_bin() -> Option<String> {
     if let Ok(p) = std::env::var("HIVE_WARMUP_BUN") {
         let pb = PathBuf::from(&p);
@@ -7898,29 +7799,26 @@ async fn bun_version(bun_bin: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Extract an uploaded ZIP into `dir` through a descriptor-relative, no-follow,
-/// bounded importer. Every entry is validated BEFORE any byte touches the filesystem:
-/// symlinks, absolute paths, `..` components, and non-regular files are rejected.
-///
-/// When the archive is a single top-level directory (the common "zip a folder" /
-/// GitHub "Download ZIP" shape), the wrapper prefix is stripped so the project root
-/// lands directly at `dir`. macOS cruft (`__MACOSX`, `.DS_Store`) is skipped.
-///
-/// Ceilings: `MAX_ZIP_ENTRIES` (16 384) and `MAX_ZIP_BYTES` (256 MiB) are hard
-/// bounds — the admin handler already caps the raw upload at 10 MiB, so the byte
-/// ceiling is a defense-in-depth floor against a future code path that bypasses
-/// the handler's check. Returns the resulting file count.
 const MAX_ZIP_ENTRIES: usize = 16_384;
 const MAX_ZIP_BYTES: u64 = 256 * 1024 * 1024;
+/// Bytes read past an entry's declared size, so an entry whose header understates its length is
+/// detected.
+const OVERFLOW_PROBE_BYTES: u64 = 1;
 
+/// Extracts an uploaded ZIP into `dir`, validating every entry BEFORE any byte touches the
+/// filesystem: symlinks, absolute paths, `..` components and non-regular files are rejected. A
+/// single top-level wrapper directory (the "zip a folder" / GitHub "Download ZIP" shape) is
+/// stripped and macOS cruft (`__MACOSX`, `.DS_Store`) skipped. `MAX_ZIP_ENTRIES` and
+/// `MAX_ZIP_BYTES` are hard bounds (the admin handler already caps the upload at 10 MiB, so the
+/// byte ceiling is defense in depth against a path that bypasses it). Returns the resulting file
+/// count.
 async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
     tokio::fs::create_dir_all(dir).await?;
     let reader = std::io::Cursor::new(bytes);
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|e| anyhow::anyhow!("invalid zip archive: {e}"))?;
 
-    // --- pass 1: collect entry paths, validate, and detect wrapper prefix ---
-    let mut entries: Vec<(String, usize)> = Vec::new(); // (normalized path, zip index)
+    let mut entries: Vec<(String, usize)> = Vec::new();
     let mut wrapper_prefix: Option<String> = None;
 
     for i in 0..archive.len() {
@@ -7933,27 +7831,20 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
             .map_err(|e| anyhow::anyhow!("zip entry {i}: {e}"))?;
         let name = entry.name().to_string();
 
-        // Skip macOS cruft before any path processing.
         if is_macos_cruft(&name) {
             continue;
         }
 
-        // Reject symlinks — the zip crate exposes symlink targets via
-        // `entry.link()` (Unix symlink extra field) and `entry.is_symlink()`.
-        // Neither is a regular file — fail loudly.
         anyhow::ensure!(
             !entry.is_symlink(),
             "zip entry {i}: symlinks are not allowed ({name})"
         );
 
-        // Reject directories-as-entries (they carry no content; the zip crate
-        // reports them via `entry.is_dir()`). We only accept regular files.
         anyhow::ensure!(
             entry.is_file(),
             "zip entry {i}: only regular files are allowed, got: {name}"
         );
 
-        // Validate the path: no absolute, no `..` components, no empty names.
         let normalized = validate_zip_entry_path(&name, i)?;
         entries.push((normalized, i));
     }
@@ -7963,18 +7854,14 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
         "zip archive contains no files after stripping macOS cruft"
     );
 
-    // Detect a single wrapper directory: every entry shares the same first
-    // component, and it is NOT the whole path (i.e. there is content inside).
     if let Some(prefix) = common_entry_prefix(&entries) {
         wrapper_prefix = Some(prefix);
     }
 
-    // --- pass 2: extract files, bounded by byte count ---
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
     for (rel_path, idx) in &entries {
-        // Strip the wrapper prefix if one was detected.
         let output_path = if let Some(ref prefix) = wrapper_prefix {
             strip_prefix_component(rel_path, prefix)
                 .unwrap_or(rel_path.as_str())
@@ -7983,28 +7870,22 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
             rel_path.clone()
         };
 
-        // Defense-in-depth: the output path must still be relative and safe.
         let output_path = validate_zip_entry_path(&output_path, *idx)?;
 
         let dest = dir.join(&output_path);
-        // Create parent directories. The path is validated above, so parent
-        // components are known-safe relative segments.
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Read the entry bytes synchronously BEFORE any async I/O. The ZIP
-        // source is in-memory (a `Cursor<&[u8]>`), so the read is instant.
-        // `ZipFile` borrows from the non-Send `Cursor<&[u8]>`, so holding it
-        // across an `.await` makes the whole future non-Send. We read the
-        // bytes here and drop the entry before the first `.await` below.
+        // Read the entry synchronously and drop it before the first `.await`: `ZipFile` borrows the
+        // non-Send `Cursor`, so holding it across an await makes the whole future non-Send.
         let (entry_bytes, entry_size) = {
             let mut entry = archive
                 .by_index(*idx)
                 .map_err(|e| anyhow::anyhow!("zip entry {idx}: {e}"))?;
             let size = entry.size();
             let mut buf = Vec::with_capacity(size as usize);
-            let mut reader = std::io::Read::take(&mut entry, size + 1); // +1 for overflow detect
+            let mut reader = std::io::Read::take(&mut entry, size + OVERFLOW_PROBE_BYTES);
             let read_bytes = std::io::copy(&mut reader, &mut buf)?;
             anyhow::ensure!(
                 read_bytes == size,
@@ -8021,8 +7902,6 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
             "zip archive exceeds {MAX_ZIP_BYTES} bytes uncompressed"
         );
 
-        // Write to a temp file next to the destination, then atomically rename.
-        // This keeps a partial write from being observed as a complete file.
         let tmp = dest.with_file_name(format!(
             ".tmp-{}-{}",
             dest.file_name()
@@ -8043,7 +7922,6 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
 /// True when the entry name is macOS archive cruft that should never be
 /// materialized.
 fn is_macos_cruft(name: &str) -> bool {
-    // Strip trailing slashes (directory markers) for comparison.
     let name = name.trim_end_matches('/');
     if name == "__MACOSX" || name.starts_with("__MACOSX/") || name.starts_with("__MACOSX\\") {
         return true;
@@ -8054,13 +7932,11 @@ fn is_macos_cruft(name: &str) -> bool {
     false
 }
 
-/// Validate a ZIP entry path: reject absolute paths, `..` components, empty
-/// names, and Windows-style absolute paths (e.g. `C:\foo`). Returns the
-/// normalized path (forward slashes, no leading slash).
+/// Validates a ZIP entry path (rejects absolute paths, Windows drive-letter paths, `..` components
+/// and empty names) and returns it normalized: forward slashes, no leading slash.
 fn validate_zip_entry_path(name: &str, idx: usize) -> anyhow::Result<String> {
     anyhow::ensure!(!name.is_empty(), "zip entry {idx}: empty name");
 
-    // Reject Windows-style absolute paths (drive letter + colon).
     if name.as_bytes().len() >= 2
         && name.as_bytes()[0].is_ascii_alphabetic()
         && name.as_bytes()[1] == b':'
@@ -8068,10 +7944,8 @@ fn validate_zip_entry_path(name: &str, idx: usize) -> anyhow::Result<String> {
         anyhow::bail!("zip entry {idx}: absolute Windows path rejected: {name}");
     }
 
-    // Normalize separators to forward slashes.
     let normalized = name.replace('\\', "/");
 
-    // Split into components and validate each.
     let mut clean = Vec::new();
     for component in normalized.split('/') {
         if component.is_empty() || component == "." {
@@ -8080,8 +7954,6 @@ fn validate_zip_entry_path(name: &str, idx: usize) -> anyhow::Result<String> {
         if component == ".." {
             anyhow::bail!("zip entry {idx}: parent-directory component rejected: {name}");
         }
-        // Reject any component that starts with a drive letter (catches
-        // `C:` without a backslash, which the prefix check above misses).
         if component.len() >= 2
             && component.as_bytes()[0].is_ascii_alphabetic()
             && component.as_bytes()[1] == b':'
@@ -8099,18 +7971,12 @@ fn validate_zip_entry_path(name: &str, idx: usize) -> anyhow::Result<String> {
     Ok(clean.join("/"))
 }
 
-/// If every entry shares the same first path component, return that component
-/// (the "wrapper directory" prefix). Returns `None` when entries are already at
-/// the root or when there is no common prefix.
+/// The first path component when every entry shares it (the "wrapper directory"); `None` when
+/// entries already sit at the root or share no prefix.
 fn common_entry_prefix(entries: &[(String, usize)]) -> Option<String> {
     if entries.len() < 2 {
-        // A single entry with a first component is a candidate wrapper dir.
-        // But a single entry IS the content — if it has a single component
-        // it's already at the root (e.g. "package.json"), not a wrapper.
-        // If it has a first component, that IS the wrapper.
         let first = entries.first()?.0.split('/').next()?;
         if first == entries.first()?.0 {
-            // Single-component path — no wrapper.
             return None;
         }
         return Some(first.to_string());
@@ -8118,7 +7984,7 @@ fn common_entry_prefix(entries: &[(String, usize)]) -> Option<String> {
 
     let first = entries.first()?.0.split('/').next()?;
     if first.is_empty() || first == entries.first()?.0 {
-        return None; // already at root
+        return None;
     }
 
     for (path, _) in entries.iter().skip(1) {
@@ -8131,22 +7997,18 @@ fn common_entry_prefix(entries: &[(String, usize)]) -> Option<String> {
     Some(first.to_string())
 }
 
-/// Strip the given prefix component from a path. `path` is a normalized
-/// forward-slash path. Returns the remainder after the first component and
-/// separator.
+/// Strips the wrapper `prefix` component and its separator from a normalized forward-slash path.
 fn strip_prefix_component<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = path.strip_prefix(prefix)?;
     if rest.is_empty() {
-        return Some(""); // path IS the prefix — shouldn't happen for a file, but safe
+        return Some("");
     }
-    // Strip the separator after the prefix.
     Some(rest.strip_prefix('/').unwrap_or(rest))
 }
 
-/// Recursively copy the CONTENTS of `src` into `dst` (created if missing). Used by a
-/// zip-upload REDEPLOY that has no re-fetchable remote: it rebuilds from the retained
-/// on-disk checkout of the prior build. Symlinks are recreated best-effort; this is a
-/// local same-filesystem copy, so cost is bounded by the checkout size.
+/// Recursively copies the CONTENTS of `src` into `dst` (created if missing), for a zip-upload
+/// REDEPLOY that rebuilds from the retained checkout of the prior build (symlinks are recreated
+/// best-effort).
 fn copy_dir_into(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -8193,15 +8055,16 @@ async fn dir_stats(dir: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
-/// Build-time V8 compile-cache warm-up (Node cold-start contract). Boots the server
-/// once under `NODE_COMPILE_CACHE=<root>/.hive-compile-cache` so V8 bytecode for the
-/// hot modules (framework + server bundle) is written INTO the artifact; the runtime
-/// cell points `NODE_COMPILE_CACHE` at the same dir (workdir == delivered root), so
-/// even a fresh microVM's first hit skips parse/compile. A `--require` preload flushes
-/// the cache and exits cleanly after a short boot window (no signal needed; works for
-/// `node x` and `npm start`). Best-effort: any failure is a perf no-op, never breaks a
-/// deploy. Uses the pinned build Node — the runtime cell must run the SAME Node
-/// major+arch or V8 silently ignores the cache (safe, just no speedup).
+/// Build-time V8 compile-cache warm-up (Node cold-start contract): boots the server once under
+/// `NODE_COMPILE_CACHE=<root>/.hive-compile-cache`, so bytecode for the hot modules is written INTO
+/// the artifact and the runtime cell, pointing at the same directory, skips parse/compile even on a
+/// fresh microVM. A `--require` preload flushes the cache and exits after a short boot window
+/// (`flushCompileCache` needs Node >= 22.8; on older Node the cache stays empty). The cache is
+/// keyed by each module's ABSOLUTE path, so where the runtime relocates the artifact (Firecracker
+/// mounts the data disk at `/build`) `HIVE_WARMUP_BUILD_PATH` runs the warm-up in a private mount
+/// namespace with `build_dir` bind-mounted there. Callers pass only functions that RESOLVE to the
+/// Node runtime. Best-effort: any failure is a perf no-op, never breaks a deploy; the warm-up Node
+/// must match the runtime's major+arch or V8 silently ignores the cache.
 async fn warmup_node_cache(
     build_dir: &Path,
     start_cmd: &[String],
@@ -8217,29 +8080,17 @@ async fn warmup_node_cache(
     {
         return;
     }
-    // Callers only invoke this for a function whose resolved runtime is Node
-    // (see the `hive_core::Runtime::resolve(...) == Runtime::Node` filter at the
-    // call site) — no redundant argv re-check here, since re-deriving it from
-    // argv alone would disagree with an EXPLICIT `runtime: "node"` config paired
-    // with an unusual custom launcher script.
     let cache_dir = build_dir.join(".hive-compile-cache");
     if tokio::fs::create_dir_all(&cache_dir).await.is_err() {
         return;
     }
-    // Preload: after HIVE_WARMUP_MS, flush the compile cache + exit(0) so bytecode
-    // persists. Self-terminating, so it works regardless of the server's own signal
-    // handling and needs no external kill. `flushCompileCache` exists on Node >=22.8;
-    // on older/unsupported Node it's a no-op and the cache dir stays empty (handled).
     let preload = build_dir.join(".hive-warmup-preload.cjs");
     let preload_js = "const m=require('module');const ms=parseInt(process.env.HIVE_WARMUP_MS||'5000',10);setTimeout(()=>{try{m.flushCompileCache&&m.flushCompileCache();}catch(e){}process.exit(0);},ms);";
     if tokio::fs::write(&preload, preload_js).await.is_err() {
         return;
     }
-    // PATH mirrors run_streamed: project-local .bin, then the pinned stable Node.
     let local_bin = build_dir.join("node_modules/.bin");
     let mut prefix = local_bin.to_string_lossy().into_owned();
-    // Pin the warm-up to the RUNTIME Node (HIVE_WARMUP_NODE on FC nodes = the microVM's
-    // baked Node) so the bytecode cache is valid at runtime, not silently re-compiled.
     let warm_node = warmup_node_bin();
     if let Some(dir) = warm_node.as_deref().and_then(|nb| Path::new(nb).parent()) {
         prefix.push(':');
@@ -8250,13 +8101,6 @@ async fn warmup_node_cache(
         std::env::var("PATH").unwrap_or_default()
     );
     let cmd_str = start_cmd.join(" ");
-    // The V8 compile cache is keyed by each module's ABSOLUTE path. On Firecracker the
-    // runtime relocates the artifact to a FIXED workdir (the microVM mounts the data
-    // disk at /build), so the warm-up must compile with those SAME paths or the runtime
-    // silently re-compiles (the cross-platform/-path silent-miss). When
-    // HIVE_WARMUP_BUILD_PATH is set (FC nodes → /build), run the warm-up in a private
-    // mount namespace with build_dir bind-mounted there so module paths match. On the
-    // Mac/mock backend build_dir IS the run dir, so no remap is needed (env unset).
     let remap = std::env::var("HIVE_WARMUP_BUILD_PATH")
         .ok()
         .filter(|p| p.starts_with('/'));
@@ -8276,8 +8120,7 @@ async fn warmup_node_cache(
     log(format!(
         "Compile-cache: warming V8 bytecode (booting `{cmd_str}`)…"
     ));
-    // `exec` so the child IS the server process (not a wrapping shell); PORT=0 binds an
-    // ephemeral port (compilation happens during boot, before/around the listen).
+    // exec: the child IS the server process, not a wrapping shell; PORT=0 binds an ephemeral port.
     let mut command = match &remap {
         Some(t) => {
             let mut c = Command::new("unshare");
@@ -8310,14 +8153,8 @@ async fn warmup_node_cache(
         .spawn();
     match child {
         Ok(mut c) => {
-            // A launcher (`npm start`, `next start`) forks the real server as a CHILD that
-            // compiles + flushes its bytecode slightly AFTER the launcher exits. Reading the
-            // cache the instant the launcher exits ships only the launcher's modules and
-            // SILENTLY MISSES the server's (the real compile cost). So poll the cache until
-            // it stops growing — i.e. all descendants have finished flushing — with a hard
-            // cap so a hung boot can't stall the deploy. The preload self-exits each Node
-            // process ~HIVE_WARMUP_MS after its modules are compiled (sync require completes
-            // first), so the cache converges quickly.
+            // The real server is a child of the launcher and flushes AFTER it exits: poll the cache
+            // until it stops growing, under a hard cap.
             let start = tokio::time::Instant::now();
             let mut last = 0u64;
             let mut stable = 0u32;
@@ -8332,13 +8169,10 @@ async fn warmup_node_cache(
                 }
                 last = bytes;
                 let elapsed = start.elapsed();
-                // Done when: the cache captured something and held steady ~2.4s; OR the
-                // launcher exited having produced nothing after a grace window (non-Node /
-                // old Node — nothing to wait for); OR the 45s hard cap.
-                if (stable >= 3 && bytes > 0)
-                    || (exited && bytes == 0 && elapsed > Duration::from_secs(8))
-                    || elapsed > Duration::from_secs(45)
-                {
+                let cache_settled = stable >= 3 && bytes > 0;
+                let nothing_to_wait_for = exited && bytes == 0 && elapsed > Duration::from_secs(8);
+                let hard_cap_reached = elapsed > Duration::from_secs(45);
+                if cache_settled || nothing_to_wait_for || hard_cap_reached {
                     break;
                 }
             }
@@ -8362,38 +8196,10 @@ async fn warmup_node_cache(
     }
 }
 
-/// Build-time Bun bytecode cache — the Bun-native equivalent of
-/// `warmup_node_cache`, but STRUCTURALLY DIFFERENT, not a copy-paste: V8's
-/// `NODE_COMPILE_CACHE` is an opaque, process-wide cache directory layered on
-/// UNMODIFIED source (any `require()` gets cached, no rewrite needed). Bun uses
-/// JavaScriptCore, which has no equivalent hook — its bytecode cache
-/// (`bun build --bytecode`) is a build-time BUNDLING step that emits a NEW file
-/// plus a `.jsc` bytecode sidecar (and, here, a `.map` external source map); `bun
-/// run <bundled-file>` auto-loads both with ZERO runtime env var. So on success
-/// this function REWRITES start_cmd to point at the bundled output — callers
-/// MUST use the returned Vec, not the one they passed in.
-///
-/// Only applies when start_cmd resolves to a real, existing entry FILE (`bun
-/// <file>` / `bun run <file>`) under `build_dir` — a plain Node-style
-/// server.js/index.js, or an OpenNext/vinext adapter's single bundled server
-/// file both qualify. Does NOT apply to a framework CLI invocation (`bunx --bun
-/// next start`, `bun run --bun next start`): a CLI wrapper is not a statically
-/// resolvable module graph Bun can bundle ahead of time — this is a REAL, proven
-/// Bun limitation (proven empirically: `bun build` on a CLI entry either fails
-/// or bundles the wrong thing), unlike Node's compile cache, which works
-/// regardless of how the process was launched. Detected explicitly and
-/// downgraded safely: start_cmd is returned UNCHANGED and a clear reason is
-/// logged; the app still runs correctly on Bun, just without the bytecode
-/// speedup for that one framework combination.
-///
-/// Best-effort: any failure (missing `bun` binary, bundling error, unexpected
-/// output shape) is a perf no-op, never breaks a deploy — returns the ORIGINAL
-/// start_cmd unchanged.
-///
-/// Pure entry-detection: is `start_cmd` a bundleable `bun <file>` / `bun run
-/// <file>` invocation? Returns the file argument if so, `None` for anything
-/// else (CLI wrappers like `bunx --bun next start`, non-Bun commands, etc.).
-/// Extracted so the decision is unit-testable without a `CloudState`.
+/// Pure entry detection: is `start_cmd` a bundleable `bun <file>` / `bun run <file>` invocation?
+/// Returns the file argument, `None` for anything else (CLI wrappers such as
+/// `bunx --bun next start`, non-Bun commands). Extracted so the decision is testable without a
+/// `CloudState`.
 fn bun_bundle_entry(start_cmd: &[String]) -> Option<String> {
     let is_bun = |s: &str| Path::new(s).file_name().and_then(|f| f.to_str()) == Some("bun");
     match start_cmd {
@@ -8403,6 +8209,15 @@ fn bun_bundle_entry(start_cmd: &[String]) -> Option<String> {
     }
 }
 
+/// Build-time Bun bytecode cache, the Bun-native counterpart of `warmup_node_cache` but
+/// structurally different: JavaScriptCore has no process-wide cache hook, so `bun build --bytecode`
+/// BUNDLES the entry into a new file with a `.jsc` bytecode sidecar (and a `.map` source map) that
+/// `bun run <bundled-file>` auto-loads with no runtime env var. On success `start_cmd` is REWRITTEN
+/// to the bundled output, so callers MUST use the returned Vec. It applies only when `start_cmd` is
+/// `bun <file>` / `bun run <file>` on an existing entry file under `build_dir`; a framework CLI
+/// invocation (`bunx --bun next start`) is not a statically resolvable module graph Bun can bundle,
+/// so it is returned UNCHANGED with a logged reason (the app still runs on Bun, just without the
+/// speedup). Best-effort: any failure returns the ORIGINAL `start_cmd`.
 async fn warmup_bun_bytecode(
     build_dir: &Path,
     start_cmd: &[String],
@@ -8492,13 +8307,10 @@ async fn warmup_bun_bytecode(
     }
 }
 
-/// Run a shell command in `dir`, streaming stdout+stderr into the build log.
-/// `env` is the project's environment variables, injected into the build so
-/// install/build steps (e.g. Next.js reading NEXT_PUBLIC_*, Vite VITE_*) see them.
-/// Ingest a Vercel WDK manifest (`.well-known/workflow/v1/manifest.json`) emitted
-/// by a built app: register each workflow — with its React-Flow `graph` — in the
-/// engine so it shows up in the Workflows tab/table and renders on the canvas.
-/// Returns the number registered. Best-effort (a non-WDK app simply has none).
+/// Ingests a Vercel WDK manifest (`.well-known/workflow/v1/manifest.json`) emitted by a built app:
+/// registers each workflow, with its React-Flow `graph`, in the engine so it shows in the Workflows
+/// tab and renders on the canvas. Returns the number registered; best-effort (a non-WDK app has
+/// none).
 async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &Path) -> usize {
     let Some(path) = find_workflow_manifest(dir) else {
         return 0;
@@ -8524,7 +8336,6 @@ async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &
                 .unwrap_or(name)
                 .to_string();
             let graph = wf.get("graph").cloned();
-            // Steps for the table = graph nodes minus the synthetic start/end markers.
             let steps: Vec<hive_edge::WorkflowStep> = graph
                 .as_ref()
                 .and_then(|g| g.get("nodes"))
@@ -8570,9 +8381,8 @@ async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &
     count
 }
 
-/// Locate a WDK `manifest.json` under a build dir (bounded walk; skips vendored /
-/// build-output trees that would duplicate it). Prefers the canonical relative
-/// path at each level.
+/// Locates a WDK `manifest.json` under a build dir: a bounded walk that skips vendored and
+/// build-output trees, preferring the canonical relative path at each level.
 fn find_workflow_manifest(dir: &Path) -> Option<std::path::PathBuf> {
     fn walk(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
         let direct = dir.join(".well-known/workflow/v1/manifest.json");
@@ -8631,19 +8441,33 @@ fn build_executor_platform_fault(error: &anyhow::Error) -> bool {
 struct IsolatedBuild {
     root: PathBuf,
     session: Option<crate::build_executor::BuildSession>,
-    /// When set, repository commands run as PLAIN HOST PROCESSES in the
-    /// checkout, exactly as `MockBackend`/`LiteboxBackend` have always built
-    /// (AGENTS.md: litebox `run_build` is byte-identical to
-    /// `crate::mock::run_build_process`, a plain unsandboxed host process).
-    /// Those backends spawn tenant functions in their own sandbox at RUN time;
-    /// their build lane never used the microVM-era isolated executor, so
-    /// requiring it here would break every source deploy on a host-exec
-    /// backend. Firecracker keeps `host_build = false` and stays
+    /// When set, repository commands run as PLAIN HOST PROCESSES in the checkout, as
+    /// `MockBackend`/`LiteboxBackend` have always built: those backends sandbox tenant functions at
+    /// RUN time and their build lane never used the isolated executor, so requiring it would break
+    /// every source deploy on a host-exec backend. Firecracker keeps `host_build = false` and stays
     /// isolated-executor-only.
     host_build: bool,
     /// This build's verdict on the host's package registry, assessed lazily by
     /// the first host command (`registry_fallback`). `None` = not assessed yet.
     registry: Option<crate::build_registry::Plan>,
+}
+
+/// PATH prefix naming every existing `node_modules/.bin` from `dir` and up to five ancestors, each
+/// followed by `:`, so an explicit `next build` or `vite build` finds the project's own installed
+/// CLI first, as it does on Vercel and in npm scripts.
+fn local_bin_dirs_on_path(dir: &Path) -> String {
+    let mut path_value = String::new();
+    let mut bin_dir = Some(dir.to_path_buf());
+    for _ in 0..6 {
+        let Some(current) = bin_dir.take() else { break };
+        let candidate = current.join("node_modules/.bin");
+        if candidate.is_dir() {
+            path_value.push_str(&candidate.to_string_lossy());
+            path_value.push(':');
+        }
+        bin_dir = current.parent().map(Path::to_path_buf);
+    }
+    path_value
 }
 
 impl IsolatedBuild {
@@ -8667,10 +8491,9 @@ impl IsolatedBuild {
         })
     }
 
-    /// A host-process build session for backends that run builds directly on
-    /// the host (mock, litebox). No isolated executor is acquired; commands
-    /// run in the real checkout and `finish` is a no-op (the checkout IS the
-    /// materialized output).
+    /// A host-process build session for backends that build directly on the host (mock, litebox):
+    /// no isolated executor is acquired and `finish` is a no-op, since the checkout IS the
+    /// materialized output.
     fn begin_host(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -8680,11 +8503,10 @@ impl IsolatedBuild {
         }
     }
 
-    /// The `npm_config_userconfig` this host command should run with, if any:
-    /// the host registry is probed once per build (`build_registry`), and a
-    /// dark public mirror with a live public registry yields a user-config file
-    /// that names the public registry. A repository's own `.npmrc` still wins
-    /// by npm's config layering.
+    /// The `npm_config_userconfig` this host command should run with, if any: the host registry is
+    /// probed once per build (`build_registry`), and a dark public mirror with a live public
+    /// registry yields a user-config naming the public registry; a repository's own `.npmrc` still
+    /// wins by npm's config layering.
     async fn registry_fallback(
         &mut self,
         home: &Path,
@@ -8807,12 +8629,10 @@ impl IsolatedBuild {
         Ok(result.exit_code)
     }
 
-    /// Run one repository command as a PLAIN HOST PROCESS in the checkout —
-    /// the mock/litebox build lane. `command` is a full shell string
-    /// (e.g. `cd ../.. && pnpm install`); `args` are appended as literal argv
-    /// after it (rare for this lane). Output streams line-buffered into the
-    /// build log exactly like the isolated path, and cancellation kills the
-    /// process group.
+    /// Runs one repository command as a PLAIN HOST PROCESS in the checkout (the mock/litebox build
+    /// lane): `command` is a full shell string (e.g. `cd ../.. && pnpm install`) and `args` are
+    /// appended as literal argv. Output streams line-buffered into the build log like the isolated
+    /// path, and cancellation kills the process group.
     #[allow(clippy::too_many_arguments)]
     async fn run_host(
         &mut self,
@@ -8828,13 +8648,8 @@ impl IsolatedBuild {
         use tokio::io::BufReader;
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
-        // POSIX `sh -c script [name [args...]]`: the FIRST word after the
-        // script becomes `$0`, and only the words after it become `$1..`.
-        // Passing the real args bare therefore shifted them all by one — a
-        // one-arg step saw `$1` UNSET (witnessed live 2026-08-26: the
-        // platform after-shim staging step failed `$1: unbound variable`
-        // under `set -u` while the identical step ran fine in the isolated
-        // executor, which supplies this placeholder). Keep argv0 constant.
+        // `sh -c script NAME args` binds the first word after the script to `$0`, so a placeholder
+        // keeps the real args at `$1..` (the isolated executor supplies the same one).
         if !args.is_empty() {
             cmd.arg("hive-build");
         }
@@ -8842,27 +8657,8 @@ impl IsolatedBuild {
             cmd.arg(arg);
         }
         cmd.current_dir(dir);
-        // A clean, explicit build environment: the platform-selected build env
-        // plus a sane PATH, never the daemon's ambient environment.
         cmd.env_clear();
-        // Vercel parity: every build command runs with the project's OWN
-        // `node_modules/.bin` first on PATH — an explicit `next build`/`vite
-        // build` refers to the locally installed CLI. Without this, tokenhun's
-        // vercel.json `next build` died `/bin/sh: next: command not found` on
-        // the host lane while the same command works on Vercel. Both the
-        // command cwd's bin and (for monorepos) its ancestors' up to the
-        // checkout are included, mirroring npm's own script PATH behavior.
-        let mut path_value = String::new();
-        let mut bin_dir = Some(dir.to_path_buf());
-        for _ in 0..6 {
-            let Some(current) = bin_dir.take() else { break };
-            let candidate = current.join("node_modules/.bin");
-            if candidate.is_dir() {
-                path_value.push_str(&candidate.to_string_lossy());
-                path_value.push(':');
-            }
-            bin_dir = current.parent().map(Path::to_path_buf);
-        }
+        let mut path_value = local_bin_dirs_on_path(dir);
         path_value.push_str(
             &std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
         );
@@ -8870,9 +8666,7 @@ impl IsolatedBuild {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         cmd.env("HOME", &home);
         cmd.env("CI", "1");
-        // HOME carries the host user's `~/.npmrc` (a provider mirror on the
-        // fleet's images); a dark mirror must not fail the build. Set BEFORE
-        // the tenant's variables so an explicit tenant value always wins.
+        // Set before the tenant's variables, so an explicit tenant value wins.
         if let Some((key, value)) = self.registry_fallback(Path::new(&home), cloud, bid).await {
             cmd.env(key, value);
         }
@@ -8882,8 +8676,6 @@ impl IsolatedBuild {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
-        // Own a process group so a cancel reaches every child (pnpm spawns
-        // many). setsid via pre_exec on Unix.
         #[cfg(unix)]
         unsafe {
             use std::os::unix::process::CommandExt;
@@ -8928,7 +8720,6 @@ impl IsolatedBuild {
         });
         let status = loop {
             if cloud.build_cancels.is_cancelled(bid) {
-                // Kill the whole process group, not just the shell.
                 #[cfg(unix)]
                 if let Some(pid) = pid {
                     unsafe {
@@ -8986,9 +8777,6 @@ impl IsolatedBuild {
         expected: Option<&crate::build_executor::WorkspacePath>,
     ) -> anyhow::Result<()> {
         if self.host_build {
-            // Host builds mutate the checkout in place — it IS the output, so
-            // there is no session to seal or tree to materialize. Verify the
-            // expected output directory exists on disk when one is required.
             if let Some(expected) = expected {
                 let path = self.root.join(expected.as_str());
                 anyhow::ensure!(
@@ -9047,10 +8835,9 @@ async fn reseal_platform_output(root: &Path) -> anyhow::Result<()> {
         .context("publish platform-finalized output")
 }
 
-/// The one gate every repository-controlled build step funnels through when
-/// the session is optional: a builder-less node (only the zero-command static
-/// lane can succeed there) refuses with the canonical message instead of ever
-/// running the step on the host.
+/// The one gate every repository-controlled build step funnels through when the session is
+/// optional: a builder-less node (only the zero-command static lane can succeed there) refuses with
+/// the canonical message instead of ever running the step on the host.
 fn require_build_session<'a>(
     isolated: &'a mut Option<&mut IsolatedBuild>,
 ) -> anyhow::Result<&'a mut IsolatedBuild> {
@@ -9061,6 +8848,9 @@ fn require_build_session<'a>(
     })
 }
 
+/// Runs a shell command in `dir` through the build session, streaming stdout+stderr into the build
+/// log; `env` is the project's environment, injected so install/build steps (Next.js
+/// `NEXT_PUBLIC_*`, Vite `VITE_*`) see it.
 async fn run_streamed(
     isolated: &mut IsolatedBuild,
     dir: &Path,
@@ -9084,10 +8874,9 @@ async fn run_streamed(
         .map(|_| ())
 }
 
-/// The package manager / toolchain a repository command invokes, when its first
-/// bare word names one. `None` for anything else (a framework binary such as
-/// `next build`, a path-shaped invocation, an empty command) — those are never
-/// substituted, because only a package manager has a drop-in equivalent.
+/// The package manager or toolchain a repository command invokes, when its first bare word names
+/// one; `None` for anything else (a framework binary such as `next build`, a path-shaped command,
+/// an empty one), since only a package manager has a drop-in equivalent to substitute.
 fn command_toolchain(command: &str) -> Option<&'static str> {
     let first = command.split_whitespace().next()?;
     let bit = crate::resources::build_toolchain_bit(first)?;
@@ -9097,27 +8886,21 @@ fn command_toolchain(command: &str) -> Option<&'static str> {
         .map(|(tool, _)| *tool)
 }
 
-/// The package manager this build needs, from the commands the repository (or
-/// Project Settings) supplies. The install command is consulted first: it runs
-/// before the build command and is the one that died `/bin/sh: line 1: bun:
-/// command not found` on a node with no bun. Deterministic — same inputs, same
-/// answer, on every node.
+/// The package manager this build needs, from the commands the repository (or Project Settings)
+/// supplies: the install command is consulted first because it runs first (it is the one that died
+/// `bun: command not found` on a node with no bun). Deterministic: same inputs, same answer, on
+/// every node.
 fn build_toolchain_need(install_command: &str, build_command: &str) -> Option<&'static str> {
     command_toolchain(install_command).or_else(|| command_toolchain(build_command))
 }
 
-/// Probe the package managers and toolchains the BUILD LANE can actually exec.
-///
-/// Runs through the very session the repository commands will use — a plain host
-/// process on the host-exec lane (mock/litebox), a shell inside the pinned
-/// builder image on the microVM lane — so the answer is the filesystem the
-/// command resolves against, never the one the daemon happens to see. The
-/// script's exit code is the toolchain bitmask (see
-/// `resources::build_toolchain_probe_script`).
-///
-/// `None` means the probe itself could not run, which callers must read as
-/// UNKNOWN: nothing is substituted and the command runs as written, so this
-/// probe can never turn a working build into a different one.
+/// Probes the package managers and toolchains the BUILD LANE can actually exec, through the very
+/// session the repository commands will use (a host process on the mock/litebox lane, a shell in
+/// the pinned builder image on the microVM lane), so the answer is the filesystem the command
+/// resolves against; the exit code is the toolchain bitmask
+/// (`resources::build_toolchain_probe_script`). `None` means the probe could not run and reads as
+/// UNKNOWN: nothing is substituted, so the probe can never turn a working build into a different
+/// one.
 async fn probe_build_toolchains(
     isolated: &mut Option<&mut IsolatedBuild>,
     dir: &Path,
@@ -9146,26 +8929,14 @@ async fn probe_build_toolchains(
     Some(crate::resources::build_toolchain_names(code as u32))
 }
 
-/// A repository command dying with the shell's 127 has failed on a MISSING
-/// EXECUTABLE, and whose fault that is depends on where the executable was
-/// supposed to come from. Platform-generated commands probe their own
-/// toolchain and print `BUILD_TOOLCHAIN_MISSING`/`BUILD_TOOLCHAIN_MISMATCH`
-/// themselves before exiting 127/42 (see `PackageManagerLauncher::invoke`),
-/// but an explicit override is repository authority and runs byte-for-byte
-/// (see the "Explicit commands" comment at the `install_cmd` assignment), so
-/// no probe ever wraps it — this classifier is the honest-failure half for
-/// that lane. A bare-word command (`bun install`) names the tool it invoked;
-/// a compound or path-shaped command stays generic (the streamed build log
-/// already carries the shell's own `x: command not found` line naming it).
-/// Either way the failure is reported as the BUILD ENVIRONMENT's missing
-/// tool with the operator remedy — never as the tenant's application
-/// failing, because the command text was preserved exactly and the absent
-/// piece is a platform-provisioned executable. Live witness for why this
-/// classification exists: tokenhun build dpl-0c9ba9d462 (2026-08-24), whose
-/// explicit `bun install` died `/bin/sh: bun: command not found` on a fleet
-/// where bun is provisioned on no build host, and surfaced to the tenant as
-/// "install command failed: exited with exit status: 127" — an app-failure
-/// shape for a platform provisioning gap.
+/// Classifies a repository command that died with the shell's 127 (a MISSING EXECUTABLE) or 42 (a
+/// toolchain mismatch). Platform-generated commands probe their own toolchain and print
+/// `BUILD_TOOLCHAIN_MISSING`/`BUILD_TOOLCHAIN_MISMATCH` themselves (see
+/// `PackageManagerLauncher::invoke`), but an explicit override is repository authority and runs
+/// byte-for-byte with no probe around it, so this classifier is the honest-failure half for that
+/// lane. A bare-word command (`bun install`) names the tool it invoked; a compound or path-shaped
+/// one stays generic. Either way the failure is reported as the BUILD ENVIRONMENT's missing tool
+/// with the operator remedy, never as the tenant's application failing.
 fn classify_command_failure(context: &str, command: &str, error: anyhow::Error) -> anyhow::Error {
     let rendered = format!("{error:#}");
     let (marker, summary) = if rendered.contains("exit status: 127") {
@@ -9226,17 +8997,6 @@ async fn run_ignored_command(
         .map(|exit| exit == 0)
 }
 
-// ---- Build cache (content-addressed, P2P, fault-tolerant) ----
-//
-// Dependencies are the slow part of a build. We cache `node_modules` (+ framework
-// caches) as a tarball keyed by a content hash of the lockfile + package manager,
-// stored under `$HIVE_DATA/build-cache/<key>.tar`. Restore before install; save
-// after a successful build. On a LOCAL miss we pull the blob from a mesh peer
-// (`GET /v1/buildcache/:key`) — the P2P paradigm: any node that has built these
-// deps can serve them to the others. Every step is best-effort: a cache error
-// (missing, corrupt, peer down) never fails the build — it just falls back to a
-// clean install.
-
 pub fn cache_root() -> PathBuf {
     crate::persist::data_dir().join("build-cache")
 }
@@ -9287,19 +9047,12 @@ async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
     )
 }
 
-/// Cache identity binds every authority and executable-input dimension. A
-/// production key cannot name a preview/fork artifact because the signed key
-/// commits to the lane as well as tenant, canonical and actual repositories,
-/// lock inputs, selected toolchain, and build policy.
-///
-/// `hive-build-cache-v4` is BLAKE3 ([`fluid_core::ContentHasher`]); v3 was
-/// SHA-256. This is the one digest in the tree a switch is safe on by
-/// construction: the key is a LOOKUP into a cache, so every already-written
-/// v3 entry simply misses once and is rebuilt — a miss is never a corruption,
-/// never a false integrity failure, and never an orphaned stored object. Any
-/// digest that NAMES stored bytes (a runtime-artifact store directory, a
-/// browser-artifact filename, a GC keep-set entry) is the opposite case and
-/// deliberately keeps its writer on the algorithm that produced it.
+/// Cache identity binds every authority and executable-input dimension: the key commits to the
+/// lane, tenant, canonical and actual repositories, lock inputs, selected toolchain and build
+/// policy, so a production key cannot name a preview/fork artifact. `hive-build-cache-v4` is BLAKE3
+/// ([`fluid_core::ContentHasher`]); v3 was SHA-256. A key is a LOOKUP into a cache, so a switch
+/// only costs one miss per entry, never a corruption: a digest that NAMES stored bytes keeps its
+/// writer on the algorithm that produced it.
 async fn compute_cache_key(
     install_dir: &Path,
     pm: &str,
@@ -9319,8 +9072,6 @@ async fn compute_cache_key(
     hasher.field("policy", policy.as_bytes());
     for (key, value) in build_env {
         hasher.field("build-env-key", key.as_bytes());
-        // Folded through the same shared primitive rather than pulling a hash
-        // crate into this crate: one BLAKE3 implementation, one place to audit.
         let value_digest =
             fluid_core::content_hash(b"hive-build-cache-v4-env-value", value.as_bytes());
         hasher.field("build-env-value-blake3", value_digest.as_bytes());
@@ -9346,24 +9097,13 @@ async fn compute_cache_key(
     Some(hasher.finish())
 }
 
-// ---- #22 build-artifact integrity + authenticity --------------------------
-//
-// A node pulls `node_modules` tarballs from mesh peers (`try_peer_fetch`). Without
-// verification, a corrupted byte stream — or a malicious peer — could inject
-// arbitrary content into a build (a supply-chain hole). We protect every pull with
-// two checks, both using primitives already in the tree (`sha2`, `hmac`):
-//   * a SHA-256 CONTENT digest (`x-hive-artifact-sha256`) catches CORRUPTION —
-//     always enforced when the header is present (works with no shared secret).
-//   * an HMAC-SHA256 SIGNATURE (`x-hive-artifact-sig`) over the bytes, keyed by a
-//     fleet-shared secret, catches FORGERY — a peer without the secret can't mint a
-//     valid signature. Enforced whenever a secret is configured on this node.
-
 pub const ARTIFACT_SHA_HEADER: &str = "x-hive-artifact-sha256";
 pub const ARTIFACT_SIG_HEADER: &str = "x-hive-artifact-sig";
 
-/// Fleet-shared secret for artifact signatures (#22). Reuses `HIVE_JWT_SECRET`
-/// (already distributed fleet-wide) unless `HIVE_ARTIFACT_SECRET` overrides it.
-/// `None` => signing disabled (dev / single-node), like the JWT dev-open default.
+/// Fleet-shared secret for artifact signatures: `HIVE_ARTIFACT_SECRET`, else a key DERIVED from
+/// `HIVE_JWT_SECRET` with a purpose-specific label (one key, one purpose: the raw JWT secret is
+/// never reused for a second HMAC role; set `HIVE_ARTIFACT_SECRET` in production for full
+/// independence). `None` disables signing (dev / single-node).
 pub fn artifact_secret() -> Option<String> {
     if let Some(s) = std::env::var("HIVE_ARTIFACT_SECRET")
         .ok()
@@ -9371,13 +9111,6 @@ pub fn artifact_secret() -> Option<String> {
     {
         return Some(s);
     }
-    // Fall back to a key DERIVED from HIVE_JWT_SECRET (a single HMAC call
-    // with a purpose-specific label — HKDF-Expand in spirit) rather than the
-    // raw JWT secret itself. Reusing the exact same symmetric key for two
-    // different HMAC purposes (session-token signing and mesh build-artifact
-    // integrity signing) violates "one key, one purpose": compromise of one
-    // subsystem's key material compromises the other. Set
-    // HIVE_ARTIFACT_SECRET explicitly in production for full independence.
     let root = std::env::var("HIVE_JWT_SECRET")
         .ok()
         .filter(|s| !s.is_empty())?;
@@ -9426,7 +9159,7 @@ pub fn artifact_sig_valid(secret: &str, bytes: &[u8], sig_hex: &str) -> bool {
     let mut mac =
         <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
     mac.update(bytes);
-    mac.verify_slice(&expected).is_ok() // constant-time comparison
+    mac.verify_slice(&expected).is_ok()
 }
 
 pub fn cache_artifact_sig(secret: &str, key: &str, bytes: &[u8]) -> String {
@@ -9460,25 +9193,22 @@ fn cache_artifact_sig_valid(secret: &str, key: &str, bytes: &[u8], sig_hex: &str
     mac.verify_slice(&expected).is_ok()
 }
 
-/// Verify a pulled artifact against the requested cache identity as well as its
-/// content. A valid signature for key A cannot be replayed as key B.
+/// Verifies a pulled artifact against the requested cache identity as well as its content: a valid
+/// signature for key A cannot be replayed as key B. The content digest, when present, MUST match
+/// (corruption guard) and accepts either the legacy SHA-256 or the BLAKE3 mint, because a
+/// mixed-version roll has peers on both. Whenever THIS node has an artifact secret a valid
+/// signature is REQUIRED: a peer that cannot sign is not trusted to supply build inputs.
 fn verify_pulled_artifact(
     key: &str,
     bytes: &[u8],
     sha: Option<&str>,
     sig: Option<&str>,
 ) -> Result<(), String> {
-    // Content digest: if present, it MUST match (corruption guard).
-    // Dual-algorithm: a peer still on the legacy SHA-256 mint and one already
-    // minting BLAKE3 both address the same bytes, so accept either — rejecting
-    // one turns a mixed-version roll into "every peer's cache is corrupt".
     if let Some(sha) = sha {
         if !fluid_core::verify_raw_content(bytes, sha) {
             return Err("content digest mismatch (corrupted artifact)".into());
         }
     }
-    // Authenticity: if THIS node has a secret configured, a valid signature is
-    // REQUIRED — a peer that can't sign is not trusted to supply build inputs.
     if let Some(secret) = artifact_secret() {
         match sig {
             Some(sig) if cache_artifact_sig_valid(&secret, key, bytes, sig) => {}
@@ -9489,20 +9219,16 @@ fn verify_pulled_artifact(
     Ok(())
 }
 
-/// Try to fetch a cache blob from a mesh peer; write it to `dest`. Returns true on
-/// success. Best-effort: any error is swallowed. Verifies integrity + authenticity
-/// of the pulled bytes (#22) before accepting — a failed check rejects that peer's
-/// copy and tries the next, never writing untrusted bytes to the cache.
+/// Fetches a cache blob from the mesh peers into `dest`; true on success, best-effort (every error
+/// is swallowed). The peers are RACED, not walked: several fleet nodes' 8786/8787 are firewalled so
+/// a request SYN-drops and burns its whole timeout, which serially was up to 20 s per unreachable
+/// peer before the install could start. Each peer gets `HIVE_BUILDCACHE_PEER_TIMEOUT_SECS` (6) and
+/// the whole phase `HIVE_BUILDCACHE_FETCH_BUDGET_SECS` (20), because a pull slower than a clean
+/// install is not worth waiting for. The request carries the mesh-internal `service` delegation
+/// that `/v1/buildcache/:key` requires (`admin::require_fleet_read`), and a blob that fails the
+/// integrity or authenticity check is rejected without ever being written to the cache.
 async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool {
     let peers = cloud.peers.read().clone();
-    // RACE the peers instead of walking them one at a time. This sits directly
-    // in front of `npm install` on every build whose lockfile hash isn't
-    // cached locally, and several fleet nodes' 8786/8787 are firewalled such
-    // that a request SYN-drops and burns the whole timeout rather than failing
-    // fast — serially that was up to 20s x (unreachable peers) of dead air
-    // before the install could even start. Concurrently the cost is one
-    // timeout total, and the whole phase is additionally capped: a cache pull
-    // that is slower than a clean install is not worth waiting for.
     let per_peer = Duration::from_secs(
         std::env::var("HIVE_BUILDCACHE_PEER_TIMEOUT_SECS")
             .ok()
@@ -9517,10 +9243,6 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
     );
     let attempts = peers.into_iter().map(|peer| {
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
-        // CWE-306: `/v1/buildcache/:key` is now gated by
-        // `admin::require_fleet_read`, so the pulling node presents the same
-        // short-lived mesh-internal `service` delegation `gossip::fetch` uses.
-        // A no-op when HIVE_JWT_SECRET is unset (issue() errors, no header).
         let mut req = cloud.http.get(&url);
         if let Ok(tok) = crate::auth::issue(
             "mesh-internal",
@@ -9564,7 +9286,7 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
                         verify_pulled_artifact(key, &bytes, sha.as_deref(), sig.as_deref())
                     {
                         tracing::warn!(peer = %peer, key = %key, %reason, "rejected untrusted build artifact (#22)");
-                        continue; // never write unverified bytes; try the next peer
+                        continue;
                     }
                     if tokio::fs::create_dir_all(cache_root()).await.is_ok()
                         && tokio::fs::write(dest, &bytes).await.is_ok()
@@ -9607,7 +9329,6 @@ async fn restore_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, k
             true
         }
         _ => {
-            // Corrupt/incompatible archive → drop it and install clean.
             let _ = tokio::fs::remove_file(&tar).await;
             cloud.builds.log(
                 bid,
@@ -9618,13 +9339,10 @@ async fn restore_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, k
     }
 }
 
-/// Save node_modules (+ framework cache if present) to the content-addressed cache.
-/// Best-effort, atomic (write temp + rename). The temp name carries the build id:
-/// the cache key is a CONTENT hash, so two concurrent builds with the same
-/// lockfile (same project redeployed twice, or two projects with identical deps)
-/// share a key — an un-suffixed `<key>.tar.tmp` had both `tar -cf` writers
-/// interleaving one file, and the loser's rename could then install a torn
-/// archive as the cached artifact.
+/// Saves node_modules (plus the framework cache when present) to the content-addressed cache,
+/// best-effort and atomic (temp + rename). The temp name carries the build id: the key is a CONTENT
+/// hash, so concurrent builds with the same lockfile share it, and an un-suffixed `<key>.tar.tmp`
+/// let two `tar -cf` writers interleave one file and install a torn archive.
 async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key: &str) {
     if !install_dir.join("node_modules").exists() {
         return;
@@ -9635,9 +9353,6 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     }
     let tmp = dir.join(format!("{key}.{bid}.tar.tmp"));
     let final_ = dir.join(format!("{key}.tar"));
-    // Include the framework's incremental cache too when it lives under the
-    // install dir (e.g. node_modules/.cache); .next/cache lives in node_modules
-    // for many setups but we keep this list conservative for portability.
     let mut args: Vec<String> = vec![
         "-cf".into(),
         tmp.to_string_lossy().into_owned(),
@@ -9660,22 +9375,13 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
-/// Build a `docker-compose`/`compose.yaml` repo into a container manifest.
-///
-/// Same reasoning as `dockerfile_container_manifest`: builder protocol v1 only
-/// accepts `BuildSurface::RepositoryCommands`, and `podman build` / `podman
-/// compose` need a container runtime, not a syscall sandbox — so this runs on the
-/// host, like every other container deployment. It used to be a hard refusal
-/// ("builder protocol v1 rejects Compose source builds"), which failed every
-/// compose repo even though `compose::parse_compose` and
-/// `compose::primary_service` already existed and were used elsewhere for routing.
-///
-/// Only the PRIMARY service becomes the deployment's routable function: compose
-/// expresses a whole topology, and this platform's unit of deployment is one
-/// project namespace with one public entrypoint. The primary service is built
-/// from source when it declares `build:`, and pulled from a registry when it
-/// declares `image:` — `build` wins when both are present, matching compose's own
-/// precedence.
+/// Builds a `docker-compose`/`compose.yaml` repo into a container manifest on the host, like every
+/// other container deployment (builder protocol v1 accepts only `BuildSurface::RepositoryCommands`,
+/// and `podman build`/`podman compose` need a container runtime, not a syscall sandbox). Only the
+/// PRIMARY service becomes the deployment's routable function (the unit of deployment is one
+/// project namespace with one public entrypoint): it is built from source when it declares
+/// `build:`, pulled when it declares `image:`, and `build` wins when both are present, as in
+/// compose.
 async fn compose_container_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -9751,19 +9457,14 @@ async fn compose_container_manifest(
             let t0 = now_ms();
             let mut args = vec![
                 "build".to_string(),
-                // `--layers` is what enables BuildKit-style cache mounts
-                // (`RUN --mount=type=cache,...`); without it podman fails on
-                // those steps outright, which is every docker/awesome-compose
-                // image (flask, django, …).
+                // --layers enables BuildKit-style cache mounts (`RUN --mount=type=cache`); without
+                // it such steps fail outright.
                 "--layers".to_string(),
                 "-t".to_string(),
                 tag.clone(),
                 "-f".to_string(),
                 dockerfile.to_string_lossy().to_string(),
             ];
-            // Honour `build.target:` — stopping at the declared stage is what
-            // real `docker compose` does; without it podman builds the last
-            // stage, which is a different image than the compose file described.
             if let Some(target) = build.target.as_deref() {
                 args.push("--target".to_string());
                 args.push(target.to_string());
@@ -9816,20 +9517,11 @@ async fn compose_container_manifest(
     .await
 }
 
-/// Build a `Dockerfile`/`Containerfile` repo into a container manifest.
-///
-/// WHY THIS IS NOT THE ISOLATED BUILDER. `BuildSurface::RepositoryCommands` is
-/// the only surface builder protocol v1 accepts — a `podman build` cannot run
-/// inside the gVisor builder (it needs a container runtime, not a syscall
-/// sandbox). Container deployments already run podman ON THE HOST on every
-/// backend (see the `is_container` note in `start_build`), so the image build
-/// belongs here too: no repository-command is executed, and nothing is
-/// materialized by the sealed builder. This lane used to be a hard refusal
-/// ("BUILD_ISOLATION_UNSUPPORTED_SURFACE ... rejects Dockerfile and
-/// Containerfile source builds"), which failed EVERY Dockerfile repo including
-/// the dashboard's own "Container (Dockerfile)" template; `parse_expose` was
-/// left orphaned by that refusal, which is the tell that the lane was removed
-/// rather than never written.
+/// Builds a `Dockerfile`/`Containerfile` repo into a container manifest on the host, not in the
+/// isolated builder: builder protocol v1 accepts only `BuildSurface::RepositoryCommands`, and a
+/// `podman build` needs a container runtime, not a syscall sandbox. Container deployments already
+/// run podman on the host on every backend, so no repository command executes and nothing is
+/// materialized by the sealed builder.
 async fn dockerfile_container_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
