@@ -1888,6 +1888,8 @@ export interface BuildLogLine {
 export interface Build {
   id: string;
   project: string;
+  /** Why the build reached `error` (absent on older backends and on success). */
+  error?: string | null;
   repo_url: string;
   branch: string;
   commit: string;

@@ -38,8 +38,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum Plan {
     Unchanged,
     /// `userconfig` is the file to hand the build as `npm_config_userconfig`.
-    Fallback { configured: String, reason: String, userconfig: PathBuf },
-    Dark { configured: String, reason: String },
+    Fallback {
+        configured: String,
+        reason: String,
+        userconfig: PathBuf,
+    },
+    Dark {
+        configured: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,7 +108,11 @@ fn parse_registry(raw: &str) -> Option<HostRegistry> {
         None => (host_port, default_port),
     };
     let host = host.trim().to_ascii_lowercase();
-    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
         return None;
     }
     let display = if port == default_port {
@@ -109,7 +120,11 @@ fn parse_registry(raw: &str) -> Option<HostRegistry> {
     } else {
         format!("{scheme}://{host}:{port}")
     };
-    Some(HostRegistry { display, host, port })
+    Some(HostRegistry {
+        display,
+        host,
+        port,
+    })
 }
 
 fn is_public_mirror(host: &str, extra_hosts: &str) -> bool {
@@ -151,7 +166,10 @@ async fn reachable(host: &str, port: u16) -> Result<(), String> {
     };
     match tokio::time::timeout(PROBE_TIMEOUT, race).await {
         Ok(result) => result,
-        Err(_) => Err(format!("{host}:{port}: no answer within {}s", PROBE_TIMEOUT.as_secs())),
+        Err(_) => Err(format!(
+            "{host}:{port}: no answer within {}s",
+            PROBE_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -190,7 +208,10 @@ pub async fn assess(home: &Path, global_npmrc: &Path, fallback_dir: &Path) -> Pl
     let user_npmrc = read_small(&home.join(".npmrc")).await;
     let configured = match user_npmrc.as_deref().and_then(npmrc_registry) {
         Some(value) => Some(value),
-        None => read_small(global_npmrc).await.as_deref().and_then(npmrc_registry),
+        None => read_small(global_npmrc)
+            .await
+            .as_deref()
+            .and_then(npmrc_registry),
     };
     let Some(registry) = configured.as_deref().and_then(parse_registry) else {
         return Plan::Unchanged;

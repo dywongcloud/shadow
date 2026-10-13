@@ -503,8 +503,45 @@ struct BuildCompletionGuard {
     slot: Arc<BuildCancelSlot>,
 }
 
+/// Every exit of a build task — return, `?`, cancel abort, panic — passes
+/// here, so this is where a build record is guaranteed a terminal state and
+/// where the project row learns that outcome.
 impl Drop for BuildCompletionGuard {
     fn drop(&mut self) {
+        let cancelled = self
+            .slot
+            .cancelled
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut outcome = None;
+        self.cloud.builds.update(&self.bid, |b| {
+            if matches!(b.state, DeployState::Queued | DeployState::Building) {
+                b.state = if cancelled {
+                    DeployState::Cancelled
+                } else {
+                    DeployState::Error
+                };
+                b.finished_ms.get_or_insert_with(now_ms);
+                if !cancelled {
+                    let msg = "build ended without reporting a result";
+                    b.error.get_or_insert_with(|| msg.into());
+                    b.lines.push(LogLine {
+                        ts_ms: now_ms(),
+                        line: msg.into(),
+                    });
+                }
+            }
+            outcome = crate::project_settings::LastBuild::from_build(b);
+        });
+        if let Some(outcome) = outcome {
+            if self.cloud.leader_forward_target().is_none() {
+                let _ = self.cloud.projects.record_last_build_exact(
+                    &self.slot.project,
+                    self.slot.incarnation,
+                    outcome,
+                );
+                crate::persist::persist(&self.cloud);
+            }
+        }
         self.cloud.build_cancels.complete(&self.bid, &self.slot);
     }
 }
@@ -1255,7 +1292,15 @@ pub async fn start_build(
         None => cloud.projects.ensure_incarnation(&project)?,
     };
     if let Some(team) = admission_team.as_deref() {
-        cloud.projects.set_team_exact(&project, incarnation, team)?;
+        cloud
+            .projects
+            .claim_team_exact(&project, incarnation, team)
+            .map_err(|error| match error {
+                crate::project_settings::ProjectClaimError::OwnedByOther => {
+                    anyhow::anyhow!("project {project} belongs to a different team")
+                }
+                crate::project_settings::ProjectClaimError::Incarnation(error) => error.into(),
+            })?;
     }
     if let Some(root) = req
         .root_dir
@@ -1266,6 +1311,12 @@ pub async fn start_build(
         cloud
             .projects
             .set_root_dir_exact(&project, incarnation, root)?;
+    }
+    let started_ms = now_ms();
+    if cloud.leader_forward_target().is_none() {
+        let _ = cloud
+            .projects
+            .record_build_started_exact(&project, incarnation, &id, started_ms);
     }
     crate::admin::adopt_authorized_legacy_deployments(
         &cloud,
@@ -1575,8 +1626,8 @@ const BROWSER_ADAPTER_FILE_SUFFIX: &str = ".cjs";
 /// `fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES` (256 KiB); the adapter itself
 /// is ~26 KiB, so this leaves real headroom and is checked BEFORE the string
 /// is built rather than discovered as a rejected bundle afterwards.
-const BROWSER_ADAPTER_EMBED_MAX_BYTES: usize = fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES
-    - 64 * 1024;
+const BROWSER_ADAPTER_EMBED_MAX_BYTES: usize =
+    fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES - 64 * 1024;
 
 /// The framework server-entry probe table: where a BUILT server actually
 /// lives, in one deterministic order. Deliberately WIDER than
@@ -5490,6 +5541,11 @@ async fn run_build(
         b.deployment_id = Some(info.id.to_string());
         b.alias = (!build_failed).then(|| self_alias.clone());
     });
+    if !build_failed {
+        let _ = cloud
+            .projects
+            .mark_first_deployed_exact(&project, incarnation, now_ms());
+    }
     // Persist HERE, not only at the tail of this function: `deploy_full` above
     // already minted the (in-memory-only) Deployment record, and this update
     // just settled the Build record's terminal state — both are the durable
@@ -6651,6 +6707,15 @@ async fn mirror_remote_build(
                     b.alias = Some(a.clone());
                 }
             });
+            if let Some(owner) = cloud
+                .builds
+                .get(bid)
+                .and_then(|b| b.project_incarnation.map(|inc| (b.project, inc)))
+            {
+                let _ = cloud
+                    .projects
+                    .mark_first_deployed_exact(&owner.0, owner.1, now_ms());
+            }
             cloud.builds.log(bid, format!("✓ {node}: deployment ready"));
             return TargetOutcome::Ready;
         }
@@ -10190,12 +10255,16 @@ impl IsolatedBuild {
         cloud: &Arc<CloudState>,
         bid: &str,
     ) -> Option<(&'static str, String)> {
-        use crate::build_registry::{assess, Plan, FALLBACK_ENV_KEY, GLOBAL_NPMRC, PUBLIC_REGISTRY};
+        use crate::build_registry::{
+            assess, Plan, FALLBACK_ENV_KEY, GLOBAL_NPMRC, PUBLIC_REGISTRY,
+        };
         if self.registry.is_none() {
             let fallback_dir = crate::persist::data_dir();
             let plan = assess(home, Path::new(GLOBAL_NPMRC), &fallback_dir).await;
             match &plan {
-                Plan::Fallback { configured, reason, .. } => {
+                Plan::Fallback {
+                    configured, reason, ..
+                } => {
                     cloud.builds.log(
                         bid,
                         format!(
@@ -11184,9 +11253,9 @@ async fn compose_container_manifest(
     let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
     let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
     let log = |s: String| cloud.builds.log(bid, s);
-    let text = tokio::fs::read_to_string(compose_path).await.map_err(|error| {
-        anyhow::anyhow!("cannot read {}: {error}", compose_path.display())
-    })?;
+    let text = tokio::fs::read_to_string(compose_path)
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", compose_path.display()))?;
     let services = crate::compose::parse_compose(&text)?;
     anyhow::ensure!(
         !services.is_empty(),
@@ -11912,28 +11981,30 @@ async fn image_container_manifest(
     // Pull the image (fail the build with the registry error if it can't be fetched —
     // e.g. not found / private registry needing auth).
     if skip_pull {
-        log(format!("Using locally built image {image} (no registry pull)."));
+        log(format!(
+            "Using locally built image {image} (no registry pull)."
+        ));
     } else {
-    log(format!("Pulling image {image} …"));
-    let t0 = now_ms();
-    let out = Command::new("podman")
-        .args(["pull", image])
-        .env("PATH", &path)
-        .output()
-        .await?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("pull failed");
-        anyhow::bail!("podman pull {image} failed: {}", msg.trim());
-    }
-    log(format!(
-        "Pulled {image} in {}ms",
-        now_ms().saturating_sub(t0)
-    ));
+        log(format!("Pulling image {image} …"));
+        let t0 = now_ms();
+        let out = Command::new("podman")
+            .args(["pull", image])
+            .env("PATH", &path)
+            .output()
+            .await?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("pull failed");
+            anyhow::bail!("podman pull {image} failed: {}", msg.trim());
+        }
+        log(format!(
+            "Pulled {image} in {}ms",
+            now_ms().saturating_sub(t0)
+        ));
     }
 
     // Port + protocol: explicit values win outright. Otherwise auto-detect from the

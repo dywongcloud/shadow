@@ -850,7 +850,9 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
 
 /// Apply a loaded snapshot to a freshly constructed CloudState (boot restore).
 pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
-    cloud.projects.rename_tombstones_load(snap.project_rename_tombstones.clone());
+    cloud
+        .projects
+        .rename_tombstones_load(snap.project_rename_tombstones.clone());
     cloud.projects.merge_synced(SyncedProjects {
         rows: snap.projects.into_iter().collect(),
         tombstones: snap.project_tombstones,
@@ -1102,6 +1104,19 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // own per-build log records internally (git.rs) -- no duplicate needed
     // here, only the DeployRecord-side gap above was missing.
     cloud.builds.load(snap.builds);
+    // Rows learn the outcome of builds that finished before the row carried
+    // one (first boot after the field arrived) and of builds `BuildStore::load`
+    // just finalized as interrupted.
+    for build in cloud.builds.list() {
+        let Some(incarnation) = build.project_incarnation else {
+            continue;
+        };
+        if let Some(outcome) = crate::project_settings::LastBuild::from_build(&build) {
+            let _ = cloud
+                .projects
+                .record_last_build_exact(&build.project, incarnation, outcome);
+        }
+    }
     cloud.incidents.load(snap.incidents);
     cloud.push.load(snap.push);
     cloud.apikeys.load(snap.apikeys);

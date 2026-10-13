@@ -25,15 +25,13 @@ fn jb(j: axum::Json<serde_json::Value>) -> Vec<u8> {
 /// `{"error": {...}}` envelope carrying the HTTP status, so a peer's refusal
 /// (plan gate, malformed filter) reaches the coordinator as a refusal instead
 /// of an empty array that reads as "no logs".
-fn jb_logs(
-    r: Result<(HeaderMap, axum::Json<serde_json::Value>), (StatusCode, String)>,
-) -> Vec<u8> {
+fn jb_logs(r: Result<(HeaderMap, axum::Json<serde_json::Value>), (StatusCode, String)>) -> Vec<u8> {
     match r {
         Ok((_hdrs, j)) => jb(j),
         Err((st, msg)) => {
-            let body = serde_json::from_str::<serde_json::Value>(&msg).unwrap_or_else(|_| {
-                serde_json::json!({ "error": { "code": "LOGS_ERROR", "message": msg } })
-            });
+            let body = serde_json::from_str::<serde_json::Value>(&msg).unwrap_or_else(
+                |_| serde_json::json!({ "error": { "code": "LOGS_ERROR", "message": msg } }),
+            );
             let mut v = body;
             if let Some(o) = v.get_mut("error").and_then(|e| e.as_object_mut()) {
                 o.insert("status".into(), serde_json::json!(st.as_u16()));
@@ -695,13 +693,16 @@ async fn dispatch_verified(
                     }
                 })
                 .unwrap_or_default();
-            let new = qparam(p, "name").unwrap_or_default().trim().to_ascii_lowercase();
+            let new = qparam(p, "name")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
             // Same shape rules as the HTTP route: a name that sanitizes
             // differently would produce a volume/checkout path that does not
             // match its own lookup prefix.
             if crate::admin::invalid_project_name(&new).is_some() {
                 return serde_json::to_vec(&serde_json::json!({ "error": "invalid project name" }))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
             }
             let rename_ms = match qparam(p, "rename_ms") {
                 Some(raw) => match raw
@@ -730,9 +731,10 @@ async fn dispatch_verified(
             }
             let owner = cloud.projects.team_of(&project);
             let owns_settings = crate::admin::norm(&owner) == team;
-            let owns_deploys = cloud.gw.list().iter().any(|d| {
-                d.project == project && crate::admin::record_tenant(&d.tenant) == team
-            });
+            let owns_deploys =
+                cloud.gw.list().iter().any(|d| {
+                    d.project == project && crate::admin::record_tenant(&d.tenant) == team
+                });
             let owns_relational = crate::relational::projects_for_team(&team)
                 .await
                 .iter()
@@ -1126,6 +1128,30 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
+        // Tenant project inventory: a follower proxies the dashboard's summary
+        // read to the leader (the row writer) for read-your-writes.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/gitops/projects") => {
+            let query = p.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let view = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("view="))
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::gitops_projects(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Query(crate::admin::GitopsProjectsQuery {
+                    view: Some(view),
+                    local: Some(true),
+                }),
+            )
+            .await
+            {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
         // Build status/log polling for the fanout mirror (coordinator streams the
         // target's build into its own record so the dashboard UX is unchanged).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/builds/") => {
@@ -1374,17 +1400,15 @@ async fn dispatch_verified(
         // Request/routing event log: recorded on the SERVING node, so the coordinator
         // proxies here to read a placed project's logs. `local=true` rides in the query
         // so this node returns only its own events (no re-fan-out → no loop).
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
-            jb_logs(
-                crate::admin::logs(
-                    State(cloud.clone()),
-                    team_headers(p),
-                    team_claims(p),
-                    logs_query(p),
-                )
-                .await,
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => jb_logs(
+            crate::admin::logs(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                logs_query(p),
             )
-        }
+            .await,
+        ),
         // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY
         // its own jobs (local=true) for the requesting team. Same tenant-scoped
         // shape as /v1/logs above.

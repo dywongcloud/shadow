@@ -17,6 +17,7 @@ import {
   ChevronRight,
   Activity,
   Loader2,
+  CircleX,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
@@ -40,8 +41,9 @@ const ServiceGraph = dynamic(
     ),
   }
 );
-import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview } from "@/lib/api";
-import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
+import { apiGet, apiSend, usePoll, currentTeam, type Deployment, type Metrics, type Overview } from "@/lib/api";
+import { usePendingBuilds, removePendingBuild, mergePending, addPendingBuild } from "@/lib/pending-builds";
+import { SUMMARY_PATH, type ProjectSummary } from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RawPortConnections } from "@/components/raw-port-connections";
@@ -65,6 +67,12 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const searchParams = useSearchParams();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
+  // The project's own inventory row: the one source that still knows a project
+  // whose builds never produced a deployment (its last build and error live
+  // there). An older backend answers 404 here and the page keeps working on
+  // deployments alone.
+  const { data: summaryRows, refresh: refreshSummary } = usePoll<ProjectSummary[]>(SUMMARY_PATH, 5000);
+  const summary = (summaryRows ?? []).find((row) => row.project === name) ?? null;
   // Per-project observability comes from the TENANT-SCOPED metrics endpoint, not
   // /v1/overview: overview's counters (requests/cdn/concurrency) are platform-wide
   // and operator-only — regular team members receive a stripped response without
@@ -83,6 +91,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [retryError, setRetryError] = useState("");
   // A redeploy doesn't create a deployment row until its build FINISHES (the live
   // version keeps serving meanwhile). The in-flight "Building" rows come from a
   // PERSISTENT store (localStorage) so they survive navigating away + reload — the
@@ -102,7 +111,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const pendingCount = pendingRows.length;
   useEffect(() => {
     refresh();
-  }, [pendingCount, refresh]);
+    refreshSummary();
+  }, [pendingCount, refresh, refreshSummary]);
   const prod = mine.find((d) => d.production) ?? mine[0];
   // The overview card's URL. When no production exists and `prod` fell back to
   // a PREVIEW record, its own alias is the honest URL — `prod.alias` is the
@@ -110,6 +120,17 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // For a real production record deploymentSelfAlias returns d.alias verbatim.
   const prodAlias = prod ? (deploymentSelfAlias(prod) || prod.alias) : undefined;
   const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
+  // A project with no deployment at all (its builds failed, were cancelled or
+  // are still running): the row exists and the name is reserved, so the page
+  // must offer retry and delete instead of a production card that never loads.
+  const empty = deps !== null && mine.length === 0;
+  const lastBuild = summary?.last_build ?? null;
+  const building = summary?.building ?? null;
+  const retrySource = lastBuild?.repo_url && !lastBuild.repo_url.startsWith("upload://") && !lastBuild.repo_url.startsWith("image://")
+    ? lastBuild.repo_url
+    : summary?.repo_url && !summary.repo_url.startsWith("upload://") && !summary.repo_url.startsWith("image://")
+      ? summary.repo_url
+      : "";
 
   async function promote(id: string) {
     setBusy(id);
@@ -155,9 +176,23 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     try { await apiSend("DELETE", `/v1/projects/${encodeURIComponent(name)}`); router.push("/projects"); }
     catch (e) { alert(String(e)); setBusy(""); }
   }
+  /** Rebuild a project that has no deployment from its last build's source
+   *  (the backend's redeploy falls back to that source for exactly this case). */
+  async function retryBuild() {
+    setBusy("retry");
+    setRetryError("");
+    try {
+      const r = await apiSend<{ build_id: string }>("POST", `/v1/projects/${encodeURIComponent(name)}/redeploy`, { use_cache: false, target: "production" });
+      addPendingBuild({ id: r.build_id, project: name, team: currentTeam(), env: "production" });
+      router.push(`/deploy/${encodeURIComponent(r.build_id)}`);
+    } catch (e) {
+      setRetryError(String(e));
+      setBusy("");
+    }
+  }
 
   const checklist = [
-    { label: "Connect Git Repository", done: !!prod?.git },
+    { label: "Connect Git Repository", done: !!prod?.git || !!retrySource },
     { label: "Add Custom Domain", done: false },
     { label: "Preview Deployment", done: mine.length > 0 },
     { label: "Enable Web Analytics", done: true },
@@ -165,6 +200,9 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     { label: "Enable Firewall", done: ov?.waf_managed ?? false },
   ];
   const doneCount = checklist.filter((c) => c.done).length;
+  const headerDot = prod
+    ? prod.state === "ready" ? "bg-green" : prod.state === "error" ? "bg-red-400" : "bg-amber-400"
+    : building ? "bg-amber-400" : lastBuild?.state === "error" ? "bg-red-400" : "bg-muted";
 
   return (
     <div>
@@ -174,7 +212,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           <Triangle />
           <div>
             <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-green" />
+              <span className={`h-2 w-2 rounded-full ${headerDot}`} />
               <h1 className="text-xl font-semibold">{name}</h1>
             </div>
             {prod && (
@@ -182,33 +220,46 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 {deploymentHost(prodAlias, prod.region_code)} <ExternalLink className="inline h-3 w-3" />
               </a>
             )}
+            {!prod && empty && (
+              <div className="text-sm text-muted">
+                {building ? "First build running…" : lastBuild ? `Last build ${lastBuild.state} — no deployment yet` : "No deployments yet"}
+              </div>
+            )}
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
-            {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
-          </Button>
+          {empty ? (
+            <Button variant="outline" onClick={retryBuild} disabled={!retrySource || !!busy || !!building}>
+              {busy === "retry" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Retry build
+            </Button>
+          ) : (
+            <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
+              {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
+            </Button>
+          )}
           <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
             <RotateCcw className="h-4 w-4" /> Instant Rollback
           </Button>
           <Button variant="danger" onClick={deleteProject} disabled={busy === "project"}>
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
-          <a
-            href={deploymentUrl(prodAlias, prod?.region_code)}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(e) => {
-              // With the zkauth experiment on, mint an anonymous proof + bootstrap
-              // the preview instead of a plain open. Otherwise the link proceeds.
-              if (zkEnabled && prod) {
-                e.preventDefault();
-                openDeployment(prodAlias || prod.alias, name, prod.region_code);
-              }
-            }}
-          >
-            <Button>Visit</Button>
-          </a>
+          {prod && (
+            <a
+              href={deploymentUrl(prodAlias, prod?.region_code)}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                // With the zkauth experiment on, mint an anonymous proof + bootstrap
+                // the preview instead of a plain open. Otherwise the link proceeds.
+                if (zkEnabled && prod) {
+                  e.preventDefault();
+                  openDeployment(prodAlias || prod.alias, name, prod.region_code);
+                }
+              }}
+            >
+              <Button>Visit</Button>
+            </a>
+          )}
         </div>
       </div>
 
@@ -228,7 +279,18 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
         <DeploymentResources deploymentId={prod?.id} />
       ) : tab === "overview" ? (
         <>
-          {/* Production Deployment */}
+          {empty ? (
+            <EmptyProjectCard
+              name={name}
+              summary={summary}
+              retrySource={retrySource}
+              busy={busy}
+              retryError={retryError}
+              onRetry={retryBuild}
+              onDelete={deleteProject}
+            />
+          ) : (
+          /* Production Deployment */
           <Card className="mb-6 p-0">
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
@@ -267,7 +329,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                   <div>
                     <div className="text-muted">Status</div>
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2 w-2 rounded-full bg-green" />
+                      <span className={`h-2 w-2 rounded-full ${prod?.state === "ready" ? "bg-green" : prod?.state === "error" ? "bg-red-400" : "bg-amber-400"}`} />
                       {prod ? prod.state.charAt(0).toUpperCase() + prod.state.slice(1) : "—"}
                     </div>
                   </div>
@@ -290,6 +352,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               </div>
             </div>
           </Card>
+          )}
 
           {/* Lower cards */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -440,7 +503,15 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 </Td>
               </tr>
             ))}
-            {!mine.length && !pendingRows.length && <tr><Td className="text-secondary">No deployments.</Td></tr>}
+            {!mine.length && !pendingRows.length && (
+              <tr>
+                <Td className="text-secondary">
+                  {lastBuild
+                    ? <>No deployments. The last build (<a className="text-link hover:underline" href={`/deploy/${encodeURIComponent(lastBuild.id)}`}>{lastBuild.id}</a>) ended {lastBuild.state}{lastBuild.error ? `: ${lastBuild.error.split("\n")[0]}` : ""}.</>
+                    : "No deployments."}
+                </Td>
+              </tr>
+            )}
           </tbody>
         </Table>
         </div>
@@ -462,8 +533,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
       {createOpen && (
         <CreateDeploymentModal
           project={name}
-          repoUrl={prod?.git?.repo_url ?? ""}
-          branch={prod?.git?.branch}
+          repoUrl={prod?.git?.repo_url ?? retrySource}
+          branch={prod?.git?.branch ?? lastBuild?.branch}
           onClose={() => setCreateOpen(false)}
           onDone={() => {
             setTab("deployments");
@@ -472,6 +543,74 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
         />
       )}
     </div>
+  );
+}
+
+/** The overview card for a project that has no deployment: why (the last
+ *  build's outcome and error), and the two things the user can do about it. */
+function EmptyProjectCard({ name, summary, retrySource, busy, retryError, onRetry, onDelete }: {
+  name: string;
+  summary: ProjectSummary | null;
+  retrySource: string;
+  busy: string;
+  retryError: string;
+  onRetry: () => void;
+  onDelete: () => void;
+}) {
+  const last = summary?.last_build ?? null;
+  const building = summary?.building ?? null;
+  const settings = `/projects/${encodeURIComponent(name)}/settings`;
+  return (
+    <Card className="mb-6 p-0">
+      <div className="flex items-center justify-between border-b border-border px-5 py-3">
+        <span className="font-medium">No deployment yet</span>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={onRetry} disabled={!retrySource || !!busy || !!building}>
+            {busy === "retry" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Retry build
+          </Button>
+          <Button variant="danger" onClick={onDelete} disabled={busy === "project"}>
+            <Trash2 className="h-4 w-4" /> Delete project
+          </Button>
+        </div>
+      </div>
+      <div className="flex flex-col gap-4 p-5 text-sm">
+        {building ? (
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
+            First build <a className="font-mono text-link hover:underline" href={`/deploy/${encodeURIComponent(building.id)}`}>{building.id}</a> running since {timeAgo(building.started_ms)}.
+          </div>
+        ) : last ? (
+          <>
+            <div className="flex items-center gap-2">
+              <CircleX className={`h-4 w-4 ${last.state === "error" ? "text-red-500" : "text-muted"}`} />
+              Build <a className="font-mono text-link hover:underline" href={`/deploy/${encodeURIComponent(last.id)}`}>{last.id}</a> ended <span className="font-medium">{last.state}</span> {timeAgo(last.finished_ms || last.started_ms)}
+              {last.state === "ready" && " without registering a deployment"}
+            </div>
+            {last.error && (
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-subtle/50 p-3 font-mono text-xs text-red-500">{last.error}</pre>
+            )}
+            <div className="text-xs text-muted">
+              Build logs may have expired on the node that ran them; the error above is kept with the project.
+            </div>
+          </>
+        ) : summary ? (
+          <div className="text-secondary">This project exists but has never built. Import its repository again under this name, or delete it.</div>
+        ) : (
+          <div className="flex items-center gap-2 text-secondary"><Loader2 className="h-4 w-4 animate-spin" /> Looking up the project…</div>
+        )}
+        {retryError && <div className="text-red-500">{retryError}</div>}
+        <div className="flex flex-wrap gap-4 text-xs">
+          {retrySource ? (
+            <span className="inline-flex items-center gap-1 text-secondary"><Github className="h-3.5 w-3.5" /> {retrySource.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/\.git$/, "")}{last?.branch ? ` @ ${last.branch}` : ""}{summary?.root_dir ? ` · ${summary.root_dir}` : ""}</span>
+          ) : (
+            <span className="text-secondary">No git source recorded — retry by importing the repository again under this name.</span>
+          )}
+          <Link href={`${settings}/environment-variables`} className="text-link hover:underline">Environment variables</Link>
+          <Link href={`${settings}/build`} className="text-link hover:underline">Build settings</Link>
+          <Link href={`${settings}/git`} className="text-link hover:underline">Git</Link>
+        </div>
+      </div>
+    </Card>
   );
 }
 

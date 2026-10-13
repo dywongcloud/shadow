@@ -415,6 +415,83 @@ pub struct ProjectSettings {
     /// dashboard surface the gap and offer a retry.
     #[serde(default)]
     pub git_ci: Option<GitCiStatus>,
+    /// Terminal outcome of the newest build the coordinator finished for this
+    /// incarnation — the only build state stored here; an in-flight build is
+    /// derived from `last_build_id` against the live `BuildStore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_build: Option<LastBuild>,
+    /// Newest build admitted for this incarnation (empty = none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_build_id: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_build_started_ms: u64,
+    /// Grow-only: when this incarnation's first deployment registered. `0`
+    /// means the project has never deployed, which is what makes its name
+    /// reusable by its own tenant.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_deployed_ms: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Longest `LastBuild::error` kept in the replicated row.
+pub const MAX_LAST_BUILD_ERROR_BYTES: usize = 400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LastBuildState {
+    Ready,
+    Error,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastBuild {
+    pub id: String,
+    pub state: LastBuildState,
+    pub started_ms: u64,
+    pub finished_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+}
+
+impl LastBuild {
+    /// `None` while the build is still Queued/Building.
+    pub fn from_build(build: &crate::git::Build) -> Option<Self> {
+        let state = match build.state {
+            fluid_core::DeployState::Ready => LastBuildState::Ready,
+            fluid_core::DeployState::Error => LastBuildState::Error,
+            fluid_core::DeployState::Cancelled => LastBuildState::Cancelled,
+            fluid_core::DeployState::Queued | fluid_core::DeployState::Building => return None,
+        };
+        let mut error = build.error.clone().unwrap_or_default();
+        if error.len() > MAX_LAST_BUILD_ERROR_BYTES {
+            let mut cut = MAX_LAST_BUILD_ERROR_BYTES;
+            while !error.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            error.truncate(cut);
+            error.push('…');
+        }
+        Some(LastBuild {
+            id: build.id.clone(),
+            state,
+            started_ms: build.started_ms,
+            finished_ms: build.finished_ms.unwrap_or(build.started_ms),
+            repo_url: build.repo_url.clone(),
+            branch: build.branch.clone(),
+            error,
+            deployment_id: build.deployment_id.clone(),
+        })
+    }
 }
 
 /// See [`ProjectSettings::git_ci`].
@@ -469,6 +546,10 @@ impl Default for ProjectSettings {
             sandbox_allow_sudo: false,
             cron_enabled: true,
             git_ci: None,
+            last_build: None,
+            last_build_id: String::new(),
+            last_build_started_ms: 0,
+            first_deployed_ms: 0,
         }
     }
 }
@@ -522,6 +603,23 @@ impl std::fmt::Display for ProjectIncarnationError {
 }
 
 impl std::error::Error for ProjectIncarnationError {}
+
+#[derive(Debug)]
+pub enum ProjectClaimError {
+    OwnedByOther,
+    Incarnation(ProjectIncarnationError),
+}
+
+impl std::fmt::Display for ProjectClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectClaimError::OwnedByOther => write!(f, "project belongs to a different team"),
+            ProjectClaimError::Incarnation(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectClaimError {}
 
 /// Old names a project was renamed FROM (old name -> new name). Populated by
 /// every rename this process applies and rebuilt at boot from the persisted
@@ -603,8 +701,7 @@ pub struct ProjectStore {
     /// platform-global: the old name stays reserved so no future project can
     /// claim it and inherit its traffic, and old labels can be answered with a
     /// permanent redirect (see [`ProjectStore::rename_row`]).
-    rename_tombstones:
-        RwLock<std::collections::BTreeMap<String, ProjectRenameTombstone>>,
+    rename_tombstones: RwLock<std::collections::BTreeMap<String, ProjectRenameTombstone>>,
     incarnation_tombstones: RwLock<
         std::collections::BTreeMap<
             String,
@@ -1317,7 +1414,7 @@ impl ProjectStore {
             .copied()
     }
 
-/// Rename a project's settings row IN PLACE under the lifecycle writer.
+    /// Rename a project's settings row IN PLACE under the lifecycle writer.
     ///
     /// The INCARNATION is invariant: this is the same project with a new name,
     /// not a new identity — minting a fresh one would orphan every in-flight
@@ -1334,12 +1431,7 @@ impl ProjectStore {
     ///   404. Reservation is what makes that redirect safe.
     ///
     /// Returns the moved row, or `None` when this node held no row to move.
-    pub fn rename_row(
-        &self,
-        from: &str,
-        to: &str,
-        rename_ms: u64,
-    ) -> Option<ProjectSettings> {
+    pub fn rename_row(&self, from: &str, to: &str, rename_ms: u64) -> Option<ProjectSettings> {
         if from == to {
             return None;
         }
@@ -1447,7 +1539,9 @@ impl ProjectStore {
         self.rename_tombstones.read().get(name).cloned()
     }
 
-    pub fn rename_tombstones_snapshot(&self) -> std::collections::BTreeMap<String, ProjectRenameTombstone> {
+    pub fn rename_tombstones_snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<String, ProjectRenameTombstone> {
         self.rename_tombstones.read().clone()
     }
 
@@ -2002,6 +2096,113 @@ impl ProjectStore {
             });
         }
         Ok(())
+    }
+
+    /// Compare-and-set ownership: an untagged row is claimed, the owner's own
+    /// claim is a no-op, another tenant's row is refused. Two tenants importing
+    /// one new name concurrently can no longer both "win" the row.
+    pub fn claim_team_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        team: &str,
+    ) -> Result<(), ProjectClaimError> {
+        let owner = {
+            let map = self.map.read();
+            map.get(project).map(|row| row.team.trim().to_string())
+        };
+        match owner.as_deref() {
+            Some(current) if current == team => Ok(()),
+            Some(current) if !current.is_empty() && current != crate::admin::UNTAGGED_TENANT => {
+                Err(ProjectClaimError::OwnedByOther)
+            }
+            _ => self
+                .set_team_exact(project, expected, team)
+                .map_err(ProjectClaimError::Incarnation),
+        }
+    }
+
+    /// Rows a tenant owns, by the stored tag alone (`record_tenant` semantics:
+    /// an untagged row belongs to nobody), cloned under one read lock.
+    pub fn rows_for_tenant(&self, tenant: &str) -> Vec<(String, ProjectSettings)> {
+        self.map
+            .read()
+            .iter()
+            .filter(|(_, row)| crate::admin::record_tenant(row.team.trim()) == tenant)
+            .map(|(name, row)| (name.clone(), row.clone()))
+            .collect()
+    }
+
+    /// A build was admitted for this incarnation; only the newest admission
+    /// is remembered.
+    pub fn record_build_started_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        build_id: &str,
+        started_ms: u64,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            if started_ms >= row.last_build_started_ms {
+                row.last_build_id = build_id.to_string();
+                row.last_build_started_ms = started_ms;
+            }
+        })
+    }
+
+    /// The terminal outcome of a build; an older build never overwrites a
+    /// newer one, and the same build's outcome is idempotent.
+    pub fn record_last_build_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        outcome: LastBuild,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            let newer = row
+                .last_build
+                .as_ref()
+                .map(|current| current.id == outcome.id || outcome.started_ms >= current.started_ms)
+                .unwrap_or(true);
+            if newer {
+                if outcome.started_ms >= row.last_build_started_ms {
+                    row.last_build_id = outcome.id.clone();
+                    row.last_build_started_ms = outcome.started_ms;
+                }
+                row.last_build = Some(outcome);
+            }
+        })
+    }
+
+    /// Grow-only: the first deployment this incarnation ever registered.
+    pub fn mark_first_deployed_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        at_ms: u64,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            if row.first_deployed_ms == 0 {
+                row.first_deployed_ms = at_ms;
+            }
+        })
+    }
+
+    /// A never-deployed project is being imported again by its owner: the
+    /// attempt-specific settings follow the new request, curated settings
+    /// (env, domains, explicit build commands, owned resources) stay.
+    pub fn reset_for_reuse_exact(
+        &self,
+        project: &str,
+        expected: fluid_core::ProjectIncarnation,
+        root_dir: &str,
+        branch: &str,
+    ) -> Result<(), ProjectIncarnationError> {
+        self.mutate_exact(project, expected, |row| {
+            row.build.root_dir = root_dir.to_string();
+            row.production_branch = branch.to_string();
+            row.inference = None;
+        })
     }
 
     /// Persist the monorepo subdirectory so redeploys keep building it.

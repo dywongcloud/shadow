@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-10-13 — a failed first build no longer hides its project or locks its name
+
+A project whose first build failed had a `ProjectSettings` row (created at
+admission by `git::start_build`) and no deployment, and every dashboard list
+derived projects from `/deployments` alone — so the project was invisible, the
+pending row vanished on `error`, and importing the same name again answered
+409. Witnessed on the leader: 62 of 98 `personal` rows had no deployment; the
+reporting user's tenant held exactly their two failed imports (`rest`,
+`security`) plus one older row, none deletable or retryable from the UI.
+
+- **Rows carry the newest build's outcome.** `ProjectSettings.last_build`
+  (terminal states only, error capped at 400 bytes) is written from the one
+  chokepoint every build exit crosses, `BuildCompletionGuard::drop`, which also
+  finalizes a build record that never reported (Cancelled if the slot was
+  cancelled, else Error); `last_build_id` records the admission and the live
+  `BuildStore` decides "building"; `first_deployed_ms` is grow-only proof that
+  a project ever deployed. Boot replays every terminal build record into its
+  row, so builds that failed before the field existed are listed after a roll.
+- **`GET /v1/gitops/projects?view=summary`** (`project_inventory.rs`): every
+  row the tenant owns (`record_tenant` on the stored tag, never `norm`), one
+  pass over gateway + peer deployments for counts, no relational tier, served
+  through the leader with a 3 s budget then locally, `require_auth_read`, and
+  a `gossip::dispatch` arm. The default view is byte-identical.
+- **Re-importing the same repository under an own never-deployed name
+  retries the project** (`start_named_deploy` → `project_inventory::name_reuse`):
+  root dir and branch follow the new request, `inference` resets, env/domains/
+  owned resources stay; an in-flight build answers 409; a different repository
+  keeps the 409 with text that names the retry/delete paths. Ownership is a
+  compare-and-set (`claim_team_exact`) so two tenants cannot both claim one
+  new name. `/v1/projects/:p/redeploy` falls back to the last build's source
+  (never `upload://`); webhook and git-poll still ignore never-deployed rows.
+  `HIVE_MAX_EMPTY_PROJECTS` (25) bounds never-deployed rows per tenant (429).
+- **Dashboard**: `lib/projects.ts` merges the inventory into the deployment
+  list (deployment first, keyed by name, ordered by activity); cards show
+  building/failed/no-deployment states with the error's first line; the
+  project page renders an empty-project card (error, build-log link, Retry
+  via redeploy, Delete, settings links) instead of a spinner and a dead Visit
+  button; `/deploy/[id]` links a failed build to its project. CLI:
+  `shadw deploy`/`build logs --follow` exit 1 on error/cancelled with the
+  retry/delete hint, `projects list` gains a LAST BUILD column.
+- Not rolled.
+
 ## 2026-10-13 — san-jose builds died on a dead resolver behind the provider npm mirror
 
 Every uncached `npm ci` / `npm install` on fc-sanjose failed: `npm ci` with

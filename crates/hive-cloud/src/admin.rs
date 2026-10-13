@@ -2990,6 +2990,28 @@ pub(crate) async fn start_named_deploy(
             .find_key_ci(requested.trim())
             .map(|k| norm(&c.projects.team_of(&k)) == t)
             .unwrap_or(false);
+    // An own project that never deployed (its first build failed) and whose
+    // last build pulled this same repository is being retried, not created:
+    // reuse its row, as `redeploy: true` would, instead of answering 409.
+    let reuse = if req.no_fanout || requested.trim().is_empty() || redeploy_existing {
+        None
+    } else {
+        c.projects.find_key_ci(requested.trim()).map(|key| {
+            let verdict = crate::project_inventory::name_reuse(c, &key, &t, &req.repo_url);
+            (key, verdict)
+        })
+    };
+    if let Some((key, crate::project_inventory::NameReuse::InFlight { build_id })) = &reuse {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("A build ({build_id}) for project \"{key}\" is still running. Wait for it or cancel it first."),
+        ));
+    }
+    let reuse_empty = matches!(
+        reuse,
+        Some((_, crate::project_inventory::NameReuse::ReuseEmpty))
+    );
+    let redeploy_existing = redeploy_existing || reuse_empty;
     if req.redeploy && expected_incarnation.is_none() && !redeploy_existing {
         return Err((
             StatusCode::NOT_FOUND,
@@ -3041,9 +3063,21 @@ pub(crate) async fn start_named_deploy(
             .find_key_ci(requested.trim())
             .map(|k| project_owned_by(c, &k, &t))
             .unwrap_or(false);
+        let own_never_deployed = taken_by_caller
+            && c.projects
+                .get_if_set(requested.trim())
+                .is_some_and(|row| row.first_deployed_ms == 0 && !row.last_build_id.is_empty());
         return Err((
             StatusCode::CONFLICT,
-            if taken_by_caller {
+            if own_never_deployed {
+                format!(
+                    "You already have a project named \"{0}\" whose builds have not produced a \
+                     deployment yet. Retry it from its project page (it is listed in Projects), \
+                     delete it there, or choose a different name. Importing the same repository \
+                     under this name retries it automatically.",
+                    requested.trim()
+                )
+            } else if taken_by_caller {
                 format!(
                     "You already have a project named \"{}\". Choose a different name.",
                     requested.trim()
@@ -3089,6 +3123,20 @@ pub(crate) async fn start_named_deploy(
                     ));
                 }
             }
+            // Every failed first build leaves a row behind; a tenant that keeps
+            // minting new names instead of retrying is bounded here (the
+            // retry path reuses the row and never counts).
+            let empty = crate::project_inventory::empty_project_count(c, &t);
+            let max_empty = crate::project_inventory::max_empty_projects();
+            if empty >= max_empty {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "You have {empty} projects whose first build never produced a deployment \
+                         (limit {max_empty}). Retry or delete some of them before creating another."
+                    ),
+                ));
+            }
         }
     }
     // Ownership check: a project already owned by a DIFFERENT tenant must never be
@@ -3122,6 +3170,18 @@ pub(crate) async fn start_named_deploy(
             None => None,
         },
     };
+    if reuse_empty {
+        if let Some(incarnation) = admitted_incarnation {
+            c.projects
+                .reset_for_reuse_exact(
+                    &project,
+                    incarnation,
+                    req.root_dir.as_deref().map(str::trim).unwrap_or(""),
+                    req.branch.as_deref().map(str::trim).unwrap_or(""),
+                )
+                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        }
+    }
     req.project = Some(project.clone());
     let build_id = crate::git::start_build(c.clone(), req, admitted_incarnation, Some(t.clone()))
         .await
@@ -6563,10 +6623,24 @@ async fn project_rename(
     }
     // Four authorization tiers, identical to `project_delete`: anything the
     // platform will LIST for a tenant must be actionable by it.
-    let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
-        || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || crate::relational::projects_for_team(&t).await.iter().any(|p| p == &project);
+    let authorized = c
+        .projects
+        .get_if_set(&project)
+        .map(|s| norm(&s.team) == t)
+        .unwrap_or(false)
+        || c.gw
+            .list()
+            .iter()
+            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || c.peer_deployments
+            .read()
+            .values()
+            .flatten()
+            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        || crate::relational::projects_for_team(&t)
+            .await
+            .iter()
+            .any(|p| p == &project);
     if !authorized {
         if !cascade {
             return Err((
@@ -6619,7 +6693,8 @@ async fn project_rename(
         // Authorization is now witnessed by at least one owner. Record the
         // reservation locally BEFORE scheduling slower retries, so the old name
         // is reserved here even if this HTTP request disappears.
-        c.projects.record_rename_tombstone(&project, &new, rename_ms);
+        c.projects
+            .record_rename_tombstone(&project, &new, rename_ms);
         crate::persist::persist(&c);
         let unreached: Vec<String> = peers
             .iter()
@@ -6854,9 +6929,8 @@ async fn rename_project_owned(
             residuals,
         };
     }
-    let rename_ms = requested_rename_ms.unwrap_or_else(|| {
-        now_ms().max(observed_project_version_ms(c, project).saturating_add(1))
-    });
+    let rename_ms = requested_rename_ms
+        .unwrap_or_else(|| now_ms().max(observed_project_version_ms(c, project).saturating_add(1)));
     // 1. The settings row moves first: it is the authority every other tree is
     //    keyed off, and it carries the incarnation across unchanged (a rename is
     //    the same project under a new name, never a new identity).
@@ -6899,7 +6973,12 @@ async fn rename_project_owned(
         "rename",
         "project",
         new,
-        &format!("from={project} incarnation={} rename_ms={rename_ms}", incarnation.map(|i| i.to_string()).unwrap_or_else(|| "none".into())),
+        &format!(
+            "from={project} incarnation={} rename_ms={rename_ms}",
+            incarnation
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".into())
+        ),
     );
     record_event(
         c,
@@ -7016,7 +7095,8 @@ pub(crate) async fn dispatch_project_rename_with(
                 mesh_team_qs(team)
             );
             if let Some(body) =
-                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
+                    .await
             {
                 // The mesh protocol carries no status code, so a REFUSAL
                 // arrives as a perfectly well-delivered body. Acceptance means
@@ -8171,10 +8251,36 @@ async fn project_redeploy(
     // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
     // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
     // zip-uploaded or image-based project (the reported bug).
-    let Some((src, prod_lane, source_ids)) = source_for_project_fleet(&c, &project) else {
+    // A project whose builds never produced a deployment has no deployment to
+    // source from, but its last build names the repository: a retry rebuilds
+    // that, on the production lane. Only here — the webhook and the git poll
+    // keep ignoring never-deployed projects.
+    let last_build_source = || {
+        let row = c.projects.get_if_set(&project)?;
+        let build = row.last_build?;
+        if build.repo_url.is_empty()
+            || build.repo_url.starts_with("upload://")
+            || build.repo_url.starts_with("image://")
+        {
+            return None;
+        }
+        Some((
+            fluid_core::GitSource {
+                repo_url: build.repo_url,
+                branch: build.branch,
+                commit: String::new(),
+                commit_message: String::new(),
+            },
+            true,
+            Vec::new(),
+        ))
+    };
+    let Some((src, prod_lane, source_ids)) =
+        source_for_project_fleet(&c, &project).or_else(last_build_source)
+    else {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Project '{project}' has no deployment to redeploy yet."),
+            format!("Project '{project}' has no deployment or build to redeploy from yet."),
         ));
     };
     // No explicit environment in the modal: a redeploy rebuilds the deployment
@@ -8315,12 +8421,43 @@ async fn project_redeploy(
 /// project created (even with zero deployments yet) on ANOTHER node still
 /// appears here — the exact class of bug that hid team Simpfi's `drugs-wtf`
 /// project on 4 of 8 fleet nodes.
-async fn gitops_projects(
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct GitopsProjectsQuery {
+    /// `summary`: the dashboard's inventory view (`project_inventory::summary`)
+    /// — every row the tenant owns with deployment counts and the newest build
+    /// outcome, served by the leader so a just-finished build is visible on
+    /// the next poll from any node. Absent: the GitOps artifact rows below.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Set by a proxying node: answer from this node's own view, never re-proxy.
+    #[serde(default)]
+    pub local: Option<bool>,
+}
+
+pub(crate) async fn gitops_projects(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Json<Value> {
+    Query(q): Query<GitopsProjectsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if q.view.as_deref() == Some("summary") {
+        require_auth_read(claims.as_ref().map(|e| &e.0))?;
+        if q.local != Some(true) {
+            if let Some(leader) = c.leader_forward_target() {
+                let read = fetch_from_host(
+                    &c,
+                    &leader,
+                    "/v1/gitops/projects?view=summary&local=true",
+                    &t,
+                );
+                if let Ok(Some(v)) = tokio::time::timeout(POLLED_READ_PER_PEER_BUDGET, read).await {
+                    return Ok(Json(v));
+                }
+            }
+        }
+        return Ok(Json(json!(crate::project_inventory::summary(&c, &t))));
+    }
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (project, settings) in c.projects.snapshot() {
@@ -8390,7 +8527,7 @@ async fn gitops_projects(
             .unwrap_or("")
             .cmp(b["project"].as_str().unwrap_or(""))
     });
-    Json(json!(out))
+    Ok(Json(json!(out)))
 }
 
 async fn gitops_get(
@@ -9104,7 +9241,9 @@ async fn admin_content_hash(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!({ "content_hash": fluid_core::content_verify_stats() })))
+    Ok(Json(
+        json!({ "content_hash": fluid_core::content_verify_stats() }),
+    ))
 }
 
 /// THIS node's supervised background loops: restart counts + heartbeat age.
@@ -9401,10 +9540,7 @@ pub async fn functions(
     let is_top_level = q.local != Some(true);
     let cache_key = format!("functions:{t}:{}", internal);
     if is_top_level {
-        if let Some(v) = c
-            .resp_cache
-            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
-        {
+        if let Some(v) = c.resp_cache.get(&cache_key, POLLED_RESPONSE_CACHE_TTL) {
             return Json(v);
         }
     }
@@ -10153,7 +10289,11 @@ fn logs_validate_terms(
     let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    for term in raw.split(',').map(|s| s.trim().to_ascii_lowercase()).take(16) {
+    for term in raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .take(16)
+    {
         if term.is_empty() {
             continue;
         }
@@ -10162,7 +10302,10 @@ fn logs_validate_terms(
                 StatusCode::BAD_REQUEST,
                 logs_err(
                     "LOGS_BAD_FILTER",
-                    format!("logs: {field}='{term}' is not one of {}", allowed.join(", ")),
+                    format!(
+                        "logs: {field}='{term}' is not one of {}",
+                        allowed.join(", ")
+                    ),
                 ),
             ));
         }
@@ -10284,9 +10427,7 @@ pub(crate) async fn logs(
         // the billing floor (`team_plan`/`account()`), so this gate stays a
         // single question — what does the OWNING TENANT's plan allow?
         let max_age = crate::billing::plan_max_log_age_ms(&plan);
-        if age_ms > max_age + LOGS_AGE_TOLERANCE_MS
-            || span_ms > max_age + LOGS_AGE_TOLERANCE_MS
-        {
+        if age_ms > max_age + LOGS_AGE_TOLERANCE_MS || span_ms > max_age + LOGS_AGE_TOLERANCE_MS {
             return Err((
                 StatusCode::PAYMENT_REQUIRED,
                 serde_json::to_string(&json!({
@@ -10308,16 +10449,29 @@ pub(crate) async fn logs(
     }
 
     // --- parse + validate the field filters --------------------------------
-    logs_validate_terms(q.level.as_deref(), "level", &["info", "warning", "error", "fatal"])?;
+    logs_validate_terms(
+        q.level.as_deref(),
+        "level",
+        &["info", "warning", "error", "fatal"],
+    )?;
     logs_validate_terms(
         q.cache.as_deref(),
         "cache",
         &["hit", "miss", "stale", "store", "revalidate"],
     )?;
     logs_validate_terms(q.env.as_deref(), "env", &["production", "preview"])?;
-    logs_validate_terms(q.resource.as_deref(), "resource", &["static", "function", "fullstack"])?;
+    logs_validate_terms(
+        q.resource.as_deref(),
+        "resource",
+        &["static", "function", "fullstack"],
+    )?;
     let mut statuses: Vec<StatusPred> = Vec::new();
-    if let Some(raw) = q.status.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(raw) = q
+        .status
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         for term in raw.split(',').take(16) {
             let term = term.trim();
             if term.is_empty() {
@@ -10337,12 +10491,17 @@ pub(crate) async fn logs(
             }
         }
     }
-    let text = q
-        .q
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .map(|s| if s.len() > 256 { s[..256].to_string() } else { s });
+    let text =
+        q.q.as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.len() > 256 {
+                    s[..256].to_string()
+                } else {
+                    s
+                }
+            });
 
     // --- tenant + project + deployment scoping, applied INSIDE the scan ----
     // Tenant scope: only events for projects owned by this team. UNATTRIBUTED
@@ -10369,22 +10528,22 @@ pub(crate) async fn logs(
     // this exact project, OR untagged/infra events whose `host` is one of THIS
     // project's real deployment hostnames (exact label or a subdomain of it).
     let project_hosts: Vec<(String, String)> = match scope_project.as_deref() {
-        Some(pl) => c
-            .gw
-            .list()
-            .into_iter()
-            .filter(|d| d.project.eq_ignore_ascii_case(pl) && record_tenant(&d.tenant) == t)
-            .flat_map(|d| {
-                [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
-                    .into_iter()
-                    .filter(|h| !h.is_empty())
-                    .map(|h| h.to_lowercase())
-            })
-            .map(|h| {
-                let dot = format!("{h}.");
-                (h, dot)
-            })
-            .collect(),
+        Some(pl) => {
+            c.gw.list()
+                .into_iter()
+                .filter(|d| d.project.eq_ignore_ascii_case(pl) && record_tenant(&d.tenant) == t)
+                .flat_map(|d| {
+                    [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
+                        .into_iter()
+                        .filter(|h| !h.is_empty())
+                        .map(|h| h.to_lowercase())
+                })
+                .map(|h| {
+                    let dot = format!("{h}.");
+                    (h, dot)
+                })
+                .collect()
+        }
         None => Vec::new(),
     };
     // `project_owned_by` walks the deployment table + peer deployments, so it
@@ -10427,10 +10586,9 @@ pub(crate) async fn logs(
                         return false; // tagged for a DIFFERENT project — never leak it.
                     }
                     let h = e.host.to_lowercase();
-                    if !hosts
-                        .iter()
-                        .any(|(ph, phd)| h == *ph || h.starts_with(phd) || ph.starts_with(h.as_str()))
-                    {
+                    if !hosts.iter().any(|(ph, phd)| {
+                        h == *ph || h.starts_with(phd) || ph.starts_with(h.as_str())
+                    }) {
                         return false;
                     }
                 }
@@ -10551,10 +10709,18 @@ pub(crate) async fn logs(
             let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
             ts(b)
                 .cmp(&ts(a))
-                .then_with(|| a.get("host").and_then(|x| x.as_str()).unwrap_or("")
-                    .cmp(b.get("host").and_then(|x| x.as_str()).unwrap_or("")))
-                .then_with(|| a.get("path").and_then(|x| x.as_str()).unwrap_or("")
-                    .cmp(b.get("path").and_then(|x| x.as_str()).unwrap_or("")))
+                .then_with(|| {
+                    a.get("host")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("host").and_then(|x| x.as_str()).unwrap_or(""))
+                })
+                .then_with(|| {
+                    a.get("path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("path").and_then(|x| x.as_str()).unwrap_or(""))
+                })
         });
     } else {
         out.sort_by(|a, b| {
@@ -10573,7 +10739,11 @@ pub(crate) async fn logs(
     logs_hdr(&mut hdrs, "x-hive-logs-offset", offset);
     logs_hdr(&mut hdrs, "x-hive-logs-returned", out.len());
     logs_hdr(&mut hdrs, "x-hive-logs-total", total);
-    logs_hdr(&mut hdrs, "x-hive-logs-has-more", if has_more { "1" } else { "0" });
+    logs_hdr(
+        &mut hdrs,
+        "x-hive-logs-has-more",
+        if has_more { "1" } else { "0" },
+    );
     logs_hdr(&mut hdrs, "x-hive-logs-oldest-ms", c.events_oldest_ms());
     if since_ms > 0 {
         logs_hdr(&mut hdrs, "x-hive-logs-since-ms", since_ms);
@@ -11963,7 +12133,8 @@ pub(crate) async fn wf_runs(
 /// when it lapses, so recovery is automatic and the steady state stays fast.
 const WORLD_COOLDOWN: Duration = Duration::from_secs(60);
 
-fn world_cooldowns() -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+fn world_cooldowns(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>> {
     static M: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     > = std::sync::OnceLock::new();
@@ -15625,10 +15796,7 @@ async fn metrics_get(
         project.unwrap_or("")
     );
     if is_top_level {
-        if let Some(v) = c
-            .resp_cache
-            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
-        {
+        if let Some(v) = c.resp_cache.get(&cache_key, POLLED_RESPONSE_CACHE_TTL) {
             return Json(v);
         }
     }
@@ -15783,7 +15951,10 @@ async fn admin_overview(
     require_operator(claims.as_ref().map(|e| &e.0))?;
     // Cached like `metrics_get`: the fleet fan-out below costs ~100 ms per
     // call on the leader and two admin pages poll this every few seconds.
-    let local = q.as_ref().map(|q| q.0.local.unwrap_or(false)).unwrap_or(false);
+    let local = q
+        .as_ref()
+        .map(|q| q.0.local.unwrap_or(false))
+        .unwrap_or(false);
     if !local {
         if let Some(v) = c
             .resp_cache

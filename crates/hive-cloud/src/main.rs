@@ -25,6 +25,7 @@ mod build_coordinates;
 mod build_executor;
 mod build_registry;
 mod cloudflare_dns;
+mod project_inventory;
 mod cluster;
 mod coi;
 mod compose;

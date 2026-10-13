@@ -382,6 +382,17 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
                 <Button className="whitespace-nowrap">Continue to Project</Button>
               </Link>
             </div>
+          ) : (errored || cancelled) && build?.project ? (
+            // The project exists even though this build produced no deployment
+            // (its name is reserved for this team): the project page holds the
+            // retry and the delete — never send the user back to a "new
+            // project" form that would answer 409 for the same name.
+            <div className="flex shrink-0 gap-2">
+              <Link href="/new"><Button variant="outline">New project</Button></Link>
+              <Link href={`/projects/${encodeURIComponent(build.project)}`}>
+                <Button className="whitespace-nowrap">View project</Button>
+              </Link>
+            </div>
           ) : errored ? (
             <Link href="/new"><Button variant="outline">Try again</Button></Link>
           ) : cancelled ? (
