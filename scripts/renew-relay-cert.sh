@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Renew the wildcard TLS cert for the standalone iroh-relay.service on the relay-hosting nodes
-# (bkk/va/sj, the ones HIVE_RELAY_URLS names) and redistribute it. Each relay's
+# (RELAY_NODES) and redistribute it. Each relay's
 # /etc/iroh-relay.toml runs cert_mode = "Reloading", which re-reads manual_cert_path/key on a
 # 24h poll, so renewal is copy-two-files with no restart. Not scheduled anywhere yet.
 #
@@ -8,7 +8,7 @@
 # node's hive-node.service unit, so the credential is configured in exactly one place.
 #
 # Usage:
-#   scripts/renew-relay-cert.sh                 # issue + distribute to all 3
+#   scripts/renew-relay-cert.sh                 # issue + distribute to every RELAY_NODES entry
 #   SSH_KEY=~/.ssh/other.pem scripts/renew-relay-cert.sh
 set -euo pipefail
 
@@ -18,7 +18,6 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_OPTS=(-i "$SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
 ACME="${ACME_SH:-$HOME/.acme.sh/acme.sh}"
 
-# The fixed relay-TLS node set, matching hosts.ini's bkk/va/sj entries.
 declare -A RELAY_NODES=(
   [fc-bangkok]=43.152.247.70
   [fc-virginia]=43.166.206.175
