@@ -457,8 +457,10 @@ pub fn routes(cloud: Arc<crate::state::CloudState>) -> Router {
         .route("/v1/zkauth/register", post(register))
         .route("/v1/zkauth/preview-proof", post(preview_proof))
         .route("/v1/zkauth/project-team", get(project_team))
+        // CWE-306: public mount is guarded; the mesh leg calls the handler
+        // directly, so the gate is on the wrapper, not the shared handler.
         .route("/v1/zkauth/roster", get(roster))
-        .route("/v1/zkauth/roster-export", get(roster_export))
+        .route("/v1/zkauth/roster-export", get(roster_export_public))
         .with_state(cloud)
 }
 
@@ -521,6 +523,18 @@ async fn mint_on_owner(
 /// that serve previews can rebuild the identical verification ring.
 pub(crate) async fn roster_export() -> Json<Value> {
     Json(export_json())
+}
+
+/// Public HTTP mount for [`roster_export`] — CWE-306: `export_json()` returns
+/// EVERY team's membership (pubkey + role) on this node, so serving it to any
+/// anonymous caller disclosed the whole roster. See `admin::require_fleet_read`.
+/// The mesh leg calls `roster_export` directly (gossip dispatch arm), so the
+/// gate is on the route, never inside the shared handler.
+async fn roster_export_public(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::admin::require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(roster_export().await)
 }
 
 #[derive(Deserialize)]
@@ -682,8 +696,21 @@ async fn preview_proof(
     }
 }
 
-async fn roster(headers: HeaderMap) -> Json<Value> {
-    let team = team_of(&headers);
+async fn roster(
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // CWE-306: `team_of` reads the SPOOFABLE `x-hive-team` header, so an
+    // anonymous caller could name any team and read its membership (user_id,
+    // public key, role). Tenancy comes from the cryptographically-bound JWT
+    // claim, never the header (AGENTS.md) — and an unauthenticated read is
+    // refused outright instead of silently resolving to "personal".
+    crate::admin::require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let team = claims
+        .as_ref()
+        .map(|e| crate::admin::norm(&e.0.tenant).to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| team_of(&headers));
     let s = store().lock().unwrap();
     let members: Vec<Value> = s
         .teams
@@ -694,5 +721,5 @@ async fn roster(headers: HeaderMap) -> Json<Value> {
                 .collect()
         })
         .unwrap_or_default();
-    Json(json!({ "team": team, "members": members }))
+    Ok(Json(json!({ "team": team, "members": members })))
 }

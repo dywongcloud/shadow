@@ -75,7 +75,9 @@ pub fn routes() -> Router<Arc<CloudState>> {
         )
         .route("/v1/enterprise/microfrontends/:id", delete(mfe_delete))
         // ---- Mesh-internal: edge-enforcement config replication ----
-        .route("/v1/enterprise/edge-export", get(edge_export))
+        // CWE-306: public mount is guarded; the gossip loop calls the handler
+        // directly, so the gate is on the wrapper, not the shared handler.
+        .route("/v1/enterprise/edge-export", get(edge_export_public))
         // ---- Conformance ----
         .route(
             "/v1/enterprise/conformance",
@@ -676,6 +678,18 @@ async fn scim_user_delete(
 /// request enters or a deployment is hosted. Peer-authenticated QUIC transport.
 async fn edge_export(State(c): State<Arc<CloudState>>) -> Json<crate::enterprise::EdgeExport> {
     Json(c.enterprise.edge_export())
+}
+
+/// Public HTTP mount for [`edge_export`] — CWE-306: the export carries every
+/// tenant's edge-enforcement config (IP blocks, deployment protection), so it
+/// must not answer an anonymous caller. See `admin::require_fleet_read`. The
+/// gossip loop calls `edge_export` directly, so the gate is on the route.
+async fn edge_export_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<crate::enterprise::EdgeExport>, (StatusCode, String)> {
+    crate::admin::require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(edge_export(State(c)).await)
 }
 
 // ==========================================================================
