@@ -23,6 +23,7 @@ mod browser_metering;
 mod browser_presence;
 mod build_coordinates;
 mod build_executor;
+mod cloudflare_dns;
 mod cluster;
 mod coi;
 mod compose;
@@ -2279,11 +2280,16 @@ async fn async_main() -> anyhow::Result<()> {
         }
     });
 
-    // Per-tenant DB gateway (Neon/Upstash model): Postgres :5432 + Redis :6379
-    // TLS-SNI proxies to each tenant DB's container. Spawns only when the gateway
-    // is enabled (HIVE_DB_DOMAIN set); the wildcard `*.{db_domain}` cert comes from
-    // the same ACME-managed SNI resolver. High ports (>1024) — no capability needed.
+    // Per-tenant DB gateway (Neon/Upstash model): TLS-SNI proxies to each tenant
+    // DB's container on `HIVE_DB_PG_LISTEN`/`HIVE_DB_REDIS_LISTEN` (default
+    // :5432/:6379 — overridable because two hive-cloud instances on one host
+    // collide on the defaults). Spawns only when the gateway is enabled
+    // (HIVE_DB_DOMAIN set); the wildcard `*.{db_domain}` cert comes from the same
+    // ACME-managed SNI resolver. High ports (>1024) — no capability needed.
     db_gateway::spawn(cloud.clone());
+    // DNS-only A/AAAA for that gateway when its zone is Cloudflare-served and
+    // Vercel DNS is not available. Opt-in (HIVE_DB_DNS_PROVIDER=cloudflare).
+    cloudflare_dns::spawn_db_dns(cloud.clone());
 
     // Generic raw-TCP ingress (the db_gateway pattern generalized to ALLOCATED
     // ports): one public listener per raw-protocol deployment's stamped

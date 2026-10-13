@@ -1352,10 +1352,14 @@ pub fn env_prefix(name: &str) -> String {
 }
 
 /// Rewrite a freshly-provisioned connection map so the PRIMARY, copyable URL is
-/// the EXTERNAL DB-gateway endpoint (`<db_host>:5432`/`:6379`, TLS-required), while
-/// preserving the node-local URL under `INTERNAL_*` (for on-node tooling) and the
-/// private `net_host`/`net_port` (for same-node app containers). No-op when the
-/// gateway is off (`db_host` empty) — the original 127.0.0.1 URLs stand.
+/// the EXTERNAL DB-gateway endpoint (`<db_host>:<gateway port>`, TLS-required),
+/// while preserving the node-local URL under `INTERNAL_*` (for on-node tooling)
+/// and the private `net_host`/`net_port` (for same-node app containers). No-op
+/// when the gateway is off (`db_host` empty) — the original 127.0.0.1 URLs stand.
+///
+/// The port is the one the gateway LISTENS on, not a hardcoded 5432/6379: a
+/// second hive-cloud instance on the same host already owns the defaults, so a
+/// moved gateway publishes a moved URL instead of a DSN that cannot connect.
 fn with_external_endpoint(
     mut conn: HashMap<String, String>,
     kind: DbKind,
@@ -1364,6 +1368,8 @@ fn with_external_endpoint(
     if db_host.is_empty() {
         return conn;
     }
+    let pg_port = crate::db_gateway::published_pg_port();
+    let redis_port = crate::db_gateway::published_redis_port();
     // Preserve the container's REAL node-local host port BEFORE overwriting `port`
     // with the public gateway port — the SNI proxy on the host node splices to
     // 127.0.0.1:<local_port>, and the reconciler/router reads it back.
@@ -1385,13 +1391,13 @@ fn with_external_endpoint(
             // gateway can route by SNI.
             conn.insert(
                 "DATABASE_URL".into(),
-                format!("postgres://{user}:{pw}@{db_host}:5432/{dbname}?sslmode=require"),
+                format!("postgres://{user}:{pw}@{db_host}:{pg_port}/{dbname}?sslmode=require"),
             );
             // SQL-over-HTTP (Neon-style) REST endpoint served by the same gateway
             // host: POST {"query","params"} with `Authorization: Bearer <password>`.
             conn.insert("SQL_HTTP_URL".into(), format!("https://{db_host}/sql"));
             conn.insert("host".into(), db_host.to_string());
-            conn.insert("port".into(), "5432".into());
+            conn.insert("port".into(), pg_port.to_string());
         }
         DbKind::Redis => {
             let pw = conn.get("password").cloned().unwrap_or_default();
@@ -1401,14 +1407,14 @@ fn with_external_endpoint(
             // `rediss://` = TLS.
             conn.insert(
                 "REDIS_URL".into(),
-                format!("rediss://default:{pw}@{db_host}:6379"),
+                format!("rediss://default:{pw}@{db_host}:{redis_port}"),
             );
             conn.insert(
                 "UPSTASH_REDIS_REST_URL".into(),
                 format!("https://{db_host}"),
             );
             conn.insert("host".into(), db_host.to_string());
-            conn.insert("port".into(), "6379".into());
+            conn.insert("port".into(), redis_port.to_string());
         }
         // Managed SQLite: the per-database hostname IS the libsql base URL.
         // `libsql://` is Hrana-over-HTTPS (the scheme rewrites to https in
@@ -1440,12 +1446,12 @@ fn with_external_endpoint(
             }
             conn.insert(
                 "DATABASE_URL".into(),
-                format!("postgres://postgres:{pw}@{db_host}:5432/{dbname}?sslmode=require"),
+                format!("postgres://postgres:{pw}@{db_host}:{pg_port}/{dbname}?sslmode=require"),
             );
             conn.insert("STUDIO_URL".into(), format!("https://{db_host}"));
             conn.insert("SUPABASE_URL".into(), format!("https://{db_host}"));
             conn.insert("host".into(), db_host.to_string());
-            conn.insert("port".into(), "5432".into());
+            conn.insert("port".into(), pg_port.to_string());
         }
         // HTTP-REST kinds (blob/queue/vector/pubsub/realtime): expose the gateway
         // host so their REST/WS URLs are externally reachable over TLS.

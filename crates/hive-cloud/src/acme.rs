@@ -1,5 +1,12 @@
-//! ACME (Let's Encrypt) wildcard certificates via **DNS-01 through the Vercel
-//! API** — the TLS half of the ngrok retirement.
+//! ACME (Let's Encrypt) wildcard certificates via **DNS-01 through an
+//! authoritative DNS provider** — the TLS half of the ngrok retirement.
+//!
+//! The provider is [`crate::cloudflare_dns::DnsProvider`]: Vercel DNS when
+//! `VERCEL_API_TOKEN` is set, otherwise the Cloudflare API when
+//! `HIVE_CLOUDFLARE_API_TOKEN` is set. Cloudflare exists because a domain like
+//! `storage.dev.autheo.com` sits in a Cloudflare-authoritative zone Vercel cannot
+//! write, and a wildcard — which the per-tenant DB gateway requires — is only
+//! obtainable through DNS-01.
 //!
 //! Two certificate bundles, deliberately isolated (the vercel.com/vercel.app
 //! split): **apps** = `*.{apps_domain}` + apex; **platform** = `api.{platform
@@ -32,7 +39,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use crate::state::CloudState;
-use crate::vercel_dns::{DesiredRecord, DnsApi, VercelApi};
+use crate::cloudflare_dns::DnsProvider;
+use crate::vercel_dns::{DesiredRecord, DnsApi};
 
 /// A replicated certificate bundle. The private key is AEAD-encrypted with the
 /// cluster secret (`secrets::encrypt`) before it ever reaches the store.
@@ -1074,9 +1082,9 @@ async fn account(
     Ok(acct)
 }
 
-/// Issue one bundle: order → DNS-01 TXT via the Vercel API → wait propagation →
-/// validate → CSR (rcgen) → finalize → certificate chain. Cleans its TXT records
-/// up afterwards (best-effort).
+/// Issue one bundle: order → DNS-01 TXT via the configured DNS provider (Vercel
+/// or Cloudflare) → wait propagation → validate → CSR (rcgen) → finalize →
+/// certificate chain. Cleans its TXT records up afterwards (best-effort).
 async fn issue(
     // The fleet's own nameservers, when the caller has them: required to gate a
     // DNS-01 challenge on EVERY authoritative NS under a live Seer delegation.
@@ -1084,7 +1092,7 @@ async fn issue(
     // check, correct there because Vercel is a single anycast authority.
     cloud: Option<&Arc<CloudState>>,
     http: &reqwest::Client,
-    api: &VercelApi,
+    api: &DnsProvider,
     names: &[String],
     zone: &str,
     challenges: &AcmeChallengeStore,
@@ -1144,6 +1152,10 @@ async fn issue(
                 // gauges every pass on this same node (the single designation
                 // leads ACME and DNS reconcile together).
                 let conflict = e.to_string().contains("409");
+                // The 409 leniency below is a VERCEL behaviour: Vercel refuses a
+                // TXT create under a name it has delegated away. Cloudflare has no
+                // such rule, so a 409 there is a real failure and stays fatal.
+                let lenient = api.kind() == "vercel";
                 let under = |z: Option<&str>| {
                     z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}")))
                         .unwrap_or(false)
@@ -1158,14 +1170,18 @@ async fn issue(
                             .api_delegation_records
                             .load(std::sync::atomic::Ordering::Relaxed)
                             > 0);
-                if conflict && delegated_live {
+                if lenient && conflict && delegated_live {
                     tracing::warn!(%fqdn, error = %e, "ACME dns-01 Vercel TXT refused under a live-Seer-delegated name — proceeding via the challenge store");
                 } else {
                     return Err(e);
                 }
             }
             challenges.insert(&fqdn, &value);
-            tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via Vercel API + Seer challenge store");
+            if api.kind() == "cloudflare" {
+                tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via the Cloudflare API + Seer challenge store");
+            } else {
+                tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via Vercel API + Seer challenge store");
+            }
             txt_names.push((rec_name, value));
         }
     }
@@ -1229,7 +1245,7 @@ async fn issue(
 }
 
 async fn cleanup_txt(
-    api: &VercelApi,
+    api: &DnsProvider,
     zone: &str,
     txts: &[(String, String)],
     challenges: &AcmeChallengeStore,
@@ -1705,11 +1721,16 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
     {
         return;
     }
-    let Some(api) = VercelApi::from_env(cloud.http.clone()) else {
-        tracing::warn!("ACME enabled but VERCEL_API_TOKEN not set — not starting");
+    let Some(api) = crate::cloudflare_dns::DnsProvider::from_env(cloud.http.clone()) else {
+        // A zone the platform cannot write (Cloudflare-served, e.g. autheo.com) was
+        // a hard stop here: no Vercel token meant no issuance at all, so the
+        // `*.{db_domain}` wildcard could never be obtained on such a domain.
+        tracing::warn!(
+            "ACME enabled but neither VERCEL_API_TOKEN nor HIVE_CLOUDFLARE_API_TOKEN is set — not starting"
+        );
         return;
     };
-    tracing::info!(staging = staging(), apps = %cloud.apps_domain, platform = %cloud.platform_domain, "ACME manager up (leader-elected, DNS-01 via Vercel)");
+    tracing::info!(staging = staging(), provider = api.kind(), apps = %cloud.apps_domain, platform = %cloud.platform_domain, "ACME manager up (leader-elected, DNS-01)");
     tokio::spawn(async move {
         loop {
             // Jittered interval: 5–7h.
@@ -2297,7 +2318,10 @@ mod tests {
             "refusing: HIVE_ACME_STAGING must be 1 for the live test"
         );
         let http = reqwest::Client::new();
-        let api = VercelApi::from_env(http.clone()).expect("VERCEL_API_TOKEN required");
+        let api = DnsProvider::Vercel(
+            crate::vercel_dns::VercelApi::from_env(http.clone())
+                .expect("VERCEL_API_TOKEN required"),
+        );
         let apps = std::env::var("HIVE_APPS_DOMAIN").unwrap_or_else(|_| "shadw.app".into());
         let names = vec![format!("*.{apps}"), apps.clone()];
         let challenges = AcmeChallengeStore::new();

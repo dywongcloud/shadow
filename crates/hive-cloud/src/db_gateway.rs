@@ -2,9 +2,11 @@
 //!
 //! Gives every managed database an external, cross-protocol endpoint at
 //! `<slug>.{db_domain}` (e.g. `db-ab12cd34.downstash.xyz`). A single wildcard
-//! `*.{db_domain}` TLS cert (the shared [`crate::acme`] SNI resolver) fronts:
-//!   * Postgres wire on `:5432`
-//!   * Redis wire on `:6379`
+//! `*.{db_domain}` TLS cert (the shared [`crate::acme`] SNI resolver) fronts two
+//! listeners whose ports come from `HIVE_DB_PG_LISTEN`/`HIVE_DB_REDIS_LISTEN`
+//! (default `:5432`/`:6379`):
+//!   * Postgres wire
+//!   * Redis wire
 //! Each listener TLS-TERMINATES the connection, reads the SNI server-name to
 //! identify the tenant DB, and byte-splices the decrypted client stream to that
 //! DB's local podman container (`127.0.0.1:<local_port>`).
@@ -32,21 +34,58 @@ enum Wire {
     Redis,
 }
 
+/// The listen address for the Postgres-wire proxy. `HIVE_DB_PG_LISTEN`, default
+/// `0.0.0.0:5432`.
+///
+/// Overridable because the default belongs to whichever hive-cloud instance bound
+/// it first: on a host running BOTH a fleet `hive-node` and a second platform
+/// instance (DevHub), the second one's bind fails. It failed SILENTLY — a log
+/// line and a `return`, no crash and nothing an operator sees — so the gateway
+/// looked configured while serving nothing.
+pub fn pg_listen_addr() -> String {
+    listen_addr("HIVE_DB_PG_LISTEN", "0.0.0.0:5432")
+}
+
+/// The listen address for the Redis-wire proxy. `HIVE_DB_REDIS_LISTEN`, default
+/// `0.0.0.0:6379`. See [`pg_listen_addr`].
+pub fn redis_listen_addr() -> String {
+    listen_addr("HIVE_DB_REDIS_LISTEN", "0.0.0.0:6379")
+}
+
+fn listen_addr(var: &str, default: &str) -> String {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// The port a client must connect to for the Postgres wire — the port the
+/// listener actually holds, not a hardcoded 5432. Published DSNs are built from
+/// this, so moving the listener moves the URL with it.
+pub fn published_pg_port() -> u16 {
+    port_of(&pg_listen_addr(), 5432)
+}
+
+/// [`published_pg_port`] for the Redis wire.
+pub fn published_redis_port() -> u16 {
+    port_of(&redis_listen_addr(), 6379)
+}
+
+fn port_of(addr: &str, default: u16) -> u16 {
+    addr.rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Spawn the DB-gateway listeners when the gateway is enabled. No-op otherwise.
 pub fn spawn(cloud: Arc<CloudState>) {
     if cloud.db_domain.is_empty() {
         return;
     }
-    let pg = std::env::var("HIVE_DB_PG_LISTEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "0.0.0.0:5432".into());
-    let redis = std::env::var("HIVE_DB_REDIS_LISTEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "0.0.0.0:6379".into());
-    spawn_listener(cloud.clone(), pg, Wire::Postgres);
-    spawn_listener(cloud, redis, Wire::Redis);
+    spawn_listener(cloud.clone(), pg_listen_addr(), Wire::Postgres);
+    spawn_listener(cloud, redis_listen_addr(), Wire::Redis);
 }
 
 fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
@@ -54,10 +93,37 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
+                // A gateway that cannot bind is INVISIBLE: no crash, no failing
+                // request, databases that simply never connect. Make it a
+                // level-triggered incident (re-asserted every start, cleared on a
+                // successful bind) and name the env var that resolves it.
+                let var = match wire {
+                    Wire::Postgres => "HIVE_DB_PG_LISTEN",
+                    Wire::Redis => "HIVE_DB_REDIS_LISTEN",
+                };
+                let condition = format!("db-gateway:bind-failed:{}", addr.replace(':', "."));
+                let _ = cloud.incidents.open(crate::incidents::OpenReq {
+                    condition: condition.clone(),
+                    ttl_ms: 30 * 60 * 1000,
+                    title: format!("DB gateway listener dead ({wire:?} on {addr})"),
+                    severity: crate::incidents::Severity::Major,
+                    affected: vec!["databases".into(), "db-gateway".into()],
+                    message: format!(
+                        "The {wire:?} DB-gateway listener could not bind {addr}: {e}. \
+                         Every `<slug>.{}` endpoint on this node is unreachable. \
+                         Set {var} to a free port (another hive-cloud instance on this \
+                         host already holds the default) and restart.",
+                        cloud.db_domain
+                    ),
+                });
                 tracing::error!(%addr, wire = ?wire, error = %e, "db-gateway: cannot bind listener");
                 return;
             }
         };
+        cloud.incidents.clear(
+            &format!("db-gateway:bind-failed:{}", addr.replace(':', ".")),
+            "Listener bound — the DB gateway is serving.",
+        );
         // Shared SNI resolver (serves the `*.{db_domain}` wildcard bundle), but a
         // config with NO ALPN — a Postgres client (libpq 17+ offers ALPN
         // `postgresql`) must not get a no_application_protocol alert.

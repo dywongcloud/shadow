@@ -121,13 +121,42 @@ export async function mintSessionToken(team?: string): Promise<string | null> {
   return granted;
 }
 
+/** The browser's own Clerk session token, when one exists.
+ *
+ *  Sent to `/api/token` so the mint can still resolve the session when the
+ *  SERVER-side `auth()` cannot — the Clerk DEVELOPMENT-instance failure where a
+ *  missing `__clerk_db_jwt` dev-browser cookie makes `auth()` report
+ *  "dev-browser-missing"/signed-out while clerk-js is in fact signed in, so the
+ *  dashboard renders and every /cloud read 401s "missing or invalid bearer
+ *  token". The route verifies this token cryptographically; sending it grants
+ *  nothing on its own. It is never persisted — read from clerk-js's in-memory
+ *  session at call time and used for this one same-origin request.
+ */
+async function clerkSessionToken(): Promise<string | null> {
+  try {
+    const clerk = (window as unknown as {
+      Clerk?: { session?: { getToken?: () => Promise<string | null | undefined> } };
+    }).Clerk;
+    if (!clerk?.session?.getToken) return null;
+    return (await clerk.session.getToken()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function mintOnce(team?: string): Promise<string | null> {
   const t = team ?? currentTeam();
   try {
+    // One call, reused for both carriers below — `getToken()` is a network-minted
+    // value, not a free read.
+    const clerkTok = await clerkSessionToken();
     const r = await fetch("/api/token", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ team: t }),
+      headers: {
+        "content-type": "application/json",
+        ...(clerkTok ? { authorization: `Bearer ${clerkTok}` } : {}),
+      },
+      body: JSON.stringify({ team: t, ...(clerkTok ? { clerk_token: clerkTok } : {}) }),
     });
     // A failed mint (mint-failed-403 when the UI server is missing
     // HIVE_INTERNAL_TOKEN, mint-unreachable, rate-limited, …) leaves the

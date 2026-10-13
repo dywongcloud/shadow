@@ -141,11 +141,88 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, reason: "mint-unreachable" }, { status: 502 });
     }
   }
+/** Verify a Clerk session token the BROWSER already holds and return its user
+ *  id, or `null` when it does not verify.
+ *
+ *  WHY THIS EXISTS: on a Clerk DEVELOPMENT instance (a `pk_test_` key — which
+ *  is what this deployment runs) the server-side `auth()` resolves a session
+ *  only when the request ALSO carries the `__clerk_db_jwt` "dev browser" cookie
+ *  the handshake writes to the app domain. When that handshake fails —
+ *  third-party-cookie blocking, a stale cookie, an `azp` mismatch against
+ *  HIVE_AUTHORIZED_PARTIES — `auth()` reports `dev-browser-missing` /
+ *  signed-out even though clerk-js still holds a perfectly valid session. The
+ *  dashboard then RENDERS (Clerk's client-side state is signed-in) while
+ *  `/api/token` answers `{"ok":false,"reason":"no-session"}`, no `hive_jwt`
+ *  cookie is set, and every `/cloud` read 401s "missing or invalid bearer
+ *  token" — live-witnessed 2026-10-12, and the exact reported symptom.
+ *
+ *  So the client hands us its own session token and we verify it
+ *  CRYPTOGRAPHICALLY against Clerk's JWKS. This trusts NOTHING the client
+ *  asserts: an unverifiable/expired/foreign token yields `null` and the caller
+ *  still answers no-session. It grants no more than the cookie path would —
+ *  the same user, the same tenant derivation, the same owner check.
+ */
+async function userIdFromSessionToken(tok: string): Promise<string | null> {
+  try {
+    const { verifyToken } = await import("@clerk/backend");
+    // Only an `azp`-bearing token can be party-checked, and the check must use
+    // the SAME allow-list the middleware does (an azp-less token has no party
+    // to match, so the check would be meaningless rather than safe).
+    let azp: unknown;
+    try {
+      const p = tok.split(".")[1];
+      if (p) azp = (JSON.parse(Buffer.from(p, "base64url").toString("utf8")) as { azp?: unknown }).azp;
+    } catch {
+      azp = undefined;
+    }
+    const payload = await verifyToken(tok, {
+      secretKey: process.env.CLERK_SECRET_KEY,
+      ...(typeof azp === "string"
+        ? {
+            authorizedParties: (process.env.HIVE_AUTHORIZED_PARTIES || "http://localhost:3001,http://127.0.0.1:3001")
+              .split(",")
+              .map((v) => v.trim())
+              .filter(Boolean),
+          }
+        : {}),
+    });
+    return payload?.sub ?? null;
+  } catch {
+    return null;
+  }
+}
+
+  // Parsed ONCE: an undici request body can only be consumed once, and both the
+  // session-token fallback above and the tenant resolution below need it.
+  let clerkTokenFromBody = "";
+  let requested = "";
+  try {
+    const body = (await req.json()) as { team?: unknown; clerk_token?: unknown } | null;
+    requested = String(body?.team ?? "").trim();
+    if (typeof body?.clerk_token === "string") clerkTokenFromBody = body.clerk_token.trim();
+  } catch {
+    /* no/invalid body → defaults below */
+  }
+
   let userId: string | null = null;
+  let usedSessionToken = false;
   try {
     userId = (await auth()).userId ?? null;
   } catch {
     /* auth() unavailable */
+  }
+  if (!userId) {
+    const bearer = req.headers.get("authorization");
+    const headerToken =
+      bearer && /^Bearer\s+/i.test(bearer) ? bearer.replace(/^Bearer\s+/i, "").trim() : "";
+    const tok = headerToken || (typeof clerkTokenFromBody === "string" ? clerkTokenFromBody : "");
+    if (tok) {
+      const verified = await userIdFromSessionToken(tok);
+      if (verified) {
+        userId = verified;
+        usedSessionToken = true;
+      }
+    }
   }
   if (!userId) {
     return NextResponse.json({ ok: false, reason: "no-session" });
@@ -155,12 +232,24 @@ export async function POST(req: NextRequest) {
   // owner check via owner_email), mirroring the identity/sync path.
   let email = "";
   let name = "";
-  try {
-    const u = await currentUser();
-    email = u?.primaryEmailAddress?.emailAddress || u?.emailAddresses?.[0]?.emailAddress || "";
-    name = [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.username || "";
-  } catch {
-    /* currentUser unavailable */
+  if (usedSessionToken) {
+    // No `auth()` context on this path (that is the whole point of it), so read
+    // the account straight from Clerk's Backend API with the verified user id.
+    try {
+      const u = await (await clerkClient()).users.getUser(userId);
+      email = u?.primaryEmailAddress?.emailAddress || u?.emailAddresses?.[0]?.emailAddress || "";
+      name = [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.username || "";
+    } catch {
+      /* user lookup unavailable */
+    }
+  } else {
+    try {
+      const u = await currentUser();
+      email = u?.primaryEmailAddress?.emailAddress || u?.emailAddresses?.[0]?.emailAddress || "";
+      name = [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.username || "";
+    } catch {
+      /* currentUser unavailable */
+    }
   }
 
   // Authoritative owner check from the verified session email (see OWNER_EMAILS).
@@ -180,12 +269,7 @@ export async function POST(req: NextRequest) {
   // authority); the personal namespace is granted only as the user's OWN. Anything
   // unrecognized/unauthorized falls back to the caller's own personal namespace —
   // never another tenant's, and never the owner's "personal" for a non-owner.
-  let requested = "";
-  try {
-    requested = String(((await req.json()) as { team?: unknown })?.team ?? "").trim();
-  } catch {
-    /* no/invalid body → default to personal */
-  }
+  // `requested` was parsed once above (an undici body cannot be re-read).
 
   let tenant = personalTenant;
   let role: "owner" | "admin" | "member" = "owner";

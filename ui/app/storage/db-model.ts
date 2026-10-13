@@ -152,7 +152,7 @@ export function managedEndpoint(db: Database): EndpointInfo | null {
       key: "STUDIO_URL",
       address: host,
       reach: reachOfHost(host),
-      protocol: "Supabase Studio (HTTPS) + postgres wire :5432",
+      protocol: "Supabase Studio (HTTPS) + postgres wire",
     };
   }
   const endpoint = c.endpoint ?? "";

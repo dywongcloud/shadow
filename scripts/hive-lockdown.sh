@@ -61,6 +61,19 @@ if command -v nft >/dev/null 2>&1; then
   nft delete table inet hive_lockdown 2>/dev/null || true
   nft add table inet hive_lockdown
   nft 'add chain inet hive_lockdown input { type filter hook input priority -100 ; policy accept ; }'
+  # Return traffic of a connection THIS host opened must never be evaluated by
+  # the port drops below: a locked dport range that overlaps
+  # net.ipv4.ip_local_port_range (50100-50999 does -- 32768 60999 by default)
+  # gets handed out by the kernel as the SOURCE port of ordinary outbound
+  # connects, so the SYN-ACK comes back with dport inside the locked range and
+  # is dropped -> Connection timed out (os error 110), socket wedged in
+  # SYN-SENT. Witnessed fleet-wide on fc-sanjose 2026-10-13 (2.2M dropped
+  # 56-byte packets; 100% of wedged sockets had a source port in the range).
+  # Belt-and-braces with `net.ipv4.ip_local_reserved_ports=50100-50999`
+  # (/etc/sysctl.d/60-hive-reserved-ports.conf), which stops the kernel ever
+  # allocating those ports automatically; this rule also covers a process that
+  # binds one explicitly.
+  nft add rule inet hive_lockdown input ct state established,related accept
   nft add rule inet hive_lockdown input iif lo accept
   nft add rule inet hive_lockdown input ip saddr "{ $PEERS_NFT }" accept
   nft add rule inet hive_lockdown input tcp dport "{ $PORTS_NFT }" drop
@@ -69,6 +82,10 @@ elif command -v iptables >/dev/null 2>&1; then
   iptables -D INPUT -j HIVE_LOCKDOWN 2>/dev/null || true
   iptables -F HIVE_LOCKDOWN 2>/dev/null || true
   iptables -N HIVE_LOCKDOWN 2>/dev/null || true
+  # Same reason as the nft branch above (see the comment there): reply packets
+  # of locally-originated connections are never the thing this chain protects
+  # against, so they RETURN before the dport drops see them.
+  iptables -A HIVE_LOCKDOWN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
   iptables -A HIVE_LOCKDOWN -i lo -j RETURN
   for p in $PEERS; do iptables -A HIVE_LOCKDOWN -s "$p" -j RETURN; done
   for port in $LOCKED_PORTS; do iptables -A HIVE_LOCKDOWN -p tcp --dport "$port" -j DROP; done
