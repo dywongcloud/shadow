@@ -1,9 +1,5 @@
 ---
-# DNS + TLS ingress via Vercel DNS + ACME DNS-01, matching RUNBOOK.md's
-# Phase 0 exactly. Only meaningful on hosts meant to be leader-capable /
-# publicly reachable (HIVE_PUBLIC_IP set) -- run this role against the
-# whole [platform] group; nodes without a public IP simply never get
-# published to DNS (safe no-op from the platform's own side).
+# DNS + TLS ingress via Vercel DNS + ACME DNS-01 (RUNBOOK.md Phase 0); run it against all of [platform]: a node without a public IP is never published to DNS.
 
 - name: Assert this host has a public IP configured (RUNBOOK.md Phase-0 step 4)
   ansible.builtin.assert:
@@ -15,12 +11,6 @@
       nodes.
   when: hive_ingress_enabled | default(true)
 
-# This fleet's convention (roles/prerequisites) is firewalld DISABLED+MASKED --
-# scripts/hive-lockdown.sh is the sole firewall, and it never blocks 80/443.
-# On such hosts there is nothing to open and the firewalld module hard-fails
-# ("firewall is not currently running"), which broke node-join on the first
-# fresh node this role ever ran against (fc-saopaulo). Only act when a host
-# genuinely runs firewalld (a non-fleet/standalone use of this role).
 - name: Check whether firewalld is running (fleet convention is masked -- hive-lockdown.sh is the sole firewall)
   ansible.builtin.command: systemctl is-active firewalld
   register: _firewalld_active

@@ -1,7 +1,5 @@
 ---
-# Firecracker on a host with REAL hardware /dev/kvm -- no kernel work needed,
-# just install the binary + a guest kernel. The production Hive rootfs is a
-# separate, explicitly drained migration owned by hive_platform_rootfs below.
+# Firecracker on a host with REAL hardware /dev/kvm: install the binary and a guest kernel; the production rootfs is a separate drained migration (hive_platform_rootfs).
 
 - name: Assert /dev/kvm is present
   ansible.builtin.stat:
@@ -15,12 +13,6 @@
       /dev/kvm is not present on this host. It belongs in the [fc_pvm]
       inventory group (roles/pvm_firecracker), not [fc_kvm].
 
-# A DOWNGRADE MUST NEVER BE SILENT. `copy` below checksums src against dest and
-# copies on any difference (force defaults to yes), with no `creates:` guard — so
-# whatever `firecracker_version` names simply becomes the installed binary, older
-# or newer. That is how a stale pin can walk a node backwards onto a version with
-# a known guest->host escape while ansible reports an ordinary `changed` line and
-# the operator learns nothing. Fail loudly instead; upgrades still proceed.
 - name: Read the firecracker version already installed (if any)
   ansible.builtin.command: /usr/local/bin/firecracker --version
   register: hive_fc_installed
@@ -29,12 +21,6 @@
 
 - name: Refuse to install an OLDER firecracker over a newer one
   vars:
-    # `regex_findall` ALWAYS returns a list, empty when nothing matches.
-    # `regex_search` with a capture group returns None on no match, and `first`
-    # then raises "'NoneType' object is not iterable" — which on a FRESH node
-    # (no firecracker installed yet) turned this guard into a provisioning
-    # failure instead of an allow. Caught by running the expression against a
-    # real empty string, not by reading it.
     _found: "{{ hive_fc_installed.stdout | default('') | regex_findall('[0-9]+[.][0-9]+[.][0-9]+') }}"
     _cur: "{{ _found[0] if (_found | length) > 0 else '' }}"
     _want: "{{ firecracker_version | regex_replace('^v', '') }}"
@@ -71,9 +57,6 @@
     dest: /var/lib/hive/vmlinux
     mode: "0644"
 
-# No bootstrap-vintage agent is ever baked here. Ordinary role runs install the
-# builder only; an operator first rolls the controller+agent package, drains the
-# node, then opts into the shared migration. The same role is included by PVM.
 - name: Install and optionally run the production rootfs migration
   ansible.builtin.include_role:
     name: hive_platform_rootfs
