@@ -23,6 +23,7 @@ CHECK_ONLY=0
 
 PK="${CLERK_PK_LIVE:-}"
 SK="${CLERK_SK_LIVE:-}"
+VERCEL_DNS_CREATE_PACE_SECS=1.2
 
 fail() { echo "FATAL: $*" >&2; exit 1; }
 mask() { printf '%s\n' "${1:0:12}…(${#1} chars)"; }
@@ -91,8 +92,8 @@ if et != "production":
     raise SystemExit("refusing: instance %s is %r, not production" % (d.get("id"), et))
 ' || fail "target instance is not a production instance"
 
-# The frontend host is encoded in the pk (base64 of "<host>$").
-FAPI_HOST="$(printf '%s' "${PK#pk_live_}" | base64 -d 2>/dev/null | tr -d '$' || true)"
+frontend_host_of_pk() { printf '%s' "${1#pk_live_}" | base64 -d 2>/dev/null | tr -d '$' || true; }
+FAPI_HOST="$(frontend_host_of_pk "$PK")"
 echo "frontend API host from key: ${FAPI_HOST:-<undecodable>}"
 case "$FAPI_HOST" in
   *.shadw.cloud) ;;
@@ -140,7 +141,7 @@ sys.exit(0 if hit else 1)"; then
     sleep $((attempt * 2))
     [ "$attempt" = 5 ] && fail "could not create CNAME $name after 5 attempts"
   done
-  sleep 1.2   # Vercel DNS creates are individually rate-limited — pace them.
+  sleep "$VERCEL_DNS_CREATE_PACE_SECS"
 done < /tmp/clerk_cnames.tsv
 
 echo "waiting for public DNS + Clerk to provision (TLS can take minutes)…"

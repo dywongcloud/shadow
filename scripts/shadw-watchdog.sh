@@ -9,6 +9,7 @@ DOMAIN="gui/$(id -u)"
 STRIKES=4
 PROBE_TIMEOUT=8
 SLEEP_BETWEEN=6
+BOOTOUT_SETTLE_SECS=3
 
 healthy() { curl -fsS -m"$PROBE_TIMEOUT" "http://127.0.0.1:$1/healthz" >/dev/null 2>&1; }
 
@@ -25,13 +26,13 @@ mesh_ok() {
 
 # A DIFFERENT hive-cloud squatting the admin port passes /healthz and /v1/mesh; argv is
 # deterministic, so no sustained window is needed. Prints the squatter pid, returns 0 only then.
-imposter_pid() { # <expected-name> <admin-port>
-  local pid args
-  pid=$(lsof -nP -tiTCP:"$2" -sTCP:LISTEN 2>/dev/null | head -1)
+imposter_pid() {
+  local expected_name="$1" admin_port="$2" pid args
+  pid=$(lsof -nP -tiTCP:"$admin_port" -sTCP:LISTEN 2>/dev/null | head -1)
   [ -n "$pid" ] || return 1
   args=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
   case "$args" in
-    *"--name $1 "*|*"--name $1") return 1 ;;
+    *"--name $expected_name "*|*"--name $expected_name") return 1 ;;
     *hive-cloud*) echo "$pid"; return 0 ;;
     *) return 1 ;;
   esac
@@ -39,63 +40,68 @@ imposter_pid() { # <expected-name> <admin-port>
 
 # launchd exit code 78 (EX_CONFIG, "Unable to get updated LWCR") means the registered job
 # definition is stale: only bootout + bootstrap cures it. hive-cloud itself never exits 78.
-spawn_broken() { # <label>
-  launchctl print "$DOMAIN/$1" 2>/dev/null | grep -q 'last exit code = 78'
+spawn_broken() {
+  local label="$1"
+  launchctl print "$DOMAIN/$label" 2>/dev/null | grep -q 'last exit code = 78'
 }
 
-reload_job() { # <label>
-  local plist="$HOME/Library/LaunchAgents/$1.plist"
+reload_job() {
+  local label="$1"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
   [ -f "$plist" ] || return 1
-  launchctl bootout "$DOMAIN/$1" 2>/dev/null || true
-  sleep 3   # bootout returns before the job is fully gone; bootstrap in that window fails EIO
+  launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+  sleep "$BOOTOUT_SETTLE_SECS"
   launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null
 }
 
-ensure() { # <label> <admin-port>
-  launchctl print "$DOMAIN/$1" >/dev/null 2>&1 || return 0   # not installed → skip
+job_registered() { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
+
+ensure() {
+  local label="$1" admin_port="$2"
+  job_registered "$label" || return 0
 
   # Evict a squatter before interpreting health: every probe below would interrogate the wrong process.
   local name pid ilabel
-  name=${1#dev.shadw.}
-  if pid=$(imposter_pid "$name" "$2"); then
+  name=${label#dev.shadw.}
+  if pid=$(imposter_pid "$name" "$admin_port"); then
     ilabel=$(launchctl list 2>/dev/null | awk -v p="$pid" '$1 == p {print $3}')
-    echo "$(date '+%H:%M:%S') $1 IMPOSTOR on :$2 (pid $pid label ${ilabel:-none} is not --name $name) — evicting and restarting $1"
+    echo "$(date '+%H:%M:%S') $label IMPOSTOR on :$admin_port (pid $pid label ${ilabel:-none} is not --name $name) — evicting and restarting $label"
     if [ -n "$ilabel" ]; then
       launchctl bootout "$DOMAIN/$ilabel" 2>/dev/null || kill "$pid" 2>/dev/null || true
     else
       kill "$pid" 2>/dev/null || true
     fi
     sleep 2
-    launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
+    launchctl kickstart -k "$DOMAIN/$label" 2>/dev/null || true
     return 0
   fi
 
-  if healthy "$2"; then
+  if healthy "$admin_port"; then
     # Same sustained-window discipline: only STRIKES consecutive isolated reads earn a restart.
-    mesh_ok "$2" && return 0
+    mesh_ok "$admin_port" && return 0
     local j
     for ((j = 2; j <= STRIKES; j++)); do
       sleep "$SLEEP_BETWEEN"
-      mesh_ok "$2" && return 0
+      mesh_ok "$admin_port" && return 0
     done
-    echo "$(date '+%H:%M:%S') $1 ISOLATED on :$2 (/v1/mesh isolated=true across $STRIKES probes; /healthz green) — restarting to rejoin mesh"
-    launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
+    echo "$(date '+%H:%M:%S') $label ISOLATED on :$admin_port (/v1/mesh isolated=true across $STRIKES probes; /healthz green) — restarting to rejoin mesh"
+    launchctl kickstart -k "$DOMAIN/$label" 2>/dev/null || true
     return 0
   fi
 
   local i
   for ((i = 2; i <= STRIKES; i++)); do
     sleep "$SLEEP_BETWEEN"
-    healthy "$2" && return 0
+    healthy "$admin_port" && return 0
   done
 
   # Failed every probe across the window; `-k` clears a wedged process that will not exit by itself.
-  echo "$(date '+%H:%M:%S') $1 down on :$2 (failed $STRIKES probes over ~$((STRIKES * (PROBE_TIMEOUT + SLEEP_BETWEEN)))s) — restarting"
-  if spawn_broken "$1"; then
-    echo "$(date '+%H:%M:%S') $1 cannot be spawned (last exit 78 EX_CONFIG) — kickstart cannot fix that; re-registering its plist"
-    reload_job "$1" && return 0
+  echo "$(date '+%H:%M:%S') $label down on :$admin_port (failed $STRIKES probes over ~$((STRIKES * (PROBE_TIMEOUT + SLEEP_BETWEEN)))s) — restarting"
+  if spawn_broken "$label"; then
+    echo "$(date '+%H:%M:%S') $label cannot be spawned (last exit 78 EX_CONFIG) — kickstart cannot fix that; re-registering its plist"
+    reload_job "$label" && return 0
   fi
-  launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
+  launchctl kickstart -k "$DOMAIN/$label" 2>/dev/null || true
 }
 
 run_checks() {

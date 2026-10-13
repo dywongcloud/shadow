@@ -13,26 +13,28 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Build sources per glibc group (membership is by OS image, never region); run
 # scripts/audit-runtime-versions.sh before any roll instead of maintaining these from memory.
-SRC239=43.166.206.175  # va
-SRC238=43.152.247.70   # bkk
+SRC239=43.166.206.175
+SRC238=43.152.247.70
 TGT239="170.106.158.151 170.106.40.67 43.172.25.45 43.173.78.95 43.166.76.159 162.62.83.144"
 TGT238="43.128.46.225 43.166.223.197 43.166.233.114 43.153.106.173 170.106.155.130 162.62.83.91"
 
 BIN_PATH=/root/hive/target/release/hive-cloud
 
-build() { # $1 src ip
+build() {
+  local src_ip="$1"
   # The root manifest + lockfile carry workspace.members; crates/ alone is not a buildable tree.
-  rsync -az --delete -e "ssh ${SSHO[*]}" "$REPO_ROOT/crates/" "root@$1:/root/hive/crates/" || return 1
-  rsync -az -e "ssh ${SSHO[*]}" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "root@$1:/root/hive/" || return 1
+  rsync -az --delete -e "ssh ${SSHO[*]}" "$REPO_ROOT/crates/" "root@$src_ip:/root/hive/crates/" || return 1
+  rsync -az -e "ssh ${SSHO[*]}" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "root@$src_ip:/root/hive/" || return 1
   # touch defeats rsync's preserved mtimes so cargo cannot skip the rebuild; pipefail fails the roll.
-  ssh "${SSHO[@]}" "root@$1" 'set -o pipefail; cd /root/hive && find crates -name "*.rs" -exec touch {} + && cargo build --release -p hive-cloud 2>&1 | tail -1'
+  ssh "${SSHO[@]}" "root@$src_ip" 'set -o pipefail; cd /root/hive && find crates -name "*.rs" -exec touch {} + && cargo build --release -p hive-cloud 2>&1 | tail -1'
 }
 
-swap_restart() { # $1 target ip, $2 expected sha256
-  ssh "${SSHO[@]}" "root@$1" "
+swap_restart() {
+  local target_ip="$1" expected_sha="$2"
+  ssh "${SSHO[@]}" "root@$target_ip" "
     set -e
     got=\$(sha256sum /tmp/hive-cloud.new | cut -d' ' -f1)
-    [ \"\$got\" = \"$2\" ] || { echo SHA_MISMATCH; exit 1; }
+    [ \"\$got\" = \"$expected_sha\" ] || { echo SHA_MISMATCH; exit 1; }
     BIN=\$(systemctl show -p ExecStart --value hive-node | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
     cp -f \"\$BIN\" \"\$BIN.old-roll\"
     chmod +x /tmp/hive-cloud.new
@@ -45,7 +47,7 @@ swap_restart() { # $1 target ip, $2 expected sha256
   "
 }
 
-roll_group() { # $1 src ip, $2 targets
+roll_group() {
   local src=$1 targets=$2
   local sha
   sha=$(ssh "${SSHO[@]}" "root@$src" "sha256sum $BIN_PATH | cut -d' ' -f1") || { echo "$src SHA_READ_FAIL"; return 1; }

@@ -143,6 +143,10 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+async function drainUnusedBody(req) {
+  await readBody(req).catch(() => null);
+}
+
 /** The ONE mint. Every claim is this process's configuration, never a caller's; the EMPTY email
  *  makes `mint_token`'s platform_admin derivation structurally impossible. `countFailures` is
  *  false for the geo lookup so a cosmetic failure never pollutes /healthz's mint counters. */
@@ -387,7 +391,7 @@ const server = createServer(async (req, res) => {
     });
   }
   if (p === "/api/token" && req.method === "POST") {
-    await readBody(req).catch(() => null); // drain; the body is deliberately unused
+    await drainUnusedBody(req);
     return mintToken(res);
   }
   if (p === "/heartbeat" && req.method === "POST") {

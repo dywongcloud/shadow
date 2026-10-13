@@ -23,7 +23,7 @@ declare -A RELAY_NODES=(
   [fc-virginia]=43.166.206.175
   [fc-sanjose]=170.106.158.151
 )
-CRED_HOST=170.106.158.151 # fc-sanjose already holds VERCEL_API_TOKEN
+VERCEL_TOKEN_HOST=170.106.158.151
 
 if [ ! -x "$ACME" ]; then
   echo "acme.sh not found at $ACME — install: curl https://get.acme.sh | sh" >&2
@@ -31,11 +31,11 @@ if [ ! -x "$ACME" ]; then
 fi
 
 echo "== fetching VERCEL_API_TOKEN from fc-sanjose's own hive-node.service unit ==" >&2
-VERCEL_TOKEN=$(ssh "${SSH_OPTS[@]}" "root@$CRED_HOST" \
+VERCEL_TOKEN=$(ssh "${SSH_OPTS[@]}" "root@$VERCEL_TOKEN_HOST" \
   "systemctl show hive-node -p Environment --value" \
   | tr ' ' '\n' | grep '^VERCEL_API_TOKEN=' | cut -d= -f2)
 if [ -z "$VERCEL_TOKEN" ]; then
-  echo "could not read VERCEL_API_TOKEN from $CRED_HOST" >&2
+  echo "could not read VERCEL_API_TOKEN from $VERCEL_TOKEN_HOST" >&2
   exit 1
 fi
 export VERCEL_TOKEN

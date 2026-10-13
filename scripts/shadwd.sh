@@ -20,10 +20,9 @@ LA="$HOME/Library/LaunchAgents"
 LOGS="$HOME/Library/Logs/shadw"
 DOMAIN="gui/$(id -u)"
 NODES="${NODES:-2}"
-FC="${FC:-1}"   # include the Firecracker-backed in-VM node as a managed agent
+FC="${FC:-1}"
 DASH="${HIVE_DASHBOARD_URL:-http://localhost:3002}"
 PUB_DASH="${HIVE_PUBLIC_DASHBOARD_URL:-https://shadw.cloud}"
-# Remote node admins via the dev.shadw.peer-* forward tunnels (Mac 127.0.0.1:1879x); empty = none.
 BKK_PEER="${BKK_PEER:-http://127.0.0.1:18796}"
 VA_PEER="${VA_PEER:-http://127.0.0.1:18797}"
 SJ_PEER="${SJ_PEER:-http://127.0.0.1:18798}"
@@ -31,14 +30,15 @@ VA2_PEER="${VA2_PEER:-http://127.0.0.1:18799}"
 NODE_BIN="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/false)")"
 PATHVAL="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
 RL="info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
+WATCHDOG_LABEL=dev.shadw.watchdog
 LABELS=(dev.shadw.lima dev.shadw.node-a)
 [ "$NODES" -ge 2 ] && LABELS+=(dev.shadw.node-b)
-[ "$FC" = 1 ] && LABELS+=(dev.shadw.fc)   # Firecracker-backed in-VM node keeper
-LABELS+=(dev.shadw.watchdog)   # loaded last; restarts any down node (backstops KeepAlive)
+[ "$FC" = 1 ] && LABELS+=(dev.shadw.fc)
+LABELS+=("$WATCHDOG_LABEL")
 
 xml_args() { for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done; }
 
-write_node_plist() { # <label> <name> <public> <admin> <dns> <tls> <datadir> [peerUrl...]
+write_node_plist() {
   local label="$1" name="$2" pub="$3" adm="$4" dns="$5" tls="$6" data="$7"; shift 7
   local args=("$BIN" --name "$name" --listen "127.0.0.1:$pub" --admin "127.0.0.1:$adm")
   local peer
@@ -160,10 +160,11 @@ cmd_install() {
 }
 
 cmd_start()  { for l in "${LABELS[@]}"; do echo "  load $l"; load_agent "$l"; done; }
+reap_leaked_mock_cells() { pkill -f "server.py" 2>/dev/null; pkill -f "hive-cells" 2>/dev/null; }
 cmd_stop()   {
-  unload_agent dev.shadw.watchdog   # stop the resurrector FIRST, else it restarts nodes
-  for l in "${LABELS[@]}"; do [ "$l" = dev.shadw.watchdog ] && continue; echo "  unload $l"; unload_agent "$l"; done
-  pkill -f "server.py" 2>/dev/null; pkill -f "hive-cells" 2>/dev/null   # reap leaked mock cells
+  unload_agent "$WATCHDOG_LABEL"
+  for l in "${LABELS[@]}"; do [ "$l" = "$WATCHDOG_LABEL" ] && continue; echo "  unload $l"; unload_agent "$l"; done
+  reap_leaked_mock_cells
   echo "stopped"
 }
 cmd_restart() { for l in "${LABELS[@]}"; do launchctl kickstart -k "$DOMAIN/$l" 2>/dev/null || load_agent "$l"; done; echo "restarted"; }
@@ -188,9 +189,6 @@ cmd_status() {
 
 cmd_logs() { echo "tailing $LOGS/*.log (Ctrl-C to stop)"; tail -n 30 -f "$LOGS"/*.log; }
 
-# A hive-cloud node with the REAL Firecracker backend INSIDE the Lima VM, as a systemd service.
-# `Cargo.lock` must already resolve tokio-vsock (`cargo check -p hive-cell-agent` on the host
-# once; the VM repo mount is read-only).
 cmd_fc_daemon() {
   local VM="${FC_VM:-hive}"
   local REPO_IN_VM="/Users/$(id -un)/fluid/hive"

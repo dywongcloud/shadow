@@ -159,7 +159,7 @@ check_dashboard
 check_backend
 REMOTE_EOF
 
-declare -A RESULTS   # key "alias:VAR" -> PRESENT|MISSING|UNREACHABLE
+declare -A STATUS_BY_ALIAS_VAR
 declare -a ORDERED=()
 
 for triple in "${HOST_TRIPLES[@]}"; do
@@ -173,12 +173,12 @@ for triple in "${HOST_TRIPLES[@]}"; do
       kv="${line#*:}"
       var="${kv%%=*}"
       status="${kv#*=}"
-      RESULTS["${alias_name}:${var}"]="$status"
+      STATUS_BY_ALIAS_VAR["${alias_name}:${var}"]="$status"
     done <<<"$output"
   else
     echo "    UNREACHABLE (ssh failed)" >&2
     for var in "${ALL_VARS[@]}"; do
-      RESULTS["${alias_name}:${var}"]="UNREACHABLE"
+      STATUS_BY_ALIAS_VAR["${alias_name}:${var}"]="UNREACHABLE"
     done
   fi
 done
@@ -199,12 +199,12 @@ for alias_name in "${ORDERED[@]}"; do
   echo "-- $disp_name --"
   printf "  %-30s %-10s %s\n" "VARIABLE" "SCOPE" "STATUS"
   for var in "${DASHBOARD_VARS[@]}"; do
-    status="${RESULTS["${alias_name}:${var}"]:-UNKNOWN}"
+    status="${STATUS_BY_ALIAS_VAR["${alias_name}:${var}"]:-UNKNOWN}"
     [[ "$status" != "PRESENT" ]] && any_gap=1
     printf "  %-30s %-10s %s\n" "$var" "dashboard" "$status"
   done
   for var in "${BACKEND_VARS[@]}"; do
-    status="${RESULTS["${alias_name}:${var}"]:-UNKNOWN}"
+    status="${STATUS_BY_ALIAS_VAR["${alias_name}:${var}"]:-UNKNOWN}"
     [[ "$status" != "PRESENT" ]] && any_gap=1
     printf "  %-30s %-10s %s\n" "$var" "backend" "$status"
   done
@@ -225,7 +225,7 @@ else
     done
     node_gaps=()
     for var in "${ALL_VARS[@]}"; do
-      status="${RESULTS["${alias_name}:${var}"]:-UNKNOWN}"
+      status="${STATUS_BY_ALIAS_VAR["${alias_name}:${var}"]:-UNKNOWN}"
       [[ "$status" != "PRESENT" ]] && node_gaps+=("${var}=${status}")
     done
     if [[ ${#node_gaps[@]} -gt 0 ]]; then
