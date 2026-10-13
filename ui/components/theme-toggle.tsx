@@ -17,7 +17,6 @@ export function ThemeToggle() {
       onClick={() => setTheme(dark ? "light" : "dark")}
       className="flex h-8 w-8 items-center justify-center rounded-md border border-border text-secondary hover:bg-subtle hover:text-fg"
     >
-      {/* Avoid hydration mismatch: render a neutral icon until mounted. */}
       {!mounted ? <Sun className="h-4 w-4" /> : dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
     </button>
   );

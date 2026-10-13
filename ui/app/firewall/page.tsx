@@ -83,7 +83,6 @@ export default function FirewallPage() {
         </div>
       </Card>
 
-      {/* AI bot management — the three types of AI traffic. */}
       <Card className="mb-4">
         <div className="mb-1 text-sm font-medium text-fg">AI bot management</div>
         <p className="mb-4 text-xs text-secondary">

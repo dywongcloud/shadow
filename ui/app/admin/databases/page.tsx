@@ -13,7 +13,6 @@ export default function AdminDatabasesPage() {
 }
 
 async function AdminDatabasesData() {
-  // Platform-owner view -> ALL databases across every tenant (global endpoint).
   const { data: dbs, error } = await fetchOpsResult<Database[]>("/v1/admin/databases");
   return <AdminDatabasesClient initialDbs={dbs} initialError={error} />;
 }

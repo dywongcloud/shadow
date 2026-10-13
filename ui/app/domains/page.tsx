@@ -17,7 +17,6 @@ export default function DomainsPage() {
   const [q, setQ] = useState("");
 
   const projects = Array.from(new Set((deps ?? []).map((d) => d.project)));
-  // managed subdomains (one per project) + custom domains
   const managed = projects.map((p) => ({ domain: deploymentHost(`${p}.localhost`), project: p, kind: "managed" as const }));
   const customList = (custom ?? []).map((c) => ({ ...c, kind: "custom" as const }));
   const all = [...customList, ...managed].filter((d) => d.domain.toLowerCase().includes(q.toLowerCase()));

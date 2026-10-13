@@ -6,6 +6,8 @@ import { useOpsPoll, type NodeInfo, type AdminOverview } from "@/lib/api";
 import { OpsFetchError } from "@/components/ops-fetch-error";
 import { timeAgo } from "@/lib/utils";
 
+const OVERVIEW_POLL_MS = 10_000;
+
 export function AdminNodesClient({
   initialNodes,
   initialOverview,
@@ -18,8 +20,7 @@ export function AdminNodesClient({
   initialOverviewError?: string | null;
 }) {
   const { data: nodes, error: nodesError } = useOpsPoll<NodeInfo[]>("/v1/nodes", 5000, true, initialNodes);
-  // Matches the backend's 15 s response cache for the overview fan-out.
-  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
+  const { data: ov, error: ovError } = useOpsPoll<AdminOverview>("/v1/admin/overview", OVERVIEW_POLL_MS, true, initialOverview);
   const nodesFailure = nodesError ?? initialNodesError ?? null;
   const ovFailure = ovError ?? initialOverviewError ?? null;
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
