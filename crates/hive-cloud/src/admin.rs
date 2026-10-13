@@ -3574,13 +3574,14 @@ async fn fleet_deployments_public(
 
 /// Public mount for [`anycast_table`]: the dashboard Network page reads it, so it takes the
 /// authenticated-read guard [`require_auth_read`] (any verified session, 401 otherwise), like
-/// `/v1/nodes`.
+/// `/v1/nodes`, and hands the claims on so the table is shaped per reader (operator or sanitized).
 async fn anycast_public(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth_read(claims.as_ref().map(|e| &e.0))?;
-    Ok(anycast_table(State(c)).await)
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    Ok(anycast_table(State(c), cl).await)
 }
 
 /// Public mount for [`functions`]: the same CWE-306 class but tenant-shaped, so it takes
@@ -7949,6 +7950,56 @@ async fn overview(
     })))
 }
 
+/// Typed connectivity of `n` as THIS observer sees it, derived from signals the node already
+/// tracks: the boolean `healthy` collapses three situations an operator must tell apart. `"self"`;
+/// `"suspect"` (gossip-alive but this observer's probes fail repeatedly, withdrawn from
+/// placement/DNS by `health::demote`'s guarded path); `"degraded"` (gossip-alive and probes pass,
+/// but THIS observer's trunk to it recently failed, `health::is_cold`: an observer-local transport
+/// fault, not a sick node); `"healthy"`. A node with no gossip for 30 s is absent from the registry
+/// list, so "offline" never appears here. Per-observer by design: through the ops proxy it answers
+/// with the LEADER's view.
+fn node_connectivity(c: &Arc<CloudState>, n: &hive_edge::region::NodeInfo) -> &'static str {
+    if n.is_self {
+        "self"
+    } else if !n.healthy {
+        "suspect"
+    } else if crate::health::is_cold(&c.registry, &n.name) {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
+
+/// The node record served to a signed-in reader who is not a platform operator: topology, health
+/// and capacity descriptors for the network page (mesh map, health, capacity totals), and NONE of
+/// the mesh-internal addressing (`iroh_addr`, `peer_id`, `public_ip`, `public_url`, `relay_url`,
+/// `guardian_iroh_addr`, `private_addr`: all dialable endpoints). The GPU fields are hardware
+/// descriptors like `cpu_cores`, not addresses; omitting them blanked the regions map's GPU
+/// colouring and badge for every non-operator viewer. Every node view that reaches a non-operator
+/// goes through this one projection.
+fn non_operator_node_view(n: &hive_edge::region::NodeInfo, connectivity: &'static str) -> Value {
+    json!({
+        "id": n.name,
+        "name": n.name,
+        "region": n.region,
+        "city": n.city,
+        "country": n.country,
+        "lat": n.lat,
+        "lon": n.lon,
+        "healthy": n.healthy,
+        "connectivity": connectivity,
+        "last_seen_ms": n.last_seen_ms,
+        "is_self": n.is_self,
+        "backend": n.backend,
+        "cpu_cores": n.cpu_cores,
+        "mem_total_mb": n.mem_total_mb,
+        "disk_total_gb": n.disk_total_gb,
+        "gpu_count": n.gpu_count,
+        "gpu_model": n.gpu_model,
+        "gpu_vram_mb": n.gpu_vram_mb,
+    })
+}
+
 pub(crate) async fn nodes(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -7956,32 +8007,6 @@ pub(crate) async fn nodes(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     let list = c.registry.nodes();
-    // Typed connectivity, derived from signals the node already tracks — the
-    // boolean `healthy` collapses three distinct situations the operator needs
-    // to tell apart, and the dashboard rendered them all as one gray:
-    //  - "healthy":  gossip-alive and this observer's probes pass.
-    //  - "degraded": gossip-alive and probes pass, but THIS observer's trunk
-    //    to it recently failed (`health::is_cold`) — an observer-local
-    //    transport fault, not a sick node; requests route around it while the
-    //    trunk re-forms.
-    //  - "suspect":  gossip-alive but this observer's probes fail repeatedly
-    //    (withdrawn from placement/DNS by `health::demote`'s guarded path).
-    //  - absent from the list entirely = no gossip for 30s = offline; the
-    //    registry already drops those, so the dashboard's "unreachable" rows
-    //    come from its own roster diff, not from this endpoint.
-    // Per-observer by design (AGENTS.md: a health verdict is per-OBSERVER) —
-    // reading this through the ops proxy answers with the LEADER's view.
-    let connectivity = |n: &hive_edge::region::NodeInfo| -> &'static str {
-        if n.is_self {
-            "self"
-        } else if !n.healthy {
-            "suspect"
-        } else if crate::health::is_cold(&c.registry, &n.name) {
-            "degraded"
-        } else {
-            "healthy"
-        }
-    };
     // Operators (and the mesh-internal gossip path) get the full record —
     // peer sync depends on iroh_addr/peer_id being present.
     if operator_allowed(cl, crate::auth::enforced()) {
@@ -7989,46 +8014,15 @@ pub(crate) async fn nodes(
             .iter()
             .map(|n| {
                 let mut v = json!(n);
-                v["connectivity"] = json!(connectivity(n));
+                v["connectivity"] = json!(node_connectivity(&c, n));
                 v
             })
             .collect();
         return Ok(Json(json!(full)));
     }
-    // Every other signed-in user gets the sanitized topology: enough to render
-    // the network page (mesh map, health, capacity totals), none of the
-    // mesh-internal addressing (iroh_addr/peer_id/public_ip/public_url/
-    // relay_url/guardian_iroh_addr — all dialable endpoints, held back from
-    // non-operators same as public_url). GPU capacity fields are NOT
-    // addresses (they're the same class of hardware descriptor as
-    // cpu_cores/mem_total_mb/disk_total_gb, already included below) — omitting
-    // them used to blank the regions map's GPU coloring/badge
-    // (`isGpuNode`/`nodeColor` in ui/app/regions/page.tsx) for every node, for
-    // every non-operator signed-in viewer, fleet-wide.
     let sanitized: Vec<Value> = list
-        .into_iter()
-        .map(|n| {
-            json!({
-                "id": n.name,
-                "name": n.name,
-                "region": n.region,
-                "city": n.city,
-                "country": n.country,
-                "lat": n.lat,
-                "lon": n.lon,
-                "healthy": n.healthy,
-                "connectivity": connectivity(&n),
-                "last_seen_ms": n.last_seen_ms,
-                "is_self": n.is_self,
-                "backend": n.backend,
-                "cpu_cores": n.cpu_cores,
-                "mem_total_mb": n.mem_total_mb,
-                "disk_total_gb": n.disk_total_gb,
-                "gpu_count": n.gpu_count,
-                "gpu_model": n.gpu_model,
-                "gpu_vram_mb": n.gpu_vram_mb,
-            })
-        })
+        .iter()
+        .map(|n| non_operator_node_view(n, node_connectivity(&c, n)))
         .collect();
     Ok(Json(json!(sanitized)))
 }
@@ -8045,8 +8039,14 @@ async fn cluster_status(
 }
 
 /// Anycast routing table: every node with latency/health, and the node this edge
-/// would route a request to (lowest-latency healthy, region-preferred).
-async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
+/// would route a request to (lowest-latency healthy, region-preferred). Operators (and dev mode)
+/// get the full node records; every other reader gets [`non_operator_node_view`] plus
+/// `latency_ms` (latency is not addressing), so this route never hands out what `/v1/nodes`
+/// withholds.
+async fn anycast_table(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<&crate::auth::Claims>,
+) -> Json<Value> {
     let selected = c.registry.anycast(Some(&c.region));
     // REAL placement: which nodes actually HOST deployments — this node's local
     // deployments plus peers' deployments learned via gossip (`peer_routes`). A
@@ -8073,17 +8073,36 @@ async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
     }
     let serving_counts: HashMap<String, usize> =
         serving.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+    let table = if operator_allowed(claims, crate::auth::enforced()) {
+        json!(c.registry.routing_table())
+    } else {
+        let rows: Vec<Value> = c
+            .registry
+            .routing_table()
+            .iter()
+            .map(|n| {
+                let mut row = non_operator_node_view(n, node_connectivity(&c, n));
+                row["latency_ms"] = json!(n.latency_ms);
+                row
+            })
+            .collect();
+        json!(rows)
+    };
     Json(json!({
         "region": c.region,
         "selected": selected.as_ref().map(|n| n.name.clone()),
-        "table": c.registry.routing_table(),
+        "table": table,
         // node name -> count of deployments it actually hosts (0/absent = standby).
         "serving": serving_counts,
     }))
 }
 
-async fn ratelimit_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.ratelimit.stats()))
+async fn ratelimit_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.ratelimit.stats())))
 }
 
 #[derive(Deserialize)]
@@ -9645,8 +9664,12 @@ async fn cdn_purge(
 
 // ---- Concurrency scaling ----
 
-async fn concurrency_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.limiter.stats()))
+async fn concurrency_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.limiter.stats())))
 }
 
 // ---- Routing layer ----

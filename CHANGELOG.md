@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-13 — /v1/anycast no longer hands every signed-in user the mesh addressing /v1/nodes withholds
+
+`anycast_table` (`admin.rs`) returned `c.registry.routing_table()`, the FULL `NodeInfo`
+of every node, to any verified session (`anycast_public` only called
+`require_auth_read`), while `/v1/nodes` serves non-operators a sanitized projection
+without the dialable addressing: a hobby-plan tenant could read every node's `peer_id`,
+`iroh_addr`, `guardian_iroh_addr`, `relay_url`, `public_ip`, `public_url` and
+`private_addr` from `GET /v1/anycast` (found by the comment-sweep agent while reading
+the handler). The non-operator projection is now ONE helper (`non_operator_node_view`),
+used by `/v1/nodes` unchanged and by `/v1/anycast` plus `latency_ms`, the one extra
+field the Network page reads; operators and dev mode keep the full table. `GET
+/v1/ratelimit` and `GET /v1/concurrency` took no caller at all and now require a
+session like the other topology reads (their consumers are the dashboard's Network
+page, deployment canvas and service graph). Witnessed on throwaway nodes: with auth
+enforced a tenant token's `/v1/anycast` rows carry none of those seven keys and do
+carry `latency_ms`, an operator token still gets all 45 `NodeInfo` keys, `/v1/nodes`
+keeps its shapes for both, no credentials is 401 on all three routes (admin listener
+and public ingress) and a tenant `PUT /v1/ratelimit` is still 403; a dev node (no
+`HIVE_JWT_SECRET`) still serves the full table and both counters without credentials.
+The other `get` routes with no caller extractor (mesh liveness probe, static
+catalogs, the public status board, share and checkout capability links) are public by
+design and unchanged. Not rolled.
+
 ## 2026-10-13 — the runtime cache no longer answers requests with no credentials
 
 `rc_authorize` (`admin.rs`) let any request without a JWT, API key, `x-hive-team` or
