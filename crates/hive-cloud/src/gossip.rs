@@ -2279,16 +2279,21 @@ pub async fn fetch_outcome(
     // any tenant-scoped privilege. A no-op when HIVE_JWT_SECRET is unset
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
-    if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue(
-            "mesh-internal",
-            "mesh",
-            "service",
-            false,
-            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
-        ) {
-            req = req.header("authorization", format!("Bearer {tok}"));
-        }
+    // Minted for EVERY gossip method, not just POST: the fleet-wide READ
+    // handlers this loop pulls (`/v1/serve-hosts`, `/v1/fleet-deployments`,
+    // `/v1/leases`, `/v1/guardian/heads`) are now guarded on their public HTTP
+    // route by `admin::require_fleet_read`, which accepts exactly this signed
+    // `service` delegation. Without it, any round that fell back to HTTP
+    // (bootstrap, or a stale/dead cached iroh addr) got a 403 and the node
+    // silently stopped learning its peers' routes, deployments and leases.
+    if let Ok(tok) = crate::auth::issue(
+        "mesh-internal",
+        "mesh",
+        "service",
+        false,
+        crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+    ) {
+        req = req.header("authorization", format!("Bearer {tok}"));
     }
     let answered = match req.timeout(Duration::from_secs(4)).send().await {
         Ok(r) if r.status().is_success() => r.bytes().await.ok().map(|b| b.to_vec()),

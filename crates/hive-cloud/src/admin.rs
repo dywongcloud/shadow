@@ -36,12 +36,15 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/overview", get(overview))
         .route("/v1/tasks/health", get(tasks_health))
         .route("/v1/nodes", get(nodes))
-        .route("/v1/serve-hosts", get(serve_hosts))
+        // CWE-306: these four are ALSO called directly by the mesh
+        // (`gossip::dispatch_verified`), so the guard lives on the public
+        // wrapper, never in the shared handler — see `require_fleet_read`.
+        .route("/v1/serve-hosts", get(serve_hosts_public))
         .route("/v1/resources", get(resources_get))
-        .route("/v1/leases", get(leases_get))
-        .route("/v1/guardian/heads", get(guardian_heads))
+        .route("/v1/leases", get(leases_public))
+        .route("/v1/guardian/heads", get(guardian_heads_public))
         .route("/v1/cluster", get(cluster_status))
-        .route("/v1/anycast", get(anycast_table))
+        .route("/v1/anycast", get(anycast_public))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
         .route("/v1/regions", get(regions))
         .route("/v1/wqueue/enqueue", post(wqueue_enqueue))
@@ -145,7 +148,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         )
         // Run a PRE-BUILT image from any registry (Docker Hub / Quay / arbitrary).
         .route("/v1/deploy/image", post(deploy_image))
-        .route("/v1/fleet-deployments", get(fleet_deployments))
+        // CWE-306: public mount is guarded; the mesh calls `fleet_deployments`
+        // directly (`gossip.rs`), so the guard is on the wrapper, not the handler.
+        .route("/v1/fleet-deployments", get(fleet_deployments_public))
         .route("/v1/builds/:id", get(build_get))
         .route("/v1/builds/:id/cancel", post(build_cancel))
         .route("/v1/buildcache/:key", get(buildcache_get))
@@ -3705,8 +3710,17 @@ async fn admin_set_project_team(
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
 /// Read-only; peers pull `node_modules` tarballs by content-addressed key.
-async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Response, StatusCode> {
+async fn buildcache_get(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(key): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
     use axum::response::IntoResponse;
+    // CWE-306: same fleet-wide-read gate as `/v1/serve-hosts`. The pulling peer
+    // presents a mesh `service` token (see `git.rs`'s build-cache fetch); the
+    // key alone is a content hash, never an authorization.
+    if require_fleet_read(claims.as_ref().map(|e| &e.0)).is_err() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     // Key is a hex content hash — reject anything else (path-traversal guard).
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(StatusCode::BAD_REQUEST);
@@ -4051,6 +4065,101 @@ pub(crate) fn require_operator(
             "platform-level change requires a platform operator".into(),
         ))
     }
+}
+
+// ---- CWE-306: public mounts for mesh-shared fleet-wide reads ----
+//
+// The auth middleware deliberately never rejects a GET for missing auth
+// (`auth::require_auth`: `if !is_mutation || open { … return resp }`), because
+// an unauthenticated read is supposed to fall through to `ANON_TENANT` and
+// come back EMPTY — "a namespace that owns nothing". That contract holds only
+// for handlers that actually consult tenancy. The handlers wrapped below return
+// FLEET-WIDE state (`c.gw.list()`, every served host, every container lease)
+// and never look at the caller, so under that middleware they served the whole
+// platform's control plane to any anonymous request. Confirmed live: an
+// unauthenticated `GET /v1/fleet-deployments` answered 200 with
+// `x-hive-anon: 1` and every tenant's deployment aliases.
+//
+// The guard goes on the PUBLIC ROUTE, never inside the shared handler: the mesh
+// leg calls these handlers directly (`gossip::dispatch_verified`), where there
+// are no HTTP headers at all, so it never passes through this layer.
+
+/// Who may read fleet-wide (non-tenant) state from the public HTTP listener.
+///   * a platform operator — the same `platform_admin` predicate
+///     [`require_operator`] uses; or
+///   * a verified short-lived mesh-internal `service` delegation (tenant
+///     `mesh`, the token `gossip::fetch` mints for node-to-node calls and
+///     `git.rs` for build-cache pulls). That is how a peer reaches these routes
+///     when iroh is unavailable and the HTTP fallback runs instead.
+///
+/// 403 (never 401) so the dashboard's existing re-mint-and-retry path fires and
+/// a caller cannot distinguish "forbidden" from "absent".
+pub(crate) fn require_fleet_read(
+    claims: Option<&crate::auth::Claims>,
+) -> Result<(), (StatusCode, String)> {
+    if !crate::auth::enforced() {
+        return Ok(()); // dev: no signing secret to verify against, as everywhere else.
+    }
+    if matches!(claims, Some(cl) if cl.platform_admin || (cl.role == "service" && cl.tenant == "mesh"))
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "fleet-wide read requires a platform operator or a mesh service token".into(),
+    ))
+}
+
+/// Public mount for [`serve_hosts`] — see [`require_fleet_read`].
+async fn serve_hosts_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: Option<Query<ServeHostsQ>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(serve_hosts(State(c), q).await)
+}
+
+/// Public mount for [`leases_get`] — see [`require_fleet_read`].
+async fn leases_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(leases_get(State(c)).await)
+}
+
+/// Public mount for [`guardian_heads`] — see [`require_fleet_read`].
+async fn guardian_heads_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(guardian_heads(State(c)).await)
+}
+
+/// Public mount for [`fleet_deployments`] — see [`require_fleet_read`]. Nothing
+/// in `ui/` calls this route; the dashboard reads the same fleet view through
+/// the separately-guarded `/v1/admin/overview` aggregation.
+async fn fleet_deployments_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(fleet_deployments(State(c)).await)
+}
+
+/// Public mount for [`anycast_table`]. Unlike the four above, this one IS read
+/// by the dashboard (Network page, `ui/app/network/page.tsx`), so it takes the
+/// ordinary authenticated-read guard [`require_auth_read`] — any verified
+/// session, 401 when there is none — exactly like `/v1/nodes`, the other
+/// topology view that page renders.
+async fn anycast_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(anycast_table(State(c)).await)
 }
 
 /// Like [`require_operator`], but also honors the internal node-to-node

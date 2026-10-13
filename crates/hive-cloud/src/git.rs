@@ -10935,7 +10935,21 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
     );
     let attempts = peers.into_iter().map(|peer| {
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
-        async move { (peer, cloud.http.get(&url).timeout(per_peer).send().await) }
+        // CWE-306: `/v1/buildcache/:key` is now gated by
+        // `admin::require_fleet_read`, so the pulling node presents the same
+        // short-lived mesh-internal `service` delegation `gossip::fetch` uses.
+        // A no-op when HIVE_JWT_SECRET is unset (issue() errors, no header).
+        let mut req = cloud.http.get(&url);
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            "mesh",
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
+            req = req.header("authorization", format!("Bearer {tok}"));
+        }
+        async move { (peer, req.timeout(per_peer).send().await) }
     });
     let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts))
         .await
