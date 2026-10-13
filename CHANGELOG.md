@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-13 — the relay certificate renewal script named a deleted host and skipped phoenix
+
+`scripts/renew-relay-cert.sh` copies the `*.relay.shadw.app` wildcard to
+`RELAY_NODES`, which listed fc-bangkok (deleted) and omitted fc-phoenix: run as
+written it aborted on the dead host and left phoenix's relay on the old
+certificate. Live check: fc-virginia, fc-sanjose and fc-phoenix all serve the same
+certificate, which EXPIRES 2026-10-31 23:59:59 GMT (issued 2026-08-27; the script
+is not scheduled anywhere), and `iroh-relay.service` is active on phoenix with
+`/etc/iroh-relay/{cert,key}.pem`. `RELAY_NODES` is now phoenix, virginia, sanjose.
+The renewal itself is not run: it is the operator's call and must happen before the
+31st or every `https://<node>.relay.shadw.app:3343` relay stops terminating TLS.
+
 ## 2026-10-13 — the host build lane reads tenant output through the capped reader
 
 `IsolatedBuild::run_host` drained a build command's stdout and stderr with

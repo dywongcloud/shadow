@@ -19,7 +19,7 @@ SSH_OPTS=(-i "$SSH_KEY" -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new 
 ACME="${ACME_SH:-$HOME/.acme.sh/acme.sh}"
 
 declare -A RELAY_NODES=(
-  [fc-bangkok]=43.152.247.70
+  [fc-phoenix]=93.188.162.67
   [fc-virginia]=43.166.206.175
   [fc-sanjose]=170.106.158.151
 )
