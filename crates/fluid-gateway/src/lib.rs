@@ -1334,6 +1334,18 @@ impl Gateway {
                 state = fluid_core::DeployState::Error;
             }
         }
+        // ONE classification, not two: `production` is the record's authoritative
+        // "is this the live production deployment" flag and it ANDs
+        // `publish_routes` with `state == Ready`, while `target` used to read the
+        // caller's `production` argument alone. A production-lane record staged
+        // before its routes published (or left non-Ready) therefore landed as
+        // `production: false, target: "production"`, and the edge preview gate —
+        // which classifies by `target` — served that NON-production deployment to
+        // anonymous callers. Measured on fc-sanjose 2026-10-13: 40 of 86 records
+        // had exactly that shape (`ughjh-58997df.shadw.app` answered 200 with no
+        // credentials, while `dpl-02afdaf3f0.shadw.app`, the same fleet's ordinary
+        // preview, correctly answered 401).
+        let is_production = production && publish_routes && state == fluid_core::DeployState::Ready;
         let dep = Deployment {
             id: id.clone(),
             project: manifest.project.clone(),
@@ -1345,8 +1357,8 @@ impl Gateway {
             state,
             creator,
             git,
-            production: production && publish_routes && state == fluid_core::DeployState::Ready,
-            target: if production {
+            production: is_production,
+            target: if is_production {
                 "production".into()
             } else {
                 "preview".into()
@@ -5091,12 +5103,16 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         commit_alias,
         branch_alias,
         id_alias: public_host(d.id.as_str()),
-        target: if d.target.is_empty() {
-            if d.production {
-                "production".into()
-            } else {
-                "preview".into()
-            }
+        // `production` is authoritative over `target`. Records registered before
+        // the write site above was fixed can disagree (`target: "production"` on a
+        // `production: false` record), and the edge preview gate classifies by
+        // `target` — so without normalizing on read, every such already-registered
+        // record would keep serving anonymously until it was rebuilt. Normalizing
+        // here fixes the whole fleet's existing records at once, with no redeploy.
+        target: if d.production {
+            "production".into()
+        } else if d.target.is_empty() || d.target.eq_ignore_ascii_case("production") {
+            "preview".into()
         } else {
             d.target.clone()
         },

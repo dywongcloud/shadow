@@ -161,6 +161,14 @@ impl CdnCache {
         }
     }
 
+    /// Drop ONE entry. Used when a response stops being servable at its key — a
+    /// protected deployment must not keep a body cached before protection
+    /// applied, and `purge()` would discard the whole node's cache to do it.
+    /// Returns whether an entry was present.
+    pub fn invalidate(&self, key: &str) -> bool {
+        self.map.lock().remove(key).is_some()
+    }
+
     pub fn purge(&self) {
         self.map.lock().clear();
     }

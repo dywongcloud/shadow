@@ -1020,12 +1020,32 @@ async fn edge_pipeline_inner(
         hive_edge::bot::BotVerdict::Allow => {}
     }
 
-    if let Some(resp) = preview_gate(&cloud, &host, &headers_vec, &region, &method, &path, &query) {
+    // Preview protection: preview deployments are private to team members by
+    // default; anonymous requests to a protected preview host get a 401.
+    let cache_key = CdnCache::key(&host, &path_q);
+    let protection = protection_for_host(&cloud, &host);
+    if let Some(resp) = preview_gate(
+        &cloud,
+        &host,
+        protection.as_ref(),
+        &headers_vec,
+        &region,
+        &method,
+        &path,
+        &query,
+    ) {
+        // Nothing cached at this key may outlive a refusal. The cache key is
+        // `host + path` and carries no auth dimension, so a body cached before
+        // this deployment became protected — or before protection was switched
+        // on — would otherwise sit there for its whole `s-maxage` (a year for a
+        // Next.js prerender). The gate runs before the lookup, so that copy can
+        // never be handed to an unauthorized caller; dropping it here keeps that
+        // true from the first refused request, not just once the entry expires.
+        cloud.cdn.invalidate(&cache_key);
         return resp;
     }
 
     let is_rsc = header(&headers_vec, "rsc").is_some();
-    let cache_key = CdnCache::key(&host, &path_q);
     if method == "GET" && !is_rsc {
         match cloud.cdn.lookup(&cache_key) {
             Lookup::Hit(c) => {
@@ -1097,7 +1117,18 @@ async fn edge_pipeline_inner(
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
 
-    let cacheable = method == "GET" && !is_rsc && status == 200 && is_cacheable(resp.headers());
+    // A protected deployment's body is never stored: the cache key has no auth
+    // dimension, so an entry written for an authorized caller is
+    // indistinguishable from one anyone may read. Protected content therefore
+    // always goes to the origin — the gate decides, every time.
+    let protected = protection
+        .as_ref()
+        .is_some_and(|p| p.kind != Protection::None);
+    let cacheable = method == "GET"
+        && !is_rsc
+        && status == 200
+        && !protected
+        && is_cacheable(resp.headers());
     let action = if cacheable { "cache-store" } else { "allow" };
     let ev = cloud.event(&region, &method, &host, &path, status, action, "");
     cloud.record(ev);
@@ -1590,24 +1621,34 @@ fn derive_dashboard(
         .filter(|u| !u.is_empty())
 }
 
-/// Gates access to protected preview deployments: `Some(401)` when the host is a team-private
-/// preview and the request carries no valid access credential, `None` to proceed. Gated by the
-/// deployment's ACTUAL environment, never the subdomain (a production deployment is never
-/// preview-protected, via its production domain or its commit/id URLs). Enterprise protection
-/// (`password` or `standard`, scope preview|all|production) is evaluated beside the legacy
-/// per-project preview toggle; a password unlocks via the sealed `hive_pw` cookie or the GET
-/// `__shadw_pw` form.
-fn preview_gate(
-    cloud: &Arc<CloudState>,
-    host: &str,
-    headers: &[(String, String)],
-    region: &str,
-    method: &str,
-    path: &str,
-    query: &str,
-) -> Option<Response> {
+/// How the deployment serving a host is protected. Decided ONCE per request by
+/// `protection_for_host` and shared by the gate and by the CDN cache: the cache
+/// key is `host + path` and carries no auth dimension, so two code paths
+/// answering "is this protected?" differently is exactly how a protected body
+/// lands in a cache any caller can read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Protection {
+    /// Not protected — production by default, or protection explicitly off.
+    None,
+    /// Enterprise password mode: a shared password unlocks it, no team identity.
+    Password,
+    /// Membership — enterprise `standard` mode OR the legacy per-project preview
+    /// toggle; a team credential unlocks it.
+    Standard,
+}
+
+/// `Protection` for the deployment serving `host`, with its project. `None` when
+/// no deployment resolves for that host on this node.
+struct HostProtection {
+    project: String,
+    kind: Protection,
+}
+
+fn protection_for_host(cloud: &Arc<CloudState>, host: &str) -> Option<HostProtection> {
     let dep = cloud.gw.deployment_for_host(host)?;
-    let project = dep.project.clone();
+    // `DeploymentInfo::target` is the authoritative environment — normalized in
+    // `fluid_gateway::view_of`, where `production` wins over a `target` that
+    // disagrees with it. An empty target is a legacy record: fall back to the flag.
     let target = if dep.target.is_empty() {
         if dep.production {
             "production"
@@ -1618,22 +1659,59 @@ fn preview_gate(
         dep.target.as_str()
     };
     let is_preview = !target.eq_ignore_ascii_case("production");
-
-    let ent = cloud.enterprise.protection(&project);
+    let ent = cloud.enterprise.protection(&dep.project);
     let ent_protects = ent.protects(target);
+    let kind = if ent_protects && ent.mode == "password" {
+        Protection::Password
+    } else if (ent_protects && ent.mode == "standard")
+        || (is_preview && cloud.projects.preview_protected(&dep.project))
+    {
+        Protection::Standard
+    } else {
+        Protection::None
+    };
+    Some(HostProtection {
+        project: dep.project.clone(),
+        kind,
+    })
+}
 
-    if ent_protects && ent.mode == "password" {
+/// Gates access to protected preview deployments: `Some(401)` when the host is a
+/// team-private preview and the request carries no valid access credential, `None`
+/// to proceed. Gated by the deployment's ACTUAL environment, never the subdomain
+/// (a production deployment is never preview-protected, via its production domain
+/// or its commit/id URLs). Enterprise protection (`password` or `standard`, scope
+/// preview|all|production) is evaluated beside the legacy per-project preview
+/// toggle; a password unlocks via the sealed `hive_pw` cookie or the GET
+/// `__shadw_pw` form.
+fn preview_gate(
+    cloud: &Arc<CloudState>,
+    host: &str,
+    protection: Option<&HostProtection>,
+    headers: &[(String, String)],
+    region: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Option<Response> {
+    // No deployment resolves for this host here: nothing to gate.
+    let protection = protection?;
+    let project = protection.project.as_str();
+    if protection.kind == Protection::None {
+        return None;
+    }
+    if protection.kind == Protection::Password {
         if let Some(pw_cookie) = cookie_value(headers, "hive_pw") {
             if cloud
                 .enterprise
-                .verify_password_cookie(&project, &pw_cookie)
+                .verify_password_cookie(project, &pw_cookie)
             {
                 return None;
             }
         }
         if let Some(submitted) = query_param(query, "__shadw_pw") {
-            if cloud.enterprise.verify_password(&project, &submitted) {
-                let cookie = cloud.enterprise.seal_password_cookie(&project, &submitted);
+            if cloud.enterprise.verify_password(project, &submitted) {
+                let cookie = cloud.enterprise.seal_password_cookie(project, &submitted);
                 let mut resp = axum::response::Redirect::temporary(path).into_response();
                 set(
                     &mut resp,
@@ -1649,7 +1727,7 @@ fn preview_gate(
                     path,
                     302,
                     "deploy-password-ok",
-                    &project,
+                    project,
                 );
                 cloud.record(ev);
                 return Some(resp);
@@ -1661,26 +1739,25 @@ fn preview_gate(
                 path,
                 401,
                 "deploy-password-bad",
-                &project,
+                project,
             );
             cloud.record(ev);
-            return Some(password_page(&project, path, region, true));
+            return Some(password_page(project, path, region, true));
         }
-        let ev = cloud.event(region, method, host, path, 401, "deploy-password", &project);
+        let ev = cloud.event(region, method, host, path, 401, "deploy-password", project);
         cloud.record(ev);
-        return Some(password_page(&project, path, region, false));
+        return Some(password_page(project, path, region, false));
     }
 
-    let legacy_preview = is_preview && cloud.projects.preview_protected(&project);
-    if !((ent_protects && ent.mode == "standard") || legacy_preview) {
-        return None;
-    }
-    let team = cloud.projects.team_of(&project);
+    // Membership protection: enterprise `standard` scope OR the legacy per-project
+    // preview toggle — both decided in `protection_for_host`, so this point is
+    // reached only when the deployment really is protected.
+    let team = cloud.projects.team_of(project);
     if has_preview_access(headers, &team) {
         return None;
     }
     #[cfg(feature = "zkauth")]
-    if crate::zkauth::cookie_access(&project, headers) {
+    if crate::zkauth::cookie_access(project, headers) {
         return None;
     }
     let ev = cloud.event(
@@ -1690,7 +1767,7 @@ fn preview_gate(
         path,
         401,
         "preview-protected",
-        &project,
+        project,
     );
     cloud.record(ev);
 
@@ -1703,13 +1780,16 @@ fn preview_gate(
                 let url = format!(
                     "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
                     pct(host),
-                    pct(&project),
+                    pct(project),
                     pct(&team),
                     pct(path),
                 );
                 let mut resp = axum::response::Redirect::temporary(&url).into_response();
                 set(&mut resp, "x-hive-region", region);
                 set(&mut resp, "x-hive-preview", "unlock-redirect");
+                // A refusal must never be cached: the cache key carries no auth
+                // dimension, so a stored redirect would be replayed to everyone.
+                set(&mut resp, "cache-control", "no-store");
                 return Some(resp);
             }
         }
@@ -1722,6 +1802,8 @@ fn preview_gate(
         .into_response();
     set(&mut resp, "x-hive-region", region);
     set(&mut resp, "x-hive-preview", "protected");
+    // Same reason as the redirect above: never let a refusal be cached.
+    set(&mut resp, "cache-control", "no-store");
     Some(resp)
 }
 
