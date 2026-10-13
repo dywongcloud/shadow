@@ -13,7 +13,7 @@ ORIGIN="http://127.0.0.1:${PORT}"
 JS_HEAP_MB="${HIVE_BROWSER_NODE_JS_HEAP_MB:-512}"
 BROKER_WAIT_SECS="${HIVE_BROWSER_NODE_BROKER_WAIT_SECS:-120}"
 HEALTH_POLL_SECS="${HIVE_BROWSER_NODE_HEALTH_POLL_SECS:-30}"
-UNREACHABLE_LIMIT="${HIVE_BROWSER_NODE_UNREACHABLE_LIMIT:-4}"
+UNREACHABLE_LIMIT="${HIVE_BROWSER_NODE_HEALTH_FAIL_LIMIT:-4}"
 # Far longer than a lease renewal (<=300s) plus an admission retry: degraded clears itself, and
 # recycling a degraded node is a restart loop.
 DEGRADED_LIMIT="${HIVE_BROWSER_NODE_DEGRADED_LIMIT:-40}"
@@ -136,6 +136,6 @@ while true; do
   if (( fails >= UNREACHABLE_LIMIT )); then
     echo "hive-browser-node: broker unreachable for $((fails * HEALTH_POLL_SECS))s — recycling chrome" >&2
     cleanup
-    exit 75   # EX_TEMPFAIL — systemd Restart=always brings it back
+    exit "$EX_TEMPFAIL"
   fi
 done
