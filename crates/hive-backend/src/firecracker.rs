@@ -1,21 +1,7 @@
-//! Firecracker cell backend — a cell is a real aarch64 microVM on KVM.
-//!
-//! Runs inside a Lima VM started with `nestedVirtualization=true` on an Apple
-//! Silicon M3/M4 host, where `/dev/kvm` is exposed to the guest. This is the
-//! faithful analogue of Hive's design: one cell == one Firecracker process,
-//! and the box daemon (this code) talks to the cell daemon (`hive-cell-agent`,
-//! running inside the guest) over **vsock**.
-//!
-//! Lifecycle here mirrors the control plane's expectations:
-//! * [`provision`](FirecrackerBackend::provision) boots a microVM and leaves the
-//!   in-guest agent idle — this is what the warm pool pre-pays.
-//! * [`run_build`](FirecrackerBackend::run_build) connects to the agent over
-//!   vsock, ships the job, and streams logs/result back.
-//! * [`terminate`](FirecrackerBackend::terminate) kills the Firecracker process
-//!   and reclaims the cell's runtime dir (cells are single-use).
-//!
-//! It compiles on all platforms; it only *works* where `/dev/kvm` and the
-//! `firecracker` binary exist.
+//! Firecracker cell backend: one cell == one Firecracker microVM on KVM, the box daemon (this code)
+//! talking to the in-guest `hive-cell-agent` over vsock. `provision` boots and leaves the agent idle
+//! (what the warm pool pre-pays), `run_build` ships a job and streams logs back, `terminate` kills
+//! the process and reclaims the run dir. Compiles everywhere; works only with `/dev/kvm`.
 
 use crate::{
     CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, PtyIo,
@@ -35,11 +21,6 @@ use hive_core::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-// File-descriptor passing and vsock-over-UDS are Unix-only. The Firecracker
-// MODULE stays declared on every platform (hive-cloud names
-// `FirecrackerBackend` unconditionally), but these imports -- and every site
-// that uses them -- are Unix-gated so `hive-backend` also typechecks for a
-// Windows target, where isolation comes from Litebox instead.
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -259,9 +240,6 @@ impl PublicationTempGuard {
             );
         }
 
-        // The image is the commit marker, so unlink and sync it first. Every
-        // durable prefix after this point is recoverable: sidecar+backup,
-        // backup alone, then the restored legacy image.
         if image_state == PublicationLinkState::Owned {
             remove_owned_publication_file(&self.image, &self.temporary_image_owner)?;
         }
@@ -336,9 +314,8 @@ pub struct FirecrackerConfig {
     pub rootfs_dir: PathBuf,
     /// Per-cell runtime state (api sockets, overlay disks, vsock) lives here.
     pub run_dir: PathBuf,
-    /// Logical name of the shared base rootfs to boot when an image has no
-    /// dedicated `<image>.ext4` (the common case: every deployment boots the same
-    /// runtime base and gets its build output from the attached data drive).
+    /// Logical name of the shared base rootfs booted when an image has no dedicated `<image>.ext4` —
+    /// the common case: every deployment boots the same base and gets its build from the data drive.
     pub base_image: String,
     /// Host-side build cache directory (tarballs keyed by cache key). Survives
     /// the ephemeral microVMs — the cross-build cache the agent restores from.
@@ -355,8 +332,6 @@ impl Default for FirecrackerConfig {
             run_dir: PathBuf::from("/var/lib/hive/run"),
             base_image: "default".to_string(),
             cache_dir: PathBuf::from("/var/lib/hive/cache"),
-            // The agent runs as PID1 (init=). The rootfs drive is the first
-            // virtio-blk device, so the kernel finds it at /dev/vda.
             boot_args:
                 "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/hive-cell-agent"
                     .to_string(),
@@ -379,23 +354,16 @@ pub struct FirecrackerBackend {
     /// Container cells run on the host and own their exact container identity and
     /// tunnel task here; they have no `Child` in `procs`.
     containers: Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>>,
-    /// Caller-authorized H1 identities scoped to one in-flight provision. The
-    /// synchronous mutex exists so the Drop guard can erase an authorization on
-    /// request cancellation; entries never survive the provision future.
+    /// Caller-authorized H1 identities scoped to one in-flight provision; a sync mutex so the Drop
+    /// guard can erase an authorization on cancellation. Entries never survive the provision future.
     artifact_authorizations: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactIdentity>>>,
-    /// Exact rootfs proofs, keyed by image path and invalidated by image or proof
-    /// inode/size/mtime changes. The multi-GiB image is hashed once at boot (or
-    /// first use), never on every cold start; an atomic rootfs/proof replacement
-    /// necessarily changes a stamp and forces re-verification before another
-    /// deployment VM can boot.
+    /// Exact rootfs proofs keyed by image path, invalidated by inode/size/mtime changes: the multi-GiB
+    /// image is hashed once, never per cold start, and an atomic replacement forces re-verification.
     rootfs_protocols: Arc<Mutex<HashMap<PathBuf, VerifiedRootfsProtocol>>>,
-    /// Proof selected while the immutable base bytes for one deployment cell were
-    /// stable and copied. Launch consumes this per-cell fact rather than whatever
-    /// rootfs publication happens to be canonical later.
+    /// Proof selected while the immutable base bytes for one deployment cell were stable and copied;
+    /// launch consumes this per-cell fact, never whatever publication is canonical later.
     cell_rootfs_proofs: Arc<std::sync::Mutex<HashMap<CellId, RuntimeArtifactRootfsMetadata>>>,
-    /// Throttled batch CPU sampler for `cpu_percent` (#2): samples the per-cell
-    /// Firecracker VMM host process, whose CPU tracks the guest's vCPU work
-    /// (Firecracker is a thin VMM).
+    /// Throttled batch CPU sampler for `cpu_percent`, sampling the per-cell VMM host process.
     sampler: Arc<crate::CpuSampler>,
 }
 
@@ -404,12 +372,6 @@ impl FirecrackerBackend {
         let procs = Arc::new(Mutex::new(HashMap::new()));
         let containers: Arc<Mutex<HashMap<CellId, crate::ContainerLaunch>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        // Self-management GC: periodically reap orphaned per-cell run dirs — the
-        // multi-GB microVM overlays left behind when a cell's firecracker process
-        // is gone (e.g. after a node restart). Without this, dead overlays
-        // accumulate and exhaust host disk (the SJ outage). Only dirs with no live
-        // process/container AND untouched for a grace period are removed, so an
-        // in-flight provision (dir created before the process registers) is never reaped.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let procs_gc = procs.clone();
             let ctrs_gc = containers.clone();
@@ -439,33 +401,10 @@ impl FirecrackerBackend {
     /// a minimal env). Covers the standard distro locations.
     const PODMAN_PATH: &'static str = crate::PODMAN_PATH;
 
-    /// Remove run dirs for cells that are NOT live (no entry in `procs` for microVM
-    /// cells, nor in `containers` for host-podman cells) and whose dir hasn't been
-    /// modified in the last 5 minutes (so an in-flight provision is safe). Frees
-    /// orphaned overlay disk. Best-effort.
-    /// Reclaim per-deployment data images in `rootfs_dir` that no live
-    /// deployment references.
-    ///
-    /// `gc_orphans` below only ever walked `run_dir` (ephemeral per-cell run
-    /// dirs). The PERSISTENT `<image>.data.ext4` files this backend writes in
-    /// `deliver_build` were structurally invisible to it — no age, no reference
-    /// check, nothing — and no other code path deletes them either
-    /// (`terminate` removes only `cell.root`; there is no delete method on the
-    /// backend trait at all). So every redeploy left its predecessor's whole
-    /// multi-GiB image behind, forever.
-    ///
-    /// Measured consequence on fc-sanjose, 2026-07-31: 370 images, 627 GiB
-    /// apparent on a 493 GiB disk, dating back five weeks. The node reached 0
-    /// bytes free and took 9 customer deployments down — and because the
-    /// headroom check ran `gc_orphans` and freed nothing, it reported "after
-    /// GC", which read as "nothing left to reclaim" when in fact the GC could
-    /// not see the 325 GiB sitting next to it.
-    ///
-    /// `keep` is the set of image stems still referenced. Anything else is
-    /// removed once older than `grace` — the age guard matters because an image
-    /// is written by `deliver_build` BEFORE the deployment that references it
-    /// finishes registering, and reaping that window would delete a build in
-    /// flight.
+    /// Reclaim per-deployment data images in `rootfs_dir` that no live deployment references: `keep`
+    /// is the set of referenced image stems (matched in both the literal and the `dpl-`-stripped
+    /// form), anything else is removed once older than `grace`, and an empty keep-set or an orphaned
+    /// fraction over `HIVE_GC_MAX_REAP_FRACTION` refuses the whole pass.
     pub async fn gc_rootfs_images(
         rootfs_dir: &std::path::Path,
         keep: &std::collections::HashSet<String>,
@@ -475,8 +414,6 @@ impl FirecrackerBackend {
         let mut removed = 0usize;
         let mut bytes = 0u64;
 
-        // Collect first, decide second — the blast-radius check below has to see
-        // the whole picture before a single file is unlinked.
         let mut candidates: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
         let mut total_images = 0usize;
         let mut entries = match tokio::fs::read_dir(rootfs_dir).await {
@@ -485,25 +422,10 @@ impl FirecrackerBackend {
         };
         while let Ok(Some(e)) = entries.next_entry().await {
             let name = e.file_name().to_string_lossy().to_string();
-            // Only this backend's own per-deployment data images. Never touch
-            // the shared base rootfs/kernel artifacts sitting in the same dir.
             let Some(stem) = name.strip_suffix(".data.ext4") else {
                 continue;
             };
             total_images += 1;
-            // Match BOTH the literal stem and the prefix-stripped form.
-            //
-            // `deliver_build` names images `dpl-{bid}` where `bid` is ALREADY
-            // `dpl-<hash>`, so every file on disk is `dpl-dpl-<hash>.data.ext4`
-            // — a real double-prefix bug (git.rs's `format!("dpl-{}", bid)`).
-            // A caller that builds `keep` from deployment ids the obvious way
-            // produces `dpl-<hash>`, which matches NOTHING on disk, and this GC
-            // would then delete every live deployment's data disk. Measured on
-            // fc-sanjose while writing this: 0 of 369 stems matched raw
-            // deployment ids, 328 of 369 matched once the extra prefix was
-            // stripped. Accepting both forms makes that class of caller bug
-            // unable to cause data loss, instead of relying on every caller
-            // knowing about the naming quirk.
             let alt = stem.strip_prefix("dpl-").unwrap_or(stem);
             if keep.contains(stem) || keep.contains(alt) {
                 continue;
@@ -521,12 +443,6 @@ impl FirecrackerBackend {
             candidates.push((e.path(), stem.to_string(), md.len()));
         }
 
-        // BLAST-RADIUS GUARD. An empty or wrongly-namespaced `keep` set makes
-        // every image on disk look orphaned, and this function would then delete
-        // every live deployment's data disk — unrecoverable. No legitimate
-        // reclaim pass ever needs to remove most of the fleet's images at once,
-        // so refuse rather than proceed, and say why. `HIVE_GC_MAX_REAP_FRACTION`
-        // relaxes it for a deliberate bulk cleanup.
         let max_fraction = std::env::var("HIVE_GC_MAX_REAP_FRACTION")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -601,7 +517,6 @@ impl FirecrackerBackend {
                 if live.contains(&cid) {
                     continue;
                 }
-                // Age guard: skip dirs modified recently (possible in-flight provision).
                 let recent = cell
                     .metadata()
                     .await
@@ -644,15 +559,9 @@ impl FirecrackerBackend {
         }
     }
 
-    /// Disk-pressure guard for cold starts: if the run filesystem is critically low,
-    /// reap orphaned overlays first, then refuse the provision (clear error, no
-    /// silent half-boot) if still below the floor. Each microVM overlay is multi-GB,
-    /// so booting into a near-full disk is what corrupted SJ's state (the outage).
+    /// Disk-pressure guard for cold starts: reap orphaned overlays first, then refuse the provision
+    /// if the run filesystem is still under the floor (`HIVE_DISK_FLOOR_MIB`, ~3 GiB).
     async fn ensure_disk_headroom(&self) -> anyhow::Result<()> {
-        // Floor: a microVM overlay pair (rootfs + data) plus slack. ~3 GiB by
-        // default; `HIVE_DISK_FLOOR_MIB` tunes it. It was a hardcoded const,
-        // which meant a fleet with larger images had no way to raise it without
-        // a rebuild.
         let floor_bytes: u64 = std::env::var("HIVE_DISK_FLOOR_MIB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -674,11 +583,6 @@ impl FirecrackerBackend {
         );
         Self::gc_orphans(&self.cfg.run_dir, &self.procs, &self.containers).await;
         let free = Self::disk_free_bytes(base);
-        // Report what the GC actually accomplished. The old message ended at
-        // "after GC", which read as "nothing left to reclaim" even when the GC
-        // had freed literally zero bytes because it could not see the images
-        // filling the disk (see `gc_rootfs_images`). Naming the delta makes an
-        // ineffective GC visible instead of implying an exhausted one.
         anyhow::ensure!(
             free >= floor_bytes,
             "no capacity: host disk critically low ({} MiB free, need {} MiB); GC reclaimed {} MiB",
@@ -1018,9 +922,8 @@ impl FirecrackerBackend {
         Ok(self.verified_rootfs_protocol(rootfs).await?.protocol)
     }
 
-    /// Protocol proved by the exact shared base rootfs this backend will boot.
-    /// `hive-cloud` advertises only this result; a sidecar's existence alone is
-    /// intentionally insufficient.
+    /// Protocol proved by the exact shared base rootfs this backend will boot; a sidecar's existence
+    /// alone is never advertised.
     pub async fn base_runtime_artifact_protocol(&self) -> anyhow::Result<u16> {
         let rootfs = self.rootfs_for(&self.cfg.base_image);
         self.verified_rootfs_runtime_artifact_protocol(&rootfs)
@@ -1038,9 +941,8 @@ impl FirecrackerBackend {
         })
     }
 
-    /// Per-deployment build-output ext4 (the artifact `deliver_build` packs and
-    /// `provision` attaches as the cell's second drive). Lives alongside the
-    /// base rootfs images, keyed by the same logical image name.
+    /// Per-deployment build-output ext4 (packed by `deliver_build`, attached by `provision` as the
+    /// second drive), beside the base images under the same logical name.
     fn data_image_for(&self, image: &str) -> PathBuf {
         self.cfg
             .rootfs_dir
@@ -1169,10 +1071,6 @@ impl FirecrackerBackend {
             }
         }
 
-        // A hard link inherits the legacy image's old inode mtime, so its mtime
-        // alone cannot prove the backup name is stale. Reap that link only when
-        // both unique files from the same maximum crash residue are themselves
-        // old enough. A lone backup is retained rather than guessed stale.
         let old_image_temporary = candidates.iter().any(|candidate| candidate.3 == 0);
         let old_identity_temporary = candidates.iter().any(|candidate| candidate.3 == 1);
         if !old_image_temporary || !old_identity_temporary {
@@ -1406,17 +1304,8 @@ impl FirecrackerBackend {
         Ok(publication.identity)
     }
 
-    /// Locate a deployment's data image on disk for the storage broker
-    /// (`storage_broker`/`hive_backend::snapshot` callers), accounting for
-    /// the historical `dpl-dpl-` double-prefix documented on
-    /// [`Self::gc_rootfs_images`]: `deliver_build` writes images keyed by
-    /// `dpl-{bid}` where `bid` is already `dpl-<hash>`, so what's actually on
-    /// disk today is double-prefixed. Tries that as-written form first (what
-    /// exists today), then the bare id as a forward-compatible fallback if
-    /// that naming bug is ever fixed at the write site — the exact same
-    /// both-forms tolerance `gc_rootfs_images` already needed, kept in one
-    /// place rather than re-derived per caller. `None` when neither file
-    /// exists: a caller must never guess a path that might not be real.
+    /// Locate a deployment's data image on disk, trying the historical `dpl-dpl-` double-prefixed name
+    /// first and the bare id second; `None` when neither exists.
     pub fn locate_data_image(&self, deployment_id: &str) -> Option<PathBuf> {
         let doubled = self.data_image_for(&format!("dpl-{deployment_id}"));
         if doubled.is_file() {
@@ -1429,24 +1318,8 @@ impl FirecrackerBackend {
         None
     }
 
-    /// Directory a deployment's snapshots are stored under — sibling to the
-    /// data images themselves, namespaced by id so `snapshot::snapshot_image`
-    /// / `count_snapshots` / `list_snapshots` never need to see any OTHER
-    /// deployment's snapshots to do their job.
-    ///
-    /// The id is embedded inside a longer `snaps-<id>` component rather than
-    /// used bare, on purpose: `sanitize_image` passes `.` through unchanged
-    /// (it only rewrites `/` and other non-`[A-Za-z0-9.-]` characters), so a
-    /// bare sanitized `deployment_id` of exactly `".."` would still BE `".."`
-    /// — a real directory-traversal component escaping this dir entirely.
-    /// `rootfs_for`/`data_image_for` are already safe from this because they
-    /// always suffix `.ext4`/`.data.ext4` (so `".."` becomes the harmless
-    /// filename `"...ext4"`, never a standalone `..` component); this method
-    /// didn't have a suffix and needs the same embedding to get the same
-    /// guarantee. In practice every caller of this method (`storage_api`)
-    /// already requires `deployment_id` to match a real, internally-generated
-    /// id before ever reaching here — this is defense in depth for whatever
-    /// calls it next, not the only gate.
+    /// Directory a deployment's snapshots live under, with the id embedded inside a `snaps-<id>`
+    /// component (never bare: `sanitize_image` passes `.` through, so a bare `..` would traverse).
     pub fn snapshot_dir(&self, deployment_id: &str) -> PathBuf {
         self.cfg
             .rootfs_dir
@@ -1454,48 +1327,20 @@ impl FirecrackerBackend {
             .join(format!("snaps-{}", crate::sanitize_image(deployment_id)))
     }
 
-    /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) can
-    /// reach the internet. Run once per process; failures are non-fatal (cells
-    /// just won't get egress).
+    /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) reach the internet; once
+    /// per process, failures non-fatal (cells just get no egress).
     async fn ensure_host_nat(&self) {
         use std::sync::atomic::Ordering;
         if self.nat_ready.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Use iptables where present, else nftables (modern distros ship only
-        // `nft`). Both set a MASQUERADE on the guest subnet + allow forwarding.
-        // TENANT ISOLATION: the cell↔cell DROP must precede the ACCEPTs. Without
-        // it, `-s 172.16/16 ACCEPT` also forwards guest→guest traffic (the host
-        // routes every per-cell /30), letting one tenant's microVM reach another's.
-        // Internet egress return-traffic is unaffected (src is external, so the
-        // 172.16→172.16 pair never matches), and host↔guest control-plane traffic
-        // uses OUTPUT/INPUT, not FORWARD.
-        // HAIRPIN: a guest that POSTs to its OWN deployment's public hostname
-        // resolves the node's PUBLIC ip, but that address lives on the cloud
-        // provider's 1:1 NAT and not on any host interface — so the packet is
-        // MASQUERADEd out the default route and dropped by the provider, which
-        // surfaced as `RUNTIME_TUNNEL_FAILED` on a callback the app made to
-        // itself. hive-cloud already listens on 0.0.0.0:{80,443}, so redirecting
-        // those flows back into the host is all that's needed. Scoped to THIS
-        // node's own public ip: traffic to any other node still egresses
-        // normally, and because REDIRECT lands the packet on the host's INPUT
-        // path the cell↔cell FORWARD DROP above is untouched (a guest still
-        // cannot reach another guest this way — it reaches the same public
-        // host-routing hive-cloud serves everyone).
         let hairpin = match std::env::var("HIVE_PUBLIC_IP")
             .ok()
             .map(|s| s.trim().to_string())
         {
-            // `auto` is a real configured value meaning "detect at runtime", not
-            // an address — and an unset/unparseable value means this host has no
-            // inbound-reachable address to hairpin to at all.
             Some(ip) if ip.parse::<std::net::Ipv4Addr>().is_ok() => ip,
             _ => String::new(),
         };
-        // `HAIRPIN_IP` arrives as an ENV VAR rather than interpolated into the
-        // script: the nft branch is full of `{ ... }` chain bodies, so a
-        // `format!` here would need every brace escaped, and an env var also
-        // leaves no shell-injection surface for a configured value.
         let script = r#"
             export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
             sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
@@ -1532,10 +1377,8 @@ impl FirecrackerBackend {
             .await;
     }
 
-    /// Allocate a /30 egress subnet + host TAP for a cell. Returns the kernel
-    /// `ip=` boot-arg fragment + guest MAC to attach as eth0, or None if host
-    /// networking couldn't be set up (cell then boots without egress — never a
-    /// regression vs. the old vsock-only behavior).
+    /// Allocate a /30 egress subnet + host TAP for a cell: the kernel `ip=` boot-arg fragment and
+    /// guest MAC, or `None` when host networking failed (the cell boots without egress).
     async fn setup_cell_net(&self, id: &CellId) -> Option<CellNet> {
         use std::sync::atomic::Ordering;
         self.ensure_host_nat().await;
@@ -1547,7 +1390,6 @@ impl FirecrackerBackend {
         let tap = format!("fc{i}");
         let mut rollback = LinkRollback::new(tap.clone());
         let mac = format!("02:fc:00:00:{:02x}:{:02x}", (i >> 8) as u8, i as u8);
-        // Recreate the tap fresh (delete any stale one from a prior cell at this index).
         let script = format!(
             "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
              ip link del {tap} 2>/dev/null; ip tuntap add dev {tap} mode tap 2>/dev/null && \
@@ -1569,24 +1411,17 @@ impl FirecrackerBackend {
         Some(CellNet {
             tap,
             mac,
-            // kernel ip= autoconfig: client::gw:netmask::device:off
             ip_cmdline: format!("ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"),
         })
     }
 
-    /// Write `/etc/resolv.conf` into the PER-CELL overlay (never the shared base
-    /// image) via debugfs — no mount needed. Deployment cells require this final
-    /// mutation to complete before their exact boot bytes are hashed; build and
-    /// sandbox cells retain the historical best-effort caller posture.
+    /// Write `/etc/resolv.conf` into the PER-CELL overlay via debugfs; deployment cells require this
+    /// final mutation before their exact boot bytes are hashed.
     async fn write_guest_resolv(&self, overlay: &std::path::Path) -> anyhow::Result<()> {
         const RESOLVER: &[u8] = b"nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
         let tmp = overlay.with_extension("resolv.tmp");
         tokio::fs::write(&tmp, RESOLVER).await?;
         let mutation = async {
-            // Removing a nonexistent path is harmless; the subsequent write and
-            // exact read-back are the authoritative mutation checks. debugfs can
-            // report command-level errors while still exiting zero, so status
-            // alone must never bless the boot bytes.
             let _ = Command::new("debugfs")
                 .args(["-w", "-R", "rm /etc/resolv.conf"])
                 .arg(overlay)
@@ -1693,9 +1528,6 @@ impl Drop for FirecrackerProvisionGuard {
         let rootfs_boot_guard = self.rootfs_boot_guard.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                // Failed-provision cleanup owns the same per-cell serialization
-                // guard, so a retry cannot recreate files while this task removes
-                // the prior attempt's private rootfs and sidecar.
                 let _rootfs_boot_guard = rootfs_boot_guard;
                 cleanup_firecracker_process_and_tap(&id, &procs, &taps).await;
                 let _ = tokio::fs::remove_dir_all(root).await;
@@ -1765,20 +1597,9 @@ async fn cleanup_firecracker_process_and_tap(
 /// Guest root where the validated checkout artifact is mounted.
 pub const DELIVERED_WORKDIR: &str = "/workspace";
 
-/// Copy `src` to `dst`, preferring a copy-on-write REFLINK clone over a full
-/// block-level copy when the host filesystem supports it (XFS formatted with
-/// `reflink=1` — the `mkfs.xfs` default since RHEL/Rocky 8, or Btrfs). A
-/// reflink clone shares the underlying extents and completes in roughly
-/// constant time regardless of file size, which matters here: `base`/
-/// `data_src` are multi-hundred-MB-to-multi-GB rootfs images copied on EVERY
-/// cold start (a real, measured contributor to provision latency — this is
-/// NOT true CoW at the Firecracker level, just a faster way to produce the
-/// per-cell writable copy it needs). Falls back to a plain byte-for-byte copy
-/// — IDENTICAL to the prior behavior — whenever reflink isn't available
-/// (ext4, a cross-filesystem copy, or any `cp` failure), so this can only ever
-/// be as fast as before, never slower or less correct. Linux-only mechanism
-/// (`cp --reflink` is a GNU coreutils extension); on any other OS this is a
-/// pure passthrough to `tokio::fs::copy`.
+/// Copy `src` to `dst`, preferring a copy-on-write reflink clone (XFS `reflink=1`, Btrfs) over a
+/// full copy — multi-GB rootfs images are copied on EVERY cold start; falls back to a plain copy
+/// wherever reflink is unavailable, and is a `tokio::fs::copy` passthrough off Linux.
 async fn reflink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -2006,9 +1827,6 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
-        // CONTAINER cell: run via podman on the HOST (outside the microVM). No KVM /
-        // microVM boot needed — just a per-cell run dir; `start_function` does the
-        // `podman run`. This is what lets a Firecracker node also run containers.
         if let Some(ctr) = &spec.container {
             let tenant = if spec.tenant.trim().is_empty() {
                 "personal"
@@ -2039,10 +1857,6 @@ impl CellBackend for FirecrackerBackend {
             });
         }
 
-        // No hypervisor on this node — a NODE fault, not capacity. On this fleet
-        // the usual cause is the documented PVM one: `kvm_pvm` refuses to load
-        // while host PTI is active, so `/dev/kvm` silently disappears and every
-        // cold start here fails identically until the node is fixed.
         anyhow::ensure!(
             self.is_supported(),
             "node cannot run microVMs: the firecracker backend is unavailable (needs Linux + \
@@ -2052,14 +1866,8 @@ impl CellBackend for FirecrackerBackend {
             self.cfg.firecracker_bin.display(),
             hive_core::fault::NODE_BACKEND_UNAVAILABLE
         );
-        // Self-manage disk before allocating multi-GB overlays: GC orphans + refuse
-        // if still critically low, so we never boot into a near-full filesystem.
         self.ensure_disk_headroom().await?;
 
-        // Per-tenant run dir (`<run_dir>/<tenant>/<cell-id>`) so each team's VM
-        // sockets / overlays / console logs are isolated on the host. (The VM
-        // itself is already isolated by its own kernel + per-cell vsock; this
-        // partitions the host-side artifacts too.) Empty tenant => "personal".
         let tenant = if spec.tenant.trim().is_empty() {
             "personal"
         } else {
@@ -2087,9 +1895,6 @@ impl CellBackend for FirecrackerBackend {
         provision.hold_rootfs_boot_guard(rootfs_boot_guard);
         let duplicate_live = self.procs.lock().await.contains_key(&spec.id);
         if duplicate_live {
-            // This attempt owns no process or rootfs bytes. Disarm its cleanup
-            // before refusing: the ordinary failure guard would otherwise remove
-            // the already-live cell that won this per-cell serialization lock.
             provision.refuse_without_cleanup();
             anyhow::bail!(
                 "cell {} already has a live Firecracker process; refusing to mutate its rootfs",
@@ -2097,10 +1902,6 @@ impl CellBackend for FirecrackerBackend {
             );
         }
 
-        // Per-cell writable rootfs. Platform deployment artifacts (`dpl-*`) always
-        // boot the one shared base whose exact bytes back NodeInfo capability; their
-        // tenant code is the separately-attached data drive. Build/sandbox cells may
-        // still select a dedicated rootfs and otherwise fall back to that base.
         let base = if spec.image.starts_with("dpl-") {
             self.rootfs_for(&self.cfg.base_image)
         } else {
@@ -2111,13 +1912,6 @@ impl CellBackend for FirecrackerBackend {
                 self.rootfs_for(&self.cfg.base_image)
             }
         };
-        // A missing base rootfs is a NODE PROVISIONING fault: this node cannot
-        // boot ANY microVM until an operator puts the image back, and no amount
-        // of retrying, scaling, or fixing the app changes that. Name the absent
-        // path and the remedy, and carry `fault::NODE_IMAGE_MISSING` so the
-        // gateway reports NODE_IMAGE_MISSING instead of blaming host capacity —
-        // the fc-sanjose-cvm-2 outage was exactly this error read as
-        // CAPACITY_EXHAUSTED on a node with 923 GB free.
         anyhow::ensure!(
             base.exists(),
             "node is missing its base rootfs image: {} does not exist (image '{}', base '{}') — \
@@ -2128,10 +1922,6 @@ impl CellBackend for FirecrackerBackend {
             self.cfg.base_image,
             hive_core::fault::NODE_IMAGE_MISSING
         );
-        // Same class, different artifact: the kernel is loaded by firecracker
-        // itself, so without this check the boot fails later as an opaque
-        // "firecracker API PUT /boot-source failed" and lands right back in the
-        // capacity catch-all.
         anyhow::ensure!(
             self.cfg.kernel_image.exists(),
             "node is missing its guest kernel image: {} does not exist — this node needs its \
@@ -2141,11 +1931,6 @@ impl CellBackend for FirecrackerBackend {
             hive_core::fault::NODE_IMAGE_MISSING
         );
 
-        // Platform deployment images are issued as `dpl-*`. Unlike build and
-        // sandbox cells, they MUST carry the immutable data image + publication
-        // sidecar and MUST boot a rootfs that proved the matching guest protocol.
-        // Perform every gate before Firecracker starts, so an old guest can never
-        // run tenant code and only then be rejected by the new host handshake.
         let data_src = self.data_image_for(&spec.image);
         let runtime_artifact_required = spec.image.starts_with("dpl-");
         let mut selected_rootfs_proof = None;
@@ -2221,9 +2006,6 @@ impl CellBackend for FirecrackerBackend {
                 hive_core::fault::NODE_RUNTIME_MISSING
             );
         }
-        // Give the guest working DNS in its private overlay, then authenticate
-        // the resulting FINAL bytes rather than the immutable base provenance.
-        // A deployment H1 cannot proceed if this expected mutation did not land.
         let resolv_result = self.write_guest_resolv(&overlay).await;
         if runtime_artifact_required {
             resolv_result.with_context(|| {
@@ -2279,12 +2061,6 @@ impl CellBackend for FirecrackerBackend {
                 "cell {} final rootfs sidecar does not describe its exact hashed bytes",
                 spec.id
             );
-            // `/proc/<pid>/fd/<n>` is Linux-only; it exists so the boot
-            // argument can name an ALREADY-OPEN, unlinked file. On a non-unix
-            // host this branch is unreachable -- Firecracker never boots there
-            // (no /dev/kvm) -- but it must still parse, so fall back to the
-            // overlay path rather than referencing a descriptor that has no
-            // portable equivalent.
             #[cfg(target_os = "linux")]
             let held_path = PathBuf::from(format!(
                 "/proc/{}/fd/{}",
@@ -2302,11 +2078,6 @@ impl CellBackend for FirecrackerBackend {
             overlay.clone()
         };
 
-        // A published build artifact carries a separately-committed exact
-        // identity. Copy both into this cell's private run directory so launch
-        // validates the image actually attached to this VM, not whatever may
-        // later appear at the shared publication path.
-        // The in-guest agent mounts /dev/vdb at DELIVERED_WORKDIR (/workspace).
         let data_overlay = run_dir.join("data.ext4");
         let cell_identity_path = run_dir.join("runtime-artifact.identity.json");
         let has_data;
@@ -2337,19 +2108,6 @@ impl CellBackend for FirecrackerBackend {
             }
         }
 
-        // Spawn the Firecracker process bound to a fresh API socket, retrying
-        // the spawn (not the whole provision — the rootfs copy above stays)
-        // up to twice as defense-in-depth against genuine transient failures
-        // (disk I/O stalls, real resource contention under heavy concurrent
-        // provisioning). NOT a fix for what was actually crashing every
-        // sandbox: coredump analysis (`coredumpctl info`, console.log capture)
-        // showed a 100%-deterministic firecracker-side panic —
-        // "Invalid instance ID: InvalidChar('_', 7)" — because firecracker's
-        // own `--id` validation rejects underscores and every sandbox cell id
-        // (`sbx-sbx_<hex>`) contains one (deployment cell ids use only
-        // hyphens, so they never hit this). Retrying the identical invalid id
-        // three times failed identically three times; the real fix is
-        // `firecracker_safe_id` below, sanitizing only the CLI arg.
         const SPAWN_ATTEMPTS: u32 = 3;
         let mut last_err = None;
         let mut process = None;
@@ -2387,16 +2145,12 @@ impl CellBackend for FirecrackerBackend {
         let process =
             process.ok_or_else(|| anyhow::anyhow!("firecracker spawn produced no process"))?;
 
-        // Outbound networking: give the cell a host TAP + NAT egress so the app
-        // can reach databases/APIs (Upstash, OpenAI, …). Best-effort — if it
-        // fails, the VM still boots (vsock-only), so this never regresses serving.
         let net = self.setup_cell_net(&spec.id).await;
         let boot_args = match &net {
             Some(n) => format!("{} {}", self.cfg.boot_args, n.ip_cmdline),
             None => self.cfg.boot_args.clone(),
         };
 
-        // Configure the microVM via the REST API, then boot it.
         let mem_mib = spec.resources.mem_mib;
         let vcpus = spec.resources.vcpus;
         fc_put(
@@ -2414,7 +2168,6 @@ impl CellBackend for FirecrackerBackend {
             }),
         )
         .await?;
-        // Attach the egress NIC (eth0 in the guest, backed by the host TAP).
         if let Some(n) = &net {
             fc_put(
                 &api_sock,
@@ -2438,7 +2191,6 @@ impl CellBackend for FirecrackerBackend {
             }),
         )
         .await?;
-        // Second drive: the delivered build output (/dev/vdb in the guest).
         if has_data {
             fc_put(
                 &api_sock,
@@ -2452,8 +2204,6 @@ impl CellBackend for FirecrackerBackend {
             )
             .await?;
         }
-        // vsock device: the host endpoint is `vsock_uds`; the guest agent
-        // listens on CELL_AGENT_PORT and we host-initiate a CONNECT later.
         fc_put(
             &api_sock,
             "/vsock",
@@ -2463,12 +2213,6 @@ impl CellBackend for FirecrackerBackend {
             }),
         )
         .await?;
-        // virtio-rng entropy device. Without a hardware RNG the guest's entropy
-        // pool starts empty, so anything that calls getrandom() at startup (e.g.
-        // Node's crypto init) BLOCKS for many seconds until the pool fills — long
-        // enough that the function misses its readiness window. Feeding the guest
-        // entropy makes cold starts fast and deterministic. Best-effort: older
-        // Firecracker without the device simply 400s and we proceed.
         let _ = fc_put(&api_sock, "/entropy", &serde_json::json!({})).await;
         if let (Some(file), Some(image_stamp), Some(proof_stamp), Some(final_proof)) = (
             boot_rootfs_file.as_ref(),
@@ -2492,9 +2236,6 @@ impl CellBackend for FirecrackerBackend {
             &serde_json::json!({ "action_type": "InstanceStart" }),
         )
         .await?;
-        // Firecracker has opened the descriptor-pinned drive and started the
-        // guest. Only now may the host release the held source inode; later guest
-        // writes are ordinary writes through the VMM's already-open drive.
         drop(boot_rootfs_file);
 
         if let Some(rootfs_proof) = selected_rootfs_proof {
@@ -2531,7 +2272,6 @@ impl CellBackend for FirecrackerBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
 
-        // The agent may still be booting; retry the host-initiated CONNECT.
         let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
 
         let _ = sink.send(LogLine {
@@ -2540,7 +2280,6 @@ impl CellBackend for FirecrackerBackend {
             line: format!("[{}] connected to cell agent; dispatching build", cell.id),
         });
 
-        // Send the job.
         let req = serde_json::to_vec(&AgentRequest::Run(job.clone()))?;
         write_frame(&mut stream, &req).await?;
 
@@ -2557,7 +2296,6 @@ impl CellBackend for FirecrackerBackend {
                         let _ = sink.send(line);
                     }
                     AgentEvent::Done(res) => return anyhow::Ok(res),
-                    // Build cache: serve the restore tarball from host disk.
                     AgentEvent::CacheGet { key, .. } => {
                         let tar = tokio::fs::read(cache_path(&cache_dir, &key))
                             .await
@@ -2575,7 +2313,6 @@ impl CellBackend for FirecrackerBackend {
                         let reply = serde_json::to_vec(&AgentRequest::CacheData { tar })?;
                         write_frame(&mut stream, &reply).await?;
                     }
-                    // Build cache: persist the tarball produced by the build.
                     AgentEvent::CachePut { key, tar } => {
                         let _ = tokio::fs::create_dir_all(&cache_dir).await;
                         let _ = tokio::fs::write(cache_path(&cache_dir, &key), &tar).await;
@@ -2590,7 +2327,6 @@ impl CellBackend for FirecrackerBackend {
                         "{}: guest sent an out-of-order handshake reply during a build",
                         hive_core::fault::NODE_RUNTIME_MISSING
                     ),
-                    // Not applicable during a build (Sandboxes-only events).
                     AgentEvent::Pong
                     | AgentEvent::RuntimeArtifactReady(_)
                     | AgentEvent::FunctionReady
@@ -2628,9 +2364,6 @@ impl CellBackend for FirecrackerBackend {
         cell: &CellHandle,
         func: &FunctionLaunch,
     ) -> anyhow::Result<CellEndpoint> {
-        // CONTAINER cell: run the OCI image via podman on the HOST and front it with
-        // the tunnel server (same as the mock backend). The cell has no microVM /
-        // vsock — it was provisioned as a lightweight host-container cell.
         if func.start_cmd.first().map(String::as_str) == Some("__container__") {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
             let internal: u16 = func
@@ -2638,7 +2371,6 @@ impl CellBackend for FirecrackerBackend {
                 .get(2)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080);
-            // Multi-service (compose) deploys carry a JSON network config in start_cmd[3].
             let net_json = func
                 .start_cmd
                 .get(3)
@@ -2648,23 +2380,12 @@ impl CellBackend for FirecrackerBackend {
             if let Some(rt) = &runtime {
                 tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
             }
-            // Primary port from `start_cmd` (TCP, drives readiness + the tunnel),
-            // plus one `/udp` publish per `FunctionLaunch::udp_ports` entry —
-            // the loopback datagram legs the UDP relay forwards to (host ports
-            // chosen upstream by fluid-compute's `cold_start`, which records
-            // them on the instance registry for the relay's resolution).
             let mut ports = vec![crate::ContainerPort::tcp(internal, func.port)];
             ports.extend(func.udp_ports.iter().map(|u| crate::ContainerPort {
                 container_port: u.container_port,
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
-            // Extra raw/published TCP publishes (`FunctionLaunch::tcp_ports` —
-            // includes the primary, whose pairing is already ports[0]; a
-            // duplicate `-p` for the same pair fails the run). Without these
-            // the raw proxy's per-port loopback leg (`Lease::tcp_host_port`)
-            // dials a port nothing publishes — connection refused on every
-            // node running THIS backend while the mock path worked.
             ports.extend(func.tcp_ports.iter().filter_map(|t| {
                 if t.host_port == func.port {
                     return None;
@@ -2685,9 +2406,7 @@ impl CellBackend for FirecrackerBackend {
                 runtime.as_deref(),
                 net_json,
                 &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids),
-                // Non-HTTP protocol (gRPC/TCP/UDP): raw byte-splice tunnel mode.
                 func.raw_proxy,
-                // Serverless GPU: CDI passthrough of the host's GPUs.
                 func.gpu,
             )
             .await?;
@@ -2701,9 +2420,6 @@ impl CellBackend for FirecrackerBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
 
-        // Bind this launch to the identity copied alongside the exact data drive
-        // during provision. Reading the shared publication here would race a later
-        // replacement and would prove the wrong bytes.
         let identity_path = cell.root.join("runtime-artifact.identity.json");
         let identity_bytes = tokio::fs::read(&identity_path).await.with_context(|| {
             format!(
@@ -2735,9 +2451,6 @@ impl CellBackend for FirecrackerBackend {
             hive_core::fault::NODE_IMAGE_MISSING
         );
 
-        // The caller derives this guest cwd from the same RuntimeArtifactSpec
-        // delivered for the image. Never collapse a workspace app back to the
-        // checkout root here.
         let func = func.clone();
         anyhow::ensure!(
             func.workdir
@@ -2747,9 +2460,6 @@ impl CellBackend for FirecrackerBackend {
             "firecracker function is missing its validated runtime artifact workdir"
         );
 
-        // Use the exact proof selected while this cell's immutable base bytes
-        // were stable and copied. Re-reading the canonical base here would bind a
-        // post-provision rootfs replacement to an already-running older guest.
         let rootfs_proof = self
             .cell_rootfs_proofs
             .lock()
@@ -2769,9 +2479,6 @@ impl CellBackend for FirecrackerBackend {
         let req = serde_json::to_vec(&AgentRequest::StartFunction(func.clone()))?;
         write_frame(&mut stream, &req).await?;
 
-        // H1: the authenticated boot transcript must already match the exact
-        // rootfs/agent proof. H2: the guest must now echo the exact mounted
-        // runtime-artifact identity before FunctionReady can be accepted.
         let mut artifact_ready = false;
         loop {
             let frame = read_frame(&mut stream).await?;
@@ -2828,10 +2535,6 @@ impl CellBackend for FirecrackerBackend {
                     ),
                 },
                 AgentEvent::FunctionError(error) => {
-                    // The guest is authenticated, but this value is still the
-                    // tenant process's stderr. Preserve it as diagnostics without
-                    // letting marker-shaped tenant text enter downstream fault
-                    // classifiers, which intentionally inspect returned errors.
                     tracing::warn!(
                         cell = %cell.id,
                         image = %cell.image,
@@ -2887,9 +2590,6 @@ impl CellBackend for FirecrackerBackend {
         let backup = Self::publication_backup_for(&out);
         let _artifact_guard = Self::artifact_lock_for(&out)?.lock().await;
 
-        // A complete publication is immutable. Reusing the exact same identity is
-        // idempotent; a platform-issued image id resolving to different content is
-        // a hard identity collision and must never overwrite the prior bytes.
         if out.is_file() && sidecar.is_file() {
             let publication = Self::read_publication_at(&sidecar, image).await?;
             Self::verify_publication_image(&publication, &out).await?;
@@ -2910,11 +2610,6 @@ impl CellBackend for FirecrackerBackend {
             return Ok(());
         }
 
-        // Recover only namespace states whose predecessor is unambiguous. Old
-        // fixed-name `.publishing` files are never reused: a killed process may
-        // still hold their inode, so every new attempt gets unique names and the
-        // old paths are left to the guarded stale sweep after a complete pair
-        // exists again.
         if !out.exists() && sidecar.exists() {
             anyhow::ensure!(
                 Self::canonical_links_publication_temporary(
@@ -3026,9 +2721,6 @@ impl CellBackend for FirecrackerBackend {
             anyhow::anyhow!("could not allocate a unique runtime artifact publication temporary")
         })?;
 
-        // Selection, symlink resolution and all size/count limits completed before
-        // this private image is created. The stage reports bytes from its held
-        // descriptor, so sizing never reopens a repository-controlled pathname.
         let source_mib = staged.materialized_size_mib();
         let image_mib = source_mib
             .saturating_mul(3)
@@ -3083,10 +2775,6 @@ impl CellBackend for FirecrackerBackend {
 
         Self::verify_publication_image(&publication, &tmp).await?;
         if legacy {
-            // Preserve the prior inode under a durable name before removing the
-            // canonical commit marker. There is no await between removal and the
-            // new pair's durable links, so request cancellation can only run the
-            // guard before or after this whole namespace transition.
             std::fs::hard_link(&out, &backup)
                 .context("preserve legacy runtime artifact before publication")?;
             sync_parent_blocking(&backup)?;
@@ -3097,10 +2785,6 @@ impl CellBackend for FirecrackerBackend {
             temp_guard.begin_publication(false)?;
         }
 
-        // Link the descriptor first and the image last. `out` is the commit marker:
-        // before it exists provision attaches nothing; once it exists both names
-        // are durable and hash-bound. These no-replace hard links and parent fsyncs
-        // are synchronous so a dropped future cannot interrupt the critical pair.
         std::fs::hard_link(&temp_guard.temporary_identity, &sidecar)
             .context("publish runtime artifact identity")?;
         sync_parent_blocking(&sidecar)?;
@@ -3167,8 +2851,6 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
-        // Sample the per-cell Firecracker VMM host process; its CPU tracks the
-        // guest's vCPU work. Container cells (no microVM) have no VMM proc → None.
         let pid = {
             let procs = self.procs.lock().await;
             procs.get(&cell.id).and_then(|c| c.id())?
@@ -3192,7 +2874,10 @@ impl CellBackend for FirecrackerBackend {
         &self,
         cell: &CellHandle,
         req: hive_core::ExecPtyRequest,
-    ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>, PtyIo)> {
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
+        PtyIo,
+    )> {
         let (rx, sender) = FirecrackerBackend::exec_pty(self, cell, req).await?;
         let input_sender = sender.clone();
         let resize_sender = sender;
@@ -3206,19 +2891,12 @@ impl CellBackend for FirecrackerBackend {
     }
 }
 
-/// Firecracker-specific microVM exec support (Sandboxes) — NOT part of the
-/// generic [`CellBackend`] trait since it's meaningless for the mock/container
-/// backends: a sandbox needs a long-lived cell that accepts MANY commands over
-/// its lifetime (unlike `run_build`'s one-shot, self-destructing cell). Each
-/// call opens its OWN fresh vsock connection to the already-booted agent (the
-/// same `CONNECT`-handshake + length-prefixed-JSON transport `run_build` uses),
-/// so multiple execs — and a kill targeting an earlier one — can be in flight
-/// concurrently.
+/// Firecracker-specific microVM exec support (Sandboxes), outside the generic [`CellBackend`]
+/// trait: each call opens its OWN vsock connection to the booted agent, so several execs and a
+/// kill targeting an earlier one can be in flight concurrently.
 impl FirecrackerBackend {
-    /// Start one argv command inside `cell` and stream its `AgentEvent`s back
-    /// (`ExecOutput`* then one `ExecDone`) on an unbounded channel. Returns as
-    /// soon as the connection is established — the caller drains the channel
-    /// (blocking: read until `ExecDone`; detached: spawn a task that drains it).
+    /// Start one argv command inside `cell` and stream its `AgentEvent`s (`ExecOutput`* then one
+    /// `ExecDone`) on an unbounded channel; returns once the connection is established.
     pub async fn exec_command(
         &self,
         cell: &CellHandle,
@@ -3255,11 +2933,8 @@ impl FirecrackerBackend {
         Ok(rx)
     }
 
-    /// Open one interactive pty session inside `cell` and return an
-    /// `AgentEvent` receiver (`PtyOutput`* then one `PtyExited`) plus a
-    /// [`PtySender`] the caller uses to push typed bytes / resize events back
-    /// on the SAME connection — unlike `exec_command`, this is a duplex
-    /// session, not a one-shot request/stream.
+    /// Open one interactive pty session inside `cell`: an `AgentEvent` receiver (`PtyOutput`* then
+    /// `PtyExited`) plus a [`PtySender`] for typed bytes / resize events on the SAME connection.
     pub async fn exec_pty(
         &self,
         cell: &CellHandle,
@@ -3310,10 +2985,8 @@ impl FirecrackerBackend {
         Ok((rx, PtySender(in_tx)))
     }
 
-    /// Signal a still-running exec (by the id it was started with) to stop.
-    /// Opens a FRESH connection (the exec's own connection is busy streaming
-    /// output) — the guest agent's process-global exec registry finds the
-    /// child by id and sends it `SIGKILL` regardless of which connection asks.
+    /// Signal a still-running exec (by id) to stop, over a FRESH connection; the guest agent's
+    /// process-global registry finds the child and sends `SIGKILL`.
     pub async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
         let uds = cell
             .endpoint
@@ -3324,17 +2997,13 @@ impl FirecrackerBackend {
             id: exec_id.to_string(),
         })?;
         write_frame(&mut stream, &payload).await?;
-        // Wait for the ack (Pong) so the caller knows the signal was actually
-        // delivered to the guest, not just queued on the wire.
         let _ = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
         Ok(())
     }
 }
 
-/// The write half of an [`FirecrackerBackend::exec_pty`] session — cheap to
-/// clone, backed by an unbounded channel feeding the connection's dedicated
-/// writer task, so a caller (the websocket handler) can hold one per browser
-/// tab without juggling a raw stream.
+/// The write half of an [`FirecrackerBackend::exec_pty`] session — cheap to clone, backed by an
+/// unbounded channel feeding the connection's writer task.
 #[derive(Clone)]
 pub struct PtySender(tokio::sync::mpsc::UnboundedSender<AgentRequest>);
 
@@ -3348,11 +3017,8 @@ impl PtySender {
     }
 }
 
-// ---- Firecracker REST API over its Unix socket ------------------------------
-
-/// Minimal HTTP/1.1 `PUT` to the Firecracker API socket. Firecracker speaks
-/// plain HTTP over a Unix domain socket; we avoid a full HTTP client dep and
-/// write the request by hand, expecting a 2xx (usually 204).
+/// Minimal hand-written HTTP/1.1 `PUT` to the Firecracker API socket, expecting a 2xx; the body is
+/// read by Content-Length, never to EOF, since Firecracker's micro-http keeps the connection open.
 async fn fc_put(api_sock: &PathBuf, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let body = serde_json::to_vec(body)?;
     let mut stream = UnixStream::connect(api_sock).await?;
@@ -3365,9 +3031,6 @@ async fn fc_put(api_sock: &PathBuf, path: &str, body: &serde_json::Value) -> any
     stream.write_all(&body).await?;
     stream.flush().await?;
 
-    // Firecracker's micro-http server keeps the connection open (it ignores our
-    // `Connection: close`), so we must NOT read to EOF — parse headers, then
-    // read exactly Content-Length bytes of body.
     let resp = read_http_response(&mut stream).await?;
     let head = String::from_utf8_lossy(&resp);
     let status_line = head.lines().next().unwrap_or("<no status>");
@@ -3388,7 +3051,6 @@ async fn read_http_response(stream: &mut UnixStream) -> anyhow::Result<Vec<u8>> 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
-        // Find end of headers.
         if let Some(hdr_end) = find_subslice(&buf, b"\r\n\r\n") {
             let header = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
             let content_len = header
@@ -3434,21 +3096,13 @@ async fn wait_for_path(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> 
         if path.exists() {
             return Ok(());
         }
-        // 5ms (was 20ms): a `stat()` on a not-yet-created socket path is a few
-        // microseconds, so tightening this only adds a handful of extra syscalls
-        // per cold start — but it shaves up to 15ms of pure polling-granularity
-        // tail latency off EVERY cold start waiting on this socket to appear.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     anyhow::bail!("timed out waiting for {}", path.display())
 }
 
-/// Firecracker's own `--id` validation accepts only `[a-zA-Z0-9-]`, up to 64
-/// chars, and rejects anything else by panicking (SIGABRT) straight out of
-/// its own `main()` instead of a clean parse error — cell ids elsewhere in
-/// this file (run-dir names, hashmap keys, vsock lookups) are untouched by
-/// this and keep using the real `spec.id` (which may contain `_`, as every
-/// sandbox cell id does).
+/// Firecracker's `--id` accepts only `[a-zA-Z0-9-]` (≤64) and SIGABRTs on anything else, so only
+/// the CLI argument is sanitized; run-dir names, keys and vsock lookups keep the real `spec.id`.
 fn firecracker_safe_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -3462,11 +3116,7 @@ fn firecracker_safe_id(id: &str) -> String {
         .collect()
 }
 
-// ---- vsock host-initiated connection + framing ------------------------------
-
-/// Host-initiated vsock connect: connect to the Firecracker vsock UDS, send the
-/// `CONNECT <port>` handshake, and wait for `OK <peer_port>`. Retries until the
-/// in-guest agent is listening (i.e. the cell has finished booting).
+/// hex(SHA-256) of the canonical handshake transcript ([`hive_core::agent_handshake_transcript`]).
 fn handshake_transcript_sha256(nonce: &str, proof: &AgentBootProof) -> String {
     let digest = Sha256::digest(agent_handshake_transcript(nonce, proof));
     let mut value = String::with_capacity(64);
@@ -3586,23 +3236,10 @@ async fn connect_agent(uds: &str, timeout: Duration) -> anyhow::Result<UnixStrea
             Ok(s) => return Ok(s),
             Err(e) => {
                 last_err = e.to_string();
-                // 25ms (was 100ms): a failed vsock connect attempt (guest agent
-                // not listening yet) is a cheap syscall that returns almost
-                // instantly, so a tighter retry interval costs negligible extra
-                // CPU — but it directly shrinks the worst-case tail latency this
-                // polling loop adds on TOP of the microVM's real boot time, on
-                // every single cold start.
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
-    // An unreachable in-guest agent is a NODE fault, not an app fault and not
-    // saturation: the microVM booted but its PID1 never answered on the vsock
-    // socket, which means the guest ROOTFS is wrong (no /sbin/hive-cell-agent,
-    // or one that cannot run) — reprovision the image. Unmarked, this landed in
-    // `classify_lease_error`'s catch-all and published CAPACITY_EXHAUSTED on the
-    // fleet's dominant backend, sending operators to look for space on a node
-    // that had plenty.
     anyhow::bail!(
         "{}: could not reach cell agent on {uds}: {last_err}",
         hive_core::fault::NODE_IMAGE_MISSING
@@ -3616,7 +3253,6 @@ async fn try_connect_once(uds: &str) -> anyhow::Result<UnixStream> {
         .await?;
     stream.flush().await?;
 
-    // Read the "OK <port>\n" line one byte at a time (it's short).
     let mut reader = BufReader::new(&mut stream);
     let mut line = Vec::new();
     let mut byte = [0u8; 1];

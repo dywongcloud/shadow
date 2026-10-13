@@ -25,21 +25,9 @@ pub use hive_core::{
     RUNTIME_ARTIFACT_PROTOCOL_VERSION,
 };
 
-// Bounds on one sealed artifact. `MAX_ENTRIES` is deliberately generous
-// because the logical tree is NOT the physical tree: a package-manager layout
-// that symlinks a shared store (pnpm's `node_modules/.pnpm`) is walked through
-// every symlink, so one physical package directory is enumerated once per
-// logical path that reaches it. Measured 2026-08-26 on a real pnpm Next.js
-// monorepo (DecOperations/Nodes.WTF, app `apps/web`): 31,697 physical entries
-// under the checkout, but **171,975** enumerated entries — 5.4x — because the
-// root `node_modules/.pnpm` store is reachable both directly and through each
-// consumer's symlink. A 100k cap therefore failed every pnpm monorepo build
-// mid-walk ("enumerate runtime artifact directory
-// node_modules/.pnpm/node_modules/acorn") while looking like a path-specific
-// defect. 1M keeps ~6x headroom over the measured worst real case; bytes stay
-// bounded independently by `MAX_LOGICAL_BYTES`/`MAX_MATERIALIZED_BYTES`, and
-// materialization hardlinks rather than copies, so entry count alone is not a
-// disk-cost multiplier.
+/// Upper bound on enumerated entries of one sealed artifact — the LOGICAL tree, not the physical
+/// one: pnpm's symlinked store is walked once per logical path (measured 5.4× the physical count on
+/// a real monorepo), so this keeps ~6× headroom; bytes are bounded separately.
 const MAX_ENTRIES: u64 = 1_000_000;
 const MAX_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MATERIALIZED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -53,10 +41,8 @@ const HOST_CONTENT_MARKER: &str = ".hive-runtime-content-v1";
 const PACKAGE_DIRECTORY: &str = "packages-v1";
 const PACKAGE_TEMP_PREFIX: &str = ".runtime-artifact-package-v1-";
 
-/// One workspace link that the dependency planner proved is development-only.
-/// Staging may omit it only when a canonical `node_modules/<link_name>` symlink
-/// resolves to the exact descriptor-bound workspace package and that package's
-/// own manifest still declares `target_package_name`.
+/// One workspace link the dependency planner proved development-only; staging may omit it only when
+/// the canonical `node_modules/<link_name>` symlink resolves to the descriptor-bound package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeArtifactWorkspaceLink {
     link_name: String,
@@ -78,9 +64,8 @@ impl RuntimeArtifactWorkspaceLink {
     }
 }
 
-/// Planner output for one immutable runtime artifact. The included paths form
-/// its positive closure; omitted workspace links are exact, named exceptions
-/// for package-manager materialization and never a broad `node_modules` ignore.
+/// Planner output for one immutable runtime artifact: the included paths form its positive closure,
+/// omitted workspace links are exact named exceptions, never a broad `node_modules` ignore.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeArtifactClosure {
     pub include_rel: Vec<PathBuf>,
@@ -114,19 +99,15 @@ impl RuntimeArtifactClosure {
 pub struct RuntimeArtifactSpec {
     pub checkout_root: PathBuf,
     pub app_rel: PathBuf,
-    /// Explicit descriptor-relative transitive runtime closure. The app itself,
-    /// root pnpm store/link roots and approved sibling workspace packages are
-    /// named here; unrelated checkout members are never traversed.
+    /// Explicit descriptor-relative transitive runtime closure; unrelated checkout members are never
+    /// traversed.
     pub include_rel: Vec<PathBuf>,
     pub omitted_workspace_links: Vec<RuntimeArtifactWorkspaceLink>,
 }
 
-/// The two serving locations derived from one validated build descriptor.
-/// `host_static_root` is only a locator used to open fluid-gateway's
-/// descriptor-bound `StaticRoot`; request-time serving must never treat the
-/// `PathBuf` itself as filesystem authority. Function processes use the
-/// backend's cwd. `delivery_required` is explicit so callers never infer
-/// isolation from a backend name or from whether these paths happen to be equal.
+/// The two serving locations derived from one validated build descriptor; `host_static_root` is
+/// only a locator for fluid-gateway's descriptor-bound `StaticRoot`, and `delivery_required` is
+/// explicit so callers never infer isolation from a backend name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeArtifactPaths {
     pub host_static_root: PathBuf,
@@ -134,25 +115,20 @@ pub struct RuntimeArtifactPaths {
     pub delivery_required: bool,
 }
 
-/// One content-addressed, read-only host copy of a validated runtime closure.
-/// Paths are derived only after reopening the store without following links and
-/// revalidating both semantic and transport identities.
+/// One content-addressed, read-only host copy of a validated runtime closure, reopened without
+/// following links and revalidated before any path is derived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedRuntimeArtifact {
     content_sha256: String,
     store_root: PathBuf,
     package_descriptor: RuntimeArtifactPackageDescriptor,
-    /// Host-specific Python environments the checkout carried and staging
-    /// omitted. Reported, never silently dropped: an operator comparing the
-    /// artifact against the repository has to be able to see that a venv was
-    /// deliberately left out.
+    /// Host-specific Python environments the checkout carried and staging omitted — reported, never
+    /// silently dropped.
     skipped_python_environments: Vec<PathBuf>,
 }
 
 /// One read-only descriptor for the exact deterministic package bound to a
-/// [`SealedRuntimeArtifact`]. The content-addressed store path stays private;
-/// transports receive only this held descriptor and its already-validated wire
-/// descriptor.
+/// [`SealedRuntimeArtifact`]; the store path stays private.
 pub struct VerifiedRuntimeArtifactPackage {
     file: std::fs::File,
     descriptor: RuntimeArtifactPackageDescriptor,
@@ -219,10 +195,8 @@ impl RuntimeArtifactSpec {
         }
     }
 
-    /// Return only the validated host locator used by
-    /// `fluid_compute::runtime_artifact_paths` to open fluid-gateway's
-    /// descriptor-bound `StaticRoot`. This `PathBuf` is not durable serving
-    /// authority: no caller may retain it for request-time descendant lookup.
+    /// The validated host locator used to open fluid-gateway's descriptor-bound `StaticRoot`; not
+    /// durable serving authority — never retained for request-time lookup.
     pub fn host_static_root(&self) -> anyhow::Result<PathBuf> {
         validate_relative(&self.app_rel, "application path")?;
         if self.app_rel == Path::new("") || self.app_rel == Path::new(".") {
@@ -248,9 +222,8 @@ impl SealedRuntimeArtifact {
         &self.content_sha256
     }
 
-    /// Checkout-relative paths of host-specific Python environments (`.venv`,
-    /// `venv`, `.tox`, `.nox`) that staging refused to seal. Empty for every
-    /// deployment that ships none; never empty when the repository carried one.
+    /// Checkout-relative host-specific Python environments (`.venv`, `venv`, `.tox`, `.nox`) staging
+    /// refused to seal.
     pub fn skipped_python_environments(&self) -> &[PathBuf] {
         &self.skipped_python_environments
     }
@@ -326,9 +299,8 @@ impl SealedRuntimeArtifact {
         Ok(root)
     }
 
-    /// Open the deterministic transport package through a read-only held
-    /// descriptor. No mutable store path crosses the crate boundary, and both
-    /// package bytes and the semantic host tree are reverified before return.
+    /// Open the deterministic transport package through a read-only held descriptor; package bytes and
+    /// the semantic host tree are reverified before return.
     pub fn verified_package(&self) -> anyhow::Result<VerifiedRuntimeArtifactPackage> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -453,17 +425,14 @@ impl StagedRuntimeArtifact {
         self.entries
     }
 
-    /// Validated staged regular-file bytes, rounded up to MiB. Callers that
-    /// allocate a filesystem image add their own inode/metadata headroom; they
-    /// never reopen the stage with `du` just to rediscover tenant-controlled
-    /// paths.
+    /// Validated staged regular-file bytes, rounded up to MiB; callers add their own filesystem-image
+    /// headroom and never reopen the stage with `du`.
     pub(crate) fn materialized_size_mib(&self) -> u64 {
         self.materialized_bytes.div_ceil(1024 * 1024)
     }
 
-    /// Give one child process a descriptor-backed name for the exact held stage.
-    /// The returned path works only on `command`, whose pre-exec hook clears
-    /// close-on-exec for this descriptor; it is not a mutable host pathname.
+    /// A descriptor-backed name for the exact held stage, valid only on `command` (whose pre-exec hook
+    /// clears close-on-exec for it); never a mutable host pathname.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn inherited_path(
         &self,
@@ -472,9 +441,7 @@ impl StagedRuntimeArtifact {
         inherit_file_path(command, &self.root_descriptor)
     }
 
-    /// Read one regular staged file through the held root descriptor. A path
-    /// rename or symlink swap cannot redirect metadata extraction after the
-    /// checkout snapshot was validated.
+    /// Read one regular staged file through the held root descriptor, immune to rename/symlink swaps.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn read_regular(
         &self,
@@ -528,9 +495,8 @@ impl StagedRuntimeArtifact {
         }
     }
 
-    /// Pack the held stage descriptor, never its mutable pathname. Archive
-    /// metadata and entry order are canonical; repository links and special
-    /// files cannot appear because staging already materialized or rejected them.
+    /// Pack the held stage descriptor, never its mutable pathname; metadata and entry order are
+    /// canonical, links and special files were already materialized or rejected.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) async fn package_workspace(&self, destination: &File) -> anyhow::Result<()> {
         let source = self.root_descriptor.try_clone()?;
@@ -544,9 +510,8 @@ impl StagedRuntimeArtifact {
         .context("runtime artifact package task failed")?
     }
 
-    /// Add the platform-owned identity marker after all repository bytes have
-    /// been materialized and hashed. `create_new` makes a repository collision a
-    /// loud refusal rather than allowing source to forge the guest handshake.
+    /// Add the platform-owned identity marker after all repository bytes are materialized and hashed;
+    /// `create_new` makes a repository collision a loud refusal.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn write_identity(
         &self,
@@ -669,16 +634,6 @@ impl Drop for StagedRuntimeArtifact {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn package_header(state: SourceState, directory: bool) -> anyhow::Result<tar::Header> {
-    // USTAR, not GNU, deliberately: paths longer than 100 bytes encode via the
-    // ustar name+prefix split (up to 255 bytes), which every consumer of this
-    // package parses — including litebox's `tar_no_std` guest filesystem. A
-    // GNU header makes tar-rs emit a GNU longname EXTENSION entry for such
-    // paths instead, which `tar_no_std` cannot parse: the guest silently lost
-    // every archive entry from the first long path onward (witnessed live —
-    // a Next.js 16 build's 100+-byte chunk paths left the litebox guest
-    // without its libraries or interpreter, failing every launch with a bare
-    // "failed to open the ELF file"). `set_ustar_path` is the matching loud
-    // refusal for paths no ustar split can encode.
     let mut header = tar::Header::new_ustar();
     header.set_uid(0);
     header.set_gid(0);
@@ -696,11 +651,8 @@ fn package_header(state: SourceState, directory: bool) -> anyhow::Result<tar::He
     Ok(header)
 }
 
-/// Prove `path` encodes in this ustar header WITHOUT a GNU longname fallback —
-/// `tar::Builder::append_data` silently emits that fallback when `set_path`
-/// fails, and the weakest package consumer (litebox's `tar_no_std`) drops
-/// every entry from the first longname extension onward. Refusing here turns a
-/// silent guest-filesystem truncation into one loud package-time error.
+/// Prove `path` encodes in this ustar header WITHOUT a GNU longname fallback (which
+/// `append_data` emits silently and litebox's `tar_no_std` cannot parse).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_ustar_path(header: &mut tar::Header, path: &Path) -> anyhow::Result<()> {
     header.set_path(path).with_context(|| {
@@ -1456,13 +1408,6 @@ fn materialize_runtime_artifact_package_blocking(
         source_state(&extracted.root_descriptor)?,
         Path::new(&extracted.root_name),
     )?;
-    // The package materializes every dereferenced symlink into a real file, so
-    // re-staging the extracted tree measures logical == materialized by
-    // construction; the SOURCE tree's logical_bytes (descriptor.logical_bytes,
-    // smaller whenever the checkout held symlinks) is not an invariant the
-    // extracted tree can reproduce. The restaged logical total must instead
-    // equal the declared MATERIALIZED total — the exact byte cost the
-    // descriptor promised this package expands to.
     anyhow::ensure!(
         staged.content_sha256() == descriptor.semantic_tree_sha256
             && staged.logical_bytes() == descriptor.materialized_bytes
@@ -1522,10 +1467,6 @@ fn stage_verified_runtime_artifact_package_blocking(
         source_state(&extracted.root_descriptor)?,
         Path::new(&extracted.root_name),
     )?;
-    // Same symlink-materialization reasoning as `materialize_runtime_artifact_
-    // package_blocking` above: the extracted tree is the descriptor's
-    // MATERIALIZED form, so its logical total must equal the declared
-    // materialized total, never the source tree's smaller logical total.
     anyhow::ensure!(
         staged.content_sha256() == descriptor.semantic_tree_sha256
             && staged.logical_bytes() == descriptor.materialized_bytes
@@ -1545,9 +1486,8 @@ fn stage_verified_runtime_artifact_package_blocking(
     Ok(staged)
 }
 
-/// Derive a backend-private stage only from the exact sealed transport bytes.
-/// The post-publication host tree is never re-traversed, so its platform marker
-/// cannot become application content.
+/// Derive a backend-private stage only from the exact sealed transport bytes; the post-publication
+/// host tree is never re-traversed.
 pub(crate) async fn stage_sealed_runtime_artifact(
     artifact: &SealedRuntimeArtifact,
     scratch_parent: &Path,
@@ -1575,9 +1515,8 @@ pub(crate) async fn stage_sealed_runtime_artifact(
     }
 }
 
-/// Stage sealed bytes while transferring an external serialization permit into
-/// the blocking task. Cancellation cannot release the permit while a hidden
-/// filesystem mutation is still running.
+/// Stage sealed bytes while transferring an external serialization permit into the blocking task,
+/// so cancellation cannot release it mid-mutation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) async fn stage_sealed_runtime_artifact_serialized<G>(
     artifact: &SealedRuntimeArtifact,
@@ -1601,17 +1540,9 @@ where
     .context("serialized sealed runtime artifact staging task failed")?
 }
 
-/// Verify and materialize one transferred package into the same content-addressed
-/// host store used by local builds. The package file is owned by the caller, but
-/// only exact package bytes and a recomputed semantic tree can become executable.
-/// Reopen sealed authority over an ALREADY-materialized content-addressed
-/// artifact. The descriptor must be a validated wire descriptor whose semantic
-/// identity names an existing store entry; the host tree is reopened without
-/// following links and its content marker re-verified before any authority is
-/// returned, so a caller can never mint a `SealedRuntimeArtifact` for bytes
-/// this store does not actually hold. This is the receiver-side bridge from a
-/// durable `Materialized` transfer record back to live artifact authority
-/// after a process restart.
+/// Reopen sealed authority over an ALREADY-materialized content-addressed artifact: the host tree is
+/// reopened without following links and its marker re-verified, so no caller can mint a
+/// `SealedRuntimeArtifact` for bytes the store does not hold (the receiver-side bridge after a restart).
 pub fn reopen_sealed_runtime_artifact(
     store_root: &Path,
     descriptor: &RuntimeArtifactPackageDescriptor,
@@ -1657,9 +1588,8 @@ pub async fn materialize_runtime_artifact_package(
     }
 }
 
-/// Materialize a descriptor-bound, symlink-free checkout snapshot. Linux uses
-/// openat2 and refuses kernels without it. macOS keeps every traversal relative
-/// to held descriptors and rejects symlinks rather than weakening containment.
+/// Materialize a descriptor-bound, symlink-free checkout snapshot: openat2 on Linux (kernels without
+/// it are refused), held-descriptor traversal on macOS.
 pub(crate) async fn stage_runtime_artifact(
     spec: &RuntimeArtifactSpec,
     scratch_parent: &Path,
@@ -1671,9 +1601,8 @@ pub(crate) async fn stage_runtime_artifact(
         .context("runtime artifact staging task failed")?
 }
 
-/// Materialize and atomically publish one backend-neutral host artifact.
-/// The final directory name is the canonical semantic digest, so every build
-/// lane consumes one immutable byte identity rather than a mutable checkout.
+/// Materialize and atomically publish one backend-neutral host artifact; the final directory name is
+/// the canonical semantic digest.
 pub async fn seal_host_runtime_artifact(
     spec: &RuntimeArtifactSpec,
     store_root: &Path,
@@ -2962,10 +2891,6 @@ fn read_directory_children(
     depth: usize,
     totals: &mut Totals,
 ) -> anyhow::Result<Vec<ChildPreflight>> {
-    // `dup`/`File::try_clone` shares the directory stream offset with the held
-    // capability. Open `.` relative to it instead so every enumeration starts
-    // from a fresh open file description; stale-stage recovery intentionally
-    // scans the same parent descriptor across successive bounded passes.
     let duplicate = open_directory_component(directory, OsStr::new("."))?.into_raw_fd();
     let stream = unsafe { libc::fdopendir(duplicate) };
     if stream.is_null() {
@@ -3571,9 +3496,8 @@ fn open_staged_regular(parent: &File, relative: &Path) -> std::io::Result<File> 
     Ok(current)
 }
 
-/// Make one already-open file visible to a single exec child without changing
-/// the parent's close-on-exec discipline. The returned procfs/devfs path names
-/// the exact open file description, not a mutable filesystem pathname.
+/// Make one already-open file visible to a single exec child via a procfs/devfs path naming the
+/// exact open file description, without changing the parent's close-on-exec discipline.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn inherit_file_path(
     command: &mut tokio::process::Command,
@@ -3586,11 +3510,6 @@ pub(crate) fn inherit_file_path(
     anyhow::ensure!(descriptor >= 0, "cannot inherit a closed file descriptor");
     unsafe {
         command.pre_exec(move || {
-            // The command owns `inherited` until spawn/output completes, so the
-            // descriptor cannot be closed and reused between path construction
-            // and fork. After fork this exact open file description is owned by
-            // the child; clearing CLOEXEC keeps it alive until the exec'd tool
-            // has consumed the descriptor-backed argument.
             let _keep_alive = &inherited;
             let flags = libc::fcntl(descriptor, libc::F_GETFD);
             if flags < 0 {
@@ -3611,10 +3530,6 @@ pub(crate) fn inherit_file_path(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_cleanup_children(directory: &File) -> anyhow::Result<Vec<ChildPreflight>> {
-    // `dup`/`File::try_clone` shares the directory stream offset with the held
-    // capability. Open `.` relative to it instead so every enumeration starts
-    // from a fresh open file description; stale-stage recovery intentionally
-    // scans the same parent descriptor across successive bounded passes.
     let duplicate = open_directory_component(directory, OsStr::new("."))?.into_raw_fd();
     let stream = unsafe { libc::fdopendir(duplicate) };
     if stream.is_null() {
@@ -3962,17 +3877,9 @@ fn hex_digest(bytes: &[u8]) -> String {
     value
 }
 
-/// A tool-managed Python environment or bytecode cache. These are HOST-SPECIFIC
-/// and cannot be sealed: `bin/python` is a symlink to an absolute interpreter
-/// path outside the checkout (`/usr/bin/python3.x`), so `openat2`'s
-/// `RESOLVE_BENEATH`/`RESOLVE_NO_XDEV` answer EXDEV for it — measured 2026-09-29
-/// in a Linux container, where the same call on an in-tree relative symlink
-/// succeeds — and `pyvenv.cfg` records that interpreter path literally, so the
-/// directory could not be relocated to another node even if it could be sealed.
-/// Nothing in this platform installs Python dependencies at build time, so a
-/// sealed artifact never needs one. Skipping them mirrors `.git`/`.npm`/`.cache`
-/// rather than dereferencing an escaping symlink into the artifact, which would
-/// give up the containment `RESOLVE_BENEATH` exists to provide.
+/// A tool-managed Python environment or bytecode cache — host-specific and unsealable (`bin/python`
+/// symlinks an absolute interpreter outside the checkout, which `RESOLVE_BENEATH` answers EXDEV
+/// for), so staging skips it like `.git`/`.cache`.
 fn python_environment_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         matches!(
@@ -3989,10 +3896,8 @@ fn python_environment_dir(name: &std::ffi::OsStr) -> bool {
     })
 }
 
-/// The subset of [`python_environment_dir`] that carries an interpreter, i.e.
-/// the one an operator could believe the deployment runs from. Its omission is
-/// recorded and WARNed so the artifact visibly lacks a venv; the pure bytecode
-/// and tool caches above are dropped silently, exactly like `.turbo`/`.cache`.
+/// The subset of [`python_environment_dir`] that carries an interpreter; its omission is recorded
+/// and WARNed, pure caches are dropped silently.
 fn python_venv_dir(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| matches!(name, ".venv" | "venv" | ".tox" | ".nox"))

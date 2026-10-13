@@ -1,46 +1,17 @@
-//! OS-aware container CLI abstraction: Apple's `container` tool
-//! (<https://opensource.apple.com/projects/container/>, Virtualization.framework
-//! microVMs, one VM per container — no shared Linux VM daemon to hang) on
-//! macOS, `podman` everywhere else (the real fleet nodes are Linux, where
-//! podman is mature and already correct).
-//!
-//! The two CLIs are OCI/Docker-shaped but NOT flag-compatible in several real
-//! ways this module hides from callers:
-//! - remove a container: podman `rm -f`, container `delete -f`
-//! - tail logs: podman `logs --tail N`, container `logs -n N`
-//! - list volumes: podman supports `--filter`, container does not (both
-//!   support `--format json`, with DIFFERENT field shapes — unified here)
-//! - resource ceilings: container has no `--pids-limit`/`--security-opt`
-//!   (each container already runs in its own lightweight VM — materially
-//!   STRONGER isolation than a podman namespace tweak, so dropping these on
-//!   macOS is not a security regression)
-//! - sandbox runtime (podman `--runtime runsc`/gVisor): meaningless for
-//!   `container` — every container is already VM-isolated, so callers should
-//!   skip the runtime-fallback dance entirely when using `container`
-//! - pull: podman accepts bare `pull`, container requires `image pull`
-//! - `--ip`/`--add-host` (static IP + sibling `/etc/hosts` for multi-service
-//!   compose networks): container has NEITHER. NOT handled transparently —
-//!   multi-service/compose deploys stay on podman even on macOS; see the
-//!   callers in `lib.rs::podman_run_container` and `mock.rs` for the explicit
-//!   fallback, and `assigned_ipv4`/`inject_hosts` below for the workaround
-//!   primitives a future compose-aware caller can build on.
-//!
-//! Every function here takes an explicit `apple: bool` rather than reading the
-//! host OS implicitly — callers that mix backends in one code path (like the
-//! multi-service exception above, which stays on podman even when running on
-//! macOS) are the single source of truth for which CLI a given call targets.
-//! `is_apple_default()` is the OS-default a caller starts from before applying
-//! its own overrides.
+//! OS-aware container CLI abstraction: Apple's `container` tool (Virtualization.framework, one VM
+//! per container) on macOS, `podman` everywhere else. The flag differences are hidden here (`rm -f`
+//! vs `delete -f`, `logs --tail` vs `-n`, volume listing shapes, podman-only `--pids-limit` /
+//! `--security-opt` / `--runtime`, `image pull`); `--ip`/`--add-host` have NO `container`
+//! equivalent, so multi-service compose deploys stay on podman even on macOS. Every function
+//! takes an explicit `apple: bool`; `is_apple_default()` is only the starting point.
 
 use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::ContainerLimits;
 
-/// Whether THIS OS defaults to Apple's `container` tool. Callers with no
-/// reason to override start from this; callers that must force one CLI or the
-/// other (e.g. multi-service compose, always podman) pass their own bool to
-/// every function below instead of calling this per-operation.
+/// Whether THIS OS defaults to Apple's `container` tool; callers that must force one CLI pass
+/// their own bool to every function instead.
 pub fn is_apple_default() -> bool {
     cfg!(target_os = "macos")
 }
@@ -54,20 +25,9 @@ pub fn bin(apple: bool) -> &'static str {
     }
 }
 
-/// Does this deploy's `net_json` (the `start_cmd[3]` run-config every container
-/// deploy carries — see `git.rs::container_volume_cfg`) actually need podman's
-/// `--ip`/`--add-host` (a real STATIC IP for this container, and/or hardcoded
-/// sibling `/etc/hosts` entries)? Every container gets attached to a
-/// project-scoped network for TENANT isolation (one tenant's container must
-/// never reach another's on a shared default bridge) — that part is universal
-/// and works fine on Apple's `container` tool too (it has its own per-network
-/// isolation). Only a real multi-service COMPOSE deploy pins a static `ip` and/or
-/// ships non-empty `hosts` entries, and only THAT case has no `container`
-/// equivalent (see the module doc). Use this, not `net_json.is_some()`, to
-/// decide whether a deploy is Apple-`container`-eligible — `net_json` being
-/// present at all is the NORMAL case (it also carries the automatic persistent
-/// volume config), so checking bare presence would wrongly force EVERY deploy
-/// onto podman.
+/// Does this deploy's `net_json` actually need podman's `--ip`/`--add-host` (a static ip and/or
+/// sibling `hosts`)? Only a real multi-service compose deploy does; bare presence of `net_json` is
+/// the NORMAL case (it also carries the volume config) and must not force podman.
 pub fn needs_podman_networking(net: &serde_json::Value) -> bool {
     let has_ip = net
         .get("ip")
@@ -82,21 +42,9 @@ pub fn needs_podman_networking(net: &serde_json::Value) -> bool {
     has_ip || has_hosts
 }
 
-/// Args to remove a container by name (best-effort teardown).
-///
-/// podman gets `-v`, which removes the container's ANONYMOUS volumes along with
-/// it. Without it every container that ran an image declaring `VOLUME` left its
-/// anonymous volume behind forever — and podman allocates one lock per VOLUME as
-/// well as per container out of a single `num_locks` pool (default 2048). Live
-/// on the leader that pool was fully consumed by 2032 volumes against just 16
-/// containers, so `podman run` failed with "allocating lock for new container:
-/// exceeded num_locks (2048)" and every cold start 503'd as CAPACITY_EXHAUSTED.
-///
-/// `-v` is specifically safe: it removes only anonymous volumes, never NAMED
-/// ones — so a provisioned database volume (`hive-vol-postgres`) is untouched.
-/// That is why this is the right place to fix the leak, rather than pruning
-/// unused volumes later (a blanket prune WOULD delete named DB volumes).
-/// Apple's `container delete` has no `-v` equivalent, so it is unchanged.
+/// Args to remove a container by name. podman gets `-v` so its ANONYMOUS volumes die with it
+/// (each holds a lock from the shared `num_locks` pool); named volumes are untouched. Apple's
+/// `container delete` has no `-v`.
 pub fn rm_args(apple: bool, name: &str) -> Vec<String> {
     if apple {
         vec!["delete".into(), "-f".into(), name.into()]
@@ -105,9 +53,7 @@ pub fn rm_args(apple: bool, name: &str) -> Vec<String> {
     }
 }
 
-/// Args to remove a volume by name. `container volume delete` has no force
-/// flag (only `--all`) — dropped on macOS; the call is always best-effort
-/// (`let _ =`) at every existing call site regardless.
+/// Args to remove a volume by name; `container volume delete` has no force flag.
 pub fn volume_rm_args(apple: bool, name: &str) -> Vec<String> {
     if apple {
         vec!["volume".into(), "rm".into(), name.into()]
@@ -134,10 +80,8 @@ pub fn pull_args(apple: bool, image: &str) -> Vec<String> {
     }
 }
 
-/// Per-container resource-ceiling flags for `run`. `--memory`/`--cpus` are
-/// supported by both CLIs; `--pids-limit`/`--security-opt no-new-privileges`
-/// are podman-only (see module doc — a VM boundary already covers the same
-/// threat model on macOS).
+/// Per-container resource-ceiling flags for `run`; `--pids-limit`/`--security-opt` are podman-only
+/// (a VM boundary covers the same threat model on macOS).
 pub fn resource_flags(apple: bool, limits: &ContainerLimits) -> Vec<String> {
     let mut f = Vec::new();
     if let Some(mem) = &limits.memory {
@@ -147,10 +91,6 @@ pub fn resource_flags(apple: bool, limits: &ContainerLimits) -> Vec<String> {
     if let Some(cpus) = &limits.cpus {
         f.push("--cpus".into());
         f.push(if apple {
-            // podman accepts a fractional CPU quota ("2.0", "0.5"); Apple's
-            // `container --cpus` requires a plain integer (verified live:
-            // "2.0" is rejected as invalid) and has no fractional-core
-            // concept. Round to the nearest whole core, minimum 1.
             let n: f64 = cpus.parse().unwrap_or(1.0);
             n.round().max(1.0).to_string()
         } else {
@@ -172,8 +112,6 @@ pub fn resource_flags(apple: bool, limits: &ContainerLimits) -> Vec<String> {
 /// container gone, malformed output) is treated as "not running".
 pub async fn is_running(apple: bool, name: &str, path_env: &str) -> bool {
     if apple {
-        // `container inspect` has no Go-template `-f` filter (podman-only) —
-        // parse the JSON `status.state` field instead.
         let Ok(out) = Command::new(bin(apple))
             .args(["inspect", name])
             .env("PATH", path_env)
@@ -207,10 +145,8 @@ pub async fn is_running(apple: bool, name: &str, path_env: &str) -> bool {
     }
 }
 
-/// All volume names currently known to the backend. Unifies podman's
-/// capitalized top-level `Name` and container's nested lowercase
-/// `configuration.name` JSON shapes behind one call so callers never touch
-/// either CLI's raw `--format`/`--filter` differences directly.
+/// All volume names the backend knows, unifying podman's `Name` and container's
+/// `configuration.name` JSON shapes.
 pub async fn try_list_volume_names(apple: bool, path_env: &str) -> Result<Vec<String>, String> {
     let out = Command::new(bin(apple))
         .args(["volume", "ls", "--format", "json"])
@@ -245,9 +181,8 @@ pub async fn try_list_volume_names(apple: bool, path_env: &str) -> Result<Vec<St
         .collect())
 }
 
-/// Compatibility wrapper for best-effort callers. Destructive ownership
-/// cleanup uses [`try_list_volume_names`] so an enumeration failure can never
-/// masquerade as an empty backend.
+/// Compatibility wrapper for best-effort callers; destructive cleanup uses
+/// [`try_list_volume_names`] so an enumeration failure never reads as an empty backend.
 pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
     try_list_volume_names(apple, path_env)
         .await
@@ -256,11 +191,6 @@ pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
 
 /// Is the given container CLI installed and responsive? (`bin --version`).
 pub async fn available(apple: bool) -> bool {
-    // `--version` only proves the CLI binary exists; podman's client can still
-    // be unable to reach its service VM (witnessed: one malformed known_hosts
-    // line broke the socket, `--version` succeeded, and every volume op failed
-    // silently — turning an environmental fault into what looked like a data
-    // bug). A real round-trip (`volume ls`) is the honest availability signal.
     let version_ok = Command::new(bin(apple))
         .arg("--version")
         .stdout(Stdio::null())
@@ -282,10 +212,8 @@ pub async fn available(apple: bool) -> bool {
         .unwrap_or(false)
 }
 
-/// Query a running container's assigned IPv4 address on a named network
-/// (Apple's `container` tool only — used solely by a macOS multi-service
-/// sibling-hosts workaround; podman's `--ip`/`--add-host` cover this natively
-/// and never need this). Returns the bare address (no `/prefix`).
+/// A running container's assigned IPv4 on a named network (Apple `container` only — the macOS
+/// multi-service sibling-hosts workaround); bare address, no prefix.
 pub async fn assigned_ipv4(name: &str, path_env: &str) -> Option<String> {
     let out = Command::new(bin(true))
         .args(["inspect", name])
@@ -309,13 +237,8 @@ pub async fn assigned_ipv4(name: &str, path_env: &str) -> Option<String> {
     Some(ip.split('/').next().unwrap_or(ip).to_string())
 }
 
-/// Inject sibling `/etc/hosts` entries into an already-running container via
-/// `exec` (Apple's `container` tool only — the macOS equivalent of podman's
-/// `--add-host`, which `container run` has no counterpart for). Best-effort;
-/// requires a POSIX shell in the target image (true for virtually all real
-/// app images; a from-scratch/distroless image has no shell and is a known,
-/// accepted limitation of this workaround, matching the same limitation any
-/// exec-based approach has).
+/// Inject sibling `/etc/hosts` entries into a running container via `exec` (Apple `container`'s
+/// stand-in for `--add-host`); best-effort, needs a POSIX shell in the image.
 pub async fn inject_hosts(name: &str, path_env: &str, entries: &[(String, String)]) {
     if entries.is_empty() {
         return;

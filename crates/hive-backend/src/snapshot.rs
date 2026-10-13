@@ -1,47 +1,9 @@
-//! Copy-on-write snapshots of per-deployment data disks.
-//!
-//! # Why reflink and not ZFS
-//!
-//! The obvious design for this is ZFS datasets + `zfs snapshot`. This fleet has
-//! no ZFS: measured 2026-07-31, no `zfs`/`zpool` binary and no kernel module on
-//! any of 14 nodes, and no spare block devices to build a pool from (e.g.
-//! fc-frankfurt's single 1000 GiB disk is fully allocated to `/`). Installing it
-//! would mean repartitioning every node.
-//!
-//! What the fleet *does* have is XFS with `reflink=1`, which provides the same
-//! copy-on-write primitive at file granularity. Measured on real hardware
-//! (fc-frankfurt, 3 GiB image containing 800 MiB of data):
-//!
-//! ```text
-//!   reflink snapshot   ->      0 MiB consumed, instant
-//!   plain copy         ->   1034 MiB consumed
-//!   write 50 MiB into the snapshot afterwards -> 51 MiB consumed
-//! ```
-//!
-//! So a snapshot is free to take and costs only what subsequently diverges —
-//! the property that makes frequent snapshots viable at all.
-//!
-//! # Capability is per-NODE, and that is deliberate
-//!
-//! The fleet is split: 9 nodes are XFS+reflink (bkk, hk, sp, fr, gpusj1/2/3,
-//! cvmsj1/2) and 5 are ext4 with no reflink at all (va, va2, va3, sj, sj2).
-//! ext4 has neither reflink nor `FIDEDUPERANGE`, so there is no way to fake it
-//! there. Rather than pretend, [`snapshot_support`] reports the real capability
-//! and [`snapshot_image`] degrades to a full copy with `Method::Copy` — the
-//! caller learns which it got. A snapshot that silently costs full size (and
-//! full time) on some nodes and not others is worse than one that says so,
-//! because the difference decides whether a scheduled snapshot is affordable.
-//!
-//! # Consistency is the caller's job, and it is the hard part
-//!
-//! A reflink of a live, mounted, actively-written image is CRASH-consistent, not
-//! application-consistent: it captures whatever was on disk at that instant,
-//! including a half-written transaction. That is fine for a filesystem with a
-//! journal and wrong for a database that has not flushed. Callers wanting an
-//! application-consistent snapshot must quiesce the writer first (checkpoint /
-//! WAL flush / freeze), and [`SnapshotOutcome::consistency`] records which
-//! guarantee the caller actually obtained so a restore path is never misled
-//! about what it holds.
+//! Copy-on-write snapshots of per-deployment data disks via XFS `reflink=1` (the fleet has no ZFS):
+//! a reflink snapshot is instant and consumes only what later diverges. Capability is per NODE and
+//! probed functionally ([`snapshot_support`]); ext4 nodes degrade to a full copy and say so
+//! (`Method::Copy`). A snapshot of a live image is CRASH-consistent only — callers wanting
+//! application consistency quiesce the writer first, and [`SnapshotOutcome::consistency`] records
+//! which guarantee was obtained.
 
 use std::path::{Path, PathBuf};
 
@@ -76,13 +38,8 @@ pub struct SnapshotOutcome {
     pub took_ms: u64,
 }
 
-/// Whether `dir`'s filesystem supports reflink, tested FUNCTIONALLY rather than
-/// by reading the filesystem type.
-///
-/// `xfs_info` reporting `reflink=1` is necessary and not sufficient — the mount,
-/// the kernel and the specific directory all have to cooperate, and the cheapest
-/// honest answer is to attempt the operation once. Costs one tiny file create +
-/// clone + unlink.
+/// Whether `dir`'s filesystem supports reflink, tested FUNCTIONALLY (one tiny create + clone +
+/// unlink) rather than by reading the filesystem type.
 pub fn snapshot_support(dir: &Path) -> bool {
     let probe = dir.join(format!(".reflink-probe-{}", std::process::id()));
     let clone = dir.join(format!(".reflink-probe-{}-c", std::process::id()));
@@ -91,10 +48,6 @@ pub fn snapshot_support(dir: &Path) -> bool {
     if std::fs::write(&probe, b"x").is_err() {
         return false;
     }
-    // stderr suppressed: a failure here is an EXPECTED outcome on any
-    // non-CoW filesystem, and on macOS (BSD cp, no --reflink flag at all) it
-    // prints a usage block. Probing must be silent or every snapshot on a dev
-    // machine spams the log with a non-error.
     let ok = std::process::Command::new("cp")
         .arg("--reflink=always")
         .arg(&probe)
@@ -109,16 +62,8 @@ pub fn snapshot_support(dir: &Path) -> bool {
     ok
 }
 
-/// Reject anything that is not a bare, safe filename component.
-///
-/// Snapshot ids reach this module from tenant-facing surfaces, and the
-/// destination path is built by joining. Without this, `..%2f..` or an absolute
-/// id would place (or overwrite) a file anywhere the process can write — the
-/// same class of bug as passing a tenant string into a mount argument, which is
-/// exactly how a storage appliance ends up exposing the host. Allowing only
-/// `[A-Za-z0-9._-]`, forbidding `..`, and refusing a leading `.` keeps the
-/// result a single component under `dest_dir` by construction rather than by
-/// the caller remembering to check.
+/// Reject anything that is not a bare, safe filename component (`[A-Za-z0-9._-]`, no `..`, no
+/// leading `.`): snapshot ids reach here from tenant-facing surfaces and are joined into a path.
 fn safe_component(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -129,10 +74,7 @@ fn safe_component(s: &str) -> bool {
         && !s.contains("..")
 }
 
-/// Snapshot `image` into `dest_dir/{snap_id}.snap.ext4`.
-///
-/// `quiesced` states whether the caller already flushed/froze the writer; it
-/// only labels the outcome — this function never assumes it.
+/// Snapshot `image` into `dest_dir/{snap_id}.snap.ext4`; `quiesced` only labels the outcome.
 pub fn snapshot_image(
     image: &Path,
     dest_dir: &Path,
@@ -158,9 +100,6 @@ pub fn snapshot_image(
     );
 
     let t0 = std::time::Instant::now();
-    // Try CoW first, fall back to a real copy. `--reflink=auto` would silently
-    // do the same thing but would not tell us WHICH happened, and the caller
-    // needs that: one is free, the other costs the image's full size.
     let reflinked = std::process::Command::new("cp")
         .arg("--reflink=always")
         .arg(image)
@@ -202,19 +141,13 @@ pub fn snapshot_image(
     Ok(outcome)
 }
 
-/// Count existing snapshots under `dest_dir`. The storage broker's quota
-/// check needs this number BEFORE deciding whether a create may proceed —
-/// exposed here rather than left for each caller to re-derive the
-/// `*.snap.ext4` naming convention itself, the same reasoning
-/// `list_snapshots` below follows.
+/// Count existing snapshots under `dest_dir` (for the storage broker's quota check).
 pub fn count_snapshots(dest_dir: &Path) -> usize {
     list_snapshots(dest_dir).len()
 }
 
-/// List existing snapshot ids under `dest_dir` (order unspecified — sort if a
-/// caller needs one). Missing/unreadable directory reads as "no snapshots
-/// yet", not an error: a project that has never snapshotted has no directory
-/// at all until its first `snapshot_image` call creates it.
+/// List existing snapshot ids under `dest_dir` (order unspecified); a missing directory reads as
+/// "no snapshots yet".
 pub fn list_snapshots(dest_dir: &Path) -> Vec<String> {
     std::fs::read_dir(dest_dir)
         .map(|rd| {

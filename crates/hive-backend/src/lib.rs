@@ -1,27 +1,9 @@
-//! `hive-backend` — the pluggable isolation layer.
-//!
-//! In real Hive a **cell** is a Firecracker microVM on KVM. The control plane,
-//! warm pool, scheduler, and lifecycle logic do not care *how* a cell is
-//! realized — they only need to provision one, run a build in it, and tear it
-//! down. That contract is [`CellBackend`].
-//!
-//! Two implementations ship here:
-//!
-//! * [`mock::MockBackend`] — a cell is a sandboxed child-process build in a temp
-//!   dir. Runs on macOS/M-series today, so the whole control plane is testable
-//!   without virtualization.
-//! * [`firecracker::FirecrackerBackend`] — a cell is a real aarch64 Firecracker
-//!   microVM, intended to run inside a Lima VM with nested virtualization.
+//! The pluggable isolation layer: the control plane only needs to provision a cell, run a build in
+//! it and tear it down ([`CellBackend`]); [`mock::MockBackend`] is a sandboxed child process (macOS
+//! too), [`firecracker::FirecrackerBackend`] a real microVM, [`litebox`] a userspace Linux ABI.
 
 pub mod cell_orphans;
 pub mod container_cli;
-// Firecracker stays declared on EVERY platform: `hive-cloud` names
-// `FirecrackerBackend` unconditionally (resources.rs, main.rs), so gating the
-// module to linux alone broke the macOS build -- caught by a host `cargo check`
-// after I made exactly that change. Its Unix-only INTERNALS are gated inside
-// the module instead, so the type exists everywhere while /dev/kvm, vsock and
-// fd passing compile only where they exist. Windows shadow nodes isolate
-// through Litebox's Linux-userland-on-Windows runner, never Firecracker.
 pub mod firecracker;
 pub mod litebox;
 pub mod litebox_macos;
@@ -52,14 +34,10 @@ pub use runtime_artifact::{
 /// any number of log subscribers.
 pub type LogSink = mpsc::UnboundedSender<LogLine>;
 
-/// Cumulative CPU time (user+system) consumed by a SINGLE `pid` since it started,
-/// in nanoseconds. Read straight from the OS (no third-party sampler — sysinfo's
-/// per-process CPU is unreliable on macOS), so the delta we compute is exact.
+/// Cumulative CPU time (user+system) of a SINGLE `pid` in nanoseconds, read straight from the OS
+/// (sysinfo's per-process CPU is unreliable on macOS).
 #[cfg(target_os = "macos")]
 fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
-    // proc_pidinfo(PROC_PIDTASKINFO) returns task times in MACH absolute-time
-    // units, not nanoseconds — on Apple Silicon a unit is ~41.67ns. Convert via
-    // mach_timebase_info (numer/denom), else CPU% reads ~42× too low.
     let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let n = unsafe {
@@ -89,11 +67,8 @@ fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
     Some(cpu)
 }
 
-/// Snapshot of every process as `(pid, ppid, cumulative_cpu_ns)`. Lets us sum CPU
-/// over a cell's whole process TREE — a function may run under a wrapper (e.g.
-/// `npm exec next start` spawns `next-server`), so sampling only the direct child
-/// would miss the real work. (On Firecracker the cell is one VMM process whose CPU
-/// already covers the guest, so its subtree is just itself.)
+/// Snapshot of every process as `(pid, ppid, cumulative_cpu_ns)`, so CPU can be summed over a
+/// cell's whole process TREE (a function may run under a wrapper like `npm exec`).
 #[cfg(target_os = "macos")]
 fn all_procs() -> Vec<(u32, u32, u64)> {
     let cnt = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -132,9 +107,8 @@ fn all_procs() -> Vec<(u32, u32, u64)> {
     out
 }
 
-/// Parse `(ppid, cpu_ns)` from a `/proc/<pid>/stat` line. The comm field (2) may
-/// contain spaces/`)`, so we split after the final `)`: then state(0), ppid(1),
-/// …, utime(11), stime(12).
+/// Parse `(ppid, cpu_ns)` from a `/proc/<pid>/stat` line, splitting after the final `)` since the
+/// comm field may contain spaces.
 #[cfg(target_os = "linux")]
 fn parse_linux_stat(stat: &str) -> Option<(u32, u64)> {
     let after = &stat[stat.rfind(')')? + 1..];
@@ -176,16 +150,8 @@ fn all_procs() -> Vec<(u32, u32, u64)> {
     Vec::new()
 }
 
-/// A pid -> (children, cumulative-cpu) index built ONCE per process snapshot.
-///
-/// This used to be rebuilt inside `subtree_cpu_ns` on every call, i.e. once per
-/// sampled instance: the autoscaler samples every live instance every 500ms, so
-/// on a node with N instances and P host processes it re-derived the SAME index
-/// from the SAME cached snapshot N times per tick — O(N x P) hashmap inserts
-/// and allocations 120x/minute (measured shape: ~1000 procs x 30 instances =
-/// ~60k inserts per tick, ~7.2M/minute) to answer N subtree queries that each
-/// touch a handful of pids. Building it with the snapshot makes each query
-/// O(subtree) instead of O(P).
+/// A pid → (children, cumulative-cpu) index built ONCE per process snapshot, so each per-instance
+/// subtree query is O(subtree) instead of re-deriving O(P) hashmaps every 500 ms tick.
 #[derive(Default)]
 struct ProcIndex {
     children: std::collections::HashMap<u32, Vec<u32>>,
@@ -229,18 +195,13 @@ impl ProcIndex {
     }
 }
 
-/// Sum cumulative CPU (ns) over `root` and all its descendants in `procs`.
-/// `None` if `root` isn't present (process gone). Thin wrapper over
-/// [`ProcIndex`] for one-shot callers (the sampler itself keeps a built index).
+/// Sum cumulative CPU (ns) over `root` and all its descendants; `None` if `root` is gone.
 fn subtree_cpu_ns(root: u32, procs: &[(u32, u32, u64)]) -> Option<u64> {
     ProcIndex::build(procs).subtree_cpu_ns(root)
 }
 
-/// Per-cell CPU sampler shared by the backends for `cpu_percent` (#2). Computes
-/// utilization as `Δsubtree_cpu_time / Δwall_time` — exact, no dependency on a
-/// sampler library's internal timing. The all-process snapshot is cached briefly
-/// so many per-cell queries within one autoscaler tick share one enumeration. The
-/// first sample for a pid returns 0 (baseline only); steady-state is accurate.
+/// Per-cell CPU sampler shared by the backends: utilization = Δsubtree_cpu_time / Δwall_time,
+/// with the all-process snapshot cached briefly; the first sample for a pid is a 0 baseline.
 pub(crate) struct CpuSampler {
     inner: std::sync::Mutex<SamplerState>,
 }
@@ -269,8 +230,6 @@ impl CpuSampler {
     pub(crate) fn cpu_percent(&self, pid: u32, vcpus: u32) -> Option<f32> {
         let now = std::time::Instant::now();
         let mut g = self.inner.lock().ok()?;
-        // Refresh the all-process snapshot at most ~4×/s; per-cell queries in one
-        // tick reuse it.
         let stale = g
             .snapshot_at
             .map(|t| t.elapsed() >= std::time::Duration::from_millis(250))
@@ -293,12 +252,6 @@ impl CpuSampler {
             None => 0.0,
         };
         g.prev.insert(pid, (cur_ns, now));
-        // Evict history for pids that no longer exist. Without this the map is
-        // append-only for the process's whole life: every cell that ever ran on
-        // this node leaves an entry behind, and cells are created and destroyed
-        // continuously (scale-to-zero + cold start). Cheap because it only runs
-        // on a snapshot refresh (~4x/s at most), and `index.cpu` is exactly the
-        // set of live pids.
         if stale && g.prev.len() > 256 {
             let live: std::collections::HashSet<u32> = g.index.cpu.keys().copied().collect();
             g.prev.retain(|p, _| live.contains(p));
@@ -321,22 +274,16 @@ pub enum CellEndpoint {
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
 
-/// Open a fresh connection to a cell endpoint. One connection per in-flight
-/// request keeps proxying simple; in-function concurrency = many of these open
-/// to the same instance at once.
+/// Open a fresh connection to a cell endpoint; one connection per in-flight request.
 pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn DuplexStream>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     match ep {
         CellEndpoint::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
-        // A vsock endpoint is reached over the VMM's Unix socket -- a
-        // Firecracker-only path that has no Windows equivalent (Windows
-        // shadow nodes isolate via Litebox, which serves over TCP).
         #[cfg(unix)]
         CellEndpoint::Vsock { uds, port } => {
             let mut s = tokio::net::UnixStream::connect(uds).await?;
             s.write_all(format!("CONNECT {port}\n").as_bytes()).await?;
             s.flush().await?;
-            // Consume the "OK <peer_port>\n" handshake line.
             let mut line = Vec::new();
             let mut b = [0u8; 1];
             loop {
@@ -355,9 +302,6 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
             );
             Ok(Box::new(s))
         }
-        // On a non-unix host a Vsock endpoint can never have been produced
-        // (no Firecracker), so refusing it here is unreachable in practice --
-        // but it must parse, and an honest error beats a silent fallback.
         #[cfg(not(unix))]
         CellEndpoint::Vsock { uds, .. } => Err(anyhow::anyhow!(
             "vsock endpoints are not supported on this platform ({}); \
@@ -367,12 +311,8 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
     }
 }
 
-/// Transport protocol for one published container port. Podman's `-p` publishes
-/// TCP by default; UDP needs an explicit `/udp` suffix appended to the internal
-/// port (see [`podman_run_container`]'s `-p` emission). Mirrors the tcp/udp
-/// split of `fluid_core::ServiceProtocol` at the level this crate needs —
-/// hive-backend does not depend on fluid-core, so this is a minimal local
-/// counterpart rather than a shared/re-exported type.
+/// Transport protocol for one published container port (podman's `-p` is TCP unless the internal
+/// port carries `/udp`); a minimal local counterpart of `fluid_core::ServiceProtocol`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContainerProtocol {
     #[default]
@@ -380,10 +320,8 @@ pub enum ContainerProtocol {
     Udp,
 }
 
-/// One port a container publishes: the port the app listens on INSIDE the
-/// container, the host port it's reachable on, and the transport it speaks.
-/// A deployment may publish several (e.g. a game server's game/rcon/query
-/// ports) — see [`ContainerSpec::ports`].
+/// One port a container publishes: the in-container port, the host port and the transport; a
+/// deployment may publish several ([`ContainerSpec::ports`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContainerPort {
     pub container_port: u16,
@@ -392,9 +330,7 @@ pub struct ContainerPort {
 }
 
 impl ContainerPort {
-    /// Build a single TCP port — the overwhelmingly common case (a plain HTTP
-    /// container) — and the bridge for callers that still carry one bare
-    /// container/host port pair instead of a full list.
+    /// A single TCP port — the common case and the bridge for single-port callers.
     pub fn tcp(container_port: u16, host_port: u16) -> ContainerPort {
         ContainerPort {
             container_port,
@@ -404,29 +340,19 @@ impl ContainerPort {
     }
 }
 
-/// A container (podman) cell: instead of a microVM / host process, the backend
-/// runs this OCI image directly via podman on the HOST. Set when the deployment's
-/// function is `runtime == "container"`. Lets Firecracker nodes run containers on
-/// the host (outside the microVM) — not just the mock backend.
+/// A container (podman) cell: the backend runs this OCI image on the HOST instead of a microVM
+/// / host process; set when the function's `runtime == "container"`.
 #[derive(Clone, Debug)]
 pub struct ContainerSpec {
     /// OCI image to `podman run` (from the function's `__container__` start_cmd).
     pub image: String,
-    /// Every port this container publishes. The first entry is the PRIMARY
-    /// port — the one health-checked for readiness and fronted by the
-    /// multiplexed tunnel server ([`podman_run_container`]); every entry
-    /// (primary and additional) gets its own `-p` publish. Non-empty by
-    /// construction for a real deploy; the overwhelmingly common shape is
-    /// exactly one TCP entry (see [`ContainerPort::tcp`]).
+    /// Every port this container publishes; the first is the PRIMARY (health-checked, fronted by the
+    /// tunnel server), every entry gets its own `-p`. Non-empty for a real deploy.
     pub ports: Vec<ContainerPort>,
 }
 
-/// Per-container resource ceilings applied to `podman run` so one tenant's
-/// container cannot exhaust host RAM, saturate every CPU, or fork-bomb the node
-/// (a DoS against every other tenant on a shared host). `None` on a field = no
-/// limit for that dimension. See [`ContainerLimits::default`] for the safe
-/// defaults applied to every deployment today; these can later be made
-/// per-deployment configurable via project settings.
+/// Per-container resource ceilings applied to `podman run` so one tenant cannot exhaust host RAM,
+/// saturate every CPU or fork-bomb the node; `None` = no limit for that dimension.
 #[derive(Clone, Debug)]
 pub struct ContainerLimits {
     /// Memory ceiling (podman `--memory`), e.g. "512m", "2g". None = no limit.
@@ -439,12 +365,6 @@ pub struct ContainerLimits {
 
 impl Default for ContainerLimits {
     fn default() -> Self {
-        // Ceilings, NOT reservations (podman `--memory` only bounds peak use), so a
-        // generous default is safe: a small app uses little, while a real monolith
-        // container (monorepo dev server, bundled front+back) isn't OOM-killed. Still
-        // bounds a runaway/hostile container on a shared host (the H1 DoS guard).
-        // 512m was far too low and OOM-killed legitimate apps (exit 137). Env-tunable
-        // fleet-wide; per-deployment override via fluid.json `container.memory`.
         fn env_or(key: &str, default: &str) -> String {
             std::env::var(key)
                 .ok()
@@ -464,16 +384,9 @@ impl Default for ContainerLimits {
 }
 
 impl ContainerLimits {
-    /// Limits for a specific container function: honor the deployment's requested
-    /// memory (`memory_mib`, from fluid.json `container.memory` / project settings),
-    /// CPU quota (`cpus`, fluid.json `container.cpus`), and max-PIDs (`pids`,
-    /// fluid.json `container.pids`) when set (memory/pids >0, cpus >0.0), else the
-    /// generous, env-tunable default for that dimension. EACH requested value is
-    /// CLAMPED to its own fleet-wide maximum — without this, a tenant's own
-    /// `fluid.json` (`{"container":{"memory":"999999m","cpus":"999","pids":999999}}`)
-    /// could remove the ceiling entirely (H1's whole point was that ONE tenant's
-    /// container must never be able to exhaust host RAM/CPU/the process table and
-    /// starve every other co-located tenant on a shared node).
+    /// Limits for a specific container function: the deployment's requested memory/cpus/pids when
+    /// set, else the env-tunable defaults — and EACH request is CLAMPED to its fleet-wide maximum, so
+    /// a tenant's own fluid.json can never remove the ceiling.
     pub fn for_container(memory_mib: u32, cpus: f64, pids: u32) -> Self {
         let mut l = Self::default();
         if memory_mib > 0 {
@@ -503,10 +416,8 @@ impl ContainerLimits {
         l
     }
 
-    /// The `podman run` OPTION flags for these limits plus always-on privilege
-    /// hardening (`--security-opt no-new-privileges`). Must be pushed BEFORE the
-    /// image name in the args vector (they're run options, not container CMD args).
-    /// Shared by every `podman run` path so limits can't drift between backends.
+    /// The `podman run` OPTION flags for these limits plus always-on `--security-opt
+    /// no-new-privileges`; pushed BEFORE the image name. Shared by every `podman run` path.
     pub fn podman_run_flags(&self) -> Vec<String> {
         let mut f = Vec::new();
         if let Some(mem) = &self.memory {
@@ -521,20 +432,14 @@ impl ContainerLimits {
             f.push("--pids-limit".into());
             f.push(pids.to_string());
         }
-        // Prevent suid binaries inside the container from escalating privileges
-        // (free defense-in-depth; applied to every container).
         f.push("--security-opt".into());
         f.push("no-new-privileges".into());
         f
     }
 }
 
-/// Parse a podman "IPAM error: requested ip address X is already allocated to
-/// container ID Y" failure into `(network, stale_container_id)`, so the caller can
-/// reap the leaked lease and retry. Returns `None` when the run failed for any
-/// other reason (so the normal error path is preserved untouched). The network
-/// name comes from the launch's own `net_json` — the only network a static `--ip`
-/// is ever pinned on.
+/// Parse a podman "IPAM error: requested ip address X is already allocated to container ID Y"
+/// failure into `(network, stale_container_id)`; `None` for any other failure.
 fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<(String, String)> {
     if !stderr.contains("IPAM error") || !stderr.contains("already allocated to container") {
         return None;
@@ -545,7 +450,6 @@ fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())?
         .to_string();
-    // "...allocated to container ID <hex>" — take the token after the last "ID".
     let id = stderr
         .rsplit_once("container ID")
         .map(|(_, tail)| tail.trim())
@@ -561,54 +465,27 @@ fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<
     Some((netname, id))
 }
 
-/// True when a container run failed BECAUSE of its pinned static `--ip` — a
-/// leaked/duplicate IPAM lease, an address outside the (possibly auto-reallocated)
-/// subnet, or an exhausted pool. Gates the "drop the --ip and retry dynamic"
-/// self-heal, which must fire for ALL of these, not just the "already allocated"
-/// wording `parse_ipam_conflict` extracts an id from. Only meaningful when the
-/// launch actually pinned an ip (compose); a standalone deploy has none, so this
-/// is always false there and the normal error path is preserved.
-/// True when a failed `podman run` failed because podman's LOCK POOL is empty
-/// ("allocating lock for new container: allocation failed; exceeded num_locks").
-///
-/// podman allocates one lock per container AND one per VOLUME from a single pool
-/// (`num_locks`, default 2048). Witnessed live: 2032 volumes against 16
-/// containers had consumed the entire pool, so NO container could start on that
-/// node and every cold start surfaced to users as 503 CAPACITY_EXHAUSTED —
-/// which reads as "you need more capacity" when the truth is "the host's lock
-/// pool leaked". This is the signal that the pool, not capacity, is the problem.
-/// Shared with `mock.rs`, whose container path is the SAME real podman on a
-/// `HIVE_FORCE_MOCK=1` node, so both must classify the fault identically.
+/// True when a failed `podman run` failed because podman's LOCK POOL is empty ("exceeded
+/// num_locks": one lock per container AND per volume) — the pool, not capacity, is the problem.
+/// Shared with `mock.rs`, whose container path is the same real podman.
 pub(crate) fn is_lock_exhaustion(stderr: &str) -> bool {
     let e = stderr.to_lowercase();
     e.contains("num_locks") || (e.contains("allocating lock") && e.contains("allocation failed"))
 }
 
-/// Is this an ANONYMOUS podman volume id (64 hex chars)?
-///
-/// Load-bearing safety check for [`reclaim_podman_locks`]: podman names
-/// anonymous volumes with a 64-hex id, while every volume the platform creates
-/// on purpose is NAMED (`hive-vol-postgres`, …). A blanket `podman volume prune`
-/// would delete a provisioned DATABASE volume the moment its container happened
-/// to be down — witnessed live: `hive-vol-postgres` sitting unused and therefore
-/// prunable. Only ids matching this shape are ever removed.
+/// Is this an ANONYMOUS podman volume id (64 hex chars)? The load-bearing guard for
+/// [`reclaim_podman_locks`]: every volume the platform creates on purpose is NAMED (`hive-vol-*`).
 fn is_anonymous_volume(name: &str) -> bool {
     name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Reclaim podman locks so containers can start again. Returns (volumes, cells).
-///
-/// Escalating, and deliberately conservative: remove EXITED `hive-cell-*`
-/// containers (ephemeral by construction) and DANGLING ANONYMOUS volumes. Never
-/// touches a running container, a named volume, or anything not recognisably
-/// ours. Called only when [`is_lock_exhaustion`] matched, so it does no work in
-/// the normal case.
+/// Reclaim podman locks so containers can start again — EXITED `hive-cell-*` containers and
+/// DANGLING ANONYMOUS volumes only, never a running container or a named volume. Returns
+/// (volumes, cells).
 async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
     use tokio::process::Command;
     let mut vols = 0usize;
     let mut cells = 0usize;
-    // Exited cell containers first: cheap, and each holds a lock plus (before
-    // `rm -v` shipped) a leaked anonymous volume.
     if let Ok(out) = Command::new(bin)
         .args([
             "ps",
@@ -639,7 +516,6 @@ async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
             }
         }
     }
-    // Then dangling anonymous volumes — the actual leak that fills the pool.
     if let Ok(out) = Command::new(bin)
         .args([
             "volume",
@@ -673,9 +549,8 @@ async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
     (vols, cells)
 }
 
-/// Reclaim below this many free podman locks. The pool defaults to 2048 and
-/// legitimate peak usage across the fleet was ~18 volumes + 7 containers, so a
-/// node under this figure is leaking, not busy.
+/// Reclaim below this many free podman locks; legitimate fleet peak was ~25 of the 2048, so a node
+/// under this is leaking, not busy.
 pub const LOCK_HEADROOM_FLOOR: u64 = 1536;
 
 /// podman's currently-free lock count, or `None` if podman isn't present /
@@ -697,18 +572,8 @@ pub async fn podman_free_locks(path_env: &str) -> Option<u64> {
         .ok()
 }
 
-/// PROACTIVE lock sweep: reclaim leaked locks BEFORE anything fails.
-///
-/// The reactive path inside the run-failure handler only fires once a cold start
-/// has already failed, so the first request after exhaustion still eats a failure
-/// plus a retry. This runs on an interval instead: if free locks have fallen
-/// under [`LOCK_HEADROOM_FLOOR`], run the same conservative reclaim. Returns
-/// `(free_locks_before, volumes, cells)`; `volumes`/`cells` are 0 when there was
-/// nothing to do, which is the normal case.
-///
-/// Safe to call on a host with no podman (returns `None`) and on a healthy host
-/// (measures, reclaims nothing). Never touches running containers or named
-/// volumes — see [`reclaim_podman_locks`].
+/// PROACTIVE lock sweep on an interval: under [`LOCK_HEADROOM_FLOOR`] free locks, run the same
+/// conservative reclaim. Returns `(free_locks_before, volumes, cells)`; `None` without podman.
 pub async fn sweep_container_locks(path_env: &str) -> Option<(u64, usize, usize)> {
     let free = podman_free_locks(path_env).await?;
     if free >= LOCK_HEADROOM_FLOOR {
@@ -746,9 +611,7 @@ fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
         || e.contains("network not found") // net was rm'd/leaked and couldn't be recreated with the pinned subnet
 }
 
-/// Make a logical image name safe as a single filename component. Shared by
-/// every backend that caches a per-image artifact on disk (Firecracker's
-/// rootfs/data images, Litebox's initial-files tar).
+/// Make a logical image name safe as a single filename component.
 pub(crate) fn sanitize_image(image: &str) -> String {
     image
         .chars()
@@ -762,9 +625,7 @@ pub(crate) fn sanitize_image(image: &str) -> String {
         .collect()
 }
 
-/// PATH for invoking podman on a Linux host (systemd units run with a
-/// minimal env). Covers the standard distro locations. Shared by every
-/// backend that runs containers via host podman (Firecracker, Litebox).
+/// PATH for invoking podman on a Linux host (systemd units run with a minimal env).
 pub(crate) const PODMAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub(crate) struct AbortTask(Option<tokio::task::JoinHandle<()>>);
@@ -899,20 +760,14 @@ async fn run_container_command(
         .await
 }
 
-/// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
-/// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
-/// the runtime to pass to `podman --runtime` ONLY when it's actually resolvable
-/// on this host, so a misconfigured/missing runtime gracefully falls back to
-/// podman's default (crun/runc) instead of failing every container cold start.
-/// Shared by every backend that runs containers via host podman.
+/// Optional container sandbox runtime (gVisor `runsc`) from `HIVE_CONTAINER_RUNTIME`, returned
+/// only when resolvable on this host so a missing runtime falls back to podman's default.
 pub(crate) fn container_runtime() -> Option<String> {
     let v = std::env::var("HIVE_CONTAINER_RUNTIME").ok()?;
     let v = v.trim();
     if v.is_empty() {
         return None;
     }
-    // Resolve to a concrete binary so we can verify it exists. An explicit path
-    // is used as-is; a bare name is searched in the standard runtime locations.
     let candidates: Vec<String> = if v.contains('/') {
         vec![v.to_string()]
     } else {
@@ -941,45 +796,14 @@ pub(crate) fn container_runtime() -> Option<String> {
 pub(crate) async fn podman_run_container(
     cell_id: &CellId,
     image: &str,
-    // Every port to publish. `ports[0]` is the PRIMARY port: it drives the
-    // `PORT` env var, the readiness probe, and the tunnel this fn fronts the
-    // container with. Every entry (including non-primary ones) gets its own
-    // `-p` publish below. Must be non-empty — a container with no published
-    // port can never be reached. The single-TCP-port case (`&[ContainerPort::
-    // tcp(internal, host)]`) reproduces this fn's pre-multi-port behavior
-    // exactly.
     ports: &[ContainerPort],
     env: &std::collections::BTreeMap<String, String>,
     max_concurrency: u32,
     path_env: &str,
-    // Optional OCI runtime (e.g. gVisor's `runsc` for stronger sandboxing). `None`
-    // uses podman's default (crun/runc). A name or absolute path podman accepts.
     runtime: Option<&str>,
-    // Optional multi-service (docker-compose) network config — a JSON object from the
-    // deploy's `start_cmd[3]`: { net, subnet, gw, ip, hosts: ["name:ip", …] }. All of
-    // a deployment's services join one **DNS-less** podman network with STATIC IPs and
-    // `/etc/hosts` (`--add-host`) entries for every sibling, so they reach each other
-    // by service name WITHOUT podman's aardvark-dns (which binds the bridge gateway's
-    // :53 and would collide with the node's Seer DNS on 0.0.0.0:53). `None` =
-    // standalone single container — unchanged behavior.
     net_json: Option<&str>,
-    // Per-container resource ceilings (memory/cpus/pids) applied as `podman run`
-    // flags so a single tenant can't DoS the shared host. See [`ContainerLimits`].
     limits: &ContainerLimits,
-    // The service speaks a NON-HTTP protocol (`FunctionLaunch::raw_proxy`, from
-    // `FunctionConfig::needs_raw_proxy()`: gRPC / raw TCP / UDP). The tunnel
-    // fronting the container then serves each accepted connection as a RAW
-    // bidirectional byte splice to the container's published loopback port —
-    // zero HTTP framing — instead of the HTTP-framed multiplexed path, which
-    // would corrupt e.g. Postgres or Minecraft wire bytes by HTTP-parsing them.
     raw_proxy: bool,
-    // Pass the host's GPUs through via CDI (`nvidia.com/gpu=all` from the
-    // nvidia-container-toolkit-generated spec at /etc/cdi/nvidia.yaml). podman
-    // only — Apple's `container` has no GPU passthrough. When the sandbox
-    // runtime is gVisor `runsc` this composes with nvproxy on hosts configured
-    // for it; on hosts where runsc lacks nvproxy the existing
-    // retry-on-default-runtime fallback below already lands the container on
-    // the default runtime, GPUs intact.
     gpu: bool,
 ) -> anyhow::Result<ContainerLaunch> {
     use tokio::process::Command;
@@ -996,16 +820,6 @@ pub(crate) async fn podman_run_container(
     );
 
     let net = net_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    // A real multi-service (compose) deploy pins a static IP + sibling
-    // `/etc/hosts` entries — podman-only (see `container_cli::needs_podman_networking`'s
-    // doc for why: Apple's `container` tool has no static-IP flag, no
-    // --add-host, no name-based DNS between containers on a shared network,
-    // and a correct macOS equivalent needs a two-phase launch this per-service
-    // function has no visibility to orchestrate across siblings — the
-    // CALLER's job, not implemented here). Every OTHER deploy (including a
-    // "standalone" single container, which still gets its own project-scoped
-    // network purely for TENANT isolation, no static IP) is fully
-    // Apple-`container`-eligible.
     let apple = !net
         .as_ref()
         .map(crate::container_cli::needs_podman_networking)
@@ -1013,19 +827,12 @@ pub(crate) async fn podman_run_container(
         && crate::container_cli::is_apple_default();
     let bin = crate::container_cli::bin(apple);
     let rollback = ContainerRollback::new(name.clone(), apple, path_env);
-    // Clear any stale container from a prior cell at this id (kill_on_drop can't).
     let _ = Command::new(bin)
         .args(crate::container_cli::rm_args(apple, &name))
         .env("PATH", path_env)
         .output()
         .await;
 
-    // Automatic persistent volume: the run-config JSON (start_cmd[3]) may carry a
-    // stable `vol` name + `volpath` mount point. Every container gets a host-backed
-    // named volume (≥1 GB, effectively bounded only by host disk) mounted there, so
-    // its data survives instance restarts / scale-to-zero. The name is keyed per
-    // project (not per cell), so redeploys keep the data. `volume create` is
-    // idempotent — an "already exists" on a re-run is expected and fine.
     let volume: Option<(String, String)> = net.as_ref().and_then(|n| {
         let name = n
             .get("vol")
@@ -1044,21 +851,10 @@ pub(crate) async fn podman_run_container(
             .env("PATH", path_env)
             .output()
             .await;
-        // One writer per tenant volume: a still-live cell of THIS node from
-        // another process boot on this volume is removed before this one
-        // starts, and the launch fails (a node fault) if it survives (see
-        // `cell_orphans`). Podman cells only: Apple `container` cells carry no
-        // labels and are not covered (`orphan_reap_ran` stays false on macOS).
         if !apple {
             crate::cell_orphans::guard_volume_single_writer(bin, path_env, vname, &name).await?;
         }
     }
-    // Idempotently create the per-deployment network (podman: DNS-LESS, no
-    // aardvark → no :53 collision with Seer DNS; Apple's `container` has no
-    // DNS daemon on its networks at all, so `--disable-dns` is meaningless
-    // there and dropped, along with `--gateway` — no static-IP need means no
-    // reason to pin one, `container`'s own allocator picks one within the
-    // subnet). "already exists" / overlap on a re-run is fine either way.
     if let Some(n) = &net {
         if let Some(netname) = n
             .get("net")
@@ -1093,17 +889,6 @@ pub(crate) async fn podman_run_container(
                 .env("PATH", path_env)
                 .output()
                 .await;
-            // Subnet-reservation self-heal: netavark (podman 5.x) can leak a
-            // network's SUBNET reservation into `ipam.db` so that after the
-            // network is gone, recreating it with the SAME deterministic subnet
-            // fails ("subnet X is already used on the host or by another config")
-            // — and the network never comes back, so every launch fails with
-            // "network not found". When create fails for a reason OTHER than the
-            // benign "already exists", retry WITHOUT the pinned --subnet/--gateway
-            // and let podman allocate a free subnet. The pinned per-service --ip
-            // (from net_json) then won't match, but the run's dynamic-IP fallback
-            // below drops it — so serving always recovers. Tenant isolation
-            // (a dedicated per-project network) is preserved regardless of subnet.
             let ok = created
                 .as_ref()
                 .map(|o| o.status.success())
@@ -1130,9 +915,6 @@ pub(crate) async fn podman_run_container(
             }
         }
     }
-    // Base `run` args (everything after the subcommand, sans --runtime). The port is
-    // published on 127.0.0.1 ONLY — the container is never exposed to the internet
-    // directly; it's reached solely via the gateway/ngrok for the deployment.
     let mut base: Vec<String> = vec![
         "-d".into(),
         "--name".into(),
@@ -1140,10 +922,6 @@ pub(crate) async fn podman_run_container(
         "-e".into(),
         format!("PORT={}", primary.container_port),
     ];
-    // Ownership labels: which cell, which node identity (`hive.owner`), which
-    // hive-cloud process boot. Owner + boot let the next boot of THIS node tell
-    // its predecessor's orphans from its own cells and from another
-    // co-hosted process's (`cell_orphans`).
     if !apple {
         base.extend(crate::cell_orphans::cell_label_args(cell_id.as_str()));
     }
@@ -1151,15 +929,12 @@ pub(crate) async fn podman_run_container(
         base.push("-e".into());
         base.push(format!("{k}={v}"));
     }
-    // Mount the automatic persistent volume + tell the app where it is ($HIVE_VOLUME).
     if let Some((vname, vpath)) = &volume {
         base.push("-e".into());
         base.push(format!("HIVE_VOLUME={vpath}"));
         base.push("-v".into());
         base.push(format!("{vname}:{vpath}"));
     }
-    // Shared network with a static IP + sibling host entries (multi-service only,
-    // podman-only — see above).
     if let Some(n) = &net {
         if let Some(netname) = n
             .get("net")
@@ -1184,17 +959,11 @@ pub(crate) async fn podman_run_container(
             }
         }
     }
-    // Resource ceilings + privilege drop — DoS / escalation defense-in-depth.
-    // These are `run` OPTIONS, so they must precede the image name below.
     base.extend(crate::container_cli::resource_flags(apple, limits));
-    // Serverless GPU: CDI device injection (see the `gpu` param doc above).
     if gpu && !apple {
         base.push("--device".into());
         base.push("nvidia.com/gpu=all".into());
     }
-    // One `-p` per published port; UDP gets podman's literal `/udp` suffix on
-    // the internal port, TCP (the default, and today's only case) gets none —
-    // byte-identical to the pre-multi-port single `-p` for a one-TCP-port spec.
     for p in ports {
         base.push("-p".into());
         let suffix = match p.protocol {
@@ -1206,8 +975,6 @@ pub(crate) async fn podman_run_container(
             p.host_port, p.container_port
         ));
     }
-    // `entrypoint:` REPLACES the image's ENTRYPOINT, so it is a run OPTION and
-    // must precede the image name.
     let argv_of = |key: &str| -> Vec<String> {
         net.as_ref()
             .and_then(|n| n.get(key))
@@ -1221,24 +988,12 @@ pub(crate) async fn podman_run_container(
     };
     let entrypoint = argv_of("entrypoint");
     if !entrypoint.is_empty() {
-        // podman's `--entrypoint` takes a JSON array for a multi-word form.
         base.push("--entrypoint".into());
         base.push(serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")));
     }
     base.push(image.to_string());
-    // `command:` OVERRIDES the image's CMD, so it is trailing argv AFTER the
-    // image — the same position `docker run <image> <cmd...>` puts it. Dropping
-    // this made every image whose ENTRYPOINT needs arguments unstartable (the
-    // canonical `minio/minio` + `command: server /data --console-address
-    // ":9001"` case: bare, it prints usage and exits, so the container never
-    // listens and the deployment's circuit opens).
     base.extend(argv_of("cmd"));
 
-    // Attempt 1: with the requested sandbox runtime (e.g. gVisor `runsc`) if any —
-    // podman only. Apple's `container` has no equivalent concept (every container is
-    // ALREADY isolated in its own lightweight VM, a stronger boundary than gVisor
-    // adds on top of a shared kernel), so `runtime`/the retry-on-default-runtime
-    // fallback below are both skipped entirely on macOS.
     let mut attempt: Vec<String> = vec!["run".into()];
     if !apple {
         if let Some(rt) = runtime {
@@ -1249,10 +1004,6 @@ pub(crate) async fn podman_run_container(
     attempt.extend(base.iter().cloned());
     let mut out = run_container_command(bin, &attempt, path_env).await?;
 
-    // Non-breaking fallback: if a sandbox runtime was requested but the container
-    // couldn't start under it (a gVisor incompatibility), retry on podman's DEFAULT
-    // runtime so the deployment still serves. Isolation degrades to the default for
-    // that one container; logged so the degradation is visible.
     if !apple && !out.status.success() && runtime.is_some() {
         tracing::warn!(
             runtime = ?runtime,
@@ -1269,18 +1020,6 @@ pub(crate) async fn podman_run_container(
         out = run_container_command(bin, &fb, path_env).await?;
     }
 
-    // CRITICAL leaked-IPAM self-heal (compose static-IP churn): a compose service
-    // pins a DETERMINISTIC static `--ip` on the project network. When podman force-
-    // removes or crashes the prior instance, its IPAM lease on that address can LEAK
-    // — the container is gone from `podman ps -a`, but the network's allocation DB
-    // still records it. The next launch re-requests the SAME `--ip` and podman
-    // refuses: "IPAM error: requested ip address X is already allocated to container
-    // ID Y". keep-warm then retries the same address forever → the deployment is
-    // permanently CAPACITY_EXHAUSTED and never recovers, even across node restarts
-    // (the lease is persisted in the network DB, not process memory). Parse the
-    // offending container id out of the error, reap its stale lease (disconnect +
-    // rm), and retry the run ONCE. Self-healing at the single chokepoint every
-    // launch flows through, so no operator ever hand-frees an IP again.
     if !apple
         && !out.status.success()
         && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
@@ -1300,23 +1039,6 @@ pub(crate) async fn podman_run_container(
             v.extend(base.iter().cloned());
             v
         };
-        // Is the container named in the conflict actually ALIVE? This decides whether
-        // the collision is a leaked lease (a ghost we may reap) or a real peer that
-        // simply holds the address — most often the PREVIOUS GENERATION of this very
-        // deployment during a rolling redeploy's overlap window. The reap below is a
-        // force-remove, so getting this wrong destroys a container that is serving
-        // live traffic, and the network reset in step 2 takes every sibling on the
-        // project network with it. Two hard-won details of the verdict itself:
-        //  - `.State.Status`, never `.State.Running`: a PAUSED container reads
-        //    `Running=false` while being precisely the live lease-holder that
-        //    produced this conflict (proven with a live paused holder); the same
-        //    goes for `restarting`/`stopping`. Only states with no process and a
-        //    released netns count as dead.
-        //  - The probe FAILS TOWARD LIVE: `podman inspect` erroring (daemon busy,
-        //    lock-pool exhaustion — a documented condition on this fleet) proves
-        //    nothing about the holder, and "couldn't check" must never authorize a
-        //    force-remove. Only a provable "no such container" or a provably dead
-        //    status permits the reap.
         let conflict = parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr));
         let holder_live = match &conflict {
             Some((_, id)) => match Command::new(bin)
@@ -1332,7 +1054,6 @@ pub(crate) async fn podman_run_container(
                     !matches!(st.as_str(), "exited" | "stopped" | "created" | "configured")
                 }
                 Ok(o) => {
-                    // Nonzero exit: only a definitive "does not exist" is dead.
                     let e = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
                     !(e.contains("no such") || e.contains("not found"))
                 }
@@ -1341,15 +1062,6 @@ pub(crate) async fn podman_run_container(
             None => false,
         };
         if holder_live {
-            // A LIVE holder is not a fault to heal — it is the previous generation
-            // (or another instance) legitimately serving on this address, and only
-            // compose services pin `--ip` at all. Every alternative is worse than
-            // failing: reaping it kills live traffic, and starting THIS container on
-            // a dynamic address silently cross-wires generations — the siblings'
-            // baked `/etc/hosts` still names the static address, so their traffic
-            // keeps landing on the OLD generation and then goes dark when it expires
-            // (measured live). The address frees when that generation's idle TTL
-            // runs out, so an honest, retryable error is the correct outcome.
             let holder = conflict.as_ref().map(|(_, i)| i.as_str()).unwrap_or("");
             anyhow::bail!(
                 "static address on network {netname} is held by live container {holder} \
@@ -1358,11 +1070,6 @@ pub(crate) async fn podman_run_container(
             );
         }
         {
-            // Step 1: when the error names a specific stale container holding our
-            // IP, try to free just that address — disconnect the ghost from the
-            // network, then remove it. Cheap + surgical when the ghost still
-            // exists as a container. (An orphaned lease with no container is
-            // handled by the network reset in step 2.)
             if let Some((_, stale_id)) = conflict {
                 tracing::warn!(
                     network = %netname, stale = %stale_id,
@@ -1386,35 +1093,9 @@ pub(crate) async fn podman_run_container(
                 out = run_container_command(bin, &build_run(runtime), path_env).await?;
             }
 
-            // Step 2: if the surgical reap didn't release the lease (a truly
-            // ORPHANED IPAM allocation — the container is already gone, so
-            // `disconnect`/`rm` are no-ops and podman's network DB still records
-            // the address), reset the whole project network: force-remove it
-            // (which drops every allocation + disconnects any sibling) and
-            // recreate it from the SAME net_json, resetting IPAM to empty. Any
-            // sibling briefly disconnected here is re-launched by keep-warm and
-            // re-acquires its own static IP on the fresh network. This is the
-            // durable self-heal that survives restarts (the leak lives in the
-            // persisted network DB, not process memory) with no operator action.
             if !out.status.success()
                 && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
             {
-                // `network rm --force` disconnects and destroys EVERY container still
-                // attached, not just the one holding our address. On a project network
-                // that is the deployment's whole compose topology — the previous
-                // generation still serving traffic, sibling services, a managed
-                // database container with a tenant's data volume. Reclaiming one IP
-                // never justifies that, so the reset is only permissible when nothing
-                // is actually running on the network; otherwise step 3's dynamic
-                // address gets this launch up without touching anyone else.
-                // `-a` is load-bearing: `network rm --force` destroys attached
-                // containers in ANY state, while `ps` without `-a` lists only
-                // running ones — a paused or between-restarts (exited) database
-                // container is exactly what this guard exists to protect and
-                // exactly what a running-only listing is blind to (proven live:
-                // a paused + an exited container both survived rm --force only
-                // once this listed them). And the probe FAILS CLOSED: a podman
-                // error proves nothing empty, so it must read as "occupied".
                 let attached = match Command::new(bin)
                     .args(["ps", "-a", "-q", "--filter", &format!("network={netname}")])
                     .env("PATH", path_env)
@@ -1435,13 +1116,11 @@ pub(crate) async fn podman_run_container(
                 }
                 if let Some(n) = net.as_ref().filter(|_| attached == 0) {
                     tracing::warn!(network = %netname, "IPAM lease still held after reap — resetting project network");
-                    // Remove containers still attached, then the network itself.
                     let _ = Command::new(bin)
                         .args(["network", "rm", "--force", &netname])
                         .env("PATH", path_env)
                         .output()
                         .await;
-                    // Recreate with the original subnet/gateway (DNS-less, as launched).
                     let mut c = vec![
                         "network".to_string(),
                         "create".to_string(),
@@ -1469,10 +1148,6 @@ pub(crate) async fn podman_run_container(
                         .env("PATH", path_env)
                         .output()
                         .await;
-                    // netavark can also leak the SUBNET reservation (survives network
-                    // rm), so recreating with the same subnet fails — recreate with an
-                    // auto-allocated subnet instead. The static --ip won't match, but
-                    // step 3's dynamic fallback drops it.
                     let recreated = rc.as_ref().map(|o| o.status.success()).unwrap_or(false);
                     if !recreated {
                         let _ = Command::new(bin)
@@ -1490,22 +1165,10 @@ pub(crate) async fn podman_run_container(
                 }
             }
 
-            // FINAL fallback — availability over perfect static addressing: netavark
-            // (podman 5.x) can leak an IPAM lease into `ipam.db` that survives BOTH
-            // container-rm AND network-rm, so the deterministic `--ip` stays
-            // permanently "allocated" to a container that no longer exists and no
-            // reset above can free it. Rather than leave the deployment down
-            // forever, drop the static `--ip` pin and let netavark assign any free
-            // address on the (250+ host) subnet. The container still joins the
-            // project network (tenant isolation intact) and is reached by the
-            // gateway on its published 127.0.0.1 port exactly as before; only
-            // sibling-by-pinned-IP `/etc/hosts` addressing degrades (logged). This
-            // is the guaranteed self-heal — a leaked lease can never wedge serving.
             if !out.status.success()
                 && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
             {
                 tracing::warn!(network = %netname, "IPAM lease unclearable — retrying with a dynamic address (dropping the static --ip pin)");
-                // Rebuild base without the `--ip <addr>` pair.
                 let mut dyn_base: Vec<String> = Vec::with_capacity(base.len());
                 let mut it = base.iter();
                 while let Some(a) = it.next() {
@@ -1530,16 +1193,6 @@ pub(crate) async fn podman_run_container(
             }
         }
     }
-    // LOCK-POOL self-heal: podman's `num_locks` pool is shared by containers AND
-    // volumes, and an exhausted pool means NO container can start on this node —
-    // every deployment cold-starting here 503s as CAPACITY_EXHAUSTED until a
-    // human intervenes. That is exactly what happened: 2032 volumes (2025 of
-    // them dangling anonymous leftovers) against 16 containers filled the pool,
-    // and a manual sweep was the only thing that brought it back. Reclaim and
-    // retry ONCE here, at the same chokepoint every launch flows through, so the
-    // condition heals itself. `rm_args` now carries `-v` so the leak stops at
-    // source too; this handles a pool already exhausted by the old behaviour (or
-    // by anything else that leaks a volume).
     if !apple && !out.status.success() && is_lock_exhaustion(&String::from_utf8_lossy(&out.stderr))
     {
         let (vols, cells) = reclaim_podman_locks(bin, path_env).await;
@@ -1562,22 +1215,12 @@ pub(crate) async fn podman_run_container(
             retry.extend(base.iter().cloned());
             out = run_container_command(bin, &retry, path_env).await?;
         } else {
-            // Nothing was reclaimable, so the pool is genuinely full of live
-            // objects — raising `num_locks` is the real remedy. Say so instead of
-            // letting this surface as a generic capacity error.
             tracing::error!(
                 "podman lock pool exhausted and NOTHING was reclaimable — raise num_locks in containers.conf (then `podman system renumber`); containers cannot start on this node"
             );
         }
     }
     if !out.status.success() {
-        // CRITICAL leak fix: a FAILED `podman run` can still leave a partial
-        // `created` container holding one of podman's 2048 container LOCKS (e.g.
-        // when the failure IS "exceeded num_locks", or an image-pull/port error
-        // after the name+storage were allocated). Every cold-start uses a unique
-        // cell name, so without this `rm` the failures pile up in `created` state
-        // and exhaust the lock pool fleet-wide → CAPACITY_EXHAUSTED on ALL
-        // deployments (not just the one that failed). Reclaim the lock here.
         let _ = Command::new(bin)
             .args(crate::container_cli::rm_args(apple, &name))
             .env("PATH", path_env)
@@ -1585,13 +1228,6 @@ pub(crate) async fn podman_run_container(
             .await;
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stderr = stderr.trim();
-        // STILL lock-exhausted after the self-heal above ran (it reclaimed
-        // nothing, or the retry hit the same wall): the pool is genuinely full of
-        // LIVE objects, which is a per-HOST resource fault with exactly one
-        // remedy — raise `num_locks` and `podman system renumber`. It is not
-        // capacity: the node can have terabytes free and still be here, and
-        // reporting CAPACITY_EXHAUSTED sent an operator looking for space that
-        // was never the problem.
         if !apple && is_lock_exhaustion(stderr) {
             anyhow::bail!(
                 "node cannot start containers: podman's lock pool is exhausted and nothing was \
@@ -1603,15 +1239,6 @@ pub(crate) async fn podman_run_container(
         }
         anyhow::bail!("{bin} run failed: {stderr}");
     }
-    // Wait for the container's port to accept connections (image pull + boot).
-    // Budget is env-tunable (`HIVE_CONTAINER_READY_SECS`, default 180) — a heavy
-    // monolith (monorepo dev server: webpack + tsc + nodemon, esp. under gVisor)
-    // can take minutes to compile before it listens, and the old hard 90s deadline
-    // killed it mid-boot → keep-warm restarted the slow boot → it never converged
-    // ("builds + deploys but never loads"). CRITICAL: on deadline we do NOT kill a
-    // container that is still RUNNING — we hand back the endpoint and let it finish
-    // booting (early requests 502 until the port opens, then it serves). We only
-    // bail if the container has actually EXITED (a real crash).
     let func_addr = format!("127.0.0.1:{}", primary.host_port);
     let ready_secs = std::env::var("HIVE_CONTAINER_READY_SECS")
         .ok()
@@ -1626,14 +1253,12 @@ pub(crate) async fn podman_run_container(
         if tokio::time::Instant::now() >= deadline {
             let running = crate::container_cli::is_running(apple, &name, path_env).await;
             if running {
-                // Still booting — keep it and return the endpoint (don't restart-loop).
                 tracing::warn!(
                     container = %name, addr = %func_addr, secs = ready_secs,
                     "container not accepting connections yet but still running — returning endpoint; it will serve once it listens"
                 );
                 break;
             }
-            // Actually crashed/exited → surface it.
             let logs = Command::new(bin)
                 .args(crate::container_cli::logs_tail_args(apple, &name, 20))
                 .env("PATH", path_env)
@@ -1641,10 +1266,6 @@ pub(crate) async fn podman_run_container(
                 .await
                 .ok()
                 .map(|o| {
-                    // BOTH streams: `podman logs` mirrors the container's stdout
-                    // to stdout and stderr to stderr — an app that logged its
-                    // dying reason via console.log/print (stdout) was invisible
-                    // to the stderr-only capture.
                     let mut t = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
                     if !e.is_empty() {
@@ -1661,11 +1282,6 @@ pub(crate) async fn podman_run_container(
                 .env("PATH", path_env)
                 .output()
                 .await;
-            // The container STARTED and then exited before listening — the
-            // "exited before listening on 127.0.0.1:PORT" shape `fluid-compute`
-            // circuits on. An APP fault, and marked as one: the circuit only
-            // opens on the third consecutive failure, so unmarked the first two
-            // reported CAPACITY_EXHAUSTED and blamed the host.
             anyhow::bail!(
                 "the deployment's own container {name} exited before listening on {func_addr} — \
                  check this deployment's logs, entrypoint and required env; the node started the \
@@ -1684,32 +1300,9 @@ pub(crate) async fn podman_run_container(
                 Ok((conn, _)) => {
                     let local = func_addr.clone();
                     tokio::spawn(async move {
-                        // Clean per-protocol branch: a non-HTTP service (gRPC /
-                        // raw TCP — Postgres, Minecraft, …) gets a genuine raw
-                        // byte splice to the container's loopback port; an
-                        // HTTP-family service keeps the existing HTTP-framed
-                        // multiplexed tunnel path, byte-identical.
-                        //
-                        // UDP EXTENSION POINT: this listener (and serve_raw's
-                        // copy_bidirectional) is TCP-only. A UDP service's
-                        // datagrams cannot ride this hop — the UDP relay
-                        // (separate mechanism) must forward datagrams directly
-                        // to the container's published loopback UDP port
-                        // (`127.0.0.1:<host_port>`, published above with the
-                        // `-p …/udp` suffix), bypassing this TCP tunnel
-                        // entirely. Plug that relay in HERE, beside the accept
-                        // loop, when it lands.
                         if raw_proxy {
                             fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
                         } else {
-                            // `serve_maybe_raw`, not bare `serve`: an
-                            // HTTP-protocol function (this branch) still
-                            // needs its normal framed path for ordinary
-                            // requests, but a WebSocket-upgrade connection
-                            // (`edge.rs`'s local splice, opened directly to
-                            // this SAME listener) needs one connection
-                            // switched to a raw byte splice — see
-                            // `TunnelServer::serve_maybe_raw`'s doc.
                             fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc)
                                 .await;
                         }
@@ -1733,19 +1326,14 @@ pub struct CellSpec {
     /// Logical image / rootfs name (warm pools are keyed on this).
     pub image: String,
     pub resources: ResourceSpec,
-    /// Owning team/tenant slug (empty = "personal"). Lets a backend partition a
-    /// cell's host resources per tenant (the mock backend nests cell workdirs
-    /// under the tenant; Firecracker nests its per-cell run dir likewise).
+    /// Owning team/tenant slug (empty = "personal"); backends partition a cell's host resources by it.
     pub tenant: String,
-    /// Set when this cell is a CONTAINER (podman) rather than a function/microVM.
-    /// The backend runs it via host podman; Firecracker uses this to skip booting a
-    /// microVM and run the container on the host instead. `None` = function cell.
+    /// Set when this cell is a CONTAINER (podman) rather than a function/microVM; `None` = function cell.
     pub container: Option<ContainerSpec>,
 }
 
-/// Make a tenant slug safe to use as a single host path component (no traversal,
-/// no separators) so an odd/hostile team name can't escape a backend's cells
-/// root. Empty / dot-only normalizes to "personal".
+/// Make a tenant slug safe as a single host path component (no traversal, no separators); empty or
+/// dot-only normalizes to "personal".
 pub(crate) fn sanitize_tenant(t: &str) -> String {
     let s: String = t
         .chars()
@@ -1785,10 +1373,8 @@ pub trait CellBackend: Send + Sync {
     /// pools — for the real backend it boots a microVM and loads the image.
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle>;
 
-    /// Provision while binding an isolated runtime to the caller-authorized
-    /// delivery identity. Backends that attach runtime artifacts override this
-    /// and reject an H1 -> H2 change before guest code can execute. The default
-    /// accepts only the explicit same-host/container `None` shape.
+    /// Provision while binding an isolated runtime to the caller-authorized delivery identity; the
+    /// default accepts only the explicit same-host/container `None` shape.
     async fn provision_runtime(
         &self,
         spec: &CellSpec,
@@ -1811,9 +1397,8 @@ pub trait CellBackend: Send + Sync {
         sink: LogSink,
     ) -> anyhow::Result<BuildResult>;
 
-    /// Make one exact sealed runtime artifact available to serving cells. A
-    /// backend never receives checkout coordinates and therefore cannot rebuild
-    /// or re-detect independently of the coordinator's immutable authority.
+    /// Make one exact sealed runtime artifact available to serving cells; a backend never receives
+    /// checkout coordinates it could rebuild from.
     async fn deliver_build(
         &self,
         _image: &str,
@@ -1825,21 +1410,15 @@ pub trait CellBackend: Send + Sync {
         )
     }
 
-    /// Whether this backend attaches an isolated runtime artifact when serving a
-    /// platform deployment. Same-host and container execution return false; an
-    /// isolated backend returns true so cold-start must resolve and carry H1.
+    /// Whether this backend attaches an isolated runtime artifact (then cold-start must resolve and
+    /// carry H1); same-host and container execution return false.
     fn requires_runtime_artifact_authorization(&self) -> bool {
         false
     }
 
-    /// Exact identity committed by `deliver_build` for `image`.
-    ///
-    /// Isolated function launches resolve this BEFORE provisioning and carry it
-    /// through `FunctionLaunch`; the backend must compare it with the artifact
-    /// it actually attaches. That closes the H1 -> H2 publication race: a launch
-    /// authorized against H1 can never silently execute a later delivery H2.
-    /// Same-host/container backends return `None` because they attach no runtime
-    /// artifact and therefore have no identity to authorize.
+    /// Exact identity committed by `deliver_build` for `image`, resolved BEFORE provisioning and
+    /// compared with the artifact actually attached, so a launch authorized against H1 can never
+    /// execute a later delivery H2. `None` for backends that attach no artifact.
     async fn runtime_artifact_identity(
         &self,
         _image: &str,
@@ -1855,10 +1434,8 @@ pub trait CellBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Start a long-lived function server inside the cell and return an endpoint
-    /// the gateway can open connections to (Fluid compute serving path). Unlike
-    /// `run_build`, the cell is NOT single-use: it stays alive serving many
-    /// concurrent requests until the pool decides to scale it down.
+    /// Start a long-lived function server inside the cell and return an endpoint the gateway opens
+    /// connections to; unlike `run_build`, the cell is not single-use.
     async fn start_function(
         &self,
         cell: &CellHandle,
@@ -1869,25 +1446,15 @@ pub trait CellBackend: Send + Sync {
     /// is called when the instance is scaled down.
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()>;
 
-    /// Current CPU utilization of this cell's function process, as a percentage of
-    /// the cell's ALLOCATED CPU budget (so ~100 ≈ one fully-busy vCPU for a 1-vCPU
-    /// cell, normalized by `cell.resources.vcpus`). This is the REAL saturation
-    /// signal that drives adaptive concurrency (#2): the pool lowers per-instance
-    /// concurrency when this is high (a CPU-bound function) so new requests scale
-    /// OUT instead of piling onto a hot instance, and raises it back when there's
-    /// headroom (an I/O-bound function keeps the full ceiling). Returns `None` when
-    /// the backend can't sample — the pool then holds concurrency unchanged, never
-    /// guessing from latency (which would wrongly penalize I/O-bound work).
+    /// Current CPU utilization of the cell's function process as a percentage of its ALLOCATED vCPU
+    /// budget — the real saturation signal behind adaptive concurrency; `None` when the backend cannot
+    /// sample (the pool then holds concurrency unchanged, never guessing from latency).
     async fn cpu_percent(&self, _cell: &CellHandle) -> Option<f32> {
         None
     }
 
-    /// Run one argv command inside an already-provisioned, long-lived cell
-    /// (Sandboxes). Unlike `run_build`'s one-shot self-destructing cell, the
-    /// cell accepts many commands over its life. Returns as soon as the
-    /// command has started; the caller drains the channel for
-    /// `AgentEvent::ExecOutput`* then one `AgentEvent::ExecDone`. Default:
-    /// unsupported (mock/container backends have no such exec channel yet).
+    /// Run one argv command inside an already-provisioned long-lived cell (Sandboxes); returns once
+    /// the command has started, the caller drains `ExecOutput`* then `ExecDone`. Default: unsupported.
     async fn exec_command(
         &self,
         _cell: &CellHandle,
@@ -1902,12 +1469,8 @@ pub trait CellBackend: Send + Sync {
         anyhow::bail!("backend {} does not support kill_exec", self.name())
     }
 
-    /// Open one interactive pty session inside `cell` (Sandboxes terminal —
-    /// real `vim`/`less`/`^C`/tab-completion support, unlike `exec_command`'s
-    /// line-buffered batch output). Returns an `AgentEvent` receiver
-    /// (`PtyOutput`* then one `PtyExited`) plus a sender the caller uses to
-    /// push typed bytes / resize events back on the same session. Default:
-    /// unsupported.
+    /// Open one interactive pty session inside `cell` (Sandboxes terminal): a receiver of `PtyOutput`*
+    /// then `PtyExited`, plus a sender for typed bytes / resize events. Default: unsupported.
     async fn exec_pty(
         &self,
         _cell: &CellHandle,
@@ -1920,10 +1483,8 @@ pub trait CellBackend: Send + Sync {
     }
 }
 
-/// Backend-agnostic write side of an `exec_pty` session — a thin
-/// `Fn`-closure wrapper so each backend can plug in its own transport
-/// (`FirecrackerBackend::PtySender`'s channel, litebox's own guest-shim
-/// call) without `CellBackend` depending on any one backend's concrete type.
+/// Backend-agnostic write side of an `exec_pty` session — an `Fn` closure so each backend plugs in
+/// its own transport without `CellBackend` naming a concrete type.
 #[derive(Clone)]
 pub struct PtyIo {
     input: Arc<dyn Fn(Vec<u8>) + Send + Sync>,

@@ -1,69 +1,11 @@
-//! Tenant cells that outlive the process that launched them.
-//!
-//! `hive-node.service` runs `KillMode=process` (AGENTS.md, "the podman lock
-//! pool") so a restart never takes managed databases down with it — and
-//! nothing ever adopted the surviving CELLS either: no backend lists RUNNING
-//! `hive-cell-*` containers, and the lock sweep removes only exited ones. So
-//! every hive-cloud restart started one more instance of every stateful
-//! project and leaked the previous one, all of them writing the same named
-//! volume: witnessed 2026-09-24, fc-sanjose ran 511 `hive-cell-*` containers
-//! (64 `itzg/minecraft-server` instances on `hive-vol-minecwaft` alone, the
-//! creation times matching `restart_history.json` one to one) and fc-virginia
-//! 124, with 132 of 128 inotify instances used and podman's lock pool under
-//! its floor.
-//!
-//! **Ownership is two labels, never one.** Every cell `podman_run_container`
-//! launches carries `hive.owner=<node identity>` (a stable hash of the node
-//! name and its canonical `$HIVE_DATA` — the same across restarts of ONE node,
-//! different for every other hive-cloud process sharing this podman store),
-//! `hive.boot=<this process's boot id>`, plus `hive.cell` and an informational
-//! `hive.node`. A cell is:
-//!
-//! * **current** — this boot launched it: never touched here;
-//! * **stale** — this node's owner, another boot: an orphan of a previous
-//!   process of this node, removed;
-//! * **foreign** — another owner (a second hive-cloud process on the same host:
-//!   co-hosted dev nodes, a hermetic e2e/acceptance node started beside a
-//!   fleet node): NEVER touched, only counted and WARNed;
-//! * **legacy** — no `hive.owner` label (launched before labelling existed):
-//!   ambiguous, so removed only where this process is the host's sole
-//!   supervised instance — `INVOCATION_ID` set (systemd started it) — or under
-//!   an explicit `HIVE_CELL_ORPHAN_REAP_LEGACY=1` (`=0` forces them kept).
-//!
-//! Two guards, one classification:
-//!
-//! * [`reap_orphaned_cells`] runs once at boot. Its URGENT half — list,
-//!   classify, SIGKILL duplicate writers of a shared volume — is what boot waits
-//!   for (bounded by the caller); the graceful stops, the removals and the
-//!   confirming re-list finish in the background. [`orphan_reap_ran`] turns
-//!   true only when that re-list shows no stale (or permitted legacy) cell left.
-//! * [`guard_volume_single_writer`] runs before a launch that mounts a named
-//!   `hive-vol-*` volume: a live stale writer on that volume (running, paused
-//!   or STILL STOPPING — the boot reap's graceful stop takes up to 10 s) is
-//!   stopped and removed first, and the launch FAILS with a node fault if one
-//!   is still live afterwards; a foreign or kept-legacy writer is WARNed. Once
-//!   a confirmed reap has also left no legacy cell behind, no stale or
-//!   unattributable cell exists and new cells all carry this boot, so the
-//!   guard stands down and costs nothing.
-//!
-//! How a stale writer is stopped matters more than that it is. On a volume with
-//! two or more live writers every stale one is SIGKILLed — a SIGTERM makes each
-//! duplicate flush its own (older) in-memory state over the volume — EXCEPT,
-//! when no current or foreign writer shares the volume, the NEWEST stale writer
-//! (the instance the previous process was serving): it gets `podman stop -t 10`
-//! after the kills, so the freshest state is the last flush. A sole stale
-//! writer and every stateless cell also get `stop -t 10`. Removal is always
-//! `rm -f -v`: the named `hive-vol-*` volume (tenant data) survives, only the
-//! anonymous volumes and the lock go. The mutating podman calls never carry
-//! `kill_on_drop` and the guard runs them in a detached task: a cold start
-//! dropped by a departed client must not SIGKILL `podman rm` halfway through.
-//!
-//! Nothing here ever touches a container outside the `hive-cell-` prefix —
-//! sandboxes (`hive-sbx-*`), managed databases (`hive-db-*`), Supabase stacks
-//! and anything not recognisably a serverless cell are out of scope by name.
-//! Apple `container` cells (macOS nodes' non-compose deploys) are neither
-//! labelled nor reaped: on a macOS node [`orphan_reap_ran`] therefore stays
-//! false by design.
+//! Tenant cells that outlive the process that launched them (`KillMode=process`). Ownership is TWO
+//! labels, `hive.owner` (a stable node identity) + `hive.boot`: a cell is current (this boot),
+//! stale (this owner, another boot — reaped), foreign (another owner — never touched, counted) or
+//! legacy (unlabelled — reaped only as the host's sole supervised instance or under
+//! `HIVE_CELL_ORPHAN_REAP_LEGACY=1`). [`reap_orphaned_cells`] runs once at boot (boot waits only
+//! for its urgent SIGKILL half), [`guard_volume_single_writer`] before every launch that mounts a
+//! named volume. Only `hive-cell-*` podman containers are ever touched; Apple `container` cells are
+//! neither labelled nor reaped.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -96,10 +38,8 @@ const GUARD_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const GUARD_SETTLE: Duration = Duration::from_secs(20);
 
 static REAP_RAN: AtomicBool = AtomicBool::new(false);
-/// The confirmed reap left NOTHING unattributable either (no kept legacy cell),
-/// so no launch can meet a stale writer and the per-volume guard may stand
-/// down. Separate from [`REAP_RAN`], which is also false on macOS for the
-/// Apple-container gap the podman guard has nothing to do with.
+/// The confirmed reap left nothing unattributable (no kept legacy cell), so the per-volume guard may
+/// stand down; separate from [`REAP_RAN`], which is also false on macOS.
 static PODMAN_CLEAN: AtomicBool = AtomicBool::new(false);
 
 struct Owner {
@@ -109,9 +49,8 @@ struct Owner {
 
 static OWNER: OnceLock<Owner> = OnceLock::new();
 
-/// This process's boot identity: 128 bits from the OS-seeded hasher keys,
-/// mixed with the pid and the start time. Stamped on every cell this process
-/// launches as `hive.boot`.
+/// This process's boot identity (128 bits from the OS-seeded hasher keys, pid and start time),
+/// stamped on every cell as `hive.boot`.
 pub fn boot_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
@@ -137,10 +76,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Set this node's cell-ownership identity, once at boot and before any cell
-/// launches: a stable hash of `node` and the canonical `data_dir`, so every
-/// restart of this node recognises its predecessors' cells and no other
-/// hive-cloud process on the host ever matches them.
+/// Set this node's cell-ownership identity once at boot: a stable hash of `node` and the canonical
+/// `data_dir`, equal across this node's restarts and unique per hive-cloud process on the host.
 pub fn set_cell_owner(node: &str, data_dir: &std::path::Path) {
     let dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let key = format!("{node}\0{}", dir.display());
@@ -150,14 +87,9 @@ pub fn set_cell_owner(node: &str, data_dir: &std::path::Path) {
     });
 }
 
-/// Whether a boot reap has been CONFIRMED complete in this process: a re-list
-/// after it showed no stale cell of this node (nor a permitted legacy one)
-/// left. The precondition for any automatic restart to be safe for tenant
-/// volumes (a restart without it can add one more writer per stateful
-/// project). False when opted out (`HIVE_CELL_ORPHAN_REAP=0`), while the reap
-/// is still running, when podman could not be listed or its output not
-/// parsed, when a stale cell survived, and always on macOS (Apple `container`
-/// cells are not covered).
+/// Whether a boot reap has been CONFIRMED complete (a re-list showed no stale or permitted-legacy
+/// cell left) — the precondition for any automatic restart; false when opted out
+/// (`HIVE_CELL_ORPHAN_REAP=0`), while running, on a listing/parse failure, and always on macOS.
 pub fn orphan_reap_ran() -> bool {
     REAP_RAN.load(Ordering::Relaxed)
 }
@@ -180,7 +112,10 @@ pub(crate) fn cell_label_args(cell_id: &str) -> Vec<String> {
 
 /// Whether label-less (pre-ownership) cells may be removed by this process.
 fn legacy_reap_allowed() -> bool {
-    match std::env::var("HIVE_CELL_ORPHAN_REAP_LEGACY").as_deref().map(str::trim) {
+    match std::env::var("HIVE_CELL_ORPHAN_REAP_LEGACY")
+        .as_deref()
+        .map(str::trim)
+    {
         Ok("1") => true,
         Ok("0") => false,
         _ => std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty()),
@@ -285,9 +220,8 @@ fn label(entry: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse `podman ps --format json`. A shape this code does not understand is
-/// an ERROR, never an empty list: an empty list reads as "nothing leaked" and
-/// would switch the reap off while reporting success.
+/// Parse `podman ps --format json`; an unrecognized shape is an ERROR, never an empty list (which
+/// would switch the reap off while reporting success).
 fn parse_cells(stdout: &[u8]) -> Result<Vec<Cell>, String> {
     let value: Value = serde_json::from_slice(stdout)
         .map_err(|e| format!("`ps --format json` output is not JSON: {e}"))?;
@@ -306,7 +240,9 @@ fn parse_cells(stdout: &[u8]) -> Result<Vec<Cell>, String> {
             continue;
         }
         let Some(state) = entry.get("State").and_then(Value::as_str) else {
-            return Err(format!("`ps --format json` entry {name} carries no string State"));
+            return Err(format!(
+                "`ps --format json` entry {name} carries no string State"
+            ));
         };
         cells.push(Cell {
             id: entry
@@ -351,7 +287,10 @@ async fn podman_read(
 ) -> Result<Vec<u8>, String> {
     let call = args.join(" ");
     match tokio::time::timeout(limit, podman(bin, path_env, args, true)).await {
-        Err(_) => Err(format!("`{bin} {call}` timed out after {}s", limit.as_secs())),
+        Err(_) => Err(format!(
+            "`{bin} {call}` timed out after {}s",
+            limit.as_secs()
+        )),
         Ok(Err(e)) => Err(format!("`{bin} {call}` failed to run: {e}")),
         Ok(Ok(o)) if !o.status.success() => Err(format!(
             "`{bin} {call}` failed: {}",
@@ -368,18 +307,22 @@ fn args(head: &[&str], names: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// List every `hive-cell-*` container (optionally narrowed by one `--filter`),
-/// cross-checked against `ps -a -q --no-trunc` so a JSON shape that silently
-/// drops entries is caught: every id the plain listing names must appear in
-/// the parsed JSON. The id listing runs FIRST, so a cell created in between
-/// only ever appears in the JSON (harmless) — never the other way round.
+/// List every `hive-cell-*` container, cross-checked against `ps -a -q --no-trunc` so a JSON shape
+/// that silently drops entries is caught; the id listing runs FIRST.
 async fn list_cells(
     bin: &str,
     path_env: &str,
     filter: Option<&str>,
     limit: Duration,
 ) -> Result<Vec<Cell>, String> {
-    let mut ids_call = vec!["ps", "-a", "-q", "--no-trunc", "--filter", "name=^hive-cell-"];
+    let mut ids_call = vec![
+        "ps",
+        "-a",
+        "-q",
+        "--no-trunc",
+        "--filter",
+        "name=^hive-cell-",
+    ];
     let mut json_call = vec!["ps", "-a", "--format", "json"];
     if let Some(f) = filter {
         ids_call.extend(["--filter", f]);
@@ -395,7 +338,10 @@ async fn list_cells(
     let parsed: HashSet<&str> = cells.iter().map(|c| c.id.as_str()).collect();
     let missing = ids
         .iter()
-        .filter(|id| !parsed.contains(id.as_str()) && !parsed.iter().any(|p| !p.is_empty() && id.starts_with(p)))
+        .filter(|id| {
+            !parsed.contains(id.as_str())
+                && !parsed.iter().any(|p| !p.is_empty() && id.starts_with(p))
+        })
         .count();
     if missing > 0 {
         return Err(format!(
@@ -407,10 +353,8 @@ async fn list_cells(
     Ok(cells)
 }
 
-/// Named `hive-vol-*` volumes each container mounts, via `podman inspect`
-/// (docker-compatible `Mounts[].Type/Name`). A batch podman cannot inspect
-/// leaves its containers volume-less here, which only ever selects the
-/// graceful stop — never a SIGKILL on unproven evidence.
+/// Named `hive-vol-*` volumes each container mounts (`podman inspect`); a batch that cannot be
+/// inspected only ever selects the graceful stop, never a SIGKILL.
 async fn volumes_of(bin: &str, path_env: &str, names: &[String]) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
     for chunk in names.chunks(BATCH) {
@@ -492,7 +436,11 @@ fn plan_stops(
             }
         }
     }
-    let mut stop: Vec<String> = stale.iter().filter(|n| !kill.contains(*n)).cloned().collect();
+    let mut stop: Vec<String> = stale
+        .iter()
+        .filter(|n| !kill.contains(*n))
+        .cloned()
+        .collect();
     stop.sort();
     StopPlan {
         kill: kill.into_iter().collect(),
@@ -502,13 +450,25 @@ fn plan_stops(
 
 async fn kill_all(bin: &str, path_env: &str, names: &[String]) {
     for chunk in names.chunks(BATCH) {
-        let _ = podman(bin, path_env, &args(&["kill", "--signal", "KILL"], chunk), false).await;
+        let _ = podman(
+            bin,
+            path_env,
+            &args(&["kill", "--signal", "KILL"], chunk),
+            false,
+        )
+        .await;
     }
 }
 
 async fn stop_all(bin: &str, path_env: &str, names: &[String]) {
     for chunk in names.chunks(BATCH) {
-        let _ = podman(bin, path_env, &args(&["stop", "-t", STOP_GRACE_SECS], chunk), false).await;
+        let _ = podman(
+            bin,
+            path_env,
+            &args(&["stop", "-t", STOP_GRACE_SECS], chunk),
+            false,
+        )
+        .await;
     }
 }
 
@@ -523,9 +483,6 @@ async fn remove_all(bin: &str, path_env: &str, names: &[String]) -> BTreeSet<Str
             removed.extend(chunk.iter().cloned());
             continue;
         }
-        // Partial batch failure: settle each name on its own so one wedged
-        // container cannot hide the rest. A name the batch already removed
-        // answers "no such container" now — gone either way, so counted.
         for name in chunk {
             let gone = podman(
                 bin,
@@ -556,13 +513,9 @@ fn describe(cells: &[&Cell]) -> Vec<String> {
         .collect()
 }
 
-/// Boot reap — see the module doc. Spawn it once at boot, before anything can
-/// launch a cell. `urgent_done` fires (or is dropped) once the listing is
-/// classified and every duplicate writer of a shared volume is SIGKILLed —
-/// the part boot waits for; the graceful stops, removals and the confirming
-/// re-list follow. Never touches a container outside [`CELL_PREFIX`] or of
-/// another owner; a listing podman cannot produce, or that this code cannot
-/// parse, skips the reap and leaves [`orphan_reap_ran`] false.
+/// Boot reap — see the module doc. `urgent_done` fires once the listing is classified and every
+/// duplicate writer of a shared volume is SIGKILLed; the graceful stops, removals and confirming
+/// re-list follow. A listing podman cannot produce leaves [`orphan_reap_ran`] false.
 pub async fn reap_orphaned_cells(
     bin: &str,
     path_env: &str,
@@ -571,14 +524,12 @@ pub async fn reap_orphaned_cells(
     let mut report = ReapReport::default();
     let apple_host = crate::container_cli::is_apple_default();
     if apple_host {
-        report.gap = Some(
-            "Apple `container` cells on this macOS node are not labelled or reaped".into(),
-        );
+        report.gap =
+            Some("Apple `container` cells on this macOS node are not labelled or reaped".into());
     }
     let cells = match list_cells(bin, path_env, None, REAP_LIST_TIMEOUT).await {
         Ok(cells) => cells,
         Err(_) if which_missing(bin, path_env).await => {
-            // No podman on this host: no podman cell can have leaked.
             report.skipped = Some(format!("{bin} is not installed"));
             REAP_RAN.store(!apple_host, Ordering::Relaxed);
             PODMAN_CLEAN.store(true, Ordering::Relaxed);
@@ -601,8 +552,6 @@ pub async fn reap_orphaned_cells(
     report.stale = stale.len();
     if !stale.is_empty() {
         let live: Vec<&Cell> = cells.iter().filter(|c| c.live()).collect();
-        // Live cells decide the writer counts; stale exited ones are inspected
-        // too so the per-volume report covers everything removed.
         let inspect: Vec<String> = cells
             .iter()
             .filter(|c| c.live() || removable(c, legacy))
@@ -631,8 +580,6 @@ pub async fn reap_orphaned_cells(
     } else {
         let _ = urgent_done.send(());
     }
-    // Confirm: nothing this reap owns may be left, whatever the calls above
-    // reported. A re-list that fails leaves the reap unconfirmed.
     match list_cells(bin, path_env, None, REAP_LIST_TIMEOUT).await {
         Ok(after) => {
             let left: Vec<&Cell> = after.iter().filter(|c| removable(c, legacy)).collect();
@@ -642,7 +589,10 @@ pub async fn reap_orphaned_cells(
         Err(e) => report.survivors = vec![format!("confirming re-list failed: {e}")],
     }
     REAP_RAN.store(report.confirmed && !apple_host, Ordering::Relaxed);
-    PODMAN_CLEAN.store(report.confirmed && report.legacy_kept == 0, Ordering::Relaxed);
+    PODMAN_CLEAN.store(
+        report.confirmed && report.legacy_kept == 0,
+        Ordering::Relaxed,
+    );
     report
 }
 
@@ -655,12 +605,9 @@ async fn which_missing(bin: &str, path_env: &str) -> bool {
     )
 }
 
-/// Launch-time single-writer guard for one named volume — see the module
-/// doc. `own` is the container about to be launched (never counted). Fails
-/// (a `NODE_BACKEND_UNAVAILABLE` node fault) only when a live stale writer is
-/// provably still on the volume after being stopped and removed; a listing
-/// that fails is WARNed and the launch proceeds (podman itself is then the
-/// likelier failure, and it reports its own error).
+/// Launch-time single-writer guard for one named volume (`own` is never counted): fails with a
+/// `NODE_BACKEND_UNAVAILABLE` node fault only when a live stale writer provably survives being
+/// stopped and removed; a failed listing is WARNed and the launch proceeds.
 pub(crate) async fn guard_volume_single_writer(
     bin: &'static str,
     path_env: &str,
@@ -709,15 +656,12 @@ pub(crate) async fn guard_volume_single_writer(
     if stale.is_empty() {
         return Ok(());
     }
-    // Every listed container mounts `volume` by construction of the filter.
     let volumes: HashMap<String, Vec<String>> = live
         .iter()
         .map(|c| (c.name.clone(), vec![volume.to_string()]))
         .collect();
     let plan = plan_stops(&live, &stale, &volumes);
     let (killed, stopped) = (plan.kill.len(), plan.stop.len());
-    // Detached: a cold start dropped mid-guard (client gone, lease deadline)
-    // must not cancel podman halfway through a stop or a removal.
     let task = {
         let path_env = path_env.to_string();
         let remove: Vec<String> = stale.iter().cloned().collect();
@@ -731,8 +675,6 @@ pub(crate) async fn guard_volume_single_writer(
         Ok(Ok(removed)) => Some(removed.len()),
         _ => None,
     };
-    // Re-list until the stale writers are gone (another stopper may still be
-    // flushing one), then refuse the launch if any is still live.
     let deadline = tokio::time::Instant::now() + GUARD_SETTLE;
     let left = loop {
         let left = match list_cells(bin, path_env, Some(&filter), GUARD_LIST_TIMEOUT).await {
@@ -773,7 +715,9 @@ pub(crate) async fn guard_volume_single_writer(
         stale = stale.len(),
         killed,
         stopped,
-        removed = removed.map(|n| n.to_string()).unwrap_or_else(|| "unconfirmed (stop/remove still running)".into()),
+        removed = removed
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unconfirmed (stop/remove still running)".into()),
         "cell volume guard: stale-generation writer(s) of this volume gone before launch"
     );
     Ok(())
