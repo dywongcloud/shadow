@@ -31,9 +31,9 @@ memories whose durable content was absorbed.
 
 - Live roster = non-`hive_retired` lines of `ansible/inventory/hosts.ini`:
   fc-orlando 209.23.0.183, va, va3, sj (chain head), sj7, phx; va2/fr/sp/bkk/hk
-  were DELETED. Every live host is glibc 2.39 (`[glibc238]` has no live member;
-  `scripts/audit-runtime-versions.sh` is the check); membership is by OS image,
-  never region. `[platform:vars]` templates `HIVE_CP_OWNER_CHAIN=fc-sanjose,
+  were DELETED (still named in the `[glibc*]`/`[browser_nodes]` groups → undefined to
+  ansible). Every live host is glibc 2.39 (`[glibc238]` has no live member,
+  `scripts/audit-runtime-versions.sh`); membership is by OS image, never region. `[platform:vars]` templates `HIVE_CP_OWNER_CHAIN=fc-sanjose,
   fc-phoenix,fc-virginia-3,fc-virginia` and `HIVE_CP_VOTERS=fc-sanjose,fc-phoenix,
   fc-virginia-3`; a node drop-in overrides the unit — read `/proc/<pid>/environ`.
 - SSH `ssh -i ~/.ssh/billing.pem root@<ip>` (orlando: `sysadmin`, `id_ed25519`).
