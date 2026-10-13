@@ -1,6 +1,4 @@
 ---
-# PVM has hard requirements. Fail loudly NOW rather than after a 30-minute build.
-
 - name: Require x86_64
   ansible.builtin.assert:
     that: ansible_architecture == "x86_64"
@@ -8,15 +6,6 @@
 
 - name: Require a dnf-based distro (Rocky/Alma/RHEL 10 tested, TencentOS also live in this fleet)
   ansible.builtin.assert:
-    # ansible_pkg_mgr, not ansible_os_family -- TencentOS Server (fc-hongkong,
-    # in this fleet's OWN fc_pvm group: no hardware virt, so it genuinely
-    # needs PVM same as va/va2/va3/sj/sj2) reports os_family as the literal
-    # string "TencentOS Server", not "RedHat", so this assert failed on a
-    # real fc_pvm-group host that has been running under PVM successfully --
-    # live-witnessed this session running `ansible-playbook site.yml --tags
-    # fail2ban` against the whole fleet: every other host succeeded, hk
-    # failed here even though the tag scoping had nothing to do with this
-    # role. Matches the identical fix in ansible/roles/prerequisites.
     that: ansible_pkg_mgr == "dnf"
     fail_msg: "This role targets dnf-based distros (found {{ ansible_distribution }}, pkg_mgr {{ ansible_pkg_mgr }})."
 
@@ -26,13 +15,6 @@
   changed_when: false
 
 - name: Check FSGSBASE / RDTSCP presence (informational only, not a hard requirement)
-  # INFORMATIONAL ONLY -- these facts must never gate work again. They used to
-  # gate the patch application in 30/40-*-kernel.yml, which voided the whole
-  # series on 7 of the 8 fc_pvm hosts (both flags measured present on va, va2,
-  # sj2, sp, fr, cvmsj1, cvmsj2; only va3 reads 0/0). The patch series is not
-  # conditional on the BUILD host's flags: X86_FEATURE_PVM_RDTSCP is a runtime
-  # gate evaluated inside the built kernel, so it is always wanted. Keep these
-  # for the operator-facing note below and for nothing else.
   ansible.builtin.set_fact:
     _has_fsgsbase: "{{ 'fsgsbase' in cpuflags.stdout }}"
     _has_rdtscp: "{{ 'rdtscp' in cpuflags.stdout }}"
@@ -70,20 +52,8 @@
   register: _running_kernel
   changed_when: false
 
-# Idempotency guard: a re-run of this role on a host that ALREADY booted a
-# PVM-built kernel (running release ends in the host_localversion suffix,
-# e.g. "-pvm") must never re-attempt the host/guest kernel build. Doing so
-# is unsafe, not just wasteful: /boot/config-$(uname -r) at that point reads
-# back the ALREADY-PVM-PATCHED kernel's own config (self-referential), which
-# live-broke on fc-sanjose-2's idempotency test (pvm_para.h C90/u64 compile
-# errors during a re-configure) -- the correct config source (the plain
-# distro kernel's config) only exists BEFORE the first PVM boot. Once
-# `/dev/kvm` is confirmed present under an already-`-pvm` release, this node
-# is fully provisioned; 30/40/50/60 become no-ops.
 - name: Set pvm_already_provisioned fact
   ansible.builtin.set_fact:
-    # Substring, not endswith: a dirty/untagged kernel tree build appends a
-    # trailing "+" (e.g. "6.12.33-pvm+"), which endswith("-pvm") would miss.
     pvm_already_provisioned: "{{ _preexisting_kvm.stat.exists and host_localversion in _running_kernel.stdout }}"
 
 - name: Note PVM is already provisioned (skipping build/install/reboot)

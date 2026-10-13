@@ -1,16 +1,5 @@
 ---
-# Build the PVM-aware Firecracker. Unlike the previous generic-fork-plus-
-# hand-patches approach, firecracker_repo (see defaults/main.yml) ALREADY
-# carries native PVM pagetable support as a first-class feature -- verified
-# by fetching its actual source: src/vmm/src/arch/x86_64/vcpu.rs's own
-# set_tsc_khz() is already a documented no-op ("Disable TSC scaling when
-# using PVM because it is unsupported on most virtualized platforms"), and
-# src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs's CPU-model
-# compatibility check is already commented out natively ("Disable the CPU
-# compatibility check to allow using templates like T2A on more modern
-# CPUs"). The two source patches this role used to re-apply against a
-# generic fork are therefore dead code against THIS fork and have been
-# removed rather than kept as silent no-ops.
+# Build the PVM-aware Firecracker: firecracker_repo already carries native PVM pagetable support, so no source patches are applied.
 
 - name: Install rustup + toolchain (user-space, no root toolchain needed)
   ansible.builtin.shell: |
@@ -30,8 +19,6 @@
     force: false
     update: "{{ pvm_git_update | bool }}"
 
-# A gnu-target build has no matching seccomp JSON, so Firecracker's build.rs
-# falls back to an empty filter automatically (no libseccomp at runtime).
 - name: Build Firecracker + jailer ({{ fc_target }}, release)
   ansible.builtin.command:
     cmd: cargo build --release --target {{ fc_target }} --package firecracker --package jailer

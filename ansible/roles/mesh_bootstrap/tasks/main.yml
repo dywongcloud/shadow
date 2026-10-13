@@ -1,23 +1,6 @@
 ---
-# Two independent mesh-admission mechanisms this fleet supports (see
-# RUNBOOK.md "Adding a node to the mesh"):
-#
-#  1. Join-proof self-admit (default, no action needed here): a new node
-#     dials HIVE_BOOTSTRAP_PEERS and proves itself with
-#     HMAC-SHA256(HIVE_JWT_SECRET, its own iroh NodeId) over a dedicated
-#     join stream. Works as long as HIVE_JWT_SECRET is shared fleet-wide
-#     (handled by hive_platform's systemd unit template) and
-#     HIVE_PEER_TRUST is NOT set to 1 anywhere.
-#
-#  2. Opt-in static allowlist (HIVE_PEER_TRUST=1): every node maintains its
-#     own HIVE_TRUSTED_NODE_IDS list and REJECTS gossip from any iroh
-#     endpoint id not on it, even a genuine join-proof holder. This is the
-#     one this session hit a real bug with: a new node's id, once minted,
-#     must be pushed into every OTHER node's allowlist -- forgetting even
-#     one leaves that node silently rejecting the newcomer's gossip while
-#     the newcomer itself reports a healthy-looking mesh view (a one-
-#     directional gap, not a crash, so it is easy to miss). See
-#     playbooks/node-join.yml for the cross-host update loop this drives.
+# Opt-in static peer-trust allowlist (HIVE_PEER_TRUST=1): every node keeps its own HIVE_TRUSTED_NODE_IDS and rejects gossip from any iroh endpoint id not on it, so a new id must reach EVERY other node (playbooks/node-join.yml drives the loop).
+# The default join-proof self-admit needs nothing here (RUNBOOK.md "Adding a node to the mesh").
 
 - name: >-
     Refuse to deploy an EMPTY allowlist with peer-trust enabled -- this

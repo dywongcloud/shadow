@@ -1,26 +1,6 @@
 ---
-# Build + stage LiteBox (an unprivileged Linux syscall-sandboxing library
-# originally from Microsoft, https://github.com/microsoft/litebox — this
-# role tracks AnEntrypoint/litebox instead, see files/PATCHES.md's "litebox
-# fork tracking" section for why) for hive-cloud's Litebox CellBackend
-# (crates/hive-backend/src/litebox.rs). Targets nodes where neither real
-# Firecracker microVMs nor the PVM software-virt fallback can safely run
-# (see that module's doc comment and AGENTS.md's "PVM kernels" section for
-# why fc-frankfurt specifically is in that state today).
-#
-# litebox ships no release binaries, so it's built from source the same way
-# hive_platform builds hive-cloud itself (rustup already installed
-# fleet-wide by roles/prerequisites) — its own, independent Cargo workspace,
-# built standalone rather than added as a workspace member (it is not on
-# crates.io and its own crate graph has no reason to be pulled into every
-# hive-cloud compile).
-#
-# This role ONLY builds + stages the runner binary (Tier 1: makes the
-# backend's existence check pass). It does NOT enable the backend — that is
-# a SEPARATE, deliberate operator decision (litebox_verified=true) taken
-# only after running `hive-cloud --litebox-probe` on this host and
-# confirming a real functional PASS. See crates/hive-backend/src/litebox.rs's
-# module doc and crates/hive-cloud/src/main.rs's backend-selection chain.
+# Build + stage the LiteBox runner for hive-cloud's Litebox CellBackend (crates/hive-backend/src/litebox.rs) from the pinned AnEntrypoint/litebox commit, built standalone (its own Cargo workspace, no release binaries).
+# It enables nothing: litebox_verified=true is a separate operator decision after a passing --litebox-probe.
 
 - name: Assert networking prerequisites for the per-cell TUN pipeline
   ansible.builtin.command:
@@ -29,18 +9,6 @@
     - "which ip"
     - "test -c /dev/net/tun"
   changed_when: false
-  # Every plain-function cell gets its own TUN device with its own
-  # independently-configured guest IP (see crates/hive-backend/src/
-  # litebox.rs's module doc, "Networking" -- litebox's guest IP/gateway are
-  # hardcoded at compile time upstream; files/networking.patch makes them
-  # configurable per invocation, so no netns/veth isolation layer is needed
-  # -- each cell just gets a distinct real address directly, the same way
-  # FirecrackerBackend::setup_cell_net gives each microVM its own TAP). Both
-  # prerequisites are confirmed present on fc-frankfurt already; asserting
-  # here turns a missing prerequisite into a clear failure on a NEW target
-  # host instead of a confusing runtime error the first time a function
-  # tries to start.
-
 - name: Ensure the litebox source directory's parent exists
   ansible.builtin.file:
     path: "{{ litebox_src_dir | dirname }}"
@@ -52,13 +20,6 @@
     repo: "{{ litebox_repo_url }}"
     dest: "{{ litebox_src_dir }}"
     version: "{{ litebox_commit }}"
-    # The pin is a DANGLING commit upstream (AnEntrypoint/litebox rewrote its
-    # history again on 2026-09-07; c325d5d9 is on no ref). A plain clone never
-    # sees it and this task then fails before the patch/build/install steps
-    # (witnessed 2026-09-09). GitHub still serves the object by full sha, and
-    # this explicit refspec is what makes the module fetch it -- see
-    # files/PATCHES.md ("Pin state") and PRD `litebox-pin-dangling-repin` for
-    # the real fix (a reachable, legitimacy-checked pin).
     refspec: "+{{ litebox_commit }}:refs/remotes/origin/pinned"
     force: true
 
@@ -143,14 +104,6 @@
     chdir: "{{ litebox_src_dir }}"
   environment:
     PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
-  # No `creates:` guard here on purpose: the clone above force-resets tracked
-  # files to pristine on every run and the patch task then re-applies
-  # networking.patch on top -- "the binary already exists at this path" is
-  # NOT the same as "the binary reflects the currently patched source"
-  # (bit us once: a stale pre-patch binary silently got re-staged because
-  # the file existed). `cargo build` is already incremental/idempotent on
-  # its own -- an unchanged source tree rebuilds in well under a second --
-  # so there is no real idempotency cost to just always invoking it.
   async: 1800
   poll: 15
 
@@ -166,12 +119,6 @@
     dest: /usr/local/bin/litebox-runner
     mode: "0755"
     remote_src: true
-  # No restart notify here on purpose: hive-node only reads this binary's
-  # PATH at its own startup, and only when HIVE_LITEBOX_VERIFIED=1 is also
-  # set. Staging the binary must never itself disturb an already-running
-  # node — only actually flipping backend selection (the drop-in tasks
-  # below) may restart it.
-
 - name: Ensure the systemd drop-in directory exists (when verified)
   ansible.builtin.file:
     path: /etc/systemd/system/hive-node.service.d

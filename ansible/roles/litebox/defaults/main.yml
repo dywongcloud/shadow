@@ -1,64 +1,9 @@
 ---
-# Pinned litebox commit. Tracking AnEntrypoint/litebox (an actively
-# developed, MIT-licensed fork, 500+ commits, real weeks-long history —
-# verified via its own commit log, not taken on faith) instead of upstream
-# microsoft/litebox as of this pin: it carries real, extensively-hardened
-# process fork()/wait4()/pty/job-control support (real interactive Linux
-# shells — vim/less/tmux/node-pty all work, correct POSIX signal-isolation
-# semantics on fork, setsid()/TIOCSCTTY, etc) that upstream microsoft/litebox
-# does not have at all, needed for the Sandboxes interactive-terminal
-# feature (crates/hive-cloud/src/sandboxes_platform.rs's open_shell / the
-# guest-side ExecPty protocol in crates/hive-cell-agent). See
-# files/PATCHES.md's "litebox fork tracking" section for the full
-# rationale and what was checked before switching.
-#
-# files/networking.patch (wildcard-bind's one remaining un-fixed site, plus
-# the multi-instance guest-IP/gateway configurability microsoft/litebox's
-# own networking.patch used to add) is re-diffed against THIS fork's tree —
-# two of the three original wildcard-bind sites are already fixed upstream
-# here independently; only the implicit-bind-on-listen() site and the
-# multi-instance addressing still need the patch. Bump deliberately,
-# re-diff against the module doc's security-posture claims in
-# crates/hive-backend/src/litebox.rs, and re-verify with --litebox-probe
-# before rolling.
-#
-# 2026-09-04: upstream AnEntrypoint/litebox's ENTIRE git history was wiped
-# and replaced with one squashed "Initial commit" (repo `created_at` ==
-# commit date == 2026-09-03T14:11:38Z; the previously-pinned
-# 19532929bbe59769ce9653fdde3c69852d85b9b3 no longer exists anywhere on
-# GitHub, confirmed via `gh api repos/.../commits/<sha>` returning 422).
-# Investigated before re-pinning (not taken on faith): the repo's
-# `created_at` timestamp exactly matches the commit, the sole commit author
-# `lanmower` is a genuine long-standing GitHub account (created 2011, real
-# org member of AnEntrypoint, bio references this same platform's own `gm`
-# tooling), and the new checkout's README/file layout/crate structure is
-# unambiguously the same real LiteBox project (not a name-squat). THIS
-# repo's own `networking.patch` applies CLEANLY (`git apply --check` exit 0)
-# against the new tree with zero changes needed, which is strong structural
-# corroboration. The "500+ commits, real weeks-long history" provenance
-# claim above is now STALE (that history no longer exists to check) —
-# re-verify provenance again, not just re-apply this note, if the repo is
-# ever bumped again.
+# Pinned AnEntrypoint/litebox commit (a full sha): this fork carries the fork()/wait4()/pty/job-control support the Sandboxes terminals need, which microsoft/litebox lacks;
+# files/PATCHES.md ("Pin state", "litebox fork tracking") holds the rationale and the legitimacy check a bump needs (re-diff networking.patch, re-verify with --litebox-probe before rolling).
 litebox_repo_url: "https://github.com/AnEntrypoint/litebox"
 litebox_commit: "c325d5d9d446948b2b9030a3589bbee482b58c88"
 litebox_src_dir: "/root/litebox-src"
 
-# Whether this host's HIVE_LITEBOX_VERIFIED=1 systemd drop-in should be
-# applied — i.e. whether hive-cloud's backend-selection chain is allowed to
-# actually pick Litebox on this node (crates/hive-cloud/src/main.rs).
-#
-# Default FALSE: this role only builds + stages the runner binary (Tier 1 —
-# makes LiteboxBackend::is_supported() pass). It does NOT enable the backend
-# by itself.
-#
-# Flip to true ONLY after running `hive-cloud --litebox-probe` on THIS
-# specific host and getting a real PASS on BOTH of its checks (the syscall
-# rewriter, and the full per-cell-TUN + patched-litebox + bind-shim network
-# round trip added 2026-08-08 -- see crates/hive-backend/src/litebox.rs's
-# module doc, "Networking" section, for exactly what that proves and what it
-# still doesn't: Python is not covered by the bind-rewrite shim yet, and
-# sustained concurrency under real production load has not been separately
-# load tested). Mirrors the PVM canary program's manual-gate discipline
-# (AGENTS.md "PVM kernels": "KVM_CREATE_VM succeeding does NOT mean microVMs
-# work").
+# true applies this host's HIVE_LITEBOX_VERIFIED=1 drop-in so hive-cloud may select Litebox: set it only after `hive-cloud --litebox-probe` PASSES on this host (default false: the role only builds and stages the runner).
 litebox_verified: false

@@ -1,17 +1,6 @@
 ---
-# Sole owner of the PVM patch-series checkout. Both kernel trees (30-host-kernel,
-# 40-guest-kernel) apply the SAME series from {{ pvm_patch_dir }} and must apply
-# the SAME revision of it -- a host `kvm_pvm` and a guest `vmlinux` built from
-# different source revisions is the documented instant triple-fault (see this
-# role's README). Keeping the checkout in one file rather than duplicating it per
-# tree makes "which series" un-drift-able by construction, and lets either
-# `--tags host_kernel` or `--tags guest_kernel` run standalone against a verified
-# tree instead of whatever the other stage happened to leave behind.
+# Sole owner of the PVM patch-series checkout: the host and guest kernel trees must apply the SAME revision of the SAME series (a host kvm_pvm and a guest vmlinux built from different revisions triple-fault instantly, see this role's README).
 
-# `version` is an immutable full sha (see defaults/main.yml), so `force: true` is
-# safe and load-bearing: it discards any local scribble that would otherwise make
-# the checkout refuse to move onto the pin. The destination content is fully
-# determined by the sha, so there is nothing here worth preserving.
 - name: Check out the PVM patch series at the pinned sha
   ansible.builtin.git:
     repo: "{{ pvm_patch_repo }}"
@@ -22,13 +11,6 @@
     force: true
     update: "{{ pvm_patch_git_update | bool }}"
 
-# Prove the checkout is the pinned sha rather than trusting the module.
-# `pvm_patch_branch` used to be the MUTABLE `main` and `update:` came from
-# `pvm_git_update` (default false), so the checkout froze at whatever `main`
-# resolved to on the FIRST clone -- live-verified still sitting at 14901fef2 on
-# fr, sj2 and sp, i.e. three hosts building an OLD series while the role reported
-# success. An unverified checkout is exactly how that stayed invisible for so
-# long, so the sha is now asserted, not assumed.
 - name: Read the patch series' checked-out sha
   ansible.builtin.command: git rev-parse HEAD
   args:
@@ -48,9 +30,6 @@
       reachability from this host), or remove {{ pvm_patch_dir }} to force a
       fresh clone.
 
-# The patch files themselves, not just the commit. A series that resolves to the
-# right sha but an empty patches/ dir would otherwise "succeed" at patching
-# nothing -- the same class of silent no-op as the CPU-flag gate.
 - name: Enumerate the patch files in the series
   ansible.builtin.find:
     paths: "{{ pvm_patch_dir }}/patches"
@@ -74,16 +53,6 @@
       so applying it would be a silent no-op. Check the pinned sha
       {{ pvm_patch_branch }}.
 
-# The base<->series contract. `pvm_patch_files` (applies to this base) plus
-# `pvm_patch_files_excluded` (deliberately does not -- see defaults/main.yml for
-# the measured reason each is where it is) must together account for EVERY patch
-# file in the series, exactly.
-#
-# This is the guard that makes a future series bump loud. Globbing `*.patch` and
-# applying whatever appears is how a patch aimed at a different base gets applied
-# to this one, and how a newly-added patch gets silently skipped; both were live
-# failure modes here. A new or removed upstream patch now STOPS the play with the
-# specific filename, so it gets reviewed against the base rather than guessed at.
 - name: Assert the declared patch set exactly matches the series on disk
   ansible.builtin.assert:
     that: _patch_names_found == _patch_names_declared
