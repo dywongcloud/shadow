@@ -123,9 +123,7 @@ function decodeSerialized(v) {
     ) {
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     }
-  } catch {
-    /* not base64 — fall through */
-  }
+  } catch {}
   return v;
 }
 
@@ -576,9 +574,7 @@ function buildWorld() {
           const full = d.id && String(d.id).includes("//") ? d.id : d.name;
           addEntry(full || d.id || d.name, d.graph);
         }
-      } catch {
-        /* defs unavailable — fall through to run-derived entries */
-      }
+      } catch {}
       if (Object.keys(workflows).length === 0) {
         try {
           const rows = await hive(
@@ -589,9 +585,7 @@ function buildWorld() {
               addEntry(r.workflowName || r.name, null);
             }
           }
-        } catch {
-          /* leave empty — console renders its empty state */
-        }
+        } catch {}
       }
       return { version: "1.0.0", workflows, steps: {} };
     },

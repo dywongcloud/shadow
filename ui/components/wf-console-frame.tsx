@@ -20,9 +20,7 @@ function syncConsoleTheme(frame: HTMLIFrameElement | null, resolved: string | un
   const theme = resolved === "light" ? "light" : "dark";
   try {
     localStorage.setItem(WF_THEME_KEY, theme);
-  } catch {
-    /* storage unavailable — the direct reconcile below still applies */
-  }
+  } catch {}
   const doc = frame?.contentDocument;
   if (doc?.documentElement) {
     const root = doc.documentElement;
@@ -140,9 +138,7 @@ export function WfConsoleFrame({
       if (inner && inner !== expected && inner.startsWith("/wfc")) {
         win.location.replace(expected);
       }
-    } catch {
-      /* frame not ready yet — initial src already carries the right path */
-    }
+    } catch {}
   }, [pathname, syncUrl]);
 
   return (

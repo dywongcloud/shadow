@@ -73,9 +73,7 @@ export default function RunNodePage() {
     queueMicrotask(() => {
       try {
         localStorage.removeItem(TARGET_KEY);
-      } catch {
-        /* ignore */
-      }
+      } catch {}
       setClearedError(revalidationFailure);
       setSelection("auto");
     });
@@ -92,9 +90,7 @@ export default function RunNodePage() {
           scope: nextScope,
         }),
       );
-    } catch {
-      /* storage unavailable — the selection just won't survive a reload */
-    }
+    } catch {}
   }
 
   function choose(sel: PickerSelection) {
@@ -121,15 +117,11 @@ export default function RunNodePage() {
           if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
         }
       }
-    } catch {
-      /* ignore malformed persisted selection */
-    }
+    } catch {}
     try {
       const savedGeo = localStorage.getItem(GEO_CONSENT_KEY);
       if (savedGeo === "granted" || savedGeo === "denied") setGeoDecision(savedGeo);
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }, []);
   const [geoError, setGeoError] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);

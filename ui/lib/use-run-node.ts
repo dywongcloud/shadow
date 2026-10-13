@@ -37,9 +37,7 @@ function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[
     if (requestId !== undefined && agent.requestId !== requestId) return;
     try {
       agent.stop();
-    } catch {
-      /* already stopped */
-    }
+    } catch {}
     agent = null;
   };
 
@@ -129,9 +127,7 @@ function createNodeWorkerBroker(post: (message: unknown, transfer?: Transferable
     if (requestId !== undefined && agent.requestId !== requestId) return;
     try {
       agent.stop();
-    } catch {
-      /* already stopped */
-    }
+    } catch {}
     agent = null;
   };
 
@@ -166,9 +162,7 @@ function persistLastStart(args: StartArgs) {
         serveMode: args.serveMode ?? "auto",
       }),
     );
-  } catch {
-    /* storage unavailable/full — replay-on-handoff just won't happen */
-  }
+  } catch {}
 }
 function readLastStart(): StartArgs | null {
   try {
@@ -184,9 +178,7 @@ function readLastStart(): StartArgs | null {
 function clearLastStart() {
   try {
     localStorage.removeItem(LAST_START_KEY);
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 }
 
 export interface StartArgs {
@@ -342,8 +334,7 @@ export function useRunNode() {
               w.onmessage = (ev) => chan.port1.postMessage(ev.data);
               dbBridge = { worker: w, requestId: msg.requestId };
               p.postMessage({ type: "dbWorkerPort", requestId: msg.requestId }, [chan.port2]);
-            } catch {
-            }
+            } catch {}
           } else if (msg && msg.type === "dbWorkerDone") {
             endDbBridge(msg.requestId);
           }
@@ -373,9 +364,7 @@ export function useRunNode() {
         reconnecting = true;
         try {
           port.close();
-        } catch {
-          /* already gone */
-        }
+        } catch {}
         lastHeartbeatRef.current = Date.now();
         connect();
         reconnecting = false;
@@ -507,9 +496,7 @@ export function useRunNode() {
         const dead = dedicatedWorker;
         try {
           dead.terminate();
-        } catch {
-          /* already gone */
-        }
+        } catch {}
         lastHeartbeatRef.current = Date.now();
         spawnOwnerWorker(true);
       };
@@ -550,9 +537,7 @@ export function useRunNode() {
           const worker = dedicatedWorker;
           try {
             worker.postMessage({ type: "visibility", visible: false, unloading: true });
-          } catch {
-            /* already gone */
-          }
+          } catch {}
           setTimeout(() => worker.terminate(), 500);
         }
         releaseLock?.();

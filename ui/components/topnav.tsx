@@ -374,9 +374,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     } catch {
       try {
         await setActive?.({ organization: orgId });
-      } catch {
-        /* best-effort — the cookie already drives the view */
-      }
+      } catch {}
     }
   }
 
