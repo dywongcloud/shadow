@@ -11,7 +11,7 @@ STATE="${HIVE_BROWSER_NODE_WATCHDOG_STATE:-/run/hive-browser-node-watchdog.count
 UNIT="${HIVE_BROWSER_NODE_UNIT:-hive-browser-node.service}"
 PROBE_TIMEOUT_SECS=5
 
-code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT_SECS" "${ORIGIN}/healthz" 2>/dev/null || echo 000)"
+code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT_SECS" "${ORIGIN}/healthz" 2>/dev/null)" || code=000
 
 bad_probes=0
 if [[ -r "$STATE" ]]; then bad_probes="$(cat "$STATE" 2>/dev/null || echo 0)"; fi
