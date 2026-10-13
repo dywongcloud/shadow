@@ -1,23 +1,19 @@
-//! shadw drive v1 — `/v1/drive/*` REST surface (bn-shadw-drive-v1).
+//! shadw drive v1: the `/v1/drive/*` REST surface.
 //!
-//! Metadata (`drive_nodes`/`drive_shares`/`drive_tokens`) lives in the
-//! guardian-db relational mirror (`relational.rs`) — replicated to every
-//! node, so `list`/`mkdir`/`move`/`delete`/`share` all read/write their own
-//! local replica with no proxying: mutations reach here only after
-//! `admin_ingress` has already forwarded them to the control-plane leader
-//! (the same single-writer discipline `project_teams`/`billing_accounts`
-//! already rely on — see relational.rs's module doc), and reads converge
-//! within seconds via guardian-db's own CRDT replication.
+//! Metadata (`drive_nodes`/`drive_shares`/`drive_tokens`) lives in the guardian-db relational
+//! mirror (`relational.rs`), replicated to every node, so `list`/`mkdir`/`move`/`delete`/`share`
+//! all read and write their own local replica with no proxying: mutations reach here only after
+//! `admin_ingress` forwarded them to the control-plane leader (the single-writer discipline
+//! `project_teams`/`billing_accounts` rely on, see `relational.rs`'s module doc), and reads
+//! converge within seconds through guardian-db's own CRDT replication.
 //!
-//! File BYTES are the one thing that is NOT replicated (`drive_blobs.rs`,
-//! node-local content-addressed store) — `owner_node` on the `drive_nodes`
-//! row names the node that received the `PUT` (in practice: whichever node
-//! `admin_ingress` forwarded it to, since PUT is a mutation). A `GET` landing
-//! on a different node (round-robin ingress) proxies to `owner_node` over the
-//! SAME owner-routed, proxy-on-miss shape `browser_artifacts.rs` uses for its
-//! content-addressed bytes: HTTP admin first, the iroh gossip transport as
-//! the NAT'd-peer fallback (see `gossip.rs`'s `/v1/drive/mesh-file/` and
-//! `/v1/drive/mesh-share/` arms).
+//! File BYTES are the one thing NOT replicated (`drive_blobs.rs`, a node-local content-addressed
+//! store): `owner_node` on the `drive_nodes` row names the node that received the `PUT` (in
+//! practice whichever node `admin_ingress` forwarded it to, since PUT is a mutation). A `GET`
+//! landing on a different node (round-robin ingress) proxies to `owner_node` in the same
+//! owner-routed, proxy-on-miss shape `browser_artifacts.rs` uses for its content-addressed bytes:
+//! HTTP admin first, the iroh gossip transport as the NAT'd-peer fallback (the
+//! `/v1/drive/mesh-file/` and `/v1/drive/mesh-share/` arms in `gossip.rs`).
 
 use axum::{
     body::Bytes,
@@ -56,9 +52,9 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) 
     (status, Json(json!({ "error": msg.into() })))
 }
 
-/// Tenant's tier — the same team-row-else-billing-account fallback every
-/// other quota-checking API module (`sandboxes_api::plan_of`) already
-/// duplicates locally rather than sharing a private helper across modules.
+/// The tenant's tier: the team row, else the billing account, the fallback every quota-checking API
+/// module (`sandboxes_api::plan_of`) duplicates locally rather than sharing a private helper across
+/// modules.
 pub(crate) fn plan_of(c: &Arc<CloudState>, team: &str) -> String {
     c.teams
         .get(team)
@@ -113,10 +109,9 @@ pub(crate) async fn resolve_full(project: &str, path: &str) -> Option<DriveNode>
     node
 }
 
-/// Split `path` into (existing parent dir id, last segment) — the shape both
-/// `mkdir` (create the last segment) and `PUT file` (write the last segment)
-/// need. The parent chain must already exist; this never creates
-/// intermediate directories.
+/// Splits `path` into (existing parent dir id, last segment), the shape both `mkdir` (create the
+/// last segment) and `PUT file` (write the last segment) need. The parent chain must already exist;
+/// this never creates intermediate directories.
 pub(crate) async fn resolve_parent(
     project: &str,
     path: &str,
@@ -259,9 +254,8 @@ async fn put_file(
     Ok(Json(node_json(&node)))
 }
 
-/// Exact-size + BLAKE3-hex check every served body must pass, local or
-/// proxied — the `browser_artifacts::verify_bytes` discipline applied to
-/// drive bytes.
+/// Exact-size and BLAKE3-hex check every served body must pass, local or proxied: the
+/// `browser_artifacts::verify_bytes` discipline applied to drive bytes.
 fn verify_bytes(node: &DriveNode, bytes: &[u8]) -> bool {
     bytes.len() as u64 == node.size_bytes as u64
         && crate::drive_blobs::matches(bytes, &node.content_hash)
@@ -284,10 +278,9 @@ fn file_response(node: &DriveNode, bytes: Vec<u8>) -> Response {
     resp
 }
 
-/// Nodes that may hold the bytes: the recorded owner, then (best-effort) the
-/// current control-plane leader — the `browser_artifacts::owner_candidates`
-/// precedent, in case `owner_node` itself is unreachable but the leader
-/// re-received a retried PUT and holds a newer copy.
+/// Nodes that may hold the bytes: the recorded owner, then (best-effort) the current control-plane
+/// leader (the `browser_artifacts::owner_candidates` precedent), in case `owner_node` itself is
+/// unreachable but the leader re-received a retried PUT and holds a newer copy.
 fn owner_candidates(cloud: &Arc<CloudState>, owner_node: &str) -> Vec<String> {
     let mut out = Vec::new();
     if !owner_node.is_empty() && owner_node != cloud.node_name {
@@ -338,10 +331,10 @@ struct LocalPathQ {
     local: Option<bool>,
 }
 
-/// Resolve `path` to its (live) file node and its verified bytes — local
-/// disk first, then every owner candidate over the proxy transport. Shared by
-/// the REST `GET .../file` handler and `drive_webdav.rs`'s read-mode `open`,
-/// so both surfaces get the exact same owner-routed, proxy-on-miss behavior.
+/// Resolves `path` to its live file node and its verified bytes: local disk first, then every owner
+/// candidate over the proxy transport. Shared by the REST `GET .../file` handler and
+/// `drive_webdav.rs`'s read-mode `open`, so both surfaces get the same owner-routed, proxy-on-miss
+/// behavior.
 pub(crate) async fn resolve_and_fetch_bytes(
     c: &Arc<CloudState>,
     project: &str,
@@ -542,10 +535,10 @@ struct ShareLocalQ {
     local: Option<bool>,
 }
 
-/// Resolve+serve a share token — file bytes only (design §2: "unauthenticated
-/// read via the share token only"). A `write`-scope grant is recorded (the
-/// data model is share-scope-complete for a future write-consuming endpoint)
-/// but this route always only reads; there is no anonymous write path in v1.
+/// Resolves and serves a share token: file bytes only (an unauthenticated read through the share
+/// token alone). A `write`-scope grant is recorded (the data model is share-scope-complete for a
+/// future write-consuming endpoint) but this route only ever reads; there is no anonymous write
+/// path in v1.
 async fn share_get(
     State(c): State<Arc<CloudState>>,
     Path(token): Path<String>,
@@ -581,9 +574,9 @@ async fn share_get(
     ))
 }
 
-/// `token` -> (live target node, its grant), independently re-derivable by
-/// every node from the SAME replicated `drive_shares`/`drive_nodes` rows —
-/// what makes anonymous cross-node proxying safe with no caller-trusted state.
+/// `token` -> (live target node, its grant), independently re-derivable by every node from the SAME
+/// replicated `drive_shares`/`drive_nodes` rows: what makes anonymous cross-node proxying safe with
+/// no caller-trusted state.
 async fn resolve_share(token: &str) -> Option<(DriveNode, relational::DriveShare)> {
     let grant = relational::drive_share_resolve(&sha256_hex(token)).await?;
     if grant.expires_at < hive_core::now_ms() as i64 {
@@ -631,9 +624,13 @@ pub async fn mesh_share_get(token: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Mint (or rotate) this project's one WebDAV Basic-auth credential — shown
-/// once, stored only as a SHA-256 hash (`apikeys.rs`'s own convention),
-/// checked by `drive_webdav.rs` on every mount request.
+/// Mints (or rotates) this project's one WebDAV Basic-auth credential: shown once, stored only as a
+/// SHA-256 hash (`apikeys.rs`'s convention), checked by `drive_webdav.rs` on every mount request.
+/// The response carries the real, directly reachable API host as `webdav_url`: a WebDAV client
+/// (Finder, Explorer, rclone, davfs2) is a native network client, not a browser page, so it has no
+/// CORS restriction and no reason to route through the dashboard's same-origin `/cloud` proxy,
+/// which exists only to avoid CORS for the dashboard's own fetches and does not reliably pass
+/// WebDAV's non-standard methods (PROPFIND, MKCOL).
 async fn webdav_token_mint(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -648,14 +645,6 @@ async fn webdav_token_mint(
         "project": project,
         "username": project,
         "password": token,
-        // A real WebDAV client (Finder/Explorer/rclone/davfs2) is a native OS
-        // network client, not a browser page -- it has no CORS restriction
-        // and no reason to route through the dashboard's same-origin `/cloud`
-        // proxy (which exists ONLY to avoid CORS for the dashboard's own
-        // browser-side fetches, and does not reliably pass through WebDAV's
-        // non-standard methods like PROPFIND/MKCOL). Hand back the real,
-        // directly-reachable API host so a client mounts against it, not a
-        // relative path the frontend would have to guess how to qualify.
         "webdav_url": format!("{}/v1/drive/webdav/{project}", c.api_base()),
     })))
 }

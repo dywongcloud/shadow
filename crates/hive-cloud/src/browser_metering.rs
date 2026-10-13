@@ -1,26 +1,22 @@
-//! Per-tenant browser relay BYTE metering (bn-impl-relay-byte-metering).
+//! Per-tenant browser relay BYTE metering.
 //!
-//! Distinct from the per-REQUEST metering in billing.rs
-//! (`browser_requests`): this module counts the FRAMED bytes a browser
-//! endpoint moves through a fleet node — the input for any future
-//! fairness/quota/pricing decision, since a browser serving through the relay
-//! costs the fleet roughly 3x the bytes of node-serving (the relay pays both
-//! legs). METERING ONLY: these counters feed no rate card and no bill.
+//! Distinct from the per-REQUEST metering in `billing.rs` (`browser_requests`): this module counts
+//! the FRAMED bytes a browser endpoint moves through a fleet node, the input for any future
+//! fairness, quota or pricing decision, since a browser serving through the relay costs the fleet
+//! roughly 3x the bytes of node-serving (the relay pays both legs). METERING ONLY: these counters
+//! feed no rate card and no bill.
 //!
-//! Byte counting happens inside hive-p2p at the two browser boundaries
-//! (inbound `serve_browser_conn`, outbound `BrowserPool::request_op`) and is
-//! reported per ENDPOINT ID through `hive_p2p::set_browser_meter`. The
-//! endpoint→tenant join happens HERE, at record time, against this node's own
-//! admission store (`live_for_endpoint` — the same re-check the CRR exchange
-//! uses): an endpoint whose admission expired or was revoked mid-connection
-//! lands in the `_unattributed` bucket rather than being silently dropped or
-//! misattributed.
+//! Byte counting happens inside hive-p2p at the two browser boundaries (inbound
+//! `serve_browser_conn`, outbound `BrowserPool::request_op`) and is reported per ENDPOINT ID
+//! through `hive_p2p::set_browser_meter`. The endpoint-to-tenant join happens HERE, at record time,
+//! against this node's own admission store (`live_for_endpoint`, the same re-check the CRR exchange
+//! uses): an endpoint whose admission expired or was revoked mid-connection lands in the
+//! `_unattributed` bucket instead of being silently dropped or misattributed.
 //!
-//! Counters are NODE-LOCAL (a sidecar under `persist::data_dir()`, the
-//! `dns_geo.json` precedent — never `PlatformSnapshot`, never replicated) and
-//! the read fans out like `admin::fleet_function_stats`: the operator view
-//! merges this node's counters with every healthy peer's
-//! `/v1/browser/metering?local=true` over `admin::fetch_from_host`.
+//! Counters are NODE-LOCAL (a sidecar under `persist::data_dir()`, the `dns_geo.json` precedent:
+//! never `PlatformSnapshot`, never replicated) and the read fans out like
+//! `admin::fleet_function_stats`: the operator view merges this node's counters with every healthy
+//! peer's `/v1/browser/metering?local=true` over `admin::fetch_from_host`.
 
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -42,14 +38,14 @@ const FORMAT_VERSION: u32 = 1;
 /// Refuse to read a file larger than this — a corrupt sidecar must never
 /// become an OOM at boot. Bounded tenants × ~100 bytes is nowhere near this.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-/// Tenant bucket for bytes whose endpoint had no live admission at record
-/// time (expired/revoked mid-connection, or a witness harness with no
-/// admission store entry). Never silently dropped, never guessed.
+/// Tenant bucket for bytes whose endpoint had no live admission at record time (expired or revoked
+/// mid-connection, or a witness harness with no admission store entry): never silently dropped,
+/// never guessed.
 const UNATTRIBUTED: &str = "_unattributed";
 
-/// Debounce interval for the background saver. `HIVE_BROWSER_METER_SAVE_MS=0`
-/// turns persistence off entirely (no load, no save). Default 10s bounds an
-/// unclean-kill loss to a few seconds of counters — metering, not a ledger.
+/// Debounce interval of the background saver. `HIVE_BROWSER_METER_SAVE_MS=0` turns persistence off
+/// entirely (no load, no save); the 10 s default bounds an unclean-kill loss to a few seconds of
+/// counters (metering, not a ledger).
 fn save_interval() -> Option<std::time::Duration> {
     let ms = std::env::var("HIVE_BROWSER_METER_SAVE_MS")
         .ok()
@@ -58,9 +54,9 @@ fn save_interval() -> Option<std::time::Duration> {
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
-/// One tenant's framed byte totals on THIS node. `reports` counts meter
-/// callbacks (one per completed read/write stage — a full request+reply
-/// exchange reports twice), a sanity signal for exactness witnesses.
+/// One tenant's framed byte totals on THIS node. `reports` counts meter callbacks (one per
+/// completed read or write stage: a full request+reply exchange reports twice), a sanity signal for
+/// exactness witnesses.
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 struct TenantMeter {
     #[serde(rename = "in")]
@@ -81,9 +77,9 @@ struct MeterState {
     dirty: bool,
 }
 
-/// The process-wide meter. A module-static (never a CloudState field) keeps
-/// this feature's whole footprint inside this file; hive-p2p's meter callback
-/// is itself process-global, so the pairing is exact.
+/// The process-wide meter. A module static (never a `CloudState` field) keeps this feature's whole
+/// footprint in this file, and hive-p2p's meter callback is itself process-global, so the pairing
+/// is exact.
 static METER: std::sync::OnceLock<BrowserMeter> = std::sync::OnceLock::new();
 
 pub struct BrowserMeter {
@@ -119,9 +115,9 @@ impl BrowserMeter {
         self.inner.lock().tenants.clone()
     }
 
-    /// Spawn the debounced background saver once per process. Every failure
-    /// mode of the write path degrades to a WARN — metering must never take
-    /// the node down, and an unsaved tick is folded into the next one.
+    /// Spawns the debounced background saver once per process. Every failure of the write path
+    /// degrades to a WARN: metering must never take the node down, and an unsaved tick is folded
+    /// into the next one.
     fn spawn_saver(&'static self) {
         let Some(interval) = save_interval() else {
             return;
@@ -145,11 +141,10 @@ impl BrowserMeter {
     }
 }
 
-/// Build the hive-p2p meter callback. Registered once at boot next to the
-/// admission handler. The endpoint→tenant join runs against this node's own
-/// admission store at RECORD time, so a revoked/expired admission can never
-/// take its already-moved bytes with it into the void — they land in
-/// `_unattributed` instead.
+/// Builds the hive-p2p meter callback, registered once at boot next to the admission handler. The
+/// endpoint-to-tenant join runs against this node's own admission store at RECORD time, so a
+/// revoked or expired admission can never take its already-moved bytes with it: they land in
+/// `_unattributed`.
 pub fn meter_handler(cloud: &Arc<CloudState>) -> hive_p2p::BrowserMeterHandler {
     let meter: &'static BrowserMeter = METER.get_or_init(BrowserMeter::load);
     meter.spawn_saver();
@@ -178,10 +173,9 @@ fn local_view(cloud: &Arc<CloudState>) -> Value {
     })
 }
 
-/// Mesh (gossip::dispatch) read path for the local slice — the iroh-only-peer
-/// counterpart of `GET /v1/browser/metering?local=true` with a service
-/// delegation. Operator gating already happened on the outer request the
-/// caller is fanning out from, exactly like the `/v1/functions` arm.
+/// Mesh (`gossip::dispatch`) read path for the local slice: the iroh-only-peer counterpart of `GET
+/// /v1/browser/metering?local=true` with a service delegation. Operator gating already happened on
+/// the outer request the caller fans out from, as in the `/v1/functions` arm.
 pub fn mesh_local(cloud: &Arc<CloudState>) -> Vec<u8> {
     serde_json::to_vec(&local_view(cloud)).unwrap_or_default()
 }
@@ -217,15 +211,18 @@ pub fn routes() -> Router<Arc<CloudState>> {
     Router::new().route("/v1/browser/metering", get(browser_metering))
 }
 
+/// `GET /v1/browser/metering`: operator-only, the fleet view by default and `?local=true` for one
+/// node's slice. A verified claim with role `service` asking for its own local slice is the
+/// internal aggregation path (the `/v1/functions?local=true` precedent) and is answered WITHOUT the
+/// operator check, because the calling node already enforced operator on the outer request. The
+/// fleet view merges this node's counters with every healthy peer's local slice (the
+/// `fleet_function_stats` fan-out shape): an unreachable or pre-upgrade peer is silently absent,
+/// never failing the whole read, and `peers_answered` counts the ones that answered.
 async fn browser_metering(
     State(cloud): State<Arc<CloudState>>,
     claims: Claims,
     axum::extract::Query(query): axum::extract::Query<MeteringQuery>,
 ) -> ApiResult {
-    // A verified `service` delegation asking for its own local slice is the
-    // internal aggregation path (the `/v1/functions?local=true` precedent) —
-    // it answers WITHOUT the operator check because the calling node already
-    // enforced operator on the outer request.
     let internal = claims
         .as_ref()
         .map(|extension| extension.0.role == "service")
@@ -240,10 +237,6 @@ async fn browser_metering(
         return Ok(Json(view));
     }
 
-    // Fleet view: this node's counters merged with every healthy peer's
-    // local slice — the `fleet_function_stats` fanout shape. Unreachable or
-    // pre-upgrade peers are silently absent (never fail the whole read over
-    // one bad node), and are counted honestly in `peers_answered`.
     let mut nodes = vec![local_view(&cloud)];
     let peers: Vec<String> = cloud
         .registry
@@ -302,11 +295,6 @@ async fn browser_metering(
     })))
 }
 
-// ---------------------------------------------------------------------------
-// On-disk form (`$HIVE_DATA/browser_metering.json`). Atomic temp-file +
-// fsync + rename, the durability shape every other sidecar uses.
-// ---------------------------------------------------------------------------
-
 #[derive(Default, Serialize, Deserialize)]
 struct DiskFile {
     #[serde(default)]
@@ -321,6 +309,8 @@ fn meter_path() -> std::path::PathBuf {
     crate::persist::data_dir().join(METER_FILE)
 }
 
+/// Writes the counters atomically (temp file, fsync, rename), the durability shape every node-local
+/// sidecar uses, to `$HIVE_DATA/browser_metering.json`.
 fn write_rows(tenants: BTreeMap<String, TenantMeter>) -> std::io::Result<()> {
     let dir = crate::persist::data_dir();
     std::fs::create_dir_all(&dir)?;
@@ -344,16 +334,15 @@ fn write_rows(tenants: BTreeMap<String, TenantMeter>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Load persisted counters. EVERY failure mode — missing, unreadable,
-/// oversized, malformed, wrong version — degrades to empty counters and at
-/// most a WARN: a corrupt scratch file must never become a boot failure.
+/// Loads persisted counters. EVERY failure mode (missing, unreadable, oversized, malformed, wrong
+/// version) degrades to empty counters and at most a WARN: a corrupt scratch file must never become
+/// a boot failure. A missing file is the normal first-boot case and logs nothing.
 fn load_from_disk() -> BTreeMap<String, TenantMeter> {
     let empty = BTreeMap::new();
     if save_interval().is_none() {
         return empty;
     }
     let path = meter_path();
-    // Absent is the normal first-boot case, not an error worth logging.
     let Ok(meta) = std::fs::metadata(&path) else {
         return empty;
     };

@@ -1,25 +1,18 @@
 //! Supervision for long-lived background loops.
 //!
-//! A panic inside a `tokio::spawn`ed loop kills THAT task silently and forever
-//! while `/healthz` stays green — the node keeps serving requests with a dead
-//! subsystem, and the only symptom is log lines that stop appearing (which is
-//! also what "nothing to report" looks like, so nobody notices). This is not
-//! hypothetical: guardian's init panic ran that way for weeks, and
-//! `spawn_world_reconcile`'s total log silence was indistinguishable from
-//! "queue is clean" until the queue was inspected by hand.
+//! A panic inside a `tokio::spawn`ed loop kills THAT task silently and forever while `/healthz`
+//! stays green: the node keeps serving with a dead subsystem, and the only symptom is log lines
+//! that stop appearing (which is also what "nothing to report" looks like, so nobody notices).
 //!
 //! [`spawn_supervised`] gives a loop two properties:
-//!  * **It restarts.** A panic (or an unexpected return — these loops are
-//!    `loop {}`s and must never return) is logged loudly and the body is
-//!    re-spawned after a backoff that doubles up to a cap, so a deterministic
-//!    crash can't spin hot.
-//!  * **It is visible.** Every supervised loop registers in a node-local table
-//!    with its restart count and a heartbeat the body bumps each iteration via
-//!    [`beat`]. [`snapshot`] serves that table (see `admin::tasks_health`), so
-//!    "is the reconciler actually running?" is one GET instead of a journal
-//!    archaeology session. This is deliberately node-local state behind a GET —
-//!    each node reports its OWN loops; asking node X about node Y's tasks is
-//!    meaningless, so the round-robin read split does not apply.
+//! * **It restarts.** A panic (or an unexpected return: these loops are `loop {}`s and must never
+//! return) is logged loudly and the body is re-spawned after a backoff that doubles up to a cap, so
+//! a deterministic crash cannot spin hot.
+//! * **It is visible.** Every supervised loop registers in a node-local table with its restart
+//! count and a heartbeat the body bumps each iteration via [`beat`]. [`snapshot`] serves that table
+//! (`admin::tasks_health`, `GET /v1/tasks/health`), so "is the reconciler actually running?" is one
+//! GET. This is deliberately node-local state behind a GET: each node reports its OWN loops (asking
+//! node X about node Y's tasks is meaningless), so the round-robin read split does not apply.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +33,8 @@ pub struct TaskHealth {
 
 struct Entry {
     restarts: AtomicU64,
-    last_beat_ms: AtomicU64, // 0 = never
+    /// Epoch ms of the last [`beat`]; 0 = never.
+    last_beat_ms: AtomicU64,
 }
 
 fn registry() -> &'static parking_lot::Mutex<std::collections::BTreeMap<&'static str, Arc<Entry>>> {
@@ -63,9 +57,8 @@ fn entry(name: &'static str) -> Arc<Entry> {
         .clone()
 }
 
-/// Mark the named loop alive. Call once per iteration, at the TOP of the loop
-/// body — a beat after the work would stall for the whole duration of a slow
-/// pass and read as dead.
+/// Marks the named loop alive. Call it once per iteration, at the TOP of the loop body: a beat
+/// after the work would stall for the whole duration of a slow pass and read as dead.
 pub fn beat(name: &'static str) {
     entry(name)
         .last_beat_ms
@@ -89,29 +82,24 @@ pub fn snapshot() -> Vec<TaskHealth> {
         .collect()
 }
 
-/// This process's own memory pressure — the direct signal behind the
-/// fc-sanjose-2 incident, which no health check surfaced because the wedge
-/// was PARTIAL: :443 (customer traffic, what DNS/mesh health already covers
-/// via the peer-observed gossip probe in `spawn_health_loop` — a real
-/// `GOSSIP_GET` dispatch, not a bare connect) kept serving fine while the
-/// process quietly climbed toward its cgroup memory ceiling. Systemd
-/// `is-active` and the admin `/healthz` 200 both stayed green throughout — a
-/// process that answers can still be minutes from an OOM kill. Reading this
-/// number directly (rather than inferring RSS from behavior after the fact,
-/// the way the incident was actually diagnosed) is what would let an operator
-/// or a future alarm catch the NEXT one climbing, before it reaches the cap.
+/// This process's own memory pressure, the direct signal for a PARTIAL wedge: the customer-facing
+/// port keeps serving (what DNS/mesh health already covers, through the peer-observed gossip probe
+/// in `spawn_health_loop`, a real `GOSSIP_GET` dispatch rather than a bare connect) while the
+/// process quietly climbs toward its cgroup memory ceiling, and systemd `is-active` and the admin
+/// `/healthz` stay green throughout, since a process that answers can still be minutes from an OOM
+/// kill. Reading the number directly, rather than inferring RSS from behavior after the fact, lets
+/// an operator or an alarm catch the NEXT climb before it reaches the cap.
 #[derive(Serialize)]
 pub struct MemoryPressure {
-    /// This process's resident set (MB), from `/proc/self/status` on Linux.
-    /// `None` off-Linux (macOS dev nodes) — no portable equivalent worth the
-    /// complexity for a fleet that is Linux in production.
+    /// This process's resident set (MB), from `/proc/self/status` on Linux; `None` off Linux (macOS
+    /// dev nodes), where no portable equivalent is worth the complexity for a fleet that is Linux
+    /// in production.
     pub rss_mb: Option<u64>,
     /// The cgroup v2 memory ceiling (MB) this process is confined to, from
-    /// `/sys/fs/cgroup/memory.max` — the number that actually matters (the
-    /// host's total RAM is not the constraint; the systemd `MemoryMax=` unit
-    /// setting is). `None` when unreadable (no cgroup, cgroup v1, or the unit
-    /// has no limit set — `max` is left unparsed rather than reported as an
-    /// artificial number).
+    /// `/sys/fs/cgroup/memory.max`: the number that matters (the host's total RAM is not the
+    /// constraint, the systemd `MemoryMax=` setting is). `None` when unreadable (no cgroup, cgroup
+    /// v1, or a unit with no limit: `max` is left unparsed rather than reported as an artificial
+    /// number).
     pub cgroup_limit_mb: Option<u64>,
     /// rss_mb / cgroup_limit_mb, when both are known — the number worth
     /// alerting on directly rather than computing at every call site.
@@ -143,13 +131,13 @@ pub fn memory_pressure() -> MemoryPressure {
     }
 }
 
-/// Spawn `make()`'s future and keep it alive: on panic OR return, log, back
-/// off (5s doubling to 5min — a deterministic crash must not spin hot), and
-/// re-spawn. `make` is a factory because the future is consumed per attempt.
+/// Spawns `make()`'s future and keeps it alive: on panic OR return it logs, backs off (5 s doubling
+/// to 5 min: a deterministic crash must not spin hot) and re-spawns. `make` is a factory because
+/// the future is consumed per attempt. A cancelled task (the runtime shutting down) is not
+/// respawned.
 ///
-/// The body should call `beat(name)` each iteration; supervision without the
-/// heartbeat still restarts crashes but cannot distinguish "healthy and quiet"
-/// from "alive but wedged mid-await", which is exactly the sj2 shape.
+/// The body should call `beat(name)` each iteration; supervision without the heartbeat still
+/// restarts crashes but cannot tell "healthy and quiet" from "alive but wedged mid-await".
 pub fn spawn_supervised<F, Fut>(name: &'static str, make: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -175,7 +163,6 @@ where
                     tracing::error!(task = name, panic = %what, "supervised background loop PANICKED — restarting after backoff");
                 }
                 Err(_) => {
-                    // Cancelled — the runtime is shutting down; do not respawn.
                     return;
                 }
             }

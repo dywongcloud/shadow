@@ -1,17 +1,16 @@
-//! Intelligent service-graph scanner (Issue #2) — a pure ALGORITHM (no AI) that
-//! inspects a deployment's checked-out repo + its manifest + env var names and
-//! derives the graph of services ACTUALLY used/consumed:
+//! Service-graph scanner: a pure ALGORITHM (no AI) that inspects a deployment's checked-out repo,
+//! its manifest and its env var names and derives the graph of services ACTUALLY used:
 //!
-//!   * the app(s) and their framework/runtime,
-//!   * monolith bundling — one Dockerfile/compose running e.g. a React frontend +
-//!     an Express backend become TWO nodes sharing one `group` (same container/PID),
-//!   * monorepo workspace packages that are genuinely consumed,
-//!   * databases/caches only when a real client dep OR a connection env var proves
-//!     they're consumed (never a node for something unused),
+//! * the app(s) and their framework/runtime,
+//! * monolith bundling: one Dockerfile/compose running, say, a React frontend and an Express
+//! backend becomes TWO nodes sharing one `group` (same container/PID),
+//! * monorepo workspace packages that are genuinely consumed,
+//! * databases and caches only when a real client dep OR a connection env var proves they are
+//! consumed (never a node for something unused).
 //!
-//! It runs async off the build path (`scan_dir` reads the filesystem), so it never
-//! blocks a deploy. Everything here is deterministic + unit-testable: the
-//! filesystem read is isolated in `scan_dir`, the reasoning in `build_graph`.
+//! It runs async off the build path (`scan_dir` reads the filesystem), so it never blocks a deploy.
+//! Everything here is deterministic and unit-testable: the filesystem read is isolated in
+//! `scan_dir`, the reasoning in `build_graph`.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -83,9 +82,9 @@ pub struct Scan {
     pub compose_services: Vec<String>,
 }
 
-// ---- database clients: dep name -> (kind, tech label) ---------------------------
-// A node is added ONLY when one of these deps is present OR a matching connection
-// env var exists — so we never draw a database that isn't consumed.
+/// Database clients: dep name -> (kind, tech label). A database node is added ONLY when one of
+/// these deps is present OR a matching connection env var exists ([`DB_ENV`]), so a database that
+/// is not consumed is never drawn.
 const DB_DEPS: &[(&str, &str, &str)] = &[
     ("pg", "postgres", "PostgreSQL"),
     ("postgres", "postgres", "PostgreSQL"),
@@ -106,7 +105,7 @@ const DB_DEPS: &[(&str, &str, &str)] = &[
     ("sqlite3", "sqlite", "SQLite"),
 ];
 
-// Connection env var name substrings -> (kind, tech). Proves consumption at runtime.
+/// Connection env var name substrings -> (kind, tech): proof of consumption at runtime.
 const DB_ENV: &[(&str, &str, &str)] = &[
     ("DATABASE_URL", "postgres", "PostgreSQL"),
     ("POSTGRES", "postgres", "PostgreSQL"),
@@ -117,7 +116,7 @@ const DB_ENV: &[(&str, &str, &str)] = &[
     ("KV_", "redis", "Redis"),
 ];
 
-// Backend web frameworks whose presence (as a dep) implies a server process.
+/// Backend web frameworks whose presence (as a dep) implies a server process.
 const BACKEND_DEPS: &[(&str, &str)] = &[
     ("express", "Express"),
     ("fastify", "Fastify"),
@@ -129,7 +128,7 @@ const BACKEND_DEPS: &[(&str, &str)] = &[
     ("socket.io", "Socket.IO"),
 ];
 
-// Frontend UI frameworks (dep -> tech) — a bundled frontend when alongside a backend.
+/// Frontend UI frameworks (dep -> tech): a bundled frontend when alongside a backend.
 const FRONTEND_DEPS: &[(&str, &str)] = &[
     ("react-scripts", "React"),
     ("react-dom", "React"),
@@ -143,6 +142,15 @@ fn has_any(deps: &BTreeSet<String>, name: &str) -> bool {
 }
 
 /// Build the service graph from scanned signals + the env var names. Pure.
+///
+/// The `ingress` node is always the entrypoint. A bundled monolith (a single deployable running
+/// BOTH a frontend and a backend, for example a Dockerfile CMD that starts React and Express
+/// concurrently) becomes TWO nodes in the SAME `group` (one PID/container) visualized separately,
+/// with an `internal` edge from frontend to backend; otherwise there is one app node labelled by
+/// its framework/runtime. Consumed workspace packages become nodes in the group, used by the
+/// primary app node. A database/cache node needs a client dep OR a connection env var as proof of
+/// use and is deduplicated by kind, so `pg` plus `DATABASE_URL` never draw two Postgres nodes;
+/// every app node depends on it.
 pub fn build_graph(
     project: &str,
     deployment_id: &str,
@@ -152,7 +160,6 @@ pub fn build_graph(
     let mut nodes: Vec<SvcNode> = Vec::new();
     let mut edges: Vec<SvcEdge> = Vec::new();
 
-    // Ingress is always the entrypoint.
     nodes.push(SvcNode {
         id: "ingress".into(),
         kind: "ingress".into(),
@@ -164,15 +171,12 @@ pub fn build_graph(
         start_cmd: None,
     });
 
-    // Bundling group id — nodes that live in ONE container/PID share it.
     let group = if scan.is_container || scan.has_dockerfile {
         Some(format!("{project}-container"))
     } else {
         None
     };
 
-    // Detect a bundled monolith: a single deployable running BOTH a frontend and a
-    // backend (e.g. a Dockerfile CMD that concurrently starts React + Express).
     let backend = BACKEND_DEPS
         .iter()
         .find(|(d, _)| has_any(&scan.deps, d))
@@ -187,7 +191,6 @@ pub fn build_graph(
 
     let mut app_ids: Vec<String> = Vec::new();
     if bundled {
-        // TWO nodes, SAME group → one PID/container, but visualized separately.
         let fe = frontend.unwrap();
         let be = backend.unwrap();
         nodes.push(SvcNode {
@@ -224,7 +227,6 @@ pub fn build_graph(
             ),
             start_cmd: start_cmd.clone(),
         });
-        // Frontend calls backend (same PID) — show the internal edge.
         edges.push(SvcEdge {
             from: "app-frontend".into(),
             to: "app-backend".into(),
@@ -238,7 +240,6 @@ pub fn build_graph(
         app_ids.push("app-frontend".into());
         app_ids.push("app-backend".into());
     } else {
-        // Single app node — labelled by its framework/runtime.
         let (tech, kind) = if !scan.framework_name.is_empty()
             && scan.framework != "static"
             && scan.framework != "node"
@@ -277,7 +278,6 @@ pub fn build_graph(
         app_ids.push("app".into());
     }
 
-    // Monorepo workspace packages that are actually consumed → nodes in the group.
     for (pkg, tech) in &scan.packages {
         let id = format!("pkg-{}", slug(pkg));
         nodes.push(SvcNode {
@@ -290,7 +290,6 @@ pub fn build_graph(
             source: "monorepo workspace".into(),
             start_cmd: None,
         });
-        // A consumed package is used by the primary app node.
         if let Some(app) = app_ids.first() {
             edges.push(SvcEdge {
                 from: app.clone(),
@@ -300,8 +299,6 @@ pub fn build_graph(
         }
     }
 
-    // Databases/caches — ONLY when a client dep OR a connection env var proves use.
-    // Dedup by kind so `pg` + `DATABASE_URL` don't draw two Postgres nodes.
     let mut seen_db: BTreeSet<&str> = BTreeSet::new();
     let mut add_db = |kind: &'static str,
                       tech: &str,
@@ -322,7 +319,6 @@ pub fn build_graph(
             source,
             start_cmd: None,
         });
-        // All app nodes depend on the datastore.
         for app in &app_ids {
             edges.push(SvcEdge {
                 from: app.clone(),
@@ -388,8 +384,6 @@ fn strip_dockerfile_instruction_prefix(c: &str) -> String {
     c.to_string()
 }
 
-// ---- filesystem scan (the only impure part) -------------------------------------
-
 /// Collect npm dep names from a package.json value (deps + devDeps).
 fn deps_from_pkg(v: &serde_json::Value, out: &mut BTreeSet<String>) {
     for key in ["dependencies", "devDependencies", "peerDependencies"] {
@@ -422,6 +416,13 @@ fn readme_oneliner(text: &str) -> String {
 
 /// Scan the checked-out build dir for service-graph signals. Bounded + best-effort:
 /// any read failure just yields fewer signals, never an error.
+///
+/// Signals read: the root `package.json` (deps and the `start`/`dev`/`serve` scripts); the first
+/// Dockerfile or Containerfile (presence, plus `CMD`/`ENTRYPOINT`/concurrent `RUN` lines as run
+/// commands); workspace packages present under `packages/` and `apps/` (one level of package dirs
+/// each, at most 40 per root, only those with a `package.json`), whose deps are folded into the
+/// consumed set because they run in-app and whose tech is guessed from their own deps; the compose
+/// services, through the compose parser; and the README one-liner.
 pub fn scan_dir(
     build_dir: &Path,
     framework: &str,
@@ -435,7 +436,6 @@ pub fn scan_dir(
         ..Default::default()
     };
 
-    // Root package.json (deps + start/dev scripts).
     if let Ok(s) = std::fs::read_to_string(build_dir.join("package.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
             deps_from_pkg(&v, &mut scan.deps);
@@ -449,7 +449,6 @@ pub fn scan_dir(
         }
     }
 
-    // Dockerfile / Containerfile: presence + CMD/ENTRYPOINT run command.
     for f in ["Dockerfile", "Containerfile"] {
         if let Ok(s) = std::fs::read_to_string(build_dir.join(f)) {
             scan.has_dockerfile = true;
@@ -466,8 +465,6 @@ pub fn scan_dir(
         }
     }
 
-    // Monorepo workspace packages actually present under packages/ and apps/ — bounded
-    // recursion (one level of package dirs each), and only those with a package.json.
     for wsdir in ["packages", "apps"] {
         let base = build_dir.join(wsdir);
         if let Ok(rd) = std::fs::read_dir(&base) {
@@ -489,9 +486,7 @@ pub fn scan_dir(
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or(fallback);
-                // Fold the sub-package's deps into the consumed set (they run in-app).
                 deps_from_pkg(&v, &mut scan.deps);
-                // Guess the package's tech from its own deps.
                 let mut sub = BTreeSet::new();
                 deps_from_pkg(&v, &mut sub);
                 let tech = FRONTEND_DEPS
@@ -505,7 +500,6 @@ pub fn scan_dir(
         }
     }
 
-    // compose services (multi-container) — reuse the compose parser.
     if let Some(cf) = crate::compose::compose_file(build_dir) {
         if let Ok(text) = std::fs::read_to_string(&cf) {
             if let Ok(svcs) = crate::compose::parse_compose(&text) {
@@ -514,7 +508,6 @@ pub fn scan_dir(
         }
     }
 
-    // README one-liner.
     for f in ["README.md", "readme.md", "README", "Readme.md"] {
         if let Ok(s) = std::fs::read_to_string(build_dir.join(f)) {
             scan.readme = readme_oneliner(&s);
@@ -527,11 +520,9 @@ pub fn scan_dir(
     scan
 }
 
-// ---- per-project store (latest graph), persisted --------------------------------
-
 #[derive(Default)]
 pub struct ServiceGraphStore {
-    // keyed by deployment id
+    /// Graphs by deployment id.
     map: RwLock<HashMap<String, ServiceGraph>>,
 }
 
@@ -556,10 +547,10 @@ impl ServiceGraphStore {
             .max_by_key(|g| g.generated_ms)
             .cloned()
     }
-    /// Rename a project's service graphs IN PLACE. Graphs are keyed by
-    /// DEPLOYMENT id (which a rename never touches), so this only rewrites the
-    /// `project` label the dashboard groups on, plus any graph node whose name
-    /// is exactly the old project name (the app node is named after it).
+    /// Renames a project's service graphs IN PLACE. Graphs are keyed by DEPLOYMENT id, which a
+    /// rename never touches, so this only rewrites the `project` label the dashboard groups on,
+    /// plus any graph node named exactly the old project name (the app node is named after the
+    /// project). Returns the number of graphs touched.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;

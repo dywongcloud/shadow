@@ -1,26 +1,23 @@
-//! Speculative prewarm: start the function a request is about to invoke while
-//! the request's TLS handshake is still finishing.
+//! Speculative prewarm: start the function a request is about to invoke while the request's TLS
+//! handshake is still finishing.
 //!
-//! A cold start (litebox ~3 s, container seconds) is the whole latency a first
-//! request pays. The ClientHello already tells us the host, so instead of
-//! discovering the cold pool after the handshake we start it during the
-//! handshake: `acme::SniResolver::resolve` hands the SNI to a bounded channel,
-//! and this worker walks the hints off the request path (on the bulkhead
-//! runtime, never on a serving tokio worker).
+//! A cold start (litebox ~3 s, container seconds) is the whole latency a first request pays. The
+//! ClientHello already tells us the host, so instead of discovering the cold pool after the
+//! handshake we start it during the handshake: `acme::SniResolver::resolve` hands the SNI to a
+//! bounded channel, and this worker walks the hints off the request path (on the bulkhead runtime,
+//! never on a serving tokio worker).
 //!
 //! Two properties are load-bearing:
 //!
-//! * **Never block, never unbounded.** Hints are dropped when the queue is
-//!   full and deduped per host, and warming goes through `Fluid::warm`, which
-//!   refuses without side effects when the pool is already warm, in backoff,
-//!   behind an open crash-loop circuit, saturated or shutting down. A wrong
-//!   guess costs one idle instance that scale-to-zero then drains — never a
-//!   permanent one, and never a request.
-//! * **Warm where the deployment IS, not where the handshake landed.** Public
-//!   hosts are round-robin DNS, so the entry node is frequently not the owner.
-//!   A hint for a host this node does not serve is forwarded to a healthy peer
-//!   that does, which hides the mesh hop too — that hop is the larger half of
-//!   the latency when the entry node is on another continent.
+//! * **Never block, never unbounded.** Hints are dropped when the queue is full and deduped per
+//! host, and warming goes through `Fluid::warm`, which refuses without side effects when the pool
+//! is already warm, in backoff, behind an open crash-loop circuit, saturated or shutting down. A
+//! wrong guess costs one idle instance that scale-to-zero then drains, never a permanent one and
+//! never a request.
+//! * **Warm where the deployment IS, not where the handshake landed.** Public hosts are round-robin
+//! DNS, so the entry node is frequently not the owner. A hint for a host this node does not serve
+//! is forwarded to a healthy peer that does, which hides the mesh hop too: that hop is the larger
+//! half of the latency when the entry node is on another continent.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,15 +47,14 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static DUPES: AtomicU64 = AtomicU64::new(0);
 static FORWARDED: AtomicU64 = AtomicU64::new(0);
 
-/// Outcome counts since the last summary line, plus when that line was emitted.
-/// The hint path runs on every handshake, so it logs at most one summary per
-/// [`SUMMARY_MS`] instead of one line per hint.
+/// Outcome counts since the last summary line, plus when that line was emitted. The hint path runs
+/// on every handshake, so it logs at most one summary per [`SUMMARY_MS`] instead of one line per
+/// hint.
 static OUTCOMES: Mutex<Option<(u64, [(u64, &str); 10])>> = Mutex::new(None);
 const SUMMARY_MS: u64 = 10_000;
 
-/// Record what a hint did. `Started` is logged at once (it is rare and it is
-/// the outcome the feature exists for); everything else is counted and emitted
-/// by the rate-limited summary.
+/// Records what a hint did. `Started` is logged at once (it is rare and it is the outcome the
+/// feature exists for); everything else is counted and emitted by the rate-limited summary.
 pub(crate) fn record(host: &str, outcome: &str) {
     let now = hive_core::now_ms();
     let emit = {
@@ -139,12 +135,11 @@ fn should_warm(host: &str) -> bool {
     }
 }
 
-/// Hand a hostname observed in a ClientHello to the prewarm worker. Called
-/// synchronously from the TLS SNI resolver, so it never blocks and never
-/// waits: a full queue drops the hint.
+/// Hands a hostname observed in a ClientHello to the prewarm worker. Called synchronously from the
+/// TLS SNI resolver, so it never blocks and never waits: a full queue drops the hint. Empty,
+/// over-long (more than 253 bytes) and dot-less names cannot name a served deployment and never
+/// reach the queue.
 pub fn hint(host: &str) {
-    // Reject the shapes that cannot name a served deployment before they
-    // reach the queue: bare names, IPs, over-long labels.
     if host.is_empty() || host.len() > 253 || !host.contains('.') {
         return;
     }
@@ -169,6 +164,9 @@ pub fn hint(host: &str) {
 }
 
 /// `HIVE_PREWARM=0` (or `false`) disables prewarming entirely.
+///
+/// A disabled node leaves the SNI hook uninstalled, so the old behavior is one env var away on a
+/// single node (an A/B measurement, or a quick retreat if a hint ever costs more than it saves).
 fn enabled() -> bool {
     std::env::var("HIVE_PREWARM")
         .ok()
@@ -180,9 +178,6 @@ fn enabled() -> bool {
 /// gateway exists.
 pub fn spawn(cloud: Arc<CloudState>) {
     if !enabled() {
-        // Kill switch: `HIVE_PREWARM=0` leaves the SNI hook uninstalled, so the
-        // old behavior is one env var away on a single node (an A/B measurement,
-        // or a quick retreat if a hint ever costs more than it saves).
         tracing::info!("prewarm: disabled by HIVE_PREWARM=0");
         return;
     }
@@ -213,15 +208,19 @@ async fn worker(cloud: Arc<CloudState>, mut rx: tokio::sync::mpsc::Receiver<Stri
     }
 }
 
+/// Warms `host` here when this node serves it; otherwise forwards the hint to a healthy peer that
+/// does, using the request path's owner selection (the full-host key first, since custom domains
+/// are keyed by their whole hostname, then the first label). The forward is fire and forget (a hint
+/// is an optimization, never a dependency, and the owner applies its own gates on arrival) and is
+/// recorded like any other outcome: a forward is the common case (most deployments live on one node
+/// while public DNS spreads handshakes across the fleet), so a silent majority path would be
+/// unobservable.
 async fn handle(cloud: &Arc<CloudState>, host: &str) {
     if cloud.gw.serves_host(host) {
         let outcome = cloud.gw.warm_host(host).await;
         record(host, outcome.as_str());
         return;
     }
-    // Not ours: forward to a healthy peer that does serve it. Same owner
-    // selection the request path uses — full-host key first (custom domains
-    // are keyed by their whole hostname), then the first label.
     let healthy_ids: std::collections::HashSet<String> = cloud
         .registry
         .nodes()
@@ -251,8 +250,6 @@ async fn handle(cloud: &Arc<CloudState>, host: &str) {
     let Some(addr) = addr else { return };
     let body = serde_json::json!({ "host": host }).to_string();
     FORWARDED.fetch_add(1, Ordering::Relaxed);
-    // Fire and forget: a hint is an optimization, never a dependency, and the
-    // owner applies its own gates on arrival.
     let sent = crate::gossip::request_to(
         cloud,
         &node_id,
@@ -264,15 +261,11 @@ async fn handle(cloud: &Arc<CloudState>, host: &str) {
     )
     .await
     .is_some();
-    // A forward is the common case (most deployments live on one node while
-    // public DNS spreads handshakes across the fleet), so it is recorded like
-    // any other outcome — a silent majority path would be unobservable.
     record(host, if sent { "forwarded" } else { "forward-failed" });
 }
 
-/// Handle a hint that arrived over the mesh (see the `/v1/warm-hint` gossip
-/// arm). This node was selected as a host that serves the deployment, so warm
-/// locally and never re-forward.
+/// Handles a hint that arrived over the mesh (see the `/v1/warm-hint` gossip arm). This node was
+/// selected as a host that serves the deployment, so it warms locally and never re-forwards.
 pub fn handle_remote(cloud: Arc<CloudState>, host: String) {
     if !should_warm(&host) {
         DUPES.fetch_add(1, Ordering::Relaxed);

@@ -1,24 +1,20 @@
-//! shadw drive v1 — WebDAV mount at `/v1/drive/webdav/:project`
-//! (bn-shadw-drive-v1, design §3). A fresh [`DavHandler`] wrapping a
-//! project-scoped [`DriveFs`] is built PER REQUEST (cheap — `Arc` clones
-//! only) so Basic-auth verification and the filesystem's tenant binding both
-//! happen before `dav_server` ever sees the request.
+//! shadw drive v1: the WebDAV mount at `/v1/drive/webdav/:project`.
 //!
-//! `DriveFs` calls the exact same storage primitives `drive_api.rs`'s REST
-//! handlers use (`relational::drive_*`, `drive_blobs::*`,
-//! `drive_api::resolve_and_fetch_bytes` for the owner-proxy-on-miss read
-//! path) — one storage layer, two protocol fronts.
+//! A fresh [`DavHandler`] wrapping a project-scoped [`DriveFs`] is built PER REQUEST (cheap: `Arc`
+//! clones only), so Basic-auth verification and the filesystem's tenant binding both happen before
+//! `dav_server` ever sees the request.
 //!
-//! **Known v1 path collision, accepted deliberately:** a project literally
-//! named `webdav` cannot reach `/v1/drive/webdav/*` as its own REST actions
-//! (`list`/`mkdir`/...) — axum's router (matchit) resolves the static
-//! `webdav` segment before the dynamic `:project` segment at the same trie
-//! depth, so `GET /v1/drive/webdav/list` always means "WebDAV mount,
-//! project=list", never "REST action=list, project=webdav". Reserving
-//! `webdav` as a disallowed project name is a platform-wide naming-validation
-//! change outside this task's scope; this is the honest, minimal-footprint
-//! alternative to inventing a non-standard mount path that would depart from
-//! the design's explicit `/v1/drive/webdav/:project`.
+//! `DriveFs` calls the exact storage primitives `drive_api.rs`'s REST handlers use
+//! (`relational::drive_*`, `drive_blobs::*`, `drive_api::resolve_and_fetch_bytes` for the
+//! owner-proxy-on-miss read path): one storage layer, two protocol fronts.
+//!
+//! **Known v1 path collision, accepted deliberately:** a project literally named `webdav` cannot
+//! reach `/v1/drive/webdav/*` as its own REST actions (`list`/`mkdir`/...): axum's router (matchit)
+//! resolves the static `webdav` segment before the dynamic `:project` segment at the same depth, so
+//! `GET /v1/drive/webdav/list` always means "WebDAV mount, project=list", never "REST action=list,
+//! project=webdav". Reserving `webdav` as a disallowed project name is a platform-wide
+//! naming-validation change; this is the minimal-footprint alternative to inventing a non-standard
+//! mount path.
 
 use axum::{
     extract::{Path, Request, State},
@@ -74,6 +70,14 @@ fn basic_credentials(req: &Request) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
+/// Serves one WebDAV request. Requests without valid Basic credentials for THIS `:project` answer
+/// 401 before any DB lookup: `basic_credentials` plus `verify_webdav_credentials` are that gate,
+/// because a WebDAV credential is minted per project and its username IS the project. Every
+/// response is buffered and sent with an honest `Content-Length`: `dav_server::body::Body` never
+/// overrides `size_hint()`, so hyper would otherwise fall back to `Transfer-Encoding: chunked` even
+/// for the fully buffered responses this handler always produces (v1 has no true streaming), and
+/// Windows' built-in WebDAV Mini-Redirector (Explorer's "Map network drive") rejects or hangs on
+/// chunked WebDAV responses.
 async fn handler(
     State(c): State<Arc<CloudState>>,
     Path(params): Path<HashMap<String, String>>,
@@ -82,10 +86,6 @@ async fn handler(
     let Some(project) = params.get("project").cloned() else {
         return (StatusCode::BAD_REQUEST, "missing project").into_response();
     };
-    // A :project that isn't the authenticated credential's own project is
-    // 403 before any DB lookup (design §5) — `basic_credentials` + the
-    // username==project check together ARE that gate, since a WebDAV
-    // credential is minted per-project and its username IS the project.
     let Some((user, pass)) = basic_credentials(&req) else {
         return unauthorized();
     };
@@ -106,17 +106,6 @@ async fn handler(
         .strip_prefix(prefix)
         .build_handler();
     let resp = dav.handle(req).await;
-    // `dav_server::body::Body`'s `HttpBody` impl never overrides `size_hint()`
-    // (dav-server-0.11.0/src/body.rs), so hyper always falls back to
-    // `Transfer-Encoding: chunked` — even for its fully-buffered `Bytes`
-    // variant, which is every response this handler ever produces (v1 has no
-    // true streaming; `ReadFile`/`WriteFile` already hold whole-file buffers
-    // in memory, see their own doc comments). Windows' built-in WebDAV
-    // Mini-Redirector (Explorer's "Map network drive"/"Add a network
-    // location") is well known to reject or hang on chunked WebDAV responses
-    // — it requires `Content-Length`. Buffering here costs nothing beyond
-    // what's already materialized and lets every response carry an honest
-    // Content-Length instead.
     let (parts, body) = resp.into_parts();
     let bytes = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX)
         .await
@@ -185,9 +174,9 @@ impl DavDirEntry for DirEntry {
     }
 }
 
-/// Read-mode file: bytes are resolved (local-or-proxied) once at `open()` —
-/// v1 has no true streaming, matching every other body handler in this
-/// crate (`axum::body::Bytes` extraction bounded by the admin body limit).
+/// Read-mode file: bytes are resolved (local or proxied) once at `open()`. v1 has no true
+/// streaming, matching every other body handler in this crate (`axum::body::Bytes` extraction
+/// bounded by the admin body limit).
 #[derive(Debug)]
 struct ReadFile {
     data: Vec<u8>,
@@ -233,10 +222,9 @@ impl DavFile for ReadFile {
     }
 }
 
-/// Write-mode file: buffers in memory (same bounded-body convention as
-/// `drive_api::put_file`) and commits — quota check, blob store, metadata
-/// upsert — once, in `flush()` (called exactly once after every `write_*`
-/// call, per `dav_server::handle_put`'s own body loop).
+/// Write-mode file: buffers in memory (the same bounded-body convention as `drive_api::put_file`)
+/// and commits (quota check, blob store, metadata upsert) once, in `flush()`, which
+/// `dav_server::handle_put`'s body loop calls exactly once after every `write_*` call.
 struct WriteFile {
     cloud: Arc<CloudState>,
     project: String,
@@ -247,10 +235,9 @@ struct WriteFile {
     flushed: bool,
 }
 
-// `CloudState` has no `Debug` impl (it holds live connection pools /
-// non-Debug guardian-db handles), so this is written by hand rather than
-// derived — `DavFile: Debug` only needs something legible for logging, never
-// a real field dump.
+/// Hand-written: `CloudState` has no `Debug` (it holds live connection pools and non-Debug
+/// guardian-db handles), and `DavFile: Debug` only needs something legible for logging, never a
+/// field dump.
 impl std::fmt::Debug for WriteFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteFile")

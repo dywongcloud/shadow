@@ -14,15 +14,14 @@ use crate::runtime_artifact_transfer_wire::{
     TransferRequest, TransferState, MAX_CHUNK_BYTES,
 };
 
-/// Domain separator for the canonical readiness-receipt digest a receiver
-/// stamps into its durable Prepared record and reply. Sender and receiver
-/// compare this exact value at commit time.
+/// Domain separator of the canonical readiness-receipt digest a receiver stamps into its durable
+/// Prepared record and reply; sender and receiver compare this exact value at commit time.
 const READINESS_DOMAIN: &[u8] = b"hive-deployment-readiness-v1\0";
 
-/// Durably persist the platform's deployment state after a publish. Bound
-/// once from `CloudState::new` (the service is constructed before the state
-/// `Arc` exists, so the hook arrives immediately after); a commit with no
-/// bound hook is refused rather than publishing an unpersistable record.
+/// Durably persists the platform's deployment state after a publish. Bound once from
+/// `CloudState::new` (the service is constructed before the state `Arc` exists, so the hook arrives
+/// right after); a commit with no bound hook is refused rather than publishing an unpersistable
+/// record.
 pub type PersistFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// One canonical digest over a gateway readiness receipt.
@@ -248,9 +247,9 @@ impl TransferService {
         })
     }
 
-    /// Bind the durable platform persistence hook. Called exactly once, right
-    /// after the owning `CloudState` `Arc` exists; until then every Commit is
-    /// refused rather than publishing a Ready record a restart would lose.
+    /// Binds the durable platform persistence hook. Called exactly once, right after the owning
+    /// `CloudState` `Arc` exists; until then every Commit is refused rather than publishing a Ready
+    /// record a restart would lose.
     pub fn bind_persist(&self, persist: PersistFn) {
         *self.persist.lock() = Some(persist);
     }
@@ -416,6 +415,12 @@ impl TransferService {
     }
 }
 
+/// The single worker thread that serializes every transfer mutation. Prepared hidden candidates are
+/// PROCESS-LOCAL by design: their armed `Drop` is the rollback mechanism, so the handles live here,
+/// owned by this one worker, and never in durable state. A restart recovers `Prepared` records as
+/// `Materialized` ([`recover_records`]), so this map and the durable store can never disagree
+/// across a boot. A closed channel without a `Shutdown` message still rolls hidden candidates back
+/// before the runtime is dropped.
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     fs: TransferFs,
@@ -433,12 +438,6 @@ fn worker_loop(
         .enable_all()
         .build()
         .expect("runtime artifact transfer worker runtime");
-    // Prepared hidden candidates are PROCESS-LOCAL by design: their armed Drop
-    // is the rollback mechanism, so the handles live here — owned by the one
-    // worker that serializes every transfer mutation — and never in durable
-    // state. A restart recovers `Prepared` records as `Materialized`
-    // (`recover_records`), so this map and the durable store can never
-    // disagree across a boot.
     let mut prepared: BTreeMap<String, fluid_gateway::StagedDeployment> = BTreeMap::new();
     while let Ok(message) = receiver.recv() {
         match message {
@@ -478,14 +477,14 @@ fn worker_loop(
             }
         }
     }
-    // A closed channel without a Shutdown message still rolls hidden
-    // candidates back before the runtime is dropped.
     drop_prepared_candidates(&runtime, &fs, &records, &boot_nonce, &mut prepared);
 }
 
-/// Drop every retained staged handle inside a live runtime context (its Drop
-/// spawns pool unregistration) and downgrade the matching durable records so
-/// no `Prepared` claim outlives the process that proved it.
+/// Drops every retained staged handle inside a live runtime context (its `Drop` spawns pool
+/// unregistration) and downgrades the matching durable records so no `Prepared` claim outlives the
+/// process that proved it. The synchronous candidate removal happens inside `Drop`; the bounded
+/// yields afterwards let the spawned async pool unregistrations make progress before the runtime
+/// goes away.
 fn drop_prepared_candidates(
     runtime: &tokio::runtime::Runtime,
     fs: &TransferFs,
@@ -504,9 +503,6 @@ fn drop_prepared_candidates(
             }
         }
     }
-    // The armed Drop spawns async pool unregistration onto this runtime;
-    // bounded yields let those tasks make progress before the runtime goes
-    // away. The synchronous candidate removal already happened inside Drop.
     runtime.block_on(async {
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -628,6 +624,13 @@ fn begin_transaction(
     Ok(record.reply(ReplyCode::Ok, "runtime artifact transfer began"))
 }
 
+/// Applies one chunk of a Receiving transfer. A chunk at the exact next contiguous offset is
+/// appended and sealed. A chunk below `next_offset` must repeat a durable seal AND the durable
+/// bytes, and is then an idempotent success ("chunk already durable"); anything else is a
+/// `ChunkConflict`. The re-verify against the durable bytes accepts a chunk digest minted under
+/// either algorithm (`verify_raw_content`): one minted by a peer still on the legacy SHA-256 mint
+/// and one minted under BLAKE3 must both keep verifying here, and rejecting either would be a false
+/// `ChunkConflict`, not a safety property, since the bytes are already in hand.
 fn apply_chunk(
     fs: &TransferFs,
     records: &RwLock<BTreeMap<String, TransferRecord>>,
@@ -673,10 +676,6 @@ fn apply_chunk(
             ));
         };
         let durable = directory.read_package_range(chunk.offset, chunk.bytes.len())?;
-        // Dual-algorithm: a chunk digest minted by a peer still on the legacy
-        // SHA-256 mint must keep verifying here, and one minted under BLAKE3
-        // must too. Rejecting either is a false ChunkConflict, not a safety
-        // property — the bytes are already in hand.
         if durable != chunk.bytes || !fluid_core::verify_raw_content(&durable, &chunk.chunk_sha256) {
             return Ok(record.reply(
                 ReplyCode::ChunkConflict,
@@ -714,6 +713,10 @@ fn apply_chunk(
     Ok(record.reply(ReplyCode::Ok, "runtime artifact transfer chunk persisted"))
 }
 
+/// Reports a transaction's state. A durable `Prepared` claim is only truthful while THIS process
+/// still holds the armed staged handle (the hidden candidate and its launched cells are
+/// process-local), so without one it is downgraded to `Materialized` and the reply says to
+/// re-prepare: a query never returns stale prepared authority.
 fn query_transaction(
     fs: &TransferFs,
     records: &RwLock<BTreeMap<String, TransferRecord>>,
@@ -728,9 +731,6 @@ fn query_transaction(
             "runtime artifact transfer transaction is unavailable",
         ));
     };
-    // A durable Prepared claim is only truthful while THIS process still holds
-    // the armed staged handle — the hidden candidate and its launched cells
-    // are process-local. Query must never return stale prepared authority.
     if record.state == TransferState::Prepared && !prepared.contains_key(&key.transaction_id) {
         downgrade_prepared(fs, records, boot_nonce, &mut record)?;
         return Ok(record.reply(
@@ -855,6 +855,12 @@ fn finalize_transaction(
     Ok(record.reply(code, message))
 }
 
+/// Aborts a transaction (a committed one cannot be aborted; an already aborted one is an idempotent
+/// success). A hidden prepared candidate is rolled back FIRST: dropping the armed handle
+/// synchronously removes the staged record and detaches its pools. The materialized package and
+/// tree authority die with the abort, since the durable record must not keep claiming a semantic
+/// identity its own package file no longer backs (the coordinator's reply validation treats
+/// semantic authority on a non-materialized state as a fault).
 fn abort_transaction(
     runtime: &tokio::runtime::Runtime,
     fs: &TransferFs,
@@ -879,8 +885,6 @@ fn abort_transaction(
     if record.state == TransferState::Aborted {
         return Ok(record.reply(ReplyCode::Ok, "runtime artifact transfer already aborted"));
     }
-    // Roll a hidden prepared candidate back FIRST: dropping the armed handle
-    // synchronously removes the staged record and detaches its pools.
     if let Some(staged) = prepared.remove(&key.transaction_id) {
         runtime.block_on(async move { drop(staged) });
     }
@@ -889,10 +893,6 @@ fn abort_transaction(
     record.participant_boot_nonce = boot_nonce.to_string();
     record.hidden_deployment_id.clear();
     record.readiness_sha256.clear();
-    // The materialized package/tree authority dies with the abort — the
-    // durable record must not keep claiming a semantic identity its own
-    // package file no longer backs (and reply validation on the coordinator
-    // treats semantic authority on a non-materialized state as a fault).
     record.semantic_tree_sha256.clear();
     record.terminal_error.clear();
     let directory = fs.open_transaction(&key.transaction_id)?;
@@ -926,6 +926,12 @@ fn downgrade_prepared(
     Ok(())
 }
 
+/// Stages the hidden candidate for a Materialized transaction and records the Prepared claim. A
+/// durable `Prepared` without a live handle cannot happen in-process (this worker owns both) but is
+/// repaired here to keep the invariant local. A failed stage is retryable, not terminal: the
+/// durable record stays `Materialized` and a staged handle, if one was created, already rolled back
+/// through `Drop`. If durable state refuses the `Prepared` claim the candidate is rolled back
+/// rather than holding readiness the store cannot survive a restart of.
 #[allow(clippy::too_many_arguments)]
 fn prepare_transaction(
     runtime: &tokio::runtime::Runtime,
@@ -951,8 +957,6 @@ fn prepare_transaction(
                 "runtime artifact deployment candidate is already prepared",
             ));
         }
-        // Durable Prepared without a live handle cannot happen in-process (the
-        // worker owns both), but repairing it here keeps the invariant local.
         TransferState::Prepared => downgrade_prepared(fs, records, boot_nonce, &mut record)?,
         TransferState::Committed => {
             return Ok(record.reply(
@@ -970,8 +974,6 @@ fn prepare_transaction(
     }
     let (staged, readiness) = match stage_hidden_candidate(runtime, fs, gw, &record) {
         Ok(prepared) => prepared,
-        // Retryable, not terminal: the durable record stays Materialized and
-        // the staged handle (if any was created) already rolled back via Drop.
         Err(error) => {
             return Ok(record.reply(
                 ReplyCode::Failed,
@@ -990,8 +992,6 @@ fn prepare_transaction(
     record.participant_boot_nonce = boot_nonce.to_string();
     let directory = fs.open_transaction(&key.transaction_id)?;
     if let Err(error) = directory.write_state(&encode_record(&record)?) {
-        // Durable state refused the Prepared claim: roll the candidate back
-        // rather than holding readiness the store cannot survive a restart of.
         runtime.block_on(async move { drop(staged) });
         return Err(error);
     }
@@ -1005,11 +1005,12 @@ fn prepare_transaction(
     ))
 }
 
-/// Deliver the exact materialized artifact to the serving backend, verify the
-/// backend's committed identity, stage the generation's canonical manifest as
-/// a HIDDEN candidate, and prove bounded readiness — everything a receiver
-/// does between `Materialized` and `Prepared`, with no source access, no
-/// build, and no locally-reconstructed configuration.
+/// Delivers the exact materialized artifact to the serving backend, verifies the backend's
+/// committed identity, stages the generation's canonical manifest as a HIDDEN candidate and proves
+/// bounded readiness: everything a receiver does between `Materialized` and `Prepared`, with no
+/// source access, no build and no locally reconstructed configuration. The deployment's
+/// display-only source metadata is derived from the sealed snapshot authority, never from
+/// receiver-local state.
 fn stage_hidden_candidate(
     runtime: &tokio::runtime::Runtime,
     fs: &TransferFs,
@@ -1044,8 +1045,6 @@ fn stage_hidden_candidate(
         .into_os_string()
         .into_string()
         .map_err(|_| anyhow::anyhow!("sealed host static root is not UTF-8"))?;
-    // Display-only source metadata, derived from the sealed snapshot authority
-    // rather than any receiver-local state.
     let contract: fluid_build::DeploymentBuildContract =
         serde_json::from_slice(&begin.snapshot_bytes)
             .context("decode sealed deployment build contract")?;
@@ -1111,6 +1110,13 @@ fn stage_hidden_candidate(
     })
 }
 
+/// Commits a Prepared candidate: publishes it Ready and persists the platform state. Idempotent for
+/// the same authority (hidden deployment id and readiness digest); a different authority on a
+/// committed transaction is a `Conflict`. A commit with no bound persistence hook is refused rather
+/// than publishing a Ready record a restart would lose (the candidate stays prepared and the
+/// coordinator retries); if the hook then reports failure the published deployment is removed and
+/// the claim downgraded. When `publish_ready` fails it has consumed the handle and its armed `Drop`
+/// already rolled the hidden candidate back.
 #[allow(clippy::too_many_arguments)]
 fn commit_transaction(
     runtime: &tokio::runtime::Runtime,
@@ -1165,8 +1171,6 @@ fn commit_transaction(
         ));
     };
     let Some(persist) = persist else {
-        // Refuse rather than publish a Ready record a restart would lose; the
-        // candidate stays prepared and the coordinator retries.
         prepared.insert(commit.key.transaction_id.clone(), staged);
         return Ok(record.reply(
             ReplyCode::Failed,
@@ -1200,8 +1204,6 @@ fn commit_transaction(
             Ok(record.reply(ReplyCode::Ok, "runtime artifact generation committed"))
         }
         Err(error) => {
-            // publish_ready consumed the handle; its armed Drop already rolled
-            // the hidden candidate back on this failure path.
             downgrade_prepared(fs, records, boot_nonce, &mut record)?;
             Ok(record.reply(
                 ReplyCode::Failed,
@@ -1224,6 +1226,13 @@ fn exact_record(
         .cloned()
 }
 
+/// Rebuilds the in-memory records from the durable transaction directories at boot, refusing (and
+/// logging) any directory whose identity, state or package disagrees with itself. A `Prepared`
+/// claim names a hidden staged candidate and its launched readiness proof, both strictly
+/// process-local (`StagedDeployment` is an armed in-memory handle), so a fresh boot recovers it as
+/// `Materialized` and clears the dead authority; the coordinator observes the new boot nonce and
+/// repeats Prepare. A `Finalizing` record returns to `Receiving`, and a package longer than the
+/// durable prefix of a Receiving or Finalizing transfer is truncated to it.
 fn recover_records(
     fs: &TransferFs,
     boot_nonce: &str,
@@ -1279,11 +1288,6 @@ fn recover_records(
             record.participant_boot_nonce = boot_nonce.to_string();
             directory.write_state(&encode_record(&record)?)?;
         }
-        // A `Prepared` claim names a hidden staged candidate and its launched
-        // readiness proof — both strictly process-local (`StagedDeployment` is
-        // an armed in-memory handle). A fresh boot therefore recovers the
-        // durable record as `Materialized` and clears the dead authority; the
-        // coordinator observes the new boot nonce and repeats Prepare.
         if record.state == TransferState::Prepared {
             record.state = TransferState::Materialized;
             record.hidden_deployment_id.clear();

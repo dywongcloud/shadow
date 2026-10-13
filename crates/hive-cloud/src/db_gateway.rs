@@ -1,21 +1,16 @@
-//! Per-tenant DATABASE gateway — the Neon/Upstash model.
+//! Per-tenant DATABASE gateway, the Neon/Upstash model.
 //!
-//! Gives every managed database an external, cross-protocol endpoint at
-//! `<slug>.{db_domain}` (e.g. `db-ab12cd34.downstash.xyz`). A single wildcard
-//! `*.{db_domain}` TLS cert (the shared [`crate::acme`] SNI resolver) fronts two
-//! listeners whose ports come from `HIVE_DB_PG_LISTEN`/`HIVE_DB_REDIS_LISTEN`
-//! (default `:5432`/`:6379`):
-//!   * Postgres wire
-//!   * Redis wire
-//! Each listener TLS-TERMINATES the connection, reads the SNI server-name to
-//! identify the tenant DB, and byte-splices the decrypted client stream to that
-//! DB's local podman container (`127.0.0.1:<local_port>`).
+//! Gives every managed database an external, cross-protocol endpoint at `<slug>.{db_domain}`. A
+//! single wildcard `*.{db_domain}` TLS cert (the shared [`crate::acme`] SNI resolver) fronts two
+//! listeners whose addresses come from `HIVE_DB_PG_LISTEN`/`HIVE_DB_REDIS_LISTEN` (default
+//! `:5432`/`:6379`): the Postgres wire and the Redis wire. Each listener TLS-TERMINATES the
+//! connection, reads the SNI server name to identify the tenant DB, and byte-splices the decrypted
+//! client stream to that DB's local podman container (`127.0.0.1:<local_port>`).
 //!
-//! SECURITY (ZeroTrust): TLS is REQUIRED — credentials never cross the wire in
-//! plaintext, and SNI is the only routing key. A connection whose SNI names no DB
-//! (or a DB not hosted on this node) is closed. Per-DB DNS points `<slug>` at the
-//! node actually running the container (see [`crate::vercel_dns`]), so the proxy
-//! always finds it locally.
+//! SECURITY: TLS is REQUIRED (credentials never cross the wire in plaintext) and SNI is the only
+//! routing key. A connection whose SNI names no DB, or a DB not hosted on this node, is closed.
+//! Per-DB DNS points `<slug>` at the node actually running the container (see
+//! [`crate::vercel_dns`]), so the proxy always finds it locally.
 //!
 //! Enabled ONLY when `HIVE_DB_DOMAIN` is set (`cloud.db_domain` non-empty).
 
@@ -34,14 +29,12 @@ enum Wire {
     Redis,
 }
 
-/// The listen address for the Postgres-wire proxy. `HIVE_DB_PG_LISTEN`, default
-/// `0.0.0.0:5432`.
+/// The listen address of the Postgres-wire proxy: `HIVE_DB_PG_LISTEN`, default `0.0.0.0:5432`.
 ///
-/// Overridable because the default belongs to whichever hive-cloud instance bound
-/// it first: on a host running BOTH a fleet `hive-node` and a second platform
-/// instance (DevHub), the second one's bind fails. It failed SILENTLY — a log
-/// line and a `return`, no crash and nothing an operator sees — so the gateway
-/// looked configured while serving nothing.
+/// Overridable because the default belongs to whichever hive-cloud instance bound it first: on a
+/// host running BOTH a fleet `hive-node` and a second platform instance, the second one's bind
+/// fails, and it failed SILENTLY (a log line and a `return`), so the gateway looked configured
+/// while serving nothing.
 pub fn pg_listen_addr() -> String {
     listen_addr("HIVE_DB_PG_LISTEN", "0.0.0.0:5432")
 }
@@ -60,9 +53,9 @@ fn listen_addr(var: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The port a client must connect to for the Postgres wire — the port the
-/// listener actually holds, not a hardcoded 5432. Published DSNs are built from
-/// this, so moving the listener moves the URL with it.
+/// The port a client must connect to for the Postgres wire: the port the listener actually holds,
+/// not a hardcoded 5432. Published DSNs are built from it, so moving the listener moves the URL
+/// with it.
 pub fn published_pg_port() -> u16 {
     port_of(&pg_listen_addr(), 5432)
 }
@@ -88,15 +81,17 @@ pub fn spawn(cloud: Arc<CloudState>) {
     spawn_listener(cloud, redis_listen_addr(), Wire::Redis);
 }
 
+/// Binds one wire's listener and serves it. A gateway that cannot bind is INVISIBLE (no crash, no
+/// failing request, databases that simply never connect), so a bind failure opens a level-triggered
+/// incident (`db-gateway:bind-failed:<addr>`, re-asserted every start, cleared on a successful
+/// bind) that names the env var that resolves it. The TLS config is the shared SNI resolver (it
+/// serves the `*.{db_domain}` wildcard bundle) but with NO ALPN: a Postgres client (libpq 17+
+/// offers ALPN `postgresql`) must not get a `no_application_protocol` alert.
 fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                // A gateway that cannot bind is INVISIBLE: no crash, no failing
-                // request, databases that simply never connect. Make it a
-                // level-triggered incident (re-asserted every start, cleared on a
-                // successful bind) and name the env var that resolves it.
                 let var = match wire {
                     Wire::Postgres => "HIVE_DB_PG_LISTEN",
                     Wire::Redis => "HIVE_DB_REDIS_LISTEN",
@@ -124,9 +119,6 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
             &format!("db-gateway:bind-failed:{}", addr.replace(':', ".")),
             "Listener bound — the DB gateway is serving.",
         );
-        // Shared SNI resolver (serves the `*.{db_domain}` wildcard bundle), but a
-        // config with NO ALPN — a Postgres client (libpq 17+ offers ALPN
-        // `postgresql`) must not get a no_application_protocol alert.
         let acceptor = TlsAcceptor::from(crate::acme::db_server_config());
         tracing::info!(%addr, wire = ?wire, domain = %cloud.db_domain, "db-gateway listener up");
         loop {
@@ -160,28 +152,32 @@ fn is_pg_ssl_request(pre: &[u8; 8]) -> bool {
     len == 8 && code == PG_SSL_REQUEST_CODE
 }
 
+/// Serves one client connection. Postgres first: the client sends an `SSLRequest` in plaintext, the
+/// server answers `S`, THEN the TLS handshake begins; a client that starts in plaintext
+/// (`sslmode=disable`, or `prefer` without TLS) gets `N` and is closed, so it fails fast with a
+/// clear error rather than hanging, because TLS is required for SNI routing. After the handshake
+/// the SNI server name (the one the resolver picked the wildcard cert by) is the routing key: it
+/// resolves the tenant database by its external hostname, and the connection is spliced,
+/// TLS-terminated client to plaintext loopback backend (`127.0.0.1:<local_port>`, the port podman
+/// publishes on THIS node), so the client's post-handshake bytes (PG StartupMessage, RESP AUTH)
+/// reach the engine untouched. A database without a `local_port` is simulated (no container) or
+/// hosted on another node, which per-DB DNS should prevent.
 async fn handle(
     cloud: Arc<CloudState>,
     mut stream: TcpStream,
     acceptor: TlsAcceptor,
     wire: Wire,
 ) -> anyhow::Result<()> {
-    // Postgres SSL negotiation preamble (must precede the TLS handshake).
     if matches!(wire, Wire::Postgres) {
         let mut pre = [0u8; 8];
         stream.read_exact(&mut pre).await?;
         if !is_pg_ssl_request(&pre) {
-            // Client tried a plaintext startup (sslmode=disable/prefer without TLS).
-            // TLS is required for SNI routing — tell it SSL is unsupported so it
-            // fails fast with a clear error rather than hanging.
             let _ = stream.write_all(b"N").await;
             anyhow::bail!("postgres client did not request TLS (needs sslmode=require)");
         }
-        stream.write_all(b"S").await?; // proceed with TLS
+        stream.write_all(b"S").await?;
     }
 
-    // TLS handshake — the SNI resolver picks the wildcard cert by the ClientHello
-    // server-name; we then read that same name to route.
     let tls = acceptor.accept(stream).await?;
     let sni = tls
         .get_ref()
@@ -190,15 +186,11 @@ async fn handle(
         .map(|s| s.to_ascii_lowercase())
         .ok_or_else(|| anyhow::anyhow!("no SNI server-name — cannot route"))?;
 
-    // Resolve the tenant DB by its external hostname.
     let db = cloud
         .databases
         .by_db_host(&sni)
         .ok_or_else(|| anyhow::anyhow!("no database for SNI {sni}"))?;
 
-    // The container is published on THIS node's loopback at `local_port` (podman
-    // `-p 127.0.0.1:<local_port>:5432|6379`). Missing = simulated (no container) or
-    // the DB is hosted on another node (per-DB DNS should prevent that).
     let local_port = db
         .connection
         .get("local_port")
@@ -211,9 +203,6 @@ async fn handle(
         .await
         .map_err(|e| anyhow::anyhow!("backend {backend_addr} unreachable: {e}"))?;
 
-    // Splice: client (TLS-terminated) <-> backend (plaintext loopback). The
-    // client's post-handshake bytes (PG StartupMessage / RESP AUTH) flow straight
-    // through to the real engine.
     let mut tls = tls;
     tokio::io::copy_bidirectional(&mut tls, &mut backend).await?;
     Ok(())
