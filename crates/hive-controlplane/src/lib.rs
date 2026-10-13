@@ -1,16 +1,7 @@
-//! `hive-controlplane` — the orchestrator.
-//!
-//! This is the brain the Hive write-up describes as the **Control Plane**:
-//! it owns job placement, the **warm pool** of pre-provisioned cells,
-//! autoscaling, and the cell/job lifecycle. It drives any [`CellBackend`]
-//! (mock processes today, Firecracker microVMs inside Lima).
-//!
-//! Design rules that keep it correct under concurrency:
-//! * All shared state lives in one [`parking_lot::Mutex`]-guarded `Inner`.
-//! * Locks are **never** held across an `.await`. Slow work (backend
-//!   provision/build/terminate) happens outside the lock; the lock is only
-//!   taken for short bookkeeping critical sections.
-//! * Every capacity reservation has exactly one matching release.
+//! The Control Plane: job placement, the warm pool of pre-provisioned cells, autoscaling and the
+//! cell/job lifecycle over any [`CellBackend`]. All shared state lives in one `Mutex`-guarded
+//! `Inner`, locks are never held across an `.await`, and every capacity reservation has exactly
+//! one release.
 
 pub mod config;
 pub mod logbus;
@@ -47,14 +38,8 @@ struct Inner {
     running_builds: usize,
 }
 
-/// How many FINISHED jobs (record + its replay log bus) are retained. In-flight
-/// jobs are never evicted regardless of this number.
-///
-/// `jobs` and `logs` were both append-only for the life of the process: one
-/// `JobRecord` and one `LogBus` per build ever submitted, neither ever removed.
-/// On a node that builds continuously that is a monotonic leak whose rate is
-/// exactly the deploy rate, and the log half carried the actual build output —
-/// megabytes per entry. Retention has to be a real number, not "forever".
+/// How many FINISHED jobs (record + replay log bus) are retained; in-flight jobs are never
+/// evicted.
 const MAX_RETAINED_FINISHED_JOBS: usize = 200;
 
 fn max_retained_finished_jobs() -> usize {
@@ -80,7 +65,6 @@ impl Inner {
     /// Take a warm cell for `image` that satisfies `req`, if one exists.
     fn take_warm(&mut self, image: &str, req: &ResourceSpec) -> Option<CellId> {
         let pool = self.warm.get_mut(image)?;
-        // Find the first warm cell big enough.
         let pos = pool.iter().position(|cid| {
             self.cells
                 .get(cid)
@@ -151,12 +135,10 @@ impl Hive {
             "control plane starting"
         );
 
-        // Scheduler loop: react to new work / freed capacity.
         {
             let h = hive.clone();
             tokio::spawn(async move { h.scheduler_loop().await });
         }
-        // Autoscaler loop: maintain the warm pool and reap stale cells.
         {
             let h = hive.clone();
             tokio::spawn(async move { h.autoscaler_loop().await });
@@ -164,8 +146,6 @@ impl Hive {
 
         hive
     }
-
-    // ---- public API ----------------------------------------------------
 
     /// Submit a build. Returns immediately; placement happens asynchronously.
     pub fn submit(&self, job: BuildJob) -> JobId {
@@ -199,30 +179,24 @@ impl Hive {
         self.logs.get(id).map(|b| b.is_done()).unwrap_or(false)
     }
 
-    /// Total bytes currently retained across every job's replay buffer — the
-    /// gauge that makes this bound observable from outside the process
-    /// (hive-cloud surfaces it on `GET /v1/debug/memory`).
+    /// Total bytes retained across every job's replay buffer — the gauge hive-cloud surfaces on
+    /// `GET /v1/debug/memory`.
     pub fn log_retention_bytes(&self) -> usize {
         self.logs.iter().map(|e| e.value().retained_bytes()).sum()
     }
 
-    /// Number of retained job records / log buses.
+    /// Number of retained job records / log buses, each read under its own lock.
     pub fn retained_job_counts(&self) -> (usize, usize) {
-        // Read the two under separate, non-overlapping locks. Written as one
-        // tuple expression the `inner` guard would live until the end of the
-        // statement, i.e. across the DashMap access — establishing an
-        // inner→logs lock order for a pair of counters that need no atomicity.
-        let jobs = self.inner.lock().jobs.len();
+        let jobs = self.retained_job_records();
         (jobs, self.logs.len())
     }
 
-    /// Evict the oldest FINISHED jobs — record and replay log together — down to
-    /// the retention bound. Called after every job terminates and on the
-    /// autoscaler tick (so a job that finished via a path that forgot to call
-    /// it is still collected).
-    ///
-    /// Record and bus are evicted as one unit: a `JobView` whose logs 404, or a
-    /// `LogBus` no job names, are both worse than an honestly-forgotten job.
+    fn retained_job_records(&self) -> usize {
+        self.inner.lock().jobs.len()
+    }
+
+    /// Evict the oldest FINISHED jobs — record and replay log as one unit — down to the retention
+    /// bound; called after every job terminates and on the autoscaler tick.
     fn reap_finished_jobs(&self) {
         let keep = max_retained_finished_jobs();
         let evict: Vec<JobId> = {
@@ -230,17 +204,12 @@ impl Hive {
             let mut finished: Vec<(u64, JobId)> = inner
                 .jobs
                 .iter()
-                // `is_terminal()` rather than a local variant list, so a new
-                // terminal state is retained-and-reaped by default instead of
-                // silently becoming immortal.
                 .filter(|(_, j)| j.state.is_terminal())
                 .map(|(id, j)| (j.finished_at_ms.unwrap_or(0), id.clone()))
                 .collect();
             if finished.len() <= keep {
                 return;
             }
-            // Oldest first; ties broken by id so the choice is deterministic
-            // rather than dependent on HashMap iteration order.
             finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             let drop_n = finished.len() - keep;
             let evict: Vec<JobId> = finished
@@ -269,7 +238,6 @@ impl Hive {
 
     pub fn cluster_status(&self) -> ClusterStatus {
         let inner = self.inner.lock();
-        // Recompute per-box warm counts from the cell table for accuracy.
         let mut warm_per_box: HashMap<BoxId, usize> = HashMap::new();
         for c in inner.cells.values() {
             if c.state == CellState::Warm {
@@ -297,11 +265,8 @@ impl Hive {
         }
     }
 
-    // ---- scheduler -----------------------------------------------------
-
     async fn scheduler_loop(self: Arc<Self>) {
         loop {
-            // Wait for a wake or a periodic safety tick.
             tokio::select! {
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(self.cfg.autoscaler_interval) => {}
@@ -338,7 +303,6 @@ impl Hive {
                 None => continue,
             };
 
-            // 1) Warm-pool hit — the fast path Hive optimizes for.
             if let Some(cell_id) = inner.take_warm(&image, &req) {
                 inner.queue.remove(idx);
                 Self::assign(&mut inner, &job_id, &cell_id, false);
@@ -351,7 +315,6 @@ impl Hive {
                 };
             }
 
-            // 2) Cold provision — reserve capacity on a box now, boot later.
             if let Some(bidx) = inner.pick_box(&req) {
                 let box_id = inner.boxes[bidx].id.clone();
                 inner.boxes[bidx].reserve(&req);
@@ -380,14 +343,12 @@ impl Hive {
                     warm: false,
                 };
             }
-            // else: this job can't be placed right now; try the next one.
         }
         Decision::Idle
     }
 
-    /// Wire a cell to a job and move both into their scheduled states.
-    /// `cold` controls whether the cell starts in Provisioning (true) or
-    /// transitions from Warm->Assigned (false).
+    /// Wire a cell to a job and move both into their scheduled states; `cold` starts the cell in
+    /// Provisioning instead of Warm->Assigned.
     fn assign(inner: &mut Inner, job_id: &JobId, cell_id: &CellId, cold: bool) {
         if let Some(cell) = inner.cells.get_mut(cell_id) {
             if !cold {
@@ -403,12 +364,9 @@ impl Hive {
         }
     }
 
-    // ---- per-cell execution -------------------------------------------
-
     /// Provision (if cold) then run the build, then tear the cell down.
     async fn run_cell(self: Arc<Self>, job_id: JobId, cell_id: CellId, warm: bool) {
         if !warm {
-            // Cold path: boot the microVM / prepare the sandbox.
             let spec = {
                 let inner = self.inner.lock();
                 match inner.cells.get(&cell_id) {
@@ -416,8 +374,6 @@ impl Hive {
                         id: c.id.clone(),
                         image: c.image.clone(),
                         resources: c.resources.clone(),
-                        // Build cells aren't tenant-attributed yet (build-pipeline
-                        // tenancy is a follow-up); default to the shared tenant.
                         tenant: String::new(),
                         container: None, // build cell, not a container
                     },
@@ -477,8 +433,6 @@ impl Hive {
             .or_insert_with(|| Arc::new(LogBus::new()))
             .clone();
 
-        // mpsc -> LogBus forwarder. run_build owns the sender; when it returns,
-        // the sender drops and this loop ends.
         let (tx, mut rx): (LogSink, mpsc::UnboundedReceiver<LogLine>) = mpsc::unbounded_channel();
         let bus_fwd = bus.clone();
         let fwd = tokio::spawn(async move {
@@ -574,23 +528,16 @@ impl Hive {
         self.wake.notify_one();
     }
 
-    // ---- autoscaler / warm pool ---------------------------------------
-
     async fn autoscaler_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(self.cfg.autoscaler_interval).await;
             self.clone().reconcile_warm_pool();
-            // Backstop for any terminal transition that does not run the
-            // post-build reap (a job failed before `run_build_phase`, a future
-            // cancellation path): retention must not depend on every writer
-            // remembering to call it.
             self.reap_finished_jobs();
         }
     }
 
     /// Bring each image's warm pool toward its target, and reap extras/stale.
     fn reconcile_warm_pool(self: Arc<Self>) {
-        // 1) Scale up.
         for image in self.cfg.warm_images() {
             let target = self.cfg.warm_target_for(&image);
             loop {
@@ -635,7 +582,6 @@ impl Hive {
             }
         }
 
-        // 2) Reap extras and stale cells.
         let ttl_ms = self.cfg.warm_idle_ttl.as_millis() as u64;
         let now = now_ms();
         let mut reap: Vec<CellId> = Vec::new();
@@ -644,14 +590,12 @@ impl Hive {
             let images: Vec<String> = inner.warm.keys().cloned().collect();
             for image in images {
                 let target = self.cfg.warm_target_for(&image);
-                // Pop from the back while over target; recycle stale ones too.
                 if let Some(pool) = inner.warm.get_mut(&image) {
                     let mut keep: VecDeque<CellId> = VecDeque::new();
                     while let Some(cid) = pool.pop_front() {
                         keep.push_back(cid);
                     }
                     *pool = VecDeque::new();
-                    // Decide per cell.
                     let mut kept = 0usize;
                     for cid in keep {
                         let stale = inner
@@ -688,7 +632,6 @@ impl Hive {
                     id: c.id.clone(),
                     image: c.image.clone(),
                     resources: c.resources.clone(),
-                    // Build cells aren't tenant-attributed yet (follow-up).
                     tenant: String::new(),
                     container: None, // build cell, not a container
                 },
@@ -714,7 +657,6 @@ impl Hive {
                     }
                 }
                 debug!(cell = %cell_id, image = %image, "warm cell ready");
-                // A new warm cell might unblock a queued job.
                 self.wake.notify_one();
             }
             Err(e) => {

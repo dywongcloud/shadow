@@ -1,20 +1,6 @@
-//! Live, no-mocks witness for hive-crsql's sync seam: REAL cr-sqlite peers
-//! (in-memory AND file-backed), exercising the per-origin-site sync protocol
-//! end to end. Run:
-//!   cargo run -p hive-crsql --example sync_roundtrip
-//! Not a test file (see AGENTS.md's no-test-files rule) -- a real, one-off
-//! executable proof, same category as this repo's other `examples/*.rs`.
-//!
-//! Proves, in order:
-//!   [1] divergent peers converge via per-site export/apply, ts survives
-//!       merge verbatim both directions, and the bounded wire encoding is
-//!       deterministic (two exports byte-identical, decode(encode(b)) == b)
-//!   [2] replay/idempotency: applying the same batches twice is a no-op
-//!   [3] interruption between batches: apply batch 1 of 3, drop+reopen the
-//!       FILE-BACKED peer (progress is durable), resume redelivers batch 1
-//!       as a no-op, batches 2-3 apply, final state == uninterrupted peer
-//!   [4] gap detection: a batch arriving before its predecessor is refused
-//!       with SyncGap and leaves zero trace; the chain then applies cleanly
+//! Live, no-mocks witness for hive-crsql's sync seam against REAL cr-sqlite peers (in-memory and
+//! file-backed): convergence + deterministic wire encoding, replay idempotency, interruption with
+//! durable progress, and gap refusal. Run: `cargo run -p hive-crsql --example sync_roundtrip`.
 
 use anyhow::Context;
 use hive_crsql::{ApplyOutcome, ChangeBatch, SyncGap};
@@ -41,9 +27,6 @@ fn full_export(conn: &rusqlite::Connection, site: &[u8]) -> anyhow::Result<Vec<C
 }
 
 fn main() -> anyhow::Result<()> {
-    // ---------------------------------------------------------------
-    // [1] Divergent peers, per-site sync round trip, ts + wire determinism
-    // ---------------------------------------------------------------
     let a = mem_peer()?;
     let b = mem_peer()?;
 
@@ -52,22 +35,16 @@ fn main() -> anyhow::Result<()> {
     let b_site = hive_crsql::site_id(&b)?;
     assert_ne!(a_site, b_site, "distinct peers must have distinct site ids");
 
-    // Per-site selection must isolate: before any sync, A holds nothing from B.
     assert!(
         full_export(&a, &b_site)?.is_empty(),
         "a must hold zero b-site changes before sync"
     );
 
-    // Diverge: peer A writes row 1, peer B writes row 2 -- neither knows
-    // about the other's write yet. Each sets its transaction ts first: the
-    // v0.17 fork resets ext_data.timestamp to 0 on commit, so writes without
-    // `crsql_set_ts` record ts '0' -- useless on the wire.
     hive_crsql::set_ts(&a, 1_754_000_000_001)?;
     a.execute("INSERT INTO items (id, label) VALUES (1, 'from-a')", [])?;
     hive_crsql::set_ts(&b, 1_754_000_000_002)?;
     b.execute("INSERT INTO items (id, label) VALUES (2, 'from-b')", [])?;
 
-    // Outbound half: per-site bounded export. One change each -> one batch.
     let a_out =
         hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
     let b_out =
@@ -92,8 +69,6 @@ fn main() -> anyhow::Result<()> {
         "b's write must carry the ts its transaction set"
     );
 
-    // Bounded DETERMINISTIC serialization: encoding is stable across exports
-    // and round-trips exactly.
     let enc1: Vec<u8> = a_out[0].encode();
     let a_out2 =
         hive_crsql::changes_since_site(&a, &a_site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?;
@@ -109,7 +84,6 @@ fn main() -> anyhow::Result<()> {
     );
     println!("[1] wire encoding deterministic: {} byte frame, export-encode-export stable, round-trip exact", enc1.len());
 
-    // Inbound half over the WIRE FORM (not the in-memory structs): real sync.
     let b_wire: Vec<ChangeBatch> = b_out
         .iter()
         .map(|bb| ChangeBatch::decode(&bb.encode()))
@@ -133,8 +107,6 @@ fn main() -> anyhow::Result<()> {
         ApplyOutcome::Applied { applied: 1, .. }
     ));
 
-    // ts must survive the merge verbatim -- the winner-clock insert binds the
-    // inbound change's own ts (changes_vtab_write.rs `set_winner_clock`).
     let a_holds_b = full_export(&a, &b_site)?;
     let b_holds_a = full_export(&b, &a_site)?;
     let merged_from_b = &a_holds_b[0].changes[0];
@@ -163,9 +135,6 @@ fn main() -> anyhow::Result<()> {
     );
     println!("[1] OK divergent peers converged via per-site sync");
 
-    // ---------------------------------------------------------------
-    // [2] Replay/idempotency: same batch twice = deterministic no-op
-    // ---------------------------------------------------------------
     let c_mem = mem_peer()?;
     let d_mem = mem_peer()?;
     let c_mem_site = hive_crsql::site_id(&c_mem)?;
@@ -173,7 +142,6 @@ fn main() -> anyhow::Result<()> {
     c_mem.execute("INSERT INTO items (id, label) VALUES (1, 'c1')", [])?;
     hive_crsql::set_ts(&c_mem, 1_754_000_001_002)?;
     c_mem.execute("INSERT INTO items (id, label) VALUES (2, 'c2')", [])?;
-    // max_changes_per_batch=1 forces one batch per commit -> a 2-batch chain.
     let cd_batches = hive_crsql::changes_since_site(&c_mem, &c_mem_site, 0, 1)?;
     assert_eq!(
         cd_batches.len(),
@@ -224,9 +192,6 @@ fn main() -> anyhow::Result<()> {
     );
     println!("[2] OK replay is a deterministic no-op (watermark {d_watermark} unchanged, state byte-identical)");
 
-    // ---------------------------------------------------------------
-    // [3] Interruption between batches + durable per-site progress
-    // ---------------------------------------------------------------
     let dir = std::env::temp_dir().join(format!(
         "hive-crsql-roundtrip-{}-{}",
         std::process::id(),
@@ -239,20 +204,14 @@ fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     result?;
 
-    // ---------------------------------------------------------------
-    // [4] Gap detection: missing/out-of-order batch is refused loudly
-    // ---------------------------------------------------------------
     scenario_gap(&cd_batches, &c_mem_site)?;
 
     println!("REAL_SYNC_ROUNDTRIP_OK");
     Ok(())
 }
 
-/// [3] File-backed peers: source C makes 3 commits -> a 3-batch chain. Peer D
-/// applies batch 1, "restarts" (connection dropped, file reopened), and MUST
-/// still know its watermark; resuming redelivers batch 1 (Replay no-op) then
-/// applies 2-3. Peer E applies all three uninterrupted. D and E must end
-/// byte-identical.
+/// File-backed peers: D applies batch 1 of 3, "restarts" (file reopened), resumes with batch 1 as
+/// a Replay no-op then 2–3; E applies all three uninterrupted; D and E must end byte-identical.
 fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
     let c = hive_crsql::open(dir.join("c.db"))?;
     c.execute_batch(ITEMS_DDL)?;
@@ -280,7 +239,6 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
             .join(" , ")
     );
 
-    // D: apply batch 1 only, then "crash".
     let applied_before_crash;
     {
         let d = hive_crsql::open(dir.join("d.db"))?;
@@ -294,7 +252,6 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         assert!(matches!(out, ApplyOutcome::Applied { applied: 1, .. }));
     } // d dropped here: the "process" is gone.
 
-    // Reopen from the file: progress must have survived the restart.
     let d = hive_crsql::open(dir.join("d.db"))?;
     let durable = hive_crsql::watermark_for(&d, &c_site)?;
     assert_eq!(
@@ -315,7 +272,6 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         "reopened peer must still know the source site"
     );
 
-    // Resume: redelivery of batch 1 is a Replay no-op, then 2 and 3 apply.
     let resume0 = hive_crsql::apply_batch(&d, &batches[0])?;
     assert!(
         matches!(resume0, ApplyOutcome::Replay { skipped: 1, .. }),
@@ -327,7 +283,6 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
         .all(|o| matches!(o, ApplyOutcome::Applied { .. })));
     println!("[3] resume: redelivered batch 1 -> Replay; batches 2-3 -> {resume_rest:?}");
 
-    // E: uninterrupted baseline, same three batches in one go.
     let e = hive_crsql::open(dir.join("e.db"))?;
     e.execute_batch(ITEMS_DDL)?;
     hive_crsql::as_crr(&e, "items")?;
@@ -356,7 +311,6 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
 fn scenario_gap(batches: &[ChangeBatch], c_site: &[u8]) -> anyhow::Result<()> {
     let f = mem_peer()?;
 
-    // Batch 2 of 2 first (its predecessor never arrived).
     let err = hive_crsql::apply_batch(&f, &batches[1])
         .expect_err("batch 2 before batch 1 must be refused");
     let gap = err
@@ -378,7 +332,6 @@ fn scenario_gap(batches: &[ChangeBatch], c_site: &[u8]) -> anyhow::Result<()> {
         "a refused batch must not advance the durable watermark (transactional rollback)"
     );
 
-    // In order now: batch 1 applies; re-trying batch 2 still works.
     let o1 = hive_crsql::apply_batch(&f, &batches[0])?;
     assert!(matches!(o1, ApplyOutcome::Applied { applied: 1, .. }));
     let o2 = hive_crsql::apply_batch(&f, &batches[1])?;

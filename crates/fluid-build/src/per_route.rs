@@ -1,21 +1,7 @@
-//! Per-route build-artifact discovery for Next.js — the foundation of Vercel-style
-//! per-route function splitting (one bundle per route, traced deps only) instead
-//! of one `next start` server for the whole app.
-//!
-//! This module is PURE DISCOVERY + CLASSIFICATION: it reads the manifests Next.js
-//! emits into `.next` and produces a [`PerRouteManifest`] mapping each route to a
-//! kind, runtime, entrypoint, and the file-trace it would bundle. It never
-//! executes anything and never touches the live serve path — the runtime
-//! dispatcher consumes this manifest separately and falls back to `next start`.
-//!
-//! Manifests read (all optional; absent ones are skipped — version-tolerant):
-//!   * `routes-manifest.json`         — Pages static/dynamic routes, headers/redirects
-//!   * `pages-manifest.json`          — Pages Router route -> server file
-//!   * `app-paths-manifest.json`      — App Router route -> server file
-//!   * `middleware-manifest.json`     — middleware + edge functions (kept on fallback)
-//!   * `prerender-manifest.json`      — SSG/ISR routes + revalidate
-//!   * `required-server-files.json`   — base files every server bundle needs
-//!   * `<server-file>.nft.json`       — per-route file traces (only these get bundled)
+//! Per-route build-artifact discovery for Next.js: pure discovery + classification of the
+//! manifests under `.next` into a [`PerRouteManifest`] (route → kind, runtime, entrypoint, file
+//! trace) for per-route function splitting. Never executes anything; the dispatcher consumes the
+//! manifest separately and falls back to `next start`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -59,12 +45,8 @@ impl RouteKind {
         }
     }
 
-    /// The runtime-facing class (#16). The canonical cache/retry/concurrency
-    /// policy lives on [`fluid_core::RouteClass`] (the shared crate the serve path
-    /// can reach); this maps build-time discovery onto it. `hive-cloud` does the
-    /// actual mapping when it persists the per-route manifest into the deployment
-    /// `Manifest` (it depends on both crates; `fluid-build` does not depend on
-    /// `fluid-core`, so the string is the contract).
+    /// The runtime-facing class name; the string is the contract with [`fluid_core::RouteClass`]
+    /// since `fluid-build` does not depend on `fluid-core`.
     pub fn class_name(self) -> &'static str {
         match self {
             RouteKind::Static => "static",
@@ -123,12 +105,12 @@ impl PerRouteManifest {
     }
 }
 
-/// Read a `.next` manifest by name, tolerant of version differences in WHERE Next
-/// puts it: newer Next (13–16) writes `app-paths-manifest.json`,
-/// `pages-manifest.json`, and `middleware-manifest.json` under `.next/server/`,
-/// while `routes-manifest.json`, `prerender-manifest.json`, and
-/// `required-server-files.json` sit at `.next/`. Try both so we work across
-/// versions; a missing file is simply None.
+fn is_next_internal_route(route: &str) -> bool {
+    route.starts_with("/_") && route != "/_error"
+}
+
+/// Read a `.next` manifest from `.next/` or `.next/server/` (Next 13–16 split them across both);
+/// a missing file is `None`.
 fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
     for cand in [dir.join(name), dir.join("server").join(name)] {
         if let Ok(txt) = std::fs::read_to_string(&cand) {
@@ -167,7 +149,6 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         return m;
     }
 
-    // ISR/SSG routes (route -> revalidate) from prerender-manifest.
     let mut prerender: BTreeMap<String, Option<i64>> = BTreeMap::new();
     if let Some(pr) = read_json(next_dir, "prerender-manifest.json") {
         m.next_version = pr
@@ -184,13 +165,11 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         }
     }
 
-    // Edge functions + middleware (kept on fallback).
     let mut edge_routes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut has_middleware = false;
     if let Some(mw) = read_json(next_dir, "middleware-manifest.json") {
         if let Some(fns) = mw.get("functions").and_then(|f| f.as_object()) {
             for (route, _) in fns {
-                // Normalize manifest keys ("/api/geo/route", "/x/page") to URL form.
                 let u = route.trim_end_matches("/page").trim_end_matches("/route");
                 edge_routes.insert(if u.is_empty() {
                     "/".into()
@@ -209,7 +188,6 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         }
     }
 
-    // required-server-files: base files for any Node bundle.
     if let Some(rsf) = read_json(next_dir, "required-server-files.json") {
         m.next_version = rsf
             .get("version")
@@ -258,15 +236,12 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         }
     };
 
-    // App Router: app-paths-manifest maps route -> server file (relative to .next).
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(app) =
         read_json(next_dir, "app-paths-manifest.json").and_then(|v| v.as_object().cloned())
     {
         for (route, file) in app {
             let sf = file.as_str().unwrap_or("");
-            // App Router server files live under server/. Normalize route key
-            // ("/page" suffix → its URL path).
             let url = route.trim_end_matches("/page").trim_end_matches("/route");
             let url = if url.is_empty() { "/" } else { url };
             if seen.insert(url.to_string()) {
@@ -278,13 +253,11 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         }
     }
 
-    // Pages Router: pages-manifest maps route -> server file.
     if let Some(pages) =
         read_json(next_dir, "pages-manifest.json").and_then(|v| v.as_object().cloned())
     {
         for (route, file) in pages {
-            // Skip Next internals.
-            if route.starts_with("/_") && route != "/_error" {
+            if is_next_internal_route(&route) {
                 continue;
             }
             if seen.insert(route.clone()) {
@@ -297,7 +270,6 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         }
     }
 
-    // Record middleware as a (fallback) route so the dispatcher knows to defer it.
     if has_middleware && seen.insert("__middleware__".into()) {
         m.routes.push(RouteBundle {
             route: "/_middleware".into(),

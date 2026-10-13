@@ -1,54 +1,22 @@
-//! Bounded capture of subprocess output.
-//!
-//! Every build/exec log line on this platform originates in a TENANT-CONTROLLED
-//! child process, and until this module existed every one of those pipes was
-//! drained with `BufReader::lines()` / `next_line()`:
-//!
-//! * `hive-cloud/src/git.rs`   — the deploy build (`npm install && npm run build`)
-//! * `hive-backend/src/mock.rs`— the mock cell backend's build steps
-//! * `hive-cell-agent`         — in-guest exec/build output
-//!
-//! `lines()` splits ONLY on `\n` and has NO length limit, so a child that
-//! writes without ever emitting a newline grows ONE `String` until the process
-//! dies. That is not a corner case: `\r`-only progress rendering (npm, pnpm,
-//! pip, curl, `podman pull`, most bundler progress plugins), a single-line
-//! source map, `tsc --listFiles` piped through a formatter, or a plain
-//! `while true; do printf x; done` all produce it. On a multi-tenant node the
-//! whole process — every other tenant's traffic with it — dies of one tenant's
-//! stdout. The three fc-hongkong kills at 98,214,816 / 98,215,476 /
-//! 98,189,292 kB anon-rss are within 0.03% of each other: that is a process
-//! consuming everything the host has, not a leak converging on a number.
-//!
-//! [`read_capped_line`] (async) and [`read_capped_line_blocking`] (sync) keep
-//! DRAINING the pipe — a child must never block on a full pipe because of us —
-//! while RETAINING at most [`MAX_LOG_LINE_BYTES`]. Peak retained bytes per
-//! reader is therefore the cap plus the `BufReader`'s own fixed buffer,
-//! regardless of what the child writes.
-//!
-//! The bound is observable, never silent: every truncation increments
-//! [`LOG_CAP_STATS`], the returned [`CappedLine`] carries `dropped_bytes`, and
-//! the emitted text ends in [`TRUNCATION_SUFFIX`] so the log READER can see it
-//! too.
+//! Bounded capture of subprocess output. Every build/exec log line comes from a
+//! TENANT-CONTROLLED child, and `BufReader::lines()` has no length limit, so a child that never
+//! emits a newline (`\r` progress bars, one-line source maps) grows one `String` until the process
+//! dies. [`read_capped_line`] / [`read_capped_line_blocking`] keep DRAINING the pipe while
+//! RETAINING at most [`MAX_LOG_LINE_BYTES`]; every truncation is counted in [`LOG_CAP_STATS`] and
+//! marked with [`TRUNCATION_SUFFIX`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum bytes RETAINED from a single log line. Anything beyond this is
-/// drained and counted, never buffered.
-///
-/// 16 KiB is far above any legitimate log line (a 200-column terminal row is
-/// ~200 bytes; the longest real lines here are stack traces and webpack module
-/// paths, low kilobytes) and small enough that the worst case across every
-/// concurrent build on a node is negligible.
+/// Maximum bytes RETAINED from a single log line; anything beyond is drained and counted, never
+/// buffered (16 KiB is far above any legitimate line).
 pub const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
 
 /// Appended to a line that hit the cap, so truncation is visible in the log
 /// itself and not only in a counter nobody reads.
 pub const TRUNCATION_SUFFIX: &str = "…[hive: line truncated, ";
 
-/// Process-global counters for the line cap. Exposed by hive-cloud's
-/// `GET /v1/debug/memory` so "is a tenant hosing us through stdout?" is a
-/// question the fleet can answer from the outside, on a node that is still
-/// alive, instead of being reconstructed from an OOM kill line.
+/// Process-global counters for the line cap, exposed by hive-cloud's `GET /v1/debug/memory` so a
+/// tenant hosing stdout is visible from outside while the node is alive.
 pub static LOG_CAP_STATS: LogCapStats = LogCapStats::new();
 
 #[derive(Debug)]
@@ -103,7 +71,6 @@ impl CappedLine {
 /// Shared tail of both readers: turn the retained bytes into a `String`,
 /// annotate truncation, and account for it.
 fn finish(mut buf: Vec<u8>, dropped: u64) -> CappedLine {
-    // `lines()` semantics: a `\r\n` terminator leaves no `\r` in the line.
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
@@ -129,10 +96,8 @@ fn split_at_newline(available: &[u8]) -> (&[u8], usize, bool) {
     }
 }
 
-/// Blocking variant, for the in-guest agent (`hive-cell-agent` runs its readers
-/// on plain OS threads with `std::io`, and deliberately depends on no runtime).
-///
-/// Returns `Ok(None)` at EOF. Never retains more than `cap` bytes.
+/// Blocking variant for the in-guest agent (plain OS threads, no runtime). Returns `Ok(None)` at
+/// EOF; never retains more than `cap` bytes.
 pub fn read_capped_line_blocking<R: std::io::BufRead>(
     r: &mut R,
     cap: usize,
@@ -165,11 +130,8 @@ pub fn read_capped_line_blocking<R: std::io::BufRead>(
     Ok(Some(finish(out, dropped)))
 }
 
-/// Async variant over any [`tokio::io::AsyncBufRead`] — the build-output path
-/// in `hive-cloud` and `hive-backend`.
-///
-/// Returns `Ok(None)` at EOF. Never retains more than `cap` bytes; the pipe is
-/// drained either way so the child never blocks on a full pipe.
+/// Async variant over any [`tokio::io::AsyncBufRead`]. Returns `Ok(None)` at EOF; never retains
+/// more than `cap` bytes and always drains the pipe.
 #[cfg(feature = "async-io")]
 pub async fn read_capped_line<R>(r: &mut R, cap: usize) -> std::io::Result<Option<CappedLine>>
 where

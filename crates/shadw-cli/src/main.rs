@@ -1,8 +1,6 @@
-//! shadw — the official command-line interface for the shadw platform.
-//!
-//! Wraps the platform REST API using the API key issued in the dashboard
-//! (Settings → API Keys). Run `shadw auth login --token shadw_…` once, then every
-//! command is scoped to that key's team.
+//! shadw — the command-line interface for the shadw platform, wrapping the REST API with the API
+//! key issued in the dashboard; `shadw auth login --token shadw_…` once, then every command is
+//! scoped to that key's team.
 
 mod client;
 mod output;
@@ -15,9 +13,7 @@ use owo_colors::{OwoColorize, Stream};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// The shadw logo — rendered in green on the landing screen (bare
-/// invocation / `--help`). Color is gated by `if_supports_color`, so a
-/// non-tty or `NO_COLOR` run gets the same art, plain.
+/// The logo for the landing screen (bare invocation / `--help`); color gated by `if_supports_color`.
 const BANNER: &str = r#"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣘⡘⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠇⡇⢱⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -32,10 +28,8 @@ const BANNER: &str = r#"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢧⠀⠀⠀�
 ⠀⠀⠀⠀⠀⠀⠀⣠⣾⣳⠥⠒⠁⠀⡇⠀⠙⠲⢕⣞⣦⡀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠈⠉⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⠀⠀"#;
 
-/// Bare invocation or `--help`/`-h` is the CLI's landing screen — show the
-/// logo there, not on every ordinary command (which would be noisy for
-/// scripting/interactive daily use). Checked against raw argv, before clap
-/// parses anything, since both cases otherwise exit inside `Cli::parse()`.
+/// Print the logo only for a bare invocation or `--help`/`-h`, checked against raw argv since
+/// both cases otherwise exit inside `Cli::parse()`.
 fn maybe_print_banner() {
     let first_arg = std::env::args().nth(1);
     let landing = matches!(first_arg.as_deref(), None | Some("--help") | Some("-h"));
@@ -117,7 +111,6 @@ enum Cmd {
     Api(ApiArgs),
 }
 
-// ---- auth ----
 #[derive(Subcommand)]
 enum AuthCmd {
     /// Save your API key + API URL and verify the connection.
@@ -132,9 +125,8 @@ enum AuthCmd {
         /// can derive platform-operator status from its own owner config).
         #[arg(long)]
         email: Option<String>,
-        /// HIVE_INTERNAL_TOKEN for mint-mode auto-login: the CLI then mints and
-        /// auto-refreshes a platform JWT, so mutations work on an enforced
-        /// platform without pasting short-lived tokens.
+        /// `HIVE_INTERNAL_TOKEN` for mint-mode auto-login: the CLI mints and auto-refreshes a platform
+        /// JWT so mutations work on an enforced platform.
         #[arg(long)]
         internal_token: Option<String>,
     },
@@ -153,7 +145,6 @@ enum AuthCmd {
     Logout,
 }
 
-// ---- deploy / build ----
 #[derive(Parser)]
 struct DeployArgs {
     /// Git repository URL to deploy.
@@ -191,7 +182,6 @@ enum BuildCmd {
     },
 }
 
-// ---- deployments ----
 #[derive(Subcommand)]
 enum DepCmd {
     /// List deployments for the active team.
@@ -204,7 +194,6 @@ enum DepCmd {
     Resources { id: String },
 }
 
-// ---- projects ----
 #[derive(Subcommand)]
 enum ProjCmd {
     /// List projects (with git + production deployment).
@@ -246,7 +235,6 @@ enum EnvCmd {
     Rm { project: String, key: String },
 }
 
-// ---- domains / dns ----
 #[derive(Subcommand)]
 enum DomCmd {
     /// List custom domains.
@@ -308,7 +296,6 @@ enum RecordCmd {
     Rm { domain: String, id: String },
 }
 
-// ---- webhooks ----
 #[derive(Subcommand)]
 enum HookCmd {
     /// List webhooks.
@@ -330,7 +317,6 @@ enum HookCmd {
     Delete { id: String },
 }
 
-// ---- teams ----
 #[derive(Subcommand)]
 enum TeamCmd {
     List,
@@ -361,7 +347,6 @@ enum MemberCmd {
     },
 }
 
-// ---- keys ----
 #[derive(Subcommand)]
 enum KeyCmd {
     List,
@@ -375,7 +360,6 @@ enum KeyCmd {
     },
 }
 
-// ---- databases ----
 #[derive(Subcommand)]
 enum DbCmd {
     List,
@@ -395,7 +379,6 @@ enum DbCmd {
     },
 }
 
-// ---- cron ----
 #[derive(Subcommand)]
 enum CronCmd {
     List,
@@ -409,7 +392,6 @@ enum CronCmd {
     },
 }
 
-// ---- workflows ----
 #[derive(Subcommand)]
 enum WfCmd {
     List,
@@ -417,7 +399,6 @@ enum WfCmd {
     Run { id: String },
 }
 
-// ---- observability ----
 #[derive(Subcommand)]
 enum ObsCmd {
     Overview,
@@ -431,7 +412,6 @@ enum ObsCmd {
     Nodes,
 }
 
-// ---- generic passthrough ----
 #[derive(Parser)]
 struct ApiArgs {
     /// HTTP method (GET, POST, PUT, DELETE).
@@ -455,9 +435,6 @@ async fn main() {
         || std::env::var("SHADW_TOKEN").is_ok()
         || std::env::var("SHADW_API_KEY").is_ok();
     let mut c = Client::resolve(cli.api.clone(), cli.token.clone(), cli.team.clone());
-    // Mint-mode auto-login (config `internal_token`): transparently swap in a
-    // fresh platform JWT so mutations pass the enforced ingress. No-op for the
-    // plain API-key flow or an explicit --token/env token.
     c.ensure_fresh_token(explicit_token).await;
     if let Err(e) = run(cli, &c, out).await {
         let prefix = "error:".if_supports_color(Stream::Stderr, |t| t.red());
@@ -535,7 +512,6 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 team: team.or_else(|| c.team.clone()),
                 email: email.or(prev.email),
                 internal_token: internal_token.or(prev.internal_token),
-                // Force a fresh mint under the possibly-changed identity.
                 jwt: None,
                 jwt_exp: None,
             };
@@ -544,18 +520,14 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 return Err(anyhow!("no credentials provided — pass --token hive_… (dashboard: Settings → API Keys) or --internal-token for mint-mode auto-login"));
             }
             client::save_config(&cfg)?;
-            // Verify with a freshly-resolved client (mint-mode mints here).
             let mut verify = Client::resolve(cfg.api.clone(), cfg.token.clone(), cfg.team.clone());
             verify.ensure_fresh_token(false).await;
             let who = verify.get("/v1/whoami").await?;
             let authed = who["authenticated"].as_bool().unwrap_or(false);
-            // Only an ENFORCING platform can prove credentials are wrong. An
-            // unenforced (dev) node reports `authenticated:false` for anything
-            // it cannot bind, so refusing there would break local development.
-            if !authed && who["enforced"].as_bool().unwrap_or(false) {
+            let platform_enforces_auth = who["enforced"].as_bool().unwrap_or(false);
+            if !authed && platform_enforces_auth {
                 return Err(anyhow!("saved config, but /v1/whoami reports unauthenticated — check the token/internal token"));
             }
-            // Fall back to the key's own team when the node bound no identity.
             let tenant = match who["tenant"].as_str().filter(|s| !s.is_empty()) {
                 Some(t) => t.to_string(),
                 None => verify
@@ -613,8 +585,6 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
             {
                 println!("Platform admin: {admin}");
             }
-            // The key's own team, independent of whether this node bound an
-            // identity — the answer to "which team am I acting as".
             if let Ok(keys) = c.get("/v1/apikeys").await {
                 if let Some(arr) = keys.as_array() {
                     if let Some(k) = arr.first() {
@@ -631,8 +601,6 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
             Ok(())
         }
         AuthCmd::Token { sub, tenant, role } => {
-            // Include the account email so the backend derives platform-operator
-            // status from its own owner config (it never trusts a client claim).
             let email = client::load_config().email.unwrap_or_default();
             out.value(
                 &c.post(
@@ -745,11 +713,25 @@ async fn follow_build(id: &str, follow: bool, c: &Client, out: Out) -> Result<()
             shown = lines.len();
         }
         let state = b["state"].as_str().unwrap_or("");
-        if !follow || state == "ready" || state == "error" {
+        let terminal = matches!(state, "ready" | "error" | "cancelled");
+        if !follow || terminal {
             if !follow {
                 out.value(&b);
             } else {
                 println!("\nBuild {id} → {state}");
+                if state != "ready" {
+                    let project = b["project"].as_str().unwrap_or("");
+                    if let Some(error) = b["error"].as_str().filter(|e| !e.is_empty()) {
+                        println!("{error}");
+                    }
+                    if !project.is_empty() {
+                        println!(
+                            "Project {project} is reserved for your team even without a deployment. \
+                             Retry: shadw projects redeploy {project} | Delete: shadw projects delete {project}"
+                        );
+                    }
+                    anyhow::bail!("build {id} ended {state}");
+                }
             }
             return Ok(());
         }
@@ -768,8 +750,22 @@ async fn projects(p: ProjCmd, c: &Client, out: Out) -> Result<()> {
                     ("root_dir", "ROOT"),
                     ("git.branch", "BRANCH"),
                     ("production.alias", "PRODUCTION URL"),
+                    ("settings.last_build.state", "LAST BUILD"),
                 ],
             );
+            if !out.json {
+                for row in v.as_array().into_iter().flatten() {
+                    let project = row["project"].as_str().unwrap_or("");
+                    let build = &row["settings"]["last_build"];
+                    let state = build["state"].as_str().unwrap_or("");
+                    if row["production"].is_null() && matches!(state, "error" | "cancelled") {
+                        println!(
+                            "{project}: build {} {state} — shadw projects redeploy {project} | shadw projects delete {project}",
+                            build["id"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+            }
         }
         ProjCmd::Settings { project } => {
             out.value(&c.get(&format!("/v1/projects/{project}/settings")).await?)

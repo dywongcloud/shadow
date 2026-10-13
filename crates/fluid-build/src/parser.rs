@@ -80,13 +80,8 @@ impl BuildOutput {
         self.config.images.is_some()
     }
 
-    /// Crate-layering bridge into `fluid_core::BuildOutputV3`.
-    ///
-    /// `fluid-build` intentionally has no production dependency on `fluid-core`.
-    /// The planner therefore calls
-    /// `fluid_core::BuildOutputV3::from_parser_value(output.descriptor_value())`
-    /// after parsing. This envelope contains no absolute path or other host
-    /// authority: only exact config metadata and validated relative inventories.
+    /// Crate-layering bridge into `fluid_core::BuildOutputV3::from_parser_value` (`fluid-build` has
+    /// no dependency on `fluid-core`); carries no absolute path or host authority.
     pub fn descriptor_value(&self) -> serde_json::Value {
         serde_json::json!({
             "config": self.raw_config,
@@ -102,12 +97,9 @@ impl BuildOutput {
     }
 }
 
-/// True when `repo` contains anything claiming the Build Output location.
-///
-/// Detection is intentionally broader than validity. A symlink, special path,
-/// directory with no config, or unreadable candidate must reach
-/// [`parse_build_output`] and fail loudly; returning false would let a caller
-/// degrade malformed v3 input to a static fallback.
+/// True when `repo` contains anything claiming the Build Output location — deliberately broader
+/// than validity, so malformed input reaches [`parse_build_output`] and fails loudly instead of
+/// degrading to a static fallback.
 pub fn has_build_output(repo: &Path) -> bool {
     match std::fs::symlink_metadata(repo.join(".vercel/output")) {
         Ok(_) => true,
@@ -631,9 +623,8 @@ fn validate_function_config(
     Ok(())
 }
 
-/// The legacy typed compatibility view predates the official Edge `regions:
-/// "all" | string | string[]` union. Normalize only that view; the durable raw
-/// config remains byte-semantically exact in `raw_config`.
+/// Normalize only the legacy typed view for the Edge `regions: "all" | string | string[]` union;
+/// `raw_config` stays byte-exact.
 fn normalized_typed_function_config(config: &serde_json::Value) -> serde_json::Value {
     let mut typed = config.clone();
     let edge = typed.get("runtime").and_then(serde_json::Value::as_str) == Some("edge");

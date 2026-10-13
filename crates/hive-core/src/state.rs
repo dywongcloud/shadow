@@ -1,17 +1,8 @@
 //! Lifecycle state machines for cells and jobs.
-//!
-//! These mirror the lifecycle the Control Plane manages in Hive: cells are
-//! provisioned, pre-warmed, assigned to a job, run, then drained/terminated.
 
 use serde::{Deserialize, Serialize};
 
-/// The lifecycle of a single cell (a Firecracker microVM in the real backend).
-///
-/// ```text
-///   Provisioning ──▶ Warm ──▶ Assigned ──▶ Running ──▶ Draining ──▶ Terminated
-///        │            │          │            │
-///        └────────────┴──────────┴────────────┴────────────▶ Failed
-/// ```
+/// The lifecycle of a single cell; legal moves are defined by [`CellState::can_transition_to`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellState {
@@ -57,20 +48,13 @@ impl CellState {
             | (Running, Failed)
             | (Draining, Terminated)
             | (Draining, Failed) => true,
-            // self-loops are no-ops but allowed
             (a, b) if a == b => true,
             _ => false,
         }
     }
 }
 
-/// The lifecycle of a build job.
-///
-/// ```text
-///   Queued ──▶ Scheduled ──▶ Building ──▶ Succeeded
-///                                    └───▶ Failed | TimedOut
-///   Queued/Scheduled/Building ───────────▶ Canceled
-/// ```
+/// The lifecycle of a build job; `is_terminal` names the end states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {

@@ -1,77 +1,18 @@
-//! Thin `rusqlite` wrapper around the vendored `superfly/cr-sqlite` loadable
-//! extension (`vendor/cr-sqlite`, built by its own `build.sh` — see
-//! `vendor/cr-sqlite/VENDOR.md` for why this fork over upstream vlcn-io).
-//!
-//! Real, live-witnessed 2026-08-01 against `crsqlite.dylib` built from the
-//! vendored source on this machine: opened an in-memory connection, loaded
-//! the extension, ran `crsql_as_crr('foo')`, inserted + updated real rows,
-//! and read them back through `crsql_changes` — `crsql_version()` reported
-//! `170000` (v0.17.0) and the changes reflected the exact history-free,
-//! last-write-wins semantics `vendor/cr-sqlite/README.md` documents (a
-//! superseded column's earlier `col_version` disappears rather than
-//! accumulating). This module is that same call sequence, not a
-//! reimplementation — the only thing new here is packaging it as a reusable
-//! sync seam instead of a one-off scratch binary.
-//!
-//! The sync seam (per `bn-impl-fleet-crr-peer`):
-//! - **Per-origin-site progress, not one global `db_version` cursor.** The
-//!   fork's clock tables keep each change's ORIGIN `site_id` and ORIGIN
-//!   `db_version` on merge, and the extension itself maintains
-//!   `crsql_db_versions (site_id, db_version)` — a durable, in-the-same-
-//!   transaction high-water mark per site, bumped on local commit
-//!   (`db_version.rs::next_db_version`) and on every merge insert
-//!   (`changes_vtab_write.rs::insert_db_version`, "whether the change won or
-//!   not"). `changes_since_site` selects per `(site_id, db_version)` and
-//!   `apply_batch` reads/advances that same store, so progress survives
-//!   process restarts and a re-sync is incremental by construction.
-//! - **Explicit gap/replay handling.** Batches chain: each carries the
-//!   `since_db_version` it continues from (the request watermark for the
-//!   first, the previous batch's max for the rest). A batch whose `since`
-//!   is AHEAD of the receiver's durable watermark means an intermediate
-//!   batch was lost — refused with [`SyncGap`], nothing written, never
-//!   silently skipped. A batch fully at/below the watermark is a replay —
-//!   deterministic no-op ([`ApplyOutcome::Replay`]). An overlapping
-//!   redelivery applies only its not-yet-seen tail. This works because the
-//!   history-free clock makes a sender's export self-healing: every live
-//!   winner above the request watermark is present in every export, so
-//!   re-requesting from the watermark after a gap always regenerates the
-//!   missing range. (Version NUMBERS in a batch can legitimately skip —
-//!   compaction erases superseded versions — which is why continuity is
-//!   chained on batch anchors, never on contiguous version arithmetic.)
-//! - **Bounded, deterministic batches.** Exports chunk at
-//!   `max_changes_per_batch` (never splitting one origin `db_version` across
-//!   batches, so a commit stays atomic on the wire; a single commit larger
-//!   than the bound forms one oversize batch — atomicity wins over the
-//!   bound). Ordering is explicit `ORDER BY db_version, seq` per site, and
-//!   [`ChangeBatch::encode`] is a fixed-layout canonical binary form: same
-//!   changes in, same bytes out.
-//! - **One transaction per batch.** `apply_batch` runs the watermark check
-//!   and every change insert in a single `BEGIN`…`COMMIT`; any failure rolls
-//!   the whole batch back, so a batch never half-applies and the watermark
-//!   (bumped by the extension inside the same transaction) never advances
-//!   past unapplied changes.
-//!
-//! NOT yet done (tracked in `.gm/prd.yml`'s `bn-impl-fleet-crr-peer`): per-
-//! tenant DB file layout under the platform's storage invariants, a fleet
-//! packaging path for the built extension binary (`extension_path()` below
-//! is a local-dev default only), replication-factor policy, and billing
-//! treatment. The browser↔fleet live exchange is separately gated on a real
-//! deployment-scoped browser database with an explicit ownership/retention
-//! contract; this seam is what it will ride.
+//! Thin `rusqlite` wrapper around the vendored `superfly/cr-sqlite` extension (`vendor/cr-sqlite`,
+//! v0.17): per-origin-site sync progress (`crsql_db_versions`, durable in the same transaction),
+//! explicit gap/replay handling ([`SyncGap`] refuses a batch chained from ahead of the watermark,
+//! [`ApplyOutcome::Replay`] is a deterministic no-op), bounded deterministic batches
+//! ([`ChangeBatch::encode`] is canonical bytes) and one transaction per batch.
 
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-/// Re-exported so consumers (hive-cloud's browser_db exchange) can name the
-/// connection type in signatures without pinning their own rusqlite version —
+/// Re-exported so consumers can name the connection type without pinning their own rusqlite —
 /// one SQLite build links into the fleet binary, not two.
 pub use rusqlite;
 
-/// Resolves the loadable extension path (WITHOUT platform suffix — SQLite's
-/// own `sqlite3_load_extension` appends `.dylib`/`.so`/`.dll` itself, and
-/// passing one explicitly makes the lookup silently fail on the wrong
-/// platform). `HIVE_CRSQL_EXTENSION_PATH` overrides for a packaged fleet
-/// deploy; the vendored build.sh output is the local-dev default.
+/// The loadable extension path WITHOUT platform suffix (SQLite appends `.dylib`/`.so`/`.dll`
+/// itself); `HIVE_CRSQL_EXTENSION_PATH` overrides for a packaged fleet deploy.
 pub fn extension_path() -> PathBuf {
     if let Ok(p) = std::env::var("HIVE_CRSQL_EXTENSION_PATH") {
         return PathBuf::from(p);
@@ -79,11 +20,8 @@ pub fn extension_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/cr-sqlite/core/dist/crsqlite")
 }
 
-/// Open a connection with the cr-sqlite extension loaded. Extension loading
-/// is enabled only for the duration of the load call — `Connection` doesn't
-/// need it enabled afterward, and leaving it enabled would let any later SQL
-/// (including tenant-supplied queries, on a connection this crate's callers
-/// might expose further up the stack) load arbitrary native code.
+/// Open a connection with the cr-sqlite extension loaded; extension loading is enabled only for
+/// the load call so later (possibly tenant-supplied) SQL can never load native code.
 pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     unsafe {
@@ -109,17 +47,12 @@ pub fn open_in_memory() -> anyhow::Result<Connection> {
 /// Upgrade an existing table to a CRR (conflict-free replicated relation) —
 /// must run once per table before its changes are tracked by `crsql_changes`.
 pub fn as_crr(conn: &Connection, table: &str) -> anyhow::Result<()> {
-    // `crsql_as_crr` is a scalar function invoked via SELECT, so it returns a
-    // row -- rusqlite's `execute()` rejects any statement that does (real
-    // error hit while building this: "Execute returned results - did you
-    // mean to call query?"). `query_row` is the correct call here.
     conn.query_row("SELECT crsql_as_crr(?1)", [table], |_| Ok(()))?;
     Ok(())
 }
 
-/// This site's stable identifier (16 raw bytes) — the `site_id` column value
-/// this node's own writes carry in `crsql_changes`. Durable: persisted in the
-/// `crsql_site_id` table (ordinal 0), so it survives reopening the DB file.
+/// This site's stable 16-byte identifier, the `site_id` this node's own writes carry; persisted
+/// in `crsql_site_id`, so it survives reopening the file.
 pub fn site_id(conn: &Connection) -> anyhow::Result<Vec<u8>> {
     Ok(conn.query_row("SELECT crsql_site_id()", [], |r| r.get(0))?)
 }
@@ -130,25 +63,17 @@ pub fn version(conn: &Connection) -> anyhow::Result<i64> {
     Ok(conn.query_row("SELECT crsql_version()", [], |r| r.get(0))?)
 }
 
-/// Set this transaction's timestamp — the `ts` value every change written by
-/// the transaction carries on the wire. The superfly v0.17 fork makes this an
-/// APPLICATION obligation: `crsql_set_ts` sets it for the current transaction
-/// and the commit/rollback hook resets it to 0 (`core/rs/core/src/commit.rs`),
-/// so a write without it records `ts = '0'` — which then lands verbatim in
-/// every receiving peer's clock tables. Call once per write transaction,
-/// before the writes, with a site-HLC value (millis-since-epoch shape, u64).
+/// Set this transaction's timestamp — the `ts` every change written by the transaction carries.
+/// The v0.17 fork resets it to 0 on commit/rollback, so a write without it records `ts = '0'`
+/// verbatim into every receiving peer; call once per write transaction, before the writes.
 pub fn set_ts(conn: &Connection, ts: u64) -> anyhow::Result<()> {
     conn.query_row("SELECT crsql_set_ts(?1)", [ts.to_string()], |_| Ok(()))?;
     Ok(())
 }
 
-/// One row of the ten-column `crsql_changes` v0.17 wire format, in the
-/// vtab's declared column order (`core/src/changes-vtab.c`): the superfly
-/// fork added the trailing `ts` (the site's HLC timestamp, `TEXT NOT NULL`)
-/// vs vlcn v0.15. `merge_insert` reads it unconditionally
-/// (`core/rs/core/src/changes_vtab_write.rs`), so a peer that omits it
-/// silently writes empty-string `ts` into the receiving site's clock tables —
-/// which that site then serves onward to OTHER peers. Never drop it.
+/// One row of the ten-column `crsql_changes` v0.17 wire format in the vtab's declared order; the
+/// trailing `ts` is read unconditionally by `merge_insert`, so a peer that omits it poisons the
+/// receiving site's clock tables. Never drop it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
     pub table: String,
@@ -163,19 +88,13 @@ pub struct Change {
     pub ts: String,
 }
 
-/// Recommended upper bound on changes per batch (see [`changes_since_site`]).
-/// Keeps wire frames and per-batch transactions small; a single origin commit
-/// larger than this still travels as one oversize batch so its changes apply
-/// atomically.
+/// Recommended upper bound on changes per batch; a single origin commit larger than this still
+/// travels as one oversize batch so it applies atomically.
 pub const DEFAULT_MAX_BATCH_CHANGES: usize = 256;
 
-/// The canonical payload-size measure of one change's `val` — the number the
-/// sync boundary's `max_value_bytes` cap is enforced against on BOTH sides
-/// (docs/browser-db-contract.md §4), so the fleet and the browser worker must
-/// agree byte-for-byte: the value's HCB1 wire cost — 1 tag byte plus payload
-/// (integer/real: 8; text/blob: a 4-byte length + the bytes; null: tag only).
-/// The browser half (`www/sqlite/hcb1.js`) carries this exact formula; change
-/// it here and it must change there, same discipline as the HCB1 layout.
+/// The canonical size of one change's `val` — the number `max_value_bytes` is enforced against
+/// on BOTH sides: HCB1 wire cost (1 tag byte + payload). `www/sqlite/hcb1.js` carries the same
+/// formula.
 pub fn val_payload_bytes(val: &rusqlite::types::Value) -> u64 {
     match val {
         rusqlite::types::Value::Null => 1,
@@ -185,20 +104,15 @@ pub fn val_payload_bytes(val: &rusqlite::types::Value) -> u64 {
     }
 }
 
-/// One bounded, deterministically-ordered unit of sync: changes from exactly
-/// ONE origin site, ascending by `(db_version, seq)`, chained to the
-/// receiver's progress via `since_db_version`. The chain is the gap
-/// detector: batch N's `since_db_version` is the export's request watermark
-/// for N=0 and batch N-1's [`max_db_version`][Self::max_db_version]
-/// otherwise, so a receiver that missed a batch sees the next one's `since`
-/// land AHEAD of its durable watermark and refuses with [`SyncGap`].
+/// One bounded, deterministically-ordered sync unit: changes from exactly ONE origin site
+/// ascending by `(db_version, seq)`, chained to the receiver's progress via `since_db_version`
+/// (the gap detector).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeBatch {
     /// Origin site every change belongs to (16 raw bytes).
     pub site_id: Vec<u8>,
-    /// The watermark this batch continues from: every change has
-    /// `db_version > since_db_version`, and the receiver must already hold
-    /// this site's history up to here (or this is a fresh `0` export).
+    /// The watermark this batch continues from: every change has `db_version > since_db_version`
+    /// and the receiver must already hold this site's history up to here.
     pub since_db_version: i64,
     /// Ascending by `(db_version, seq)`; one origin `db_version` never
     /// spans two batches.
@@ -214,16 +128,8 @@ impl ChangeBatch {
         self.changes.iter().map(|c| c.db_version).max()
     }
 
-    /// Canonical binary encoding: fixed field order, big-endian integers,
-    /// explicit lengths, type-tagged `val` — the same change set always
-    /// encodes to the same bytes (the deterministic wire form the bounded
-    /// batches travel in). Layout:
-    ///   "HCB1" | site_id (u8 len + bytes) | since_db_version (i64)
-    ///   | count (u32) | per change:
-    ///     table (u16 + utf8) | pk (u32 + bytes) | cid (u16 + utf8)
-    ///     | val (tag u8; 1=i64, 2=f64 bits, 3=u32+utf8, 4=u32+bytes)
-    ///     | col_version (i64) | db_version (i64) | site_id (u8 len + bytes)
-    ///     | cl (i64) | seq (i64) | ts (u16 + utf8)
+    /// Canonical binary encoding (`"HCB1"` magic, fixed field order, big-endian integers, explicit
+    /// lengths, type-tagged `val`): the same change set always encodes to the same bytes.
     pub fn encode(&self) -> Vec<u8> {
         fn push_str(out: &mut Vec<u8>, s: &str) {
             out.extend_from_slice(&(s.len() as u16).to_be_bytes());
@@ -273,11 +179,8 @@ impl ChangeBatch {
         out
     }
 
-    /// Inverse of [`encode`][Self::encode]. Validates the batch invariants
-    /// the sync protocol relies on, so a corrupt or hand-mangled frame is
-    /// refused up front rather than applied: every change must belong to the
-    /// batch's single `site_id`, and `db_version` must be non-decreasing
-    /// (the deterministic export order).
+    /// Inverse of [`encode`][Self::encode]; refuses a frame whose changes are not all from the
+    /// batch's `site_id` or whose `db_version`s decrease.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<ChangeBatch> {
         struct Cursor<'a> {
             b: &'a [u8],
@@ -381,12 +284,9 @@ impl ChangeBatch {
     }
 }
 
-/// A batch arrived claiming continuity from a point AHEAD of what this peer
-/// has durably applied for that origin site — an intermediate batch is
-/// missing. The batch is refused and rolled back (never partially applied,
-/// never silently skipped); the caller re-requests an export from
-/// `watermark`, which regenerates the missing range because a history-free
-/// sender's export always contains every live winner above the watermark.
+/// A batch claimed continuity from AHEAD of this peer's durable watermark for its origin site —
+/// an intermediate batch is missing. Refused and rolled back; re-request the export from
+/// `watermark`.
 #[derive(Debug)]
 pub struct SyncGap {
     pub site_id: Vec<u8>,
@@ -424,10 +324,8 @@ pub enum ApplyOutcome {
         /// overlap prefix with `db_version <= from_db_version`).
         applied: usize,
     },
-    /// The batch's maximum `db_version` is at/below the durable watermark:
-    /// already fully applied earlier. Nothing was written — replaying a
-    /// batch is a deterministic no-op, which is what makes interrupted syncs
-    /// safe to resume by simple redelivery.
+    /// The batch's maximum `db_version` is at/below the durable watermark: already applied, nothing
+    /// written — redelivery is a deterministic no-op.
     Replay {
         site_id: Vec<u8>,
         at_db_version: i64,
@@ -440,10 +338,8 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Every origin site this DB has durable progress for, ascending by site id
-/// (deterministic), with its high-water mark. Straight read of the
-/// extension-maintained `crsql_db_versions` — one row per site that has
-/// committed locally or been merged from. A fresh DB has none.
+/// Every origin site this DB has durable progress for, ascending by site id, with its high-water
+/// mark (the extension-maintained `crsql_db_versions`).
 pub fn known_sites(conn: &Connection) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
     let mut stmt =
         conn.prepare("SELECT site_id, db_version FROM crsql_db_versions ORDER BY site_id ASC")?;
@@ -452,9 +348,8 @@ pub fn known_sites(conn: &Connection) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
         .map_err(anyhow::Error::from)
 }
 
-/// This peer's durable high-water mark for one origin site (0 = nothing ever
-/// received from it). This is the number `changes_since_site` exports are
-/// requested with and the number `apply_batch`'s gap check chains on.
+/// This peer's durable high-water mark for one origin site (0 = nothing received); the number
+/// exports are requested with and the gap check chains on.
 pub fn watermark_for(conn: &Connection, site_id: &[u8]) -> anyhow::Result<i64> {
     use rusqlite::OptionalExtension;
     Ok(conn
@@ -467,17 +362,10 @@ pub fn watermark_for(conn: &Connection, site_id: &[u8]) -> anyhow::Result<i64> {
         .unwrap_or(0))
 }
 
-/// All tracked changes from ONE origin site with `db_version >
-/// since_db_version`, as bounded, deterministically-ordered [`ChangeBatch`]es
-/// — the outbound half of a sync round, replacing the old single global
-/// cursor. Pass the RECEIVER's [`watermark_for`] this site as
-/// `since_db_version` (0 = full export).
-///
-/// Determinism: explicit `ORDER BY db_version, seq ASC` (the vtab consumes
-/// it — `changes_vtab.rs::changes_best_index`), batches chained via
-/// `since_db_version`, chunking that never splits one origin `db_version`
-/// across batches. Two exports of the same state produce byte-identical
-/// [`ChangeBatch::encode`] output.
+/// All tracked changes from ONE origin site with `db_version > since_db_version` as bounded,
+/// deterministically-ordered [`ChangeBatch`]es — the outbound half of a sync round. Pass the
+/// RECEIVER's [`watermark_for`] this site (0 = full export). Two exports of the same state are
+/// byte-identical.
 pub fn changes_since_site(
     conn: &Connection,
     site_id: &[u8],
@@ -517,8 +405,6 @@ pub fn changes_since_site(
         let c = row?;
         let new_group = group_end_v != Some(c.db_version);
         if new_group && !cur.is_empty() && cur.len() >= max_changes_per_batch {
-            // Close the batch at a db_version boundary: the group that just
-            // ended stays whole, and the next batch chains from its max.
             let max = cur.last().map(|x| x.db_version).unwrap_or(batch_since);
             batches.push(ChangeBatch {
                 site_id: site_id.to_vec(),
@@ -540,23 +426,11 @@ pub fn changes_since_site(
     Ok(batches)
 }
 
-/// Apply ONE received batch — the inbound half of a sync round — in a single
-/// transaction: the per-site watermark read, the gap/replay checks, and every
-/// change insert all commit or roll back together, and the extension bumps
-/// `crsql_db_versions` inside that same transaction, so durable progress can
-/// never advance past unapplied changes or record a half-applied batch.
-///
-/// Deterministic outcomes per origin site, given the durable watermark `w`:
-/// - `batch.max_db_version <= w` → [`ApplyOutcome::Replay`], nothing written.
-/// - `batch.since_db_version > w` → [`SyncGap`] error, everything rolled
-///   back: an intermediate batch is missing. Re-request the export from `w`.
-/// - otherwise → merge the changes with `db_version > w` (the overlap prefix
-///   is provably redundant: the watermark only ever advances along fully-
-///   applied batch chains) and commit; [`ApplyOutcome::Applied`].
-///
-/// So an out-of-order later batch is a loud gap refusal, a duplicated
-/// earlier batch is a no-op, and an interrupted stream resumes by plain
-/// redelivery from the durable watermark.
+/// Apply ONE received batch in a single transaction (watermark read, gap/replay checks, every
+/// insert and the extension's watermark bump commit or roll back together). Given durable
+/// watermark `w`: `max_db_version <= w` → [`ApplyOutcome::Replay`]; `since_db_version > w` →
+/// [`SyncGap`], everything rolled back; otherwise merge the changes above `w` →
+/// [`ApplyOutcome::Applied`].
 pub fn apply_batch(conn: &Connection, batch: &ChangeBatch) -> anyhow::Result<ApplyOutcome> {
     if batch.site_id.is_empty() {
         anyhow::bail!("batch site_id must be non-empty");
@@ -574,8 +448,6 @@ pub fn apply_batch(conn: &Connection, batch: &ChangeBatch) -> anyhow::Result<App
     let w = watermark_for(&tx, &batch.site_id)?;
     let batch_max = batch.max_db_version();
     match batch_max {
-        // Empty batch: nothing to merge. Still gap-checked so a fabricated
-        // "progress" frame cannot pretend continuity from the future.
         None => {
             if batch.since_db_version > w {
                 return Err(anyhow::Error::new(SyncGap {
@@ -611,12 +483,6 @@ pub fn apply_batch(conn: &Connection, batch: &ChangeBatch) -> anyhow::Result<App
             let mut applied = 0usize;
             for c in &batch.changes {
                 if c.db_version <= w {
-                    // Overlap prefix: already merged by an earlier batch in
-                    // the chain (watermark == max version ever applied for
-                    // this site, and versions only advance along fully-
-                    // applied chains). Re-inserting would be an idempotent
-                    // no-op in the extension's merge; skipping is the same
-                    // result, deterministically.
                     continue;
                 }
                 stmt.execute(rusqlite::params![
@@ -634,8 +500,6 @@ pub fn apply_batch(conn: &Connection, batch: &ChangeBatch) -> anyhow::Result<App
                 applied += 1;
             }
             drop(stmt);
-            // The extension's insert_db_version bumps the per-site row in
-            // this same transaction; read back the durable truth.
             let to = watermark_for(&tx, &batch.site_id)?;
             anyhow::ensure!(
                 to == std::cmp::max(w, max),
@@ -654,11 +518,9 @@ pub fn apply_batch(conn: &Connection, batch: &ChangeBatch) -> anyhow::Result<App
     }
 }
 
-/// Apply batches in order, one transaction each (see [`apply_batch`]),
-/// stopping at the first error. Batches already committed stay committed —
-/// progress is durable per batch, so after fixing the cause (a gap means
-/// re-requesting the export from the current watermark) the caller simply
-/// resumes; redelivered batches come back as [`ApplyOutcome::Replay`].
+/// Apply batches in order, one transaction each, stopping at the first error; committed batches
+/// stay committed, so after fixing the cause the caller simply resumes (redeliveries come back as
+/// [`ApplyOutcome::Replay`]).
 pub fn apply_batches(
     conn: &Connection,
     batches: &[ChangeBatch],

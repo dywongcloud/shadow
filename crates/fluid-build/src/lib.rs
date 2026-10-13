@@ -1,16 +1,7 @@
-//! `fluid-build` — Framework-Defined Infrastructure.
-//!
-//! Turns a source repository into the **Build Output API v3** contract: detect
-//! the framework, run its build, and normalize the result into static assets +
-//! serverless/edge functions + routing that the platform provisions from.
-//!
-//! Two paths:
-//! 1. **Native** — the framework (Next.js, Nuxt, SvelteKit, Remix…) emits
-//!    `.vercel/output` directly (via its `vercel build` adapter). We
-//!    [`parse_build_output`] it.
-//! 2. **Adapted** — for frameworks without an adapter (Vite, CRA, Astro, plain
-//!    static, a Node server) we run the build and *synthesize* a Build Output
-//!    from the native output directory.
+//! Framework-Defined Infrastructure: turn a source repository into the Build Output API v3
+//! contract (static assets + serverless/edge functions + routing). Native frameworks emit
+//! `.vercel/output` themselves ([`parse_build_output`]); adapted ones (Vite, CRA, Astro, static,
+//! a Node server) have their native output [`synthesize`]d into one.
 
 pub mod build_output;
 pub mod deployment_snapshot;
@@ -252,11 +243,8 @@ pub fn analyze(repo: &Path) -> Analysis {
     }
 }
 
-/// Resolve a repo to a [`BuildOutput`].
-///
-/// If the repo already contains `.vercel/output`, parse it. Otherwise this
-/// returns the [`BuildPlan`] the caller must execute (run install + build), then
-/// the caller should call [`synthesize`] on the produced output directory.
+/// A repo resolved to a [`BuildOutput`]: an existing `.vercel/output` parsed directly, else the
+/// [`BuildPlan`] the caller runs before calling [`synthesize`] on its output directory.
 pub enum Resolution {
     /// Build Output already present — provision straight from it.
     Ready(BuildOutput),
@@ -306,9 +294,8 @@ pub fn resolve_build_output_checked(
     Ok(Some(output))
 }
 
-/// Resolve build planning and any checked-in Build Output through one fail-closed
-/// entry point. `package_manager` is the already-validated install/workspace-root
-/// snapshot; framework detection and outputDirectory remain selected-app local.
+/// Resolve build planning and any checked-in Build Output through one fail-closed entry point;
+/// `package_manager` is the validated install/workspace-root snapshot.
 pub fn resolve_build_checked(
     repo: &Path,
     package_manager: &PackageManagerDetection,
@@ -339,18 +326,14 @@ pub fn resolve(repo: &Path) -> anyhow::Result<Resolution> {
     }
 }
 
-/// Synthesize a Build Output config for a framework whose native output is a
-/// static directory (Vite/CRA/Astro/static) or a single serverless server
-/// (Node). This is the minimal "adapter" that maps non-`.vercel/output`
-/// frameworks into the standard contract.
-///
-/// `static_dir` is the framework's output directory (e.g. `dist`, `build`,
-/// `out`). For SPA frameworks we add a catch-all rewrite to `index.html`.
+/// Synthesize a Build Output config for a framework whose native output is a static directory
+/// (Vite/CRA/Astro/static) or a single Node server — the minimal adapter into the standard
+/// contract; `static_dir` is the framework's output directory and SPA frameworks get a catch-all
+/// rewrite to `index.html`.
 pub fn synthesize_config(primitive: Primitive) -> BuildOutputConfig {
     let mut cfg = BuildOutputConfig::default();
     match primitive {
         Primitive::Static => {
-            // Serve files from the filesystem; SPA fallback to index.html.
             cfg.routes = vec![
                 Route {
                     handle: Some("filesystem".into()),
@@ -364,7 +347,6 @@ pub fn synthesize_config(primitive: Primitive) -> BuildOutputConfig {
             ];
         }
         Primitive::Serverless | Primitive::Hybrid => {
-            // Static assets first, then everything else hits the function.
             cfg.routes = vec![
                 Route {
                     handle: Some("filesystem".into()),

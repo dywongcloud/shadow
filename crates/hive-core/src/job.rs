@@ -18,7 +18,6 @@ pub struct ResourceSpec {
 
 impl Default for ResourceSpec {
     fn default() -> Self {
-        // A sensible "default cell" — small but real.
         ResourceSpec {
             vcpus: 2,
             mem_mib: 2048,
@@ -51,9 +50,8 @@ pub struct BuildJob {
     pub commands: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub resources: ResourceSpec,
-    /// Build-cache key (e.g. a hash of the lockfile). When set, the cache_paths
-    /// are restored before the build and saved after a successful build — the
-    /// "npm install is nearly instant when package.json is unchanged" trick.
+    /// Build-cache key (e.g. a lockfile hash); when set, `cache_paths` are restored before the build
+    /// and saved after a successful one.
     #[serde(default)]
     pub cache_key: Option<String>,
     /// Directories (relative to the work dir) to cache, e.g. ["node_modules"].
