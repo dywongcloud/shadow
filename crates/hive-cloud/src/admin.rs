@@ -10495,31 +10495,34 @@ struct RcTag {
     tag: String,
 }
 
-async fn rc_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn rc_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let (entries, reads, writes, hits, revalidations) = c.runtime_cache.stats();
-    Json(json!({
+    Ok(Json(json!({
         "entries": entries, "reads": reads, "writes": writes,
         "hits": hits, "revalidations": revalidations,
-    }))
+    })))
 }
 
-/// Runtime-cache scope authorization. The scope is `{project}:{env}`; project
-/// names are globally unique, so ownership is checked via the project's team.
-/// Requests carrying NO tenant context (no JWT / API key / x-hive-team) are the
-/// in-cell loopback data plane (HIVE_RUNTIME_CACHE_URL) — the admin port is
-/// loopback-bound + firewalled, so those pass through unchanged.
+/// The scope is `{project}:{env}` and the caller must own the project. A request with no credentials
+/// is served only without auth enforcement (dev); the public API ingress runs the same router as the
+/// loopback listener and the auth middleware never rejects a read, so under enforcement it is 401.
 fn rc_authorize(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
     claims: Option<&crate::auth::Claims>,
     scope: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let has_ctx = claims.is_some()
+    let has_credentials = claims.is_some()
         || headers.contains_key("x-hive-team")
         || headers.contains_key(axum::http::header::AUTHORIZATION);
-    if !has_ctx {
+    if !has_credentials && !crate::auth::enforced() {
         return Ok(());
     }
+    require_auth_read(claims)?;
     let project = scope.split(':').next().unwrap_or("");
     let t = tenant(c, headers, claims);
     if project_owned_by(c, project, &t) {

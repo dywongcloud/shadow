@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-13 — the runtime cache no longer answers requests with no credentials
+
+`rc_authorize` (`admin.rs`) let any request without a JWT, API key, `x-hive-team` or
+`Authorization` header through, on the premise that such requests are the in-cell
+loopback data plane. The public `api.<platform_domain>` ingress serves the same admin
+router and the auth middleware never rejects a read, so `GET
+/v1/runtime-cache/entry?scope=<project>:<env>&key=<k>` with no credentials returned
+any tenant's cached value, and `GET /v1/runtime-cache` served fleet-wide counters.
+Witnessed on a throwaway node with auth enforced: tenant B's token got 403 on
+tenant A's scope, a request with no credentials got 200 and A's value (found by the
+comment-sweep agent while reading the handler). Under enforcement a request with no
+credentials is now 401 (`require_auth_read`, the same contract as every tenant
+read), another tenant's token stays 403 and the stats are operator-only; without
+`HIVE_JWT_SECRET` (dev) the in-cell data plane stays open exactly as before
+(verified: PUT 204, GET 200, DELETE 204). Anonymous PUT/DELETE were already 401 at the
+middleware. Not rolled.
+
 ## 2026-10-13 — the relay certificate renewal script named a deleted host and skipped phoenix
 
 `scripts/renew-relay-cert.sh` copies the `*.relay.shadw.app` wildcard to
