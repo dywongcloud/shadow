@@ -138,6 +138,12 @@ pub trait SqlEngine: Send {
     /// Execute one statement and buffer its result. `want_rows: false` still
     /// executes (Hrana says so) and still counts `rows_read`, it just keeps no
     /// row bodies.
+    ///
+    /// `budget` guards what is KEPT, never what is stepped: a `SELECT` past
+    /// `max_rows` with `want_rows: false` answers `rows_read`, no rows and no
+    /// error, identically on both engines — a caller that wants a refusal for
+    /// an oversized set asks for the rows. An implementation must therefore be
+    /// able to produce the count without materialising the rows it discards.
     async fn run(
         &mut self,
         sql: &str,

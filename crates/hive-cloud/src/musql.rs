@@ -40,14 +40,21 @@
 //! hands out a fresh one on EVERY response, which would cost every client an
 //! extra round trip), and its constant `rows_read: 0` is replaced with the rows
 //! actually stepped — which is why the engine is asked for rows even when the
-//! caller did not want them (see [`MusqlEngine::run`]).
+//! caller did not want them. That count is the LENGTH of the returned array,
+//! read before a single row is decoded, so a discarded result set costs no
+//! decode at all (see [`MusqlEngine::run`]).
 //!
 //! # Four measured divergences from SQLite, and what was decided about each
 //!
 //! * **`rows_read` with `want_rows: false`.** musqld returns no row bodies, so
 //!   counting what came back reported 0 for a SELECT that stepped rows. Fixed:
-//!   the engine is always asked for rows and the count is taken from the step,
-//!   matching the rusqlite engine byte for byte.
+//!   the engine is always asked for rows and `rows_read` is the length of that
+//!   array, never a count of decoded values — so it agrees with the rusqlite
+//!   engine's step count for every statement, over the row ceiling included.
+//!   An earlier form of this fix decoded the rows in order to count them and
+//!   then enforced `MAX_ROWS` on the set it discarded; that disagreed with
+//!   rusqlite (which counts and keeps nothing, and budgets only what it keeps)
+//!   and paid a full 20 000-row / 32 MiB decode for a number it threw away.
 //! * **A non-finite REAL.** musqld's row encoder has no representation for
 //!   `Inf`/`-Inf`/`NaN` and emits `{"type":"null"}`, indistinguishable from a
 //!   real NULL — yet `SELECT 1e308*10 IS NULL` answers 0 and
@@ -748,8 +755,9 @@ impl SqlEngine for MusqlEngine {
         // `want_rows: false` musqld returns no row bodies at all, which would
         // report 0 for a `SELECT` that stepped rows. The rusqlite engine counts
         // every stepped row BEFORE it looks at `want_rows`, and that is what
-        // clients see today, so that is the contract. The rows are discarded
-        // below when the caller did not ask for them.
+        // clients see today, so that is the contract. The count is the length of
+        // the returned array, so nothing is decoded when the caller did not ask
+        // for the rows.
         let mut stmt = json!({ "sql": sql, "want_rows": true });
         if !args.is_empty() {
             stmt["args"] = Value::Array(args.iter().map(Self::encode).collect());
@@ -770,59 +778,6 @@ impl SqlEngine for MusqlEngine {
         let result = res.get("result").cloned().unwrap_or(Value::Null);
 
         let cols = Self::cols(&result);
-        let mut rows: Vec<Vec<SqlValue>> = Vec::new();
-        let mut bytes = 0usize;
-        let mut realish_nulls: Vec<usize> = Vec::new();
-        for row in result.get("rows").and_then(|r| r.as_array()).unwrap_or(&vec![]) {
-            let arr = row.as_array().ok_or("musql returned a non-array row")?;
-            let mut out = Vec::with_capacity(arr.len());
-            for (i, v) in arr.iter().enumerate() {
-                let decoded = Self::decode(v)?;
-                if matches!(decoded, SqlValue::Null)
-                    && Self::could_be_non_finite(cols.get(i))
-                    && !realish_nulls.contains(&i)
-                {
-                    realish_nulls.push(i);
-                }
-                bytes += decoded.approx_bytes();
-                out.push(decoded);
-            }
-            rows.push(out);
-            if rows.len() > budget.max_rows {
-                return Err(format!(
-                    "result set exceeds {} rows over the pipeline endpoint — paginate with \
-                     LIMIT/OFFSET",
-                    budget.max_rows
-                ));
-            }
-            if bytes > budget.max_bytes {
-                return Err(format!(
-                    "result set exceeds {}MiB over the pipeline endpoint — narrow the projection \
-                     or paginate",
-                    budget.max_bytes / (1024 * 1024)
-                ));
-            }
-        }
-        // A NULL in a REAL-capable column is the one place musqld's encoder is
-        // lossy, so it is re-checked against the engine before the row is
-        // handed out. See `non_finite_probe`.
-        if !realish_nulls.is_empty() {
-            if let Some((col, value)) = self.non_finite_probe(sql, &cols, &realish_nulls).await {
-                return Err(crate::hrana_proto::non_finite_message(&col, value));
-            }
-        }
-        // musqld reports rows_read: 0 unconditionally, so the honest substitute
-        // is what this statement stepped. Deliberately taken from every row the
-        // statement produced, not from the rows the caller asked for:
-        // `want_rows: false` still executes and still counts.
-        let rows_read = rows.len() as u64;
-        if !want_rows {
-            // The rusqlite engine does not materialise a row it was told not to
-            // return; the budget above is still applied to the set that had to
-            // be materialised to count it, which is the safer direction (a
-            // refusal, not an unbounded buffer).
-            rows.clear();
-        }
         let rows_written = result
             .get("affected_row_count")
             .and_then(|n| n.as_u64())
@@ -842,6 +797,78 @@ impl SqlEngine for MusqlEngine {
         }
         let last_insert_rowid =
             if rows_written > 0 { (self.last_rowid != 0).then_some(self.last_rowid) } else { None };
+
+        // musqld reports `rows_read: 0` for every statement, so the honest
+        // substitute is what this statement stepped — and its reply is ONE JSON
+        // document, which makes that count free: it is the length of the rows
+        // array, readable before a single row is decoded.
+        //
+        // Reading it first is what keeps `want_rows: false` cheap AND what makes
+        // the two engines agree above the row ceiling. The rusqlite engine steps
+        // and counts a row it was told not to return, and applies the row/byte
+        // budget only to the rows it KEEPS, so a 25 000-row `SELECT` with
+        // `want_rows: false` answers `rows_read: 25000`, no rows and no error.
+        // Enforcing the budget on a set that is about to be discarded is both a
+        // divergent envelope and a 32 MiB decode whose result is thrown away.
+        let returned = result.get("rows").and_then(|r| r.as_array());
+        let rows_read = returned.map(|a| a.len() as u64).unwrap_or(0);
+        if !want_rows {
+            // Nothing is decoded, so the discarded bodies never become a second
+            // allocation, and the non-finite re-check below is skipped with
+            // them: it exists to stop a lossy NULL reaching a client, and no
+            // row reaches a client here (the rusqlite engine's equivalent check
+            // is `hrana_proto::encode_value`, which also only sees kept rows).
+            return Ok(RunResult {
+                cols,
+                rows: Vec::new(),
+                rows_read,
+                rows_written,
+                last_insert_rowid,
+            });
+        }
+        // Refuse on the COUNT, before any row is decoded: a result one row over
+        // the ceiling must not cost 20 001 decodes to be told it is too large.
+        if rows_read > budget.max_rows as u64 {
+            return Err(format!(
+                "result set exceeds {} rows over the pipeline endpoint — paginate with \
+                 LIMIT/OFFSET",
+                budget.max_rows
+            ));
+        }
+        let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(returned.map_or(0, |a| a.len()));
+        let mut bytes = 0usize;
+        let mut realish_nulls: Vec<usize> = Vec::new();
+        for row in returned.into_iter().flatten() {
+            let arr = row.as_array().ok_or("musql returned a non-array row")?;
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                let decoded = Self::decode(v)?;
+                if matches!(decoded, SqlValue::Null)
+                    && Self::could_be_non_finite(cols.get(i))
+                    && !realish_nulls.contains(&i)
+                {
+                    realish_nulls.push(i);
+                }
+                bytes += decoded.approx_bytes();
+                out.push(decoded);
+            }
+            rows.push(out);
+            if bytes > budget.max_bytes {
+                return Err(format!(
+                    "result set exceeds {}MiB over the pipeline endpoint — narrow the projection \
+                     or paginate",
+                    budget.max_bytes / (1024 * 1024)
+                ));
+            }
+        }
+        // A NULL in a REAL-capable column is the one place musqld's encoder is
+        // lossy, so it is re-checked against the engine before the row is
+        // handed out. See `non_finite_probe`.
+        if !realish_nulls.is_empty() {
+            if let Some((col, value)) = self.non_finite_probe(sql, &cols, &realish_nulls).await {
+                return Err(crate::hrana_proto::non_finite_message(&col, value));
+            }
+        }
         Ok(RunResult {
             cols,
             rows,

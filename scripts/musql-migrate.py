@@ -19,6 +19,11 @@ moves the live .db (and its -wal/-shm) aside — never deleted — and copies th
 verified export into place. Deleting <stem>.musq is NOT a rollback: it leaves
 the record pointing at an engine with no file behind it.
 
+Every subcommand writes its backups under `--backup-dir` (default
+`$HIVE_DATA/sqlite-dbs-backup`), the same root the Rust
+`musql_migrate::rollback` uses (`backup_root()`), so one place holds every
+pre-migration and pre-rollback file whichever mechanism took it.
+
 Digests are engine independent: every cell is encoded by TYPE (so an int/float
 flip cannot pass), rows are canonicalised and SORTED (so row order / rowid
 differences cannot pass), then sha256'd.
@@ -198,8 +203,7 @@ def nonfinite(path):
 # ---------------------------------------------------------------- subcommands
 def cmd_migrate(a):
     d, port = a.dir, a.port
-    bk = os.path.join(os.path.dirname(d.rstrip("/")),
-                      "sqlite-dbs-backup-%s" % time.strftime("%Y%m%d-%H%M%S"))
+    bk = os.path.join(a.backup_dir, "migrate-%s" % time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(bk, exist_ok=True)
     files = sorted(f for f in os.listdir(d) if f.startswith("hive-sqlite-") and f.endswith(".db"))
     out = {"node": os.uname().nodename, "dir": d, "backup_dir": bk,
@@ -255,7 +259,9 @@ def cmd_migrate(a):
 
 def cmd_roundtrip(a):
     d = a.dir
-    bks = sorted(glob.glob(os.path.join(os.path.dirname(d.rstrip("/")), "sqlite-dbs-backup-*")))
+    # Same root the Rust rollback writes to (`musql_migrate::backup_root`), so a
+    # backup taken by either mechanism is found at the same place.
+    bks = sorted(glob.glob(os.path.join(a.backup_dir, "migrate-*")))
     bk = bks[-1] if bks else None
     work = "/tmp/hive-musql-roundtrip"
     shutil.rmtree(work, ignore_errors=True); os.makedirs(work)
@@ -327,8 +333,11 @@ def cmd_rollback(a):
     live file aside (never delete it) and copy the verified export into place.
     """
     d, port = a.dir, a.port
-    bk = os.path.join(os.path.dirname(d.rstrip("/")),
-                      "sqlite-dbs-rollback-%s" % time.strftime("%Y%m%d-%H%M%S"))
+    if a.db_id and len(a.db_id) == 1:
+        run = "%s-rollback-%s" % (a.db_id[0], time.strftime("%Y%m%d-%H%M%S"))
+    else:
+        run = "rollback-%s" % time.strftime("%Y%m%d-%H%M%S")
+    bk = os.path.join(a.backup_dir, run)
     os.makedirs(bk, exist_ok=True)
     out = {"node": os.uname().nodename, "dir": d, "backup_dir": bk, "databases": []}
     log = open("/tmp/hive-musqld-rollback.log", "ab")
@@ -438,6 +447,10 @@ def main():
     common.add_argument("--convert", default=os.environ.get("HIVE_MUSQL_CONVERT_BIN",
                                                             "/usr/local/bin/musql-convert"))
     common.add_argument("--port", type=int, default=18699)
+    # `musql_migrate::backup_root()` — backups sit beside the store, never in it.
+    common.add_argument("--backup-dir", default=os.path.join(
+        os.environ.get("HIVE_DATA", "/var/lib/hive/data"), "sqlite-dbs-backup"),
+        help="backup root (default: $HIVE_DATA/sqlite-dbs-backup)")
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
