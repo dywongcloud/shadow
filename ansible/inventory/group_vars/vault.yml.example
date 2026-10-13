@@ -1,40 +1,24 @@
-# Copy to group_vars/vault.yml, fill in real values, then encrypt it:
-#   ansible-vault encrypt inventory/group_vars/vault.yml
-# vault.yml (encrypted) is gitignored; only this .example (never real
-# secrets) is committed. See ansible/README.md's Secrets section for the
-# .vault_pass file ansible.cfg expects.
+# Copy to group_vars/vault.yml, fill in real values, then encrypt it: ansible-vault encrypt inventory/group_vars/vault.yml
+# Only this .example is committed (vault.yml and .vault_pass are gitignored; see ansible/README.md's Secrets section).
 ---
-vault_hive_jwt_secret: "REPLACE_ME"          # HS256 secret shared by the whole fleet -- signs/verifies gossip + platform JWTs
+vault_hive_jwt_secret: "REPLACE_ME"          # HS256 secret shared by the whole fleet: signs/verifies gossip + platform JWTs
 vault_hive_internal_token: "REPLACE_ME"      # gates server-only endpoints (x-hive-internal header), e.g. /v1/token minting
 vault_vercel_api_token: "REPLACE_ME"         # Vercel REST token, DNS-records scope, for the dns_vercel role
-vault_vercel_team_id: ""                      # optional -- only if the domains live in a Vercel team
-vault_stripe_secret_key: ""                   # optional -- only if billing is enabled
-# Clerk auth keys for the dashboard UI (hive_ui role). NEXT_PUBLIC_CLERK_*
-# bakes into the client bundle at build time. Omit both to build a UI with
-# Clerk auth disabled (dev/self-host without Clerk).
+vault_vercel_team_id: ""                      # optional: only if the domains live in a Vercel team
+vault_stripe_secret_key: ""                   # optional: only if billing is enabled
+# Clerk keys for the dashboard (hive_ui): NEXT_PUBLIC_CLERK_* bakes into the client bundle at build time; omit both for a UI without Clerk auth
 vault_clerk_publishable_key: ""               # NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 vault_clerk_secret_key: ""                    # CLERK_SECRET_KEY
 
-# GitHub App + Composio integration (hive_ui role: dashboard git-connect
-# flow; hive_platform role: webhook verification + private-clone fallback).
-# All global, same value on every node (see AGENTS.md /
-# recall("fleet-creds-enumerate-required-vars")). Omit all to run with
-# git-import/webhook features disabled (manual git-URL import still works).
-vault_composio_api_key: ""                    # COMPOSIO_API_KEY -- Composio API key, GitHub OAuth connection flow
+# GitHub App + Composio (hive_ui git-connect flow; hive_platform webhook verification + private-clone fallback): global, the same value on every node; omit all to disable git-import/webhooks (manual git-URL import still works)
+vault_composio_api_key: ""                    # COMPOSIO_API_KEY: Composio API key, GitHub OAuth connection flow
 vault_github_app_client_id: ""                # GITHUB_APP_CLIENT_ID
 vault_github_app_client_secret: ""            # GITHUB_APP_CLIENT_SECRET -- also derives the session-cookie encryption key; must match across every node
 vault_github_app_redirect_uri: ""             # GITHUB_APP_REDIRECT_URI
 vault_hive_github_auth_config_id: ""          # HIVE_GITHUB_AUTH_CONFIG_ID
 vault_github_webhook_secret: ""               # GITHUB_WEBHOOK_SECRET -- signs (hive_ui) / verifies (hive_platform) GitHub webhook signatures; must match fleet-wide
 vault_github_token: ""                        # GITHUB_TOKEN -- node-wide fallback for cloning private repos on webhook-triggered builds
-# GitHub App server-to-server auth (hive_platform role) -- lets a webhook-triggered
-# build (no user session, see GITHUB_TOKEN above) mint its OWN short-lived
-# per-repo installation token instead of depending on a shared node-wide PAT,
-# for any repo the App is installed on. DIFFERENT credential pair from
-# vault_github_app_client_id/secret above (those are the App's OAuth
-# client id/secret for the interactive user-to-server flow; these are the
-# App's identity for JWT-signed app-to-server auth). Both optional -- omit
-# either to keep using the GITHUB_TOKEN-only fallback.
+# GitHub App server-to-server auth (hive_platform): a webhook-triggered build mints its own short-lived per-repo installation token instead of using a shared PAT; a DIFFERENT credential pair from the OAuth client id/secret above; omit either to keep the GITHUB_TOKEN-only fallback
 vault_github_app_id: ""                       # GITHUB_APP_ID -- the App's numeric ID (App settings page)
 vault_github_app_private_key: ""              # GITHUB_APP_PRIVATE_KEY -- PEM from the App's "generate a private key"; paste with literal \n in place of newlines
 vault_hive_secret_key: ""                     # HIVE_SECRET_KEY -- encrypts per-project env-var secrets at rest; must match across the whole fleet

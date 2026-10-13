@@ -1,18 +1,12 @@
 ---
-# End-to-end fleet deployment: prerequisites -> Firecracker (KVM or PVM,
-# chosen per-host by inventory group) -> the hive-cloud platform binary ->
-# mesh trust config -> DNS/TLS ingress.
+# End-to-end fleet deployment: prerequisites -> Firecracker (KVM or PVM, per inventory group) -> hive-cloud binary ->
+# Litebox -> dashboard UI -> mesh trust -> DNS/TLS ingress.
 #
 # Usage:
 #   ansible-playbook playbooks/site.yml
 #   ansible-playbook playbooks/site.yml --limit fc_pvm         # one flavor only
-#   ansible-playbook playbooks/site.yml --tags hive_platform    # redeploy code only (see also platbooks/platform-only.yml)
+#   ansible-playbook playbooks/site.yml --tags hive_platform   # redeploy code only (see also playbooks/platform-only.yml)
 #   ansible-playbook playbooks/site.yml --tags pvm_firecracker -e pvm_reboot=false
-#
-# Every role is independently idempotent (see each role's own tasks) so a
-# partial re-run after a failure picks up where it left off rather than
-# redoing expensive work (kernel/Firecracker/hive-cloud builds all guard on
-# `creates:`).
 
 - name: Base OS prerequisites
   hosts: platform
@@ -34,14 +28,6 @@
 - name: Firecracker (PVM, no hardware KVM)
   hosts: fc_pvm
   become: true
-  # ONE HOST AT A TIME. This role REBOOTS into a freshly-built custom kernel;
-  # without `serial` ansible runs the play's linear strategy across every
-  # fc_pvm host in lockstep, so the reboot task fires on ALL of them together
-  # and a kernel that fails to boot takes the whole group down at once instead
-  # of one node. Same reason platform-only.yml:14 is serial -- except the blast
-  # radius here is larger, because a bad kernel needs console access to
-  # recover, not a service restart. A failure on host N stops the roll before
-  # host N+1, which is the entire point.
   serial: 1
   roles:
     - role: pvm_firecracker

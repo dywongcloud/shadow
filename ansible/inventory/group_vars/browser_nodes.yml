@@ -1,40 +1,18 @@
 ---
-# Vars for the five hosts that run a headless browser node
-# (playbooks/browser-nodes.yml, roles/hive_browser_node). Everything with a
-# defensible default lives in the role's defaults/main.yml -- this file only
-# holds what is a FLEET decision rather than a role default.
+# Fleet decisions for [browser_nodes] (playbooks/browser-nodes.yml); the role's own defaults live in roles/hive_browser_node/defaults/main.yml.
 
-# Loopback port the node-local session broker listens on. Lives HERE rather
-# than only in the role's defaults because playbooks/browser-nodes.yml's verify
-# play runs OUTSIDE the role, and role defaults are not in scope there -- a
-# verify play that silently templated an undefined port would be a check that
-# never actually checked anything.
+# also read by the verify play, which runs outside the role where role defaults are not in scope
 hive_browser_node_port: 3009
 
-# The tenant whose browser-eligible deployments these nodes serve. "personal"
-# is the platform owner's own namespace (see ui/app/api/token/route.ts: the
-# owner keeps the legacy "personal", every other account is u_<uid>), which is
-# the right default for fleet-operated donor capacity. Change it to an org slug
-# to donate to a team instead -- and note the presence/admission lists are
-# per-tenant, so the verify step must be run with the matching team.
+# tenant whose browser-eligible deployments these nodes serve ("personal" = the owner's namespace); run the verify step with the matching team
 hive_browser_node_team: personal
 
-# Serve lane. "auto" asks the fleet to derive this tenant's WHOLE
-# browser-eligible set on every renewal, so a new browser function starts being
-# served on the next lease refresh with no config change and no redeploy here.
-# The node never names what lands in the set -- that resolution is entirely
-# server-side (crates/hive-cloud/src/browser_admission.rs::validate_request).
+# "auto": the fleet derives this tenant's whole browser-eligible set on every renewal (server-side, browser_admission.rs validate_request)
 hive_browser_node_serve_mode: auto
 
-# TEAM scope only. Public scope exposes a deployment to any anonymous donor and
-# is gated on platform-admin / team-owner-or-admin / public-node-division
-# membership; a fleet-run node mints `role: member` precisely so it is
-# structurally incapable of holding a public-scope admission.
+# team scope only: a fleet-run node mints role "member", which can never hold a public-scope admission
 hive_browser_node_scope: team
 
-# Relays these browser endpoints home on. The https :3343 form is mandatory:
-# with TLS enabled the standalone iroh-relay serves every relay service on the
-# https socket only, and the *.relay.shadw.app wildcard cert means an IP
-# literal can never pass verification (see inventory/hosts.ini's own note).
+# https :3343 relay hostnames only: the relays serve TLS with a wildcard certificate, so an IP literal fails verification
 hive_browser_node_relays: >-
   https://fc-sanjose.relay.shadw.app:3343,https://fc-bangkok.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343

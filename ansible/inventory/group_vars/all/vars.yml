@@ -1,10 +1,10 @@
 ---
 # Only the vars this fleet runs with; the full HIVE_* set: grep crates/hive-cloud/src for `std::env::var("HIVE_`.
 
-hive_repo_url: "https://github.com/your-org/hive.git"   # or a private mirror
+hive_repo_url: "https://github.com/your-org/hive.git"
 hive_repo_ref: "main"
-hive_src_dir: "/root/hive"                                # flat (non-crates/-prefixed) layout
-hive_cargo_target_dir: "/root/fc-target"                   # matches the fc_pvm hosts' convention; fc_kvm hosts can use hive_src_dir/target
+hive_src_dir: "/root/hive"
+hive_cargo_target_dir: "/root/fc-target"
 hive_binary_path: "{{ hive_cargo_target_dir }}/release/hive-cloud"
 hive_data_dir: "/var/lib/hive/data"
 
@@ -13,12 +13,11 @@ hive_listen: "0.0.0.0:8787"
 hive_admin: "127.0.0.1:8786"
 hive_bootstrap_peers: ""
 hive_discovery_dns: ""     # comma-separated http://<ip>:3350 of discovery-capable nodes
-hive_relay_urls: ""        # comma-separated self-hosted iroh relay URLs; TLS relays MUST use their https://<name>.relay.shadw.app:3343 form (the plaintext :3340 socket is captive-portal-only once TLS is on)
+hive_relay_urls: ""        # comma-separated https://<name>.relay.shadw.app:3343 URLs of the self-hosted iroh relays
 hive_discovery_n0: "0"     # 0 = opt out of public n0 discovery, use self-hosted only (fleet default)
-# Public mainline-DHT address lookup, on by default (the only address source needing no reachable fleet peer):
-# "0" = no DHT socket at all; HIVE_DHT_PUBLISH=0 resolves without publishing.
+# "1" = public mainline-DHT address lookup, "0" = no DHT socket at all
 hive_discovery_dht: "1"
-# Deliberately EMPTY: pinning a port removes the crate's 6881-then-ephemeral fallback.
+# stays empty: pinning a port removes the crate's 6881-then-ephemeral fallback
 hive_dht_port: ""
 hive_dht_publish_direct: "0"   # 1 = also publish this node's public ip:HIVE_IROH_PORT
 hive_p2p_discovery_ms: "8000"
@@ -34,13 +33,12 @@ hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode
 hive_platform_domain: "shadw.cloud"
 hive_apps_domain: "shadw.app"
-# Managed-database gateway zone; empty disables db_rest/db_gateway fleet-wide, so set it on EVERY node
-# (each presents the `*.{hive_db_domain}` cert).
+# empty disables db_rest/db_gateway fleet-wide: set it on EVERY node (each presents the *.<hive_db_domain> cert)
 hive_db_domain: "downstash.xyz"
 hive_deploy_zone: "deploy.{{ hive_apps_domain }}"
 hive_public_dashboard_url: "https://{{ hive_platform_domain }}"
 hive_dashboard_url: "http://localhost:3002"
-# The edge's dashboard reverse-proxy target; REQUIRED for apex/www to serve the dashboard at all.
+# the edge's dashboard reverse-proxy target; REQUIRED for apex/www to serve the dashboard
 hive_dashboard_upstream: "http://127.0.0.1:3002"
 hive_http_listen: "0.0.0.0:80"
 hive_https_listen: "0.0.0.0:443"
@@ -49,18 +47,16 @@ hive_dns_addr: "127.0.0.1:5354"
 hive_dns_leader_node: "{{ hive_cp_owner_chain.split(',')[0] }}"
 
 hive_acme_email: "ops@{{ hive_platform_domain }}"
-hive_acme_staging: "1"     # 1 = Let's Encrypt staging (KEEP during setup/testing; prod has a 5-cert/week limit)
+hive_acme_staging: "1"     # 1 = Let's Encrypt staging (production caps certificates per week)
 hive_ingress_enabled: true  # set false per-host (hosts.ini) for an internal-only node never published to DNS
 # hive_public_ip / hive_public_ip6: per-host in hosts.ini; a node without hive_public_ip is never published to DNS.
 
-# Extra --peer args: the SSH-tunnel-bridged `--peer http://127.0.0.1:<port>` pattern for admin ports not
-# directly reachable across hosts.
+# extra --peer args, e.g. SSH-tunnel-bridged http://127.0.0.1:<port> for admin ports not directly reachable
 hive_extra_peers: []
 
-hive_container_runtime: "runc"   # fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
+hive_container_runtime: "runc"   # fc_kvm default; fc_pvm hosts set runsc (gVisor) in group_vars/fc_pvm.yml
 
-# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS and the backend's admin_emails: EVERY
-# owner address must live here (env.local.j2 renders the whole file from this variable).
+# comma-separated; EVERY owner address must live here (env.local.j2 renders the whole file from this variable)
 hive_owner_email: "ops@{{ hive_platform_domain }},dylanwong007@gmail.com"
 # Platform admins beyond the owner (comma-separated): mint platform_admin JWTs and are locked to the enterprise plan.
 hive_admin_emails: "noahbladenbankers@gmail.com,dylan@simplyfi.cloud,dylan@shadw.cloud,dylan@weave.cloud,dylan@shadw.com"
@@ -69,8 +65,7 @@ hive_public_node_tenants: "thoth-division"
 
 hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
 
-# The code defaults (timeout 2 s, interval 5 s) are too tight for this geography; the interval must stay
-# GREATER than the timeout or probe rounds overlap.
+# the interval must stay GREATER than the timeout or probe rounds overlap
 hive_health_timeout: 10
 hive_health_interval: 15
 hive_health_fail_threshold: 2

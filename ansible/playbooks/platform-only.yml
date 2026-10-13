@@ -1,10 +1,7 @@
 ---
-# Fast path: rebuild and install the hive-cloud controller plus its exact
-# hive-cell-agent companion fleet-wide, skipping Firecracker/kernel/DNS work.
-# The guest agent is published on the host here but is NOT baked automatically;
-# a later explicitly drained hive_platform_rootfs run owns that migration.
-#
-# One host at a time so mesh quorum is never lost across more than one node.
+# Fast path: rebuild and install the hive-cloud controller plus its exact hive-cell-agent companion fleet-wide, skipping
+# Firecracker/kernel/DNS work, one host at a time so mesh quorum is never lost across more than one node. The guest agent
+# is published on the host here but NOT baked: a later explicitly drained hive_platform_rootfs run owns that migration.
 #
 # Usage:
 #   ansible-playbook playbooks/platform-only.yml

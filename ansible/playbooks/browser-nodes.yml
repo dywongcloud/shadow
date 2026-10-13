@@ -1,29 +1,15 @@
 ---
-# ONE headless browser node per host, on exactly five hosts:
-#   fc-bangkok  fc-sanjose  fc-virginia  fc-saopaulo  fc-frankfurt
-#
-# A "browser node" is the /run-node page's SharedWorker -- crates/hive-browser's
-# wasm BrowserNode over iroh QUIC via a WSS relay -- running unattended. This
-# playbook installs headless Chromium plus a node-local session broker that
-# mints the short-lived, tenant-scoped platform JWT the admission requires, and
-# caps the whole thing with cgroup limits chosen so it can never compete with
-# hive-node on the same box.
-#
-# Read roles/hive_browser_node/README.md before running: it documents the auth
-# decision and every cap value.
+# One headless browser node per host in [browser_nodes] (roles/hive_browser_node; its README documents the auth decision and every cap value).
 #
 # Usage:
-#   ansible-playbook playbooks/browser-nodes.yml                       # all five
-#   ansible-playbook playbooks/browser-nodes.yml --limit fr            # one host
+#   ansible-playbook playbooks/browser-nodes.yml                       # every host in [browser_nodes]
+#   ansible-playbook playbooks/browser-nodes.yml --limit <host>        # one host
 #   ansible-playbook playbooks/browser-nodes.yml --syntax-check        # local only, no connections
-#   # NOTE: --check is NOT a useful dry run here. The verification tasks poll a
-#   # broker that check mode never started, so they report failure for a reason
-#   # that has nothing to do with the change. Use --limit on one host instead.
 #   ansible-playbook playbooks/browser-nodes.yml -e hive_browser_node_team=acme
 #   ansible-playbook playbooks/browser-nodes.yml --tags verify         # re-verify only
+# --check is not a dry run here (the verify tasks poll a broker that check mode never started): use --limit on one host.
 #
-# Rollback (leaves the profile/identity in place so a re-enable keeps the same
-# endpoint id):
+# Rollback (keeps the profile/identity, so a re-enable keeps the same endpoint id):
 #   ansible browser_nodes -m systemd -a 'name=hive-browser-node state=stopped enabled=false'
 #   ansible browser_nodes -m systemd -a 'name=hive-browser-node-broker state=stopped enabled=false'
 
@@ -33,14 +19,7 @@
   run_once: true
   tags: [always]
   tasks:
-    # Guards the ONE thing an inventory edit can silently get wrong: a sixth
-    # host, a duplicate, or a missing region. The role re-checks per host, but
-    # a run that is going to install on the wrong machine should fail before it
-    # touches any machine.
     - name: Assert the group resolves to exactly the six expected nodes
-      # delegate_to localhost: this is an inventory check, and it must be able
-      # to fail BEFORE any SSH connection is attempted -- a run aimed at the
-      # wrong machines should never reach the machines.
       delegate_to: localhost
       become: false
       ansible.builtin.assert:
@@ -59,11 +38,7 @@
 - name: Headless browser node (capped, unattended)
   hosts: browser_nodes
   become: true
-  gather_facts: true          # the caps are derived from memtotal/vcpus facts
-  # One host at a time. Not for quorum reasons (a browser node holds no
-  # platform state) but because the FIRST thing this role does on a new host is
-  # install a large package set and start a browser next to a live hive-node:
-  # a mistake should surface on one production host, not five.
+  gather_facts: true
   serial: 1
   roles:
     - role: hive_browser_node
@@ -94,9 +69,6 @@
           presence_age_ms={{ bn_health.json.presence_age_ms }}
           geo={{ bn_health.json.geo_source | default('?') }}
 
-    # The real proof: the CONTROL PLANE lists this endpoint as present. Read
-    # through the same loopback proxy + minted cookie the node itself uses, so
-    # this needs no operator credential on the control host.
     - name: Ask the fleet for this tenant's browser presence
       ansible.builtin.shell: |
         set -euo pipefail
@@ -109,15 +81,6 @@
         executable: /bin/bash
       register: bn_presence
       changed_when: false
-      # Presence is published by the browser and then REPLICATED; the node this
-      # loopback proxy happens to reach need not have observed it yet. A
-      # single-shot read therefore fails on a node that is genuinely online and
-      # serving — witnessed on the fc-frankfurt canary, whose /healthz already
-      # reported lifecycle=online, admission=granted, serving=true with presence
-      # published 3.8s earlier. Poll instead of sampling once.
-      #
-      # failed_when is disabled so an exhausted retry falls through to the assert
-      # below, which explains what to check; the bare task failure would not.
       retries: 12
       delay: 10
       until: (bn_health.json.endpoint_id | default('')) in (bn_presence.stdout | default(''))

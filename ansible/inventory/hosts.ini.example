@@ -1,80 +1,33 @@
-# Copy this file to hosts.ini (gitignored) and fill in real hosts. hosts.ini
-# itself is never committed -- only this .example template is, so the repo
-# never carries real fleet IPs.
-#
-# Groups:
-#   [platform]  every node that runs hive-cloud (all of fc_kvm + fc_pvm)
-#   [fc_kvm]    hosts with REAL hardware /dev/kvm (bare metal, or a cloud VM
-#               with nested virtualization) -- Firecracker runs directly,
-#               no kernel work needed.
-#   [fc_pvm]    hosts WITHOUT hardware KVM (the common case on cloud VMs
-#               that don't expose nested virt) -- Firecracker runs via PVM,
-#               which needs a custom host + guest kernel build per host.
-#
-# A host belongs to exactly one of fc_kvm / fc_pvm, and always to platform.
+# Copy this file to hosts.ini (gitignored: the repo never carries real fleet IPs) and fill in real hosts.
+# [platform] is every node that runs hive-cloud (all of fc_kvm + fc_pvm; a host is in exactly one of those two).
+# [fc_kvm] has REAL hardware /dev/kvm (bare metal or nested virt): Firecracker runs directly.
+# [fc_pvm] has no hardware KVM: Firecracker runs via PVM (custom host + guest kernel build per host).
 
 [platform:children]
 fc_kvm
 fc_pvm
 
 [fc_kvm]
-# bare-metal or nested-virt-enabled hosts; ansible_host = real IP.
-# hive_public_ip is required for this node to be published to DNS
-# (RUNBOOK.md Phase-0 step 4) -- omit it for an internal-only node.
+# hive_public_ip publishes the node to DNS (RUNBOOK.md Phase-0 step 4); omit it for an internal-only node
 bkk-example ansible_host=203.0.113.10 ansible_user=root hive_name=fc-example1 hive_region=example-region hive_public_ip=203.0.113.10
 
 [fc_pvm]
-# cloud VMs without hardware KVM -- see roles/pvm_firecracker/README.md.
-# fsgsbase/rdtscp are NOT a requirement for adding a host here: the patch
-# series turns both into soft runtime fallbacks, and preflight only logs which
-# path a host will use.
-#
-# pvm_skip=true excludes a host from the pvm_firecracker role ENTIRELY (no
-# kernel build, no patching, no REBOOT, no microVM smoke test). Set it in
-# inventory rather than relying on a hand-shaped --limit, because this role
-# reboots and an exclusion you have to remember is one you will eventually
-# forget. Use it for a host that must not be rebooted, one that is down, or one
-# with a known-bad PVM kernel (a real case: a host where booting a microVM
-# hard-resets the machine).
+# pvm_skip=true on a host line excludes it from the pvm_firecracker role entirely (roles/pvm_firecracker/README.md)
 va-example  ansible_host=203.0.113.20 ansible_user=root hive_name=fc-example2 hive_region=example-region-2 hive_public_ip=203.0.113.20
 sj-example  ansible_host=203.0.113.21 ansible_user=root hive_name=fc-example3 hive_region=example-region-2 hive_public_ip=203.0.113.21
 # fr-example  ansible_host=203.0.113.22 ansible_user=root hive_name=fc-example4 hive_region=example-region-3 hive_public_ip=203.0.113.22 pvm_skip=true
 
 [platform:vars]
 ansible_python_interpreter=/usr/bin/python3
-# The control-plane owner chain (comma-separated hive_name values, most-
-# preferred first). See crates/hive-cloud/src/cluster.rs::control_plane_owner.
+# comma-separated hive_name values, most-preferred first (crates/hive-cloud/src/cluster.rs control_plane_owner)
 hive_cp_owner_chain=fc-example1,fc-example2,fc-example3
 
-# Hosts running ONE headless browser node each (ansible/playbooks/browser-nodes.yml,
-# roles/hive_browser_node). A browser node is the /run-node page's worker --
-# crates/hive-browser's wasm BrowserNode over iroh QUIC via a WSS relay --
-# running unattended under headless Chromium, capped by systemd so it can never
-# compete with the hive-node process on the same box.
-#
-# Membership is deliberately NARROW and asserted twice (the playbook checks this
-# group, the role checks hive_browser_node_allowed in its defaults), because the
-# node consumes real memory/CPU on a machine whose actual job is the platform.
-# One host per REGION is the intended shape: donor capacity concentrated in one
-# region is not capacity, it is a correlated failure.
+# One headless browser node per host (playbooks/browser-nodes.yml, roles/hive_browser_node); the playbook and the role's hive_browser_node_allowed both assert the membership
 [browser_nodes]
 va-example
 sj-example
 
-# Hosts eligible for the Litebox CellBackend (roles/litebox,
-# crates/hive-backend/src/litebox.rs) -- the syscall-sandbox fallback for a
-# host with no safe microVM path (no /dev/kvm, or a PVM kernel that resets the
-# host). Membership is ELIGIBILITY only: the role builds + stages the runner
-# from the pinned AnEntrypoint/litebox commit and restarts nothing.
-#
-# Enabling is a per-host, per-probe decision recorded ON THE HOST LINE:
-#   1. run the role once (build + stage), 2. on that host as root run
-#   `hive-cloud --litebox-probe` and require a real PASS, 3. add
-#   `litebox_verified=true` to the host's line, 4. run the role again (writes
-#   the HIVE_LITEBOX_VERIFIED=1 drop-in and restarts hive-node).
-# The inventory mark is load-bearing: a role re-run on a host WITHOUT it removes
-# the drop-in and silently downgrades that node to MockBackend. Never set it on
-# a macOS node (the flag selects the Linux backend, which cannot exist there).
+# Hosts eligible for the Litebox CellBackend (roles/litebox); litebox_verified=true on a host line records a PASSED `hive-cloud --litebox-probe` on that host
 [litebox]
 # fr-example
-# sj-example   litebox_verified=true   # example of a probed, enabled host
+# sj-example   litebox_verified=true
