@@ -4,9 +4,6 @@ import { useEffect, useState } from "react";
 import { CheckCircle2, AlertTriangle, AlertOctagon, Activity, Clock, ChevronDown } from "lucide-react";
 import { usePoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
 
-// A standalone, public, statuspage-style board. No dashboard chrome (the nav /
-// footer hide on /status). Polls the global incidents feed in real time.
-
 const SEV_RANK: Record<Severity, number> = { minor: 1, major: 2, critical: 3 };
 
 const STATUS_LABEL: Record<IncidentStatus, string> = {
@@ -22,7 +19,9 @@ const SEV_STYLE: Record<Severity, { dot: string; text: string; chip: string }> =
   critical: { dot: "bg-red-500", text: "text-red-500", chip: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" },
 };
 
-// The platform surfaces shown in the components strip.
+const PUBLIC_INCIDENTS_PATH = "/v1/status/incidents";
+const INCIDENTS_POLL_MS = 10_000;
+
 const COMPONENTS = ["Edge Network", "Builds & Deployments", "Fluid Compute", "Dashboard", "Admin API", "Storage"];
 
 function fmtAbs(ms: number) {
@@ -38,16 +37,11 @@ function fmtAgo(ms: number) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+/** Public statuspage-style board over the operator-declared incident feed: no dashboard chrome (the nav and footer hide on /status). */
 export default function StatusPage() {
-  // The public feed: operator-declared incidents only (open + recent
-  // history), served without auth. `/v1/incidents` is operator-gated and
-  // answered this public page 403 for every visitor.
-  const { data } = usePoll<Incident[]>("/v1/status/incidents", 10000);
+  const { data } = usePoll<Incident[]>(PUBLIC_INCIDENTS_PATH, INCIDENTS_POLL_MS);
   const [now, setNow] = useState(0);
   useEffect(() => {
-    // Date.now() is client-only and time-varying -- cannot be computed during
-    // SSR/lazy-init without a hydration mismatch; the `now ? ... : ""` render
-    // guard covers the gap until this effect first fires.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 30_000);
@@ -72,7 +66,6 @@ export default function StatusPage() {
   return (
     <div className="min-h-screen bg-bg text-fg">
       <div className="mx-auto max-w-3xl px-5 py-10 sm:py-14">
-        {/* Header */}
         <div className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-fg text-bg">
@@ -92,7 +85,6 @@ export default function StatusPage() {
           </div>
         </div>
 
-        {/* Overall banner */}
         <div className={`mb-8 flex items-center gap-4 rounded-xl border p-5 ${banner.cls}`}>
           {banner.icon}
           <div>
@@ -103,7 +95,6 @@ export default function StatusPage() {
           </div>
         </div>
 
-        {/* Components */}
         <div className="mb-10 overflow-hidden rounded-xl border border-border bg-card">
           <div className="border-b border-border px-4 py-2.5 text-sm font-medium">Components</div>
           {COMPONENTS.map((c) => {
@@ -120,7 +111,6 @@ export default function StatusPage() {
           })}
         </div>
 
-        {/* Active incidents */}
         {active.length > 0 && (
           <section className="mb-10">
             <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-secondary">
@@ -132,7 +122,6 @@ export default function StatusPage() {
           </section>
         )}
 
-        {/* Past incidents */}
         <section>
           <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-secondary">
             <Clock className="h-4 w-4" /> Incident History

@@ -8,28 +8,20 @@ import {
 } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
 
-/**
- * OAuth callback for the platform's first-party GitHub App — the exact URL
- * registered on the App (https://shadw.cloud/oauth/github/callback). Verifies the
- * signed CSRF state, exchanges the code for a user-to-server token, seals it into
- * the encrypted httpOnly cookie, and returns the user to where they started with
- * `?connected=github` (the same contract the Composio flow used, so the
- * Integrations/GitOps/New-Project pages react identically).
- *
- * Every failure path redirects with a human-readable `github_error` flag — never
- * a raw 500, and never any credential material in a response.
- */
+/** OAuth callback for the first-party GitHub App (the URL registered on the App, https://shadw.cloud/oauth/github/callback): verifies the signed CSRF state, exchanges the
+ *  code for a user token, seals it into the encrypted httpOnly cookie and returns to the page the user started on with `?connected=github`, the contract the Composio flow
+ *  used. Every failure redirects with a human-readable `github_error`, never a raw 500 or credential material. */
 export async function GET(req: NextRequest) {
   const url = req.nextUrl;
-  // Behind the gateway proxy the request's own origin is the INTERNAL
-  // localhost:3002 — redirects must target the PUBLIC host the user is on.
   const origin = publicOrigin(req);
+  const consumeStateCookie = (res: NextResponse) => {
+    res.cookies.set(stateCookieName(), "", { httpOnly: true, path: "/", maxAge: 0 });
+  };
   const back = (path: string, params: Record<string, string>) => {
     const u = new URL(path, origin);
     for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
     const res = NextResponse.redirect(u);
-    // One-shot state cookie is consumed either way.
-    res.cookies.set(stateCookieName(), "", { httpOnly: true, path: "/", maxAge: 0 });
+    consumeStateCookie(res);
     return res;
   };
 
@@ -37,10 +29,9 @@ export async function GET(req: NextRequest) {
     return back("/integrations", { github_error: "GitHub App not configured on this deployment." });
   }
 
-  // User declined the authorization on GitHub.
-  const err = url.searchParams.get("error");
-  if (err) {
-    return back("/integrations", { github_error: err === "access_denied" ? "GitHub authorization was cancelled." : err });
+  const providerError = url.searchParams.get("error");
+  if (providerError) {
+    return back("/integrations", { github_error: providerError === "access_denied" ? "GitHub authorization was cancelled." : providerError });
   }
 
   const code = url.searchParams.get("code");
@@ -49,7 +40,6 @@ export async function GET(req: NextRequest) {
     return back("/integrations", { github_error: "Missing authorization code." });
   }
 
-  // CSRF: the state must be OUR signature and match the nonce cookie set at connect.
   const nonce = req.cookies.get(stateCookieName())?.value;
   const v = verifyState(state, nonce);
   if (!v.ok) {
@@ -61,12 +51,10 @@ export async function GET(req: NextRequest) {
     return back(v.returnTo, { github_error: "GitHub token exchange failed — please try again." });
   }
 
-  // Bind the connection to the Clerk user who initiated the connect (carried in
-  // the SIGNED state) — a different signed-in user on this browser won't see it.
   if (v.uid) bundle.uid = v.uid;
   await setTokenCookie(bundle);
   const sep = v.returnTo.includes("?") ? "&" : "?";
   const res = NextResponse.redirect(new URL(`${v.returnTo}${sep}connected=github`, origin));
-  res.cookies.set(stateCookieName(), "", { httpOnly: true, path: "/", maxAge: 0 });
+  consumeStateCookie(res);
   return res;
 }

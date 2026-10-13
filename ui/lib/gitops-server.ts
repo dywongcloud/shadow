@@ -3,12 +3,11 @@ import { createHash } from "crypto";
 import { buildArtifacts } from "@/lib/gitops-yaml";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
+const BACKEND_TIMEOUT_MS = 20_000;
 
 /** Calls the backend admin API scoped to a tenant. `authToken` (the user's platform JWT) is forwarded as `Authorization: Bearer` so MUTATIONS pass
  *  `require_auth`: a Next route's server->backend `fetch()` does not carry the browser's `hive_jwt` cookie the way the `/cloud` proxy does, so a route
  *  that writes on the user's behalf MUST pass it. The backend derives the tenant from the JWT claim, not `x-hive-team`. */
-const BACKEND_TIMEOUT_MS = 20_000;
-
 export async function backend(path: string, team: string, init?: RequestInit, authToken?: string | null) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS);

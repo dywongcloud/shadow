@@ -7,6 +7,10 @@ import { Card, Button, PageHeader, Badge } from "@/components/ui";
 import { apiSend, usePoll, type BillingInfo, type LedgerEntry, type Invoice } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
+const BILLING_POLL_MS = 30_000;
+const LEDGER_POLL_MS = 120_000;
+const INVOICES_POLL_MS = 60_000;
+
 function usd(cents: number) {
   return `$${(cents / 100).toFixed(2)}`;
 }
@@ -22,48 +26,34 @@ export default function BillingPage() {
 function BillingInner() {
   const router = useRouter();
   const params = useSearchParams();
-  // Billing is slow-moving, and `/v1/billing/ledger` is measured at a flat
-  // ~10s against the live fleet (its relational mirror table is wedged), so
-  // polling it every 5s held a request in flight permanently. A checkout or
-  // plan change still invalidates the shared GET cache and `refresh` is
-  // called explicitly after any mutation on this page.
-  const { data, refresh } = usePoll<BillingInfo>("/v1/billing", 30000);
-  const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 120000);
-  const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", 60000);
+  const { data, refresh } = usePoll<BillingInfo>("/v1/billing", BILLING_POLL_MS);
+  const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", LEDGER_POLL_MS);
+  const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", INVOICES_POLL_MS);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
 
-  // Complete a returning checkout (?success=<session>) — applies the plan/credits.
-  const success = params.get("success");
+  const returnedSession = params.get("success");
   useEffect(() => {
-    if (success && success !== "1") {
-      apiSend("POST", "/v1/billing/confirm", { session: success })
+    if (returnedSession && returnedSession !== "1") {
+      apiSend("POST", "/v1/billing/confirm", { session: returnedSession })
         .then(() => { setMsg("Payment successful — your plan is updated."); refresh(); router.replace("/billing"); })
         .catch(() => {});
-    } else if (success === "1") {
-      // Responds to a URL param change (external system), not a synchronous render cascade.
+    } else if (returnedSession === "1") {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setMsg("Payment successful.");
     }
-  }, [success, refresh, router]);
+  }, [returnedSession, refresh, router]);
 
   async function checkout(kind: "plan" | "credits", body: Record<string, unknown>) {
     setBusy(kind + JSON.stringify(body));
     try {
       const r = await apiSend<{ url: string; mock: boolean; applied?: boolean }>("POST", "/v1/billing/checkout", { kind, ...body });
-      // A free plan (Hobby) has nothing to charge — the backend applies it
-      // immediately and returns no checkout URL, so there's nothing to
-      // redirect to.
       if (r.applied) {
         setMsg("Plan updated.");
         setBusy("");
         refresh();
         return;
       }
-      // r.url is a real cross-origin Stripe checkout URL (or the mock
-      // fallback's internal path) -- a full navigation via window.location is
-      // required here, not a render-time mutation. Same idiom used across
-      // every other checkout/OAuth redirect in this codebase.
       // eslint-disable-next-line react-hooks/immutability
       window.location.href = r.url;
     } catch (e) {
@@ -86,7 +76,6 @@ function BillingInner() {
         <div className="mb-5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400">{msg}</div>
       )}
 
-      {/* Current account */}
       {acc && (
         <Card className="mb-6 p-5">
           <div className="flex flex-wrap items-center justify-between gap-4">
@@ -111,7 +100,6 @@ function BillingInner() {
         </Card>
       )}
 
-      {/* Plan limits / quota (business locking) */}
       {data?.limits && (
         <Card className="mb-6 p-5">
           <div className="mb-4 flex items-center justify-between">
@@ -147,7 +135,6 @@ function BillingInner() {
         </Card>
       )}
 
-      {/* Plans */}
       <div className="mb-3 text-base font-semibold">Plans</div>
       <div className="mb-8 grid grid-cols-1 gap-4 md:grid-cols-2">
         {plans.map((p) => {
@@ -185,7 +172,6 @@ function BillingInner() {
         })}
       </div>
 
-      {/* Buy credits */}
       <div className="mb-3 text-base font-semibold">Compute credits</div>
       <Card className="mb-8 flex flex-wrap items-center gap-3 p-5">
         <Coins className="h-5 w-5 text-amber-500" />
@@ -197,7 +183,6 @@ function BillingInner() {
         ))}
       </Card>
 
-      {/* Invoices */}
       <div className="mb-3 text-base font-semibold">Invoices</div>
       <div className="mb-8 overflow-hidden rounded-xl border border-border bg-card">
         <div className="grid grid-cols-[1fr_auto_auto_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
@@ -237,7 +222,6 @@ function BillingInner() {
         )}
       </div>
 
-      {/* Ledger */}
       <div className="mb-3 text-base font-semibold">Transaction history</div>
       <div className="overflow-hidden rounded-xl border border-border bg-card">
         <div className="grid grid-cols-[1fr_auto_auto_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">

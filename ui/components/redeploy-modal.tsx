@@ -22,11 +22,7 @@ import { addPendingBuild } from "@/lib/pending-builds";
 
 type Env = "production" | "preview";
 
-/**
- * Vercel-style Redeploy confirmation modal. Lets the user choose the target
- * environment and whether to reuse the existing build cache, then kicks off a
- * redeploy and surfaces a blue "New Deployment Created" toast.
- */
+/** Redeploy confirmation: choose the target environment and whether to reuse the build cache, start the redeploy and show a "New Deployment Created" toast. */
 export function RedeployModal({
   deployment,
   prodAlias,
@@ -50,7 +46,6 @@ export function RedeployModal({
   const [error, setError] = useState("");
   const cardRef = useRef<HTMLDivElement>(null);
 
-  // Close on Escape (unless mid-redeploy).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onClose();
@@ -63,13 +58,10 @@ export function RedeployModal({
     setBusy(true);
     setError("");
     try {
-      // Via the server route so a redeploy of a PRIVATE github repo gets the user's
-      // GitHub token attached server-side (never in the browser) for the clone.
       const r = await apiDeployViaServerRoute<{ build_id: string }>(
         `/api/projects/${encodeURIComponent(deployment.project)}/redeploy`,
         { target: env, use_cache: useCache },
       );
-      // Persist the in-flight build so its "Building" row survives navigation/reload.
       addPendingBuild({ id: r.build_id, project: deployment.project, team: currentTeam(), env });
       toast("New Deployment Created");
       onDone?.(r.build_id, env);
@@ -81,13 +73,10 @@ export function RedeployModal({
   }
 
   const selfHost = deploymentHost(deployment.id_alias || deployment.commit_alias || deployment.alias);
-  // Assigned domain reflects the CHOSEN environment: production → the project's
-  // production domain; preview → the generated preview URL (branch alias, else the
-  // unique deployment alias) — never the production URL for a preview redeploy.
   const previewHost = deploymentHost(
     deployment.branch_alias || deployment.id_alias || deployment.commit_alias || deployment.alias,
   );
-  const domainHost = env === "production" ? deploymentHost(prodAlias) : previewHost;
+  const assignedHost = env === "production" ? deploymentHost(prodAlias) : previewHost;
   const commitMsg = deployment.git?.commit_message || "Latest commit";
 
   if (typeof document === "undefined") return null;
@@ -110,7 +99,6 @@ export function RedeployModal({
             Create a new deployment with the same source code as your current one but with the latest Project Settings.
           </p>
 
-          {/* Choose Environment */}
           <label className="mb-1.5 mt-6 block text-sm text-secondary">Choose Environment</label>
           <div className="relative">
             <button
@@ -147,7 +135,6 @@ export function RedeployModal({
             )}
           </div>
 
-          {/* Current deployment */}
           <div className="mt-3 rounded-lg border border-border p-4">
             <div className="flex items-start gap-3">
               <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-[5px] border-[#0070f3]" />
@@ -169,15 +156,13 @@ export function RedeployModal({
             </div>
           </div>
 
-          {/* Assigned domains */}
           <div className="mt-4">
             <div className="text-sm text-secondary">Assigned domains:</div>
             <div className="mt-1 flex items-center gap-1.5 text-sm">
-              <Globe className="h-3.5 w-3.5 text-muted" /> <span className="font-mono text-xs">{domainHost}</span>
+              <Globe className="h-3.5 w-3.5 text-muted" /> <span className="font-mono text-xs">{assignedHost}</span>
             </div>
           </div>
 
-          {/* Use existing Build Cache */}
           <label className="mt-5 flex cursor-pointer items-center gap-2.5 text-sm">
             <button
               type="button"
@@ -207,7 +192,6 @@ export function RedeployModal({
           {error && <p className="mt-4 text-sm text-red-600 dark:text-red-400">{error}</p>}
         </div>
 
-        {/* Footer */}
         <div className="flex items-center justify-between gap-3 border-t border-border px-6 py-4 sm:px-7">
           <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel

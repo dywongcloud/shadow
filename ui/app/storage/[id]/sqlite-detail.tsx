@@ -19,21 +19,12 @@ import { KindBadge } from "../kind";
 import { sqliteDatabases, sqliteConnectivity, SQLITE_NO_DSN, type SqliteDb } from "../db-model";
 import { BrowserDbConfigModal, BrowserDbStatusPanel, formatBytes } from "../browser-db-panel";
 
-/**
- * Detail page for a browser-replicated SQLite database — deliberately the same
- * shell as the managed-engine detail (back link, PageHeader + status + Delete,
- * a Mini stat row, a Connection card, then the specifics). The Connection card
- * is honest about the two access shapes: browsers sync a local replica (no
- * DSN), and servers use the token-gated libsql/Hrana + Upstash-style REST
- * surface (`browser_db_rest`) whose URLs are server-derived and shown here.
- */
+/** Detail page for a browser-replicated SQLite database, in the same shell as the managed-engine detail. Browsers sync a local replica (no DSN); servers use
+ *  the token-gated libsql/Hrana + Upstash-style REST surface (`browser_db_rest`), whose URLs are server-derived and shown on the Connection card. */
 export function SqliteDatabaseDetail({ project }: { project: string }) {
   const router = useRouter();
   const { data: deployments } = usePoll<Deployment[]>("/deployments", 15000);
   const [settingsPolicy, setSettingsPolicy] = useState<BrowserDbPolicy | null | undefined>(undefined);
-  // Bumped after a save so the dashboard-managed mirror is re-read fresh; the
-  // load itself lives in the effect (never a setState in the effect BODY) and
-  // drops its result when the project changes mid-flight.
   const [settingsNonce, setSettingsNonce] = useState(0);
   useEffect(() => {
     let cancelled = false;
@@ -51,8 +42,6 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
     return () => { cancelled = true; };
   }, [project, settingsNonce]);
 
-  // BOTH sources must have answered before a verdict: deciding "not deployed"
-  // from a half-loaded view would flash a wrong status on every page open.
   const loading = settingsPolicy === undefined || !deployments;
   const db: SqliteDb | null = useMemo(() => {
     if (loading) return null;
@@ -69,22 +58,19 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
   const [redeploying, setRedeploying] = useState(false);
   const [copied, setCopied] = useState("");
 
-  // The REST/Hrana surface: URLs + token-existence ride the same status poll
-  // the Replication panel uses (shared cache, one wire request). `minted`
-  // holds a just-minted plaintext token — shown ONCE, never re-fetchable.
   const { data: dbStatus, refresh: refreshStatus } = usePoll<BrowserDbStatusResponse>(
     `/v1/projects/${encodeURIComponent(project)}/browser-db/status`,
     10000,
   );
   const rest = dbStatus && dbStatus.opted_in ? dbStatus.rest : null;
   const [minting, setMinting] = useState<"team" | "public" | null>(null);
-  const [minted, setMinted] = useState<BrowserDbRestMint | null>(null);
+  const [justMinted, setJustMinted] = useState<BrowserDbRestMint | null>(null);
 
   async function mint(scope: "team" | "public") {
     setMinting(scope);
     try {
       const m = await mintBrowserDbRestToken(project, scope);
-      setMinted(m);
+      setJustMinted(m);
       await refreshStatus();
     } catch (e) {
       toast(`Couldn't mint token: ${String(e).replace(/^Error:\s*/, "")}`, {});
@@ -168,7 +154,6 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
         </Card>
       )}
 
-      {/* The connection surface — stated, not faked. */}
       <Card className="mb-4">
         <div className="mb-2 flex items-center gap-2">
           <FileStack className="h-4 w-4 text-muted" />
@@ -190,8 +175,6 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
             </ul>
           </div>
         </div>
-        {/* Server access: the token-gated libsql/REST surface — URLs are
-            server-derived (status poll), the token is minted here. */}
         {rest && (
           <div className="mt-4 divide-y divide-border border-t border-border">
             <CopyRow
@@ -240,15 +223,15 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
                 A public token was minted earlier, but public read is now disabled — it refuses every request until re-enabled.
               </p>
             )}
-            {minted && (
+            {justMinted && (
               <div className="rounded-md border border-green/40 bg-green/5 p-2.5">
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="font-medium text-green">{minted.scope} token — shown once, store it now</span>
-                  <button onClick={() => copy("new token", minted.token)} className="text-muted hover:text-fg" title="Copy token">
+                  <span className="font-medium text-green">{justMinted.scope} token — shown once, store it now</span>
+                  <button onClick={() => copy("new token", justMinted.token)} className="text-muted hover:text-fg" title="Copy token">
                     {copied === "new token" ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
                   </button>
                 </div>
-                <code className="block break-all font-mono text-[11px] text-fg">{minted.token}</code>
+                <code className="block break-all font-mono text-[11px] text-fg">{justMinted.token}</code>
                 <p className="mt-1 text-[11px] text-muted">
                   Only its hash is kept server-side — this exact value is never recoverable again; rotate to replace.
                 </p>

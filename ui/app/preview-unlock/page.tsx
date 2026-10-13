@@ -4,13 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { useUser } from "@clerk/nextjs";
 import Link from "next/link";
 
-// Protected-preview unlock interstitial. Clean, theme-aware "Authenticating"
-// screen (spoke spinner + title in the foreground color) with a terminal-style
-// zero-knowledge proof/verification log beneath it (bright green on dark, regular
-// green on light). The real work runs in /api/preview-unlock; the log is staged
-// around its result, then we redirect into the preview.
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+const LOG_LINE_INTERVAL_MS = 270;
 
+/** Protected-preview unlock interstitial: `/api/preview-unlock` does the real work while a staged, purely decorative terminal-style proof log plays, then the page
+ *  redirects into the preview. */
 export default function PreviewUnlockPage() {
   return clerkEnabled ? <ClerkGate /> : <Authenticating signedIn loaded />;
 }
@@ -31,7 +29,7 @@ function SpokeSpinner() {
   );
 }
 
-const hex = (n: number) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+const randomHex = (n: number) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
 
 function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boolean }) {
   const [lines, setLines] = useState<string[]>([]);
@@ -43,43 +41,35 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
     const qs = window.location.search;
     const p = new URLSearchParams(qs);
     if (!p.get("host") || !p.get("project")) {
-      // Depends on window.location.search (client-only) plus the async
-      // Clerk-resolved `loaded`/`signedIn` props -- genuinely can't be a lazy
-      // initializer; this whole effect is a one-time, ref-guarded auth/redirect
-      // flow, not a synchronous render-time derivation.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setError("This unlock link is missing deployment details.");
       return;
     }
     if (clerkEnabled && !signedIn) {
-      // Hard navigation, not useRouter().push(): this leaves the whole
-      // unauthenticated interstitial for Clerk's hosted sign-in flow, which
-      // needs a fresh page load to initialize correctly.
       // eslint-disable-next-line @next/next/no-location-assign-relative-destination
       window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
       return;
     }
     started.current = true;
 
-    // Streamed zero-knowledge proof / verification log.
-    const script = [
+    const stagedLog = [
       "$ zkauth: opening membership session",
       "» deriving witness from secret key",
-      `» commit     0x${hex(40)}`,
-      `» proof      0x${hex(56)}`,
-      `» nullifier  0x${hex(24)}`,
+      `» commit     0x${randomHex(40)}`,
+      `» proof      0x${randomHex(56)}`,
+      `» nullifier  0x${randomHex(24)}`,
       "→ transmitting proof to verifier",
       "« verifier: checking ring signature over team roster",
       "« verifier: constraints 1/1 satisfied",
     ];
     let i = 0;
     const tick = setInterval(() => {
-      setLines((l) => (i < script.length ? [...l, script[i]] : l));
+      setLines((l) => (i < stagedLog.length ? [...l, stagedLog[i]] : l));
       i += 1;
-      if (i >= script.length) clearInterval(tick);
-    }, 270);
+      if (i >= stagedLog.length) clearInterval(tick);
+    }, LOG_LINE_INTERVAL_MS);
 
-    const minShow = new Promise((r) => setTimeout(r, script.length * 270));
+    const minShow = new Promise((r) => setTimeout(r, stagedLog.length * LOG_LINE_INTERVAL_MS));
     const work = fetch(`/api/preview-unlock${qs}`, { cache: "no-store" })
       .then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }))
       .catch(() => ({ status: 0, body: { error: "network error" } as any }));
@@ -88,7 +78,6 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
       clearInterval(tick);
       const { status, body } = res as { status: number; body: any };
       if (status === 401 && body?.signin) {
-        // Same hard-navigation reasoning as the earlier redirect above.
         // eslint-disable-next-line @next/next/no-location-assign-relative-destination
         window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
         return;

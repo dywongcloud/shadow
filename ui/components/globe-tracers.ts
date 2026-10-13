@@ -1,20 +1,5 @@
-// The hero globe's animated tracer overlay: 15 globe routes and 30 SMIL
-// sweep animations, EXTRACTED from the old single-file
-// `/globe-wireframe.svg` so it no longer carries the globe raster.
-//
-// WHY IT LIVES HERE AS A STRING: the old asset embedded its 2048x762 globe
-// raster as a base64 `data:image/png` INSIDE the SVG -- 904,850 of its
-// 906,804 bytes -- which is why it was 886 KB on the wire, why gzip could
-// barely compress it (already-compressed PNG, inflated 33% by base64), and
-// why it had to be fetched. The raster is now its own cacheable image
-// (globe-wireframe.webp, lossless, 405 KB) and these tracers are ~21 KB of
-// markup that ship with the component: no fetch, no post-hydration wait,
-// and nothing can silently fail and leave the hero blank.
-//
-// It is inlined rather than served as a file so the SMIL timeline is part of
-// the live document (SMIL in an <img>-referenced SVG is not something to
-// rely on), and rendered via dangerouslySetInnerHTML because this markup is
-// a build-time constant from this repo, never user input.
+/** The hero globe's animated tracer overlay: 15 routes, 30 SMIL sweeps. Inlined (not served as a file) so the SMIL timeline is part of the live document, and a
+ *  build-time constant from this repo, never user input, so injecting it with `dangerouslySetInnerHTML` is safe. */
 export const GLOBE_TRACERS_SVG = `<svg xmlns="http://www.w3.org/2000/svg"
      xmlns:xlink="http://www.w3.org/1999/xlink"
      width="2048" height="762" viewBox="0 0 2048 762"

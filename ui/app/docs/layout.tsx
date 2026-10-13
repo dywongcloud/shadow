@@ -40,8 +40,6 @@ const NAV: { group: string; items: NavItem[] }[] = [
   {
     group: "Errors",
     items: [
-      // The edge's own 404 screen links here (edge.rs deployment_not_found),
-      // so this page must stay public and its path stable.
       { label: "DEPLOYMENT_NOT_FOUND", href: "/docs/errors/deployment-not-found" },
     ],
   },
@@ -53,7 +51,6 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
   const [q, setQ] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
 
-  // ⌘K / "/" focuses the docs search.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -71,14 +68,8 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
     return NAV.map((g) => ({ ...g, items: g.items.filter((i) => i.label.toLowerCase().includes(s)) })).filter((g) => g.items.length);
   }, [q]);
 
-  // Track the active hash so only ONE sidebar item highlights. Without this, every
-  // item sharing a base path (e.g. all the /docs/getting-started#… anchors) lit up
-  // at once because we only compared the path. Synced on hashchange + scrollspy.
   const [hash, setHash] = useState("");
   useEffect(() => {
-    // window.location.hash is client-only, and this effect re-runs on every
-    // route change (deps: [pathname]) to re-sync for the new page's anchors --
-    // not eligible for a lazy initializer, which would only run once at mount.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHash(window.location.hash);
     const onHash = () => setHash(window.location.hash);
@@ -86,8 +77,6 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
     return () => window.removeEventListener("hashchange", onHash);
   }, [pathname]);
 
-  // Scrollspy: on a page with #fragment anchors, highlight whichever section is in
-  // view as you scroll (so the sidebar follows the reader, not just clicks).
   useEffect(() => {
     const frags = NAV.flatMap((g) => g.items)
       .filter((i) => i.href.split("#")[0] === pathname && i.href.includes("#"))
@@ -112,14 +101,11 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
   const isActive = (href: string) => {
     const [base, frag] = href.split("#");
     if (pathname !== base) return false;
-    // A fragment link is active only when its hash matches; a plain page link is
-    // active only when no section hash is selected.
     return frag ? hash === `#${frag}` : hash === "" || hash === "#";
   };
 
   return (
     <div className="relative left-1/2 w-screen -translate-x-1/2 -my-8 min-h-screen bg-bg text-fg">
-      {/* Top nav */}
       <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
         <div className="flex h-14 items-center justify-between px-4 lg:px-6">
           <div className="flex items-center gap-3">
@@ -146,7 +132,6 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
       </header>
 
       <div className="mx-auto flex max-w-[1600px]">
-        {/* Sidebar — the API Reference uses its own collapsible endpoint tree. */}
         <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-72 shrink-0 overflow-y-auto border-r border-border px-4 py-6 lg:block">
           {isApi ? (
             <ApiSidebar />
@@ -191,7 +176,6 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
           )}
         </aside>
 
-        {/* Content */}
         <main className="min-w-0 flex-1 px-5 py-10 sm:px-8 lg:px-14">{children}</main>
       </div>
     </div>

@@ -3,11 +3,8 @@
 import { useEffect, useState } from "react";
 import { COUNTRY_GEO } from "./country-geo";
 
-// Region TV — the atlas "TV logic" from PeerSpeak/dial.wtf mapped onto THIS
-// fleet's regions AND the whole world. Data source: iptv-org's public channel
-// + stream catalog (https://github.com/iptv-org/iptv, MIT — the dataset that
-// powers tv.garden). No API key; joined server-side by /api/tv/catalog and
-// fetched once per session (never on page load).
+// Region TV data: iptv-org's public channel + stream catalog (https://github.com/iptv-org/iptv, MIT), no API key, joined server-side by /api/tv/catalog and
+// fetched once per session, never on page load.
 
 export interface TvChannel {
   id: string;
@@ -47,9 +44,7 @@ export interface TvTarget {
   channels: TvChannel[];
 }
 
-/** The fleet's serving regions → geo + the country whose national catalog
- *  represents them. Static by design (regions are operator-provisioned; a
- *  region missing here simply gets no TV plot — never an error). */
+/** The fleet's serving regions -> geo + the country whose national catalog represents them. Static: a region missing here gets no TV plot, never an error. */
 export const REGION_TV_GEO: Record<string, { lat: number; lon: number; country: string }> = {
   bangkok: { lat: 13.7563, lon: 100.5018, country: "TH" },
   "hong-kong": { lat: 22.3193, lon: 114.1694, country: "HK" },
@@ -69,9 +64,8 @@ export function flagEmoji(cc: string): string {
 
 let catalogPromise: Promise<Map<string, TvChannel[]>> | null = null;
 
-/** country code → playable channels. Fetched from THIS origin's proxy
- *  (`/api/tv/catalog`) — the browser can't reach iptv-org directly under the
- *  app's CSP, and the join runs server-side there. Cached once per session. */
+/** country code -> playable channels, fetched from this origin's `/api/tv/catalog` proxy (the CSP keeps the browser off iptv-org) and cached for the session; a failed
+ *  load is dropped so the next call retries. */
 export function loadTvCatalog(): Promise<Map<string, TvChannel[]>> {
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
@@ -88,7 +82,7 @@ export function loadTvCatalog(): Promise<Map<string, TvChannel[]>> {
     }
     return byCountry;
   })().catch((e) => {
-    catalogPromise = null; // a transient failure must not poison the session
+    catalogPromise = null;
     throw e;
   });
   return catalogPromise;
@@ -114,9 +108,8 @@ export function regionTv(catalog: Map<string, TvChannel[]>, liveRegions: string[
   return out;
 }
 
-/** Every country in the loaded catalog that has channels, richest first. A
- *  country with channels but no known centroid still appears (lat/lon NaN) so
- *  the searchable list can show it even when the map can't place it. */
+/** Every country in the loaded catalog that has channels, richest first. A country with no known centroid still appears (lat/lon NaN) so the searchable list can
+ *  show it even though the map cannot place it. */
 export function worldTv(catalog: Map<string, TvChannel[]>): CountryTv[] {
   const out: CountryTv[] = [];
   for (const [country, channels] of catalog) {

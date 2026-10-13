@@ -2,21 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
 
-/**
- * Redeploy entry point (the Vercel-style "Redeploy" modal). Same purpose as
- * /api/git/deploy: attach the signed-in user's connected-GitHub token SERVER-SIDE so
- * a redeploy of a PRIVATE git repo can clone. The backend reconstructs the repo_url
- * from the project's newest deployment, so we can't cheaply tell here whether it's a
- * github repo — we attach the token unconditionally (the backend only injects it for
- * https://github.com/ clone URLs and ignores it for zip/image redeploys). The token
- * is never returned to the browser.
- */
+const GITHUB_TOKEN_LOOKUP_DEADLINE_MS = 8_000;
+
+/** Redeploy entry point (the Redeploy modal): like /api/git/deploy, attaches the signed-in user's connected-GitHub token SERVER-SIDE so a private repo can be cloned.
+ *  The backend rebuilds `repo_url` from the project's newest deployment, so the token is attached unconditionally; the backend injects it only for https://github.com/
+ *  clone URLs and drops it for zip and image sources. It is never returned to the browser. */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ project: string }> }) {
   const { project } = await ctx.params;
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const team = String((body.team as string) || req.headers.get("x-hive-team") || "personal");
-  // Bounded so a slow/unreachable Composio never hangs the redeploy — fall back to
-  // no token (backend then uses the GITHUB_TOKEN env fallback or a clear error).
   const token = await Promise.race([
     (async () => {
       try {
@@ -25,11 +19,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ project: s
         return null;
       }
     })(),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), GITHUB_TOKEN_LOOKUP_DEADLINE_MS)),
   ]);
   if (token) body.git_token = token;
-  // Forward the user's platform JWT (see /api/git/deploy) so the redeploy
-  // mutation passes the backend's require_auth.
   const r = await backend(
     `/v1/projects/${encodeURIComponent(project)}/redeploy`,
     team,
