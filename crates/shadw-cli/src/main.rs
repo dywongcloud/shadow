@@ -125,8 +125,9 @@ enum AuthCmd {
         /// can derive platform-operator status from its own owner config).
         #[arg(long)]
         email: Option<String>,
-        /// `HIVE_INTERNAL_TOKEN` for mint-mode auto-login: the CLI mints and auto-refreshes a platform
-        /// JWT so mutations work on an enforced platform.
+        /// HIVE_INTERNAL_TOKEN for mint-mode auto-login: the CLI then mints and
+        /// auto-refreshes a platform JWT, so mutations work on an enforced
+        /// platform without pasting short-lived tokens.
         #[arg(long)]
         internal_token: Option<String>,
     },
