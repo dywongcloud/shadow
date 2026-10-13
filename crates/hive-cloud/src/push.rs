@@ -1,18 +1,16 @@
-//! Push delivery — Web Push (VAPID + RFC 8291 aes128gcm) and SMS (Textbelt) for
-//! the notification inbox, scoped per tenant.
+//! Push delivery for the notification inbox, scoped per tenant: Web Push (VAPID + RFC 8291
+//! `aes128gcm`) and SMS (hosted Textbelt, then a self-hosted fallback, then a direct-MX
+//! carrier-gateway blast).
 //!
-//! Subscriptions and SMS targets are stored under the caller's VERIFIED tenant
-//! (JWT claim, never a raw header — see `admin::tenant`'s priority order), and
-//! the dispatcher fans a tenant's notifications out ONLY to rows stored under
-//! that exact tenant, so cross-tenant delivery is structurally impossible
-//! rather than merely filtered.
+//! Subscriptions and SMS targets are stored under the caller's VERIFIED tenant (the JWT claim,
+//! never a raw header), and the dispatcher fans a tenant's notifications out ONLY to rows stored
+//! under that exact tenant, so cross-tenant delivery is structurally impossible rather than merely
+//! filtered.
 //!
-//! The store rides the leader→follower `store_sync` REGISTRY (mutations are
-//! leader-gated in `admin.rs`, same as incidents), and the delivery loop runs
-//! ONLY on the control-plane leader so the fleet never double-sends. Web Push
-//! is implemented natively on `ring` (ES256 VAPID JWT per RFC 8292; ECDH +
-//! HKDF + AES-128-GCM content encryption per RFC 8291) — zero new
-//! dependencies, delivered over the existing shared `reqwest` client.
+//! The store rides the leader→follower `store_sync` registry, and the delivery loop acts only where
+//! `leadership::may_act(PushDispatch)` admits, so the fleet never double-sends. Web Push is
+//! implemented natively on `ring` (ES256 VAPID JWT per RFC 8292; ECDH + HKDF + AES-128-GCM content
+//! encryption per RFC 8291) over the shared `reqwest` client.
 
 use crate::state::CloudState;
 use parking_lot::RwLock;
@@ -24,14 +22,12 @@ use std::sync::Arc;
 /// Max subscription rows per (user, tenant) — a browser has one per profile;
 /// this bounds a malicious/looping client from unbounded row growth.
 const MAX_SUBS_PER_USER_TENANT: usize = 20;
-/// Per-tenant delivered-id retention (FIFO). Bounds memory while covering far
-/// more than any tenant's live-notification set, so a stable-id notification
-/// never re-delivers within a reasonable horizon.
+/// Per-tenant delivered-id retention (FIFO): bounds memory while covering far more than any
+/// tenant's live-notification set, so a stable-id notification never re-delivers within a
+/// reasonable horizon.
 const DELIVERED_CAP_PER_TENANT: usize = 1000;
-/// SMS verification code validity + resend cooldown.
+/// SMS verification code validity; the resend cooldown (60 s) is enforced in `set_sms_pending`.
 const SMS_CODE_TTL_MS: u64 = 10 * 60_000;
-
-// ============================ store ============================
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PushSubscription {
@@ -55,9 +51,8 @@ pub struct SmsTarget {
     pub tenant: String,
     /// E.164 ("+15551234567") — validated at the API boundary.
     pub phone: String,
-    /// The user WANTS SMS on (their toggle) — but delivery also requires
-    /// `verified`. A number never receives notifications until its owner
-    /// proves control by entering the code we texted it.
+    /// The user WANTS SMS on (their toggle); delivery also requires `verified`, so a number never
+    /// receives notifications until its owner proves control by entering the code texted to it.
     pub enabled: bool,
     /// Owner-of-the-number proof: set true only after `verify_sms` matches the
     /// code we sent. Reset to false whenever the phone number changes.
@@ -72,10 +67,9 @@ pub struct SmsTarget {
     pub created_ms: u64,
 }
 
-/// VAPID signing keypair. The PKCS#8 secret must be FLEET-UNIFORM (generated
-/// once on the leader, adopted by followers via the sync registry): a push
-/// subscription is bound to the public key it was created against, so per-node
-/// keys would strand every subscription minted through another node.
+/// VAPID signing keypair. The PKCS#8 secret is FLEET-UNIFORM (generated once on the leader, adopted
+/// by followers through the sync registry): a push subscription is bound to the public key it was
+/// created against, so per-node keys would strand every subscription minted through another node.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VapidKeys {
     /// base64url uncompressed P-256 public point (the `applicationServerKey`).
@@ -89,22 +83,20 @@ pub struct VapidKeys {
 pub struct PushState {
     pub subs: Vec<PushSubscription>,
     pub sms: Vec<SmsTarget>,
-    /// tenant → notification ids already delivered (FIFO-bounded). Deduping on
-    /// the stable notification id (not a ts watermark) means an ongoing
-    /// anomaly whose id is constant but whose ts churns every recompute is
-    /// delivered exactly ONCE, and a leader flap can't re-deliver it.
+    /// tenant → notification ids already delivered (FIFO-bounded). Deduping on the stable
+    /// notification id, not a timestamp watermark, delivers an ongoing anomaly whose id is constant
+    /// but whose `ts` churns on every recompute exactly ONCE, and a leader flap cannot re-deliver
+    /// it.
     #[serde(default)]
     pub delivered: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub vapid: VapidKeys,
-    /// Operator-set Textbelt API key, preferred over `HIVE_TEXTBELT_KEY`.
-    /// EXISTS BECAUSE refilling is a paid action that mints a NEW key on
-    /// Textbelt's side — requiring per-node env surgery to activate a funded
-    /// key left SMS dead even after the user paid. Set via the operator-gated
-    /// `POST /v1/push/sms-key`; replicates fleet-wide with the rest of this
-    /// store (sync registry + persist), so pasting it once in the dashboard
-    /// activates every node, including the NA-egress relay peers. Empty =
-    /// unset (env fallback). NEVER serialized back to clients unmasked.
+    /// Operator-set Textbelt API key, preferred over `HIVE_TEXTBELT_KEY`. Refilling is a paid
+    /// action that mints a NEW key on Textbelt's side, and activating it through per-node env edits
+    /// left SMS dead even after the user paid. Set through the operator-gated `POST
+    /// /v1/push/sms-key`, it replicates fleet-wide with the rest of this store, so pasting it once
+    /// activates every node, including the NA-egress relay peers. Empty means unset (env fallback);
+    /// never serialized back to clients unmasked.
     #[serde(default)]
     pub sms_key_override: String,
 }
@@ -144,10 +136,12 @@ impl PushStore {
         self.inner.write().sms_key_override = key.trim().to_string();
     }
 
-    /// Upsert this browser's subscription. Refuses to re-home an endpoint that
-    /// already belongs to a DIFFERENT user (an authed caller who learned
-    /// another user's endpoint URL must not be able to silence/hijack their
-    /// row), and caps rows per (user, tenant).
+    /// Upserts this browser's subscription, keyed by endpoint. Refuses to re-home an endpoint that
+    /// already belongs to a DIFFERENT user (an authenticated caller who learned another user's
+    /// endpoint URL must not be able to silence or hijack their row) and caps rows per (user,
+    /// tenant) at `MAX_SUBS_PER_USER_TENANT`. A same-user re-subscribe, possibly under a newly
+    /// switched tenant, MOVES the row: a device follows the tenant its own user last registered it
+    /// for and an endpoint is never fanned across tenants.
     pub fn upsert_subscription(&self, sub: PushSubscription) -> SubscribeResult {
         let mut s = self.inner.write();
         if let Some(existing) = s.subs.iter().find(|x| x.endpoint == sub.endpoint) {
@@ -164,18 +158,15 @@ impl PushStore {
                 return SubscribeResult::CapReached;
             }
         }
-        // Same-user re-subscribe (possibly under a newly-switched tenant) MOVES
-        // the row — a device follows the tenant its own user last registered it
-        // for, never fans one endpoint across tenants.
         s.subs.retain(|x| x.endpoint != sub.endpoint);
         s.subs.push(sub);
         s.subs.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
         SubscribeResult::Ok
     }
 
-    /// Remove by endpoint. Scoped to `user_id` when `Some` (an API caller may
-    /// only remove their own rows); `None` is the dispatcher pruning a
-    /// push-service-reported-dead endpoint regardless of owner.
+    /// Removes by endpoint. Scoped to `user_id` when `Some` (an API caller may only remove their
+    /// own rows); `None` is the dispatcher pruning an endpoint its push service reported dead,
+    /// regardless of owner.
     pub fn remove_subscription(&self, endpoint: &str, user_id: Option<&str>) -> bool {
         let mut s = self.inner.write();
         let before = s.subs.len();
@@ -184,9 +175,9 @@ impl PushStore {
         s.subs.len() != before
     }
 
-    /// Purge every push subscription + SMS target for a (user, tenant) — the
-    /// membership-revocation hook called when a user is removed from a team so
-    /// an ex-member stops receiving that team's notifications immediately.
+    /// Purges every push subscription and SMS target of a (user, tenant): the membership-revocation
+    /// hook run when a user is removed from a team, so an ex-member stops receiving that team's
+    /// notifications immediately.
     pub fn purge_user_tenant(&self, user_id: &str, tenant: &str) -> usize {
         let mut s = self.inner.write();
         let before = s.subs.len() + s.sms.len();
@@ -217,10 +208,11 @@ impl PushStore {
             .collect()
     }
 
-    /// Store a phone as PENDING verification: keeps `verified=false` and stashes
-    /// the code, so no delivery happens until `verify_sms`. Changing the number
-    /// clears any prior verification. Returns false (no code stored) if a fresh
-    /// code was sent within the cooldown, to bound resend-driven SMS spend.
+    /// Stores a phone as PENDING verification: keeps `verified=false` (and `enabled=false`) and
+    /// stashes the code, so nothing is delivered until `verify_sms`; changing the number clears any
+    /// prior verification. Returns false, storing no code, when the same number is already verified
+    /// or a code was sent within the last 60 s (the resend cooldown bounds resend-driven SMS
+    /// spend).
     pub fn set_sms_pending(
         &self,
         user_id: &str,
@@ -236,11 +228,10 @@ impl PushStore {
             .find(|x| x.user_id == user_id && x.tenant == tenant)
         {
             if t.phone == phone && t.verified {
-                // Re-confirming the same, already-verified number: no new code.
                 return false;
             }
             if now.saturating_sub(t.code_sent_ms) < 60_000 {
-                return false; // cooldown
+                return false;
             }
             t.phone = phone.to_string();
             t.verified = false;
@@ -362,16 +353,16 @@ impl PushStore {
         }
     }
 
-    /// Read the current VAPID keypair WITHOUT generating — followers must never
-    /// mint their own (that forks the fleet key). Empty until the leader
-    /// generates and the sync registry propagates it.
+    /// Reads the current VAPID keypair WITHOUT generating: followers must never mint their own
+    /// (that forks the fleet key). Empty until the leader generates it and the sync registry
+    /// propagates it.
     pub fn vapid(&self) -> VapidKeys {
         self.inner.read().vapid.clone()
     }
 
-    /// Generate the VAPID keypair if absent. LEADER-ONLY — the single caller is
-    /// `ensure_vapid_on_leader`, gated on `leadership::may_act(PushDispatch)`.
-    /// Returns true if it just generated (so the caller persists).
+    /// Generates the VAPID keypair if absent. LEADER-ONLY: the single caller is
+    /// `ensure_vapid_on_leader`, gated on `leadership::may_act(PushDispatch)`. Returns true if it
+    /// just generated (so the caller persists).
     fn ensure_vapid(&self) -> bool {
         let mut s = self.inner.write();
         if !s.vapid.public_b64.is_empty() {
@@ -393,11 +384,10 @@ impl PushStore {
     }
 }
 
-/// Generate + persist the fleet VAPID keypair, but only on the push
-/// dispatcher's writer (`leadership::may_act(PushDispatch)` — a node that
-/// merely believes it leads for a moment would fork the key, stranding every
-/// subscription made against the other one). Safe to call every tick, and from
-/// the key GET handler — a no-op once the key exists.
+/// Generates and persists the fleet VAPID keypair, but only on the push dispatcher's writer
+/// (`leadership::may_act(PushDispatch)`: a node that merely believes it leads for a moment would
+/// fork the key, stranding every subscription made against the other one). Safe to call every tick,
+/// and from the key GET handler: a no-op once the key exists.
 pub fn ensure_vapid_on_leader(c: &Arc<CloudState>) {
     if c.push.vapid().public_b64.is_empty()
         && crate::leadership::may_act(c, crate::leadership::Job::PushDispatch)
@@ -407,11 +397,11 @@ pub fn ensure_vapid_on_leader(c: &Arc<CloudState>) {
     }
 }
 
-// ============================ endpoint allowlist ============================
-
-/// Known Web Push service hosts. Refusing arbitrary endpoints stops our
-/// VAPID-signed, server-side POSTs from being aimed at attacker-chosen URLs
-/// (SSRF/amplification) via a forged subscription.
+/// Whether `endpoint` is an https URL on a known Web Push service: FCM (`fcm.googleapis.com` for
+/// Chrome/Android, plus the legacy `android.googleapis.com`), Firefox autopush
+/// (`.push.services.mozilla.com`), Edge WNS (`.notify.windows.com`) or Safari (`.push.apple.com`).
+/// Refusing arbitrary endpoints stops our VAPID-signed, server-side POSTs from being aimed at
+/// attacker-chosen URLs (SSRF/amplification) via a forged subscription.
 fn allowed_push_host(endpoint: &str) -> bool {
     let Some(rest) = endpoint.strip_prefix("https://") else {
         return false;
@@ -424,11 +414,11 @@ fn allowed_push_host(endpoint: &str) -> bool {
         .next()
         .unwrap_or("");
     const SUFFIXES: &[&str] = &[
-        "fcm.googleapis.com",         // Chrome / Android (FCM)
-        "android.googleapis.com",     // legacy GCM/FCM
-        ".push.services.mozilla.com", // Firefox (autopush)
-        ".notify.windows.com",        // Edge (WNS)
-        ".push.apple.com",            // Safari (Apple Push)
+        "fcm.googleapis.com",
+        "android.googleapis.com",
+        ".push.services.mozilla.com",
+        ".notify.windows.com",
+        ".push.apple.com",
     ];
     SUFFIXES.iter().any(|s| {
         if let Some(dom) = s.strip_prefix('.') {
@@ -460,8 +450,6 @@ pub fn valid_subscription_input(
     Ok(())
 }
 
-// ============================ base64url helpers ============================
-
 fn b64u(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
@@ -474,8 +462,6 @@ fn b64u_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
         .or_else(|| base64::engine::general_purpose::STANDARD.decode(s).ok())
 }
-
-// ============================ VAPID (RFC 8292) ============================
 
 fn generate_vapid() -> Option<VapidKeys> {
     let rng = ring::rand::SystemRandom::new();
@@ -498,9 +484,9 @@ fn generate_vapid() -> Option<VapidKeys> {
 }
 
 /// `Authorization: vapid t=<jwt>, k=<pub>` for a push-service origin.
+/// The audience is the endpoint's origin (`scheme://host[:port]`), cut by hand instead of pulling
+/// in a URL crate because endpoints are always absolute https URLs from the browser's push service.
 fn vapid_auth_header(keys: &VapidKeys, endpoint: &str) -> Option<String> {
-    // Origin (scheme://host[:port]) without pulling in a URL crate: endpoints
-    // are always absolute https URLs from the browser's push service.
     let (scheme, rest) = endpoint.split_once("://")?;
     let host = rest.split('/').next()?;
     let aud = format!("{scheme}://{host}");
@@ -532,8 +518,6 @@ fn vapid_auth_header(keys: &VapidKeys, endpoint: &str) -> Option<String> {
     ))
 }
 
-// ============================ RFC 8291 content encryption ============================
-
 /// HKDF with arbitrary output length (ring's typed lengths via a shim).
 struct HkdfLen(usize);
 impl ring::hkdf::KeyType for HkdfLen {
@@ -552,24 +536,25 @@ fn hkdf_expand(salt: &[u8], ikm: &[u8], info: &[u8], out_len: usize) -> Option<V
     Some(out)
 }
 
-/// Encrypt `payload` for a subscriber per RFC 8291 (`aes128gcm` coding),
-/// returning the full body (coding header ‖ ciphertext). All-`Option`, never
-/// panics on malformed subscription keys.
+/// Encrypts `payload` for a subscriber per RFC 8291 (`aes128gcm` coding) and returns the full body:
+/// the coding header `salt(16) ‖ rs(4) ‖ idlen(1) ‖ keyid(as_public)` followed by one record,
+/// `payload ‖ 0x02` (the last-record delimiter) sealed with AES-128-GCM under a key and nonce
+/// derived by HKDF from the ECDH secret and the subscriber's auth secret. All-`Option`: malformed
+/// subscription keys return `None`, never panic.
 fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<Vec<u8>> {
-    let ua_public = b64u_decode(p256dh_b64)?; // 65-byte uncompressed point
-    let auth_secret = b64u_decode(auth_b64)?; // 16 bytes
+    let ua_public = b64u_decode(p256dh_b64)?;
+    let auth_secret = b64u_decode(auth_b64)?;
     if ua_public.len() != 65 || auth_secret.len() != 16 {
         return None;
     }
     let rng = ring::rand::SystemRandom::new();
     let eph =
         ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng).ok()?;
-    let as_public = eph.compute_public_key().ok()?.as_ref().to_vec(); // 65 bytes
+    let as_public = eph.compute_public_key().ok()?.as_ref().to_vec();
     let peer =
         ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, ua_public.clone());
     let ecdh = ring::agreement::agree_ephemeral(eph, &peer, |secret| secret.to_vec()).ok()?;
 
-    // ikm = HKDF(salt=auth_secret, ikm=ecdh, info="WebPush: info"‖0x00‖ua_pub‖as_pub, 32)
     let mut info = Vec::with_capacity(14 + 65 + 65);
     info.extend_from_slice(b"WebPush: info\0");
     info.extend_from_slice(&ua_public);
@@ -581,7 +566,6 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
     let cek = hkdf_expand(&salt, &ikm, b"Content-Encoding: aes128gcm\0", 16)?;
     let nonce = hkdf_expand(&salt, &ikm, b"Content-Encoding: nonce\0", 12)?;
 
-    // Single record: payload ‖ 0x02 (last-record delimiter), AES-128-GCM.
     let mut record = payload.to_vec();
     record.push(0x02);
     let key = ring::aead::LessSafeKey::new(
@@ -591,7 +575,6 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
     key.seal_in_place_append_tag(n, ring::aead::Aad::empty(), &mut record)
         .ok()?;
 
-    // aes128gcm coding header: salt(16) ‖ rs(4) ‖ idlen(1) ‖ keyid(as_public).
     let mut body = Vec::with_capacity(16 + 4 + 1 + 65 + record.len());
     body.extend_from_slice(&salt);
     body.extend_from_slice(&4096u32.to_be_bytes());
@@ -601,11 +584,10 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
     Some(body)
 }
 
-// ============================ delivery ============================
-
-/// One web push to one subscription. `Ok(true)` delivered; `Ok(false)` the
-/// push service reported the subscription permanently gone (prune it);
-/// `Err` transient/other failure (keep the subscription, log).
+/// Sends one web push to one subscription. `Ok(true)`: delivered; `Ok(false)`: the push service
+/// reported the subscription permanently gone (404/410), so prune it; `Err`: a transient or other
+/// failure (keep the subscription, log), carrying only the status and never the push service's raw
+/// response body.
 pub async fn send_web_push(
     c: &Arc<CloudState>,
     sub: &PushSubscription,
@@ -635,25 +617,21 @@ pub async fn send_web_push(
     match r.status().as_u16() {
         200..=299 => Ok(true),
         404 | 410 => Ok(false),
-        // Do NOT echo the push service's raw response body (belt-and-braces
-        // against leaking anything sensitive into logs) — just the status.
         s => Err(format!("push service returned {s}")),
     }
 }
 
-/// Send one SMS via Textbelt, with an egress-geography fallback. `test_mode`
-/// appends the documented `_test` suffix (full request validation, nothing
-/// sent, no quota consumed).
+/// Sends one SMS: hosted Textbelt first (`send_sms_primary`), then the self-hosted fallback
+/// (`send_sms_fallback`), then a direct-MX blast to the carrier gateways. A fallback success IS a
+/// delivery and reports Ok, with a WARN naming the primary failure. `test_mode` appends Textbelt's
+/// `_test` key suffix (full request validation, nothing sent, no quota consumed).
 ///
-/// The fallback exists because Textbelt's cheaper REGIONAL keys are gated on
-/// the API CALLER's IP geography, and several fleet nodes egress via Tencent
-/// AS ranges (or genuinely sit in Asia — bkk/hk), which Textbelt can classify
-/// as non-North-American. Live-witnessed: "North America region keys can only
-/// be used from North American countries" when a send originated from a
-/// non-NA-classified node during a leadership flap. On that specific error we
-/// retry the send THROUGH a peer whose egress is reliably NA-classified
-/// (`HIVE_SMS_EGRESS_NODES`, default the LA nodes) over the authenticated
-/// mesh, so SMS keeps working no matter which node runs the dispatcher.
+/// Textbelt's cheaper REGIONAL keys are gated on the API caller's IP geography, so a node whose
+/// egress Textbelt classifies as non-North-American is rejected with 'North America region keys can
+/// only be used from North American countries'; on that error the send is retried THROUGH a peer
+/// with NA egress (`HIVE_SMS_EGRESS_NODES`) over the mesh. The direct-MX last resort needs an open
+/// outbound :25, which cloud nodes block, so it goes to those peers first
+/// (`/v1/push/sms-direct-mx`) and then runs locally.
 pub async fn send_sms(
     c: &Arc<CloudState>,
     phone: &str,
@@ -663,53 +641,34 @@ pub async fn send_sms(
     let primary = send_sms_primary(c, phone, message, test_mode).await;
     match primary {
         Ok(()) => Ok(()),
-        Err(primary_err) => {
-            // Hosted-Textbelt failed (quota, region, network, missing key):
-            // try the SELF-HOSTED fallback service (the OSS textbelt deployed
-            // as a platform app at sms.{platform_domain}, carrier email-to-SMS
-            // gateways). A fallback success IS a delivery — report Ok but log
-            // loudly so the primary failure stays visible operationally.
-            match send_sms_fallback(c, phone, message).await {
-                Ok(()) => {
-                    tracing::warn!(node = %c.node_name, %primary_err, "primary SMS provider failed; delivered via self-hosted fallback");
-                    Ok(())
-                }
-                Err(fb_err) => {
-                    // LAST resort: direct-MX to the carrier gateways. This node
-                    // (leader/dispatcher) is almost always a cloud node whose
-                    // outbound :25 is blocked — so DON'T attempt it locally;
-                    // relay to an NA-egress peer (fc-lax/fc-lax2) whose :25 is
-                    // open. Proven: US Cellular's gateway accepts from those
-                    // Macs, so a 909 US Cellular number the hosted+cloud paths
-                    // can't reach delivers here. Best-effort: a peer that also
-                    // can't reach any accepting gateway just fails and we
-                    // surface the combined error.
-                    for peer in sms_egress_peers(&c.node_name) {
-                        let dm = serde_json::json!({ "phone": phone, "message": message });
-                        if let Some(v) =
-                            crate::admin::put_to_host(c, &peer, "/v1/push/sms-direct-mx", "", &dm)
-                                .await
-                        {
-                            if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
-                                tracing::warn!(node = %c.node_name, %peer, %primary_err, %fb_err, "delivered via direct-MX carrier gateway on NA-egress peer");
-                                return Ok(());
-                            }
+        Err(primary_err) => match send_sms_fallback(c, phone, message).await {
+            Ok(()) => {
+                tracing::warn!(node = %c.node_name, %primary_err, "primary SMS provider failed; delivered via self-hosted fallback");
+                Ok(())
+            }
+            Err(fb_err) => {
+                for peer in sms_egress_peers(&c.node_name) {
+                    let dm = serde_json::json!({ "phone": phone, "message": message });
+                    if let Some(v) =
+                        crate::admin::put_to_host(c, &peer, "/v1/push/sms-direct-mx", "", &dm).await
+                    {
+                        if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                            tracing::warn!(node = %c.node_name, %peer, %primary_err, %fb_err, "delivered via direct-MX carrier gateway on NA-egress peer");
+                            return Ok(());
                         }
                     }
-                    // If THIS node itself has open :25 (e.g. an LA Mac running
-                    // the dispatcher), try locally too before giving up.
-                    if let Ok(()) = send_direct_mx(phone, message).await {
-                        tracing::warn!(node = %c.node_name, %primary_err, %fb_err, "delivered via local direct-MX carrier gateway");
-                        return Ok(());
-                    }
-                    Err(format!("{primary_err}; self-hosted fallback: {fb_err}"))
                 }
+                if let Ok(()) = send_direct_mx(phone, message).await {
+                    tracing::warn!(node = %c.node_name, %primary_err, %fb_err, "delivered via local direct-MX carrier gateway");
+                    return Ok(());
+                }
+                Err(format!("{primary_err}; self-hosted fallback: {fb_err}"))
             }
-        }
+        },
     }
 }
 
-/// The hosted-Textbelt path (direct + NA-egress relay), unchanged semantics.
+/// The hosted-Textbelt path: a direct send, retried through NA-egress peers on a region error.
 async fn send_sms_primary(
     c: &Arc<CloudState>,
     phone: &str,
@@ -741,35 +700,26 @@ async fn send_sms_primary(
     }
 }
 
-/// Self-hosted fallback: the OSS typpo/textbelt server (carrier email-to-SMS
-/// gateways) deployed as a platform app. `HIVE_SMS_FALLBACK_URL` overrides the
-/// endpoint; empty/"off" disables. The OSS API takes `number` (not `phone`)
-/// and replies `{success, message?}` — its failure text (e.g. an SMTP
-/// transport error) is surfaced verbatim; it contains no key material.
+/// Self-hosted fallback: the OSS typpo/textbelt server (carrier email-to-SMS gateways) deployed as
+/// a platform app at `sms.{platform_domain}`; `HIVE_SMS_FALLBACK_URL` overrides the endpoint, and
+/// empty or `off` disables it. Its API takes `number` (not `phone`), requires a bare 9-10 digit US
+/// number (so the leading `1` of the stored E.164 form is stripped) and replies `{success,
+/// message?}`; its failure text, which carries no key material, is surfaced verbatim. The client
+/// timeout is 90 s: the service fans an unknown-carrier number out to every gateway concurrently,
+/// and one stalling provider can take about 66 s (6 s connect plus up to six SMTP replies at 10 s),
+/// which a shorter timeout aborted mid-response-body.
 async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> Result<(), String> {
     let url = std::env::var("HIVE_SMS_FALLBACK_URL")
         .unwrap_or_else(|_| format!("https://sms.{}/text", c.platform_domain));
     if url.is_empty() || url.eq_ignore_ascii_case("off") {
         return Err("disabled".into());
     }
-    // The OSS textbelt `/text` route requires a bare 9-10 digit US number (its
-    // own `stripPhone` + length check, no country code) — hive stores E.164
-    // (`+1XXXXXXXXXX`, 11 digits after stripping non-digits), which it rejected
-    // outright as "Invalid phone number" (live-witnessed). Strip a leading
-    // country-code '1' when present so the fallback gets the shape it expects.
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
     let local = if digits.len() == 11 && digits.starts_with('1') {
         digits[1..].to_string()
     } else {
         digits
     };
-    // The OSS service blasts an unknown-carrier number to all 15 US gateway
-    // domains CONCURRENTLY (Promise.allSettled), but a single stalling
-    // provider can legitimately take 6s connect + up to 6 SMTP replies x 10s
-    // each ≈ 66s worst case — a 20s client timeout aborted mid-response body
-    // on exactly that class of send (live-witnessed: "bad response: error
-    // decoding response body" on a real, in-progress blast). 90s comfortably
-    // clears the realistic worst case without waiting forever.
     let r = c
         .http
         .post(&url)
@@ -790,11 +740,8 @@ async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> R
     }
 }
 
-/// The single direct Textbelt call, no relay. Returns the RAW (unsanitized)
-/// Textbelt error so the caller can classify it; every path that surfaces the
-/// error outward must run it through `sanitize_textbelt_error` first.
-/// The effective Textbelt key: the operator-set store override (dashboard,
-/// fleet-replicated) wins over the `HIVE_TEXTBELT_KEY` env.
+/// The effective Textbelt key: the operator-set store override (dashboard, fleet-replicated) wins
+/// over the `HIVE_TEXTBELT_KEY` env.
 pub fn textbelt_key(c: &Arc<CloudState>) -> Option<String> {
     c.push.sms_key_override().or_else(|| {
         std::env::var("HIVE_TEXTBELT_KEY")
@@ -809,6 +756,9 @@ pub fn reset_sms_quota_cache() {
     *QUOTA_CACHE.write() = None;
 }
 
+/// The single direct Textbelt call, no relay. Returns the RAW (unsanitized) Textbelt error so the
+/// caller can classify it; every path that surfaces the error outward runs it through
+/// `sanitize_textbelt_error` first.
 async fn send_sms_direct(
     c: &Arc<CloudState>,
     phone: &str,
@@ -850,10 +800,9 @@ fn is_region_error(raw: &str) -> bool {
     l.contains("region keys can only be used") || l.contains("region key can only be used")
 }
 
-/// Peers whose egress is reliably classified North-American by Textbelt.
-/// Comma-separated node names via `HIVE_SMS_EGRESS_NODES`; defaults to the LA
-/// nodes (Charter residential egress — unambiguously NA). Self is skipped (we
-/// already failed locally).
+/// Peers whose egress Textbelt reliably classifies as North American: comma-separated node names
+/// from `HIVE_SMS_EGRESS_NODES`, default `fc-lax,fc-lax2` (the LA nodes, on residential egress).
+/// Self is skipped: it already failed locally.
 fn sms_egress_peers(self_name: &str) -> Vec<String> {
     std::env::var("HIVE_SMS_EGRESS_NODES")
         .unwrap_or_else(|_| "fc-lax,fc-lax2".into())
@@ -863,9 +812,9 @@ fn sms_egress_peers(self_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Mesh/HTTP relay executor: run the DIRECT send on this node (never re-relay —
-/// the caller already chose this node for its egress) and report a sanitized
-/// result. Served by the `/v1/push/sms-relay` admin route and its gossip arm.
+/// Mesh/HTTP relay executor: runs the DIRECT send on this node (never re-relays: the caller already
+/// chose this node for its egress) and reports a sanitized result. Served by the
+/// `/v1/push/sms-relay` admin route and its gossip arm.
 pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> serde_json::Value {
     let phone = body
         .get("phone")
@@ -890,52 +839,40 @@ pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> ser
     }
 }
 
-// ---- Self-contained direct-MX carrier-gateway SMS (no external provider) -------
-//
-// The zero-provider path: resolve each US carrier email-to-SMS gateway domain's
-// MX and speak minimal SMTP to deliver `<number>@<gateway>`. This ONLY reaches a
-// carrier from a node whose outbound :25 is open AND whose IP that carrier's MX
-// accepts. Cloud nodes block :25 entirely; the LA Mac nodes (fc-lax/fc-lax2,
-// residential egress) have :25 open and — proven live — US Cellular's
-// `email.uscc.net` MX accepts from them (a 909 US Cellular number that the
-// hosted-Textbelt + cloud-fallback paths could not reach now delivers). Major
-// carriers (Verizon/T-Mobile/AT&T) still block the residential IP by reputation,
-// so this is a best-effort blast: success = ANY gateway returns 2xx.
-
-/// US carrier email-to-SMS gateway domains (the live subset of typpo/textbelt's
-/// `providers.us` — dead carriers whose MX no longer resolves are dropped so a
-/// blast isn't dominated by NXDOMAIN noise; unknown-carrier sends still fan out
-/// to every listed gateway and the recipient's real carrier is whichever one
-/// accepts + delivers).
+/// US carrier email-to-SMS gateway domains: the live subset of typpo/textbelt's `providers.us` (US
+/// Cellular, Verizon, T-Mobile, AT&T, Nextech, Google Fi, Republic Wireless, Qwest), with dead
+/// carriers whose MX no longer resolves dropped so a blast is not dominated by NXDOMAIN noise. An
+/// unknown-carrier send still fans out to every listed gateway, and the recipient's real carrier is
+/// whichever one accepts and delivers.
 const US_SMS_GATEWAYS: &[&str] = &[
-    "email.uscc.net",    // US Cellular  (proven accepting from fc-lax)
-    "vtext.com",         // Verizon
-    "tmomail.net",       // T-Mobile
-    "txt.att.net",       // AT&T
-    "sms.ntwls.net",     // Nextech
-    "msg.fi.google.com", // Google Fi
+    "email.uscc.net",
+    "vtext.com",
+    "tmomail.net",
+    "txt.att.net",
+    "sms.ntwls.net",
+    "msg.fi.google.com",
     "text.republicwireless.com",
     "qwestmp.com",
 ];
 
 /// Deliver ONE plaintext message to one carrier-gateway recipient over SMTP.
 /// Returns Ok on a 2xx to the final `.`; Err with the SMTP reason otherwise.
+/// The MX is the lowest-preference exchange, contacted on port 25 with a 6 s connect timeout, and
+/// every SMTP reply read is bounded at 10 s, so a peer that accepts the TCP session but never
+/// replies cannot hang the whole blast. A domain with no MX answers an error; there is no
+/// implicit-MX fallback to its address record.
 async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let domain = to
         .split('@')
         .nth(1)
         .ok_or_else(|| format!("bad recipient {to}"))?;
-    // MX lookup (falls back to the domain itself as an implicit MX per RFC 5321).
     let resolver = hickory_resolver::Resolver::builder_tokio()
         .map_err(|e| format!("resolver init: {e}"))?
         .build()
         .map_err(|e| format!("resolver build: {e}"))?;
     let host = match resolver.mx_lookup(domain).await {
         Ok(lookup) => {
-            // Iterate the underlying records (the MxLookup deref-shadows a
-            // generic `iter`, so read MX rdata off the records directly), pick
-            // the lowest-preference exchange.
             let mut mxs: Vec<(u16, String)> = lookup
                 .answers()
                 .iter()
@@ -965,8 +902,8 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
     .map_err(|e| format!("connect {host}:25: {e}"))?;
     let mut sock = connect;
 
-    // Read one SMTP reply line, bounded — a peer that accepts the TCP session
-    // but never replies (witnessed) must not hang the whole blast.
+    /// Reads one SMTP reply: complete at a line whose fourth character is a space (`NNN `, final)
+    /// rather than `-` (continuation), and its first digit must be `want`.
     async fn read_reply(sock: &mut tokio::net::TcpStream, want: u8) -> Result<String, String> {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
@@ -980,8 +917,6 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
                 return Err("connection closed".into());
             }
             buf.extend_from_slice(&chunk[..n]);
-            // A complete reply ends with a line whose 4th char is a space
-            // ("NNN " — final) rather than '-' (continuation).
             if let Some(line) = String::from_utf8_lossy(&buf)
                 .lines()
                 .last()
@@ -1004,7 +939,7 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
     }
 
     let helo = std::env::var("SMS_HELO").unwrap_or_else(|_| "sms.shadw.cloud".into());
-    read_reply(&mut sock, b'2').await?; // greeting
+    read_reply(&mut sock, b'2').await?;
     send_line(&mut sock, &format!("HELO {helo}")).await?;
     read_reply(&mut sock, b'2').await?;
     send_line(&mut sock, &format!("MAIL FROM:<{from}>")).await?;
@@ -1022,11 +957,14 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
     Ok(())
 }
 
-/// Best-effort direct-MX blast to every US carrier gateway concurrently.
-/// Ok if ANY gateway accepted (the recipient's real carrier is whichever one
-/// honors the number); Err with the first failure reason if none did.
+/// Best-effort direct-MX SMS to every US carrier gateway concurrently, with no external provider:
+/// each gateway domain's MX is resolved and a minimal SMTP session delivers `<number>@<gateway>`.
+/// It only reaches a carrier from a node whose outbound :25 is open AND whose IP that carrier's MX
+/// accepts (cloud nodes block :25 entirely), so success is ANY gateway accepting, since the
+/// recipient's real carrier is whichever one honors the number. Takes a US number in any common
+/// form and uses its bare 10 digits (gateways want no country code); Err with the first failure
+/// reason when none accepted.
 pub async fn send_direct_mx(phone: &str, message: &str) -> Result<(), String> {
-    // Bare 10-digit local number (gateways want no country code).
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
     let local = if digits.len() == 11 && digits.starts_with('1') {
         digits[1..].to_string()
@@ -1086,20 +1024,17 @@ pub async fn sms_direct_mx_exec(body: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Textbelt echoes the API key back inside some error messages — most notably
-/// the out-of-quota one: "Out of quota. Refill at
-/// https://textbelt.com/purchase?key=<THE FULL SECRET KEY>". This error is
-/// surfaced all the way to the browser (via push_test / push_sms_put), so it
-/// MUST be scrubbed of the key before it leaves the process. Redact the exact
-/// key value AND any residual `key=`/purchase-URL fragment, and map the known
-/// out-of-quota case to a clean message with no URL at all.
+/// Scrubs a raw Textbelt error before it can leave the process. Textbelt echoes the API key inside
+/// some messages (the out-of-quota one embeds a purchase URL carrying the FULL SECRET KEY) and
+/// these errors reach the browser through the push test and SMS routes. The known out-of-quota case
+/// maps to a clean message with no URL; otherwise the exact key value (from BOTH sources, the store
+/// override and the env, also in its `_test` form) is redacted, as is any residual `key=` fragment
+/// up to the next whitespace.
 fn sanitize_textbelt_error(c: &Arc<CloudState>, raw: &str) -> String {
     if raw.to_ascii_lowercase().contains("out of quota") {
         return "SMS quota exhausted — refill your Textbelt account to send more.".into();
     }
     let mut s = raw.to_string();
-    // Redact BOTH possible key sources (store override + env) — whichever the
-    // send actually used, the echo must not leave the process.
     let mut keys: Vec<String> = Vec::new();
     if let Some(k) = c.push.sms_key_override() {
         keys.push(k);
@@ -1113,8 +1048,6 @@ fn sanitize_textbelt_error(c: &Arc<CloudState>, raw: &str) -> String {
         s = s.replace(&format!("{key}_test"), "***");
         s = s.replace(&key, "***");
     }
-    // Belt-and-braces: drop any lingering key= query fragment (and everything
-    // after it up to whitespace) even if the env value didn't textually match.
     if let Some(i) = s.find("key=") {
         let tail_end = s[i..]
             .find(char::is_whitespace)
@@ -1143,6 +1076,9 @@ pub async fn sms_quota_cached(c: &Arc<CloudState>) -> Option<i64> {
 
 static QUOTA_CACHE: RwLock<Option<(u64, Option<i64>)>> = RwLock::new(None);
 
+/// Remaining Textbelt quota of the effective key, clamped to >= 0: Textbelt reports a negative
+/// `quotaRemaining` for an exhausted or invalid key, which the settings page rendered as a
+/// nonsensical negative count.
 async fn sms_quota(c: &Arc<CloudState>) -> Option<i64> {
     let key = textbelt_key(c)?;
     let r = c
@@ -1153,9 +1089,6 @@ async fn sms_quota(c: &Arc<CloudState>) -> Option<i64> {
         .await
         .ok()?;
     let v: serde_json::Value = r.json().await.ok()?;
-    // Clamp to >=0: Textbelt reports a negative quotaRemaining for an
-    // exhausted/invalid key, which read as a nonsensical "-1 SMS remaining" in
-    // the UI. 0 is the honest "none left" the settings page renders sensibly.
     v.get("quotaRemaining")
         .and_then(|q| q.as_i64())
         .map(|q| q.max(0))
@@ -1186,36 +1119,35 @@ pub fn push_payload(n: &crate::notifications::Notification) -> serde_json::Value
     })
 }
 
-// ============================ dispatcher ============================
-
 /// SMS rate bound: at most this many SMS SENDS per tenant per hour (protects
 /// the Textbelt quota; web push has no such cost).
 const SMS_HOURLY_CAP: usize = 3;
 /// At most this many web-push notifications per tenant per tick.
 const PUSH_TICK_CAP: usize = 5;
-/// Bounded fan-out concurrency for the per-notification sends, so one slow push
-/// service can't head-of-line-block the rest of a tenant's (or the fleet's)
-/// delivery.
+/// Bounded fan-out concurrency for the web pushes of one notification, so one slow push service
+/// cannot head-of-line-block the rest of a tenant's (or the fleet's) delivery.
 const SEND_CONCURRENCY: usize = 8;
 
-/// Leader-only delivery loop, gated on `leadership::may_act(PushDispatch)`.
-/// Followers idle (checked every tick, so a re-election hands over within one
-/// interval plus the job's tenure); the leader computes each
-/// target tenant's live notifications with the SAME `build_notifications` the
-/// inbox bell uses and delivers anything not already delivered (per stable id),
-/// scoped strictly to that tenant.
+/// Delivery loop, every 30 s and only where `leadership::may_act(PushDispatch)` admits (followers
+/// idle, so a re-election hands over within one tick plus the job's tenure). Per tenant with a
+/// deliverable target it builds the live notifications with the SAME `build_notifications` the
+/// inbox bell uses and delivers the newest `PUSH_TICK_CAP` that are not archived, not already
+/// delivered (by stable id) and affirmatively owned by the tenant (`project_owned_by` guards the
+/// orphan/untagged-project cross-tenant fallback).
+///
+/// Web pushes go out in chunks of `SEND_CONCURRENCY`, each capped at 15 s, and a 404/410 prunes the
+/// subscription. An `error`-severity notification also sends an SMS to each verified, enabled
+/// target, at most `SMS_HOURLY_CAP` sends per tenant per hour (an in-memory window; a restart
+/// resets it). A notification is marked delivered whatever the per-send outcome, so a persistent
+/// failure never becomes an every-30-seconds retry storm.
 pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
     tokio::spawn(async move {
-        // tenant → send timestamps within the trailing hour (real SENDS, not
-        // notifications). In-memory; a restart resets the window, bounded by
-        // the cap regardless.
         let mut sms_sent: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if !crate::leadership::may_act(&c, crate::leadership::Job::PushDispatch) {
                 continue;
             }
-            // Generate the fleet VAPID key on the leader if it doesn't exist yet.
             ensure_vapid_on_leader(&c);
 
             let tenants = c.push.tenants_with_targets();
@@ -1226,10 +1158,6 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
             for tenant in tenants {
                 let mut notifs: Vec<_> = crate::admin::build_notifications(&c, &tenant)
                     .into_iter()
-                    // Never deliver a notification the tenant doesn't
-                    // affirmatively own (guards the orphan/untagged-project
-                    // cross-tenant fallback in project_owned_by), already-read,
-                    // or archived, or that we've already delivered.
                     .filter(|n| {
                         !n.archived
                             && !c.push.was_delivered(&tenant, &n.id)
@@ -1246,8 +1174,6 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                 let subs = c.push.subscriptions_for_tenant(&tenant);
                 for n in &send {
                     let payload = push_payload(n);
-                    // Fan the web pushes out with bounded concurrency; a hung
-                    // endpoint can't stall the others (each has its own 15s cap).
                     for chunk in subs.chunks(SEND_CONCURRENCY) {
                         let results =
                             futures::future::join_all(chunk.iter().map(|sub| {
@@ -1264,9 +1190,6 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                                 Ok(false) => {
                                     tracing::info!(%endpoint, "pruning dead push subscription (404/410)");
                                     c.push.remove_subscription(&endpoint, None);
-                                    // `dirty` is set unconditionally at
-                                    // mark_delivered below (runs every
-                                    // iteration), so the prune is persisted too.
                                 }
                                 Err(e) => {
                                     tracing::warn!(tenant = %tenant, error = %e, "web push send failed")
@@ -1281,10 +1204,10 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                             let window = sms_sent.entry(tenant.clone()).or_default();
                             window.retain(|t| now.saturating_sub(*t) < 3_600_000);
                             if window.len() >= SMS_HOURLY_CAP {
-                                break; // tenant hourly SMS budget spent
+                                break;
                             }
                             match send_sms(&c, &target.phone, &sms_body(n), false).await {
-                                Ok(()) => window.push(now), // count real SENDS
+                                Ok(()) => window.push(now),
                                 Err(e) => {
                                     tracing::warn!(tenant = %tenant, error = %e, "sms send failed")
                                 }
@@ -1292,10 +1215,6 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                         }
                     }
 
-                    // Mark delivered regardless of per-send outcome: a
-                    // persistent failure must never turn into an every-30s
-                    // retry storm (the inbox still shows it; retrying the push
-                    // service forever is worse than one miss).
                     c.push.mark_delivered(&tenant, &n.id);
                     dirty = true;
                 }

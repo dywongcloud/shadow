@@ -1,51 +1,46 @@
 //! Fail-closed execution boundary for repository-controlled build commands.
 //!
-//! The executor deliberately has no host-process or alternate-runtime path. A
-//! build is admitted only after Podman, the pinned runsc binary, the pinned
-//! builder image, the quota-capable named-volume driver, and (when enabled) the
-//! host-declared egress network have been probed. Repository bytes cross the
-//! boundary with `podman cp`; the checkout is never bind-mounted.
+//! The executor has no host-process or alternate-runtime path. A build is admitted only after
+//! Podman, the pinned runsc binary, the pinned builder image, the quota-capable named-volume driver
+//! and, when enabled, the host-declared egress network have been probed. Repository bytes cross the
+//! boundary as a tar stream over `podman exec -i` (`import_checkout`; `podman cp` cannot reach the
+//! read-only builder's workspace volume), and the checkout is never bind-mounted.
 //!
 //! # Invocation/image capability contract (reviewed builder v8)
 //!
-//! The reviewed builder image is NOT started with a blanket `--cap-drop=all`
-//! plus outer `no-new-privileges`, and its entrypoint is never bypassed. That
-//! earlier invocation could not pass its own probe against the reviewed image:
-//! in-image `buildah` is a broker CLIENT (`/usr/local/bin/buildah` ->
-//! `/usr/local/libexec-hive-buildah-client`) that requires the image init's
-//! broker, and the init (`/usr/local/libexec-hive-build-init`, the image
-//! Entrypoint) refuses to start unless the container carries EXACTLY the
-//! eleven capabilities in [`BUILDER_CAPABILITIES`] with `no_new_privs` CLEAR
-//! at entry (`hive-build-init.c`, `require_initial_security`).
+//! The reviewed builder image is NOT started with a blanket `--cap-drop=all` plus outer
+//! `no-new-privileges`, and its entrypoint is never bypassed. That invocation could not pass its
+//! own probe against the reviewed image: in-image `buildah` is a broker CLIENT
+//! (`/usr/local/bin/buildah` -> `/usr/local/libexec-hive-buildah-client`) that requires the image
+//! init's broker, and the init (`/usr/local/libexec-hive-build-init`, the image Entrypoint) refuses
+//! to start unless the container carries EXACTLY the eleven capabilities in
+//! [`BUILDER_CAPABILITIES`] with `no_new_privs` CLEAR at entry (`hive-build-init.c`,
+//! `require_initial_security`).
 //!
-//! Privilege separation is enforced INSIDE the sandbox by the init, not by
-//! blanket outer flags: the init verifies the exact entry state, forks a
-//! capability-retaining Buildah broker (which launches real Buildah inside a
-//! nested user+mount namespace with `--isolation=chroot` forced by an option
-//! allowlist), then forks the tenant with ALL capabilities dropped and
-//! `no_new_privs` latched, and finally drops its own. Tenant build commands
-//! therefore run with zero capabilities and NNP exactly as before; the eleven
-//! capabilities exist only in the PID-separated broker. Why each is retained
-//! (all consumed by chroot-isolation image assembly inside gVisor):
-//! `SYS_CHROOT` (chroot into the build rootfs), `CHOWN`/`FOWNER`/`FSETID`
-//! (foreign-uid ownership, modes and set-id bit preservation during layer
-//! extraction/commit, e.g. `COPY --chown`), `DAC_OVERRIDE` (traversing store
-//! content owned by other mapped ids), `SETUID`/`SETGID` (multi-id
-//! `uid_map`/`gid_map` for the nested userns and `USER` directives in tenant
-//! builds), `SETPCAP` (broker bounds the child capability set before exec),
-//! `SYS_ADMIN` (bind mounts of /proc//dev into the chroot build root),
-//! `MKNOD` (device nodes in tenant rootfs), `SETFCAP` (file-capability
-//! xattrs in tenant images). A mixed invocation is structurally impossible:
-//! under dropped capabilities or preset NNP the init exits 125 before any
-//! tenant byte runs, and without the init the broker socket never exists, so
-//! every nested-build path refuses. Never reintroduce the blanket flags
-//! silently: they LOOK stricter but only disable the reviewed privilege
-//! separation and were never a working contract against this image.
+//! Privilege separation is enforced INSIDE the sandbox by the init, not by blanket outer flags: the
+//! init verifies the exact entry state, forks a capability-retaining Buildah broker (which launches
+//! real Buildah inside a nested user+mount namespace with `--isolation=chroot` forced by an option
+//! allowlist), forks the tenant with ALL capabilities dropped and `no_new_privs` latched, and
+//! finally drops its own. Tenant build commands therefore run with zero capabilities and NNP; the
+//! eleven capabilities exist only in the PID-separated broker, where each is consumed by
+//! chroot-isolation image assembly inside gVisor: `SYS_CHROOT` (chroot into the build rootfs),
+//! `CHOWN`/`FOWNER`/`FSETID` (foreign-uid ownership, modes and set-id bit preservation during layer
+//! extraction and commit, e.g. `COPY --chown`), `DAC_OVERRIDE` (traversing store content owned by
+//! other mapped ids), `SETUID`/`SETGID` (multi-id `uid_map`/`gid_map` for the nested userns and
+//! `USER` directives in tenant builds), `SETPCAP` (the broker bounds the child capability set
+//! before exec), `SYS_ADMIN` (bind mounts of /proc and /dev into the chroot build root), `MKNOD`
+//! (device nodes in the tenant rootfs) and `SETFCAP` (file-capability xattrs in tenant images).
 //!
-//! Identity is pinned end-to-end: the installed declaration must carry the
-//! byte-reproducible reviewed archive facts (`REVIEWED_BUILDER_*`), the
-//! measured archive hash must match, and the Podman image id must equal the
-//! reviewed OCI config digest. Any mismatch leaves the capability blank.
+//! A mixed invocation is structurally impossible: under dropped capabilities or preset NNP the init
+//! exits 125 before any tenant byte runs, and without the init the broker socket never exists, so
+//! every nested-build path refuses. Never reintroduce the blanket flags silently: they LOOK
+//! stricter but only disable the reviewed privilege separation and were never a working contract
+//! against this image.
+//!
+//! Identity is pinned end-to-end: the installed declaration must carry the byte-reproducible
+//! reviewed archive facts (`REVIEWED_BUILDER_*`), the measured archive hash must match, and the
+//! Podman image id must equal the reviewed OCI config digest. Any mismatch leaves the capability
+//! blank.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,17 +71,14 @@ const OUTPUT_ROOT: &str = "/artifact";
 const ADMIN_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_PATH: &str = "/workspace/source/node_modules/.bin:/usr/local/bin:/usr/bin:/bin";
-// `directfs` is deliberately absent (runsc's own default, true, applies).
-// Forcing directfs=false makes gVisor fall back to the gofer-only filesystem
-// path, and on this fleet's PVM-patched kernels (6.12.33-pvm+, the CVM/GPU
-// hosts) that path's platform init dies immediately: "initialize systrap:
-// unable to attach: operation not permitted" in the sandbox's own oci-log,
-// surfaced to the podman client only as "cannot read client sync file:
-// waiting for sandbox to start: EOF". Isolated live via single-flag
-// bisection on sj2 (2026-08-28): directfs=false alone, no other flags,
-// reproduces the failure against a bare `podman run --runtime runsc`; every
-// other flag here works individually and combined. hive-cell-agent's own
-// sandboxes never pass --directfs and boot fine on the same kernel.
+/// The exact runsc wrapper flags the installed declaration must carry; any other set is a
+/// `CapabilityMismatch`. `directfs` is deliberately absent, so runsc's own default (true) applies:
+/// forcing `directfs=false` makes gVisor fall back to the gofer-only filesystem path, whose
+/// platform init dies immediately on the PVM-patched kernels (`initialize systrap: unable to
+/// attach: operation not permitted` in the sandbox's own oci-log, surfaced to the podman client
+/// only as `cannot read client sync file: waiting for sandbox to start: EOF`). Single-flag
+/// bisection isolated it: `directfs=false` alone reproduces the failure against a bare `podman run
+/// --runtime runsc`, while every other flag here works individually and combined.
 const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 7] = [
     "platform=systrap",
     "network=sandbox",
@@ -97,24 +89,16 @@ const REQUIRED_RUNSC_RUNTIME_FLAGS: [&str; 7] = [
     "allow-flag-override=false",
 ];
 
-/// Reviewed builder artifact facts (hive-build-executor v8, accepted after two
-/// independent clean-BuildKit-root builds produced byte-identical archives).
-/// The installed declaration must repeat these EXACTLY and the measured
-/// archive must hash to them; any drift leaves the capability blank. There are
-/// no floating defaults: shipping a new builder means reviewing and updating
-/// these constants together with the archive.
-///
-/// The archive is the COMPRESSION-NORMALIZED artifact, not BuildKit's raw
-/// export. BuildKit's uncompressed layers are byte-reproducible across
-/// independent roots (identical diff_ids), but its gzip envelope is NOT
-/// deterministic (measured: two independent roots gave identical uncompressed
-/// content, 531,394,560 vs 468,183,040 compressed bytes). The recipe therefore
-/// recompresses every layer with a single canonical gzip (fixed level, mtime=0,
-/// no original-name) and rebuilds the manifest/index deterministically, so any
-/// two independent builds normalize to the exact bytes pinned below. The image
-/// CONFIG digest is unaffected (it references only uncompressed diff_ids), which
-/// is why `builder_config_digest` == the podman image id stays stable across
-/// the normalization.
+/// Reviewed builder artifact facts (hive-build-executor v8, accepted after two independent
+/// clean-BuildKit-root builds produced byte-identical archives). The installed declaration must
+/// repeat these EXACTLY and the measured archive must hash to them; any drift leaves the capability
+/// blank, and there are no floating defaults: shipping a new builder means reviewing and updating
+/// these constants together with the archive. The archive is the COMPRESSION-NORMALIZED artifact,
+/// not BuildKit's raw export (BuildKit's layers are byte-reproducible but its gzip envelope is
+/// not): the recipe recompresses every layer with one canonical gzip (fixed level, mtime=0, no
+/// original name) and rebuilds the manifest/index deterministically. The image CONFIG digest
+/// references only uncompressed diff_ids, so `builder_config_digest` == the podman image id stays
+/// stable across the normalization.
 const REVIEWED_BUILDER_ARCHIVE_SHA256: &str =
     "9e40310b3bd0591e1276bd3a58cd09832949d0c8686270d01b1a98e13e095682";
 const REVIEWED_BUILDER_ARCHIVE_BYTES: u64 = 459_059_200;
@@ -131,10 +115,10 @@ const REVIEWED_RUNSC_SHA256: &str =
 /// invoked explicitly, so a config drift can never silently bypass it.
 const BUILDER_INIT_PATH: &str = "/usr/local/libexec-hive-build-init";
 const BUILDER_INIT_ENTRYPOINT_FLAG: &str = "--entrypoint=/usr/local/libexec-hive-build-init";
-/// The exact container capability set the image init requires at entry (see
-/// the module doc for why each is retained by the broker). Order follows the
-/// kernel capability numbers; the derived tenant bounding mask is
-/// [`BUILDER_TENANT_BOUNDING_MASK`].
+/// The exact container capability set the image init requires at entry (the module doc says why the
+/// broker retains each). `container_create_args` drops all and adds back exactly these, never
+/// `--security-opt=no-new-privileges`. Order follows the kernel capability numbers; the derived
+/// tenant bounding mask is [`BUILDER_TENANT_BOUNDING_MASK`].
 const BUILDER_CAPABILITIES: [&str; 11] = [
     "CHOWN",
     "DAC_OVERRIDE",
@@ -148,10 +132,10 @@ const BUILDER_CAPABILITIES: [&str; 11] = [
     "MKNOD",
     "SETFCAP",
 ];
-/// /proc/self/status CapBnd for the tenant: the eleven capabilities above as
-/// a kernel bitmask. The tenant's effective/permitted/inheritable/ambient
-/// sets must all read zero; only the unusable bounding set retains the mask
-/// (no file capabilities or set-id binaries exist in the reviewed image).
+/// `/proc/self/status` CapBnd for the tenant: the eleven capabilities above as a kernel bitmask.
+/// The tenant's effective, permitted, inheritable and ambient sets must all read zero; only the
+/// unusable bounding set retains the mask (the reviewed image has no file capabilities or set-id
+/// binaries).
 const BUILDER_TENANT_BOUNDING_MASK: &str = "00000000882401db";
 /// Mirrors the reviewed bring-up harness invocation; single-container runsc
 /// sandboxes accept it inertly and CRI-style shims require it.
@@ -228,10 +212,9 @@ pub struct BuildUser {
 
 #[derive(Clone, Debug)]
 pub struct BuildVolumePolicy {
-    /// Only Podman's local tmpfs-backed named volumes are accepted. The volume
-    /// stays continuously mounted by an owned keeper container until its
-    /// consumer is attached, so the kernel-enforced size limit and bytes remain
-    /// live without exposing a host path.
+    /// Only Podman's local tmpfs-backed named volumes are accepted. An owned keeper container keeps
+    /// the volume continuously mounted until its consumer is attached, so the kernel-enforced size
+    /// limit and the bytes stay live without exposing a host path.
     pub driver: String,
     /// Filesystem allocation units may round the reported size upward by at most
     /// this amount. It is policy-digested and must remain small.
@@ -283,9 +266,9 @@ pub struct BuildExecutorConfig {
     pub user: BuildUser,
     pub volume: BuildVolumePolicy,
     pub limits: BuildLimits,
-    /// When non-empty, repository variables must be in this set. The installed
-    /// executor leaves it empty and instead admits every syntactically-valid,
-    /// non-reserved key explicitly supplied by the trusted build coordinator.
+    /// When non-empty, repository variables must be in this set. The installed executor leaves it
+    /// empty and instead admits every syntactically valid, non-reserved key explicitly supplied by
+    /// the trusted build coordinator.
     pub allowed_env: BTreeSet<String>,
     /// `None` means `--network=none`. Some means attach only to the named,
     /// live-verified host policy network.
@@ -325,14 +308,13 @@ pub fn get() -> Result<BuildExecutor> {
 struct InstalledCapability {
     protocol: String,
     builder_image_id: String,
-    /// Optional reviewed-archive pin. When present, ALL five must be present
-    /// and match the reviewed facts and the archive is re-hashed against them
-    /// (fail-closed on corruption). When absent — the canonical
-    /// `ansible/roles/build_executor` declaration shape, which this codebase
-    /// cannot edit — the declaration parses and only the archive byte-check
-    /// is skipped; the runsc/image-id/flags checks below still bind. Never
-    /// make these silent-floating: an absent pin is a conscious declaration
-    /// choice, a wrong value is always a refusal.
+    /// Optional reviewed-archive pin (`builder_archive_path` and the four fields after it),
+    /// all-or-nothing: a partial set is a malformed declaration and refused, while a full set must
+    /// match the reviewed facts and the archive is re-hashed against them (fail-closed on
+    /// corruption). An absent set is the canonical `ansible/roles/build_executor` declaration
+    /// shape: it parses and only the archive byte-check is skipped, while the runsc, image-id and
+    /// flags checks still bind. Never make these silently floating: an absent pin is a conscious
+    /// declaration choice, a wrong value is always a refusal.
     #[serde(default)]
     builder_archive_path: Option<PathBuf>,
     #[serde(default)]
@@ -562,9 +544,9 @@ impl SealedOutputMount {
 }
 
 impl BuildExecutor {
-    /// Load the root-published v1 declaration and re-probe every effective
-    /// prerequisite. Absence or any mismatch is an error; callers advertise no
-    /// capability and must not fall back to host execution.
+    /// Loads the root-published v1 declaration and re-probes every effective prerequisite. Absence
+    /// or any mismatch is an error; callers advertise no capability and must not fall back to host
+    /// execution.
     pub async fn installed() -> Result<Self> {
         let path = Path::new(INSTALLED_CAPABILITY_PATH);
         validate_trusted_regular_file(path, "BuildExecutor capability")?;
@@ -612,10 +594,6 @@ impl BuildExecutor {
                 "runsc wrapper flags differ from the reviewed fail-closed set",
             ));
         }
-        // Reviewed-archive pin: all-or-nothing. A partial set is a malformed
-        // declaration (refuse); a full set must match the reviewed facts and
-        // the archive is re-hashed; an absent set (canonical role) parses and
-        // skips only the archive byte-check.
         let archive_pin_present = declaration.builder_archive_path.is_some()
             || declaration.builder_archive_sha256.is_some()
             || declaration.builder_archive_bytes.is_some()
@@ -1195,6 +1173,16 @@ impl BuildExecutor {
         Ok(Some(Arc::new(acquired)))
     }
 
+    /// Admits a build: creates the quota-limited workspace volume and build container, then streams
+    /// the checkout in. The workspace-prep exec runs with `WORKSPACE_MOUNT` as its working
+    /// directory, never `SOURCE_ROOT`: that exec CREATES `/workspace/source`, and `podman exec
+    /// --workdir` chdirs before running anything, so the runtime would refuse before the shell
+    /// starts. The checkout enters through `import_checkout`, a tar stream over `podman exec -i`,
+    /// because `podman cp` writes through the container's ROOTFS: the builder runs `--read-only`
+    /// with its workspace on a SEPARATE tmpfs volume, so podman would resolve the destination
+    /// against a rootfs that has no `/workspace` and is read-only anyway. The extract writes into
+    /// the sandbox's own writable workspace volume, where every later step runs, and no host path
+    /// is mounted in.
     pub async fn begin(&self, request: BuildRequest) -> Result<BuildSession> {
         let surface = request.surface;
         let deadline = Instant::now() + self.inner.config.limits.max_total_time;
@@ -1282,16 +1270,6 @@ impl BuildExecutor {
             .await?;
         require_success("start build container", &started)?;
 
-        // The workspace-prep exec runs with `WORKSPACE_MOUNT` as its working
-        // directory, never `SOURCE_ROOT`: this exec is the thing that CREATES
-        // `/workspace/source`, and `podman exec --workdir <path>` chdirs into
-        // <path> before running anything, so asking for SOURCE_ROOT here makes
-        // the runtime refuse before the shell ever starts ("failed to find
-        // initial working directory \"/workspace/source\": no such file or
-        // directory" — reproduced live on fc-orlando 2026-10-09, and it fails
-        // identically under runc, so this path could never have completed a
-        // repository build on any node). The script uses absolute paths only,
-        // so the mount root is the correct and sufficient cwd.
         let prep = self
             .exec_fixed(
                 &container,
@@ -1303,17 +1281,6 @@ impl BuildExecutor {
             .await?;
         require_success("prepare build workspace", &prep)?;
 
-        // `podman cp` cannot import the checkout here: it writes through the
-        // container's ROOTFS, and the builder runs `--read-only` with its
-        // workspace on a SEPARATE tmpfs volume, so podman resolves the
-        // destination against a rootfs that has no `/workspace` at all and is
-        // read-only anyway ("could not be found on container", then "read-only
-        // file system" — reproduced live on fc-orlando 2026-10-09; this is a
-        // property of `--read-only` plus a volume-mounted destination, not of
-        // any one OCI runtime, so this import has never succeeded anywhere).
-        // Stream a tar through `podman exec -i` instead: the extract writes
-        // into the sandbox's own writable workspace volume — exactly where
-        // every later build step runs — and no host path is mounted in.
         let copied = self
             .import_checkout(&container, &checkout, self.inner.config.limits.max_step_time)
             .await?;
@@ -1345,6 +1312,16 @@ impl BuildExecutor {
         })
     }
 
+    /// Probes the whole runtime contract end to end. A writer container's tenant first runs the
+    /// in-image selfcheck (exact uid/gid 65532, tenant CapEff/CapPrm/CapInh/CapAmb all zero, CapBnd
+    /// exactly `BUILDER_TENANT_BOUNDING_MASK`, `no_new_privs` latched, a live broker, the pinned
+    /// toolchain), whose output is renamed into place atomically so the exec probe never reads a
+    /// partial write. The exec probe recovers the per-boot ABSTRACT broker socket name
+    /// (`HIVE_BUILDAH_SOCKET`) by scanning every readable `/proc/*/environ`, because exec'd
+    /// processes never inherit the broker environment and the init (PID 1) does not carry it, then
+    /// runs a brokered chroot-isolation Buildah build. A reader container starts while the writer
+    /// still pins the tmpfs mount: named local tmpfs bytes do not survive a complete unmount, so
+    /// continuous ownership is part of the contract.
     async fn probe_sandbox_and_volume(&self) -> Result<()> {
         let id = Uuid::new_v4().simple().to_string();
         let volume = format!("hive-build-probe-vol-{id}");
@@ -1355,13 +1332,6 @@ impl BuildExecutor {
             .await?;
         cleanup.add_volume(volume.clone());
 
-        // The writer's tenant first runs the in-image selfcheck, which
-        // witnesses the full runtime contract from inside the sandbox: exact
-        // uid/gid 65532, tenant CapEff/CapPrm/CapInh/CapAmb all zero, tenant
-        // CapBnd exactly BUILDER_TENANT_BOUNDING_MASK, no_new_privs latched,
-        // a live broker, and the pinned toolchain versions. The output file
-        // is renamed into place atomically so the exec probe below never
-        // reads a partial write.
         let idle = "hive-builder-selfcheck > /workspace/.hive-selfcheck.tmp 2>&1 \
             && mv /workspace/.hive-selfcheck.tmp /workspace/.hive-selfcheck.out \
             || { mv /workspace/.hive-selfcheck.tmp /workspace/.hive-selfcheck.out 2>/dev/null; exit 125; }; \
@@ -1385,20 +1355,6 @@ impl BuildExecutor {
             .podman_output([os("start"), os(&writer)], Duration::from_secs(30))
             .await?;
         require_success("probe start runsc sandbox", &started)?;
-        // Exec'd processes never inherit the broker environment, so the probe
-        // has to recover the per-boot ABSTRACT socket name to talk to the
-        // broker the way tenant mains do. It is NOT in the init's own
-        // environment: measured 2026-09-28 on fc-virginia inside a live
-        // sandbox, PID 1 (hive-build-init) carried 31 variables and none of
-        // them HIVE_BUILDAH_*, while the tenant processes carried both
-        // `HIVE_BUILDAH_SOCKET=@hive-buildah-<32hex>` and
-        // HIVE_BUILDAH_BROKER_PID. Reading only /proc/1/environ therefore
-        // yielded an empty name, `test -n` failed, and the whole probe failed
-        // with BUILD_ISOLATION_UNAVAILABLE on a perfectly working executor --
-        // which is why no node ever advertised build-isolation protocol v1.
-        // Scan every readable environ instead. Buildah then runs brokered
-        // with the chroot isolation the broker's option allowlist enforces; a
-        // direct or rootless invocation has no working path in this image.
         let script = "set -eu; \
             test \"$(cat /proc/gvisor/kernel_is_gvisor)\" = gvisor; \
             test \"$(/usr/bin/id -u)\" = \"$1\"; \
@@ -1457,9 +1413,6 @@ impl BuildExecutor {
             "probe volume quota",
         )?;
 
-        // Start the reader while the writer still pins the tmpfs mount. Named
-        // local tmpfs bytes do not survive a complete unmount, so continuous
-        // ownership is part of the contract and is exercised here.
         let args = self.container_create_args(
             &reader,
             &[format!("{volume}:{WORKSPACE_MOUNT}:ro,nodev,nosuid")],
@@ -1691,6 +1644,22 @@ impl BuildExecutor {
         require_success("create quota volume", &output)
     }
 
+    /// Builds the `podman create` argv for a build or probe container: read-only rootfs, private
+    /// namespaces, resource ceilings, `--cap-drop=all` followed by `--cap-add` of exactly
+    /// [`BUILDER_CAPABILITIES`] (the image init refuses any other set, and an outer
+    /// `--security-opt=no-new-privileges` makes it exit 125 before any tenant byte runs), and tmpfs
+    /// mounts for `/tmp`, `/run`, `/run/lock` and `/var/tmp`. `/run/lock` gets its own tmpfs
+    /// because Buildah's vfs store creates its lock directory there and the root-owned mode-0755
+    /// `/run` denies the tenant; loosening `/run` is refused.
+    ///
+    /// The main process is always the image init, pinned with `BUILDER_INIT_ENTRYPOINT_FLAG` and
+    /// verified against the image config at probe time: it re-verifies the entry capability
+    /// contract, starts the broker and execs the argv as the de-capped, `no_new_privs`-latched
+    /// tenant. A step container (an `env_file` or `image_env`) runs the script directly because
+    /// `clean_env_wrapper` copies only the requested `--env-file` keys into its own `env -i` (an
+    /// outer `env -i` would erase them first). `image_env` true keeps the image environment plus
+    /// the broker variables (`HIVE_BUILDAH_SOCKET`/`_BROKER_PID`), sound only for
+    /// coordinator-authored probe scripts; false scrubs the tenant environment with `env -i`.
     fn container_create_args(
         &self,
         name: &str,
@@ -1700,10 +1669,6 @@ impl BuildExecutor {
         workdir: &str,
         script: &str,
         script_args: &[String],
-        // `true` keeps the image environment plus the init-exported broker
-        // variables for the tenant (`HIVE_BUILDAH_SOCKET`/`_BROKER_PID`, only
-        // sound for coordinator-authored probe scripts); `false` scrubs the
-        // tenant environment with `env -i` exactly as before.
         image_env: bool,
     ) -> Vec<OsString> {
         let config = &self.inner.config;
@@ -1727,13 +1692,6 @@ impl BuildExecutor {
             os("--read-only"),
             os("--read-only-tmpfs=false"),
             os("--image-volume=ignore"),
-            // The image init requires EXACTLY this capability set with
-            // no_new_privs clear at entry; it retains them only in the
-            // PID-separated Buildah broker and starts the tenant with all
-            // capabilities dropped and no_new_privs latched. An outer
-            // `--security-opt=no-new-privileges` or a bare `--cap-drop=all`
-            // makes the init exit 125 before any tenant byte runs (see the
-            // module doc, "Invocation/image capability contract").
             os("--cap-drop=all"),
             os(SANDBOX_ANNOTATION),
             os("--ipc=private"),
@@ -1770,14 +1728,6 @@ impl BuildExecutor {
             os(format!(
                 "/run:rw,nodev,nosuid,noexec,size={tmpfs_each},mode=0755"
             )),
-            // Buildah's vfs store creates its lock directory under /run/lock,
-            // which the root-owned mode-0755 /run tmpfs denies the tenant.
-            // Measured 2026-09-28 on fc-virginia: the nested build died with
-            // "creating build container: creating lock file directory: mkdir
-            // /run/lock: permission denied", failing the executor probe on a
-            // node whose executor was otherwise healthy and keeping the node
-            // from ever advertising build-isolation protocol v1. Give the
-            // lock path its own writable tmpfs rather than loosening /run.
             os("--tmpfs"),
             os(format!(
                 "/run/lock:rw,nodev,nosuid,noexec,size={tmpfs_each},mode=1777"
@@ -1806,17 +1756,7 @@ impl BuildExecutor {
             args.push(os("--volume"));
             args.push(os(mount));
         }
-        // Every container main process is supervised by the image init: it
-        // re-verifies the entry capability contract, starts the broker, and
-        // execs the argv below as the fully-de-capped, NNP-latched tenant.
-        // The init path is pinned here AND verified against the image config
-        // at probe time, so neither side can drift silently.
         if env_file.is_some() || image_env {
-            // Step containers need the validated --env-file values long enough for
-            // clean_env_wrapper to copy only the requested keys into its own
-            // `env -i` process. An outer `env -i` would erase them first. The
-            // probe writer keeps the image environment for the same reason:
-            // the in-image selfcheck consumes the broker variables.
             args.extend([
                 os(BUILDER_INIT_ENTRYPOINT_FLAG),
                 os(&config.builder_image),
@@ -1878,14 +1818,13 @@ impl BuildExecutor {
         self.podman_output(args, timeout).await
     }
 
-    /// Stream `checkout/.` into the build container's workspace over stdin.
-    ///
-    /// `podman cp` is unusable for this — see the call site in [`Self::begin`]:
-    /// it writes through the container's read-only rootfs, which does not
-    /// contain the workspace volume. `tar` produces the stream on the host and
-    /// consumes it inside the sandbox, so the guest still never sees a host
-    /// path mounted in, and the bytes land on the workspace volume the build
-    // actually executes against.
+    /// Streams `checkout/.` into the build container's workspace over stdin (see [`Self::begin`]
+    /// for why `podman cp` cannot do it): `tar` produces the stream on the host and consumes it
+    /// inside the sandbox, so the guest never sees a host path mounted in and the bytes land on the
+    /// workspace volume the build actually executes against. The two pipes are joined by a copy
+    /// task because tokio has no `From<ChildStdout> for Stdio`. When the extract fails, the
+    /// producer's own stderr (an unreadable or vanished checkout) is reported instead of the
+    /// extract's truncated-input error, which is the symptom and not the cause.
     async fn import_checkout(
         &self,
         container: &str,
@@ -1961,9 +1900,6 @@ impl BuildExecutor {
                 error.to_string(),
             )
         })?;
-        // Bridge the producer into the consumer: tokio has no
-        // `From<ChildStdout> for Stdio`, so the two pipes are joined by a copy
-        // task instead of by handing one child's stdout to the other's stdin.
         let mut exec_stdin = exec_child.stdin.take().ok_or_else(|| {
             BuildExecutorError::new(
                 BuildExecutorErrorCode::PodmanFailed,
@@ -2017,9 +1953,6 @@ impl BuildExecutor {
                     error.to_string(),
                 )
             })??;
-        // Reap the producer and surface its own failure (an unreadable or
-        // vanished checkout) rather than only the extract's truncated-input
-        // error, which is the symptom and not the cause.
         let _ = tar_child.wait().await;
         let (tar_stderr, _) = tar_err_task
             .await
@@ -2044,14 +1977,13 @@ impl BuildExecutor {
         })
     }
 
-    /// Stream `<container>:<source>/.` out to a host directory as a tar on the
-    /// container's stdout.
-    ///
-    /// Mirror of [`Self::import_checkout`] and for the same reason: `podman cp`
-    /// resolves paths against the container's read-only rootfs, which holds
-    /// neither the workspace nor the sealed-artifact volume, so it cannot read
-    /// the build output at all. `tar` runs inside the sandbox to produce the
-    /// stream and on the host to unpack it.
+    /// Streams `<container>:<source>/.` out to a host directory as a tar on the container's stdout:
+    /// the mirror of [`Self::import_checkout`], for the same reason (`podman cp` resolves paths
+    /// against the container's read-only rootfs, which holds neither the workspace nor the
+    /// sealed-artifact volume, so it cannot read the build output at all). `tar` runs inside the
+    /// sandbox to produce the stream and on the host to unpack it; when the unpack only saw
+    /// truncated input, the sandbox's own stderr is reported, because the unpack error is the
+    /// symptom and the exec error is the cause.
     async fn export_directory(
         &self,
         container: &str,
@@ -2124,7 +2056,6 @@ impl BuildExecutor {
                 format!("cannot run tar: {error}"),
             )
         })?;
-        // Bridge the two pipes (tokio has no `From<ChildStdout> for Stdio`).
         let mut tar_stdin = tar_child.stdin.take().ok_or_else(|| {
             BuildExecutorError::new(
                 BuildExecutorErrorCode::CapabilityUnavailable,
@@ -2190,8 +2121,6 @@ impl BuildExecutor {
                     error.to_string(),
                 )
             })??;
-        // Surface the sandbox's own failure when the unpack only saw truncated
-        // input: the unpack error is the symptom, the exec error is the cause.
         if !status.success() && !exec_err.is_empty() {
             return Ok(CommandOutput {
                 status,
@@ -3131,9 +3060,9 @@ chmod 0400 "$archive"
 }
 
 impl SealedCacheArtifact {
-    /// Atomically publish the executor-sealed cache at a platform-owned path.
-    /// The sibling temporary is create-new and mode 0600; a cache path supplied
-    /// by repository data is never accepted by this API.
+    /// Atomically publishes the executor-sealed cache at a platform-owned path. The sibling
+    /// temporary is create-new with mode 0600, and a cache path supplied by repository data is
+    /// never accepted by this API.
     pub async fn materialize_replace(mut self, destination: &Path) -> Result<()> {
         if !destination.is_absolute() {
             return Err(BuildExecutorError::new(
@@ -3293,9 +3222,9 @@ impl SealedBuildOutput {
         Ok(())
     }
 
-    /// Prove that a checkout-relative output path is a real directory inside the
-    /// immutable sealed volume. Every component is inspected without following a
-    /// symlink, and the volume is attached read-only to the inspector.
+    /// Proves that a checkout-relative output path is a real directory inside the immutable sealed
+    /// volume. Every component is inspected without following a symlink, and the volume is attached
+    /// read-only to the inspector.
     pub async fn require_directory(&self, path: &WorkspacePath) -> Result<()> {
         self.verify().await?;
         let id = Uuid::new_v4().simple().to_string();
@@ -3375,9 +3304,12 @@ exit 74
         })
     }
 
-    /// Replace a disposable platform checkout with the verified bounded output.
-    /// The destination must already be a real directory; tenant input never
-    /// becomes a Podman path or mount argument.
+    /// Replaces a disposable platform checkout with the verified bounded output. The destination
+    /// must already be a real directory; tenant input never becomes a Podman path or mount
+    /// argument. The output leaves the sealed-artifact volume as a tar stream through `podman exec`
+    /// (`export_directory`) that is unpacked on the host into a sibling staging directory, because
+    /// `podman cp` resolves its container-side path against the read-only rootfs, which does not
+    /// contain that volume.
     pub async fn materialize_replace(mut self, destination: &Path) -> Result<()> {
         self.verify().await?;
         let metadata = tokio::fs::symlink_metadata(destination)
@@ -3436,12 +3368,6 @@ exit 74
                 format!("cannot create sibling staging directory: {error}"),
             )
         })?;
-        // Mirror of `import_checkout`: `podman cp` resolves its container-side
-        // path against the container's read-only ROOTFS, which does not contain
-        // the sealed-artifact volume, so it fails with "could not be found on
-        // container" before any byte moves (reproduced live on fc-orlando
-        // 2026-10-09). Stream a tar out through `podman exec` and unpack it on
-        // the host into the staging directory instead.
         let copied = self
             .executor
             .export_directory(
@@ -4332,6 +4258,11 @@ fn image_digest(reference: &str) -> Result<&str> {
     Ok(digest)
 }
 
+/// Verifies a local image-inspect document: the image must report the configured sha256 identity
+/// (id, digest or repo digest) and still carry the reviewed runtime contract: the init as its only
+/// Entrypoint (the executor invokes it explicitly, but a config drift here means the archive is not
+/// the reviewed one), the exact non-root user `65532:65532`, `WorkingDir` at the workspace mount
+/// and the protocol label.
 fn verify_image_inspect(bytes: &[u8], reference: &str) -> Result<()> {
     let expected = image_digest(reference)?;
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
@@ -4372,10 +4303,6 @@ fn verify_image_inspect(bytes: &[u8], reference: &str) -> Result<()> {
             format!("local image does not report configured sha256:{expected}"),
         ));
     }
-    // The loaded image must still carry the reviewed runtime contract: the
-    // init as Entrypoint (this executor invokes it explicitly, but a config
-    // drift here means the archive is not the reviewed one), the exact
-    // non-root user, and the protocol label.
     let image_config = object
         .get("Config")
         .or_else(|| object.get("config"))

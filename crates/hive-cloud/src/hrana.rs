@@ -1,52 +1,45 @@
-//! Hrana-over-HTTP server — the libsql wire protocol for the `sqlite` database
-//! kind, so `@libsql/client` (and the Rust/Go/Python libsql clients) connect to
-//! a platform-managed SQLite database with no adapter in between.
+//! Hrana-over-HTTP server: the libsql wire protocol for the `sqlite` database kind, so
+//! `@libsql/client` (and the Rust, Go and Python libsql clients) connect to a platform-managed
+//! SQLite database with no adapter in between.
 //!
 //! # Addressing
 //!
-//! Two mount points, both serving the identical handler:
+//! Two mount points serve the identical handler:
 //!
-//! * `https://<slug>.{HIVE_DB_DOMAIN}/v2/pipeline` — the per-database hostname
-//!   every other managed engine already gets (wildcard ACME cert, per-DB A
-//!   record pointing at the owning node). This is the DSN the platform
-//!   publishes, as `libsql://<slug>.{db_domain}`.
-//! * `https://api.{platform_domain}/v1/sqlite/<db_id>/v2/pipeline` — the same
-//!   thing without a DB gateway domain, so the lane works on a node with
-//!   `HIVE_DB_DOMAIN` unset. Its DSN is published WITH A TRAILING SLASH
-//!   (`libsql://api.host/v1/sqlite/<id>/`) and that is load-bearing:
-//!   `hrana-client-ts` resolves `v2/pipeline` RELATIVELY against the base URL
-//!   (`new URL(pipelinePath, baseUrl)`), so a base without the trailing slash
-//!   silently drops its last segment and posts to `/v1/sqlite/v2/pipeline` —
-//!   a different database, or none.
+//! * `https://<slug>.{HIVE_DB_DOMAIN}/v2/pipeline`: the per-database hostname every other managed
+//!   engine already gets (wildcard ACME cert, per-DB A record pointing at the owning node). This is
+//!   the DSN the platform publishes, as `libsql://<slug>.{db_domain}`.
+//! * `https://api.{platform_domain}/v1/sqlite/<db_id>/v2/pipeline`: the same thing without a DB
+//!   gateway domain, so the lane works on a node with `HIVE_DB_DOMAIN` unset. Its DSN is published
+//!   WITH A TRAILING SLASH (`libsql://api.host/v1/sqlite/<id>/`) and that is load-bearing:
+//!   `hrana-client-ts` resolves `v2/pipeline` RELATIVELY against the base URL (`new
+//!   URL(pipelinePath, baseUrl)`), so a base without the trailing slash silently drops its last
+//!   segment and posts to `/v1/sqlite/v2/pipeline`, a different database or none.
 //!
-//! The version path is NOT negotiated by the JS client: `hrana-client-ts`
-//! hardcodes `version: 2, encoding: "json"` and never probes. Both `v2` and
-//! `v3` pipelines are therefore mounted, JSON only, and the `v3-protobuf`
-//! probe is deliberately NOT served — answering it 2xx is the one thing that
-//! would push a client onto the protobuf encoding this server does not speak.
+//! The version path is NOT negotiated by the JS client: `hrana-client-ts` hardcodes `version: 2,
+//! encoding: "json"` and never probes. Both `v2` and `v3` pipelines are therefore mounted, JSON
+//! only, and the `v3-protobuf` probe is deliberately NOT served: answering it 2xx is the one thing
+//! that would push a client onto the protobuf encoding this server does not speak.
 //!
 //! # Owner routing
 //!
-//! A SQLite database is a FILE on `Database::host_node`. Every other node
-//! PROXIES to that owner (HTTP admin when known, else the iroh mesh) instead of
-//! opening a local file — opening one would silently create a second, empty
-//! database and diverge forever. This is the `proxy_to_owner` /
-//! `fetch_artifact_from_host` shape: the owner re-runs the credential check
-//! against its own replicated record, and a `local` marker in the envelope
-//! stops it re-proxying. When the owner cannot be reached the answer is an
-//! honest 421, never a locally-invented empty database.
+//! A SQLite database is a FILE on `Database::host_node`. Every other node PROXIES to that owner
+//! (HTTP admin when known, else the iroh mesh) instead of opening a local file, which would
+//! silently create a second, empty database and diverge forever. It is the shape of
+//! `browser_artifacts::fetch_artifact_from_host`: the owner re-runs the credential check against
+//! its own replicated record and refuses to re-proxy (`mesh_serve`). When the owner cannot be
+//! reached the answer is an honest 421, never a locally invented empty database.
 //!
-//! Because every node proxies, all stream (baton) state lives on the owner —
-//! so an interactive transaction spanning several POSTs is pinned to one
-//! connection by construction, whichever node the round-robin DNS picked.
+//! Because every node proxies, all stream (baton) state lives on the owner, so an interactive
+//! transaction spanning several POSTs is pinned to one connection by construction, whichever node
+//! the round-robin DNS picked.
 //!
 //! # Auth
 //!
-//! The bearer is the database's own dedicated `DB_REST_TOKEN`, compared
-//! constant-time by `db_rest::credential_matches` (the same function the
-//! Postgres/Redis REST surface uses). Scope is exactly one database; there is
-//! no team-wide token on this surface and no tenant name is ever read from the
-//! request.
+//! The bearer is the database's own dedicated `DB_REST_TOKEN`, compared in constant time by
+//! `db_rest::credential_matches` (the same function the Postgres/Redis REST surface uses). Scope is
+//! exactly one database; there is no team-wide token on this surface and no tenant name is ever
+//! read from the request.
 
 use crate::databases::{Database, DbKind};
 use crate::hrana_proto::{execute_pipeline, SqlCache};
@@ -62,9 +55,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-/// How long a stream may sit between requests before it is reaped and its
-/// connection returned to the pool. An abandoned interactive transaction
-/// otherwise holds a pooled connection (and, mid-`BEGIN`, the file's write
+/// How long a stream may sit between requests (`HIVE_SQLITE_STREAM_IDLE_MS`, default 30 s, clamped
+/// to 1-600 s) before it is reaped and its connection returned to the pool. An abandoned
+/// interactive transaction otherwise holds a pooled connection (and, mid-`BEGIN`, the file's write
 /// lock) forever.
 fn stream_idle_ms() -> u64 {
     std::env::var("HIVE_SQLITE_STREAM_IDLE_MS")
@@ -74,47 +67,38 @@ fn stream_idle_ms() -> u64 {
         .clamp(1_000, 600_000)
 }
 
-/// Max request body for a pipeline POST.
-///
-/// ENFORCED TWICE ON PURPOSE, because the two mounts differ in where the bytes
-/// arrive. `axum`'s own default body limit (2 MiB) otherwise rejects first —
-/// measured live on this very route: a 1.9 MiB body answered 200 and a 2 MiB
-/// one answered `413 text/plain`, so the number below was never the number a
-/// client met. The routes now carry `DefaultBodyLimit::max(BODY_CAP)` so the
-/// documented cap is the enforced one. It still fires in the framework, before
-/// `serve` runs: an over-cap body therefore gets 413 with axum's text/plain
-/// message and no `code`, and it does so BEFORE the bearer is checked (measured:
-/// an over-cap body with a wrong token answers 413, not 401). The check in
-/// `serve` remains the chokepoint for every caller that reaches the handler with
-/// bytes already in hand — notably `mesh_serve`, whose body arrives base64
-/// inside a JSON envelope and is checked after decoding.
+/// Max request body for a pipeline POST, ENFORCED TWICE ON PURPOSE because the two mounts differ in
+/// where the bytes arrive. The routes carry `DefaultBodyLimit::max(BODY_CAP)` because axum's own 2
+/// MiB default would otherwise reject first, so the documented cap is the enforced one. That limit
+/// fires in the framework, before `serve` runs: an over-cap body gets 413 with axum's text/plain
+/// message and no `code`, and it does so BEFORE the bearer is checked (an over-cap body with a
+/// wrong token answers 413, not 401). The check in `serve` remains the chokepoint for every caller
+/// that reaches the handler with bytes already in hand, notably `mesh_serve`, whose body arrives
+/// base64 inside a JSON envelope and is checked after decoding.
 const BODY_CAP: usize = 4 * 1024 * 1024;
 
-/// The mesh hop carries the same bytes base64-encoded inside a JSON envelope,
-/// so its transport limit has to clear the encoded size of a full-cap body
-/// (~5.6 MiB) or a pipeline the owner would accept could not reach it.
+/// The mesh hop carries the same bytes base64-encoded inside a JSON envelope, so its transport
+/// limit has to clear the encoded size of a full-cap body (a third larger) or a pipeline the owner
+/// would accept could not reach it.
 const MESH_BODY_CAP: usize = BODY_CAP * 2;
 
-/// One Hrana stream's connection to whichever engine this database runs on.
-///
-/// Both arms execute the SAME pipeline implementation
-/// (`hrana_proto::execute_pipeline`), so the wire contract cannot drift between
-/// engines. They differ only in where the work happens: the rusqlite arm is
-/// moved onto `spawn_blocking` (its engine is blocking file IO and must never
-/// run on a serving tokio worker), the musql arm is awaited on the runtime (its
-/// engine is loopback HTTP).
+/// One Hrana stream's connection to whichever engine this database runs on. Both arms execute the
+/// SAME pipeline implementation (`hrana_proto::execute_pipeline`), so the wire contract cannot
+/// drift between engines. They differ only in where the work happens: the rusqlite arm is moved
+/// onto `spawn_blocking` (its engine is blocking file IO and must never run on a serving tokio
+/// worker), the musql arm is awaited on the runtime (its engine is loopback HTTP).
 enum EngineConn {
     Rusqlite(PooledConn),
     Musql(MusqlEngine),
 }
 
 impl EngineConn {
+    /// Whether the stream can continue: a rusqlite stream asks its pooled connection, while a musql
+    /// stream is live as long as it is checked out (the sidecar owns the underlying file handle and
+    /// reports its own failures as request errors).
     fn is_live(&self) -> bool {
         match self {
             EngineConn::Rusqlite(c) => c.is_live(),
-            // A musql stream is live as long as it is checked out; the sidecar
-            // owns the underlying file handle and reports its own failures as
-            // request errors.
             EngineConn::Musql(_) => true,
         }
     }
@@ -136,6 +120,9 @@ impl EngineConn {
         }
     }
 
+    /// Runs a cursor batch. On the rusqlite arm the closure must own everything the future borrows:
+    /// it is `for<'a>` over the connection's lifetime, so a borrow of a local could not be shown to
+    /// outlive it.
     async fn cursor(
         &mut self,
         batch: Value,
@@ -146,9 +133,6 @@ impl EngineConn {
             EngineConn::Rusqlite(c) => {
                 let cache = cache.clone();
                 c.call_blocking(move |conn| {
-                    // The closure must own everything the future borrows: it is
-                    // `for<'a>` over the connection's lifetime, so a borrow of a
-                    // local could not be shown to outlive it.
                     let cache = cache.clone();
                     Box::pin(async move {
                         crate::hrana_proto::execute_cursor(conn, batch, &cache, version, false)
@@ -179,24 +163,25 @@ fn streams() -> &'static Streams {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Unforgeable, single-use stream handle: 32 bytes from the OS CSPRNG,
-/// base64url-nopad. A client can neither guess another stream's baton nor
-/// reuse its own — every response mints a fresh one and retires the old.
+/// Unforgeable, single-use stream handle: 32 bytes from the OS CSPRNG, base64url-nopad. A client
+/// can neither guess another stream's baton nor reuse its own: every response mints a fresh one and
+/// retires the old. A CSPRNG failure yields an empty string, which `checkin` treats as a closed
+/// stream, never a predictable baton.
 fn mint_baton() -> String {
     use ring::rand::SecureRandom;
     static RNG: OnceLock<ring::rand::SystemRandom> = OnceLock::new();
     let mut buf = [0u8; 32];
     let rng = RNG.get_or_init(ring::rand::SystemRandom::new);
-    // A CSPRNG failure must not silently downgrade to a predictable baton.
     if rng.fill(&mut buf).is_err() {
         return String::new();
     }
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Reap streams idle past the budget. Runs on every request rather than on a
-/// timer: a stream can only be starved of capacity by traffic, and traffic is
-/// what runs this.
+/// Reaps streams idle past the budget. Runs on every request rather than on a timer: a stream can
+/// only be starved of capacity by traffic, and traffic is what runs this. The expired streams are
+/// dropped outside the lock, because `PooledConn::drop` rolls back an open transaction and touches
+/// the pool.
 fn sweep() {
     let cutoff = hive_core::now_ms().saturating_sub(stream_idle_ms());
     let expired: Vec<Stream> = {
@@ -208,8 +193,6 @@ fn sweep() {
             .collect();
         keys.iter().filter_map(|k| map.remove(k)).collect()
     };
-    // Drop outside the lock: `PooledConn::drop` rolls back an open transaction
-    // and touches the pool.
     for s in expired {
         tracing::debug!(db = %s.db_id, "hrana stream expired; connection returned to pool");
     }
@@ -229,25 +212,20 @@ pub fn close_streams(db_id: &str) {
     drop(dropped);
 }
 
-// ---- Conversion quiesce ---------------------------------------------------
-
-/// Databases whose file is mid-conversion, keyed by database id.
-///
-/// `close_streams` closes what is ALREADY open, which is not enough: a client
-/// that dials in one second later reopens the file behind the migration's back,
-/// and a write landing after `musql_migrate` snapshotted the source is lost the
-/// moment the record flips. Witnessed live: `-shm` mtimes moved nine minutes
-/// after the snapshot. So the whole conversion holds this set and `checkout`
-/// REFUSES new streams for it (refuses, never queues — a queued stream would
-/// open onto a file that has already been replaced).
+/// Databases whose file is mid-conversion, keyed by database id. `close_streams` closes what is
+/// ALREADY open, which is not enough: a client that dials in a second later reopens the file behind
+/// the migration's back, and a write landing after `musql_migrate` snapshotted the source is lost
+/// the moment the record flips. So the whole conversion holds this set and `checkout` REFUSES new
+/// streams for it (refuses, never queues: a queued stream would open onto a file that has already
+/// been replaced).
 fn quiescing() -> &'static Mutex<std::collections::HashSet<String>> {
     static Q: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
     Q.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Held for the duration of a conversion. The set entry is removed by `Drop`,
-/// never on a success or error branch: a conversion that panics or returns
-/// early must not leave a database refusing every request forever.
+/// Held for the duration of a conversion. The set entry is removed by `Drop`, never on a success or
+/// error branch: a conversion that panics or returns early must not leave a database refusing every
+/// request forever.
 pub struct ConversionGuard(String);
 
 impl Drop for ConversionGuard {
@@ -270,8 +248,6 @@ pub fn is_quiescing(db_id: &str) -> bool {
     quiescing().lock().contains(db_id)
 }
 
-// ---- HTTP surface ---------------------------------------------------------
-
 #[derive(Clone, Copy, PartialEq)]
 enum Endpoint {
     Pipeline(u8),
@@ -279,23 +255,27 @@ enum Endpoint {
     Probe(u8),
 }
 
+/// Maps method and path to an endpoint. The GET probes answer 2xx for each supported version (v2
+/// and v3); `v3-protobuf` is deliberately not routed at all.
 fn route(method: &Method, path: &str) -> Option<Endpoint> {
     let p = path.trim_end_matches('/');
     match (method, p) {
         (&Method::POST, "/v2/pipeline") => Some(Endpoint::Pipeline(2)),
         (&Method::POST, "/v3/pipeline") => Some(Endpoint::Pipeline(3)),
         (&Method::POST, "/v3/cursor") => Some(Endpoint::Cursor(3)),
-        // Capability probes: 2xx means "this version is supported". v2 and v3
-        // are; `v3-protobuf` deliberately is not routed at all.
         (&Method::GET, "/v2") => Some(Endpoint::Probe(2)),
         (&Method::GET, "/v3") => Some(Endpoint::Probe(3)),
         _ => None,
     }
 }
 
-/// Serve one Hrana request for `db`. `path` is the endpoint path RELATIVE to
-/// the database's base URL (`/v2/pipeline`, `/v3`, …) — the two mount points
-/// normalise to it before calling.
+/// Serves one Hrana request for `db`. `path` is the endpoint path RELATIVE to the database's base
+/// URL (`/v2/pipeline`, `/v3`, ...); the two mount points normalise to it before calling. A
+/// wrong-kind database answers BYTE-IDENTICALLY to `api_serve`'s unknown-id answer: a distinct
+/// 'does not speak the libsql protocol' message would be readable WITHOUT any credential (the kind
+/// check precedes the bearer check), letting an unauthenticated caller holding a leaked id confirm
+/// both that the id existed and which engine it ran. The file lives on exactly one node: everyone
+/// else proxies to the owner (`forward_to_owner`).
 pub async fn serve(
     cloud: Arc<CloudState>,
     db: Database,
@@ -305,12 +285,6 @@ pub async fn serve(
     body: axum::body::Bytes,
 ) -> Response {
     if db.kind != DbKind::Sqlite {
-        // BYTE-IDENTICAL to `api_serve`'s unknown-id answer. A distinct
-        // "does not speak the libsql protocol" message here was readable
-        // WITHOUT any credential (the kind check precedes the bearer check), so
-        // an unauthenticated caller holding a leaked id could confirm both that
-        // the id existed and which engine it ran — the existence leak this
-        // surface documents as closed.
         return err(StatusCode::NOT_FOUND, "no such database", None);
     }
     if !crate::db_rest::credential_matches(&db, &bearer) {
@@ -341,7 +315,6 @@ pub async fn serve(
         );
     }
 
-    // OWNER ROUTING. The file lives on exactly one node; everyone else proxies.
     if !is_owner(&cloud, &db) {
         return match forward_to_owner(&cloud, &db, &bearer, &path, &body).await {
             Some(r) => r,
@@ -355,10 +328,10 @@ pub async fn serve(
     serve_local(&cloud, &db, endpoint, &body).await
 }
 
+/// Whether this node hosts the database file. An empty `host_node` is a pre-sqlite-lane record
+/// shape, and refusing to guess is the only safe answer: it counts as 'not us', so the proxy fails
+/// honestly instead of creating an empty file here.
 fn is_owner(cloud: &Arc<CloudState>, db: &Database) -> bool {
-    // An empty `host_node` is a pre-sqlite-lane record shape; refusing to guess
-    // is the only safe answer, so treat it as "not us" and let the proxy fail
-    // honestly rather than create an empty file here.
     !db.host_node.is_empty() && db.host_node == cloud.node_name
 }
 
@@ -380,16 +353,24 @@ async fn serve_local(
     }
 }
 
-/// Take the stream named by `baton`, or open a fresh one. Returns the stream
-/// plus whether it was newly opened (only used for logging).
+/// Takes the stream named by `baton`, or opens a fresh one; while a conversion holds the database
+/// (`begin_conversion`) it refuses with a retryable 503 `SQLITE_BUSY` instead of opening a
+/// connection onto a database that is being replaced. A baton is single-use AND database-scoped:
+/// another database's baton is put straight back and answered exactly as if it had never existed,
+/// so batons cannot probe other databases' streams. Take-and-restore happens under ONE lock guard:
+/// `match streams().lock().remove(b) { ... }` self-deadlocks, because the scrutinee's `MutexGuard`
+/// temporary lives to the END of the match and re-locking inside an arm blocks a non-reentrant
+/// `parking_lot::Mutex` against a guard this thread holds; every request starts with `sweep()` (the
+/// same map), so the node's HTTP runtime would be consumed one wedged worker at a time. A musql
+/// database whose engine is not serving is an honest 503, never an invented empty database or a
+/// silent fall-through to rusqlite: those are different files, and serving one as the other is the
+/// divergence owner routing exists to prevent.
 async fn checkout(
     cloud: &Arc<CloudState>,
     db: &Database,
     baton: Option<&str>,
 ) -> Result<Stream, Response> {
     sweep();
-    // A conversion is running on this file: refuse, loudly and retryably,
-    // rather than open a connection onto a database that is being replaced.
     if is_quiescing(&db.id) {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -398,27 +379,11 @@ async fn checkout(
         ));
     }
     if let Some(b) = baton {
-        // ONE guard covers take-and-restore. Writing this as
-        // `match streams().lock().remove(b) { … }` is a self-deadlock: the
-        // scrutinee's `MutexGuard` temporary lives until the END of the match,
-        // so re-locking inside an arm blocks a non-reentrant
-        // `parking_lot::Mutex` against a guard this very thread holds. It never
-        // unblocks, the guard is never dropped, and because EVERY request
-        // starts with `sweep()` (which locks the same map) the whole node's
-        // HTTP runtime is consumed one wedged worker at a time — witnessed
-        // live: one cross-database baton took down `/healthz` and every other
-        // route on the node, permanently.
         let taken = {
             let mut map = streams().lock();
             match map.remove(b) {
-                // A baton is single-use AND database-scoped: presenting another
-                // database's baton must not reach this database's connection.
                 Some(s) if s.db_id == db.id => Some(s),
                 Some(other) => {
-                    // Belongs to a different database — put it straight back
-                    // under the guard we already hold, and answer exactly as if
-                    // it had never existed (below), so a baton cannot be used to
-                    // probe for live streams on another database.
                     map.insert(b.to_string(), other);
                     None
                 }
@@ -437,11 +402,6 @@ async fn checkout(
     let conn = match engine {
         DbEngine::Musql => {
             let e = MusqlEngine::connect(cloud.http.clone(), &db.id).await.map_err(|e| {
-                // A database whose record says musql while the engine is not
-                // serving is an honest 503, never a locally-invented empty
-                // database and never a silent fall-through to rusqlite — those
-                // two files are different databases and serving one as the other
-                // is exactly the divergence owner-routing exists to prevent.
                 err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &format!("musql engine unavailable for this database: {e}"),
@@ -486,9 +446,8 @@ async fn checkout(
     })
 }
 
-/// Re-insert a live stream under a FRESH baton and return it. `None` when the
-/// stream was closed (or lost its connection), which the client reads as a
-/// null baton = stream closed.
+/// Re-inserts a live stream under a FRESH baton and returns it. `None` when the stream was closed
+/// (or lost its connection), which the client reads as a null baton = stream closed.
 fn checkin(mut stream: Stream) -> Option<String> {
     if !stream.conn.is_live() {
         return None;
@@ -502,6 +461,11 @@ fn checkin(mut stream: Stream) -> Option<String> {
     Some(baton)
 }
 
+/// Runs one pipeline POST on the stream named by the baton (or a fresh one). When the connection is
+/// gone the stream cannot continue, so the whole pipeline fails (500 `SQLITE_ERROR`) rather than
+/// pretending the requests ran. The response's `base_url` is `null`, which keeps the client on the
+/// URL it already has: a node-specific absolute URL would pin the stream to one node's address, and
+/// every node proxies to the owner instead.
 async fn pipeline(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -536,8 +500,6 @@ async fn pipeline(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u
             (o.results, o.closed)
         }
         Err(e) => {
-            // The connection is gone; the stream cannot continue. Report it as
-            // a whole-pipeline failure rather than pretending the requests ran.
             drop(stream);
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -549,14 +511,13 @@ async fn pipeline(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u
     let next = if closed { None } else { checkin(stream) };
     ok_json(json!({
         "baton": next,
-        // `null` keeps the client on the URL it already has. Handing out a
-        // node-specific absolute URL would pin the stream to one node's
-        // address; every node proxies to the owner instead.
         "base_url": Value::Null,
         "results": results,
     }))
 }
 
+/// Runs one cursor POST. The response is newline-delimited JSON: a `CursorRespBody` line (`baton`,
+/// `base_url`), then one line per entry.
 async fn cursor(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -592,8 +553,6 @@ async fn cursor(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]
         }
     };
     let next = checkin(stream);
-    // The cursor response is newline-delimited JSON: a `CursorRespBody` line,
-    // then one line per entry.
     let mut out = serde_json::to_string(&json!({ "baton": next, "base_url": Value::Null }))
         .unwrap_or_default();
     for e in entries {
@@ -611,8 +570,6 @@ async fn cursor(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]
     )
 }
 
-// ---- Owner proxy ----------------------------------------------------------
-
 /// The internal envelope carried to the owning node. Bodies ride base64 so the
 /// same envelope carries a JSON pipeline body and an NDJSON cursor response.
 fn envelope(bearer: &str, path: &str, body: &[u8]) -> Value {
@@ -623,6 +580,11 @@ fn envelope(bearer: &str, path: &str, body: &[u8]) -> Value {
     })
 }
 
+/// Proxies a request to the owning node: HTTP admin first (the same two-tier shape as
+/// `admin::fetch_from_host`), the mesh gossip route as fallback. `None` when neither answered,
+/// which the caller turns into the honest 421. Every failing exit is logged with its reason: an
+/// unlogged `None` would surface to the client as a bare 421 with no way to tell 'no admin URL for
+/// the owner' from 'the mesh dial failed', two problems with completely different fixes.
 async fn forward_to_owner(
     cloud: &Arc<CloudState>,
     db: &Database,
@@ -641,13 +603,8 @@ async fn forward_to_owner(
     let env = envelope(bearer, path, body);
     let route = format!("/v1/databases/{}/hrana-mesh", db.id);
 
-    // Every exit below is logged. An unlogged `None` here surfaces to the
-    // client as a bare 421 with no way to tell "no admin URL for the owner"
-    // from "the mesh dial failed" — the two have completely different fixes,
-    // and diagnosing it from the outside means reading this function's source.
     let mut why = String::new();
 
-    // HTTP admin first (same two-tier shape as `admin::fetch_from_host`).
     let admin = cloud.node_admins.read().get(&node).cloned();
     if admin.is_none() {
         why.push_str("no HTTP admin URL known for owner; ");
@@ -682,7 +639,6 @@ async fn forward_to_owner(
         }
     }
 
-    // Mesh fallback.
     let target = cloud
         .registry
         .nodes()
@@ -741,9 +697,10 @@ fn decode_envelope(v: &Value) -> Option<Response> {
     ))
 }
 
-/// The owner half of the proxy: re-resolve the database from THIS node's own
-/// replicated record, re-check the presented credential, refuse to re-proxy,
-/// and serve locally. Shared by the HTTP admin route and the gossip arm.
+/// The owner half of the proxy: re-resolves the database from THIS node's own replicated record,
+/// re-checks the presented credential, refuses to re-proxy, and serves locally. Shared by the HTTP
+/// admin route and the gossip arm. A node that is not the owner either means the caller's routing
+/// information is stale, and answering 421 honestly beats a proxy loop.
 pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value {
     let refuse = |status: StatusCode, msg: &str| {
         json!({
@@ -766,8 +723,6 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value
             "invalid auth token for this database",
         );
     }
-    // NO RE-PROXY: if this node is not the owner either, the caller's routing
-    // information is stale. Answering honestly beats a proxy loop.
     if !is_owner(cloud, &db) {
         return refuse(
             StatusCode::MISDIRECTED_REQUEST,
@@ -802,19 +757,18 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value
     })
 }
 
-// ---- Route wiring ---------------------------------------------------------
-
-/// `/v1/sqlite/:id/*` — the platform-API mount. Deliberately NOT tenant-JWT
-/// gated: the database's own token is the credential (the `db_rest` posture),
-/// and `auth::require_auth` exempts this prefix for exactly that reason.
+/// The routes of this lane: the `/v1/sqlite/:id/*` platform-API mount, the owner-proxy hop
+/// `/v1/databases/:id/hrana-mesh`, and the operator routes for pool stats and storage-engine
+/// switching. The `/v1/sqlite/:id/*` mount is deliberately NOT tenant-JWT gated: the database's own
+/// token is the credential (the `db_rest` posture), and `auth::require_auth` exempts this prefix
+/// for that reason. Its routes carry an OPTIONS arm because `@libsql/client` runs in browsers and
+/// its POST (`authorization` + `content-type: application/json`) triggers a preflight (the
+/// `<slug>.{db_domain}` mount gets it from `db_rest::handle`). The body cap is enforced by
+/// `DefaultBodyLimit` where the bytes arrive (see `BODY_CAP`), and `add_cors` rides along because
+/// the framework's over-cap rejection never reaches `cors()` inside a handler, which would leave a
+/// browser client with an opaque network error instead of the 413.
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     use axum::routing::{get, post};
-    // `@libsql/client` runs in browsers too, and its POST carries
-    // `authorization` + `content-type: application/json` — both preflight
-    // triggers. Without an OPTIONS arm the router answers 405 and the browser
-    // never sends the real request, so the preflight is part of the endpoint,
-    // not an extra. (The `<slug>.{db_domain}` mount already gets this from
-    // `db_rest::handle`'s own OPTIONS short-circuit.)
     axum::Router::new()
         .route(
             "/v1/sqlite/:id/v2/pipeline",
@@ -830,11 +784,6 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         )
         .route("/v1/sqlite/:id/v2", get(api_probe_v2).options(preflight))
         .route("/v1/sqlite/:id/v3", get(api_probe_v3).options(preflight))
-        // The documented body cap, enforced where the bytes arrive (see
-        // `BODY_CAP`). `add_cors` rides along because an over-cap body is
-        // rejected by the framework and never reaches `cors()` inside the
-        // handler — without it a browser client sees an opaque network error
-        // instead of the 413.
         .layer(axum::extract::DefaultBodyLimit::max(BODY_CAP))
         .layer(axum::middleware::map_response(add_cors))
         .route(
@@ -847,9 +796,8 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         .route("/v1/databases/:id/sqlite-engine/plan", get(engine_plan_route))
 }
 
-/// Dry run: what a switch to musql WOULD do, including the blockers
-/// (`integrity_check` and the non-finite REAL scan) — so an operator can see a
-/// refusal before asking for the real thing.
+/// Dry run: what a switch to musql WOULD do, including the blockers (`integrity_check` and the
+/// non-finite REAL scan), so an operator can see a refusal before asking for the real thing.
 async fn engine_plan_route(
     State(c): State<Arc<CloudState>>,
     AxPath(id): AxPath<String>,
@@ -870,9 +818,9 @@ async fn engine_plan_route(
     }
 }
 
-/// Operator view of every managed SQLite database's storage engine on this
-/// node, plus the sidecar's own state. Node-local like `sqlite-pools` (a pool
-/// and a sidecar are both things on one machine), read per node.
+/// Operator view of every managed SQLite database's storage engine on this node, plus the sidecar's
+/// own state. Node-local like `sqlite-pools` (a pool and a sidecar are both things on one machine),
+/// read per node.
 async fn engine_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -900,13 +848,16 @@ async fn engine_stats(
     })))
 }
 
-/// Switch one managed SQLite database's engine, with the conversion VERIFIED
-/// before the record moves. `{"engine":"musql"}` converts and checks
-/// row-for-row; `{"engine":"rusqlite"}` exports back and checks the same way.
+/// Switches one managed SQLite database's engine, with the conversion VERIFIED before the record
+/// moves. `{"engine":"musql"}` converts and checks row-for-row; `{"engine":"rusqlite"}` exports
+/// back and checks the same way. The record flips (`set_engine`) only after a VERIFIED conversion,
+/// since `migrate` and `rollback` both refuse to return `Ok` with a divergent table; a `.musq`
+/// staged by an earlier verified run is moved aside rather than blocking the flip (`live_is_musql`
+/// is false here by construction, because an equal target returned earlier).
 ///
-/// Owner-only by design: the file lives on one node and a non-owner has nothing
-/// to convert. It answers 421 rather than proxying — this is an operator action,
-/// not tenant traffic, and an honest refusal beats a silent no-op.
+/// Owner-only by design: the file lives on one node and a non-owner has nothing to convert. It
+/// answers 421 rather than proxying: this is an operator action, not tenant traffic, and an honest
+/// refusal beats a silent no-op.
 async fn set_engine_route(
     State(c): State<Arc<CloudState>>,
     AxPath(id): AxPath<String>,
@@ -946,17 +897,12 @@ async fn set_engine_route(
         return ok_json(json!({ "db_id": id, "engine": target.label(), "changed": false }));
     }
     let result = if target == DbEngine::Musql {
-        // `live_is_musql` is false here by construction (an equal target
-        // returned above), so a `.musq` staged by an earlier verified run is
-        // moved aside rather than blocking the flip.
         crate::musql_migrate::migrate(&id, current == DbEngine::Musql).await
     } else {
         crate::musql_migrate::rollback(&id).await
     };
     match result {
         Ok(report) => {
-            // Only a VERIFIED conversion reaches this line: `migrate`/`rollback`
-            // both refuse to return `Ok` with a divergent table.
             c.databases.set_engine(&id, target);
             crate::hrana::close_streams(&id);
             crate::sqlite_pool::close(&id);
@@ -966,10 +912,9 @@ async fn set_engine_route(
     }
 }
 
-/// Operator view of this NODE's live SQLite pools + open streams. Node-local by
-/// nature (a pool is a set of open file handles on one machine), so it is
-/// deliberately not aggregated — read it per node, the way `/v1/dns/stats` is
-/// read per node.
+/// Operator view of this NODE's live SQLite pools and open streams. Node-local by nature (a pool is
+/// a set of open file handles on one machine), so it is deliberately not aggregated: read it per
+/// node, the way `/v1/dns/stats` is read per node.
 async fn pool_stats(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<axum::Json<Value>, (StatusCode, String)> {
@@ -1030,13 +975,15 @@ async fn preflight() -> Response {
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
-/// `cors` as a response-mapping middleware, so a response produced OUTSIDE the
-/// handlers (the framework's over-cap 413) still carries the headers the
-/// browser preflight was promised.
+/// `cors` as a response-mapping middleware, so a response produced OUTSIDE the handlers (the
+/// framework's over-cap 413) still carries the headers the browser preflight was promised.
 async fn add_cors(resp: Response) -> Response {
     cors(resp)
 }
 
+/// Shared handler of the `/v1/sqlite/:id/*` routes: extracts the bearer and calls `serve`. An
+/// unknown id and a wrong-kind id get the identical answer, so no existence leaks across tenants
+/// (the `browser_artifacts::resolve_for_tenant` posture).
 async fn api_serve(
     cloud: Arc<CloudState>,
     id: String,
@@ -1046,9 +993,6 @@ async fn api_serve(
     body: axum::body::Bytes,
 ) -> Response {
     let Some(db) = cloud.databases.get_raw(&id) else {
-        // Unknown id and wrong-kind id are the identical answer — no existence
-        // leak across tenants (the `browser_artifacts::resolve_for_tenant`
-        // posture).
         return err(StatusCode::NOT_FOUND, "no such database", None);
     };
     let bearer = crate::db_rest::bearer_token(&headers).unwrap_or_default();
@@ -1062,8 +1006,6 @@ async fn mesh_route(
 ) -> axum::Json<Value> {
     axum::Json(mesh_serve(&c, &id, &env).await)
 }
-
-// ---- Response helpers -----------------------------------------------------
 
 fn ok_json(v: Value) -> Response {
     cors(

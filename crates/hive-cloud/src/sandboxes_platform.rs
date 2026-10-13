@@ -1,32 +1,21 @@
-//! `PlatformSandboxProvider` — the production [`SandboxProvider`]: real
-//! isolated cells via the generic `hive_backend::CellBackend` trait — real
-//! Firecracker microVMs when available (the SAME isolation tech Fluid
-//! serverless functions use on this fleet), falling back to Litebox on nodes
-//! where microVMs are unavailable/suppressed and Litebox has been verified
-//! (`HIVE_LITEBOX_VERIFIED=1`, mirroring `main.rs`'s own backend-selection
-//! ranking) — reused, not duplicated, per the platform's "one isolation
-//! selection" design. Never Mock: an unsandboxed node honestly reports
-//! `EngineUnavailable` rather than presenting a fake "sandbox" that isolates
-//! nothing.
+//! `PlatformSandboxProvider`, the production [`SandboxProvider`]: every sandbox is a long-lived
+//! cell of the generic `hive_backend::CellBackend`, a Firecracker microVM or, where microVMs are
+//! unavailable or suppressed and Litebox is verified (`HIVE_LITEBOX_VERIFIED=1`), a Litebox cell;
+//! `main.rs` ranks the shared backend the same way. Never Mock: a node with neither reports
+//! `EngineUnavailable` instead of presenting a fake sandbox that isolates nothing.
 //!
-//! A sandbox is a long-lived cell (`CellBackend::provision`, never torn down
-//! until `stop`/`delete`/idle-timeout). Command execution rides the guest-
-//! agent protocol's `AgentRequest::Exec`/`KillExec` (`hive-core/proto.rs`)
-//! that runs one argv command per call over its own vsock connection, streaming
-//! `ExecOutput` (stdout/stderr kept distinct) then one `ExecDone`; the
-//! interactive terminal rides the sibling `ExecPty`/`PtyInput`/`PtyResize`/
-//! `PtyOutput`/`PtyExited` messages — see `CellBackend::exec_command`/
-//! `kill_exec`/`exec_pty`.
+//! A cell lives until `stop`, `delete` or the idle timeout. Commands ride the guest-agent
+//! protocol's `AgentRequest::Exec`/`KillExec` (`hive-core/proto.rs`): one argv command per call
+//! over its own vsock connection, streaming `ExecOutput` (stdout and stderr kept distinct) and then
+//! one `ExecDone`. The interactive terminal rides
+//! `ExecPty`/`PtyInput`/`PtyResize`/`PtyOutput`/`PtyExited` (`CellBackend::exec_command`,
+//! `kill_exec`, `exec_pty`).
 //!
-//! On a node with no selected backend, every cell-touching operation reports
-//! `EngineUnavailable`, and `create_sandbox` FAILS CLOSED: no record is
-//! persisted, no success-shaped "failed" row exists, and a partially
-//! provisioned cell is released by a Drop guard on the error/cancel path.
-//! There is no simulation mode — a sandbox either has a real isolated cell on
-//! `SandboxRecord::owner_node` or it does not exist. Placement onto a node
-//! that CAN provision is `sandboxes_api::create_sandbox`'s job (it delegates
-//! from an incapable leader to a capable peer); this provider only ever
-//! provisions locally.
+//! `create_sandbox` FAILS CLOSED: a failed provision persists no record, and a partially
+//! provisioned cell is released by a Drop guard on the error and cancel paths. There is no
+//! simulation mode: a sandbox either has a real cell on `SandboxRecord::owner_node` or does not
+//! exist. This provider only ever provisions locally; placing a create on a capable node is
+//! `sandboxes_api::create_sandbox`'s job (it delegates from an incapable leader to a capable peer).
 
 use crate::sandboxes::*;
 use hive_backend::{CellBackend, CellHandle, CellSpec};
@@ -35,13 +24,11 @@ use parking_lot::RwLock as PLRwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Holds a freshly provisioned cell between `provision` returning and the
-/// sandbox record being committed. Armed by construction: if the create path
-/// errors or the request future is dropped (axum drops it when the client goes
-/// away — `AGENTS.md`'s "request cancellation is a failure mode") before
-/// `commit`, the cell is terminated and never leaks as an untracked microVM /
-/// litebox process. `commit` publishes the handle into the provider's live
-/// `cells` map and disarms.
+/// Holds a freshly provisioned cell between `provision` returning and the sandbox record being
+/// committed. Armed by construction: if the create path errors or the request future is dropped
+/// (axum drops it when the client goes away) before `commit`, the cell is terminated instead of
+/// leaking as an untracked microVM or litebox process. `commit` publishes the handle into the
+/// provider's live `cells` map and disarms.
 struct ProvisionedCellGuard {
     sandbox_id: String,
     handle: Option<CellHandle>,
@@ -65,7 +52,7 @@ impl ProvisionedCellGuard {
 impl Drop for ProvisionedCellGuard {
     fn drop(&mut self) {
         let Some(handle) = self.handle.take() else {
-            return; // committed
+            return;
         };
         let backend = self.backend.clone();
         let sandbox_id = self.sandbox_id.clone();
@@ -84,28 +71,20 @@ impl Drop for ProvisionedCellGuard {
     }
 }
 
-/// Mint a platform sandbox id — `sbx_` + 16 lowercase hex. Called by the
-/// leader BEFORE any transport so a delegated create that times out and is
-/// retried carries the same id, which the owner treats as the same request.
+/// Mints a platform sandbox id: `sbx_` + 16 lowercase hex. The leader mints it BEFORE any
+/// transport, so a delegated create that times out and is retried carries the same id, which the
+/// owner treats as the same request.
 pub fn mint_sandbox_id() -> String {
     format!("sbx_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
 }
 
-/// Host programs a sandbox shell needs beyond the fixed tool set, by runtime
-/// family — the interpreter itself. Naming just the interpreter is enough:
-/// the litebox backend's `support_plan_for` recognizes `node`/`python3` by
-/// their resolved binary name and stages their whole standard-library/
-/// package-manager tree (npm's `node_modules_22`, Python's stdlib)
-/// alongside them — see that function's doc for what that covers and why a
-/// single interpreter name is the right unit to request here rather than
-/// listing `npm`/`npx` separately.
-///
-/// `python3`, `git`, `curl` and `wget` are NOT listed: the backend stages
-/// them into every shell tar on its own (`SHELL_GUEST_TOOL_PROGRAMS`), so a
-/// node sandbox gets them too. `npx` deliberately stays tied to a node
-/// runtime — it needs `node` plus the 15 MiB npm tree, and staging that into
-/// a python-runtime shell is ~90 MiB of guest filesystem for a tool that
-/// shell has no use for.
+/// Host programs a sandbox shell needs beyond the backend's fixed sets (`SHELL_GUEST_PROGRAMS`, and
+/// the `python3`/`git`/`curl`/`wget` toolchain `SHELL_GUEST_TOOL_PROGRAMS`): the interpreter of the
+/// sandbox's runtime family. Naming just the interpreter is enough, because the litebox backend's
+/// `support_plan_for` recognizes `node`/`python3` by their resolved binary name and stages their
+/// whole standard-library and package-manager tree alongside (npm's `node_modules_22`, Python's
+/// stdlib). `npm`/`npx` are never listed separately, so a python-runtime shell does not carry the
+/// npm tree.
 fn shell_runtime_programs(runtime: &str) -> Vec<String> {
     if runtime.starts_with("node") {
         vec!["node".to_string()]
@@ -139,24 +118,22 @@ pub struct PlatformSandboxProvider {
     commands: Arc<PLRwLock<Vec<SandboxCommandRecord>>>,
     snapshots: Arc<PLRwLock<Vec<SandboxSnapshotRecord>>>,
     mounts: Arc<PLRwLock<Vec<SandboxMountRecord>>>,
-    /// Live cell handles — NOT persisted (a `CellHandle`'s vsock/socket paths
-    /// don't survive a node restart; any running sandbox is re-provisioned
-    /// fresh on next use, same as Fluid function cells today).
+    /// Live cell handles, NOT persisted: a `CellHandle`'s vsock/socket paths do not survive a node
+    /// restart, so a running sandbox is re-provisioned fresh on its next use.
     cells: Arc<PLRwLock<HashMap<String, CellHandle>>>,
     /// Live kill-channels for detached execs, keyed by command id, so
     /// `kill_command` can stop draining even if the guest-side kill races.
     killers: Arc<PLRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
-    /// Sandbox ids with an interactive SHELL session open on this node right
-    /// now. A terminal someone is typing in is not idle, so the idle-timeout
-    /// reap refreshes its deadline instead of tearing the cell down under it.
-    /// Released by a `Drop` guard in the websocket handler, never by the
-    /// client's close frame alone (a vanished client drops the upgrade future
-    /// and never sends one).
+    /// Sandbox ids with an interactive SHELL session open on this node right now. A terminal
+    /// someone is typing in is not idle, so the idle-timeout reap refreshes its deadline instead of
+    /// tearing the cell down under it. Released by a `Drop` guard in the websocket handler, never
+    /// by the client's close frame alone (a vanished client drops the upgrade future and never
+    /// sends one).
     open_shells: Arc<PLRwLock<HashSet<String>>>,
     backend: Option<Arc<dyn CellBackend>>,
     region: String,
-    /// This node's own name — stamped onto `SandboxRecord::owner_node` for
-    /// every cell provisioned HERE, and what `owns` compares against.
+    /// This node's own name: stamped onto `SandboxRecord::owner_node` for every cell provisioned
+    /// HERE, and what `ensure_cell` and the idle reap compare a record's `owner_node` against.
     node_name: String,
 }
 
@@ -176,10 +153,10 @@ impl PlatformSandboxProvider {
         }
     }
 
-    /// Can THIS node provision a sandbox cell and execute commands in it? The
-    /// same `sandbox_exec_capable` predicate the remote-candidate filter uses,
-    /// applied to the locally selected backend's advertised name — so a node
-    /// never provisions locally what it would refuse to place on a peer.
+    /// Whether THIS node can provision a sandbox cell and execute commands in it: the same
+    /// `sandbox_exec_capable` predicate the remote-candidate filter uses, applied to the locally
+    /// selected backend's name, so a node never provisions locally what it would refuse to place on
+    /// a peer.
     pub fn local_exec_capable(&self) -> bool {
         self.backend
             .as_ref()
@@ -205,11 +182,10 @@ impl PlatformSandboxProvider {
         self.open_shells.write().remove(sandbox_id);
     }
 
-    /// Adopt a record provisioned on ANOTHER node (its `owner_node` names the
-    /// peer) as local metadata — never provisions a cell here. The leader
-    /// keeps a copy so every later leader-forwarded mutation can find the
-    /// owner to route to; a duplicate adopt (same id) replaces in place so a
-    /// retried delegation stays idempotent.
+    /// Adopts a record provisioned on ANOTHER node (its `owner_node` names the peer) as local
+    /// metadata; never provisions a cell here. The leader keeps the copy so a later
+    /// leader-forwarded mutation can find the owner to route to, and adopting the same id again
+    /// replaces it in place, so a retried delegation is idempotent.
     pub fn adopt_record(&self, rec: SandboxRecord) {
         let mut w = self.sandboxes.write();
         if let Some(existing) = w.iter_mut().find(|s| s.id == rec.id) {
@@ -234,15 +210,10 @@ impl PlatformSandboxProvider {
         }
     }
 
-    /// Look up a sandbox by id ALONE, no project scope — used only by
-    /// `mesh_shell::resolve_sandbox_shell`, whose `RawTarget` handshake (a
-    /// fixed `{project,function,port,proto}` shape defined in `hive-p2p`,
-    /// deliberately not modified for this hive-cloud-local feature) has no
-    /// project field to carry. Safe specifically because the caller checks
-    /// that THIS node owns the record immediately after — a sandbox id
-    /// collision across two tenants' projects is already precluded by the id's
-    /// own generation (`mint_sandbox_id`: a random suffix, never tenant input),
-    /// so this adds no cross-tenant leak beyond what the id already guarantees.
+    /// Looks a sandbox up by id ALONE, with no project scope. The only caller is
+    /// `mesh_shell::resolve_sandbox_shell`, which binds the record to the project in the opener's
+    /// handshake and checks that this node owns it before serving anything; the id is a minted
+    /// random value (`mint_sandbox_id`), never tenant input.
     pub fn get_sandbox_by_id(&self, id: &str) -> Option<SandboxRecord> {
         self.sandboxes
             .read()
@@ -251,10 +222,9 @@ impl PlatformSandboxProvider {
             .cloned()
     }
 
-    /// Rename a project's sandboxes IN PLACE: live records plus their command
-    /// / snapshot / mount history. Sandbox ids are minted (never derived from
-    /// the project name), so nothing on disk or in the cell moves — only the
-    /// ownership label every list/authorize call filters on.
+    /// Renames a project's sandboxes IN PLACE: live records plus their command, snapshot and mount
+    /// history. Sandbox ids are minted (never derived from the project name), so nothing on disk or
+    /// in the cell moves, only the ownership label every list/authorize call filters on.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;
@@ -306,6 +276,10 @@ impl PlatformSandboxProvider {
             self.mounts.read().clone(),
         )
     }
+    /// Replaces the in-memory sets from a persisted snapshot. Cells do not survive a restart, so
+    /// every record persisted as `Running` comes back `Stopped` (its next use provisions a fresh
+    /// cell) with `last_stopped_at` stamped, which keeps a record stopped by a restart
+    /// distinguishable from one never started.
     pub fn load(
         &self,
         s: Vec<SandboxRecord>,
@@ -317,11 +291,6 @@ impl PlatformSandboxProvider {
         *self.commands.write() = c;
         *self.snapshots.write() = sn;
         *self.mounts.write() = m;
-        // Cells don't survive a restart; any RUNNING record is stale until the
-        // sandbox is used again (mirrors Fluid's own cold-restart behavior).
-        // Stamp `last_stopped_at` too — otherwise a record stopped by a restart
-        // is indistinguishable from one never started, and `stop`'s
-        // `total_duration_ms` accumulation silently drops that run.
         let now = hive_core::now_ms();
         for rec in self.sandboxes.write().iter_mut() {
             if rec.status == SandboxStatus::Running {
@@ -350,20 +319,18 @@ impl PlatformSandboxProvider {
             .count() as u32
     }
 
-    /// Idle-timeout reap: mirrors `fluid_compute::reconcile()`'s idle/drain
-    /// pattern — a real deadline, real teardown, not just a status flip.
+    /// Idle-timeout reap: a real deadline and a real teardown (the idle/drain pattern of
+    /// `fluid_compute::reconcile()`), never just a status flip. A sandbox with a command in flight
+    /// or an open shell is BUSY, not idle: its cell is never torn down mid-command, and its
+    /// deadline restarts from now so the countdown the UI shows never runs out under live work.
+    /// Only the OWNER reaps: an adopted metadata copy has no cell, and flipping it to Stopped would
+    /// claim a state the owner has not reached.
     ///
-    /// Returns how many sandboxes it stopped. The stopped records live only in
-    /// memory until something persists, so the CALLER persists when the count
-    /// is non-zero (this provider holds no `CloudState`): an unpersisted reap
-    /// would let a process restart resurrect an already-expired record as
-    /// `Running`.
+    /// Returns how many sandboxes it stopped. The stopped records live only in memory until
+    /// something persists, so the CALLER persists when the count is non-zero (this provider holds
+    /// no `CloudState`).
     pub async fn reap_expired(&self) -> usize {
         let now = hive_core::now_ms();
-        // A sandbox with a command in flight is BUSY, never idle: tearing its
-        // cell down mid-command is the one thing "keep sandboxes running"
-        // forbids, and a long command must not be killed by the deadline its
-        // own start set.
         let busy: HashSet<String> = self
             .commands
             .read()
@@ -380,9 +347,6 @@ impl PlatformSandboxProvider {
                 s.status == SandboxStatus::Running
                     && s.timeout_expires_at.map(|t| now >= t).unwrap_or(false)
                     && !busy.contains(&s.id)
-                    // Only the OWNER reaps: an adopted metadata copy (leader)
-                    // has no cell to tear down, and flipping it to Stopped
-                    // here would claim a state the owner has not reached.
                     && (s.owner_node.is_empty() || s.owner_node == self.node_name)
             })
             .map(|s| (s.project_id.clone(), s.id.clone()))
@@ -391,9 +355,6 @@ impl PlatformSandboxProvider {
         let mut kept = 0usize;
         for (project_id, id) in expired {
             if busy.contains(&id) {
-                // Busy, not idle: a command in flight or an open terminal. Its
-                // cell stays up and the deadline restarts from now, so the
-                // countdown the UI shows never runs out under live work.
                 self.mark_running(&project_id, &id, None);
                 kept += 1;
             } else if SandboxProvider::stop_sandbox(self, &project_id, &id)
@@ -433,9 +394,8 @@ impl PlatformSandboxProvider {
             .ok_or_else(|| SandboxError::NotFound(id.to_string()))
     }
 
-    /// The typed refusal every cell-touching path on a backend-less node
-    /// returns. Names the real cause (which backend this node lacks), never
-    /// a "simulated" state.
+    /// The typed refusal every cell-touching path on a backend-less node returns; its message names
+    /// which backend this node lacks.
     fn engine_unavailable(&self) -> SandboxError {
         SandboxError::EngineUnavailable(format!(
             "node {} has no exec-capable isolation backend for sandboxes (Firecracker needs Linux + /dev/kvm; Litebox needs a verified runner + HIVE_LITEBOX_VERIFIED=1); backend here: {}",
@@ -444,9 +404,9 @@ impl PlatformSandboxProvider {
         ))
     }
 
-    /// Provision a cell for `sandbox` WITHOUT publishing it: the returned guard
-    /// owns the cell until `commit` (which inserts it into `cells`) — dropping
-    /// the guard on any error/cancel path terminates the cell.
+    /// Provisions a cell for `sandbox` WITHOUT publishing it: the returned guard owns the cell
+    /// until `commit` inserts it into `cells`, and dropping the guard on any error or cancel path
+    /// terminates the cell.
     async fn provision_cell(
         &self,
         sandbox: &SandboxRecord,
@@ -488,13 +448,14 @@ impl PlatformSandboxProvider {
 
     /// Provision (or re-provision, if the cell was lost to a restart) the
     /// sandbox's cell and return its handle. Idempotent per sandbox id.
+    /// A record whose `owner_node` is another node is only a metadata copy here: provisioning a
+    /// SECOND cell would fork the sandbox across two nodes, so that case answers
+    /// `OwnerUnreachable`.
     async fn ensure_cell(&self, sandbox: &SandboxRecord) -> Result<CellHandle, SandboxError> {
         if let Some(h) = self.cells.read().get(&sandbox.id).cloned() {
             return Ok(h);
         }
         if !sandbox.owner_node.is_empty() && sandbox.owner_node != self.node_name {
-            // A metadata copy adopted from the real owner: provisioning a
-            // SECOND cell here would fork the sandbox across two nodes.
             return Err(SandboxError::OwnerUnreachable(format!(
                 "sandbox {} is owned by node {}; this node ({}) only holds its metadata",
                 sandbox.id, sandbox.owner_node, self.node_name
@@ -504,11 +465,14 @@ impl PlatformSandboxProvider {
         Ok(guard.commit())
     }
 
-    /// Owner-side create with a CALLER-MINTED id (the leader mints before any
-    /// transport). Idempotent on that id: a retry after a timed-out delegation
-    /// returns the record the first attempt already committed instead of
-    /// provisioning twice. Fails closed — an `ensure_cell`/provision failure
-    /// returns the typed `EngineUnavailable` and persists NOTHING.
+    /// Owner-side create with a CALLER-MINTED id (the leader mints before any transport).
+    /// Idempotent on that id: a retry after a timed-out delegation returns the record the first
+    /// attempt already committed instead of provisioning twice. Fails closed: a provisioning
+    /// failure returns the typed `EngineUnavailable` and persists NOTHING, and the armed
+    /// `ProvisionedCellGuard` releases the cell if anything before the commit errors or is
+    /// cancelled. The id/name uniqueness check is repeated under the write lock after provisioning:
+    /// a concurrent create that committed meanwhile wins, and the guard tears this duplicate cell
+    /// down.
     pub async fn create_sandbox_with_id(
         &self,
         tenant_id: &str,
@@ -605,14 +569,8 @@ impl PlatformSandboxProvider {
         };
         rec.timeout_expires_at = Some(now + rec.timeout_ms);
 
-        // Fail closed: a provisioning error propagates typed, no record is
-        // written, and the guard releases the cell if anything between here
-        // and the commit below errors or is cancelled.
         let guard = self.provision_cell(&rec).await?;
         {
-            // Re-check under the write lock: a concurrent create for the same
-            // id/name may have committed while we were provisioning. The guard
-            // (still armed) tears our duplicate cell down on the early return.
             let mut w = self.sandboxes.write();
             if let Some(existing) = w.iter().find(|s| s.id == rec.id && s.deleted_at.is_none()) {
                 return Ok(existing.clone());
@@ -636,16 +594,13 @@ impl PlatformSandboxProvider {
         Ok(rec)
     }
 
-    /// Publish that this sandbox HAS a live cell right now: status `Running`
-    /// plus a fresh idle deadline. This is the ONE place a record becomes
-    /// `Running` after create, so every path that (re)provisions a cell —
-    /// `start`, and any exec/shell that resurrected a cell via `ensure_cell`
-    /// — reports the same state instead of leaving a stopped record over a
-    /// live cell (which is what made a stopped sandbox look unstartable).
+    /// Publishes that this sandbox HAS a live cell right now: status `Running` plus a fresh idle
+    /// deadline. The ONE place a record becomes `Running` after create, so every path that
+    /// (re)provisions a cell (`start`, or an exec/shell that resurrected one through `ensure_cell`)
+    /// reports the same state instead of leaving a stopped record over a live cell.
     ///
-    /// Idempotent and non-destructive to accounting: an already-`Running`
-    /// record keeps its `last_started_at`, so `stop`'s
-    /// `last_stopped_at - last_started_at` accumulation never double-counts.
+    /// Idempotent for accounting: an already-`Running` record keeps its `last_started_at`, so
+    /// `stop`'s `last_stopped_at - last_started_at` accumulation never double-counts.
     fn mark_running(&self, project_id: &str, id: &str, endpoint: Option<String>) {
         let mut w = self.sandboxes.write();
         let Some(rec) = w
@@ -668,11 +623,10 @@ impl PlatformSandboxProvider {
         }
     }
 
-    /// Tear the sandbox's cell down and forget it. A teardown FAILURE is never
-    /// silent: the handle is dropped either way (the caller's state change is
-    /// what the user asked for) but a WARN names the orphan, because nothing
-    /// reaps it — `reap_orphaned_runners` runs only at backend construction,
-    /// so a leaked runner keeps its TUN device and cell root dir.
+    /// Tears the sandbox's cell down and forgets it. The handle is dropped even when teardown fails
+    /// (the caller's state change is what was asked for), but the failure is logged at WARN naming
+    /// the orphan: `reap_orphaned_runners` runs only at litebox backend construction, so a leaked
+    /// runner keeps its TUN device and cell root dir until the next boot.
     async fn terminate_cell(&self, sandbox_id: &str) {
         let handle = self.cells.write().remove(sandbox_id);
         if let (Some(handle), Some(backend)) = (handle, self.backend.as_ref()) {
@@ -730,6 +684,10 @@ impl SandboxProvider for PlatformSandboxProvider {
             .ok_or_else(|| SandboxError::NotFound(id_or_name.to_string()))
     }
 
+    /// Returns the project's sandbox named `input.name`, creating it when absent. A `Failed` row
+    /// can only be a record persisted before create failed closed (this provider no longer writes
+    /// one); returning it would present a sandbox that never had a cell as existing, so it surfaces
+    /// as the typed failure instead.
     async fn get_or_create_sandbox(
         &self,
         tenant_id: &str,
@@ -737,10 +695,6 @@ impl SandboxProvider for PlatformSandboxProvider {
         input: CreateSandboxInput,
     ) -> Result<SandboxRecord, SandboxError> {
         if let Ok(existing) = self.get_sandbox(project_id, &input.name).await {
-            // A `Failed` row can only be a pre-fail-closed persisted record
-            // (this provider no longer writes one). Returning it would present
-            // a sandbox that never had a cell as "existing" — surface it as
-            // the typed failure it is instead of masking it.
             if existing.status == SandboxStatus::Failed {
                 return Err(SandboxError::EngineUnavailable(format!(
                     "sandbox '{}' ({}) has no cell — it was recorded as failed ({}); delete it and create again",
@@ -758,6 +712,10 @@ impl SandboxProvider for PlatformSandboxProvider {
         self.create_sandbox(tenant_id, project_id, input).await
     }
 
+    /// Starts a sandbox on this node. A cell lost to `stop`, `delete` or a restart is gone for
+    /// good, so a start is always a fresh provision through `ensure_cell` (the one
+    /// provision/resurrect primitive: it returns the live handle when this node still holds the
+    /// cell), never a resume of dead state.
     async fn start_sandbox(
         &self,
         project_id: &str,
@@ -767,27 +725,21 @@ impl SandboxProvider for PlatformSandboxProvider {
         if !self.local_exec_capable() {
             return Err(self.engine_unavailable());
         }
-        // `ensure_cell` is the ONE provision/resurrect primitive: it returns the
-        // live handle if this node still holds the cell, else provisions fresh.
-        // A cell lost to `stop`, `delete` or a restart is gone for good, so a
-        // start is always a fresh provision — never a resume of dead state.
         let handle = self.ensure_cell(&sandbox).await?;
         self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
         tracing::info!(sandbox = %sandbox.id, node = %self.node_name, backend = self.backend_name().unwrap_or("none"), "sandbox cell started");
         self.get_sandbox(project_id, &sandbox.id).await
     }
 
+    /// Stops a sandbox: a persistent one with a live cell first takes a record-level snapshot
+    /// (`create_snapshot`), then the cell is terminated and the run is added to
+    /// `total_duration_ms`.
     async fn stop_sandbox(
         &self,
         project_id: &str,
         id: &str,
     ) -> Result<SandboxRecord, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
-        // Persistent sandboxes snapshot BEFORE teardown — Firecracker's own
-        // `/snapshot/create` API would be the natural fit here; this slice
-        // uses the same record-level persistence contract as the podman-era
-        // design (see `create_snapshot`) rather than a live memory/disk
-        // snapshot, which is real future work (documented in the writeup).
         if sandbox.persistent && self.cells.read().contains_key(id) {
             let _ = SandboxProvider::create_snapshot(
                 self,
@@ -821,6 +773,12 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(())
     }
 
+    /// Runs a command in the sandbox's cell, provisioning the cell first when it was lost. Every
+    /// exec refreshes the idle deadline through `mark_running` (idempotent), so the timeout is
+    /// measured from the last use of the sandbox, never from its creation; applied only while
+    /// `status != Running` it would let a busy sandbox be reaped at its original deadline
+    /// mid-command. The drain and its deadline run in a supervisor task (`supervise_exec`) for both
+    /// modes, and a blocking call only awaits it.
     async fn run_command(
         &self,
         project_id: &str,
@@ -834,12 +792,6 @@ impl SandboxProvider for PlatformSandboxProvider {
             .as_ref()
             .ok_or_else(|| self.engine_unavailable())?;
         let handle = self.ensure_cell(&sandbox).await?;
-        // Idempotent, so it runs on EVERY exec and not only on a resurrect:
-        // an already-Running sandbox gets a fresh idle deadline, which is what
-        // "keep running" means — the timeout is measured from the last time
-        // anyone used the sandbox, never from when it was created. Guarded to
-        // `status != Running` it would let a busy sandbox be reaped at its
-        // original deadline mid-command.
         self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
         let secrets = self.secret_values(&sandbox);
         let cmd_id = format!("cmd_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
@@ -894,16 +846,6 @@ impl SandboxProvider for PlatformSandboxProvider {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.killers.write().insert(cmd_id.clone(), notify.clone());
 
-        // The drain runs in a task of its own for BOTH modes. A blocking
-        // caller's request future is dropped by axum the instant the client
-        // gives up (curl's timeout, a closed tab, the leader's forward budget),
-        // and a drain awaited inline dies with it: the runner keeps running
-        // with nobody watching and the record stays `running` forever — the
-        // `ColdStartGuard` rule (release on Drop, never only on the Err
-        // branch) applied to a guest process. The deadline lives in the same
-        // task for the same reason: a hung guest (witnessed: a litebox fork
-        // child spinning at 100% CPU) must be killed whether or not anyone is
-        // still waiting for it.
         let deadline = if input.detached {
             detached_exec_ceiling(sandbox.timeout_ms)
         } else {
@@ -923,12 +865,16 @@ impl SandboxProvider for PlatformSandboxProvider {
         if input.detached {
             return Ok(base_rec);
         }
-        // Awaited by JoinHandle: if THIS future is dropped the task carries on
-        // and finalizes the record on its own.
         let _ = supervisor.await;
         self.get_command(project_id, id, &cmd_id).await
     }
 
+    /// Opens an interactive pty in the sandbox's cell. Like `run_command` it marks the record
+    /// running again and refreshes the idle deadline, so an open shell is never reaped from under
+    /// the user. The runtime's interpreter is requested through `ExecPtyRequest::programs`
+    /// (`shell_runtime_programs`): the litebox guest tar holds only sh and coreutils unless told
+    /// otherwise, so without it `node` is not found in a node sandbox's shell; Firecracker ignores
+    /// the list (its rootfs has the runtime).
     async fn open_shell(
         &self,
         project_id: &str,
@@ -948,9 +894,6 @@ impl SandboxProvider for PlatformSandboxProvider {
             .as_ref()
             .ok_or_else(|| self.engine_unavailable())?;
         let handle = self.ensure_cell(&sandbox).await?;
-        // Same rule as `run_command`: a STOPPED record whose cell `ensure_cell`
-        // just resurrected must say so, AND a live one must get a fresh idle
-        // deadline so an open shell is never reaped out from under the user.
         self.mark_running(project_id, &sandbox.id, handle.endpoint.clone());
         let session_id = format!("sh_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
 
@@ -960,11 +903,6 @@ impl SandboxProvider for PlatformSandboxProvider {
             .map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc)))
             .collect::<std::collections::BTreeMap<_, _>>();
 
-        // The sandbox's own runtime must be reachable from its shell: the
-        // litebox guest tar holds only sh + coreutils unless told otherwise,
-        // and `node -v` in a node22 sandbox was a not-found that litebox's
-        // fork emulation turns into "glibc detected an invalid stdio handle"
-        // (2026-09-02). Firecracker ignores this (its rootfs has the runtime).
         let programs = shell_runtime_programs(&sandbox.runtime);
         let req = hive_core::ExecPtyRequest {
             id: session_id,
@@ -1009,6 +947,10 @@ impl SandboxProvider for PlatformSandboxProvider {
             .ok_or_else(|| SandboxError::CommandNotFound(command_id.to_string()))
     }
 
+    /// Kills a command: the project-scoped sandbox lookup is the authorization, the guest is told
+    /// through `kill_exec` and the drain's `Notify` fires. After a 300 ms grace for the drain to
+    /// observe `ExecDone`, a record still `Running` is marked `Killed` here, so the caller never
+    /// reads a stale `Running` status.
     async fn kill_command(
         &self,
         project_id: &str,
@@ -1016,7 +958,7 @@ impl SandboxProvider for PlatformSandboxProvider {
         command_id: &str,
     ) -> Result<SandboxCommandRecord, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
-        let _ = sandbox; // (kept for the tenant/project-scoped lookup above)
+        let _ = sandbox;
         let handle = self.cells.read().get(id).cloned();
         if let Some(handle) = handle {
             if let Some(backend) = self.backend.as_ref() {
@@ -1026,9 +968,6 @@ impl SandboxProvider for PlatformSandboxProvider {
         if let Some(notify) = self.killers.read().get(command_id) {
             notify.notify_waiters();
         }
-        // Give the drain loop a brief moment to observe ExecDone before we read
-        // back the record; if the guest doesn't report in time, mark it Killed
-        // here so the caller never sees a stale "Running" status forever.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let mut w = self.commands.write();
         let rec = w
@@ -1055,8 +994,6 @@ impl SandboxProvider for PlatformSandboxProvider {
                     "path '{path}' must be absolute with no '..' segments"
                 )));
             }
-            // Base64 through argv (no shell) avoids ever putting file content on
-            // a shell-interpreted command line — `sh -c` is never invoked here.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let dir = std::path::Path::new(&path)
@@ -1139,6 +1076,10 @@ impl SandboxProvider for PlatformSandboxProvider {
             })
     }
 
+    /// Records a lightweight snapshot marker (the runtime's base image, `provider_snapshot_id`) for
+    /// a sandbox with a live cell and makes it the sandbox's `current_snapshot_id`; snapshots
+    /// beyond `keep_last` are deleted. No live memory or disk state is captured: Firecracker's
+    /// `/snapshot/create` (pause + dump) is not wired up.
     async fn create_snapshot(
         &self,
         project_id: &str,
@@ -1151,11 +1092,6 @@ impl SandboxProvider for PlatformSandboxProvider {
                 "sandbox has no live microVM to snapshot".into(),
             ));
         }
-        // NOTE (honest scope limit — see writeup): Firecracker natively
-        // supports `/snapshot/create` (pause + dump memory/disk), which is NOT
-        // wired up in this slice. This records a lightweight, real marker
-        // (which base image the sandbox is currently pinned to) so
-        // stop→resume reuses that image, WITHOUT live memory-state capture.
         let snap_id = format!("snap_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
         let now = hive_core::now_ms();
         let rec = SandboxSnapshotRecord {
@@ -1225,6 +1161,10 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(())
     }
 
+    /// The intended preview URL for an exposed port, `http://<HIVE_PUBLIC_IP or 127.0.0.1>:<port>`.
+    /// It is not routable yet: a public preview needs a host-side port-forward or edge route, and a
+    /// cell's networking is per-cell (`setup_cell_net`: a TAP on Firecracker, a TUN on Litebox), so
+    /// this only fixes the URL contract for the UI and API.
     async fn domain(&self, project_id: &str, id: &str, port: u16) -> Result<String, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
         if !sandbox.ports.contains(&port) {
@@ -1232,12 +1172,6 @@ impl SandboxProvider for PlatformSandboxProvider {
                 "port {port} was not exposed at sandbox creation — add it to `ports` first"
             )));
         }
-        // NOTE (honest scope limit — see writeup): the microVM's egress/ingress
-        // networking is per-cell (Firecracker TAP + NAT, see
-        // `FirecrackerBackend::setup_cell_net`); a public preview URL requires
-        // a host-side port-forward or edge route, which is not wired up in
-        // this slice. This documents the intended URL shape so the UI/API
-        // contract is stable once that plumbing lands.
         let host = std::env::var("HIVE_PUBLIC_IP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -1245,6 +1179,9 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(format!("http://{host}:{port}"))
     }
 
+    /// Stores the new policy on the record. A running cell's network namespace is fixed at boot
+    /// (Firecracker has no live network-policy toggle), so the change takes effect on the sandbox's
+    /// NEXT provision, not instantaneously.
     async fn update_network_policy(
         &self,
         project_id: &str,
@@ -1256,13 +1193,14 @@ impl SandboxProvider for PlatformSandboxProvider {
         let rec = Self::find_mut(&mut w, project_id, id)?;
         rec.network_policy = policy;
         rec.updated_at = hive_core::now_ms();
-        // A running cell's network namespace is fixed at boot (Firecracker has
-        // no live network-policy toggle); a policy change here takes effect on
-        // the sandbox's NEXT provision, not instantaneously — documented, not
-        // silently pretended.
         Ok(rec.clone())
     }
 
+    /// Validates and records a storage mount (credentials sealed with `secrets::encrypt`).
+    /// Attaching it to the microVM is not wired: persistent drives and remote-FUSE mounts need a
+    /// second attached drive or an in-guest FUSE driver, which the boot path lacks (its data-disk
+    /// mechanism serves delivered builds only), so the record reports status `pending` instead of a
+    /// fake `mounted`.
     async fn mount_storage(
         &self,
         project_id: &str,
@@ -1300,13 +1238,6 @@ impl SandboxProvider for PlatformSandboxProvider {
             config_refs.insert(format!("extra_{k}"), v.clone());
         }
 
-        // NOTE (honest scope limit — see writeup): persistent drives and
-        // remote-FUSE mounts need a second attached drive / in-guest FUSE
-        // driver, neither wired into the microVM boot path in this slice
-        // (the data-disk mechanism exists for delivered builds, not
-        // sandbox-requested mounts). Configuration is captured and validated
-        // in full (including sealed credentials); attachment reports "pending"
-        // honestly rather than a fake "mounted".
         let (status, note) = ("pending", "mount is configured; attaching it to the sandbox's microVM is not yet wired up on this node".to_string());
         let _ = &sandbox;
 
@@ -1354,19 +1285,18 @@ impl SandboxProvider for PlatformSandboxProvider {
     }
 }
 
-/// Wall clock a BLOCKING `run_command` may hold the guest: the leader→owner
-/// forward's own budget (`HIVE_SANDBOX_RUN_MS`, 110 s in `sandboxes_api`)
-/// minus headroom, so the owner has killed the guest and finalized the record
-/// BEFORE the forward gives up on it — one knob, two consistent bounds.
+/// Wall clock a BLOCKING `run_command` may hold the guest: the leader→owner forward's own budget
+/// (`HIVE_SANDBOX_RUN_MS`, default 110 s, read by `sandboxes_api`) minus 10 s of headroom, so the
+/// owner has killed the guest and finalized the record BEFORE the forward gives up on it: one knob,
+/// two consistent bounds.
 fn blocking_run_deadline() -> std::time::Duration {
     let forward_ms = env_u64("HIVE_SANDBOX_RUN_MS", 110_000);
     std::time::Duration::from_millis(forward_ms.saturating_sub(10_000).max(1_000))
 }
 
-/// Ceiling for a DETACHED exec: the sandbox's own remaining life is the
-/// natural bound (its timeout reaper tears the cell down regardless), capped
-/// by `HIVE_SANDBOX_EXEC_MAX_MS` (default one hour) so a guest that ignores
-/// its stdio can never outlive that — a spinning fork child, a runaway loop.
+/// Ceiling for a DETACHED exec: the sandbox's own timeout (its reaper tears the cell down
+/// regardless) capped by `HIVE_SANDBOX_EXEC_MAX_MS` (default one hour), so a guest that ignores its
+/// stdio, such as a spinning fork child or a runaway loop, can never outlive that.
 fn detached_exec_ceiling(sandbox_timeout_ms: u64) -> std::time::Duration {
     let cap = env_u64("HIVE_SANDBOX_EXEC_MAX_MS", 3_600_000).max(1_000);
     let ms = if sandbox_timeout_ms > 0 {
@@ -1384,19 +1314,23 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Grace between the deadline kill and closing the record by hand: the
-/// backend's waiter reports the signal death as `ExecDone { None }` within
-/// milliseconds, so this only ever runs out when the runner is unkillable.
+/// Grace between the deadline kill and closing the record by hand: the backend's waiter reports the
+/// signal death as `ExecDone { None }` within milliseconds, so this only runs out when the runner
+/// is unkillable.
 const EXEC_KILL_GRACE_MS: u64 = 3_000;
 
-/// Drain one exec to completion under a hard deadline, then finalize its
-/// record — in a task of its own (see `run_command`). On expiry the guest's
-/// whole process group is killed through the backend (`kill_exec` = `killpg`
-/// on litebox, the agent's `KillExec` on firecracker), the drain gets
-/// `EXEC_KILL_GRACE_MS` to observe the resulting `ExecDone`, and a record
-/// still `running` after that is closed as `killed` with the reason appended
-/// to its stderr — a hung guest never leaves a command "running" forever, and
-/// the tenant reads WHY in the same logs they were already polling.
+/// Drains one exec to completion under a hard deadline, then finalizes its record, in a task of its
+/// own for BOTH blocking and detached modes: a blocking caller's request future is dropped by axum
+/// the moment the client gives up (a timeout, a closed tab, the leader's forward budget), and a
+/// drain awaited inline would die with it, leaving the runner running unwatched and the record
+/// `running` forever. The deadline lives in the same task for the same reason, so a hung guest is
+/// killed whether or not anyone is still waiting for it.
+///
+/// On expiry the guest's whole process group is killed through the backend (`kill_exec` = `killpg`
+/// on litebox, the agent's `KillExec` on firecracker), the drain gets `EXEC_KILL_GRACE_MS` to
+/// observe the resulting `ExecDone`, and a record still `running` after that is closed as `killed`
+/// with the reason appended to its stderr, so the tenant reads WHY in the logs they were already
+/// polling.
 #[allow(clippy::too_many_arguments)]
 async fn supervise_exec(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
@@ -1452,10 +1386,10 @@ async fn supervise_exec(
     killers.write().remove(&cmd_id);
 }
 
-/// Drain one exec's event channel into its `SandboxCommandRecord`, redacting
-/// secrets and bounding output as it goes, until `ExecDone` or the kill
-/// `Notify` fires (killer already told the guest via `kill_exec`; this just
-/// stops us waiting on a connection whose far end may already be gone).
+/// Drains one exec's event channel into its `SandboxCommandRecord`, redacting secrets and bounding
+/// output (`MAX_OUTPUT_BYTES` in total, `MAX_LINE_BYTES` per line) until `ExecDone` or the kill
+/// `Notify` fires (the killer already told the guest through `kill_exec`; this only stops waiting
+/// on a connection whose far end may be gone).
 async fn drain_exec_events(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
     commands: &Arc<PLRwLock<Vec<SandboxCommandRecord>>>,
@@ -1496,7 +1430,6 @@ async fn drain_exec_events(
                 let mut w = commands.write();
                 if let Some(rec) = w.iter_mut().find(|c| c.id == cmd_id) {
                     rec.exit_code = exit_code;
-                    // Never report success on a non-zero/absent exit.
                     rec.status = match exit_code {
                         Some(0) => CommandStatus::Exited,
                         Some(_) => CommandStatus::Failed,

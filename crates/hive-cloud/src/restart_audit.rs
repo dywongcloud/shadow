@@ -1,61 +1,49 @@
-//! Restart audit — makes an OOM-kill restart SELF-EVIDENT instead of silent.
+//! Restart audit: makes an OOM-kill restart SELF-EVIDENT instead of silent.
 //!
-//! The gap this closes, stated as what actually happened. Nodes on this fleet
-//! are killed by the cgroup OOM killer and systemd restarts them a second
-//! later. `Restart=always` does its job perfectly, and that is the problem:
-//! the process comes back, healthz answers, the mesh reconverges, and NOTHING
-//! at the platform level records that the node died. No log line (the old
-//! process was SIGKILLed — it cannot log its own death, and the new one starts
-//! with a clean slate), no metric, no gossip field, no incident. The only
-//! evidence is a kernel line in `dmesg` on that specific host.
+//! The gap it closes: a node killed by the cgroup OOM killer comes back a second later under
+//! `Restart=always`, healthz answers and the mesh reconverges, and nothing at the platform level
+//! records that it died. The SIGKILLed process cannot log its own death, the new one starts with a
+//! clean slate, and the only evidence is a kernel line in `dmesg` on that host, so every downstream
+//! symptom (probe failures, dropped trunks, a placement gap, a DNS withdrawal) reads as its own
+//! mystery.
 //!
-//! Consequence, measured: a node cycling every 2–3 hours presented to
-//! operators as "random unhealthy nodes" for a whole session. Every downstream
-//! symptom — probe failures, dropped trunks, a placement gap, a DNS withdrawal
-//! — was investigated as its own mystery, because the one fact that explains
-//! all of them (the process is being killed) was only visible to whoever
-//! thought to SSH in and read `dmesg` on the right host at the right time.
-//!
-//! `memwatch` is the other half of this and is deliberately not this: it
-//! watches RSS climb and tries to capture a profile BEFORE the kill. This
-//! module runs AFTER, on the next boot, and answers "did we just die, and
-//! why?" — which is the question that was unanswerable, and which stays
-//! answerable even for a burst too fast for any sampler to catch.
+//! `memwatch` is the other half and is deliberately not this: it watches RSS climb and tries to
+//! capture a profile BEFORE the kill. This module runs AFTER, on the next boot, and answers 'did we
+//! just die, and why?', which stays answerable even for a burst too fast for any sampler to catch.
 //!
 //! ## How the verdict is reached
 //!
-//! A marker file (`$HIVE_DATA/run_marker.json`) is written at boot and
-//! refreshed by a heartbeat, carrying this process's pid, start time, the
-//! host's boot id, its last observed RSS and memory ceiling, and the cgroup's
-//! OOM counter. The SIGTERM path stamps `clean_exit: true`. So at boot the
+//! A marker file (`$HIVE_DATA/run_marker.json`) is written at boot and refreshed by a heartbeat,
+//! carrying this process's pid, start time, the host's boot id, its last observed RSS and memory
+//! ceiling, and the cgroup's OOM counter. The SIGTERM path stamps `clean_exit: true`. At boot the
 //! previous process's marker is a witness statement, and the verdict is:
 //!
+//! * no marker → **first_boot**.
 //! * `clean_exit` set → **clean_restart** (a deploy, a `systemctl restart`).
-//! * kernel log names the previous PID in an OOM kill → **oom_kill**. Direct
-//!   evidence, and the pid match is required — an older kill's line still in
-//!   the ring buffer must never be re-reported as this restart's cause.
-//! * this cgroup's `memory.events` already shows `oom_kill > 0` → **oom_kill**.
-//! * host boot id changed → **host_reboot** (the host went down, not us).
-//! * last heartbeat RSS was within `HIVE_OOM_SUSPECT_PCT` of the memory
-//!   ceiling → **oom_suspected**. Named as a suspicion, never as proof: on a
-//!   host whose kernel buffer has rolled or is unreadable this is all the
-//!   evidence there is, and calling it `oom_kill` would be a lie the operator
-//!   cannot audit.
-//! * otherwise → **unclean_exit** (panic, SIGKILL from something else, power
-//!   loss with no boot-id change... also worth knowing, also invisible today).
+//! * the kernel log names the previous PID in an OOM kill → **oom_kill**: direct evidence, and the
+//!   pid match is required, because an older kill's line still in the ring buffer must never be
+//!   re-reported as this restart's cause.
+//! * this cgroup's `memory.events` `oom_kill` advanced past the previous heartbeat's reading →
+//!   **oom_kill**.
+//! * the host boot id changed → **host_reboot** (the host went down, not us).
+//! * the last heartbeat's RSS was within `HIVE_OOM_SUSPECT_PCT` (default 90) of the memory ceiling
+//!   → **oom_suspected**: named as a suspicion, never as proof, because on a host whose kernel
+//!   buffer has rolled or is unreadable this is all the evidence there is, and calling it
+//!   `oom_kill` would be a lie the operator cannot audit.
+//! * otherwise → **unclean_exit** (a panic, a SIGKILL from something else, power loss with no
+//!   boot-id change): also worth knowing, and otherwise invisible.
 //!
-//! Every verdict is appended to a bounded history file, so "this node cycles
-//! every 2–3 hours" is a readable list of timestamps and uptimes rather than
-//! an inference someone has to make. The counters ride gossip
-//! (`NodeInfo::oom_restarts_24h` / `last_oom_ms` / `started_ms`), so the fleet
-//! view shows it without logging into anything.
+//! Every verdict is appended to a bounded history file (`HISTORY_MAX` records), so 'this node
+//! cycles every 2-3 hours' is a readable list of timestamps and uptimes rather than an inference.
+//! The counters ride gossip (`NodeInfo::oom_restarts_24h` / `last_oom_ms` / `started_ms`), so the
+//! fleet view shows it without logging into anything.
 //!
-//! Nothing here can fail a boot: every read is best-effort, an unreadable or
-//! corrupt marker is treated as absent (with a WARN), and no verdict is ever
-//! fabricated from a missing source. An unreadable history is set aside and
-//! treated as absent too — but its restarts are UNKNOWN, not zero, so the
-//! per-reason restart caps counted from it fail closed
-//! ([`controlled_restarts_within`]).
+//! Nothing here can fail a boot: every host reading is best-effort (`None` means UNKNOWN and is
+//! never coerced to a number, because a fabricated reading produces a fabricated verdict), an
+//! unreadable or corrupt marker is treated as absent (with a WARN), and no verdict is ever
+//! fabricated from a missing source. An unreadable history is set aside and treated as absent too,
+//! but its restarts are UNKNOWN, not zero, so the per-reason restart caps counted from it fail
+//! closed ([`controlled_restarts_within`]).
 
 use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
@@ -63,11 +51,10 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Set by `mark_clean_exit`; read by the heartbeat before every marker write.
-/// The graceful tail runs tens of seconds past the clean-exit stamp, so a
-/// 20 s heartbeat tick lands after it and — without this latch — rewrites the
-/// marker with `clean_exit=false`, reporting every self-exiting restart as
-/// UNCLEAN on the next boot (measured on every graceful stop of 75).
+/// Set by `mark_clean_exit`; read by the heartbeat before every marker write. The graceful tail
+/// runs tens of seconds past the clean-exit stamp, so a 20 s heartbeat tick lands after it and,
+/// without this latch, rewrites the marker with `clean_exit=false`, reporting every self-exiting
+/// restart as UNCLEAN on the next boot.
 static CLEAN_EXIT_MARKED: AtomicBool = AtomicBool::new(false);
 
 /// Bounded — this is a diagnostic tail, not a log.
@@ -90,9 +77,9 @@ fn history_path() -> std::path::PathBuf {
     crate::persist::data_dir().join("restart_history.json")
 }
 
-/// The previous process's witness statement. Every field `serde(default)` so a
-/// marker written by an older build still deserializes — a missing field must
-/// degrade the verdict's confidence, never discard the whole record.
+/// The previous process's witness statement. Every field is `serde(default)` so a marker written by
+/// an older build still deserializes: a missing field must degrade the verdict's confidence, never
+/// discard the whole record.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Marker {
     #[serde(default)]
@@ -120,11 +107,10 @@ struct Marker {
     clean_exit: bool,
     #[serde(default)]
     version: String,
-    /// The controlled-restart reason this process requested (`exit(17)`
-    /// paths: memory pressure, mesh watchdog triggers), empty when none.
-    /// Written the moment the restart is REQUESTED, not at exit, so a
-    /// shutdown that dies on its hard deadline still leaves the reason
-    /// behind for the next boot's record.
+    /// The controlled-restart reason this process requested (`exit(17)` paths: memory pressure,
+    /// mesh watchdog triggers), empty when none. Written the moment the restart is REQUESTED, not
+    /// at exit, so a shutdown that dies on its hard deadline still leaves the reason behind for the
+    /// next boot's record.
     #[serde(default)]
     restart_reason: String,
 }
@@ -136,9 +122,8 @@ pub struct RestartRecord {
     /// `first_boot` | `clean_restart` | `oom_kill` | `oom_suspected` |
     /// `host_reboot` | `unclean_exit`
     pub verdict: String,
-    /// Human-readable statement of WHAT was observed, never a restatement of
-    /// the verdict — an operator must be able to disagree with the conclusion
-    /// by reading the evidence.
+    /// Human-readable statement of WHAT was observed, never a restatement of the verdict: an
+    /// operator must be able to disagree with the conclusion by reading the evidence.
     pub evidence: String,
     #[serde(default)]
     pub prev_pid: u32,
@@ -155,10 +140,9 @@ pub struct RestartRecord {
     /// Previous RSS as a percentage of the memory ceiling, when both are known.
     #[serde(default)]
     pub prev_rss_pct: Option<u64>,
-    /// The controlled-restart reason the previous process requested, if it
-    /// asked for its own restart (`memory_pressure`, `mesh_isolation`,
-    /// `mesh_degradation`, `establishment_wedge`). What restart rate caps
-    /// count ([`controlled_restarts_within`]), so a cap survives the very
+    /// The controlled-restart reason the previous process requested, if it asked for its own
+    /// restart (`memory_pressure`, `mesh_isolation`, `mesh_degradation`, `establishment_wedge`).
+    /// What restart rate caps count ([`controlled_restarts_within`]), so a cap survives the very
     /// restarts it limits.
     #[serde(default)]
     pub reason: Option<String>,
@@ -197,11 +181,6 @@ fn history() -> &'static parking_lot::RwLock<Vec<RestartRecord>> {
     H.get_or_init(|| parking_lot::RwLock::new(Vec::new()))
 }
 
-// ---------------------------------------------------------------------------
-// Host readings. All best-effort; `None` means UNKNOWN and is never coerced to
-// a number, because a fabricated reading here produces a fabricated verdict.
-// ---------------------------------------------------------------------------
-
 fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -209,9 +188,8 @@ fn boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// This process's cgroup path as an absolute `/sys/fs/cgroup/...` dir (cgroup
-/// v2 only — v1's split hierarchy has no single `memory.events` and the fleet
-/// is v2).
+/// This process's cgroup path as an absolute `/sys/fs/cgroup/...` dir (cgroup v2 only: v1's split
+/// hierarchy has no single `memory.events`, and the fleet is v2).
 fn cgroup_dir() -> Option<std::path::PathBuf> {
     let raw = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = raw
@@ -224,11 +202,10 @@ fn cgroup_dir() -> Option<std::path::PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// `memory.events: oom_kill` — the kernel's own count of processes this cgroup
-/// has had killed. Note the counter lives with the CGROUP: systemd recreates a
-/// unit's cgroup on restart, so this normally reads 0 on a fresh boot and a
-/// NON-zero value is itself strong evidence (something in this cgroup was
-/// killed since it was created, and this process was just started into it).
+/// `memory.events: oom_kill`, the kernel's own count of processes this cgroup has had killed. The
+/// counter lives with the CGROUP: a recreated cgroup starts again at 0 and a surviving one keeps
+/// counting, which is why `classify` compares it with the previous heartbeat's reading instead of
+/// treating any non-zero value as new.
 fn cgroup_oom_kills() -> Option<u64> {
     let dir = cgroup_dir()?;
     let text = std::fs::read_to_string(dir.join("memory.events")).ok()?;
@@ -237,10 +214,10 @@ fn cgroup_oom_kills() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-/// The ceiling RSS is actually measured against: the cgroup's `memory.max`
-/// when it is a real number, else the host's MemTotal. `memory.max` reading
-/// `max` (no limit) is not a limit and must fall through — treating the string
-/// as 0 would make every node look permanently 100% of its ceiling.
+/// The ceiling RSS is actually measured against: the cgroup's `memory.max` when it is a real
+/// number, else the host's MemTotal. `memory.max` reading `max` (no limit) is not a limit and must
+/// fall through; treating the string as 0 would make every node look permanently 100% of its
+/// ceiling.
 fn mem_limit_bytes() -> Option<u64> {
     if let Some(dir) = cgroup_dir() {
         if let Ok(text) = std::fs::read_to_string(dir.join("memory.max")) {
@@ -261,26 +238,25 @@ fn mem_limit_bytes() -> Option<u64> {
     })
 }
 
-/// Scan the kernel ring buffer for an OOM kill naming `prev_pid`.
+/// Scans the kernel ring buffer for an OOM kill naming `prev_pid`, reading `/dev/kmsg` rather than
+/// shelling out to `dmesg`/`journalctl` (no subprocess, no PATH assumption, works on a node whose
+/// journal is volatile). It is opened NON-BLOCKING (`O_NONBLOCK`, written as its Linux literal
+/// `0o4000`) because a blocking read waits forever for the NEXT message once the buffer is drained,
+/// which would hang boot. `/dev/kmsg` exists only on Linux and may be unreadable (no permission, a
+/// container without it): that is UNKNOWN, and the caller falls back to the RSS suspicion instead
+/// of inventing a verdict. Each `read()` returns exactly one `prio,seq,ts,flag;message` record, at
+/// most 8192 are read, and `EPIPE` (32) means the buffer wrapped past our position, so it is a
+/// continue, not a stop.
 ///
-/// `/dev/kmsg` rather than shelling out to `dmesg`/`journalctl`: no subprocess,
-/// no PATH assumption, and it works on a node whose journal is volatile. Opened
-/// NON-BLOCKING because a blocking read on `/dev/kmsg` waits forever for the
-/// NEXT message once the buffer is drained — that would hang boot.
-///
-/// Returns `(direct_evidence, all_oom_lines_seen)`. The direct verdict requires
-/// the previous pid to appear in the line: the ring buffer routinely still
-/// holds OOM lines from EARLIER kills, and reporting one of those as this
-/// restart's cause would manufacture a fresh incident out of old history. The
-/// other lines are still returned, as context an operator can read.
+/// Returns `(direct_evidence, all_oom_lines_seen)`. The direct verdict requires the previous pid to
+/// appear in the line: the ring buffer routinely still holds OOM lines from EARLIER kills, and
+/// reporting one as this restart's cause would manufacture a fresh incident from old history. The
+/// other lines (at most 16) are context for an operator.
 #[cfg(unix)]
 fn kmsg_oom_evidence(prev_pid: u32) -> (Option<String>, Vec<String>) {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // O_NONBLOCK (0o4000 on Linux). A literal rather than a whole `libc`
-    // dependency for one constant; `/dev/kmsg` only exists on Linux, so on any
-    // other unix the open below simply fails and the caller falls back.
     const O_NONBLOCK: i32 = 0o4000;
     let mut f = match std::fs::OpenOptions::new()
         .read(true)
@@ -288,22 +264,16 @@ fn kmsg_oom_evidence(prev_pid: u32) -> (Option<String>, Vec<String>) {
         .open("/dev/kmsg")
     {
         Ok(f) => f,
-        // Unreadable (no permission, a container without it) — UNKNOWN, and
-        // the caller falls back to the RSS suspicion rather than inventing a
-        // verdict.
         Err(_) => return (None, Vec::new()),
     };
     let mut direct = None;
     let mut lines: Vec<String> = Vec::new();
-    // Each read() returns exactly one record. Bounded so a huge ring buffer
-    // cannot stretch boot.
     let mut buf = [0u8; 8192];
     for _ in 0..8192 {
         match f.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let rec = String::from_utf8_lossy(&buf[..n]);
-                // "prio,seq,ts,flag;message"
                 let msg = match rec.split_once(';') {
                     Some((_, m)) => m.trim(),
                     None => rec.trim(),
@@ -327,13 +297,10 @@ fn kmsg_oom_evidence(prev_pid: u32) -> (Option<String>, Vec<String>) {
                 }
             }
             Err(e) => {
-                // EPIPE (32) = the buffer wrapped past our read position; the
-                // kernel repositions us and the next read succeeds, so this is
-                // a continue, not a stop.
                 if e.raw_os_error() == Some(32) {
                     continue;
                 }
-                break; // EAGAIN (drained) or anything else
+                break;
             }
         }
     }
@@ -345,11 +312,8 @@ fn kmsg_oom_evidence(_prev_pid: u32) -> (Option<String>, Vec<String>) {
     (None, Vec::new())
 }
 
-// ---------------------------------------------------------------------------
-// Marker + history I/O. Atomic temp+rename everywhere (a torn marker read at
-// boot would be indistinguishable from a crash).
-// ---------------------------------------------------------------------------
-
+/// Writes through a temp file and `rename`, so the marker and the history are never torn: a torn
+/// marker read at boot would be indistinguishable from a crash.
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -408,9 +372,10 @@ fn save_marker(m: &Marker) {
     }
 }
 
-/// The persisted history. `Err` when a history file EXISTS but cannot be
-/// read or parsed: the restarts it recorded are unknown, which is not the
-/// same as none (an absent file is a genuine empty history).
+/// The persisted history. `Err` when a history file EXISTS but cannot be read or parsed: the
+/// restarts it recorded are unknown, which is not the same as none (an absent file is a genuine
+/// empty history). The cap is enforced on LOAD as well as on write, so no on-disk file can reload
+/// past `HISTORY_MAX`.
 fn load_history() -> Result<Vec<RestartRecord>, String> {
     let path = history_path();
     let text = match std::fs::read_to_string(&path) {
@@ -421,8 +386,6 @@ fn load_history() -> Result<Vec<RestartRecord>, String> {
     let mut v = serde_json::from_str::<Vec<RestartRecord>>(&text)
         .map_err(|e| format!("restart history unparseable: {e}"))?;
     if v.len() > HISTORY_MAX {
-        // Enforce the cap on LOAD as well as on write, so no on-disk
-        // file can reload past it (the `dns_geo` MAX_ENTRIES rule).
         let start = v.len() - HISTORY_MAX;
         v.drain(..start);
     }
@@ -433,10 +396,6 @@ fn save_history(records: &[RestartRecord]) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(records).map_err(std::io::Error::other)?;
     write_atomic(&history_path(), &bytes)
 }
-
-// ---------------------------------------------------------------------------
-// The audit itself.
-// ---------------------------------------------------------------------------
 
 /// Classify the previous process's exit from its marker plus live host
 /// evidence. Pure given its inputs; the I/O is all in [`audit_boot`].
@@ -529,11 +488,15 @@ fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> Resta
     rec
 }
 
-/// Read the previous run's marker, reach a verdict, log it LOUDLY, append it
-/// to the bounded history, and stamp a fresh marker for this process.
+/// Reads the previous run's marker, reaches a verdict, logs it LOUDLY, appends it to the bounded
+/// history and stamps a fresh marker for this process at once: a node that OOMs before the first
+/// heartbeat tick must still leave a witness behind. Call once, early in boot, before anything that
+/// can wedge; it is local file I/O and cannot fail the boot.
 ///
-/// Call once, early in boot, before anything that can wedge — it is pure local
-/// file I/O and cannot fail the boot.
+/// An unreadable history is set aside (`restart_history.corrupt-<ms>`) for forensics rather than
+/// overwritten, and this process's restart rate caps fail closed because the restarts the file held
+/// are unknown, not zero. A failed history write does the same: this boot's record is not on disk,
+/// so the next process cannot count it, and this one cannot trust what it counts.
 pub fn audit_boot(node: &str) -> Value {
     STARTED_MS.store(now_ms(), Ordering::Relaxed);
     let _ = NODE.set(node.to_string());
@@ -560,9 +523,6 @@ pub fn audit_boot(node: &str) -> Value {
     let mut hist = match load_history() {
         Ok(hist) => hist,
         Err(why) => {
-            // Set aside for forensics rather than overwritten, and this
-            // process's rate caps fail closed: the restarts the file held
-            // are unknown, not zero.
             let aside = history_path().with_extension(format!("corrupt-{}", now_ms()));
             let _ = std::fs::rename(history_path(), &aside);
             tracing::warn!(reason = %why, moved_to = %aside.display(),
@@ -578,8 +538,6 @@ pub fn audit_boot(node: &str) -> Value {
         hist.drain(..start);
     }
     if let Err(e) = save_history(&hist) {
-        // This boot's record is not on disk, so the next process cannot count
-        // it; nor can this one trust what it counts.
         tracing::warn!(error = %e, path = %history_path().display(),
             "restart audit: restart history write FAILED — restart rate caps fail closed for \
              this process");
@@ -595,8 +553,6 @@ pub fn audit_boot(node: &str) -> Value {
     *history().write() = hist;
     let _ = boot_record().set(rec.clone());
 
-    // Stamp this process's marker immediately: a node that OOMs before the
-    // first heartbeat tick must still leave a witness behind.
     save_marker(&current_marker(node, false));
 
     let summary = json!({
@@ -657,21 +613,15 @@ pub fn audit_boot(node: &str) -> Value {
     summary
 }
 
-/// A 24h window's [`WindowStats`].
+/// One 24h window's restart counts. `first_boot` is excluded from the restart count: a wiped data
+/// dir is not a restart, and counting it as one would make every fresh node look unstable.
 ///
-/// `first_boot` is excluded from the restart count — a wiped data dir is not a
-/// restart, and counting it as one would make every fresh node look unstable.
-/// One 24h window's restart counts.
-///
-/// `unclean` is the number this module existed to produce and did not: restarts
-/// whose verdict is neither a graceful exit nor a host reboot, i.e. the process
-/// DIED (SIGSEGV, panic, a SIGKILL it did not ask for). It is the only counter
-/// that sees an involuntary crash — [`crate::ControlledRestart`] is the
-/// chokepoint for restarts hive CHOOSES, and a process that segfaulted is
-/// already gone, so no rate cap, no reason tally and no admission check ever
-/// observes it. Measured on fc-sanjose 2026-10-10: 42 restarts in 24h, 34 of
-/// them `unclean_exit`, `oom_restarts_24h` = 0 — an OOM-only view of this node
-/// reported perfect health for the whole crash loop.
+/// `unclean` counts the `unclean_exit` verdicts: restarts where the process DIED without a graceful
+/// shutdown and without kernel OOM evidence (a SIGSEGV, a panic, a SIGKILL it did not ask for). It
+/// is the only counter that sees an involuntary crash: [`crate::ControlledRestart`] is the
+/// chokepoint for restarts hive CHOOSES, and a process that segfaulted is already gone, so no rate
+/// cap, reason tally or admission check ever observes it, and an OOM-only view (`oom_restarts_24h`)
+/// reads perfect health through a whole crash loop.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowStats {
     pub restarts: u32,
@@ -688,9 +638,9 @@ impl WindowStats {
     }
 }
 
-/// How many involuntary deaths in 24h make a node crash-cycling. Three, not
-/// one: a single unclean exit is a deploy SIGKILLed at the shutdown deadline or
-/// a one-off panic, and calling that a loop would make this signal worthless.
+/// How many involuntary deaths in 24h make a node crash-cycling. Three, not one: a single unclean
+/// exit is a deploy SIGKILLed at the shutdown deadline or a one-off panic, and calling that a loop
+/// would make this signal worthless.
 const CRASH_CYCLE_MIN: u32 = 3;
 
 fn window_stats(hist: &[RestartRecord]) -> WindowStats {
@@ -723,9 +673,8 @@ pub fn oom_restarts_24h() -> u32 {
     window_stats(&history().read()).oom
 }
 
-/// Involuntary deaths in the last 24h. Gossiped on `NodeInfo` next to
-/// `oom_restarts_24h` so `/v1/nodes` shows a crash loop rather than a node that
-/// merely looks freshly started.
+/// Involuntary deaths in the last 24h. Gossiped on `NodeInfo` next to `oom_restarts_24h` so
+/// `/v1/nodes` shows a crash loop rather than a node that merely looks freshly started.
 pub fn unclean_restarts_24h() -> u32 {
     window_stats(&history().read()).unclean
 }
@@ -743,12 +692,11 @@ pub fn started_ms() -> u64 {
     STARTED_MS.load(Ordering::Relaxed)
 }
 
-/// Record that this process REQUESTED a controlled restart for `reason`, and
-/// stamp it into the run marker at once: the next boot's history record then
-/// carries it whatever happens to the graceful tail (a clean exit, the hard
-/// deadline's forced exit, a SIGKILL). Called by the shared
-/// `ControlledRestart::request` — every automatic restart path records its
-/// reason in one place, so a rate cap can count them across restarts.
+/// Records that this process REQUESTED a controlled restart for `reason`, and stamps it into the
+/// run marker at once: the next boot's history record then carries it whatever happens to the
+/// graceful tail (a clean exit, the hard deadline's forced exit, a SIGKILL). Called by the shared
+/// `ControlledRestart::request`, so every automatic restart path records its reason in one place
+/// and a rate cap can count them across restarts.
 pub fn note_controlled_restart(reason: &str) {
     if REQUESTED_RESTART.set(reason.to_string()).is_err() {
         return;
@@ -760,19 +708,17 @@ pub fn note_controlled_restart(reason: &str) {
     save_marker(&current_marker(&node, false));
 }
 
-/// How many restarts this node took for controlled-restart `reason` within
-/// the last `window_ms`, from the persisted history (so it counts restarts
-/// of EARLIER processes — the one thing an in-memory counter cannot).
+/// How many restarts this node took for controlled-restart `reason` within the last `window_ms`,
+/// from the persisted history (so it counts restarts of EARLIER processes, the one thing an
+/// in-memory counter cannot).
 ///
-/// FAILS CLOSED: `Err(why)` when the count cannot be trusted — the history
-/// file existed but could not be read or parsed at boot, this boot's record
-/// could not be written (a full or read-only data dir: the next process
-/// would count zero), or the latest run-marker write failed (a restart
-/// requested now would leave no reason behind). A cap that fails open is a
-/// restart loop on exactly the node whose disk is already in trouble. What it
-/// cannot see: a rollback to a binary predating `RestartRecord::reason`
-/// rewrites the history without it, so after the roll-forward earlier
-/// restarts count as none — at most one extra capped restart, once.
+/// FAILS CLOSED: `Err(why)` when the count cannot be trusted: the history file existed but could
+/// not be read or parsed at boot, this boot's record could not be written (a full or read-only data
+/// dir: the next process would count zero), or the latest run-marker write failed (a restart
+/// requested now would leave no reason behind). A cap that fails open is a restart loop on exactly
+/// the node whose disk is already in trouble. What it cannot see: a rollback to a binary predating
+/// `RestartRecord::reason` rewrites the history without it, so after the roll-forward earlier
+/// restarts count as none, at most one extra capped restart, once.
 pub fn controlled_restarts_within(reason: &str, window_ms: u64) -> Result<usize, String> {
     if let Some(why) = lock(&HISTORY_FAULT).clone() {
         return Err(why);
@@ -788,58 +734,45 @@ pub fn controlled_restarts_within(reason: &str, window_ms: u64) -> Result<usize,
         .count())
 }
 
-/// Stamp the marker as a GRACEFUL shutdown. Called from the SIGTERM/SIGINT
-/// path next to `persist::flush_blocking` — without it every deploy restart
-/// would be classified `unclean_exit` and the signal would be worthless.
+/// Stamps the marker as a GRACEFUL shutdown. Called from the SIGTERM/SIGINT path next to
+/// `persist::flush_blocking`; without it every deploy restart would be classified `unclean_exit`
+/// and the signal would be worthless. The latch is set BEFORE the write, so a heartbeat tick racing
+/// this call observes the stamp as final and skips its own write.
 pub fn mark_clean_exit(node: &str) {
-    // Latched BEFORE the write so a heartbeat tick racing this call observes
-    // the stamp as final and skips its own write.
     CLEAN_EXIT_MARKED.store(true, Ordering::SeqCst);
     let mut m = current_marker(node, true);
     m.heartbeat_ms = now_ms();
     save_marker(&m);
 }
 
-/// Heartbeat + reminder loop.
+/// Heartbeat + reminder loop. The heartbeat carries the RSS and cgroup-OOM readings the NEXT boot
+/// classifies against (a SIGKILLed process cannot write them on the way out), so its interval
+/// trades freshness against load: too long and the recorded RSS predates the burst that killed us.
+/// Once the clean-exit stamp is set the loop returns, because a later heartbeat would overwrite it
+/// with `clean_exit=false`.
 ///
-/// The heartbeat is what makes the verdict possible at all: it carries the
-/// RSS and cgroup-OOM readings the NEXT boot classifies against, and a
-/// SIGKILLed process obviously cannot write them on the way out. Interval is a
-/// tradeoff — too long and the recorded RSS predates the burst that killed us.
-///
-/// The reminder exists because a single boot-time log line scrolls away. While
-/// this node is crash-cycling it re-states the fact periodically, so a node
-/// dying every few minutes is loud in a log tail taken at ANY moment, not just
-/// the one right after a kill.
-///
-/// What counts as cycling: ANY involuntary death, OOM or not. Gating this on
-/// `oom > 0` alone was the blind spot — it is silent for exactly the loop that
-/// repeats most reliably, because a SIGSEGV/panic loop produces
-/// `verdict = unclean_exit` and `oom_restarts_24h = 0` forever. Witnessed on
-/// fc-sanjose 2026-10-10: 8 SIGSEGVs in 3h, `restarts_24h` = 42,
-/// `oom_restarts_24h` = 0, and this reminder never fired once.
+/// The reminder exists because a single boot-time log line scrolls away: while this node is
+/// crash-cycling it re-states the fact periodically, so a node dying every few minutes is loud in a
+/// log tail taken at ANY moment. Cycling means ANY involuntary death, OOM or not (gating on `oom >
+/// 0` alone would stay silent for a SIGSEGV/panic loop, whose verdict is `unclean_exit` with
+/// `oom_restarts_24h = 0`). The incident is level-triggered like every automated incident
+/// (`incidents.rs`): re-asserted every pass with a TTL of three passes, so it lapses and the
+/// leader-only reconciler resolves it once the node stops dying.
 pub fn spawn(node: String, cloud: Arc<crate::CloudState>) {
     let interval = std::time::Duration::from_secs(env_u64("HIVE_RESTART_MARKER_SECS", 20));
     let remind_ms = env_u64("HIVE_RESTART_REMIND_SECS", 900) * 1000;
-    // Three passes of this loop, the incidents.rs convention: the observation
-    // lapses and the leader-only reconciler resolves the incident as soon as the
-    // node stops dying, so a crash loop never leaves a permanent row behind.
     let ttl_ms = interval.as_millis() as u64 * 3;
     tokio::spawn(async move {
         let mut last_remind = 0u64;
         loop {
             tokio::time::sleep(interval).await;
             if CLEAN_EXIT_MARKED.load(Ordering::SeqCst) {
-                // The clean-exit stamp is the marker's final word; a heartbeat
-                // after it would overwrite it with clean_exit=false.
                 return;
             }
             save_marker(&current_marker(&node, false));
             let w = window_stats(&history().read());
             let now = now_ms();
 
-            // Level-triggered: re-asserted every pass while the condition holds,
-            // never opened once and left to rot (incidents.rs).
             if w.crashy() >= CRASH_CYCLE_MIN {
                 cloud.incidents.open(crate::incidents::OpenReq {
                     condition: format!("crash-cycle:{node}"),
@@ -885,10 +818,8 @@ pub fn spawn(node: String, cloud: Arc<crate::CloudState>) {
     });
 }
 
-/// Operator view. NODE-LOCAL, like `/v1/dns/stats`: the marker, the history
-/// file and `/proc` all belong to the node serving the request. Through the
-/// dashboard's `/ops/*` proxy this reads the LEADER's restarts, not the
-/// page-serving node's — the gossiped `NodeInfo` counters are the fleet view.
+/// Operator view. NODE-LOCAL, like `/v1/dns/stats`: the marker, the history file and `/proc` all
+/// belong to the node serving the request, so the gossiped `NodeInfo` counters are the fleet view.
 pub fn snapshot(node: &str) -> Value {
     let hist = history().read().clone();
     let w = window_stats(&hist);
