@@ -5,41 +5,17 @@ import { usePathname, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { currentTeam, ensureSessionMinted, mintSessionToken } from "@/lib/api";
 
-// ---------------------------------------------------------------------------
-// Seamless embed of the LITERAL upstream @workflow/web console (served at
-// /wfc by app/wf-console/[[...slug]]/route.ts) inside the shadw dashboard's
-// own chrome. The iframe is the isolation boundary that keeps the console's
-// Tailwind v4 stylesheet from colliding with the dashboard's Tailwind v3 —
-// visually it is borderless, full-height, and URL-synced, so the console
-// reads as a native page under the platform navbar.
-//
-// Scope handoff: the iframe's `name` attribute carries "wfc|<team>|<project>"
-// into the embedded window (window.name survives SPA navigation inside the
-// frame). The patched console rpc client (scripts/patch-wf-console.mjs,
-// __hive_rpc_guard) reads it and appends hiveTeam/hiveProject to every
-// /wfc/api/rpc call; the wf-console route threads them into the World proxy.
-//
-// Session lifetime: this parent page runs clerk-js (Clerk session stays
-// fresh) and re-mints the httpOnly hive_jwt cookie on mount + every few
-// minutes + on tab re-focus, so the embedded console — which runs no
-// clerk-js of its own — never goes stale. The rpc guard's own
-// re-mint-and-retry is the second line of defense.
-// ---------------------------------------------------------------------------
+// Seamless same-origin iframe embed of the upstream @workflow/web console (served at /wfc): the
+// iframe isolates its Tailwind v4 from the dashboard's v3, its `name` carries
+// "wfc|<team>|<project>" to the patched rpc client, and this page keeps hive_jwt fresh for it.
 
 const REMINT_INTERVAL_MS = 4 * 60_000;
 const URL_SYNC_INTERVAL_MS = 300;
 
-// The embedded console runs its OWN next-themes instance on this storage key
-// (same origin — localStorage is shared). Writing the platform's RESOLVED
-// theme here before the iframe mounts makes the console's SSR theme
-// bootstrap paint correctly on first paint; writing it again on every
-// platform toggle fires a same-origin `storage` event that the console's
-// next-themes cross-tab listener applies live.
 const WF_THEME_KEY = "workflow-theme";
 
-/** Push the platform's resolved theme into the console: storage key (first
- *  paint + next-themes storage listener) AND a direct root-class reconcile on
- *  the live iframe document (covers the pre-hydration window). */
+/** Push the platform's resolved theme into the console: storage key + a direct root-class
+ *  reconcile on the live iframe document. */
 function syncConsoleTheme(frame: HTMLIFrameElement | null, resolved: string | undefined) {
   const theme = resolved === "light" ? "light" : "dark";
   try {
@@ -77,45 +53,16 @@ export function WfConsoleFrame({
   const searchParams = useSearchParams();
   const pathname = usePathname();
   const { resolvedTheme } = useTheme();
-  // The parent URL we last wrote from an iframe navigation — distinguishes a
-  // real outer navigation (Next router) from our own replaceState mirroring.
   const lastMirroredRef = useRef<string | null>(null);
-  // CLIENT-ONLY, set after the session mint below: a useState initializer
-  // runs during SSR and its value survives hydration, which froze the name
-  // as "wfc||" (no team) in production — the scope must come from the real
-  // browser-side identity.
   const [frameName, setFrameName] = useState<string | null>(null);
-  // The initial src is computed ONCE — subsequent navigation happens inside
-  // the frame (or via contentWindow.location.replace below), never by
-  // re-setting src (which would reload the whole console app).
-  // Parent search params pass through ONLY on the URL-synced standalone page
-  // (/workflows?tab=hooks → console tab=hooks, legacy-link compatible); a
-  // tabbed embed must NOT leak its host page's own ?tab= into the console.
   const [src] = useState(() => {
     const qs = syncUrl ? searchParams?.toString() : "";
     return `/wfc${initialPath ? `/${initialPath}` : ""}${qs ? `?${qs}` : ""}`;
   });
 
-  // Keep the hive_jwt session perpetually fresh while the console is open.
-  // The iframe is NOT mounted until the first mint resolves (frameName gates
-  // the render below): the console's very first rpc otherwise races the mint
-  // and receives the backend's cookie-less 200-EMPTY response, settling the
-  // runs table on a false "No workflow runs found" (the session-mint-race
-  // class, witnessed live on production).
   useEffect(() => {
     let alive = true;
-    // Theme BEFORE mount: the console's SSR bootstrap reads the storage key
-    // synchronously, so the first paint matches the platform theme (no
-    // wrong-theme flash). The frame isn't mounted yet — frame arg null.
     syncConsoleTheme(null, resolvedTheme);
-    // Perf: warm the ~6MB console bundle DURING the mint gate. The frame is
-    // deliberately not mounted until the mint resolves (above), so without
-    // this the browser only starts fetching /wfc + its entry chunk after the
-    // mint round-trip completes — serializing two latencies. A `prefetch`
-    // link for the console document (which cascades into its module graph on
-    // a warm connection) overlaps that download with the mint, so the iframe
-    // paints from cache the moment it mounts. Removed on cleanup so repeated
-    // mounts don't pile up <link> nodes.
     const warm = document.createElement("link");
     warm.rel = "prefetch";
     warm.as = "document";
@@ -136,21 +83,9 @@ export function WfConsoleFrame({
       document.removeEventListener("visibilitychange", onVis);
       warm.remove();
     };
-    // `resolvedTheme` is intentionally excluded: this effect's syncConsoleTheme
-    // call is a one-time PRE-MOUNT seed (frame is null — the comment above
-    // explains why), not the live sync path — that's the separate
-    // `[resolvedTheme, frameName]` effect below. Re-running this effect on
-    // every theme toggle would needlessly re-mint the session, re-create the
-    // prefetch <link>, and restart the remint interval. `src` is a
-    // useState-with-lazy-initializer value that never changes after mount
-    // (no setter is ever called), so omitting it changes nothing at runtime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
-  // Live theme sync: every platform toggle re-writes the console's storage
-  // key (its next-themes storage listener applies it) and reconciles the
-  // live iframe root class directly. Also re-applied on iframe load so a
-  // frame that navigated internally starts in the right theme.
   useEffect(() => {
     syncConsoleTheme(frameRef.current, resolvedTheme);
     const frame = frameRef.current;
@@ -160,8 +95,6 @@ export function WfConsoleFrame({
     return () => frame.removeEventListener("load", onLoad);
   }, [resolvedTheme, frameName]);
 
-  // Fill the viewport below the navbar (measured, not hardcoded — survives
-  // chrome-height changes) and track window resizes.
   useEffect(() => {
     const compute = () => {
       const el = wrapRef.current;
@@ -174,7 +107,6 @@ export function WfConsoleFrame({
     return () => window.removeEventListener("resize", compute);
   }, []);
 
-  // iframe -> parent URL mirroring (same-origin read of the frame location).
   useEffect(() => {
     if (!syncUrl) return;
     const iv = setInterval(() => {
@@ -184,39 +116,23 @@ export function WfConsoleFrame({
       try {
         inner = win.location.pathname + win.location.search;
       } catch {
-        return; // transiently unreadable (mid-navigation)
+        return;
       }
       if (!inner.startsWith("/wfc")) return;
       const mapped = "/workflows" + inner.slice("/wfc".length);
       const current = window.location.pathname + window.location.search;
       if (mapped !== current && mapped !== lastMirroredRef.current) {
         lastMirroredRef.current = mapped;
-        // Raw replaceState (not the Next router): no page re-render, the
-        // iframe keeps its state; deep links stay copy-pastable.
-        //
-        // Next's app-router monkey-patches window.history.replaceState
-        // globally (node_modules/next/dist/client/components/app-router.js)
-        // so ANY caller's replaceState — not just Next's own — dispatches
-        // ACTION_RESTORE and re-renders every usePathname()/useSearchParams()
-        // consumer app-wide (topnav's SectionTabs/ProjectWorkflowsCrumb among
-        // them) UNLESS the history-state object carries one of Next's own
-        // skip markers (`__NA`/`_N`). Every 300ms tick this ran unmarked, it
-        // was silently re-triggering that global router transition — the
-        // navbar flicker. `_N: true` opts this call out of the patch while
-        // still updating the visible URL for copy/paste deep links.
         window.history.replaceState({ ...window.history.state, _N: true }, "", mapped);
       }
     }, URL_SYNC_INTERVAL_MS);
     return () => clearInterval(iv);
   }, [syncUrl]);
 
-  // parent -> iframe: a REAL outer navigation to a different /workflows path
-  // (e.g. a pasted deep link resolving through Next, or browser navigation
-  // that re-rendered the page) points the existing frame at the new path.
   useEffect(() => {
     if (!syncUrl) return;
     const expected = "/wfc" + (pathname?.startsWith("/workflows") ? pathname.slice("/workflows".length) : "");
-    if (("/workflows" + expected.slice("/wfc".length)) === lastMirroredRef.current) return; // our own mirror write
+    if (("/workflows" + expected.slice("/wfc".length)) === lastMirroredRef.current) return;
     const win = frameRef.current?.contentWindow;
     if (!win) return;
     try {
@@ -232,10 +148,6 @@ export function WfConsoleFrame({
   return (
     <div
       ref={wrapRef}
-      // No background of its own: the platform shell already paints the page
-      // background, and repainting it here (previously `bg-bg` on both layouts)
-      // stacked a second opaque surface over it — so the console read as a flat
-      // panel instead of sitting on the platform background.
       className={
         bleed
           ? "-mx-4 -my-8 sm:-mx-6 overflow-hidden bg-transparent"
@@ -249,15 +161,8 @@ export function WfConsoleFrame({
           name={frameName}
           title="Workflow console"
           className="block w-full border-0 bg-transparent"
-          // A transparent wrapper is not enough: the iframe element itself
-          // paints the browser default canvas unless told not to, which would
-          // still cover the platform background behind it.
           style={{ height, background: "transparent" }}
           allowTransparency
-          // Defer the console's own resource load until the frame is near the
-          // viewport — a real win for the project-tab embed (where the frame
-          // can sit below the fold); on the full-page /workflows view it's
-          // already in-view so this is a harmless no-op there.
           loading="lazy"
         />
       ) : (

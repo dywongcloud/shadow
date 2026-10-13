@@ -17,7 +17,6 @@ import { useIsPlatformOwner } from "@/lib/owner";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
-// Team/account-level tabs — shown when NO project/deployment is selected.
 const teamTabs = [
   { href: "/", label: "Projects" },
   { href: "/regions", label: "Regions" },
@@ -35,13 +34,10 @@ const teamTabs = [
   { href: "/settings", label: "Settings" },
 ];
 
-/** Drilled-in context (Vercel breadcrumb-tabs model): once a project or a
- *  deployment is selected, the TEAM tabs collapse into the breadcrumb and the
- *  SUB-tabs for that level take the top tab-bar position. Returns the tab set +
- *  the active key for the current URL. `tabParam` is the reactive `?tab=` value. */
+/** Drilled-in tab context: once a project or deployment is selected its sub-tabs take the top
+ *  tab bar and the team tabs collapse into the breadcrumb. `tabParam` is the reactive `?tab=`. */
 type TabItem = { href: string; label: string; key: string };
 function contextTabs(pathname: string, tabParam: string | null): { items: TabItem[]; activeKey: string } | null {
-  // Deployment detail: /deployments/<id>
   const dep = pathname.match(/^\/deployments\/([^/]+)/);
   if (dep) {
     const id = dep[1];
@@ -53,14 +49,10 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
     const activeKey = tabParam === "logs" ? "logs" : tabParam === "workflows" ? "workflows" : "overview";
     return { items, activeKey };
   }
-  // Project: /projects/<p>[/logs|/settings] with ?tab= for the in-page tabs.
   const proj = pathname.match(/^\/projects\/([^/]+)/);
   if (proj) {
     const p = proj[1];
     const base = `/projects/${p}`;
-    // (The project's Workflows tab now embeds the upstream console, which
-    // carries its own Runs/Hooks/Workflows segmented control — no ?wf=
-    // sub-tab override in the top bar anymore.)
     const items: TabItem[] = [
       { href: `${base}?tab=overview`, label: "Overview", key: "overview" },
       { href: `${base}?tab=graph`, label: "Service Graph", key: "graph" },
@@ -78,9 +70,6 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
     else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
     return { items, activeKey };
   }
-  // (/workflows embeds the upstream console, which carries its own
-  // Runs/Hooks/Workflows segmented control — the top bar keeps the normal
-  // team tabs there, no sub-tab override.)
   return null;
 }
 
@@ -92,40 +81,23 @@ function Slash() {
 export function TopNav() {
   const pathname = usePathname();
   const isOwner = useIsPlatformOwner();
-  // The owner/ops dashboard + auth + public status pages render their own chrome.
   if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status") || pathname.startsWith("/docs")) return null;
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
-  // When a project is selected, scope the breadcrumb to it:
-  //   LOGO / Team / Project
   const projectSeg = pathname.startsWith("/projects/")
     ? decodeURIComponent(pathname.split("/")[2] ?? "")
     : "";
-  // Deployment detail also gets a breadcrumb crumb (LOGO / Team / <id>), and its
-  // own sub-tabs take the top bar — matching Vercel's drill-in.
   const deploymentSeg = pathname.startsWith("/deployments/")
     ? decodeURIComponent(pathname.split("/")[2] ?? "")
     : "";
-  // Workflows is a drilled-in context: breadcrumb LOGO / Team / Workflows, with the
-  // Workflows sub-tabs (Runs / Workflows / Hooks) in the top tab bar below.
   const workflowsSeg = pathname === "/workflows" || pathname.startsWith("/workflows/");
 
   return (
     <header
       className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur"
-      // bn-ui-mobile-lifecycle: the root layout sets viewport-fit=cover +
-      // apple-mobile-web-app-status-bar-style=black-translucent (app/layout.tsx),
-      // which is what lets an installed iOS PWA extend content under the
-      // notch/status-bar in the first place -- but without THIS, a sticky
-      // top-0 header (this one) renders its own content underneath that
-      // status bar/notch with nothing pushing it down, exactly the classic
-      // "content hidden behind the notch" PWA bug. env() resolves to 0 on
-      // any device with no notch/inset (desktop, older phones), so this is a
-      // no-op everywhere except where it's actually needed.
       style={{ paddingTop: "env(safe-area-inset-top)" }}
     >
-      {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">
           <Link href="/" className="flex items-center"><Logo className="h-5 w-auto" /></Link>
@@ -141,8 +113,6 @@ export function TopNav() {
                 <Triangle className="h-5 w-5 shrink-0" />
                 <span className="truncate">{projectSeg}</span>
               </Link>
-              {/* Deeper crumb (Project / Workflows) when drilled into the project's
-                  Workflows. Suspense-bounded: it reads `?tab=` (useSearchParams). */}
               <Suspense fallback={null}>
                 <ProjectWorkflowsCrumb project={projectSeg} />
               </Suspense>
@@ -171,7 +141,6 @@ export function TopNav() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {/* Ops entry — platform owner only (middleware enforces; this just hides the link). */}
           {isOwner && (
             <Link
               href="/admin"
@@ -193,12 +162,7 @@ export function TopNav() {
           </Link>
         </div>
       </div>
-      {/* Row 2: section tabs — ONE horizontally-scrollable underline bar at every
-          width (Vercel-style). No dropdown/overlay on mobile: it swipes, the active
-          tab auto-centers, and the scrollbar is hidden. */}
       <div className="mx-auto max-w-[1400px] px-2 sm:px-4">
-        {/* Suspense-wrapped: SectionTabs reads `?tab=` (useSearchParams) — the
-            boundary keeps that from deopting static marketing pages to dynamic. */}
         <Suspense fallback={<div className="h-[38px]" />}>
           <SectionTabs isActive={isActive} />
         </Suspense>
@@ -207,10 +171,8 @@ export function TopNav() {
   );
 }
 
-/** Breadcrumb crumb rendered after the project when drilled into its Workflows
- *  (`/projects/<p>?tab=workflows`): `… / Project / Workflows`. Reads `?tab=`, so it
- *  must live under a Suspense boundary (kept out of the static-page render path).
- *  Links back to the project's Workflows root (the Runs sub-tab). */
+/** Breadcrumb crumb after the project when drilled into its Workflows; reads `?tab=`, so it
+ *  must live under a Suspense boundary. */
 function ProjectWorkflowsCrumb({ project }: { project: string }) {
   const tab = useSearchParams().get("tab");
   if (tab !== "workflows") return null;
@@ -228,17 +190,13 @@ function ProjectWorkflowsCrumb({ project }: { project: string }) {
   );
 }
 
-/** The section tab bar: a single underline row that scrolls horizontally on narrow
- *  screens instead of collapsing into a dropdown. Keeps the active tab in view.
- *  Context-aware: team tabs at the top level, or the project/deployment SUB-tabs
- *  once drilled in (Vercel breadcrumb-tabs model). */
+/** The section tab bar: one horizontally scrolling underline row (team tabs at the top level,
+ *  project/deployment sub-tabs once drilled in) that keeps the active tab in view. */
 function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const navRef = useRef<HTMLDivElement>(null);
   const ctx = contextTabs(pathname, searchParams.get("tab"));
-  // Center the active tab within the scroll container (it may start off-screen on
-  // mobile). Only touches the container's scrollLeft — never scrolls the page.
   useEffect(() => {
     const nav = navRef.current;
     const el = nav?.querySelector<HTMLElement>("[data-active='true']");
@@ -248,7 +206,6 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   }, [pathname, searchParams]);
 
   if (ctx) {
-    // Drilled-in: render the project/deployment sub-tabs in the top bar position.
     return (
       <nav ref={navRef} className="no-scrollbar -mb-px flex items-center gap-0.5 overflow-x-auto">
         {ctx.items.map((t) => {
@@ -295,13 +252,8 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
 
 const PERSONAL = "__personal__";
 
-/** The ACTIVE tenant's actual subscription tier (hobby | pro | enterprise) from
- *  its billing account — the same half the Billing page shows, and correct for
- *  the personal namespace too (it has a billing account but no team row). The
- *  hive_jwt cookie scopes /v1/billing to the active tenant, and usePoll
- *  re-fetches on `hive-team-changed` after a switch re-mints it. Returns null
- *  until known: a badge must render NOTHING rather than assert "Hobby" for an
- *  account whose real tier simply hasn't loaded yet. */
+/** The ACTIVE tenant's subscription tier from its billing account (cookie-scoped `/v1/billing`,
+ *  re-fetched on `hive-team-changed`); `null` until known so a badge renders nothing. */
 function useActivePlan(): string | null {
   const { data } = usePoll<{ account?: { plan?: string } }>("/v1/billing", 60000);
   return data?.account?.plan || null;
@@ -314,13 +266,8 @@ function tenantOf(org: { slug?: string | null; id: string } | null | undefined):
   return org.slug || org.id;
 }
 
-/**
- * Clerk-driven team switcher: the navbar lists the user's actual Clerk
- * organizations + personal account, reflects Clerk's active organization, and
- * is the single source of truth for the active tenant. Switching here calls
- * Clerk's `setActive` and the active-org effect re-points `hive_team`, which
- * every data hook depends on — so data never bleeds across accounts.
- */
+/** Clerk-driven team switcher: lists the user's organizations + personal account and is the
+ *  single source of truth for the active tenant (`setActive` + `hive_team` re-pointing). */
 function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
   const { organization } = useOrganization();
   const { userMemberships, setActive, isLoaded } = useOrganizationList({
@@ -329,9 +276,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
   const clerk = useClerk();
   const activePlan = useActivePlan();
   const [open, setOpen] = useState(false);
-  // OUR selection is the source of truth for the dashboard view — persisted in
-  // localStorage and authoritative over Clerk's (possibly org-forced) active
-  // session. This is what makes "switch to Personal" stick + survive refresh.
   const [selected, setSelected] = useState<string>(PERSONAL);
   const ref = useRef<HTMLDivElement>(null);
   const initDone = useRef(false);
@@ -340,87 +284,36 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
   const memberships = userMemberships?.data ?? [];
   const orgBySlug = (s: string) => memberships.find((m) => (m.organization.slug || m.organization.id) === s)?.organization;
 
-  // Reset per-account view state when a DIFFERENT user signs in (someone logged
-  // out, someone else logged in) — so the previous account's active team, the
-  // breadcrumb team/org label + dropdown, favorites, onboarding, etc. never leak
-  // into the new session. Runs BEFORE init so the cleared state is re-derived
-  // from the new user's own Clerk active org.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    // IMPORTANT: ignore the transient "local" placeholder identity that appears
-    // while Clerk's useUser() is still loading (or signed out). Treating it as a
-    // user change would spuriously wipe onboarding/gitops/team state on EVERY load
-    // (e.g. re-prompting the GitOps setup modal after it was already completed).
     if (!identity.id || identity.id === "local") return;
     const prev = localStorage.getItem("hive_uid");
-    const firstIdentity = prev !== identity.id; // includes unset -> set
+    const firstIdentity = prev !== identity.id;
     if (prev && firstIdentity) {
-      // `hive_pending_builds` rides along: the previous account's in-flight build
-      // rows (project names + build ids, with live Cancel links) must not carry
-      // into the next signed-in user's session on a shared browser. Neither may
-      // `hive_platform_admin` — a stale operator flag would open operator-only
-      // surfaces (e.g. /cdn) to the next, non-operator account on this browser.
       for (const k of ["hive_team", "hive_is_owner", "hive_platform_admin", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;
-      // react-hooks/set-state-in-effect: defer by one microtask (same
-      // behavior-preserving fix as use-run-node.ts) rather than remove --
-      // this branch genuinely needs to reset the selection when the signed-in
-      // identity changes.
       queueMicrotask(() => setSelected(PERSONAL));
     }
     localStorage.setItem("hive_uid", identity.id);
-    // When the user id is first established, the personal namespace changes from
-    // the pre-auth placeholder to `u_<uid>` — re-mint through switchTeam (never a
-    // raw dispatch) so pollers re-fetch under the CORRECT per-account namespace
-    // with a matching cookie. A raw dispatch here left the PREVIOUS account's
-    // hive_jwt cookie (up to 1h TTL, nothing else ever clears it) fully valid —
-    // it kept authenticating this session as the old user/tenant, silently
-    // serving their data under the freshly-signed-in account's view.
     if (firstIdentity) void switchTeam(PERSONAL);
   }, [identity.id]);
 
-  // Initialize the selection ONCE: restore the user's saved choice if any,
-  // otherwise adopt Clerk's active org the first time it loads. After init, the
-  // user's explicit navbar choice always wins — Clerk never overrides it.
   useEffect(() => {
     if (typeof window === "undefined" || initDone.current) return;
     const saved = localStorage.getItem("hive_team");
     if (saved) {
-      // Already-persisted selection: SessionToken's mount-time mint (which ran
-      // BEFORE this effect, reading this same localStorage value) already
-      // minted a matching cookie — nothing to re-mint here.
-      // react-hooks/set-state-in-effect: microtask-deferred, same as above.
       queueMicrotask(() => setSelected(saved));
       initDone.current = true;
     } else if (isLoaded) {
       const slug = tenantOf(organization);
-      // initDone.current is set FIRST (a ref write, unaffected by the
-      // microtask deferral below) so a re-render triggered by switchTeam's
-      // own state changes can't re-enter this branch — the guard above reads
-      // initDone.current, never `selected`.
       initDone.current = true;
-      // react-hooks/set-state-in-effect: microtask-deferred, same as above.
       queueMicrotask(() => setSelected(slug));
-      // Route through switchTeam (persists + re-mints + THEN broadcasts) rather
-      // than a raw setItem+dispatch — the mount-time mint already ran with NO
-      // hive_team set (currentTeam() fell through to the pre-auth placeholder),
-      // so the cookie does not yet match this adopted org; broadcasting first
-      // told every poller "the view is now `slug`" while the browser kept
-      // sending that stale/placeholder-scoped cookie, rendering whatever it
-      // authenticated as under the newly-adopted org's view.
       void switchTeam(slug);
     }
   }, [isLoaded, organization]);
 
-  // Resync the navbar's selection with `hive_team` on every `hive-team-changed`
-  // — same-tab (a no-op here since `pick`/the effects above already set
-  // `selected` directly) AND cross-tab (lib/api.ts re-dispatches this event
-  // locally on a `storage` change from another tab). Without this, a second
-  // open tab's navbar keeps showing its OLD tenant's label while the shared
-  // cookie/localStorage — and therefore every poller's actual data — has
-  // already moved to whatever tenant the OTHER tab switched to.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const resync = () => {
@@ -431,17 +324,11 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     return () => window.removeEventListener("hive-team-changed", resync);
   }, [selected]);
 
-  // Index the user + (resolved) org into the store for the active tenant. Keyed
-  // on the selection, not Clerk's org, so it follows what the user picked.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const org = selected === PERSONAL ? null : orgBySlug(selected) ?? null;
-    if (selected !== PERSONAL && !org && !isLoaded) return; // wait for memberships
-    // Personal scope is per-USER (`u_<uid>`), never the shared literal "personal".
+    if (selected !== PERSONAL && !org && !isLoaded) return;
     const team = selected === PERSONAL ? `u_${identity.id}` : selected;
-    // De-dup: this effect re-runs on several dep changes that can fire in a <100ms
-    // burst, POSTing the same identity 2-4x. Skip when the (team,user,org) tuple is
-    // unchanged so we sync once per unique selection.
     const key = `${team}|${identity.id}|${org?.id ?? ""}`;
     if (syncedKey.current === key) return;
     syncedKey.current = key;
@@ -455,30 +342,15 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     })
       .then((r) => r.json())
       .then(async (d) => {
-        // The backend authoritatively marks the platform owner (owner_email). The
-        // owner keeps the legacy "personal" namespace; everyone else stays isolated
-        // under `u_<uid>`. Refresh pollers so personal data loads under the right one.
         const prev = localStorage.getItem("hive_is_owner");
         const now = d?.is_owner ? "1" : "0";
         localStorage.setItem("hive_is_owner", now);
         if (prev === now) return;
-        // hive_is_owner flips which tenant currentTeam() resolves to (personal vs
-        // u_<uid>) — the FIRST time this resolves (a brand-new session), the
-        // hive_jwt cookie was already minted moments earlier under the OLD guess
-        // (u_<uid>, since hive_is_owner wasn't known yet — see the sibling
-        // hive_uid effect's switchTeam(PERSONAL) call above). The backend derives
-        // the tenant SOLELY from that cookie's claim, never from client-side
-        // belief, so a raw dispatch here told pollers to re-fetch while they kept
-        // authenticating as the WRONG (but validly empty) u_<uid> tenant — a
-        // successful 200 for the wrong namespace, never a 401 that would trigger
-        // the auth-retry remint, so it silently never self-corrected without a
-        // reload. Re-mint for the NOW-correct tenant before telling anyone to
-        // re-fetch, mirroring switchTeam's own discipline.
         await mintSessionToken();
         window.dispatchEvent(new Event("hive-team-changed"));
       })
       .catch(() => {
-        if (syncedKey.current === key) syncedKey.current = ""; // allow a retry on failure
+        if (syncedKey.current === key) syncedKey.current = "";
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, isLoaded, memberships.length, identity.id]);
@@ -491,11 +363,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     return () => document.removeEventListener("mousedown", onClick);
   }, []);
 
-  // Switch tenant: `switchTeam` persists the selection, RE-MINTS the hive_jwt
-  // cookie for the new tenant (validated server-side), and only then fires
-  // hive-team-changed so pollers re-fetch with the correct cookie. Clerk's active
-  // org is aligned best-effort afterwards (no longer drives the tenant — that's
-  // the cookie now — so it never blocks or gates the view).
   async function pick(tenantSlug: string) {
     setOpen(false);
     setSelected(tenantSlug);
@@ -541,9 +408,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option
             label={identity.name}
-            // The personal namespace's real tier is only known while it IS the
-            // active tenant (/v1/billing is cookie-scoped) — omit the hint
-            // otherwise rather than asserting a tier that may be wrong.
             hint={isPersonal ? activePlan ?? undefined : undefined}
             icon={<User className="h-3.5 w-3.5" />}
             selected={isPersonal}
@@ -576,7 +440,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
           <Link href="/teams" onClick={() => setOpen(false)} className="flex items-center gap-2 border-t border-border px-3 py-2.5 text-sm text-secondary hover:bg-subtle hover:text-fg">
             <Building2 className="h-3.5 w-3.5" /> Manage teams
           </Link>
-          {/* Create org/team — the very bottom action, opens Clerk's create flow. */}
           <button
             onClick={() => {
               setOpen(false);
@@ -595,10 +458,6 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
 /** Toggleable team switcher — a personal ("just my name") view plus any teams. */
 function TeamSwitcher({ identity }: { identity: Identity }) {
   const [open, setOpen] = useState(false);
-  // Team membership rarely changes — one fetch to populate the topnav label,
-  // then only re-poll while the dropdown is actually open (instead of forever
-  // in the background on every page). `choose()` already force-refreshes via
-  // `hive-team-changed` on switch, so freshness on interaction is unaffected.
   const { data: teams } = usePoll<Team[]>("/v1/teams", 10000, open);
   const activePlan = useActivePlan();
   const [sel, setSel] = useState<string>(PERSONAL);
@@ -606,21 +465,14 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    // A `?team=<slug>` deep-link selects (and persists) that team — shareable,
-    // team-scoped dashboard URLs.
     const param = new URLSearchParams(window.location.search).get("team");
     if (param) {
       const slug = param === "personal" ? PERSONAL : param;
-      // react-hooks/set-state-in-effect: microtask-deferred, same as topnav's
-      // other effects above -- switchTeam below still runs synchronously
-      // right after, unaffected by when setSel's deferred update lands.
       queueMicrotask(() => setSel(slug));
-      // Re-mint the cookie for the deep-linked team (validated) before re-fetch.
       void switchTeam(slug);
       return;
     }
     const saved = localStorage.getItem("hive_team");
-    // react-hooks/set-state-in-effect: microtask-deferred, same as above.
     if (saved) queueMicrotask(() => setSel(saved));
   }, []);
   useEffect(() => {
@@ -633,15 +485,12 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
 
   function choose(slug: string) {
     setSel(slug);
-    // Persist + re-mint the cookie for the new tenant BEFORE pollers re-fetch.
     void switchTeam(slug);
     setOpen(false);
   }
 
   const current = sel === PERSONAL ? null : (teams ?? []).find((t) => t.slug === sel);
   const label = current ? current.name : identity.name;
-  // Personal has no team row — its tier comes from the billing account. Null
-  // until known; the badge renders nothing rather than a wrong placeholder.
   const plan = current ? current.plan : activePlan;
 
   return (

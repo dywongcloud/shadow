@@ -1,67 +1,7 @@
-// scripts/patch-wf-console.mjs
-//
-// Idempotent build-time patches over the compiled @workflow/web bundles in
-// node_modules, so the LITERAL upstream WDK console serves at /wfc and is
-// embedded (iframe) inside the dashboard's own /workflows page — platform
-// navbar on top, zero upstream chrome — reading hive data through the World
-// proxy (lib/wf-console/hive-world.mjs). The upstream package ships compiled
-// Vite bundles only — there is no source to fork; every customization is a
-// targeted, sentinel-guarded string replacement (the agentos
-// patch-workflow-web.mjs discipline).
-//
-// IMPORTANT: anchors target the PRISTINE upstream bundles. If patches report
-// `no-anchor`, reinstall the package fresh first:
-//   (cd ui && npm i --no-save @workflow/web@<locked version>)
-// then re-run. Re-runs over an already-patched tree are no-ops (sentinels).
-//
-// Patches:
-//   1. basename        "/" -> "/wfc" in the React Router builds. The console
-//                      is served under /wfc (next.config rewrites
-//                      /wfc/:path* -> /wf-console/wfc/:path*), while the
-//                      user-facing /workflows page is a normal dashboard page
-//                      (platform navbar) embedding /wfc in a seamless iframe.
-//   2. rpc guard       the client hardcodes fetch("/api/rpc"). Replace with a
-//                      guarded fetch to /wfc/api/rpc that (a) carries the
-//                      hive team/project scope the parent page stores in
-//                      window.name ("wfc|<team>|<project>"), (b) verifies the
-//                      response is actually CBOR before decoding — an auth
-//                      redirect or error page previously fed HTML to cbor-x
-//                      and surfaced as "Unknown token 28", (c) re-mints the
-//                      hive_jwt session ONCE via POST /api/token and retries
-//                      on a non-ok/non-CBOR response, so an idle tab recovers
-//                      instead of erroring.
-//   3. stream URL      `/api/stream/...` -> `/wfc/api/stream/...`.
-//   4. isLocalBackend  force TRUE (and force backendId/@displayName) so the
-//                      Workflows/Graph tabs render — the gate would otherwise
-//                      hide them because WORKFLOW_TARGET_WORLD points at a
-//                      custom module path, not "@workflow/world-local".
-//   5. manifest        fetchWorkflowsManifest reads from disk upstream;
-//                      delegate to world.hiveFetchWorkflowsManifest() (hive's
-//                      /v1/workflows defs reshaped) when the World offers it.
-//   6. run ops         cancel/recreate/reenqueue/wakeUp are composed from
-//                      World primitives upstream (events.create + queue +
-//                      full event walks); delegate each to world.hiveOps.*
-//                      which maps 1:1 onto hive's dedicated run-op endpoints.
-//   7. hide header     the upstream console's own sticky navbar (Workflow
-//                      logo, "Local Dev: …", Health Check, theme toggle,
-//                      Docs) is display:none'd in BOTH client and SSR bundles
-//                      (hydration-consistent) — the shadw platform navbar is
-//                      the only chrome. The in-page Runs/Hooks/Workflows
-//                      segmented control is page content and survives.
-//   8. theme sync      the console's ThemeProvider keeps its own storage key
-//                      ("workflow-theme") with NO forcedTheme — the platform
-//                      page (components/wf-console-frame.tsx) writes that key
-//                      from the dashboard's next-themes state before mount and
-//                      on every toggle, so the console follows the platform's
-//                      light/dark live. defaultTheme "dark" = fallback for a
-//                      direct /wfc visit only.
-//
-// Run before every `next build` (see package.json "build"). Re-runs are
-// no-ops. If an anchor is missing after an upstream version bump, the run
-// reports `no-anchor` for that patch — re-locate the needle in the new
-// bundle and update it here.
+// Idempotent, sentinel-guarded string patches over the compiled @workflow/web bundles in
+// node_modules so the upstream console serves at /wfc inside the dashboard; run before every
+// `next build`. `no-anchor` means the installed package is not pristine — reinstall it fresh.
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,9 +20,6 @@ function patchBasename(file, s) {
   return { s: s.replace(needle, replace), status: "patched" };
 }
 
-// The single data-plane choke point: every console read (fetchRuns/fetchRun/
-// fetchEvents/… and the manifest + run-op server actions) rides this one
-// rpc() helper. Guarding here covers the entire console.
 function patchRpcGuard(file, s) {
   const needle =
     `async function rpc(method, params) {\n` +
@@ -201,9 +138,6 @@ function patchManifestDelegation(file, s) {
   return { s: s.replace(needle, replace), status: "patched" };
 }
 
-// The four run-op server actions. Each gets an early delegation to
-// world.hiveOps.<op> right after its `const world = await getWorldFromEnv…`
-// line, keeping the upstream primitive-composed implementation as fallback.
 const RUN_OP_PATCHES = [
   {
     sentinel: "__hive_op_cancel",
@@ -264,10 +198,6 @@ function patchRunOps(file, s) {
   return { s, status: "skip-already" };
 }
 
-// The upstream console's own sticky navbar (Workflow logo + ConnectionStatus
-// "Local Dev: …" + HealthCheckButton + ThemePicker + DocsLink). display:none
-// keeps client and SSR renders identical (no hydration mismatch) while the
-// shadw platform navbar (in the parent page) is the only visible chrome.
 function patchHideHeader(file, s) {
   const needle = `className: "sticky top-0 z-50 bg-background border-b px-6 py-4",`;
   const replace =
@@ -278,16 +208,6 @@ function patchHideHeader(file, s) {
   return { s: s.replaceAll(needle, replace), status: "patched" };
 }
 
-// Theme SYNC (not force): the platform's WfConsoleFrame drives the console's
-// next-themes storage key ("workflow-theme") from the dashboard's own
-// next-themes state — pre-written before the iframe mounts (correct FIRST
-// paint via the console's SSR theme bootstrap) and live-updated on every
-// platform toggle (same-origin storage events reach the iframe's cross-tab
-// listener; the frame also reconciles the root class directly). So the
-// provider must NOT carry forcedTheme (an earlier patch generation forced
-// dark, which broke light-mode users — the reported bug). defaultTheme
-// "dark" stays as the brand fallback for a direct /wfc visit with no stored
-// key.
 function patchThemeSync(file, s) {
   const needle = `attribute: "class",\n    defaultTheme: "system"`;
   const replace = `attribute: "class",\n    defaultTheme: "dark" /* __hive_theme_sync */`;
@@ -321,90 +241,6 @@ function collectBundleFiles() {
   );
 }
 
-// Patching edits content-hashed, `immutable, max-age=1y`-cached client chunks
-// IN PLACE — serving changed bytes under an unchanged filename. A browser that
-// re-fetches ONE such chunk while holding immutable-cached copies of its
-// siblings ends up with a mixed module graph, which dies at import time
-// ("module './mermaid-…js' does not provide an export named 'B'") and kills
-// the console's hydration silently and PERMANENTLY (the poisoned entries never
-// revalidate). Fix at the root: any client chunk this patch run modified gets
-// a NEW name carrying a digest of its patched content (`x.h<8hex>.js`), and
-// every reference across the whole build (sibling chunk imports, the server
-// build's SSR asset manifest/preloads) is rewritten. Unmodified chunks keep
-// their upstream names — their bytes never change, so cached copies stay
-// valid. Idempotent: a re-run strips the previous marker, re-digests, and
-// no-ops when content is unchanged.
-function rehashPatchedClientAssets(_dirtied) {
-  const clientAssets = path.join(BUILD, "client", "assets");
-  if (!fs.existsSync(clientAssets)) return;
-  const marker = /\.h[0-9a-f]{8}(?=\.(js|css)$)/;
-  const renames = new Map(); // old basename -> new basename
-  // EVERY .js/.css asset is renamed, not just the ones this run's patches
-  // dirtied: end-user browsers were witnessed holding POISONED immutable
-  // cached copies of assets whose BYTES never changed (a css cached as an
-  // auth-redirect HTML body in an earlier serving-bug era renders the whole
-  // console unstyled forever) — the only recovery an origin can force against
-  // `immutable` is a NEW URL, so each patch generation fresh-names the whole
-  // set. Digest of the patched content keeps it deterministic/idempotent.
-  // One GENERATION fingerprint for the whole set (not per-file digests: the
-  // reference rewrite below changes file bytes after renaming, so per-file
-  // digests never converge across runs). Computed over every asset's content
-  // with existing markers normalized away, plus this script's own source —
-  // any upstream or patch change moves the ENTIRE set to fresh names
-  // atomically, which is exactly the coherence the module graph needs.
-  const genHash = crypto.createHash("sha256");
-  genHash.update(fs.readFileSync(fileURLToPath(import.meta.url)));
-  const assetNames = fs
-    .readdirSync(clientAssets)
-    .filter((f) => /\.(js|css)$/.test(f))
-    .sort();
-  for (const f of assetNames) {
-    genHash.update(f.replace(marker, ""));
-    genHash.update(
-      fs.readFileSync(path.join(clientAssets, f), "utf8").replace(/\.h[0-9a-f]{8}(?=\.(js|css))/g, "")
-    );
-  }
-  const gen = genHash.digest("hex").slice(0, 8);
-  for (const f of assetNames) {
-    const full = path.join(clientAssets, f);
-    const stripped = f.replace(marker, "");
-    const ext = path.extname(stripped);
-    const next = `${stripped.slice(0, -ext.length)}.h${gen}${ext}`;
-    if (next === f) continue;
-    fs.renameSync(full, path.join(clientAssets, next));
-    renames.set(f, next);
-    // sourceMappingURL comments get rewritten to `<next>.map` by the global
-    // reference rewrite below — rename the sibling map to match.
-    if (fs.existsSync(full + ".map")) {
-      fs.renameSync(full + ".map", path.join(clientAssets, next + ".map"));
-    }
-    console.log(`[patch-wf-console] rehash ${f} -> ${next}`);
-  }
-  if (renames.size === 0) return;
-  // Rewrite every reference across the build (basenames are high-entropy and
-  // globally unique, so a blind replaceAll is safe).
-  const targets = [];
-  const walk = (d) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/\.(js|mjs|css|html|json|map)$/.test(e.name)) targets.push(p);
-    }
-  };
-  walk(BUILD);
-  for (const t of targets) {
-    let s = fs.readFileSync(t, "utf8");
-    let dirty = false;
-    for (const [from, to] of renames) {
-      if (s.includes(from)) {
-        s = s.replaceAll(from, to);
-        dirty = true;
-      }
-    }
-    if (dirty) fs.writeFileSync(t, s);
-  }
-}
-
 function main() {
   if (!fs.existsSync(BUILD)) {
     console.log("[patch-wf-console] @workflow/web not installed — skipping");
@@ -430,28 +266,8 @@ function main() {
       dirtied.add(f);
     }
   }
-  // Rehash-all-assets (renaming patched chunks to a content-derived name +
-  // rewriting every cross-chunk import) is DELIBERATELY DISABLED. It existed
-  // to work around `immutable, max-age=1y` caching pinning stale patched
-  // bundles — but that is now solved more simply and robustly at the caching
-  // layer: the bridge route serves /wfc assets `no-cache` (always revalidate)
-  // and the service worker fetches code chunks with `{cache:'reload'}`, so
-  // every chunk of a page load is revalidated against the origin and always
-  // comes from the SAME internally-consistent build. The renaming's own
-  // machinery (a shared generation hash + a blind cross-file basename rewrite)
-  // was itself fragile — it contributed to repeated "does not provide an
-  // export named X" module-graph breakages — so removing it eliminates that
-  // failure surface entirely. Upstream's own content-hash filenames are kept
-  // as-is; `no-cache` revalidation, not the filename, guarantees freshness.
-  // (The function is retained above, unreferenced, for a quick revert if a
-  // future caching regression ever makes per-file content-addressing needed.)
-  void rehashPatchedClientAssets;
   const summary = PATCHES.map(([n]) => `${n}:${totals[n] || 0}`).join(" ");
   console.log(`[patch-wf-console] done — ${summary} (files:${files.length})`);
-  // The basename + rpc-guard + header patches are load-bearing: fail loudly
-  // when the server build has none of them applied and none pre-applied
-  // (e.g. after an upstream version bump moved the anchors, or the tree is
-  // still carrying an OLD patch generation — reinstall fresh, then re-run).
   const serverBuild = files.find((f) => path.basename(f).startsWith("server-build-"));
   if (serverBuild) {
     const s = fs.readFileSync(serverBuild, "utf8");

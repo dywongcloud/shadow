@@ -1,12 +1,7 @@
 #!/usr/bin/env node
-// Syncs the built hive-browser wasm bundle (crates/hive-browser/www/{pkg,identity.js})
-// into ui/public/browser-node/ so the dashboard's "Run a node" SharedWorker can load
-// it as a same-origin static asset. The wasm build is a real generated artifact
-// (crates/hive-browser/build.sh) -- this script keeps ui/public in sync with it
-// rather than letting a manual one-time copy silently go stale. A missing source
-// (hive-browser not yet built) is a WARN, never a build failure: the dashboard
-// still builds and serves everything else; "Run a node" degrades to its own
-// explicit unsupported-browser/missing-bundle state at runtime.
+// Syncs the built hive-browser bundle and the hand-written browser-node modules from
+// crates/hive-browser/www into ui/public/browser-node; a missing artifact is a WARN, never a
+// build failure ("Run a node" reports its own missing-bundle state at runtime).
 import { existsSync, mkdirSync, readdirSync, copyFileSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,38 +23,6 @@ for (const f of readdirSync(srcPkg)) {
     copyFileSync(join(srcPkg, f), join(destPkg, f));
   }
 }
-// Worker-loadable ES modules the SharedWorker imports directly (identity for
-// both, plus the browser-worker-quickjs-runtime lane: the canonical policy
-// digest module and the worker-native QuickJS runtime, and the browser-to-
-// browser WebRTC mesh lane). These are hand-written sources in www/, not build
-// artifacts — pkg/ alone is not enough.
-//
-// peer-mesh*.js are load-bearing here: run-node-worker.js resolves them with a
-// RUNTIME dynamic import against its own deployed origin, so omitting them from
-// this list does not fail any build — it 404s in the browser at the moment the
-// mesh lane starts, on the fleet only. That is exactly what happened: both files
-// existed in crates/hive-browser/www/ and neither was ever copied to
-// ui/public/browser-node/, so the deployed worker imported a path that was never
-// published.
-//
-// node-runtime.js USED to be a static import of worker-function-runtime.js —
-// the hand-written Node API shim evaluated INSIDE the QuickJS guest. The
-// substrate is node-worker now (execution-path-swap-off-quickjs), which IS
-// Node, so the shim is deleted and the module graph has one fewer
-// load-bearing file.
-// sync-fs-agent.js is the page half of the SAME bridge (bn-node-worker-service-
-// worker-sync-fs): `navigator.serviceWorker` is `[Exposed=Window]`, so the
-// run-node SharedWorker cannot register sw.js itself and brokers it through a
-// connected page, which imports this module from the deployed origin at
-// runtime — exactly the peer-mesh-agent.js shape, so omitting it fails no
-// build and only 404s on the fleet at the moment the lane is needed.
-//
-// node-worker-host.js / node-worker-agent.js / node-worker-vfs.js are the
-// node-worker substrate's own trio (bn-node-worker-substrate +
-// bn-node-worker-vfs-opfs-fsa). The host is imported by the agent, and it
-// imports the vfs module with a RUNTIME dynamic import — so a missing
-// node-worker-vfs.js fails no build and only surfaces as a page-side
-// "no persistent guest filesystem" degradation inside a donor's browser.
 for (const f of [
   "identity.js",
   "artifact-policy.js",
@@ -79,24 +42,6 @@ for (const f of [
   }
 }
 
-// The node-worker lane (bn-node-worker-substrate): the real Node.js runtime
-// (Node core transpiled for a Worker) that replaces the QuickJS lane for
-// browser execution, so a browser node can host arbitrary Node/Next/Svelte
-// apps with no per-repo opt-in. dist/ is produced by
-// scripts/build-node-worker.sh from vendor/node-worker; everything here is a
-// build artifact, never hand-edited. A missing artifact is a WARN, never a
-// build failure -- same discipline as pkg/ and the sqlite lane above, and the
-// runtime reports its own honest error if the lane is absent.
-//
-// sw.js and sw-handler.js are the ServiceWorker half of the SYNCHRONOUS `fs`
-// bridge: node-worker's module resolver is synchronous end to end, so without
-// a service worker backing sync `fs` there is no working `require` and nothing
-// runs. They must be published at the scope the page registers them under —
-// that scope is this directory (`/browser-node/node-worker/`, sw.js's own
-// default), which is also where dist/worker.js lives, because what makes the
-// worker's blocking requests interceptable is its own script URL being inside
-// the scope. Registration itself is browser-node/sync-fs-agent.js (see its
-// header); NODE_WORKER_SET below is what puts the bytes there for it.
 const NODE_WORKER_SET = ["index.js", "worker.js", "sw.js", "sw-handler.js"];
 const nwSrcRoot = join(srcRoot, "node-worker");
 if (existsSync(nwSrcRoot)) {
@@ -118,17 +63,6 @@ if (existsSync(nwSrcRoot)) {
   );
 }
 
-// The browser-replicated database lane (bn-run-node-db-sync-wiring): when the
-// admission capability carries a `db` block, run-node-worker.js spawns the
-// sqlite DedicatedWorker from these deployed assets. The set is the exact
-// runtime import graph of sqlite-worker.js + sync-client.js (crsqlite-sync.mjs
-// loads crsqlite-sync.wasm relative to its own import.meta.url, so both must
-// land in the same directory) — every file the worker can reach, nothing
-// more. crsqlite-sync.{mjs,wasm} are build artifacts of
-// crates/hive-browser/www/sqlite/build-sqlite.sh; the rest are hand-written
-// sources. A missing source is a WARN, never a build failure — the same
-// discipline as pkg/ above (the db lane reports its own honest error at
-// runtime; "Run a node" itself still works).
 const SQLITE_SET = [
   "sqlite/sqlite-worker.js",
   "sqlite/sync-client.js",
@@ -150,9 +84,6 @@ for (const rel of SQLITE_SET) {
   }
   mkdirSync(dirname(dest), { recursive: true });
   copyFileSync(src, dest);
-  // Byte-verify every shipped file: a truncated or partial copy would only
-  // surface later as an opaque import/wasm failure inside a user's browser,
-  // so the sync refuses to be silent about it.
   if (!readFileSync(src).equals(readFileSync(dest))) {
     console.error(`[sync-browser-node] byte mismatch after copy: ${rel}`);
     process.exit(1);
@@ -162,12 +93,6 @@ for (const rel of SQLITE_SET) {
 console.log(`[sync-browser-node] synced ${srcPkg} -> ${destPkg}`);
 console.log(`[sync-browser-node] synced sqlite set (${sqliteSynced}/${SQLITE_SET.length} files) -> ${join(destRoot, "sqlite")}`);
 
-// The musql browser lane: an IN-MEMORY musql (wasm) database, for analysis and
-// sandbox work over an exported snapshot. A THIRD surface, not a replacement
-// for the CRR lane above -- it has no clock tables, no CRR, no replication and
-// no persistence, so nothing points it at browser-dbs. musql.wasm is a build
-// artifact of crates/hive-browser/www/musql/build-musql.sh and is gitignored,
-// so an unbuilt tree warns here exactly the way the crsqlite wasm does.
 const MUSQL_SET = [
   "musql/musql-worker.js",
   "musql/musql-client.js",

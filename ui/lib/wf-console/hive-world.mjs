@@ -1,58 +1,13 @@
-// lib/wf-console/hive-world.mjs
-//
-// A @workflow/world implementation that proxies every read (and the four run
-// operations) to hive's /v1/workflows/* admin API, so the LITERAL upstream
-// @workflow/web console (mounted at /workflows by app/wf-console/[[...slug]]/
-// route.ts) renders hive's real run data.
-//
-// Loaded by the compiled @workflow/web server bundle via
-//   WORKFLOW_TARGET_WORLD=<abs path to this file>
-// which the bundle `require()`s (Node >= 22 supports require(esm)) and calls
-// `mod.default()` / `mod.createWorld()` on. See createWorld() at the bottom.
-//
-// Method surface implemented = exactly what the console's RPC server actions
-// call (verified against build/server/assets/server-build-*.js):
-//   world.runs.get / runs.list
-//   world.steps.get / steps.list
-//   world.events.get / events.list / events.listByCorrelationId / events.create
-//   world.hooks.get / hooks.getByToken / hooks.list
-//   world.listStreamsByRunId, world.streams.* (streams are not persisted by
-//     hive -> empty), world.queue (re-enqueue fallback), world.specVersion
-// plus two hive-specific extension points the patched bundle prefers when
-// present (scripts/patch-wf-console.mjs):
-//   world.hiveOps.{cancelRun,recreateRun,reenqueueRun,wakeUpRun}  -> hive's
-//     dedicated run-op endpoints (POST /v1/workflows/runs/:id/{cancel,replay,
-//     reenqueue,wakeup})
-//   world.hiveFetchWorkflowsManifest -> GET /v1/workflows reshaped to the
-//     {version, workflows:{[filePath]:{[name]:{workflowId, graph}}}} manifest
-//     the WorkflowsList expects.
-//
-// Per-request auth: the Next route handler stores {team, authToken} in an
-// AsyncLocalStorage shared through a global symbol; every hive fetch forwards
-// x-hive-team + Authorization: Bearer <hive_jwt> exactly like
-// ui/lib/gitops-server.ts backend() does.
+// A @workflow/world implementation that proxies every read (and the four run operations) to
+// hive's /v1/workflows/* admin API, loaded by the compiled @workflow/web server bundle via
+// WORKFLOW_TARGET_WORLD; per-request team + bearer ride an AsyncLocalStorage (see ALS_KEY).
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
-// NO hardcoded project fallback: an unscoped console (the global /workflows
-// view) lists runs across ALL of the tenant's projects (the backend fans out
-// when the `project` query param is omitted), and run ops auto-scan for the
-// hosting project. HIVE_WF_PROJECT remains available as an explicit operator
-// override only.
 const DEFAULT_PROJECT = process.env.HIVE_WF_PROJECT || "";
 const DEFAULT_TEAM = process.env.HIVE_WF_TEAM || "personal";
-// Server-side budget for one hive call. Must exceed the backend's own summed
-// phase budgets for /v1/workflows/runs (wf_runs_collect: 8s world reads + 8s
-// peer fan-out) or a healthy-but-full aggregation gets aborted mid-flight —
-// which is exactly the "Error creating response: This operation was aborted"
-// the runs tab showed. Tunable for operators; the retry below covers the
-// first-poll case where the backend is warming its caches.
 const TIMEOUT_MS = Number(process.env.HIVE_WF_TIMEOUT_MS || 25_000);
-
-// ---------------------------------------------------------------------------
-// Request context (shared with app/wf-console/[[...slug]]/route.ts)
-// ---------------------------------------------------------------------------
 
 const ALS_KEY = Symbol.for("hive.wfConsole.requestContext");
 if (!globalThis[ALS_KEY]) globalThis[ALS_KEY] = new AsyncLocalStorage();
@@ -80,15 +35,7 @@ function projectBody() {
   return p ? { project: p } : {};
 }
 
-// ---------------------------------------------------------------------------
-// hive HTTP client (mirrors ui/lib/gitops-server.ts backend())
-// ---------------------------------------------------------------------------
-
 async function hive(path, init) {
-  // One retry for aborted/timed-out READS: the backend computes the runs
-  // aggregation on a detached, coalesced task and serves later polls from
-  // cache, so the retry is cheap and typically hits the cache the first
-  // attempt just populated. Writes are never retried (not idempotent here).
   const method = (init && init.method) || "GET";
   try {
     return await hiveOnce(path, init);
@@ -131,11 +78,6 @@ async function hiveOnce(path, init) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Reshaping: hive rows -> @workflow/world shapes
-// (field contracts documented in ui/vendor/workflow-web/world-types/*.ts)
-// ---------------------------------------------------------------------------
-
 const RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled"];
 const STATUS_ALIASES = {
   succeeded: "completed",
@@ -166,22 +108,18 @@ function toDate(v) {
   return Number.isNaN(d.getTime()) ? undefined : d;
 }
 
-/**
- * hive stores WDK spec>=2 serialized payloads as base64 of the native devalue
- * bytes (magic prefix "devl"). Decode those back to the Uint8Array the console
- * expects (SerializedDataSchema); pass legacy/other values through untouched.
- */
+const DEVALUE_MAGIC = Buffer.from("devl");
+
+/** Decode hive's base64 devalue payloads (`DEVALUE_MAGIC` prefix) to the Uint8Array the console
+ *  expects; legacy values pass through untouched. */
 function decodeSerialized(v) {
   if (v === null || v === undefined) return undefined;
-  if (typeof v !== "string") return v; // legacy specVersion 1: raw JSON value
+  if (typeof v !== "string") return v;
   try {
     const buf = Buffer.from(v, "base64");
     if (
-      buf.length >= 4 &&
-      buf[0] === 0x64 && // d
-      buf[1] === 0x65 && // e
-      buf[2] === 0x76 && // v
-      buf[3] === 0x6c //    l
+      buf.length >= DEVALUE_MAGIC.length &&
+      buf.subarray(0, DEVALUE_MAGIC.length).equals(DEVALUE_MAGIC)
     ) {
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     }
@@ -265,8 +203,6 @@ function reshapeStep(s, resolveData = "all") {
   return out;
 }
 
-// Which eventData field carries the (serialized) payload per event type —
-// mirrors EVENT_DATA_PAYLOAD_FIELD_BY_EVENT_TYPE in the vendored world types.
 const EVENT_PAYLOAD_FIELD = {
   run_created: "input",
   run_started: "input",
@@ -299,7 +235,6 @@ function reshapeEvent(e, withData) {
       if (withData) copy[payloadField] = decodeSerialized(copy[payloadField]);
       else delete copy[payloadField];
     }
-    // Sleep bars in the trace viewer read eventData.resumeAt as a date.
     if ("resumeAt" in copy) copy.resumeAt = toDate(copy.resumeAt);
     if (Object.keys(copy).length > 0) out.eventData = copy;
   } else if (ed !== undefined && ed !== null) {
@@ -325,7 +260,6 @@ function reshapeHook(h) {
   };
 }
 
-// "workflow//./app/workflows/daemon//daemonWorkflow" -> parts
 function parseWfName(full) {
   const parts = String(full || "").split("//");
   if (parts.length >= 3) {
@@ -333,11 +267,6 @@ function parseWfName(full) {
   }
   return { filePath: "./workflows", name: String(full || "workflow") };
 }
-
-// ---------------------------------------------------------------------------
-// Pagination helper: hive returns full arrays; the console paginates with
-// {data, cursor, hasMore}. Cursor = stringified offset into the sorted array.
-// ---------------------------------------------------------------------------
 
 function paginate(rows, pagination = {}, defaultSort = "desc", sortKey = "createdAt") {
   const sortOrder = pagination.sortOrder || defaultSort;
@@ -357,16 +286,8 @@ function paginate(rows, pagination = {}, defaultSort = "desc", sortKey = "create
   };
 }
 
-// ---------------------------------------------------------------------------
-// Run-detail cache. runs.get + steps.list + events.list all come from the same
-// GET /v1/workflows/runs/:id endpoint; one page render fires all three, so a
-// tiny TTL cache collapses them into a single backend round-trip.
-// ---------------------------------------------------------------------------
-
 const DETAIL_TTL_MS = 2_000;
-const detailCache = new Map(); // runId -> { at, promise }
-// correlationId -> runId, learned from every event we serve (lets
-// events.listByCorrelationId work even though hive's API is run-scoped).
+const detailCache = new Map();
 const correlationToRun = new Map();
 const CORRELATION_CAP = 20_000;
 
@@ -390,11 +311,9 @@ async function fetchRunDetail(runId) {
       try {
         detail = await hive(`/v1/workflows/runs/${id}?project=${encodeURIComponent(project)}`);
       } catch (e) {
-        // Run may live in another project — the backend auto-scans without one.
         detail = await hive(`/v1/workflows/runs/${id}`);
       }
     } else {
-      // Unscoped (global console) — the backend auto-scans for the run's host.
       detail = await hive(`/v1/workflows/runs/${id}`);
     }
     const run = detail && detail.run;
@@ -411,10 +330,6 @@ async function fetchRunDetail(runId) {
   return promise;
 }
 
-// ---------------------------------------------------------------------------
-// The World
-// ---------------------------------------------------------------------------
-
 function buildWorld() {
   const world = {
     specVersion: 3,
@@ -426,8 +341,6 @@ function buildWorld() {
         return reshapeRun(detail.run, resolveData);
       },
       async list(params = {}) {
-        // Scoped: one project's runs. Unscoped: the backend fans out across
-        // every project of the tenant (the global /workflows view).
         const rows = await hive(`/v1/workflows/runs?summary=1${projectParam()}`);
         let runs = (Array.isArray(rows) ? rows : []).map((r) =>
           reshapeRun(r, "none")
@@ -490,10 +403,6 @@ function buildWorld() {
           .map((e) => reshapeEvent(e, withData));
         return paginate(events, params.pagination, "asc");
       },
-      // The console is an observability surface: the only writes the upstream
-      // code path can reach here are the run-op compositions, and the patched
-      // bundle prefers world.hiveOps for those. Keep exact fallbacks for the
-      // two event types the unpatched compositions would emit.
       async create(runId, data) {
         const eventType = data && data.eventType;
         if (eventType === "run_cancelled") {
@@ -509,8 +418,6 @@ function buildWorld() {
           };
         }
         if (eventType === "wait_completed") {
-          // wakeUpRun composition fallback — hive's wakeup endpoint completes
-          // ALL pending sleeps at once; per-wait event creation is a no-op.
           return {
             event: {
               eventId: `evnt_local_${Date.now()}`,
@@ -555,8 +462,6 @@ function buildWorld() {
       },
     },
 
-    // hive does not persist WDK streams — the console degrades gracefully
-    // (no live output panes) when a run has none.
     async listStreamsByRunId() {
       return [];
     },
@@ -586,8 +491,6 @@ function buildWorld() {
       },
     },
 
-    // The unpatched reenqueue composition calls runs.get + queue(...). Map the
-    // queue publish onto hive's dedicated reenqueue endpoint.
     async queue(_queueName, payload) {
       const runId = payload && payload.runId;
       if (!runId) throw new Error("hive world queue(): missing runId");
@@ -595,10 +498,6 @@ function buildWorld() {
       return { messageId: `msg_local_${Date.now()}` };
     },
 
-    // The bundle registers step/workflow queue handlers AT IMPORT TIME
-    // (getWorldHandlers() -> createQueueHandler(stepPrefix, ...)). This
-    // console never receives queue deliveries — hive's own runtime executes
-    // workflows — so hand back an inert request handler.
     createQueueHandler(_queueNamePrefix, _handler) {
       return async () =>
         new Response(
@@ -610,8 +509,6 @@ function buildWorld() {
     async getDeploymentId() {
       return "dpl_hive_console";
     },
-
-    // --- hive-specific extension points (preferred by the patched bundle) ---
 
     hiveOps: {
       async cancelRun(runId, cancelReason) {
@@ -683,8 +580,6 @@ function buildWorld() {
         /* defs unavailable — fall through to run-derived entries */
       }
       if (Object.keys(workflows).length === 0) {
-        // No registered defs: derive the catalog from observed runs so the
-        // Workflows tab still lists every workflow that has actually run.
         try {
           const rows = await hive(
             `/v1/workflows/runs?summary=1${projectParam()}`
