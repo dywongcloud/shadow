@@ -36,9 +36,9 @@ USER_TABLES_SQL = ("SELECT name FROM sqlite_master WHERE type='table' "
                    "AND name NOT LIKE 'sqlite_%' ORDER BY name")
 SCHEMA_SQL = ("SELECT type, name, tbl_name, sql FROM sqlite_master "
               "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+CANONICAL_NAN = b"f:nan;"
 
 
-# ---------------------------------------------------------------- engine-neutral digest
 def enc(v):
     if v is None:
         return b"N;"
@@ -48,7 +48,7 @@ def enc(v):
         return b"i:%d;" % v
     if isinstance(v, float):
         if v != v:
-            return b"f:nan;"          # collapse NaN bit patterns
+            return CANONICAL_NAN
         return b"f:%s;" % struct.pack(">d", v).hex().encode()
     if isinstance(v, bytes):
         return b"b:%d:%s;" % (len(v), v.hex().encode())
@@ -80,9 +80,9 @@ def hrana_value(v):
     if t == "text":
         return v["value"]
     if t == "blob":
-        b = v.get("base64") or v.get("value") or ""   # Hrana v3: "base64"
-        b += "=" * (-len(b) % 4)
-        return base64.b64decode(b)
+        b64 = v.get("base64") or v.get("value") or ""
+        b64 += "=" * (-len(b64) % 4)
+        return base64.b64decode(b64)
     raise SystemExit("unknown hrana value type %r" % t)
 
 
@@ -151,7 +151,6 @@ def compare(before, after):
             "all_match": bool(ok) and before["schema"] == after["schema"]}
 
 
-# ---------------------------------------------------------------- node primitives
 def sha256(p):
     h = H()
     with open(p, "rb") as f:
@@ -200,7 +199,6 @@ def nonfinite(path):
     return out
 
 
-# ---------------------------------------------------------------- subcommands
 def cmd_migrate(a):
     d, port = a.dir, a.port
     bk = os.path.join(a.backup_dir, "migrate-%s" % time.strftime("%Y%m%d-%H%M%S"))
@@ -259,13 +257,11 @@ def cmd_migrate(a):
 
 def cmd_roundtrip(a):
     d = a.dir
-    # Same root the Rust rollback writes to (`musql_migrate::backup_root`), so a
-    # backup taken by either mechanism is found at the same place.
     bks = sorted(glob.glob(os.path.join(a.backup_dir, "migrate-*")))
     bk = bks[-1] if bks else None
     work = "/tmp/hive-musql-roundtrip"
     shutil.rmtree(work, ignore_errors=True); os.makedirs(work)
-    iso = os.path.join(work, "isolated"); os.makedirs(iso)
+    musq_only_dir = os.path.join(work, "isolated"); os.makedirs(musq_only_dir)
     rep = {"node": os.uname().nodename, "backup_dir": bk, "databases": []}
     for musq in sorted(glob.glob(os.path.join(d, "hive-sqlite-*.musq"))):
         stem = os.path.basename(musq)[:-5]
@@ -280,9 +276,9 @@ def cmd_roundtrip(a):
             cmp = compare(side_sqlite(s2), side_sqlite(exp))
             rec["roundtrip_vs_backup"] = cmp
             rec["roundtrip_match"] = cmp["all_match"]
-        shutil.copy2(musq, iso)          # .musq alone, no .delta/.lock/.db
+        shutil.copy2(musq, musq_only_dir)
         rep["databases"].append(rec)
-    p = subprocess.Popen([a.musqld, "-dir", iso, "-listen", "127.0.0.1:%d" % a.port,
+    p = subprocess.Popen([a.musqld, "-dir", musq_only_dir, "-listen", "127.0.0.1:%d" % a.port,
                           "-idle-timeout", "900s"],
                          stdout=open(os.path.join(work, "musqld.log"), "ab"),
                          stderr=subprocess.STDOUT)
@@ -310,6 +306,10 @@ def cmd_roundtrip(a):
                     for r in rep["databases"]) else 2
 
 
+def repr_without_bearer_token(e):
+    return repr(e).split("Bearer")[0][:200]
+
+
 def flip(base, token, db_id, engine):
     """Flip the database RECORD to `engine` through the operator endpoint."""
     body = json.dumps({"engine": engine}).encode()
@@ -320,8 +320,8 @@ def flip(base, token, db_id, engine):
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return {"status": r.status, "body": json.loads(r.read())}
-    except Exception as e:                      # never echo the token
-        return {"status": None, "error": repr(e).split("Bearer")[0][:200]}
+    except Exception as e:
+        return {"status": None, "error": repr_without_bearer_token(e)}
 
 
 def cmd_rollback(a):
@@ -357,9 +357,6 @@ def cmd_rollback(a):
             live = os.path.join(d, stem + ".db")
             rec = {"db_id": db_id, "musq_bytes": os.path.getsize(musq), "musq_sha256": sha256(musq)}
             if os.path.exists(live):
-                # Snapshot first: the live file is about to be moved aside, and a
-                # crash between the two steps must still leave the pre-rollback
-                # database on disk.
                 pre = os.path.join(bk, stem + ".pre-rollback.db")
                 snapshot(live, pre)
                 rec["pre_rollback_snapshot"] = pre
@@ -372,7 +369,6 @@ def cmd_rollback(a):
                 rec["verdict"] = "EXPORT_FAILED"
                 out["databases"].append(rec)
                 continue
-            # Verify BEFORE it becomes the live file.
             rec["verify_vs_musql"] = compare(side_musql(base, stem + ".localhost"),
                                              side_sqlite(exp))
             rec["verified_before_install"] = rec["verify_vs_musql"]["all_match"]
@@ -396,7 +392,6 @@ def cmd_rollback(a):
             shutil.copy2(exp, live)
             rec["installed_bytes"] = os.path.getsize(live)
             rec["installed_sha256"] = sha256(live)
-            # Prove it: what an app opens must be what the engine still serves.
             rec["post_install"] = compare(side_musql(base, stem + ".localhost"),
                                           side_sqlite(live))
             rec["app_data_intact"] = rec["post_install"]["all_match"]
@@ -436,19 +431,14 @@ def cmd_verify(a):
 
 
 def main():
-    # Shared options live on EVERY subcommand (via `parents`), not on the main
-    # parser: argparse resolves a subparser default over a value the main parser
-    # already parsed, so declaring them in both places would silently discard
-    # `--dir` given before the subcommand name.
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--dir", default=os.path.join(
+    subcommand_options = argparse.ArgumentParser(add_help=False)
+    subcommand_options.add_argument("--dir", default=os.path.join(
         os.environ.get("HIVE_DATA", "/var/lib/hive/data"), "sqlite-dbs"))
-    common.add_argument("--musqld", default=os.environ.get("HIVE_MUSQLD_BIN", "/usr/local/bin/musqld"))
-    common.add_argument("--convert", default=os.environ.get("HIVE_MUSQL_CONVERT_BIN",
+    subcommand_options.add_argument("--musqld", default=os.environ.get("HIVE_MUSQLD_BIN", "/usr/local/bin/musqld"))
+    subcommand_options.add_argument("--convert", default=os.environ.get("HIVE_MUSQL_CONVERT_BIN",
                                                             "/usr/local/bin/musql-convert"))
-    common.add_argument("--port", type=int, default=18699)
-    # `musql_migrate::backup_root()` — backups sit beside the store, never in it.
-    common.add_argument("--backup-dir", default=os.path.join(
+    subcommand_options.add_argument("--port", type=int, default=18699)
+    subcommand_options.add_argument("--backup-dir", default=os.path.join(
         os.environ.get("HIVE_DATA", "/var/lib/hive/data"), "sqlite-dbs-backup"),
         help="backup root (default: $HIVE_DATA/sqlite-dbs-backup)")
 
@@ -456,9 +446,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("migrate", parents=[common]).set_defaults(fn=cmd_migrate)
-    sub.add_parser("roundtrip", parents=[common]).set_defaults(fn=cmd_roundtrip)
-    rb = sub.add_parser("rollback", parents=[common])
+    sub.add_parser("migrate", parents=[subcommand_options]).set_defaults(fn=cmd_migrate)
+    sub.add_parser("roundtrip", parents=[subcommand_options]).set_defaults(fn=cmd_roundtrip)
+    rb = sub.add_parser("rollback", parents=[subcommand_options])
     rb.add_argument("--db-id", action="append", help="only these database ids (repeatable)")
     rb.add_argument("--dry-run", action="store_true",
                     help="export and verify, but do not touch the live file")
@@ -466,7 +456,7 @@ def main():
     rb.add_argument("--token", default=os.environ.get("HIVE_OPS_TOKEN", ""),
                     help="operator bearer for --api-base (default $HIVE_OPS_TOKEN)")
     rb.set_defaults(fn=cmd_rollback)
-    v = sub.add_parser("verify", parents=[common])
+    v = sub.add_parser("verify", parents=[subcommand_options])
     v.add_argument("--sqlite", required=True)
     v.add_argument("--musql-base")
     v.add_argument("--musql-db")
