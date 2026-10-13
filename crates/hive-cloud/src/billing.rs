@@ -14,19 +14,18 @@ use uuid::Uuid;
 
 pub const MONTH_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-/// Plan catalog. `included_cents` is the monthly compute allowance; `overage`
-/// allows pay-as-you-go beyond it (Pro only). `max_projects`/`max_members` are the
-/// enforced quotas (0 = unlimited) — the "business locking" gates.
+/// Plan catalog. `included_cents` is the monthly compute allowance, the only field that costs real
+/// money per active tenant (the rest are ceilings that decide how early a user hits a wall);
+/// `overage` allows pay-as-you-go beyond it (Pro, Enterprise). The `max_*` fields are the enforced
+/// quotas (0 = unlimited).
 #[derive(Clone, Serialize)]
 pub struct PlanSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub price_cents: u64,
-    /// The real Stripe recurring Price id for this plan's subscription
-    /// (`price_...`), or `None` for a plan with no paid subscription (Hobby).
-    /// Checkout uses this directly (`mode=subscription`) instead of ad-hoc
-    /// `price_data` — required for a REAL recurring charge; ad-hoc price_data
-    /// only supports one-time payments.
+    /// The Stripe recurring Price id of this plan's subscription (`price_...`), `None` for Hobby.
+    /// Checkout uses it directly (`mode=subscription`): ad-hoc `price_data` only supports one-time
+    /// payments.
     pub stripe_price_id: Option<&'static str>,
     pub included_cents: u64,
     pub overage: bool,
@@ -44,10 +43,8 @@ pub struct PlanSpec {
     pub max_sandbox_env_vars: u32,
     /// Max exposed ports per sandbox, 0 = unlimited.
     pub max_sandbox_ports: u32,
-    /// Max total live bytes across a project's shadw drive (design §4), 0 =
-    /// unlimited. Enforced only at the `PUT file` handler (`drive_api.rs`),
-    /// matching this file's existing per-quota-site enforcement pattern
-    /// rather than a centralized check.
+    /// Max total live bytes across a project's shadw drive (0 = unlimited), enforced only at the
+    /// `PUT file` handler (`drive_api.rs`).
     pub max_drive_bytes: u64,
     pub features: &'static [&'static str],
 }
@@ -58,17 +55,8 @@ pub const PLANS: &[PlanSpec] = &[
         name: "Hobby",
         price_cents: 0,
         stripe_price_id: None,
-        // Included COMPUTE is deliberately unchanged at $5. It is the only field
-        // here that costs real money per active tenant; the rest are resource
-        // ceilings that mostly just decide how early a hobby user hits a wall.
         included_cents: 500,
         overage: false,
-        // Raised 2026-08-08. The previous ceilings (5 sandboxes, 1 running, 1
-        // mount, 2 ports, 1 seat) made the free tier hard to evaluate the
-        // platform on at all — a single running sandbox with one mount cannot
-        // demonstrate much. Pro stays clearly ahead on every axis (50 sandboxes,
-        // 10 running, 25 seats, pay-as-you-go overage), so the upgrade reason is
-        // intact.
         max_projects: 250,
         max_members: 3,
         max_sandboxes: 15,
@@ -109,8 +97,6 @@ pub const PLANS: &[PlanSpec] = &[
     PlanSpec {
         id: "enterprise",
         name: "Enterprise",
-        // $1,000/mo flat — matches the real Stripe price exactly (was 50000 /
-        // $500, a stale mock value from before real pricing existed).
         price_cents: 100000,
         stripe_price_id: Some("price_1TqKCGRj0yq8r94E4B8VhCC3"),
         included_cents: 100000,
@@ -133,16 +119,11 @@ pub const PLANS: &[PlanSpec] = &[
     },
 ];
 
-/// Per-plan CEILING on a single function's resources: `(max_vcpus,
-/// max_memory_mib)`, or `None` for no plan-specific cap (the container-level
-/// `HIVE_CONTAINER_*_MAX` clamp still applies fleet-wide).
-///
-/// Capacity policy (operator decision, 2026-08): enterprise deployments are
-/// the fleet's biggest consumers, so an enterprise function is capped at
-/// 2 vCPU / 4 GiB (the default sizing, 1 vCPU / 2 GiB, is unchanged — this
-/// only lowers the MAX an enterprise function may request). Every other plan
-/// — including any legacy/grandfathered tenant — is left exactly as it was:
-/// `None` means "no new cap here", so nothing about their sizing changes.
+/// Per-plan CEILING on one function's resources, `(max_vcpus, max_memory_mib)`, or `None` for no
+/// plan-specific cap (the fleet-wide `HIVE_CONTAINER_*_MAX` clamp still applies). Capacity policy:
+/// an enterprise function may request at most 2 vCPU / 4 GiB (default sizing is unchanged) since
+/// enterprise deployments are the fleet's biggest consumers; every other plan, legacy tenants
+/// included, keeps its sizing.
 pub fn plan_resource_ceiling(plan: &str) -> Option<(u32, u32)> {
     match plan.trim().to_ascii_lowercase().as_str() {
         "enterprise" => Some((2, 4096)),
@@ -201,22 +182,19 @@ pub struct RateCard {
     pub waf_per_million_cents: f64,
     /// Serverless GPU instance-time, cents per GPU-hour (Tesla T4 class).
     pub gpu_hr_cents: f64,
-    /// Requests served by a donated browser node, cents per million. 0.0 by
-    /// design (bn-impl-billing-metering): Cloudflare/Salad precedent is to
-    /// bill only platform-consumed resources, and an owner's own browser
-    /// serving their own app consumes none. Kept as a real rate-card field
-    /// (not omitted) so pricing it later is a config change, not a schema
-    /// migration.
+    /// Requests served by a donated browser node, cents per million. 0.0 by design: only
+    /// platform-consumed resources are billed, and an owner's own browser serving their own app
+    /// consumes none. A real rate-card field, so pricing it later is a config change.
     pub browser_per_million_cents: f64,
 }
 
 pub const RATE_CARD: RateCard = RateCard {
-    active_cpu_hr_cents: 12.8,         // $0.128 / active-CPU-hr
-    mem_gb_hr_cents: 1.06,             // $0.0106 / GB-hr
-    requests_per_million_cents: 200.0, // $2.00 / M requests
-    waf_per_million_cents: 60.0,       // $0.60 / M blocked
-    gpu_hr_cents: 60.0,                // $0.60 / GPU-hr (T4 class)
-    browser_per_million_cents: 0.0,    // uncharged today, see field doc
+    active_cpu_hr_cents: 12.8,
+    mem_gb_hr_cents: 1.06,
+    requests_per_million_cents: 200.0,
+    waf_per_million_cents: 60.0,
+    gpu_hr_cents: 60.0,
+    browser_per_million_cents: 0.0,
 };
 
 /// Cumulative usage counters for a tenant (as measured from live metrics).
@@ -227,14 +205,12 @@ pub struct UsageTotals {
     pub mem_gb_hr_milli: u64,
     pub requests: u64,
     pub blocked: u64,
-    /// GPU instance wall-time, ms (a GPU function's fluid_ms — the GPU is held
-    /// for the instance's whole life, so wall-time not active-CPU is the honest
-    /// unit). `serde(default)` keeps persisted pre-GPU snapshots loading.
+    /// GPU instance wall-time, ms: the GPU is held for the instance's whole life, so wall-time, not
+    /// active-CPU, is the honest unit. `serde(default)` keeps pre-GPU snapshots loading.
     #[serde(default)]
     pub gpu_ms: u64,
-    /// Requests served by a donated browser node — counted separately from
-    /// `requests` so it's visible in the UI/quota ahead of any pricing
-    /// decision, never silently folded into the billed fleet-request count.
+    /// Requests served by a donated browser node, counted apart from `requests` so they are visible
+    /// ahead of any pricing decision and never folded into the billed fleet-request count.
     #[serde(default)]
     pub browser_requests: u64,
 }
@@ -266,10 +242,9 @@ pub struct Invoice {
     /// "paid" | "due" | "draft"
     pub status: String,
     pub created_ms: u64,
-    /// Tamper-evident commitment over this SAME period's raw ledger entries.
-    /// `Some` only once `account()`'s rollover computed one — never on a
-    /// "draft" invoice from `current_invoice`. `#[serde(default)]` so
-    /// pre-existing persisted invoices load with `None`.
+    /// Tamper-evident commitment over this SAME period's raw ledger entries: `Some` only once
+    /// `account()`'s rollover computed one, never on a draft invoice. `serde(default)` loads older
+    /// invoices with `None`.
     #[serde(default)]
     pub ledger_checkpoint: Option<LedgerCheckpoint>,
 }
@@ -280,11 +255,10 @@ pub struct InvoiceLine {
     pub amount_cents: i64,
 }
 
-/// Tamper-evident commitment over one tenant-period's raw `LedgerEntry` rows.
-/// NOT a zk-SNARK/STARK: there is no external, untrusted verifier for this
-/// platform's own billing process to convince, so this is a plain SHA-256
-/// hash chain giving tamper-evidence and fast replay verification, not real
-/// zero-knowledge trust-minimization. See `BillingStore::compute_ledger_checkpoint`.
+/// Tamper-evident commitment over one tenant-period's raw `LedgerEntry` rows: a plain SHA-256 hash
+/// chain for tamper-evidence and fast replay verification. NOT zero-knowledge: this platform's
+/// billing has no external untrusted verifier to convince. See
+/// `BillingStore::compute_ledger_checkpoint`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LedgerCheckpoint {
     pub tenant: String,
@@ -320,11 +294,6 @@ pub fn plan_allows_failover(plan: &str) -> bool {
 pub fn plan_allows_sso(plan: &str) -> bool {
     plan == "enterprise"
 }
-
-// ---- Enterprise feature gating (see [`crate::enterprise`]) ----------------
-// SAML SSO, SCIM directory sync, custom SIEM audit streaming, account-level IP
-// blocking, and Conformance are Enterprise-only. Deployment password protection
-// and microfrontends are available from Pro up (Vercel parity).
 
 /// SAML SSO configuration is Enterprise-only (org identity federation).
 pub fn plan_allows_saml(plan: &str) -> bool {
@@ -372,41 +341,31 @@ pub fn plan_max_log_age_ms(plan: &str) -> u64 {
 pub struct BillingAccount {
     pub tenant: String,
     pub plan: String,
-    pub status: String, // "active"
+    pub status: String,
     pub included_cents: u64,
     pub used_cents: u64,
     /// Prepaid credit balance (pay-as-you-go top-ups), in cents.
     pub balance_cents: i64,
     #[serde(default)]
     pub stripe_customer: String,
-    /// The active Stripe Subscription id (`sub_...`) backing a paid plan, if
-    /// any — set from the checkout/webhook verification response. Lets a
-    /// `customer.subscription.deleted`/`.updated` webhook find the right
-    /// tenant to downgrade/sync without a separate index.
+    /// The Stripe Subscription id (`sub_...`) backing a paid plan, so a
+    /// `customer.subscription.deleted`/`.updated` webhook can find its tenant without a separate
+    /// index.
     #[serde(default)]
     pub stripe_subscription: String,
     pub period_start_ms: u64,
     pub period_end_ms: u64,
     pub updated_ms: u64,
-    /// Operator-set tier FLOOR. While `Some(plan)`, no automatic path may move
-    /// this tenant below that plan — not the free-plan checkout shortcut, not a
-    /// Stripe `customer.subscription.deleted`, not a period rollover.
-    ///
-    /// A one-shot grant is not durable, and that cost real money and real
-    /// downtime: the platform owner was granted `enterprise` on 2026-07-18, a
-    /// user-initiated free-plan checkout silently reverted only the BILLING
-    /// half to `hobby` on 2026-07-25, and the account sat quota-locked
-    /// (`can_deploy` denied, balance -42030 cents) while `c.teams` still read
-    /// `enterprise`. Only an explicit operator call sets or clears this, so a
-    /// downgrade event can no longer undo a grant.
+    /// Operator-set tier FLOOR: while `Some(plan)`, no automatic path (the free-plan checkout
+    /// shortcut, Stripe `customer.subscription.deleted`, a period rollover) may move this tenant
+    /// below that plan. A one-shot grant is not durable (a free-plan checkout once reverted only
+    /// the billing half of an `enterprise` grant, leaving the account quota-locked while `c.teams`
+    /// still read `enterprise`), so only an explicit operator call sets or clears it.
     #[serde(default)]
     pub tier_locked_plan: Option<String>,
-    /// One-off addon charges (e.g. "Dedicated IPv4 — myapp") for the
-    /// CURRENT (in-progress) period, folded into `build_invoice`'s output
-    /// alongside the subscription/usage lines it already computes — this is
-    /// the whole mechanism, no separate invoice-line store: cleared back to
-    /// empty on period rollover, right after the closing invoice snapshot
-    /// (which still includes them) is built.
+    /// One-off addon charges (e.g. "Dedicated IPv4 — myapp") for the CURRENT period, folded into
+    /// `build_invoice`'s output beside the subscription and usage lines and cleared on rollover
+    /// right after the closing invoice, which still includes them, is built.
     #[serde(default)]
     pub addon_lines: Vec<InvoiceLine>,
 }
@@ -475,10 +434,8 @@ pub struct Checkout {
     /// Empty unless `kind == "addon"`.
     #[serde(default)]
     pub target: String,
-    /// The REAL Stripe Checkout Session id (`cs_...`), set once the real
-    /// session is created. Empty for a mock (no-Stripe) checkout. Lets
-    /// confirmation verify actual payment with Stripe instead of trusting an
-    /// unauthenticated client's say-so that they paid.
+    /// The REAL Stripe Checkout Session id (`cs_...`); empty for a mock checkout. Confirmation
+    /// verifies actual payment with Stripe through it instead of trusting a client's say-so.
     #[serde(default)]
     pub stripe_session_id: String,
     pub created_ms: u64,
@@ -493,34 +450,23 @@ struct MeterState {
 }
 
 /// One tenant's meter cursor as it crosses the persistence boundary
-/// (`meters_snapshot`/`meters_load` → `PlatformSnapshot::billing_meters`).
-///
-/// This exists because the cursor is the ONLY thing standing between a restart
-/// and a re-bill: `meter_usage` charges `current - last`, and `last` used to
-/// live exclusively in a `RwLock<HashMap<..>>` that `snapshot()` never
-/// returned. A restart therefore restarted every tenant's watermark at zero
-/// while the fleet-wide counters it is subtracted from kept climbing, so the
-/// first tick after a restart charged the ENTIRE cumulative fleet total again
-/// (the −$55 incident documented on `meter_usage`'s counter-reset branch,
-/// which fixed the fleet-side half of the same arithmetic and left the
-/// persistence-side half open).
+/// (`meters_snapshot`/`meters_load`). It is the ONLY thing standing between a restart and a
+/// re-bill: `meter_usage` charges `current - last`, and `last` once lived only in memory, so the
+/// first tick after a restart re-charged the ENTIRE cumulative fleet total.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MeterWatermark {
     pub tenant: String,
     #[serde(default)]
     pub last: UsageTotals,
-    /// Sub-cent remainder carried to the next tick. Persisted with the
-    /// watermark: dropping it silently discards up to 1¢ of accrued usage per
-    /// tenant per restart, in the customer's favour but out of the ledger.
+    /// Sub-cent remainder carried to the next tick, persisted with the watermark (dropping it loses
+    /// up to 1 cent of accrued usage per tenant per restart).
     #[serde(default)]
     pub frac_cents: f64,
 }
 
-/// How long an unconfirmed checkout survives. Stripe expires a Checkout Session
-/// after 24h, so a local record older than that can never be confirmed — and
-/// persistence (below) is what makes the bound necessary in the first place: the
-/// map used to be cleared by every process restart, which "collected" abandoned
-/// checkouts by accident.
+/// How long an unconfirmed checkout survives: Stripe expires a Checkout Session after 24 h, so an
+/// older local record can never be confirmed. Needed because checkouts persist; the map used to be
+/// cleared by every restart.
 pub const CHECKOUT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Default)]
@@ -530,17 +476,11 @@ pub struct BillingStore {
     checkouts: RwLock<HashMap<String, Checkout>>,
     meters: RwLock<HashMap<String, MeterState>>,
     invoices: RwLock<HashMap<String, Vec<Invoice>>>,
-    /// Set when this process restored a snapshot that carried NO meters field
-    /// at all (a pre-upgrade node's snapshot, or no snapshot). A missing field
-    /// means the watermarks are UNKNOWN, never zero — so the first reading for
-    /// a tenant with no cursor is adopted as its baseline and charged nothing,
-    /// exactly as a counter DECREASE is (`meter_usage`). Under-counting one
-    /// tick is the correct direction to err; charging from zero re-bills the
-    /// whole fleet's cumulative usage.
-    ///
-    /// Default `false` is the honest value for a store that never loaded
-    /// anything (fresh install, unit tests): there is no lost watermark to be
-    /// unknown about, so a first reading is genuinely first usage.
+    /// Set when this process restored a snapshot with NO meters field (a pre-upgrade node's, or
+    /// none): the watermarks are UNKNOWN, not zero, so a tenant's first reading is adopted as its
+    /// baseline and charged nothing, like a counter decrease (`meter_usage`); charging from zero
+    /// would re-bill the fleet's cumulative usage. `false` for a store that never loaded anything:
+    /// a first reading is then genuinely first usage.
     meters_baseline_unknown: std::sync::atomic::AtomicBool,
 }
 
@@ -550,6 +490,13 @@ impl BillingStore {
     }
 
     /// Get (or lazily create a Hobby) account for a tenant.
+    ///
+    /// A call after the period elapsed ROLLS it: finalizes the closing invoice (ledger checkpoint
+    /// from the OLD `period_start_ms`), resets the counters and re-derives the allowance from the
+    /// EFFECTIVE plan, never below an operator tier floor. The rollover holds the `accounts` write
+    /// guard, so it may call only `usage_cost_cents_since` and `compute_ledger_checkpoint`, never
+    /// `usage_cost_cents_for`, whose read lock deadlocks against it (a real leader hang once the
+    /// relational mirror called `account()` per tenant per tick).
     pub fn account(&self, tenant: &str) -> BillingAccount {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -560,39 +507,18 @@ impl BillingStore {
         let acc = m
             .entry(tenant.to_string())
             .or_insert_with(|| BillingAccount::default_for(tenant));
-        // Roll the monthly period (renew included allowance) if elapsed — and
-        // FINALIZE the closing period's invoice before resetting the counters.
         let now = now_ms();
         let rolled = if now >= acc.period_end_ms {
-            // MUST use usage_cost_cents_since (ledger-only, no `self.accounts`
-            // touch) here, never usage_cost_cents_for -- `m` (accounts' write
-            // guard) is still held at this point, and usage_cost_cents_for
-            // internally does `self.accounts.read()`, which deadlocks against
-            // parking_lot::RwLock's non-reentrant write-then-read-same-thread
-            // pattern. Live-witnessed in production: this branch only fires
-            // once a tenant's monthly period actually elapses, so it went
-            // unhit for a long time -- reproduced as a real hang on the
-            // control-plane leader once account() started being called more
-            // frequently (relational mirror loop, one call per tenant per
-            // tick) raised the odds of landing on a tenant mid-rollover.
             let mut closing = build_invoice(
                 acc,
                 self.usage_cost_cents_since(tenant, acc.period_start_ms),
                 "paid",
             );
-            // Compute the checkpoint from the OLD period_start_ms, before it's
-            // overwritten below. compute_ledger_checkpoint touches only
-            // `self.ledger` (never `self.accounts`), same locking-safety rule
-            // as `usage_cost_cents_since` above — `m` is still held here.
             closing.ledger_checkpoint =
                 Some(self.compute_ledger_checkpoint(tenant, acc.period_start_ms, now));
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
-            // Re-derive the allowance from the EFFECTIVE plan, i.e. never below
-            // an operator tier floor. Without this a locked tenant whose stored
-            // plan was downgraded before the lock existed would have the lower
-            // allowance re-applied every month, re-arming `can_deploy`'s block.
             let effective = match acc.tier_locked_plan.as_deref() {
                 Some(f) if plan_rank(f) > plan_rank(&acc.plan) => {
                     acc.plan = f.to_string();
@@ -602,9 +528,6 @@ impl BillingStore {
             };
             acc.included_cents = plan_spec(effective).included_cents;
             acc.updated_ms = now;
-            // The closing snapshot above already carries this period's addon
-            // lines (`build_invoice` read `acc` before this clear runs) — the
-            // new period starts with none of its own.
             acc.addon_lines.clear();
             Some(closing)
         } else {
@@ -629,12 +552,10 @@ impl BillingStore {
         out
     }
 
-    /// Sum of usage (non-plan) charges recorded THIS period, in cents. Looks up
-    /// the tenant's period_start_ms itself via `self.accounts.read()` -- ONLY
-    /// safe to call when the caller does NOT already hold a lock (read or
-    /// write) on `self.accounts` on this thread/task. `account()`'s rollover
-    /// path holds `self.accounts`'s write lock across this computation and
-    /// must use `usage_cost_cents_since` instead (see its call site).
+    /// Sum of usage (non-plan) charges recorded THIS period, in cents; takes `self.accounts.read()`
+    /// itself, so call it ONLY when no lock on `self.accounts` is held on this thread
+    /// (parking_lot's RwLock is not re-entrant). `account()`'s rollover uses
+    /// `usage_cost_cents_since`.
     fn usage_cost_cents_for(&self, tenant: &str) -> i64 {
         let acc_start = self
             .accounts
@@ -645,32 +566,26 @@ impl BillingStore {
         self.usage_cost_cents_since(tenant, acc_start)
     }
 
-    /// Sum of usage (non-plan) charges recorded since `period_start_ms`, in
-    /// cents. Touches only `self.ledger`, never `self.accounts` -- safe to
-    /// call while the caller already holds `self.accounts`'s write lock.
+    /// Sum of usage (non-plan) charges recorded since `period_start_ms`, in cents (usage ledger
+    /// entries are negative amounts, so the sum is negated). Touches only `self.ledger`, never
+    /// `self.accounts`: safe to call while the caller already holds `self.accounts`'s write lock.
     fn usage_cost_cents_since(&self, tenant: &str, period_start_ms: u64) -> i64 {
         self.ledger
             .read()
             .iter()
             .filter(|e| e.tenant == tenant && e.kind == "usage" && e.ts_ms >= period_start_ms)
-            .map(|e| -e.amount_cents) // usage entries are negative amounts
+            .map(|e| -e.amount_cents)
             .sum()
     }
 
-    /// Compute (never mutates) a tamper-evident SHA-256 hash-chain commitment
-    /// over a tenant's raw ledger entries in `[period_start_ms, period_end_ms)`.
-    /// Touches only `self.ledger` — safe to call while the caller holds
-    /// `self.accounts`'s write lock, same rule as `usage_cost_cents_since`.
+    /// Computes (never mutates) a tamper-evident SHA-256 hash-chain commitment over a tenant's raw
+    /// ledger entries in `[period_start_ms, period_end_ms)`; touches only `self.ledger`, so it is
+    /// safe under `self.accounts`'s write lock.
     ///
-    /// Entries are sorted `(ts_ms, id)` ASC before chaining: `self.ledger` is
-    /// push-appended across all tenants concurrently, not itself ordered per
-    /// tenant, so the chain must be computed over a deterministic order or two
-    /// computations of the "same" period would disagree. `0x1F` (ASCII unit
-    /// separator) delimits fields to avoid ambiguous concatenation without a
-    /// canonicalized encoding. The genesis hash is domain-separated by a
-    /// version string + tenant + period start so two tenants'/periods' empty
-    /// chains never collide, and leaves a `v2` escape hatch if this leaf
-    /// encoding ever changes.
+    /// Entries are sorted `(ts_ms, id)` first (the ledger is push-appended across tenants
+    /// concurrently, and two computations of one period must agree); `0x1F` delimits fields
+    /// unambiguously; the genesis hash is domain-separated by version + tenant + period start, so
+    /// no two empty chains collide, and leaves a `v2` escape hatch.
     pub(crate) fn compute_ledger_checkpoint(
         &self,
         tenant: &str,
@@ -747,10 +662,9 @@ impl BillingStore {
         before - g.len()
     }
 
-    /// Mark the in-memory `Invoice` whose checkpoint covers
-    /// `[period_start_ms, period_end_ms)` as pruned, so a restart's
-    /// `invoices_load` correctly remembers pruned-state without re-attempting
-    /// an already-completed relational delete on every tick.
+    /// Marks the in-memory `Invoice` whose checkpoint covers `[period_start_ms, period_end_ms)` as
+    /// pruned, so a restart's `invoices_load` does not re-attempt the completed relational delete
+    /// every tick.
     pub(crate) fn mark_checkpoint_pruned(&self, tenant: &str, period_start_ms: u64) {
         if let Some(invs) = self.invoices.write().get_mut(tenant) {
             for inv in invs.iter_mut() {
@@ -789,10 +703,15 @@ impl BillingStore {
         self.ledger_push(tenant, "usage", -(cents as i64), bal_after, note);
     }
 
-    /// Feed the latest cumulative usage totals for a tenant; charges the delta since
-    /// the last reading (delta·rate), carrying the sub-cent remainder so nothing is
-    /// lost. Handles counter resets (pool recycle / node restart) by charging the
-    /// fresh value. This is the metering→billing pipeline. Returns cents charged.
+    /// Feeds the latest cumulative usage totals for a tenant and charges the delta since the last
+    /// reading, carrying the sub-cent remainder; returns cents charged.
+    ///
+    /// The counters are CUMULATIVE and summed across the fleet (`fleet_function_stats`), so `cur <
+    /// last` is a counter RESET (a node restarted), not usage: it re-baselines, charging nothing.
+    /// Charging `cur` re-billed the ENTIRE fleet's usage on every node restart (a tenant hit -$55
+    /// against a $5 allowance during a rolling upgrade and tripped the `can_deploy` credit lock);
+    /// under-counting is the right direction to err. A tenant with no cursor in a process booted
+    /// without persisted meters is treated the same (`meters_baseline_unknown`).
     pub fn meter_usage(&self, tenant: &str, current: UsageTotals) -> u64 {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -801,32 +720,11 @@ impl BillingStore {
         };
         let (delta, carry) = {
             let mut meters = self.meters.write();
-            // No cursor for this tenant AND this process booted without a
-            // persisted meters field => the watermark is UNKNOWN, not zero.
-            // Adopt the live counters as the baseline and charge nothing this
-            // tick (same re-baseline rule as a counter decrease below).
             let seeding = self
                 .meters_baseline_unknown
                 .load(std::sync::atomic::Ordering::Relaxed)
                 && !meters.contains_key(tenant);
             let st = meters.entry(tenant.to_string()).or_default();
-            // These are CUMULATIVE counters summed across the whole fleet
-            // (`fleet_function_stats`), so `cur < last` means a counter RESET,
-            // not usage — a single node restarting drops its contribution and
-            // with it the fleet total.
-            //
-            // Charging `cur` in that case (the previous behaviour) re-bills the
-            // ENTIRE fleet's accumulated usage as if it were brand new, every
-            // time any one node restarts. A rolling fleet upgrade therefore
-            // bills the whole fleet over and over: witnessed as a tenant landing
-            // at -$55 against a $5 allowance during a session that restarted all
-            // 12 nodes several times, which then tripped the can_deploy credit
-            // lock and refused deploys.
-            //
-            // Treat a decrease as a re-baseline: charge nothing for this tick and
-            // adopt the new floor. That can under-count the usage accrued between
-            // the last sample and the restart, which is the correct direction to
-            // err for billing — never charge a customer for a counter reset.
             let sub = |cur: u64, last: u64| if cur >= last { cur - last } else { 0 };
             let delta = if seeding {
                 tracing::info!(
@@ -891,13 +789,10 @@ impl BillingStore {
         v
     }
 
-    /// Finalized (`status == "paid"`) invoices for a tenant, exactly as
-    /// stored — WITHOUT the current in-progress period's draft (unlike
-    /// `invoices()`, which appends it for the read API). `self.invoices`
-    /// only ever holds invoices `account()`'s period-rollover pushed via
-    /// `build_invoice(.., "paid")`, so this is already finalized-only by
-    /// construction; used by the relational mirror (`relational::upsert_billing`),
-    /// which must NEVER persist a draft (transient/computed, not a stored fact).
+    /// Finalized (`status == "paid"`) invoices for a tenant as stored, WITHOUT the in-progress
+    /// draft that `invoices()` appends; `self.invoices` only holds what `account()`'s rollover
+    /// pushed, so it is finalized-only by construction, and the relational mirror
+    /// (`relational::upsert_billing`) must NEVER persist a draft.
     pub fn finalized_invoices(&self, tenant: &str) -> Vec<Invoice> {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -932,10 +827,9 @@ impl BillingStore {
         e
     }
 
-    /// Set (or clear, with `None`) a tenant's operator tier FLOOR, and raise the
-    /// live plan to it immediately so the lock and the served tier can never
-    /// disagree. Operator-only by construction: the only caller is the admin
-    /// grant path, so no user-reachable route can lift or lower it.
+    /// Sets (or clears, with `None`) a tenant's operator tier FLOOR and raises the live plan to it
+    /// at once (through `set_plan`), so the lock and the served tier cannot disagree. Operator-only
+    /// by construction: the only caller is the admin grant path.
     pub fn set_tier_lock(&self, tenant: &str, floor: Option<&str>) -> BillingAccount {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -950,8 +844,6 @@ impl BillingStore {
             acc.tier_locked_plan = floor.map(|s| s.to_string());
             acc.updated_ms = now_ms();
         }
-        // Raising to the floor goes through set_plan so the ledger records the
-        // change and `included_cents` is re-derived from the plan spec.
         match floor {
             Some(f) if plan_rank(f) > plan_rank(&self.account(tenant).plan) => {
                 self.set_plan(tenant, f)
@@ -960,18 +852,16 @@ impl BillingStore {
         }
     }
 
+    /// Sets a tenant's plan, never below its operator tier floor: every automatic downgrade path
+    /// (free-plan checkout shortcut, `customer.subscription.deleted`, checkout confirmation)
+    /// funnels through here, so the floor is enforced at this ONE chokepoint and `set_tier_lock` is
+    /// the only way past it.
     pub fn set_plan(&self, tenant: &str, plan: &str) -> BillingAccount {
         let tenant = if tenant.is_empty() {
             "personal"
         } else {
             tenant
         };
-        // Honour the operator-set tier FLOOR. Every automatic downgrade path in
-        // the platform (free-plan checkout shortcut, Stripe
-        // `customer.subscription.deleted`, checkout confirmation) funnels
-        // through here, so enforcing it at this ONE chokepoint is what makes
-        // the lock unbypassable rather than something each caller must
-        // remember. `set_tier_lock` is the only way past it.
         let locked = self
             .accounts
             .read()
@@ -1030,14 +920,10 @@ impl BillingStore {
         self.account(tenant)
     }
 
-    /// Record a one-off addon charge (e.g. dedicated-IPv4 provisioning) onto
-    /// the tenant's CURRENT invoice — `description`/`amount_cents` become an
-    /// `InvoiceLine` on `BillingAccount::addon_lines`, which `build_invoice`
-    /// already folds into both the live draft and (on rollover) the
-    /// finalized invoice `relational::upsert_billing` persists. Also logs a
-    /// ledger entry purely for visibility in the billing ledger view — the
-    /// ledger's `balance_after_cents` is unaffected (an addon charge is
-    /// billed on the invoice, not drawn from prepaid balance).
+    /// Records a one-off addon charge (e.g. dedicated-IPv4 provisioning) as an `InvoiceLine` on
+    /// `BillingAccount::addon_lines`, which `build_invoice` folds into the live draft and the
+    /// finalized invoice. A ledger entry is logged for visibility only: `balance_after_cents` is
+    /// unaffected, since an addon is billed on the invoice, not drawn from prepaid balance.
     pub fn record_addon_charge(&self, tenant: &str, description: &str, amount_cents: i64) {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -1085,7 +971,6 @@ impl BillingStore {
                 if acc.balance_cents >= remaining as i64 {
                     acc.balance_cents -= remaining as i64;
                 } else if spec.overage {
-                    // Pay-as-you-go: allow the balance to go negative (invoiced).
                     acc.balance_cents -= remaining as i64;
                 } else {
                     return Err("Insufficient credits — upgrade to Pro or add credits.".into());
@@ -1133,10 +1018,8 @@ impl BillingStore {
         v
     }
 
-    /// Checkouts currently open (not yet confirmed — `confirm_checkout`
-    /// removes a checkout from the live map once applied) for a tenant. Used
-    /// by the relational mirror to persist a tenant's in-flight checkout
-    /// state (`billing_checkouts`, previously not mirrored at all).
+    /// Checkouts currently open (not yet confirmed) for a tenant, for the relational mirror's
+    /// `billing_checkouts`.
     pub fn checkouts_for_tenant(&self, tenant: &str) -> Vec<Checkout> {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -1196,10 +1079,8 @@ impl BillingStore {
         }
     }
 
-    /// Persist the Stripe customer/subscription ids backing a tenant's paid
-    /// plan (from a verified checkout or a `checkout.session.completed`
-    /// webhook). Empty strings are no-ops (never overwrite a known id with
-    /// nothing just because one event's payload omitted it).
+    /// Persists the Stripe customer/subscription ids backing a tenant's paid plan; an empty string
+    /// is a no-op, so an event whose payload omits an id never overwrites a known one.
     pub fn set_stripe_ids(&self, tenant: &str, customer: &str, subscription: &str) {
         let tenant = if tenant.is_empty() {
             "personal"
@@ -1234,46 +1115,30 @@ impl BillingStore {
         self.checkouts.read().get(id).cloned()
     }
 
-    /// Drop a tenant's billing account entirely (used when its team is deleted),
-    /// so a removed tenant cannot leave a stray tier/quota row behind. The
-    /// LEDGER is deliberately left intact: it is the financial record of what
-    /// actually happened and must survive the account it describes.
+    /// Drops a tenant's billing account (its team was deleted). The LEDGER is left intact on
+    /// purpose: it is the financial record and must outlive the account.
     pub fn remove_account(&self, tenant: &str) -> Option<BillingAccount> {
         self.accounts.write().remove(tenant)
     }
 
-    /// Complete a checkout: apply the plan change or credit top-up. Idempotent
-    /// (consumes the session).
-    /// Complete a checkout. A CREDIT top-up is applied here (it touches only the
-    /// balance). A PLAN checkout deliberately does NOT write the plan here: the
-    /// caller applies it via `admin::apply_plan_everywhere`, which writes BOTH
-    /// the billing account and the team record and emits the audit entry.
-    ///
-    /// This used to call `set_plan` itself, which made it a SECOND, silent plan
-    /// writer behind the caller's back — a tier could change with no audit
-    /// record and with the team record left stale, which is exactly the split
-    /// (`teams: enterprise` / `billing: hobby`, no `plan_change` in the audit
-    /// log) witnessed in production. One writer only.
+    /// Completes a checkout (idempotent: it consumes the session). A CREDIT top-up is applied here;
+    /// a PLAN checkout deliberately is NOT: the caller applies it through
+    /// `admin::apply_plan_everywhere`, which writes BOTH the billing account and the team record
+    /// and audits it (this used to call `set_plan` itself, leaving a stale team record and no
+    /// `plan_change` audit entry), and an addon is provisioned by the caller too. One writer only.
     pub fn confirm_checkout(&self, id: &str) -> Option<(Checkout, BillingAccount)> {
         let c = self.checkouts.write().remove(id)?;
         let acc = match c.kind.as_str() {
             "credits" => self.add_credits(&c.tenant, c.amount_cents, "Credit top-up (checkout)"),
-            // "plan" and "addon" both leave the account untouched here — plan
-            // application (`apply_plan_everywhere`) and addon provisioning
-            // (`tencent_eip::provision_from_checkout`) are the CALLER's job,
-            // the same single-writer split the "credits" branch above already
-            // draws for itself.
             _ => self.account(&c.tenant),
         };
         Some((c, acc))
     }
 
-    // --- persistence ---
-    // FOUR pairs, not one: `snapshot`/`load` (accounts + ledger),
-    // `invoices_snapshot`/`invoices_load`, `meters_snapshot`/`meters_load`, and
-    // `checkouts_snapshot`/`checkouts_load`. Every field of `BillingStore` is
-    // covered by exactly one of them — anything added to the struct without a
-    // pair here is state that silently dies at the next restart or failover.
+    /// Persistence comes in FOUR pairs: `snapshot`/`load` (accounts + ledger),
+    /// `invoices_snapshot`/`invoices_load`, `meters_snapshot`/`meters_load` and
+    /// `checkouts_snapshot`/`checkouts_load`. Every field of `BillingStore` is covered by exactly
+    /// one: a field added without a pair silently dies at the next restart or failover.
     pub fn snapshot(&self) -> (Vec<BillingAccount>, Vec<LedgerEntry>) {
         (
             self.accounts.read().values().cloned().collect(),
@@ -1287,19 +1152,13 @@ impl BillingStore {
             .collect();
         *self.ledger.write() = ledger;
     }
-    /// Per-tenant meter watermarks (for persistence), tenant-sorted so the
-    /// bytes are deterministic — a byte-compare change gate (`store_sync`,
-    /// the relational dirty-check) must not see a HashMap's iteration order as
-    /// a change.
+    /// Per-tenant meter watermarks for persistence, tenant-sorted so the bytes are deterministic
+    /// for byte-compare change gates.
     ///
-    /// Deliberately a SEPARATE pair from `snapshot()`/`load()` rather than a
-    /// widened tuple: the accounts+ledger tuple is also the wire shape
-    /// `store_sync`'s `billing` entry encodes, and a node running the previous
-    /// binary decodes that wire value with `serde_json::from_slice::<(Map,
-    /// Vec)>`, which fails outright on a 3-element array. Widening it would
-    /// stop billing replicating to every not-yet-upgraded node for the length
-    /// of a rollout. `invoices_snapshot`/`invoices_load` set the same
-    /// precedent.
+    /// A SEPARATE pair from `snapshot()`/`load()` on purpose: that tuple is the wire shape
+    /// `store_sync`'s `billing` entry encodes, and a node on the previous binary decodes it as
+    /// `(Map, Vec)`, which fails on a 3-element array, so widening it would stop billing
+    /// replicating to every not-yet-upgraded node for the length of a rollout.
     pub fn meters_snapshot(&self) -> Vec<MeterWatermark> {
         let m = self.meters.read();
         let mut v: Vec<MeterWatermark> = m
@@ -1314,12 +1173,9 @@ impl BillingStore {
         v
     }
 
-    /// Restore the meter watermarks. `None` means the snapshot carried no
-    /// meters field at all — a pre-upgrade node wrote it, or there is no
-    /// snapshot — which is UNKNOWN, not "everyone is at zero"; see
-    /// `meters_baseline_unknown`. `Some(vec![])` is a real, known, empty set
-    /// (nothing has ever been metered), so a tenant absent from a PRESENT list
-    /// is genuinely new and still bills from zero.
+    /// Restores the meter watermarks. `None` (no meters field in the snapshot) means UNKNOWN, not
+    /// zero (`meters_baseline_unknown`); `Some(vec![])` is a real empty set, so a tenant absent
+    /// from a PRESENT list is new and bills from zero.
     pub fn meters_load(&self, meters: Option<Vec<MeterWatermark>>) {
         let Some(list) = meters else {
             self.meters_baseline_unknown
@@ -1437,9 +1293,6 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
         total_cents: subtotal,
         status: status.to_string(),
         created_ms: now_ms(),
-        // Never set here — drafts (`current_invoice`) must never carry a
-        // checkpoint; the rollover call site in `account()` overwrites this
-        // with a real one for a finalized period.
         ledger_checkpoint: None,
     }
 }
@@ -1721,16 +1574,13 @@ mod tests {
     }
 }
 
-/// Create a real Stripe Checkout Session (best-effort). `price_id` is `Some` for
-/// a plan upgrade — a REAL recurring subscription against that Stripe Price
-/// (`mode=subscription`); `None` for a one-time purchase (credit top-ups —
-/// `mode=payment` with ad-hoc `price_data`, since there's no fixed Price object
-/// for an arbitrary top-up amount). `checkout_id` is OUR internal `Checkout.id`,
-/// stamped into the session's `metadata` so the webhook handler (which only
-/// ever hears from Stripe, never from our own client) can find the matching
-/// local record. Returns `(hosted_checkout_url, stripe_session_id)` — the
-/// session id is stored via `BillingStore::attach_stripe_session` so
-/// `billing_confirm` can later verify real payment before applying anything.
+/// Creates a real Stripe Checkout Session (best-effort). `price_id` is `Some` for a plan upgrade (a
+/// recurring subscription, `mode=subscription`) and `None` for a one-time purchase (a credit
+/// top-up, `mode=payment` with ad-hoc `price_data`). `checkout_id` is OUR `Checkout.id`, stamped
+/// into the session `metadata` (and the SUBSCRIPTION's, since `customer.subscription.*` webhooks
+/// carry only that) so webhooks can find the local record. Returns `(hosted_checkout_url,
+/// stripe_session_id)`; the session id is stored via `attach_stripe_session` so `billing_confirm`
+/// verifies real payment before applying anything.
 pub async fn stripe_checkout(
     http: &reqwest::Client,
     price_id: Option<&str>,
@@ -1751,10 +1601,6 @@ pub async fn stripe_checkout(
         Some(pid) => {
             params.push(("mode".into(), "subscription".into()));
             params.push(("line_items[0][price]".into(), pid.to_string()));
-            // Subscriptions need the metadata on the SUBSCRIPTION object too
-            // (not just the checkout session) — that's what the
-            // `customer.subscription.*` webhooks carry, and the session's own
-            // metadata isn't copied onto it automatically.
             params.push((
                 "subscription_data[metadata][checkout_id]".into(),
                 checkout_id.to_string(),
@@ -1791,12 +1637,10 @@ pub async fn stripe_checkout(
     Ok((url.to_string(), session_id.to_string()))
 }
 
-/// Real payment/subscription status of a Stripe Checkout Session, fetched
-/// directly from Stripe. `paid` is true when the session actually completed
-/// (`payment_status == "paid"` for a one-time charge, or `status ==
-/// "complete"` for a $0-due-now subscription setup) — this is the
-/// authoritative check `billing_confirm` uses instead of trusting an
-/// unauthenticated client's redirect-back as proof of payment.
+/// Real payment/subscription status of a Stripe Checkout Session, fetched from Stripe: `paid` is
+/// true when it actually completed (`payment_status == "paid"`, or `status == "complete"` for a
+/// $0-due subscription setup). The authoritative check `billing_confirm` uses instead of a client's
+/// redirect-back.
 pub struct StripeSessionStatus {
     pub paid: bool,
     pub customer: Option<String>,
@@ -1834,12 +1678,10 @@ pub async fn stripe_verify_session(
     })
 }
 
-/// Verify a Stripe webhook delivery's `Stripe-Signature` header
-/// (`t=<unix_ts>,v1=<hex_hmac_sha256>[,v1=<hex>...]`) against the RAW request
-/// body using `STRIPE_WEBHOOK_SECRET`. Matches Stripe's documented scheme:
-/// HMAC-SHA256 of `"{timestamp}.{raw_body}"`, constant-time compared against
-/// each `v1` value (Stripe may send more than one during a signing-secret
-/// rotation), with a 5-minute replay-tolerance window on the timestamp.
+/// Verifies a Stripe webhook's `Stripe-Signature` header (`t=<unix_ts>,v1=<hex_hmac_sha256>[,...]`)
+/// against the RAW body with `STRIPE_WEBHOOK_SECRET`: HMAC-SHA256 of `"{timestamp}.{raw_body}"`,
+/// constant-time compared against each `v1` (several during a secret rotation), with a 5-minute
+/// replay window.
 pub fn verify_webhook_signature(payload: &[u8], sig_header: &str, secret: &str) -> bool {
     let mut timestamp: Option<i64> = None;
     let mut v1_sigs: Vec<&str> = Vec::new();

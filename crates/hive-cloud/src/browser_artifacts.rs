@@ -1,69 +1,36 @@
-//! Browser-executable function artifacts: build-time bundling, the
-//! content-addressed on-disk store, and its guarded GC
-//! (browser-function-artifact-build-contract).
+//! Browser-executable function artifacts: build-time bundling, the content-addressed on-disk store
+//! and its guarded GC (browser-function-artifact-build-contract).
 //!
-//! A function becomes browser-eligible by opting in via fluid.json
-//! `functions[].browser` ([`fluid_core::BrowserPolicy`]) — or automatically,
-//! via `git::infer_browser_entry` — and surviving [`bundle`]'s rejection pass.
-//! The emitted artifact is ONE deterministic, self-contained source string —
-//! an `async function (request, ops)` expression in exactly the shape the
-//! browser substrate evaluates (`module.exports = (<source>)`, run as CommonJS
-//! by the vendored node-worker guest — see
-//! `crates/hive-browser/www/node-worker-host.js`) — carrying no
-//! env and no secrets.
+//! A function is browser-eligible by fluid.json opt-in (`functions[].browser`,
+//! [`fluid_core::BrowserPolicy`]) or automatically (`git::infer_browser_entry`), once it survives
+//! [`bundle`]'s rejection pass. The artifact is ONE deterministic, self-contained source string, an
+//! `async function (request, ops)` expression in the shape the substrate evaluates (`module.exports
+//! = (<source>)`, run as CommonJS by the vendored node-worker guest, see
+//! `crates/hive-browser/www/node-worker-host.js`), with no env and no secrets.
 //!
-//! NODE SURFACE (browser-node-api-runtime): the build does NOT reject Node/Bun
-//! runtime TOKENS. `require(...)`, `process.*`, `Buffer`, `__dirname`,
-//! `__filename`, `import(...)`, `Deno.*`/`Bun.*` references all compile through
-//! to the artifact, because the browser substrate SUPPLIES a Node API — the
-//! substrate is vendored node-worker (`vendor/node-worker`: Node v25.9.0's own
-//! lib transpiled for a Worker), with Node's real CommonJS/ESM loader,
-//! `process`, `Buffer` and `fetch`. That replaced QuickJS, whose global object
-//! is bare ECMAScript and which could honestly run none of it. A module the
-//! substrate genuinely cannot provide (`net`, `dns`, outbound `http.request`,
-//! …) throws a NAMED error at the point of use rather than being silently
-//! no-op'd — the same "loud, at the honest boundary" discipline the removed
-//! token scan had, moved from build time to the exact call that cannot work.
+//! The build does NOT reject Node/Bun runtime tokens (`require`, `process.*`, `Buffer`,
+//! `__dirname`, `import(...)`, `Deno.*`/`Bun.*`): the substrate supplies a Node API, and a module
+//! it cannot provide (`net`, `dns`, outbound `http.request`) throws a NAMED error at the point of
+//! use. ES module syntax is REWRITTEN to CommonJS ([`crate::browser_esm`]) because the substrate
+//! loads FILES while the artifact is an EXPRESSION, and rejecting it excluded every framework build
+//! output; only forms with no CommonJS equivalent are refused (mixing `export default` with named
+//! exports, an unreadable `export`, an unterminated statement). A CommonJS entry is returned
+//! byte-identical.
 //!
-//! ES MODULE SYNTAX is REWRITTEN, not rejected (browser-esm-rewrite,
-//! [`crate::browser_esm`]). The artifact is ONE `async function (request, ops)`
-//! EXPRESSION, so a static `import`/`export` STATEMENT is a hard SyntaxError in
-//! its body — but it was also what excluded every framework build output
-//! (`dist/server/entry.mjs`, `.output/server/index.mjs`, a SvelteKit
-//! `build/index.js`) from browser nodes. Since the substrate's loader loads
-//! FILES while the artifact is an EXPRESSION, the build rewrites the module
-//! syntax into the CommonJS the envelope and the guest's
-//! `require`/`module.exports` registry already supply, and refuses only the
-//! forms with no CommonJS equivalent (an entry mixing `export default` with
-//! named exports, an unreadable `export`, an unterminated statement). A
-//! CommonJS entry is returned byte-identical.
+//! Refused loudly: what NO substrate can provide (machine code: `process.dlopen`, a `*.node` addon,
+//! `node-gyp-build`; Node's internal `process.binding`) plus the standing checks (non-JS runtime,
+//! TypeScript entry, oversized source, no handler export).
 //!
-//! STILL REFUSED LOUDLY is what NO browser substrate can provide: machine code
-//! (`process.dlopen`, a `*.node` addon, `node-gyp-build`) and Node's internal
-//! `process.binding`. Plus the standing checks: non-JS runtime, TypeScript
-//! entry, oversized source, and an entry that exports no request→response
-//! handler at all.
+//! Store layout, `persist::data_dir()/browser-artifacts/`: `<policy_digest>.js` is the emitted
+//! source, content-addressed by the canonical-policy digest (the 64-hex value the wire protocol
+//! routes on); `<policy_digest>.json` is a sidecar with the [`fluid_core::BrowserArtifact`]
+//! descriptor and owning deployment ids (bookkeeping only: the GC keep-set comes from LIVE
+//! deployment records). The bytes are node-local and do NOT ride `PlatformSnapshot` or store_sync;
+//! only descriptor metadata replicates, inside the deployment manifest.
 //!
-//! Store layout under `persist::data_dir()/browser-artifacts/`:
-//!
-//! * `<policy_digest>.js`   — the emitted source bytes, content-addressed by
-//!   the canonical-policy digest (the same 64-hex value the whole wire
-//!   protocol routes on: `encode_invoke`'s code digest,
-//!   `BrowserFunctionRuntime.pin`'s return, the admission's `digest`).
-//! * `<policy_digest>.json` — sidecar: the [`fluid_core::BrowserArtifact`]
-//!   descriptor plus the owning deployment ids. Ownership is bookkeeping for
-//!   operators; the GC keep-set is computed from LIVE deployment records
-//!   (the authoritative state), never from these sidecars.
-//!
-//! The bytes are node-local derived data and deliberately do NOT ride
-//! `PlatformSnapshot` or store_sync (the `dns_geo.json` precedent): only
-//! descriptor metadata replicates, inside the deployment manifest.
-//!
-//! GC ([`gc`] / [`spawn_gc_loop`]) copies `gc_rootfs_images`' blast-radius
-//! guards: an empty keep-set or a reap set larger than
-//! `HIVE_BROWSER_ARTIFACT_GC_MAX_REAP_FRACTION` of the store refuses the
-//! whole pass, and only files older than a grace window are candidates, so a
-//! just-built artifact whose record hasn't settled yet is never reaped.
+//! GC ([`gc`], [`spawn_gc_loop`]) copies `gc_rootfs_images`' blast-radius guards: an empty
+//! keep-set, or a reap set over `HIVE_BROWSER_ARTIFACT_GC_MAX_REAP_FRACTION` of the store, refuses
+//! the whole pass, and only files older than a grace window are candidates.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -102,28 +69,21 @@ pub struct BundledArtifact {
     pub notes: Vec<String>,
 }
 
-/// Whether a CommonJS entry assigns a handler the wrapper can resolve —
-/// `module.exports = ...`, `module.exports.handler = ...`, `exports.handler =
-/// ...`, or the `default` form a TypeScript-transpiled entry emits
-/// (`exports.default = ...`). Mirrors the wrapper's runtime resolution
-/// (a function `module.exports`, else `.handler`, else `.default`), scanned
-/// statically so a server/library/bare-script entry that never touches
-/// `module.exports` is filtered before it can ship. A plain substring is
-/// enough: any reference to `module.exports` (whole-object, `.handler` or
-/// `.default`) means the file participates in the CommonJS export the wrapper
-/// reads; a bare `exports.handler` / `exports.default` covers the aliased forms
-/// the wrapper also accepts.
+/// Whether a CommonJS entry assigns a handler the wrapper can resolve (`module.exports`,
+/// `.handler`, `exports.handler` or the TypeScript-transpiled `exports.default`), mirroring the
+/// wrapper's runtime resolution; a plain substring scan suffices. It must run at BUILD time, since
+/// the wrapper throws when no handler resolves: a server/library/bare-script entry is rejected here
+/// (skipped silently when auto-detected, a failed build when explicitly opted in) instead of
+/// shipping bytes that throw in every donor's browser.
 fn handler_export_present(src: &str) -> bool {
     src.contains("module.exports")
         || src.contains("exports.handler")
         || src.contains("exports.default")
 }
 
-/// Surfaces NO browser substrate can ever provide, matched line-wise so the
-/// rejection names the exact line: machine code and Node's internal bindings.
-/// Everything else — a module the substrate lacks, a relative specifier,
-/// outbound `http.request` — is left to the runtime to name at the point of
-/// use, never turned into a build-time guess here.
+/// Surfaces NO browser substrate can provide (machine code and Node's internal bindings), matched
+/// line-wise so the rejection names the line. Everything else (a missing module, outbound
+/// `http.request`) is left to the runtime to name at the point of use, never a build-time guess.
 const UNIMPLEMENTABLE: &[(&str, &str)] = &[
     (
         "process.dlopen(",
@@ -159,7 +119,6 @@ pub(crate) fn unimplementable_lines(source: &str) -> Vec<(usize, &'static str)> 
                 out.push((i + 1, *why));
             }
         }
-        // A `*.node` specifier is a compiled addon by extension.
         if (line.contains(".node\"") || line.contains(".node'"))
             && line.contains("require(")
         {
@@ -186,11 +145,9 @@ pub(crate) fn import_meta_binding(entry: &str) -> String {
     )
 }
 
-/// Resolve the entry path safely inside the deployment build dir. The entry
-/// is tenant-controlled input, so this is the same class of check as
-/// `container_volume_cfg`'s sanitization: an absolute path or a `..`
-/// component must never let a fluid.json read (or, worse, have the build
-/// bundle) a host file outside the build output.
+/// Resolves the entry path inside the deployment build dir. The entry is tenant-controlled input:
+/// an absolute path, a `..` component or a symlink out of the build output (a zip can carry one)
+/// must never let the build read or bundle a host file.
 fn resolve_entry(build_dir: &Path, entry: &str) -> Result<PathBuf, String> {
     let rel = Path::new(entry);
     if rel.is_absolute() {
@@ -212,9 +169,6 @@ fn resolve_entry(build_dir: &Path, entry: &str) -> Result<PathBuf, String> {
             "browser entry {entry:?} does not exist in the build output"
         ));
     }
-    // `..` components are rejected above, but a SYMLINK inside the build
-    // output could still point outside it (a zip can carry one). Resolve and
-    // re-verify containment so an entry can never bundle a host file.
     let canon = path
         .canonicalize()
         .map_err(|e| format!("browser entry {entry:?} cannot be resolved: {e}"))?;
@@ -229,10 +183,22 @@ fn resolve_entry(build_dir: &Path, entry: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Bundle one opted-in (or auto-detected) function into its deterministic
-/// browser artifact. Every ineligibility is a loud `Err` naming the function
-/// and the reason — the caller (the build pipeline) fails an EXPLICIT opt-in on
-/// it and skips an auto-detected one silently.
+/// Bundles one opted-in (or auto-detected) function into its deterministic browser artifact. Every
+/// ineligibility is a loud `Err` naming the function and the reason: the build pipeline fails an
+/// EXPLICIT opt-in on it and skips an auto-detected one silently.
+///
+/// The emitted bytes (and both digests) depend only on the entry source and the policy: line
+/// endings normalize to LF and the wrapper is a constant template. The envelope wraps the user's
+/// file verbatim and (a) resolves the handler, (b) normalizes the request (a JSON string on the
+/// guest path, an object on the native path), (c) normalizes the response into the `{status,
+/// headers, body, bodyBase64}` string the gateway's `browser_response` parses. `__hive_node_bridge`
+/// is the ONE hook the Node runtime installs: absent it (a substrate without Node, e.g. the native
+/// DOM lane) `request`/`ops` pass through and the handler's RETURN value is the response; present,
+/// the handler also gets Node's `(req, res)` convention, where `req` and `res` are supersets of the
+/// request descriptor and `ops`, and `bridge.settle(out)` reconciles the two (an explicit non-`res`
+/// return wins, else the response written on `res`). Every binding the wrapper introduces is
+/// `__hive_`-prefixed because the entry shares its scope: a plain `const handler` collided with the
+/// common `function handler(request, ops)` and failed to PARSE in every donor's browser.
 pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, String> {
     let name = || format!("function {:?}", f.name);
     let Some(policy) = f.browser.as_ref() else {
@@ -241,9 +207,6 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
             name()
         ));
     };
-    // Runtime eligibility: only JS handlers (node/bun-class runtimes) can
-    // produce a browser artifact. Containers, prebuilt images, and every
-    // non-JS runtime are unsupported by construction.
     let resolved_runtime = hive_core::Runtime::resolve(&f.runtime, &f.start_cmd);
     match resolved_runtime {
         hive_core::Runtime::Node | hive_core::Runtime::Bun => {}
@@ -309,20 +272,8 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
             fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES
         ));
     }
-    // Deterministic bytes: identical input source must hash identically
-    // regardless of the author's platform, so line endings normalize to LF
-    // before wrapping (and before hashing).
     let user = raw.replace("\r\n", "\n").replace('\r', "\n");
 
-    // ES module syntax -> CommonJS (browser-esm-rewrite). A static
-    // `import`/`export` STATEMENT is a SyntaxError inside the function
-    // expression below, so instead of rejecting the entry — which excluded
-    // every framework build output from browser nodes — the module syntax is
-    // rewritten into the `require`/`module.exports` the envelope (and the
-    // guest's Node module registry) already evaluates. A CommonJS entry comes
-    // back byte-identical. Only a form with NO CommonJS equivalent is an Err
-    // here, and that is a loud build rejection (explicit opt-in) or a silent
-    // skip (auto-detected entry), decided by the caller.
     let rewritten = match crate::browser_esm::rewrite_esm(&user) {
         Ok(esm) => esm,
         Err(reason) => {
@@ -339,15 +290,6 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     for (line, why) in unimplementable_lines(&user) {
         rejections.push(format!("line {line}: {why}"));
     }
-    // A browser artifact MUST resolve to a request→response handler at runtime:
-    // the wrapper below resolves `module.exports` and THROWS if it is not a
-    // function. Verify that export exists STATICALLY here so a non-handler
-    // entry (a long-running server, a library, a bare script) is caught at
-    // build — an AUTO-detected candidate is then skipped silently and an
-    // EXPLICIT opt-in fails the build loudly, instead of shipping bytes that
-    // throw in every donor's browser. This is what makes probing a function's
-    // own entry (not just a `.browser.js` convention file) safe: a server's
-    // entry never assigns module.exports, so it is filtered here.
     if !handler_export_present(&user) {
         rejections.push(
             "defines no handler export — assign the request→response handler to `module.exports` \
@@ -367,38 +309,6 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
         ));
     }
 
-    // The deterministic single-function source: the user's file — CommonJS, or
-    // ESM rewritten to CommonJS — verbatim inside a fixed envelope that (a)
-    // resolves the handler, (b) normalizes the request (a JSON string on the
-    // guest path, an object on the native path), and (c) normalizes the
-    // response into the `{status, headers, body, bodyBase64}` envelope string
-    // the gateway's `browser_response` parses. The wrapper is a constant
-    // template, so the emitted bytes — and therefore both digests — depend only
-    // on the entry source and the policy.
-    //
-    // `__hive_node_bridge` is the ONE hook the Node runtime installs — the
-    // guest's Node API shim (node-runtime.js today, node-worker's runtime after
-    // the substrate swap), evaluated in the guest before this function. When it
-    // is absent — a substrate with no Node runtime, e.g. the native-mode DOM
-    // lane — every line below behaves exactly as it did before it existed:
-    // `request`/`ops` are passed through unchanged and the handler's RETURN
-    // value is the response. When it is present the handler additionally gets
-    // Node's `(req, res)` calling convention: `req` is a superset of the
-    // platform request descriptor (so a `(request, ops)` handler still reads
-    // `request.method`/`.path`/`.headers`), `res` is a superset of `ops` (so
-    // `ops.call(...)` still works), and `bridge.settle(out)` is the ONE place
-    // the two conventions are reconciled — an explicit non-`res` return value
-    // always wins (the platform contract, unchanged), otherwise the response
-    // written on `res` is used, including the `return res.json(...)` shape
-    // that returns `res` rather than `undefined`.
-    // Every binding the wrapper itself introduces is `__hive_`-prefixed, and
-    // that is not cosmetics: the entry is embedded VERBATIM in the same scope,
-    // so a plain `const handler = …` / `const status = …` here collided with
-    // the overwhelmingly common `function handler(request, ops)` a deployment
-    // declares — the artifact failed to PARSE ("Identifier 'handler' has
-    // already been declared") in every donor's browser, for every request.
-    // `module` and `exports` keep their names because the entry references
-    // them; everything internal does not.
     let prelude = if rewritten.uses_import_meta {
         format!(
             "\x20 const exports = module.exports;\n\x20 {}\n",
@@ -482,10 +392,10 @@ struct ArtifactSidecar {
     created_ms: u64,
 }
 
+/// The `.js`/`.json` store paths for a policy digest, validated as 64 lowercase hex BEFORE it
+/// becomes a path component (a store keyed on a tenant-influenced string is the `hive-vol-`
+/// bind-mount footgun again).
 fn digest_paths(digest: &str) -> Result<(PathBuf, PathBuf), String> {
-    // The digest is our own BLAKE3 hex, but validate before it ever becomes a
-    // path component — a store keyed on a tenant-influenced string is the
-    // `hive-vol-` bind-mount footgun all over again.
     if digest.len() != 64
         || !digest
             .bytes()
@@ -504,12 +414,12 @@ fn digest_paths(digest: &str) -> Result<(PathBuf, PathBuf), String> {
 
 /// Persist the emitted bytes + sidecar content-addressed (idempotent: same
 /// source + policy ⇒ same digest ⇒ same file). Existing owners are preserved.
+/// The `.js` is written through a temp file and renamed, so a crash never leaves a truncated file
+/// under a valid digest.
 pub async fn persist(source: &str, descriptor: &BrowserArtifact) -> std::io::Result<()> {
     let (js_path, json_path) = digest_paths(&descriptor.policy_digest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     tokio::fs::create_dir_all(store_dir()).await?;
-    // Write-then-rename so a crash mid-write never leaves a truncated file
-    // under a valid digest (the bytes must always hash to their own name).
     let tmp = store_dir().join(format!(".{}.tmp", descriptor.policy_digest));
     tokio::fs::write(&tmp, source.as_bytes()).await?;
     tokio::fs::rename(&tmp, &js_path).await?;
@@ -534,7 +444,7 @@ pub async fn add_owner(policy_digest: &str, deployment_id: &str) -> std::io::Res
         ));
     };
     if !sidecar.owners.insert(deployment_id.to_string()) {
-        return Ok(()); // already recorded
+        return Ok(());
     }
     write_sidecar(&json_path, &sidecar).await
 }
@@ -552,10 +462,9 @@ async fn write_sidecar(path: &Path, sidecar: &ArtifactSidecar) -> std::io::Resul
     tokio::fs::rename(&tmp, path).await
 }
 
-/// Every policy digest referenced by a LIVE deployment record on this node —
-/// the GC keep-set. All records count (including Error-state ones): a record
-/// leaves the set only when the deployment is actually removed, which is the
-/// conservative direction for reaping.
+/// Every policy digest referenced by a LIVE deployment record on this node: the GC keep-set. All
+/// records count (Error-state ones too): a record leaves it only when the deployment is removed,
+/// the conservative direction for reaping.
 pub fn live_digests(cloud: &Arc<CloudState>) -> BTreeSet<String> {
     cloud
         .gw
@@ -568,12 +477,11 @@ pub fn live_digests(cloud: &Arc<CloudState>) -> BTreeSet<String> {
 
 /// Guarded reaper. Returns (reaped artifacts, reclaimed bytes).
 ///
-/// BLAST-RADIUS GUARDS (the `gc_rootfs_images` precedent): an empty keep-set
-/// makes every artifact on disk look orphaned — indistinguishable from a
-/// caller/state bug — so the whole pass refuses loudly instead. Likewise a
-/// candidate set larger than `HIVE_BROWSER_ARTIFACT_GC_MAX_REAP_FRACTION`
-/// (default 0.5) of the store: no legitimate pass reaps most artifacts at
-/// once. And only files older than the grace window are candidates at all.
+/// BLAST-RADIUS GUARDS (the `gc_rootfs_images` precedent): an empty keep-set refuses the pass
+/// loudly (it makes every artifact look orphaned, indistinguishable from a caller/state bug); so
+/// does a candidate set over `HIVE_BROWSER_ARTIFACT_GC_MAX_REAP_FRACTION` (default 0.5) of the
+/// store; and only files older than the grace window are candidates (an unreadable mtime counts as
+/// recent).
 pub async fn gc(keep: &BTreeSet<String>) -> (usize, u64) {
     let grace_secs = std::env::var("HIVE_BROWSER_ARTIFACT_GC_GRACE_SECS")
         .ok()
@@ -586,10 +494,10 @@ pub async fn gc(keep: &BTreeSet<String>) -> (usize, u64) {
         .unwrap_or(DEFAULT_GC_MAX_REAP_FRACTION);
     let now = std::time::SystemTime::now();
     let mut total = 0usize;
-    let mut candidates: Vec<(String, u64)> = Vec::new(); // (digest stem, bytes)
+    let mut candidates: Vec<(String, u64)> = Vec::new();
     let mut entries = match tokio::fs::read_dir(store_dir()).await {
         Ok(d) => d,
-        Err(_) => return (0, 0), // no store, nothing to reap
+        Err(_) => return (0, 0),
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -608,7 +516,7 @@ pub async fn gc(keep: &BTreeSet<String>) -> (usize, u64) {
             .ok()
             .and_then(|t| now.duration_since(t).ok())
             .map(|age| age.as_secs() < grace_secs)
-            .unwrap_or(true); // unknown mtime => treat as recent, never reap
+            .unwrap_or(true);
         if recent {
             continue;
         }
@@ -651,6 +559,9 @@ pub async fn gc(keep: &BTreeSet<String>) -> (usize, u64) {
 
 /// Periodic sweep — every node (the store is per-host, like the podman lock
 /// pool), same registration shape as `spawn_container_lock_sweep`.
+/// The first interval tick fires at once, so two are skipped: the first pass runs a full interval
+/// after boot, when persisted deployments are restored into the keep-set.
+/// `HIVE_BROWSER_ARTIFACT_GC_SECS` sets the cadence (default 3600).
 pub fn spawn_gc_loop(cloud: Arc<CloudState>) {
     let interval_secs = std::env::var("HIVE_BROWSER_ARTIFACT_GC_SECS")
         .ok()
@@ -659,10 +570,6 @@ pub fn spawn_gc_loop(cloud: Arc<CloudState>) {
         .unwrap_or(DEFAULT_GC_INTERVAL_SECS);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        // tokio intervals fire immediately on the FIRST tick — skip two so the
-        // first real pass runs a full interval after boot, when persisted
-        // deployments have long been restored into the keep-set (an empty
-        // keep-set refuses the pass anyway, but never rely on one guard).
         tick.tick().await;
         tick.tick().await;
         loop {
@@ -710,8 +617,6 @@ pub fn descriptor_for(
                 .iter()
                 .find(|f| f.name == function)
             else {
-                // Deployment exists but has no such function — today's
-                // `deployment_not_ready` outcome, not "ineligible".
                 return None;
             };
             return Some(
@@ -777,21 +682,13 @@ pub fn auto_serve_max() -> usize {
         .min(fluid_gateway::MAX_BROWSER_TARGETS_PER_ENDPOINT)
 }
 
-/// EVERY browser-eligible function a tenant owns, across every Ready
-/// deployment — the automatic counterpart of [`descriptor_for`]'s one
-/// hand-named target (browser-auto-serve-eligible-set).
-///
-/// Same two replicated sources, in the same order, under the same tenant gate
-/// as `descriptor_for`/`resolve_for_tenant`: local gw records first, then the
-/// gossiped peer view, with (deployment, function) dedup so a deployment
-/// visible in both is counted once. A deployment that is not Ready, or belongs
-/// to another tenant, or carries no build-stamped artifact simply is not in the
-/// set — absence of capability, never a broader one.
-///
-/// Deterministically ordered (production, then newest, then id/name) and
-/// truncated to `auto_serve_max()`, so every node computing this from the same
-/// replicated state produces the same answer and a renewal does not reshuffle
-/// a donor's pins for no reason.
+/// EVERY browser-eligible function a tenant owns across every Ready deployment, the automatic
+/// counterpart of [`descriptor_for`]'s one hand-named target. Same replicated sources, order and
+/// tenant gate as `descriptor_for`/`resolve_for_tenant`, deduplicated by (deployment, function); a
+/// deployment that is not Ready, belongs to another tenant or has no build-stamped artifact is
+/// simply absent: absence of capability, never a broader one. Deterministically ordered
+/// (production, then newest, then id/name) and truncated to `auto_serve_max()`, so every node
+/// computing it from the same state agrees and a renewal does not reshuffle a donor's pins.
 pub fn eligible_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> Vec<EligibleFunction> {
     let mut out: Vec<EligibleFunction> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
@@ -851,35 +748,18 @@ pub fn eligible_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> Vec<Eligibl
     out
 }
 
-// ---------------------------------------------------------------------------
-// Content-addressed delivery (browser-function-artifact-delivery)
-// ---------------------------------------------------------------------------
-//
-// `GET /v1/browser/artifacts/<policy_digest>` serves the artifact BYTES to an
-// authenticated tenant that owns a Ready deployment referencing that exact
-// descriptor. The bytes exist only on the node that ran the build (they never
-// ride `PlatformSnapshot`, store_sync, or the deliver_build ext4), but the
-// public ingress is round-robin across every node — the AGENTS.md "node-local
-// state behind round-robin GETs" trap. This module follows the documented
-// owner-read pattern exactly: serve locally when possible, otherwise resolve
-// the owning (host/build) node and proxy the raw bytes from it — HTTP admin
-// first (`fetch_bytes_from_host`'s shape), then the iroh gossip transport
-// (`fetch_from_host`'s shape, which needs the `dispatch` arm registered in
-// gossip.rs). Proxied bytes are RE-VERIFIED against the descriptor before
-// being served: a node must never emit bytes under immutable digest headers
-// that do not hash to the descriptor's source digest, no matter which peer
-// they came from.
-//
-// The digest is validated (64 lowercase hex) before it ever becomes a path
-// component (`digest_paths`), so no tenant-controlled path fragment can reach
-// the filesystem — the `hive-vol-` bind-mount rule applied to a read path.
-
-/// Hard ceiling on an artifact body we will serve or accept from a peer. The
-/// build already bounds the entry at [`fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES`];
-/// this adds headroom for the fixed wrapper envelope so a corrupted/oversized
-/// store file or peer reply is rejected before it is ever read in full.
+/// Hard ceiling on an artifact body served or accepted from a peer: the build bounds the entry at
+/// [`fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES`] and this adds wrapper headroom, so a corrupt or
+/// oversized file or reply is rejected before it is read in full.
 const MAX_ARTIFACT_BYTES: u64 = fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES as u64 + 64 * 1024;
 
+/// The delivery route, `GET /v1/browser/artifacts/<policy_digest>`: serves the BYTES to an
+/// authenticated tenant owning a Ready deployment that references the descriptor. The bytes exist
+/// only on the node that ran the build while the public ingress is round-robin, so it follows the
+/// owner-read pattern: serve locally, else proxy from the owning node (HTTP admin first, then the
+/// iroh gossip transport with its `dispatch` arm in gossip.rs). Proxied bytes are RE-VERIFIED
+/// against the descriptor before serving: a node must never emit bytes under immutable digest
+/// headers that do not hash to the descriptor's source digest, whichever peer they came from.
 pub fn routes() -> Router<Arc<CloudState>> {
     Router::new().route("/v1/browser/artifacts/:digest", get(get_artifact))
 }
@@ -893,11 +773,9 @@ pub struct ArtifactResolution {
     pub hosts: Vec<String>,
 }
 
-/// Resolve `policy_digest` to its descriptor under `tenant`'s ownership,
-/// consulting the SAME replicated deployment state admission trusts (local gw
-/// records first, then the gossiped peer view). `None` covers BOTH "no such
-/// artifact" and "owned by another tenant" — the handler maps both to 404 so
-/// the route never confirms a digest's existence across tenant boundaries.
+/// Resolves `policy_digest` to its descriptor under `tenant`'s ownership from the SAME replicated
+/// state admission trusts. `None` covers BOTH "no such artifact" and "owned by another tenant" (the
+/// handler maps both to 404), so the route never confirms a digest across tenants.
 pub fn resolve_for_tenant(
     cloud: &Arc<CloudState>,
     tenant: &str,
@@ -975,10 +853,9 @@ pub(crate) async fn read_verified(descriptor: &BrowserArtifact) -> Option<Vec<u8
     verify_bytes(descriptor, &bytes).then_some(bytes)
 }
 
-/// The immutable content-addressed response. The policy digest IS the URL, so
-/// the body can never change under it: cache forever, and echo both digests so
-/// a worker can log/preflight before its own BLAKE3 recompute (the actual
-/// verification stays client-side in `BrowserFunctionRuntime.pin`).
+/// The immutable content-addressed response: the digest IS the URL, so the body never changes under
+/// it (cache forever), and both digests are echoed so a worker can preflight before its own BLAKE3
+/// recompute (verification stays client-side in `BrowserFunctionRuntime.pin`).
 fn artifact_response(descriptor: &BrowserArtifact, bytes: Vec<u8>) -> Response {
     let mut resp = (StatusCode::OK, bytes).into_response();
     let h = resp.headers_mut();
@@ -1006,11 +883,9 @@ fn artifact_response(descriptor: &BrowserArtifact, bytes: Vec<u8>) -> Response {
     resp
 }
 
-/// Nodes that may hold the bytes, best-first: every host of a Ready deployment
-/// referencing the digest (the build ran on the host in the fanout flow), then
-/// the control-plane leader (the coordinator-built / re-homed case, and the
-/// `build_get` precedent). Self is excluded — the local store was already
-/// tried before proxying is considered.
+/// Nodes that may hold the bytes, best-first: every host of a Ready deployment referencing the
+/// digest (the build ran there in the fanout flow), then the control-plane leader
+/// (coordinator-built or re-homed). Self is excluded: the local store was tried first.
 fn owner_candidates(cloud: &Arc<CloudState>, hosts: &[String]) -> Vec<String> {
     let mut out: Vec<String> = hosts
         .iter()
@@ -1025,11 +900,9 @@ fn owner_candidates(cloud: &Arc<CloudState>, hosts: &[String]) -> Vec<String> {
     out
 }
 
-/// Fetch raw artifact bytes from a candidate owner node — the byte-oriented
-/// sibling of `admin::fetch_from_host`: HTTP admin when we have a URL for the
-/// node, else over the iroh gossip transport (NAT'd peers). The `local=true`
-/// marker tells the receiving handler to serve local-only, so a proxied read
-/// can never re-proxy (the `/v1/functions?local=true` no-loop precedent).
+/// Fetches raw artifact bytes from a candidate owner, the byte-oriented sibling of
+/// `admin::fetch_from_host`: HTTP admin when a URL is known, else the iroh gossip transport.
+/// `local=true` tells the receiver to serve local-only, so a proxied read can never re-proxy.
 async fn fetch_artifact_from_host(
     cloud: &Arc<CloudState>,
     node: &str,
@@ -1100,9 +973,6 @@ async fn get_artifact(
     if let Some(bytes) = read_verified(&resolution.descriptor).await {
         return Ok(artifact_response(&resolution.descriptor, bytes));
     }
-    // `local=true` marks a node-to-node proxied read: serve local-only so the
-    // request can never bounce between peers (every candidate would otherwise
-    // re-resolve the same hosts and proxy right back).
     if q.local == Some(true) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1114,7 +984,7 @@ async fn get_artifact(
             continue;
         };
         if bytes.is_empty() {
-            continue; // mesh "not servable" sentinel (dispatch has no status channel)
+            continue;
         }
         if verify_bytes(&resolution.descriptor, &bytes) {
             return Ok(artifact_response(&resolution.descriptor, bytes));
@@ -1131,13 +1001,10 @@ async fn get_artifact(
     ))
 }
 
-/// Serving half of the gossip `/v1/browser/artifacts/` dispatch arm. The
-/// owner node re-runs the SAME tenant-ownership gate against its own (locally
-/// authoritative, since it hosts the deployment) state before serving — the
-/// sandbox `proxy_to_owner` re-check precedent. Empty body = not servable:
-/// the dispatch layer has no status channel, and artifact bodies are never
-/// empty (the wrapper envelope alone is ~1 KiB), so the caller safely treats
-/// empty as "try the next candidate".
+/// Serving half of the gossip `/v1/browser/artifacts/` dispatch arm: the owner re-runs the SAME
+/// tenant-ownership gate against its own state. An empty body means not servable (the dispatch
+/// layer has no status channel and artifact bodies are never empty), so the caller tries the next
+/// candidate.
 pub async fn mesh_get(cloud: &Arc<CloudState>, tenant: &str, digest: &str) -> Vec<u8> {
     if !hive_browser_proto::valid_blake3_digest(digest) {
         return Vec::new();

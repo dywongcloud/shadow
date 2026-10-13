@@ -1,31 +1,18 @@
-//! ACME (Let's Encrypt) wildcard certificates via **DNS-01 through an
-//! authoritative DNS provider** — the TLS half of the ngrok retirement.
+//! ACME (Let's Encrypt) certificates: DNS-01 through an authoritative DNS provider
+//! ([`crate::cloudflare_dns::DnsProvider`]: Vercel DNS when `VERCEL_API_TOKEN` is set, else
+//! Cloudflare when `HIVE_CLOUDFLARE_API_TOKEN` is set; a zone Vercel cannot write, and the DB
+//! gateway's wildcard, need it) and HTTP-01 for tenant custom domains.
 //!
-//! The provider is [`crate::cloudflare_dns::DnsProvider`]: Vercel DNS when
-//! `VERCEL_API_TOKEN` is set, otherwise the Cloudflare API when
-//! `HIVE_CLOUDFLARE_API_TOKEN` is set. Cloudflare exists because a domain like
-//! `storage.dev.autheo.com` sits in a Cloudflare-authoritative zone Vercel cannot
-//! write, and a wildcard — which the per-tenant DB gateway requires — is only
-//! obtainable through DNS-01.
-//!
-//! Two certificate bundles, deliberately isolated (the vercel.com/vercel.app
-//! split): **apps** = `*.{apps_domain}` + apex; **platform** = `api.{platform
-//! _domain}` (+ `relay.`/`discovery.` if `HIVE_ACME_PLATFORM_EXTRA=1`; the iroh
-//! relay does its own TLS so they're off by default).
-//!
-//! * Only the CLUSTER LEADER (same election as billing/DNS-reconciler) runs the
-//!   ACME client — N nodes must not race Let's Encrypt. The ACCOUNT it runs as
-//!   is fleet state, not leader state: the credential is sealed with the cluster
-//!   secret and replicated (see `account`), so a handover keeps ONE Let's
-//!   Encrypt identity and one rate-limit budget instead of registering a new
-//!   account per leader.
-//! * Renewal at ~2/3 of the 90-day validity (issue + 60d), jittered daily check.
-//! * Distribution: bundle JSON in the guardian replicated store with the private
-//!   key AEAD-encrypted (`enc:v1:` via `secrets.rs`) — never plaintext in a
-//!   replicated doc. Every node polls, decrypts with the cluster secret, and
-//!   hot-swaps the SNI resolver (arc-swap — zero-downtime reload).
-//! * `HIVE_ACME_STAGING=1` (default) → LE staging. Production has a
-//!   5-duplicate-certs/week limit; do not burn it in dev.
+//! - `bundles()` lists what is issued, one isolated bundle per zone.
+//! - Only the leader runs the ACME client (`leadership::may_act`: `Job::Acme`, `Job::AcmeHttp01`),
+//! so N nodes never race Let's Encrypt; the ACCOUNT is fleet state (see `account`), so a handover
+//! keeps one identity and one rate-limit budget.
+//! - Renewal at `RENEW_AFTER_MS` (60 of 90 days), checked every 5-7 h.
+//! - Distribution: bundle JSON in the guardian replicated store with the key sealed (`enc:v1:`,
+//! `secrets.rs`); every node syncs (`spawn_cert_sync`: guardian, mesh, HTTPS) and hot-swaps the SNI
+//! resolver (arc-swap).
+//! - `HIVE_ACME_STAGING` defaults to staging: production allows 5 duplicate certificates per 168
+//! hours.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,7 +44,8 @@ pub struct CertBundle {
 }
 
 const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-const RENEW_AFTER_MS: u64 = 60 * 24 * 60 * 60 * 1000; // 2/3 of validity
+/// Renew at two thirds of the validity: issued + 60 days.
+const RENEW_AFTER_MS: u64 = 60 * 24 * 60 * 60 * 1000;
 
 fn staging() -> bool {
     std::env::var("HIVE_ACME_STAGING")
@@ -72,8 +60,6 @@ fn directory_url() -> &'static str {
         LetsEncrypt::Production.url()
     }
 }
-
-// ---- SNI resolver (hot-swappable) ---------------------------------------------
 
 /// zone (registrable domain, e.g. `shadw.app`) → certified key.
 static CERTS: std::sync::OnceLock<ArcSwap<HashMap<String, Arc<CertifiedKey>>>> =
@@ -113,9 +99,8 @@ impl ResolvesServerCert for SniResolver {
         let map = certs().load();
         if let Some(k) = map.get(&name) {
             fire_warm(&name);
-            return Some(k.clone()); // apex / exact host bundle key
+            return Some(k.clone());
         }
-        // one label up → wildcard zone
         let (_, zone) = name.split_once('.')?;
         let k = map.get(zone).cloned();
         if k.is_some() {
@@ -135,7 +120,6 @@ pub fn installed_zones() -> Vec<String> {
 /// issuance and on every node when the replicated bundle syncs.
 pub fn install_bundle(bundle: &CertBundle) -> anyhow::Result<()> {
     let key_pem = crate::secrets::decrypt(&bundle.key_pem_enc);
-    // NB: named `chain`, not `certs` — a local would shadow the `certs()` map fn.
     let chain: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut bundle.chain_pem.as_bytes()).collect::<Result<_, _>>()?;
     anyhow::ensure!(!chain.is_empty(), "bundle has no certificates");
@@ -149,32 +133,18 @@ pub fn install_bundle(bundle: &CertBundle) -> anyhow::Result<()> {
         let zone = name.strip_prefix("*.").unwrap_or(name).to_ascii_lowercase();
         map.insert(zone, ck.clone());
         if name.contains('.') && !name.starts_with("*.") {
-            map.insert(name.to_ascii_lowercase(), ck.clone()); // exact host (api.…)
+            map.insert(name.to_ascii_lowercase(), ck.clone());
         }
     }
     certs().store(Arc::new(map));
     Ok(())
 }
 
-/// A rustls `ServerConfig` using the SNI resolver (plus HTTP/1.1+h2 ALPN).
-/// TLS config for PUBLISHED raw ports (compose `ports: ["9001:9001"]` served
-/// with TLS termination): the same SNI resolver as the 443 gateway — same
-/// wildcard/per-host certs, so `https://<project>.<apps-domain>:9001` presents
-/// exactly the certificate the browser already trusts for the project — but
-/// ALPN pinned to http/1.1 ONLY. The gateway's h2 offer would be wrong here:
-/// the terminated plaintext is spliced byte-for-byte into the container's own
-/// HTTP server, and a client that negotiated h2 via ALPN would then speak h2
-/// frames at an HTTP/1.1 backend.
-/// SNI resolver SCOPED to one tenant's hostnames. The shared [`SniResolver`]
-/// holds EVERY fleet certificate — api./admin./webhook./dashboard hosts, the
-/// apps and DB wildcards, and every tenant's custom domain — and handing it to
-/// a tenant-controlled raw-port listener let that listener present ANY of them
-/// to a client that asked by SNI. On a port the tenant chose, that is a
-/// credential-harvesting surface: a victim pointed at `<tenant-port>` while
-/// sending `api.<platform>` as SNI would complete a handshake against the
-/// platform's own certificate. A published port may only ever speak for the
-/// hostnames that legitimately route to its project; anything else fails the
-/// handshake (resolve → None), which is the correct, loud outcome.
+/// SNI resolver SCOPED to one tenant's hostnames. The shared [`SniResolver`] holds EVERY fleet
+/// certificate (api./admin./webhook., the apps and DB wildcards, every custom domain); handing it
+/// to a tenant-controlled raw-port listener would let it present any of them to a client asking by
+/// SNI, a credential-harvesting surface. A published port speaks only for the hostnames routed to
+/// its project; anything else fails the handshake (`resolve` returns `None`).
 pub struct ScopedSniResolver {
     allowed: Vec<String>,
 }
@@ -223,6 +193,10 @@ pub fn raw_server_config_for(hosts: Vec<String>) -> Arc<rustls::ServerConfig> {
     Arc::new(cfg)
 }
 
+/// TLS for PUBLISHED raw ports (compose `ports: ["9001:9001"]`): the 443 gateway's SNI resolver, so
+/// the project's certificate is the one the browser already trusts, but ALPN pinned to http/1.1:
+/// the terminated plaintext is spliced into the container's own HTTP server, which a client that
+/// negotiated h2 would address with h2 frames.
 pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -231,33 +205,6 @@ pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
     Arc::new(cfg)
 }
 
-// ---- fleet-shared TLS session tickets ---------------------------------------
-//
-// rustls resumption is STATEFUL by default: `ServerConfig` ships a 256-entry
-// in-process session cache and no ticketer, so a ticket is only ever redeemable
-// at the node that minted it. Measured on shadw.cloud (2026-09-28, four A
-// records behind one name): a ticket minted by 93.188.162.67 resumes there
-// ("Reused, TLSv1.3") but is refused by 170.106.158.151 and 43.172.25.45
-// ("New, TLSv1.3") — with round-robin DNS that caps the resumption rate at
-// roughly one in four, so three out of four reconnects pay a full handshake.
-//
-// Fix: mint STATELESS tickets under a key every node derives identically, so
-// any node can redeem a ticket any other node issued. The key is derived from
-// `secrets::key_material()` — the same fleet-shared at-rest key this crate
-// already uses to derive per-tenant secrets (`zkauth::derive_secret`) and to
-// seal the ACME private keys themselves. That is deliberate: a node that can
-// read `HIVE_SECRET_KEY` can already recover the TLS signing key, so a derived
-// ticket key grants no capability the fleet secret does not already grant.
-//
-// Forward secrecy stays bounded the way rustls requires ("lifetime must be
-// implemented by key rolling and erasure, *not* by storing a lifetime in the
-// ticket"): the key is re-derived every `TICKET_ROTATE_SECS`, and a ticket is
-// only accepted while its epoch is the current one or the one before it, so a
-// key stops being usable at most 2 x TICKET_ROTATE_SECS after it was first
-// used. 0-RTT is untouched — `max_early_data_size` stays 0, and rustls only
-// offers early data when the ticketer is DISABLED, so enabling it here can
-// never turn into early data on a non-idempotent request.
-
 /// How long one derived ticket key is used for minting (`lifetime()` advertises
 /// this to clients too). Six hours matches rustls's own `Ticketer::new()`.
 const TICKET_ROTATE_SECS: u64 = 6 * 60 * 60;
@@ -265,15 +212,12 @@ const TICKET_ROTATE_SECS: u64 = 6 * 60 * 60;
 /// Layout: `[epoch: u64 BE][nonce: 12][ChaCha20-Poly1305 ct + 16-byte tag]`.
 const TICKET_HEADER_LEN: usize = 8 + ring::aead::NONCE_LEN;
 
-/// Upper bound on an accepted ticket. rustls's own ticketer tracked the largest
-/// ciphertext it ever produced for this; a fixed bound is the same defence
-/// against the partitioning-oracle attack (reject absurdly long input before
-/// touching the AEAD) without mutable state on the accept path.
+/// Upper bound on an accepted ticket: absurdly long input is rejected before the AEAD runs
+/// (partitioning-oracle defence), with no mutable state on the accept path.
 const TICKET_MAX_LEN: usize = 4096;
 
-/// Domain separator for the derivation — changing it invalidates every
-/// outstanding ticket at once, which is the intended way to force a fleet-wide
-/// reset.
+/// Changing the key-derivation domain invalidates every outstanding ticket at once: the intended
+/// fleet-wide reset.
 const TICKET_KEY_DOMAIN: &[u8] = b"hive-tls-session-ticket-v1";
 
 fn shared_tickets_enabled() -> bool {
@@ -287,10 +231,8 @@ fn ticket_epoch(secs: u64) -> u64 {
     secs / TICKET_ROTATE_SECS
 }
 
-/// The ChaCha20-Poly1305 key for one epoch, derived (never stored) — the same
-/// one every node computes for the same epoch from the same fleet secret.
-/// Cheap enough to redo per handshake: one HMAC-SHA256 over ~40 bytes against
-/// an ECDSA handshake signature that costs three orders of magnitude more.
+/// The ChaCha20-Poly1305 key for one epoch, derived (never stored) and identical on every node; one
+/// HMAC-SHA256 per handshake is negligible next to the ECDSA signature.
 fn ticket_key(epoch: u64) -> ring::aead::LessSafeKey {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -305,6 +247,13 @@ fn ticket_key(epoch: u64) -> ring::aead::LessSafeKey {
 }
 
 /// Stateless, fleet-shared TLS session tickets.
+///
+/// rustls resumption is stateful per node (a 256-entry cache), so behind round-robin DNS roughly
+/// three reconnects in four paid a full handshake. These tickets are stateless under a key EVERY
+/// node derives from `secrets::key_material()`, the fleet secret that already seals the ACME keys,
+/// so it grants nothing new. The key is re-derived every `TICKET_ROTATE_SECS` and a ticket is
+/// accepted only in its own epoch or the next (a key is usable at most twice that period); 0-RTT
+/// stays off (`max_early_data_size` is 0).
 #[derive(Debug)]
 pub struct FleetTicketer;
 
@@ -340,9 +289,9 @@ impl rustls::server::ProducesTickets for FleetTicketer {
         Some(out)
     }
 
-    /// Fully attacker-controlled input: length-checked and epoch-checked before
-    /// the AEAD runs, and any failure is `None` — rustls then simply does not
-    /// offer/accept a PSK and falls back to a full handshake.
+    /// Attacker-controlled input: length- and epoch-checked before the AEAD runs; any failure is
+    /// `None` and rustls falls back to a full handshake. `open_in_place` leaves the Vec's length
+    /// alone, so the tag must be truncated off or resumption silently never happens.
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
         if cipher.len() <= TICKET_HEADER_LEN || cipher.len() > TICKET_MAX_LEN {
             return None;
@@ -350,18 +299,12 @@ impl rustls::server::ProducesTickets for FleetTicketer {
         let (epoch_bytes, rest) = cipher.split_at(8);
         let epoch = u64::from_be_bytes(epoch_bytes.try_into().ok()?);
         let now = ticket_epoch(hive_core::now_ms() / 1000);
-        // Current epoch, or the one it just rolled out of (so a ticket minted
-        // moments before a rotation still works for up to one more period).
         if epoch != now && epoch + 1 != now {
             return None;
         }
         let (nonce_bytes, sealed) = rest.split_at(ring::aead::NONCE_LEN);
         let nonce: [u8; ring::aead::NONCE_LEN] = nonce_bytes.try_into().ok()?;
         let mut buf = sealed.to_vec();
-        // `open_in_place` returns the plaintext as a SUBSLICE but leaves the
-        // Vec's length alone, so the 16-byte tag is still there. Without this
-        // truncate `ServerSessionValue::read_bytes` sees trailing bytes and the
-        // ticket never decrypts — resumption silently never happens.
         let plain_len = ticket_key(epoch)
             .open_in_place(
                 ring::aead::Nonce::assume_unique_for_key(nonce),
@@ -375,26 +318,21 @@ impl rustls::server::ProducesTickets for FleetTicketer {
     }
 }
 
+/// The 443 gateway's `ServerConfig`: the SNI resolver, h2 + http/1.1 ALPN and the fleet-shared
+/// [`FleetTicketer`] (`HIVE_TLS_SHARED_TICKETS=0` restores the stateful per-node cache).
 pub fn server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(SniResolver));
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     if shared_tickets_enabled() {
-        // Stateless and shared: `session_storage`'s 256-entry per-process cache
-        // stops being the resumption path for TLS1.3 (rustls prefers the
-        // ticketer when it is enabled), so a reconnect landing on ANY node
-        // resumes. Off only via HIVE_TLS_SHARED_TICKETS=0, which restores
-        // exactly the previous stateful behaviour.
         cfg.ticketer = Arc::new(FleetTicketer);
     }
     Arc::new(cfg)
 }
 
-/// A rustls `ServerConfig` for the DB gateway (Postgres/Redis wire) — same SNI
-/// resolver but NO ALPN. Advertising h2/http1.1 makes rustls send a
-/// `no_application_protocol` alert to a Postgres client (libpq 17+ offers ALPN
-/// `postgresql`, which wouldn't match) — so the DB proxy must not negotiate ALPN.
+/// The DB gateway's `ServerConfig` (Postgres/Redis wire): the SNI resolver and NO ALPN, since
+/// offering h2/http1.1 makes rustls alert a Postgres client (libpq 17+ offers ALPN `postgresql`).
 pub fn db_server_config() -> Arc<rustls::ServerConfig> {
     Arc::new(
         rustls::ServerConfig::builder()
@@ -403,12 +341,9 @@ pub fn db_server_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
-// ---- DNS-01 challenges for Seer-answered zones ----------------------------------
-
-/// How long a challenge entry may live before it stops being answered and is
-/// swept: ACME validates within minutes, so 1h covers the slowest retry loop
-/// while guaranteeing an abandoned entry (leader died mid-order, cleanup never
-/// ran) cannot accumulate or keep answering forever.
+/// How long a challenge entry is answered before it is swept: 1 h covers the slowest ACME retry
+/// loop, while an abandoned entry (the leader died mid-order) can neither accumulate nor answer
+/// forever.
 const CHALLENGE_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// One name's pending DNS-01 TXT values (a wildcard+apex order places TWO
@@ -419,20 +354,13 @@ pub struct AcmeChallenge {
     pub created_ms: u64,
 }
 
-/// fqdn (lowercase, no trailing dot) → pending DNS-01 TXT values.
-///
-/// Written on the LEADER at challenge placement alongside the Vercel API write
-/// — Vercel still serves every name in zones NOT delegated to Seer, but for a
-/// zone that IS (the deploy zone, `api.{platform}` once its NS moves), Let's
-/// Encrypt may query ANY of the advertised fleet nameservers while the ACME
-/// client runs only on the leader — so the values replicate to every node via
-/// the `acme_challenges` entry in `store_sync::REGISTRY`. Read by
-/// `dnsserver::lookup`'s delegated-zone TXT arms.
+/// fqdn (lowercase, no trailing dot) to pending DNS-01 TXT values, written on the leader next to
+/// the provider write. For a zone delegated to Seer Let's Encrypt may query ANY fleet nameserver
+/// while the ACME client runs only on the leader, so the values replicate to every node
+/// (`acme_challenges` in `store_sync::REGISTRY`) and `dnsserver::lookup` answers from them.
 pub struct AcmeChallengeStore {
     inner: parking_lot::RwLock<std::collections::BTreeMap<String, AcmeChallenge>>,
 }
-
-// ---- HTTP-01 challenges (custom tenant domains) --------------------------------
 
 /// One pending HTTP-01 answer: the body LE expects at
 /// `http://<domain>/.well-known/acme-challenge/<token>`.
@@ -442,11 +370,9 @@ pub struct Http01Challenge {
     pub created_ms: u64,
 }
 
-/// token → key-authorization for in-flight HTTP-01 orders, replicated via the
-/// `acme_http01` store_sync entry so a validation fetch landing on ANY node
-/// (round-robin/geo DNS is the whole point of HTTP-01) gets the answer. Same
-/// TTL/sweep discipline as the DNS-01 store: issuance is the sweep cadence,
-/// and an abandoned entry ages out instead of answering forever.
+/// token to key-authorization for in-flight HTTP-01 orders, replicated (`acme_http01` store_sync
+/// entry) so a validation fetch landing on ANY node gets the answer; same TTL/sweep discipline as
+/// the DNS-01 store.
 pub struct Http01Store {
     inner: parking_lot::RwLock<std::collections::BTreeMap<String, Http01Challenge>>,
 }
@@ -513,9 +439,8 @@ impl AcmeChallengeStore {
         fqdn.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
-    /// Add `value` under `fqdn`. Also sweeps every expired entry while holding
-    /// the write lock — issuance is the natural sweep cadence (the map only
-    /// ever grows when challenges churn), so abandoned entries never pile up.
+    /// Adds `value` under `fqdn`, sweeping every expired entry under the same write lock (issuance
+    /// is the natural sweep cadence).
     pub fn insert(&self, fqdn: &str, value: &str) {
         let now = hive_core::now_ms();
         let mut m = self.inner.write();
@@ -543,11 +468,9 @@ impl AcmeChallengeStore {
         }
     }
 
-    /// TXT values for `fqdn` — empty when unknown or past TTL (the DNS side
-    /// then keeps its authoritative no-data answer). The TTL gate matters on
-    /// FOLLOWERS too: store-sync adoption declines an empty leader snapshot
-    /// (registry-wide never-wipe rule), so a follower's copy of a cleaned-up
-    /// challenge ages out here instead.
+    /// TXT values for `fqdn`; empty when unknown or past TTL. The TTL gate matters on FOLLOWERS
+    /// too: store-sync adoption declines an empty leader snapshot, so a follower's copy of a
+    /// cleaned-up challenge ages out here.
     pub fn lookup(&self, fqdn: &str) -> Vec<String> {
         self.inner
             .read()
@@ -574,11 +497,8 @@ impl Default for AcmeChallengeStore {
     }
 }
 
-// ---- issuance -------------------------------------------------------------------
-
-/// The `_acme-challenge` record NAME relative to `zone` for an identifier:
-/// `shadw.app` in zone `shadw.app` → `_acme-challenge`; `api.shadw.cloud` in
-/// zone `shadw.cloud` → `_acme-challenge.api`. Pure; unit-tested.
+/// The `_acme-challenge` record NAME relative to `zone`: `shadw.app` in zone `shadw.app` gives
+/// `_acme-challenge`, `api.shadw.cloud` in zone `shadw.cloud` gives `_acme-challenge.api`.
 pub fn challenge_record_name(identifier: &str, zone: &str) -> String {
     let id = identifier.strip_prefix("*.").unwrap_or(identifier);
     if id == zone {
@@ -589,27 +509,16 @@ pub fn challenge_record_name(identifier: &str, zone: &str) -> String {
     }
 }
 
-/// Poll public DNS (DoH against Google + Cloudflare — reqwest, no new deps) until
-/// the TXT value is visible, or time out (~2 min). Vercel's nameservers publish
-/// fast; the wait is for their anycast propagation.
-/// Poll EVERY authoritative nameserver of a fleet-served zone until the
-/// challenge is visible on all of them, or time out (~2 min).
-///
-/// This is the check `wait_txt` cannot make. A zone delegated to this fleet has
-/// several NS and Let's Encrypt picks one at random, so "a resolver saw it" is
-/// not evidence — one of four servers held the `deploy` challenge while the
-/// order went `Invalid`. Public resolvers make it worse by caching a single
-/// server's answer. Ask each NS directly and require unanimity before telling
-/// Let's Encrypt the challenge is ready.
+/// Polls EVERY authoritative nameserver of a fleet-served zone (those advertising a public `:53`
+/// that peers in at least two regions attested) until all hold the challenge, or ~2 min pass.
+/// `wait_txt` cannot make this check: Let's Encrypt asks one nameserver at random (one of four held
+/// the `deploy` challenge while the order went `Invalid`) and public resolvers cache a single
+/// server's answer.
 async fn wait_txt_all_ns(cloud: &Arc<CloudState>, fqdn: &str, value: &str) -> bool {
     let ns: Vec<String> = cloud
         .registry
         .nodes()
         .into_iter()
-        // A nameserver this fleet actually publishes: it advertises a public
-        // `:53` (`dns_ns`) AND peers in at least two regions have attested it
-        // answers (`dns_attest`), which is the same proof-before-advertise rule
-        // the DNS reconciler uses to build the NS set LE will query.
         .filter(|n| n.dns_ns.is_some() && n.dns_attest.len() >= 2)
         .filter_map(|n| n.public_ip.clone())
         .collect();
@@ -655,6 +564,9 @@ async fn wait_txt_all_ns(cloud: &Arc<CloudState>, fqdn: &str, value: &str) -> bo
     false
 }
 
+/// Polls public DNS (DoH against Google and Cloudflare) until the TXT value is visible, or ~2 min
+/// pass: right for a zone with ONE anycast authority (Vercel); a fleet-served zone needs
+/// [`wait_txt_all_ns`].
 async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
     for i in 0..24 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -694,30 +606,6 @@ async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
     }
     false
 }
-
-// ---- the fleet's ACME account ---------------------------------------------------
-//
-// The account credential is the fleet's IDENTITY at Let's Encrypt, and every
-// rate limit that matters is scoped to it or to the identifier set it orders
-// for. It used to live only in `$HIVE_DATA/acme-account.json`, leader-local and
-// in PLAINTEXT, so every control-plane handover registered a brand-new account:
-// the fleet's issuance history, its per-account limits and its order history all
-// restarted under an identity nothing else in the platform knew about.
-//
-// It is now sealed with the cluster secret (`secrets::encrypt` — the same
-// treatment `CertBundle.key_pem_enc` already gets, in this same file) and stored
-// in the replicated GuardianDB store, so whichever node holds the designation
-// resolves the SAME account. Two rules the code below enforces and that any
-// future change must keep:
-//
-//   * The credential is NEVER written unsealed, NEVER logged, and never carried
-//     in an error or incident message. The only things that surface are the
-//     source it came from and, for a failure, the remedy.
-//   * A NEW account is created ONLY when no source yields credentials at all. If
-//     credentials exist but cannot be ACTIVATED (LE directory unreachable, order
-//     endpoint 5xx), that is an error to retry on the next pass — never a reason
-//     to register a second identity, which is precisely how a transient network
-//     failure would have burned one.
 
 /// Envelope version for the sealed account credential at rest / in the store.
 const ACCOUNT_ENVELOPE_V: u32 = 1;
@@ -778,7 +666,6 @@ fn seal_account(creds: &AccountCredentials) -> Option<String> {
         creds_enc: crate::secrets::encrypt(&plain),
         created_ms: hive_core::now_ms(),
     };
-    // A seal that didn't actually seal must never reach disk or the mesh.
     if !crate::secrets::is_encrypted(&env.creds_enc) {
         tracing::error!(
             "ACME account credential could not be AEAD-sealed — refusing to store it in the clear"
@@ -788,6 +675,9 @@ fn seal_account(creds: &AccountCredentials) -> Option<String> {
     serde_json::to_string(&env).ok()
 }
 
+/// Opens through `secrets::try_decrypt`, never `decrypt` (which returns its input when no key opens
+/// it): a wrong key must read `Undecryptable`, not a parse failure that looks like `Missing` and
+/// registers a second account.
 fn open_account_envelope(bytes: &[u8]) -> EnvelopeOpen {
     let Ok(env) = serde_json::from_slice::<AccountEnvelope>(bytes) else {
         return EnvelopeOpen::Missing;
@@ -800,10 +690,6 @@ fn open_account_envelope(bytes: &[u8]) -> EnvelopeOpen {
         );
         return EnvelopeOpen::Missing;
     }
-    // try_decrypt, not decrypt: `decrypt` returns its input unchanged when no
-    // key opens the value, which would turn "wrong key" into a JSON parse
-    // failure indistinguishable from "no account stored" — the exact confusion
-    // that must not silently register a second account.
     let Some(plain) = crate::secrets::try_decrypt(&env.creds_enc) else {
         return EnvelopeOpen::Undecryptable;
     };
@@ -818,9 +704,9 @@ fn open_account_envelope(bytes: &[u8]) -> EnvelopeOpen {
     }
 }
 
-/// Write the sealed envelope to the local cache (tmp + rename, chmod 600) and
-/// VERIFY it reads back and opens. Returns false on any failure — callers treat
-/// that as loud, because an unwritten credential means the next pass registers
+/// Writes the sealed envelope to the local cache (temp file named after the target so staging and
+/// prod never share one, rename, chmod 600) and VERIFIES it reads back and opens; `false` on any
+/// failure, which callers treat as loud since an unwritten credential means the next pass registers
 /// another account.
 fn write_account_sealed(env_json: &str) -> bool {
     let path = account_sealed_path();
@@ -828,8 +714,6 @@ fn write_account_sealed(env_json: &str) -> bool {
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
-    // tmp name derived from the target, so a staging and a prod write can never
-    // rename each other's partial file into place.
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
     if std::fs::write(&tmp, env_json).is_err() {
@@ -853,23 +737,18 @@ fn write_account_sealed(env_json: &str) -> bool {
 fn read_account_sealed() -> EnvelopeOpen {
     let path = account_sealed_path();
     let Ok(bytes) = std::fs::read(&path) else {
-        return EnvelopeOpen::Missing; // no local copy yet — normal
+        return EnvelopeOpen::Missing;
     };
     let opened = open_account_envelope(&bytes);
     if matches!(opened, EnvelopeOpen::Missing) {
-        // The file EXISTS but is not a readable envelope. Treated as absent so
-        // TLS still gets an account, but never silently: this is the one shape
-        // in which a stored credential is lost without a key problem.
         tracing::error!(path = ?path, "the local sealed ACME account file is present but unreadable — it will be ignored");
     }
     opened
 }
 
-/// Observation validity for the ACME loops' incidents: the platform bundle
-/// pass runs every 5–7 h and the custom-domain pass retries at a 6 h backoff
-/// ceiling, so a condition still true is re-asserted well inside 24 h and one
-/// that stopped being observed (a key fixed and the node restarted, a bundle
-/// finally issued) resolves itself a day later at the latest.
+/// Observation validity for the ACME loops' incidents: the platform pass runs every 5-7 h and the
+/// custom-domain pass backs off to ~64 min at most, so a live condition is re-asserted well inside
+/// 24 h and a vanished one resolves within a day.
 const INCIDENT_TTL_MS: u64 = 24 * 3600 * 1000;
 
 /// Re-assert an incident for a condition the ACME loop observes on this pass
@@ -907,27 +786,30 @@ fn open_key_incident(incidents: Option<&crate::incidents::IncidentStore>, where_
     );
 }
 
-/// Resolve the fleet's ACME account: sealed local cache → replicated store →
-/// legacy plaintext file (migrated forward) → create one, in that order.
+/// Resolves the fleet's ACME account: replicated store, then the local sealed cache, then the legacy
+/// plaintext file (sealed and migrated forward), and only then creates one. The account is the
+/// fleet's identity at Let's Encrypt and every rate limit that matters is scoped to it, so:
+///
+/// - The replicated copy is read FIRST: every node that was ever leader may hold a DIFFERENT account
+///   of its own, and reading the local copy first would let each keep it forever. The local cache is
+///   the fallback for a guardian that is down or empty, so an offline node still issues.
+/// - A cache hit is never pushed to the replicated store: an empty `get` cannot tell "the fleet has
+///   no account" from "this replica has not synced yet", and seeding on the second would overwrite
+///   the fleet's identity. Only the migrate and create paths write it.
+/// - A NEW account is created ONLY when no source yields credentials at all. Credentials that cannot
+///   be ACTIVATED (directory unreachable, order endpoint 5xx) are an error to retry next pass, never
+///   a reason to register a second identity.
+/// - The credential is never written unsealed, logged or carried in an error or incident message,
+///   and the legacy plaintext file is removed only once a verified sealed copy exists.
 async fn account(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     incidents: Option<&crate::incidents::IncidentStore>,
 ) -> anyhow::Result<Account> {
-    let _ = http; // account creation uses instant-acme's own hyper client
     let mut found: Option<(&'static str, Box<AccountCredentials>)> = None;
 
-    // REPLICATED COPY FIRST, local cache second. Order is the convergence rule,
-    // not a preference: every node that was ever leader may hold a DIFFERENT
-    // account of its own, and reading the local copy first would let each keep
-    // using its own forever — the exact per-leader-identity split this change
-    // exists to end. Reading the fleet's copy first makes every node adopt the
-    // one account. The local cache remains the fallback for a guardian that is
-    // down or has nothing yet, so an offline node still issues.
     if let Some(bytes) = crate::guardian::get(&account_guardian_key()).await {
         match open_account_envelope(&bytes) {
             EnvelopeOpen::Opened(c) => {
-                // Cache it locally so later boots don't depend on guardian being
-                // reachable. Best-effort: the credential is already in hand.
                 if let Some(env) = seal_account(&c) {
                     if !write_account_sealed(&env) {
                         tracing::warn!("adopted the replicated ACME account but could not write the local sealed cache");
@@ -946,16 +828,8 @@ async fn account(
             EnvelopeOpen::Undecryptable => open_key_incident(incidents, "local sealed cache"),
             EnvelopeOpen::Missing => {}
         }
-        // Deliberately NOT pushed to guardian on a plain cache hit: `get`
-        // returning nothing cannot distinguish "the fleet has no account" from
-        // "this node's replica hasn't synced yet", and seeding on the second
-        // would overwrite the fleet's identity with this node's. Only the
-        // migrate and create paths below (which know no account was found
-        // anywhere) write to the replicated store.
     }
 
-    // The pre-seal plaintext file: adopt it rather than ever regenerating, then
-    // seal it forward and remove the plaintext copy.
     if found.is_none() {
         let legacy = account_legacy_path();
         if let Ok(s) = std::fs::read_to_string(&legacy) {
@@ -970,9 +844,6 @@ async fn account(
                         if let Some(env) = sealed {
                             crate::guardian::put(&account_guardian_key(), env.into_bytes()).await;
                         }
-                        // Only after a VERIFIED sealed copy exists: this is the
-                        // whole point of the migration, an account private key
-                        // must not stay in plaintext on disk.
                         match std::fs::remove_file(&legacy) {
                             Ok(()) => tracing::info!(
                                 "migrated the plaintext ACME account credential into the sealed, \
@@ -998,10 +869,6 @@ async fn account(
     }
 
     if let Some((source, creds)) = found {
-        // A plaintext credential still on disk after resolving from somewhere
-        // else is a superseded account this node once owned. NOT deleted: we
-        // hold no sealed copy of it, and deleting a credential we haven't
-        // stored is irreversible. Named so an operator can remove it.
         if source != "legacy plaintext file" {
             let legacy = account_legacy_path();
             if legacy.exists() {
@@ -1013,9 +880,6 @@ async fn account(
                 );
             }
         }
-        // Credentials in hand: activation failure is TRANSIENT (the ACME
-        // directory is fetched here). Registering a new account on this path
-        // would silently abandon the fleet's identity over a network blip.
         return match Account::builder()?.from_credentials(*creds).await {
             Ok(acct) => {
                 tracing::info!(source, "ACME: reusing the fleet's Let's Encrypt account");
@@ -1055,8 +919,6 @@ async fn account(
              now sealed and replicated, so a control-plane handover will reuse it"
         );
     } else {
-        // Unstorable = the next pass finds nothing again and registers yet
-        // another account. That is an operator-visible condition, not a warn line.
         tracing::error!(
             "ACME: registered a NEW Let's Encrypt account but could NOT store it — every future \
              pass will register another one until this is fixed"
@@ -1082,14 +944,25 @@ async fn account(
     Ok(acct)
 }
 
-/// Issue one bundle: order → DNS-01 TXT via the configured DNS provider (Vercel
-/// or Cloudflare) → wait propagation → validate → CSR (rcgen) → finalize →
-/// certificate chain. Cleans its TXT records up afterwards (best-effort).
+/// instant-acme's internal HTTPS client needs a process-level rustls provider; installing is
+/// idempotent, and the listener may not have run yet.
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Issues one bundle: order, DNS-01 TXT through the provider, wait for propagation, validate,
+/// finalize (rcgen CSR), certificate chain; the TXT records are cleaned up afterwards
+/// (best-effort). `cloud` supplies the fleet's own nameservers (`None`, the Vercel-hosted staging
+/// test, falls back to the public-resolver check, right for a single anycast authority).
+///
+/// Each challenge TXT goes to BOTH authorities: the provider while the zone (or a sub-zone like
+/// `api.`) is still served there, and the replicated challenge store so every Seer nameserver
+/// answers once the delegation moves here. Vercel refuses a TXT under a name it has delegated away
+/// (409); that is tolerated ONLY for Vercel and ONLY under a LIVE delegation (the
+/// `vercel_dns::STATS` gauges, never static zone config: below the capable-NS floor the api
+/// delegation disengages to flat A records, and swallowing the 409 there would place nothing at the
+/// authority that matters and fail opaquely at validation). Any other failure is fatal.
 async fn issue(
-    // The fleet's own nameservers, when the caller has them: required to gate a
-    // DNS-01 challenge on EVERY authoritative NS under a live Seer delegation.
-    // `None` (the Vercel-hosted staging test) falls back to the public-resolver
-    // check, correct there because Vercel is a single anycast authority.
     cloud: Option<&Arc<CloudState>>,
     http: &reqwest::Client,
     api: &DnsProvider,
@@ -1098,15 +971,12 @@ async fn issue(
     challenges: &AcmeChallengeStore,
     incidents: Option<&crate::incidents::IncidentStore>,
 ) -> anyhow::Result<CertBundle> {
-    // instant-acme's internal HTTPS client needs a process-level rustls provider;
-    // idempotent, so install unconditionally (the listener may not have run yet).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_rustls_provider();
     let acct = account(http, incidents).await?;
     let identifiers: Vec<Identifier> = names.iter().map(|n| Identifier::Dns(n.clone())).collect();
     let mut order = acct.new_order(&NewOrder::new(&identifiers)).await?;
 
-    // Pass 1: write a TXT record for every pending dns-01 challenge.
-    let mut txt_names: Vec<(String, String)> = Vec::new(); // (record name, value) for cleanup
+    let mut txt_names: Vec<(String, String)> = Vec::new();
     {
         let mut authzs = order.authorizations();
         while let Some(a) = authzs.next().await {
@@ -1121,15 +991,6 @@ async fn issue(
             let value = challenge.key_authorization().dns_value();
             let rec_name = challenge_record_name(&host, zone);
             let fqdn = format!("{rec_name}.{zone}");
-            // BOTH authorities on purpose: Vercel answers while the zone (or a
-            // sub-zone like `api.`/the deploy label) is still Vercel-served,
-            // and the replicated challenge store is what lets every advertised
-            // Seer nameserver answer once the NS delegation moves here. Once a
-            // name IS delegated, Vercel refuses the TXT create as a child of
-            // the delegation (the same 409 record_conflicts rule witnessed
-            // stranding the api cutover) — that refusal must not kill the
-            // renewal, because Seer is then the authority that matters. Any
-            // other failure stays fatal.
             if let Err(e) = api
                 .create(
                     zone,
@@ -1142,20 +1003,8 @@ async fn issue(
                 )
                 .await
             {
-                // The gate must be the LIVE delegation state, never static
-                // zone config: below the capable-NS floor the api delegation
-                // deliberately disengages back to the flat A set (Vercel
-                // authoritative again), and swallowing a 409 THERE would
-                // place nothing at the authority that matters and fail the
-                // order opaquely minutes later at LE validation
-                // (adversarial-review confirmed). The reconciler stamps these
-                // gauges every pass on this same node (the single designation
-                // leads ACME and DNS reconcile together).
                 let conflict = e.to_string().contains("409");
-                // The 409 leniency below is a VERCEL behaviour: Vercel refuses a
-                // TXT create under a name it has delegated away. Cloudflare has no
-                // such rule, so a 409 there is a real failure and stays fatal.
-                let lenient = api.kind() == "vercel";
+                let provider_is_vercel = api.kind() == "vercel";
                 let under = |z: Option<&str>| {
                     z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}")))
                         .unwrap_or(false)
@@ -1170,7 +1019,7 @@ async fn issue(
                             .api_delegation_records
                             .load(std::sync::atomic::Ordering::Relaxed)
                             > 0);
-                if lenient && conflict && delegated_live {
+                if provider_is_vercel && conflict && delegated_live {
                     tracing::warn!(%fqdn, error = %e, "ACME dns-01 Vercel TXT refused under a live-Seer-delegated name — proceeding via the challenge store");
                 } else {
                     return Err(e);
@@ -1186,12 +1035,8 @@ async fn issue(
         }
     }
 
-    // Wait until the TXT records are publicly visible.
     for (rec_name, value) in &txt_names {
         let fqdn = format!("{rec_name}.{zone}");
-        // Under a live Seer delegation the fleet's own nameservers are the
-        // authority LE will query, so they ALL must hold the challenge; the
-        // public-resolver check below cannot see a partial rollout.
         let under = |z: Option<&str>| {
             z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}")))
                 .unwrap_or(false)
@@ -1207,8 +1052,6 @@ async fn issue(
         }
     }
 
-    // Pass 2: flip every pending challenge to ready (authorization state is
-    // cached — no extra network on the second walk).
     {
         let mut authzs = order.authorizations();
         while let Some(a) = authzs.next().await {
@@ -1222,8 +1065,6 @@ async fn issue(
         }
     }
 
-    // Poll to Ready, finalize (instant-acme generates the CSR + key via rcgen),
-    // then poll the certificate chain.
     let retry = instant_acme::RetryPolicy::default();
     let status = order.poll_ready(&retry).await?;
     if status != OrderStatus::Ready {
@@ -1244,6 +1085,8 @@ async fn issue(
     })
 }
 
+/// Removes what `issue` placed: the challenge-store copy first, then the provider's record
+/// (best-effort).
 async fn cleanup_txt(
     api: &DnsProvider,
     zone: &str,
@@ -1253,7 +1096,6 @@ async fn cleanup_txt(
     if txts.is_empty() {
         return;
     }
-    // Mirror of the double-write at placement: drop the Seer-answered copy too.
     for (n, v) in txts {
         challenges.remove(&format!("{n}.{zone}"), v);
     }
@@ -1269,8 +1111,6 @@ async fn cleanup_txt(
         }
     }
 }
-
-// ---- custom tenant domains (HTTP-01) -------------------------------------------
 
 /// Bundle name for a tenant domain — deterministic, never a raw tenant string
 /// (the same discipline as every other name in this file).
@@ -1288,14 +1128,10 @@ pub fn custom_bundle_name(domain: &str) -> String {
     format!("dom-{}", &hex[..12])
 }
 
-/// The (bundle, SANs, zone) set for every verified custom domain — the third
-/// element mirrors `bundles()`'s shape so cert-sync can chain the two lists.
-/// SANs are apex + the explicit `www` host ONLY: Let's Encrypt never offers
-/// HTTP-01 for a wildcard identifier (CA/B forbids it), so asking for
-/// `*.{domain}` here made every order fail "no http-01 challenge offered"
-/// (adversarial finding — first issuance was impossible). Wildcards for
-/// tenant domains belong to the DNS-01 path against a delegated zone (the
-/// tenant-zone `_acme-challenge` arm in dnsserver.rs).
+/// The (bundle, SANs, zone) set for every verified custom domain, shaped like `bundles()` so
+/// cert-sync can chain the two. SANs are the apex plus the explicit `www.` host ONLY: Let's Encrypt
+/// never offers HTTP-01 for a wildcard identifier (wildcards for tenant domains belong to DNS-01
+/// against a delegated zone).
 pub fn custom_domain_bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
     let mut out = Vec::new();
     for d in cloud.domains.snapshot() {
@@ -1316,19 +1152,16 @@ pub fn custom_domain_bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String
     out
 }
 
-/// HTTP-01 issuance for custom domains — `issue()`'s shape with the challenge
-/// type swapped and the replicated token store standing in for the TXT
-/// double-write. No Vercel zone is involved: the tenant's DNS points the name
-/// at the fleet already (that is what verification proved), so LE's fetch of
-/// `/.well-known/acme-challenge/<token>` lands on some node, and any node can
-/// answer from the replicated store.
+/// HTTP-01 issuance for custom domains: `issue`'s shape with the replicated `Http01Store` standing
+/// in for the TXT double-write. No DNS zone is written: the tenant's DNS already points the name at
+/// the fleet, so Let's Encrypt's fetch lands on some node, and any node answers from the store.
 async fn issue_http01(
     http: &reqwest::Client,
     names: &[String],
     store: &Http01Store,
     incidents: Option<&crate::incidents::IncidentStore>,
 ) -> anyhow::Result<CertBundle> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_rustls_provider();
     let acct = account(http, incidents).await?;
     let identifiers: Vec<Identifier> = names.iter().map(|n| Identifier::Dns(n.clone())).collect();
     let mut order = acct.new_order(&NewOrder::new(&identifiers)).await?;
@@ -1386,14 +1219,11 @@ impl Drop for IssuingGuard<'_> {
     }
 }
 
-/// The SAN set an HTTP-01 order can actually validate THIS pass:
-/// `www.{domain}` is kept only when it resolves to a current fleet edge
-/// address — LE validates each SAN independently and fails the WHOLE order
-/// otherwise, so a tenant who pointed only their apex (path A) or a
-/// delegated zone pre-verification would otherwise never get even the apex
-/// cert (adversarial finding). The narrowed set feeds the freshness check
-/// too, so a later www arrival naturally re-issues with full coverage.
-/// DoH lookup, same client shape as the domain verifier.
+/// The SAN set an HTTP-01 order can validate THIS pass: `www.{domain}` is kept only when a DoH A
+/// lookup shows it resolving to a current fleet edge address, because Let's Encrypt fails the WHOLE
+/// order when any SAN fails (a tenant who pointed only their apex would never get even the apex
+/// certificate). The narrowed set feeds the freshness check, so a later `www` arrival re-issues
+/// with full coverage.
 async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String> {
     if names.len() != 2 {
         return names.to_vec();
@@ -1442,10 +1272,9 @@ async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String
     }
 }
 
-/// Install a custom bundle before its DomainRecord may claim issuance. The
-/// metadata is a health statement consumed independently of the SNI cache, so
-/// writing it after a parse/key-install failure would recreate the original
-/// fictional "active SSL" state.
+/// Installs a custom bundle BEFORE its DomainRecord may claim issuance: the record's metadata is a
+/// health statement read independently of the SNI cache, so writing it after an install failure
+/// would recreate the fictional "active SSL" state.
 fn install_and_record_custom_bundle(
     cloud: &Arc<CloudState>,
     zone: &str,
@@ -1462,19 +1291,15 @@ fn install_and_record_custom_bundle(
     ))
 }
 
-/// One pass over every verified custom domain: ensure a fresh, SAN-covering
-/// bundle exists, else issue one via HTTP-01 and publish it (guardian + local
-/// store) for the fleet's cert-sync to pick up. **Leader-only internally** —
-/// the kick paths spawn it from several nodes at once, and an un-gated pass
-/// both duplicate-issues against LE's 5/168h duplicate-cert budget (every
-/// node has its own "no local cache" view) and drops its tokens into a
-/// follower store the next store_sync pull wipes mid-order (adversarial
-/// findings). Safe to call from anywhere: it simply no-ops unless
-/// `leadership::may_act(AcmeHttp01)` — the shared single-writer gate, with a
-/// designation that is exactly the `acme_http01` store's writer (the node
-/// followers pull that store from and the port-80 miss proxy targets), so a
-/// chain-less mesh's `HIVE_DNS_LEADER_NODE` pin can never put the tokens on a
-/// node whose store the next pull wipes.
+/// One pass over every verified custom domain: ensure a fresh, SAN-covering bundle exists, else
+/// issue one through HTTP-01 and publish it (guardian + local cache) for cert-sync. A missing local
+/// cache adopts the guardian replica first, so a fresh leader or wiped data dir does not re-issue
+/// every domain.
+///
+/// Leader-only INSIDE (`leadership::may_act(AcmeHttp01)`, whose designation is exactly the
+/// `acme_http01` store's writer), so it is safe to call from anywhere: an ungated pass would
+/// duplicate-issue against Let's Encrypt's 5-per-168 h budget and drop its tokens into a follower
+/// store the next store_sync pull wipes mid-order.
 pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
     if cloud.ingress == "ngrok" {
         return;
@@ -1482,34 +1307,25 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
     if !crate::leadership::may_act(cloud, crate::leadership::Job::AcmeHttp01) {
         return;
     }
-    // Per-domain failure streak + backoff (the crash-loop rule from AGENTS.md:
-    // a circuit's open window must outlast the failure it guards). A domain
-    // whose DNS never arrives would otherwise order LE every 300s forever —
-    // burning the fleet account's failed-validation AND new-orders budgets
-    // until the platform's own renewals starve too. Backoff doubles per
-    // consecutive failure to a 6h ceiling; after 12 the domain is dropped
-    // from the pass set with an incident naming the state (a fresh
-    // verification or a settings change resets the streak by process
-    // restart, and each success resets it immediately).
+    /// Per-bundle `(consecutive failures, next attempt ms)`, in memory (a restart resets it, a
+    /// success removes it). A domain whose DNS never arrives would otherwise order every 300 s,
+    /// burning the account's failed-validation and new-orders budgets until the platform's own
+    /// renewals starve, so retries back off from 2 min to a ~64 min ceiling (a circuit's open
+    /// window must outlast the failure it guards). It never parks: tenants often point DNS only
+    /// AFTER attaching. At 12 consecutive failures an incident opens and retries continue.
     static STREAKS: std::sync::OnceLock<
         parking_lot::RwLock<std::collections::HashMap<String, (u32, u64)>>,
     > = std::sync::OnceLock::new();
     let streaks =
         STREAKS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-    // Per-bundle in-flight issuance set: concurrent kicks (attach,
-    // forward-ack, owner arm, watcher, verify-now, the 300s loop) plus
-    // per-observer leadership flaps must never run two issuances of the same
-    // SAN set — five duplicate orders inside 168h closes LE's
-    // duplicate-certificate window for a week, and this repo treats a closed
-    // window as a Major incident (adversarial finding).
+    /// Per-bundle in-flight set: concurrent kicks and leadership flaps must never run two issuances
+    /// of the same SAN set, since five duplicate orders inside 168 h close Let's Encrypt's
+    /// duplicate-certificate window for a week. `IssuingGuard` releases the reservation on EVERY
+    /// exit, so a cancelled pass never wedges renewals.
     static ISSUING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let issuing = ISSUING.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
     for (bundle, names, zone) in custom_domain_bundles(cloud) {
-        // The reservation is held from the freshness check through order
-        // completion and released by the guard's Drop on EVERY exit path —
-        // a cancelled pass (leader flap mid-await, task abort) must never
-        // wedge the bundle's renewals (the ColdStartGuard rule).
         if !issuing.lock().insert(bundle.clone()) {
             continue;
         }
@@ -1519,19 +1335,10 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
         };
         {
             let (_fails, next_at) = streaks.read().get(&bundle).copied().unwrap_or((0, 0));
-            // No permanent park: a tenant very often points DNS at the fleet
-            // only AFTER attaching/verifying, so a hard `fails >= 12` skip
-            // would strand the bundle unissued until a leader restart. The
-            // backoff ceiling alone (~64min) keeps chronically-unpointed
-            // domains far inside LE's failed-validation rate limit while
-            // letting a late DNS fix issue on its own.
             if hive_core::now_ms() < next_at {
                 continue;
             }
         }
-        // Narrow the SAN set to what validates this pass (www pre-flight —
-        // see effective_sans). Drives the freshness check and the order, so
-        // coverage widens on its own once www reaches the fleet.
         let names = effective_sans(cloud, &names).await;
         let fresh = |issued: u64, have: &[String]| {
             hive_core::now_ms().saturating_sub(issued) < RENEW_AFTER_MS
@@ -1551,9 +1358,6 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
                 continue;
             }
         } else {
-            // The local disk is not the only source of truth — a fresh
-            // leader boot/a wiped dir must adopt the guardian replica instead
-            // of re-issuing every domain (the duplicate-cert budget again).
             let gb = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 crate::guardian::get(&guardian_key(&bundle)),
@@ -1624,9 +1428,6 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
                     e.1 = hive_core::now_ms() + (60_000u64 << f.min(6)).min(6 * 3_600_000);
                     f
                 };
-                // Rate limits and validation failures are typed incidents,
-                // re-asserted per failing attempt (the store dedups on the
-                // condition) and cleared by the attempt that succeeds.
                 let msg = e.to_string();
                 if msg.contains("rateLimited") || msg.contains("rate limit") {
                     cloud.incidents.open(crate::incidents::OpenReq {
@@ -1676,14 +1477,11 @@ pub fn spawn_custom_cert_loop(cloud: Arc<CloudState>) {
     }
     tokio::spawn(async move {
         loop {
-            // Gated inside the pass (`leadership::may_act(AcmeHttp01)`).
             custom_cert_pass(&cloud).await;
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
     });
 }
-
-// ---- orchestration ---------------------------------------------------------------
 
 fn guardian_key(bundle: &str) -> String {
     format!(
@@ -1710,8 +1508,22 @@ fn store_bundle_local(bundle: &str, b: &CertBundle) {
     }
 }
 
-/// Leader loop: ensure both bundles exist and are fresh; re-issue at 2/3 of
-/// validity. Jittered check every ~6h (cheap no-op when fresh).
+/// Leader loop: every bundle from `bundles()` is ensured fresh on a jittered 5-7 h cadence (a cheap
+/// no-op when fresh). Fresh means younger than `RENEW_AFTER_MS` AND covering every wanted name: the
+/// coverage check is what makes a SAN addition (a new region's `api-<region>` host) reissue by itself
+/// instead of failing TLS until the 60-day renewal.
+///
+/// Gated by `leadership::may_act(Job::Acme)`, the designation of the DNS writer, billing and every
+/// other single-writer job, so two nodes never order the same bundle against Let's Encrypt's
+/// duplicate window (the `HIVE_DNS_LEADER_NODE` pin survives only on a chain-less mesh). Off the gate
+/// the loop re-asks every minute instead of sleeping the renewal interval, so a node that becomes
+/// the writer does not wait hours.
+///
+/// A sentinel file `$HIVE_DATA/acme-force-<bundle>` forces one re-issue regardless of freshness and
+/// is deleted after a successful issue (`touch` it on the leader and restart, as the loop sleeps
+/// between passes; clearing the local or guardian cache cannot force it, since cert-sync pulls the
+/// old bundle back from a peer). A forced renewal spends the duplicate-certificate budget (5 per 168
+/// h per exact identifier set); a rate-limited order opens the `acme:rate-limit:<bundle>` incident.
 pub fn spawn_acme(cloud: Arc<CloudState>) {
     if cloud.ingress == "ngrok"
         && std::env::var("HIVE_ACME_FORCE")
@@ -1722,9 +1534,6 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
         return;
     }
     let Some(api) = crate::cloudflare_dns::DnsProvider::from_env(cloud.http.clone()) else {
-        // A zone the platform cannot write (Cloudflare-served, e.g. autheo.com) was
-        // a hard stop here: no Vercel token meant no issuance at all, so the
-        // `*.{db_domain}` wildcard could never be obtained on such a domain.
         tracing::warn!(
             "ACME enabled but neither VERCEL_API_TOKEN nor HIVE_CLOUDFLARE_API_TOKEN is set — not starting"
         );
@@ -1733,38 +1542,15 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
     tracing::info!(staging = staging(), provider = api.kind(), apps = %cloud.apps_domain, platform = %cloud.platform_domain, "ACME manager up (leader-elected, DNS-01)");
     tokio::spawn(async move {
         loop {
-            // Jittered interval: 5–7h.
             let jitter = (hive_core::now_ms() % 7200) as u64;
             let sleep = 5 * 3600 + jitter;
-            // The shared leader-only job gate (`leadership::may_act`): the
-            // strict chain owner with tenure, isolation and voter quorum —
-            // the same designation as the DNS writer, billing and every other
-            // single-writer job, so two nodes can never both order the same
-            // bundle against LE's 5-per-168h duplicate window. The
-            // `HIVE_DNS_LEADER_NODE` pin survives only on a chain-less mesh.
-            // Off the gate this loop re-asks every minute instead of sleeping
-            // the 5-7h renewal interval: a node that becomes the writer (or
-            // finishes its boot tenure) must not wait hours to renew.
             if !crate::leadership::may_act(&cloud, crate::leadership::Job::Acme) {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
             }
             for (bundle, names, zone) in bundles(&cloud) {
-                // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`
-                // makes this pass re-issue the bundle regardless of freshness, then
-                // is deleted after a successful issue. This is the ONLY reliable way
-                // to re-issue after a SAN change (e.g. adding admin.) — clearing the
-                // local/guardian cache doesn't work because cert-sync pulls the old
-                // bundle back from a peer via mesh_fetch. `touch` it on the leader,
-                // restart, and the new SANs land in one pass.
                 let force_path = crate::persist::data_dir().join(format!("acme-force-{bundle}"));
                 let forced = std::fs::metadata(&force_path).is_ok();
-                // Fresh = young enough AND covering every wanted name. The
-                // coverage check is what makes a SAN ADDITION (a new region's
-                // `api-<region>` host, a new explicit platform host) reissue
-                // automatically — before it, the only path was the manual
-                // force sentinel, and a forgotten sentinel meant a name that
-                // resolved in DNS but failed TLS until the 60-day renewal.
                 let fresh = !forced
                     && load_bundle_local(&bundle)
                         .map(|b| {
@@ -1793,7 +1579,7 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                         );
                         store_bundle_local(&bundle, &b);
                         if forced {
-                            let _ = std::fs::remove_file(&force_path); // one-shot
+                            let _ = std::fs::remove_file(&force_path);
                         }
                         if let Ok(js) = serde_json::to_vec(&b) {
                             crate::guardian::put(&guardian_key(&bundle), js).await;
@@ -1805,15 +1591,6 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                         }
                     }
                     Err(e) => {
-                        // A Let's Encrypt rate-limit is a BUDGET event, not a
-                        // transient: the duplicate-certificate window (5 per
-                        // 168h per exact identifier set) closes the bundle
-                        // until the window opens — live-witnessed 2026-07-29
-                        // after five forced renewals in a week ('retry after
-                        // 2026-07-30 10:06:58 UTC'), which also silently
-                        // disarmed the acme-force sentinel path. Warn alone
-                        // buried that; make it an incident so the operator
-                        // sees the window (and that force-renewals spend it).
                         if e.to_string().contains("rateLimited") {
                             cloud.incidents.open(crate::incidents::OpenReq {
                                 condition: format!("acme:rate-limit:{bundle}"),
@@ -1835,13 +1612,9 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
     });
 }
 
-/// Remove a custom-domain bundle that is no longer wanted: its SNI map
-/// entries (derived from the cached bundle exactly the way `install_bundle`
-/// keyed them, minus any name a WANTED bundle still covers — two
-/// attachments can share the `www` key, and detaching one must not kill the
-/// other's cert) and its local cache file. Without this a detached/unverified
-/// domain kept answering HTTPS with a still-valid cert until process
-/// restart — routing revoked, TLS not.
+/// Removes a custom-domain bundle that is no longer wanted: its SNI entries (minus any name a
+/// WANTED bundle still covers: two attachments can share the `www` key) and its local cache file.
+/// Without it a detached domain kept answering HTTPS until restart: routing revoked, TLS not.
 fn prune_custom_bundle(
     bundle: &str,
     wanted_names: &std::collections::HashSet<String>,
@@ -1866,44 +1639,45 @@ fn prune_custom_bundle(
     tracing::info!(%bundle, "TLS bundle pruned (custom domain no longer attached)");
 }
 
+/// cert-sync's poll interval while some bundle is still missing.
+const CERT_SYNC_CATCHUP_SECS: u64 = 20;
+/// cert-sync's poll interval once every bundle is installed.
+const CERT_SYNC_STEADY_SECS: u64 = 300;
+
 /// Every node: load local cache at boot, then poll the guardian replicated store
 /// and hot-swap the SNI resolver when a newer bundle lands.
+///
+/// Per bundle the newest source wins in this order: guardian replica (bounded to 10 s: a sick
+/// guardian must not starve the loop), authenticated mesh (`mesh_fetch`), then the HTTPS admin
+/// fallback (`http_fetch`), which survives the iroh mesh to the issuer being down (including the
+/// bootstrap deadlock where the relay hostname is missing from the very cert being synced). The
+/// local cache installs first at boot, then the loop runs every `CERT_SYNC_CATCHUP_SECS` until
+/// every bundle is installed and every `CERT_SYNC_STEADY_SECS` after.
+///
+/// Custom-domain bundles no longer wanted are pruned so they stop answering TLS, behind
+/// blast-radius guards: an EMPTY domain snapshot (a wholesale-replace flap signature) prunes
+/// nothing, a bundle must be unwanted for TWO consecutive ticks, and SNI keys a wanted bundle still
+/// covers are kept. Each node prunes on its own cadence; a lingering guardian replica is never
+/// fetched, since the loop iterates only the wanted set.
 pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
     if cloud.ingress == "ngrok" {
         return;
     }
     tokio::spawn(async move {
-        let mut installed: HashMap<String, u64> = HashMap::new(); // bundle -> issued_ms
-                                                                  // bundle -> consecutive unwanted ticks (prune flap damping)
-        let mut unwanted: HashMap<String, u8> = HashMap::new();
-        // boot: local cache first (guardian may take a while to come online)
+        let mut installed_issued_ms: HashMap<String, u64> = HashMap::new();
+        let mut unwanted_ticks: HashMap<String, u8> = HashMap::new();
         for (bundle, ..) in bundles(&cloud)
             .into_iter()
             .chain(custom_domain_bundles(&cloud))
         {
             if let Some(b) = load_bundle_local(&bundle) {
                 if install_bundle(&b).is_ok() {
-                    installed.insert(bundle.clone(), b.issued_ms);
+                    installed_issued_ms.insert(bundle.clone(), b.issued_ms);
                     tracing::info!(%bundle, "TLS bundle loaded from local cache");
                 }
             }
         }
         loop {
-            // Prune custom-domain bundles no longer wanted (detached /
-            // verification cleared / project deleted): they must stop
-            // answering TLS here, not just stop renewing. Guards (every
-            // prune/GC in this codebase has one — the podman lock pool and
-            // gc_rootfs_images lessons): (1) an EMPTY domain snapshot is a
-            // wholesale-replace flap signature, never a real "zero domains"
-            // — skip the pass entirely rather than prune everything;
-            // (2) a bundle must be unwanted for TWO consecutive ticks before
-            // it is pruned, so a one-tick status flap (owner-election churn,
-            // the 2026-08-18 lesson) never reaches the SNI map; (3) SNI
-            // keys still covered by a WANTED bundle are never removed (two
-            // attachments can share the `www` key). Peers prune on their own
-            // cadence; a guardian replica may linger but is never fetched
-            // (this loop only iterates the wanted set), so a fresh node
-            // never installs one.
             let wanted: Vec<(String, Vec<String>, String)> = custom_domain_bundles(&cloud);
             let wanted_bundles: std::collections::HashSet<String> =
                 wanted.iter().map(|(b, ..)| b.clone()).collect();
@@ -1911,47 +1685,35 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                 .iter()
                 .flat_map(|(_, names, _)| names.iter().cloned())
                 .collect();
-            for b in installed
+            for b in installed_issued_ms
                 .keys()
                 .filter(|b| b.starts_with("dom-"))
                 .cloned()
                 .collect::<Vec<_>>()
             {
                 if wanted_bundles.contains(&b) {
-                    unwanted.remove(&b);
+                    unwanted_ticks.remove(&b);
                 } else {
-                    *unwanted.entry(b).or_insert(0) += 1;
+                    *unwanted_ticks.entry(b).or_insert(0) += 1;
                 }
             }
             if !cloud.domains.snapshot().is_empty() {
-                let stale: Vec<String> = unwanted
+                let stale: Vec<String> = unwanted_ticks
                     .iter()
                     .filter(|(_, n)| **n >= 2)
                     .map(|(b, _)| b.clone())
                     .collect();
                 for b in stale {
-                    prune_custom_bundle(&b, &wanted_names, &mut installed);
-                    unwanted.remove(&b);
+                    prune_custom_bundle(&b, &wanted_names, &mut installed_issued_ms);
+                    unwanted_ticks.remove(&b);
                 }
             }
             for (bundle, ..) in bundles(&cloud)
                 .into_iter()
                 .chain(custom_domain_bundles(&cloud))
             {
-                let cur = installed.get(&bundle).copied().unwrap_or(0);
-                // Guardian replica first (works when local == writer), then the
-                // authenticated mesh (the cross-node path: per-node AEAD keys
-                // make replicated ciphertext unreadable on peers), then the
-                // plain HTTPS admin fallback (the path that still works when
-                // the iroh mesh to the issuer is down — including the
-                // bootstrap deadlock where the RELAY hostname is missing from
-                // the very cert being synced, so the relay fallback that
-                // mesh_fetch depends on is itself broken).
+                let cur = installed_issued_ms.get(&bundle).copied().unwrap_or(0);
                 let mut candidate: Option<CertBundle> = None;
-                // Bounded: a sick guardian (corrupt store looping re-init,
-                // witnessed live on fc-virginia) must never starve the whole
-                // cert-sync loop — the mesh + HTTPS fallbacks below are
-                // exactly for when guardian can't answer.
                 let guardian_bytes = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     crate::guardian::get(&guardian_key(&bundle)),
@@ -1966,10 +1728,6 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                         if b.issued_ms > cur {
                             match install_bundle(&b) {
                                 Ok(()) => candidate = Some(b),
-                                // EXPECTED on every non-writer node: the replica's
-                                // key_pem_enc is ciphertext under the WRITER's
-                                // per-node AEAD key. Named so the journal shows
-                                // why the newer guardian bundle didn't install.
                                 Err(e) => {
                                     tracing::debug!(%bundle, newer_issued_ms = b.issued_ms, cur, "cert-sync: guardian replica newer but uninstallable here (foreign AEAD key?): {e}")
                                 }
@@ -2007,39 +1765,30 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                 }
                 if let Some(b) = candidate {
                     store_bundle_local(&bundle, &b);
-                    installed.insert(bundle.clone(), b.issued_ms);
+                    installed_issued_ms.insert(bundle.clone(), b.issued_ms);
                     tracing::info!(%bundle, zones = ?installed_zones(), "TLS bundle installed (replica/mesh sync)");
                 }
             }
-            // Fast cadence until BOTH bundles are installed, then relax.
-            // Fast cadence until every bundle is installed, then relax.
-            let have_all = installed.len()
+            let have_all = installed_issued_ms.len()
                 >= bundles(&cloud)
                     .into_iter()
                     .chain(custom_domain_bundles(&cloud))
                     .count();
             tokio::time::sleep(std::time::Duration::from_secs(if have_all {
-                300
+                CERT_SYNC_STEADY_SECS
             } else {
-                20
+                CERT_SYNC_CATCHUP_SECS
             }))
             .await;
         }
     });
 }
 
-/// HTTPS-admin fallback for cert distribution, authenticated by the
-/// fleet-shared `HIVE_INTERNAL_TOKEN` (fails closed when unset). This is the
-/// iroh-independent path: it works whenever HTTPS to the platform edge works,
-/// which is exactly the condition dashboards and webhooks already rely on.
-///
-/// `api.<platform>` is multi-A round-robin, so ONE request lands on a random
-/// node (whose local bundle may itself be stale). Instead, sweep EVERY healthy
-/// fleet node deterministically: pin each registry `public_ip` under the valid
-/// `api.<platform>` TLS name via `reqwest`'s resolver override — the private
-/// key rides inside real TLS to each specific node — and keep the NEWEST
-/// bundle across all answers (same newest-wins rule as `mesh_fetch`).
-/// `HIVE_CERT_SYNC_URLS` (comma-separated) remains as an explicit override.
+/// HTTPS-admin fallback for cert distribution, authenticated by `HIVE_INTERNAL_TOKEN` (fails closed
+/// when unset); it needs HTTPS to the platform edge, not the iroh mesh. `api.<platform>` is multi-A
+/// round-robin, so one request lands on a random, possibly stale node: every healthy registry node
+/// is asked directly instead (its `public_ip` pinned under the `api.<platform>` TLS name) and the
+/// NEWEST bundle wins, as in `mesh_fetch`. `HIVE_CERT_SYNC_URLS` adds explicit targets.
 async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle> {
     let token = std::env::var("HIVE_INTERNAL_TOKEN")
         .ok()
@@ -2113,22 +1862,13 @@ async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
     best
 }
 
-/// Serve the local bundle to a MESH PEER with the private key DECRYPTED.
-/// The transport is the peer-authenticated, end-to-end-encrypted iroh QUIC mesh
-/// (signed-gossip enforce verifies the requester's identity); the receiver
-/// immediately re-encrypts with ITS OWN node key before touching disk. This is
-/// the distribution path that actually works cross-node — per-node AEAD keys
-/// mean a replicated *ciphertext* is undecryptable on peers.
+/// Serves the local bundle to a MESH PEER with the private key DECRYPTED, over the
+/// peer-authenticated iroh QUIC mesh; the receiver re-seals it under ITS OWN key (without a
+/// fleet-shared `HIVE_SECRET_KEY` a replicated ciphertext is unreadable off the writer). What is
+/// served is DERIVED from `bundles()` plus the `dom-*` custom bundles, never a hardcoded list: a
+/// bundle missing from one (`deploy`) made every follower answer 404 and its certificate never
+/// sync.
 pub fn bundle_for_mesh(cloud: &Arc<CloudState>, bundle: &str) -> Vec<u8> {
-    // Serve any bundle THIS node manages, plus per-tenant custom-domain bundles.
-    //
-    // The allowlist is DERIVED from `bundles()`, never hardcoded. It used to name
-    // `apps`/`platform`/`db` literally, so every bundle added to `bundles()` also
-    // had to be added here — and `deploy` was not (2026-10-01). Followers then got
-    // `404 no such bundle` from every node, the guardian replica is uninstallable
-    // off the writer (foreign AEAD key), and so the deploy certificate could never
-    // sync: previews under it failed TLS on every node except the issuer. Every
-    // new bundle would have repeated this. One source of truth removes the class.
     let known: std::collections::HashSet<String> =
         bundles(cloud).into_iter().map(|(name, ..)| name).collect();
     if !known.contains(bundle) && !bundle.starts_with("dom-") {
@@ -2148,8 +1888,14 @@ pub fn bundle_for_mesh(cloud: &Arc<CloudState>, bundle: &str) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// Fetch a bundle from any mesh peer that has it (leader or already-synced
-/// node), re-encrypting the key locally.
+/// Per-peer budget of a mesh bundle fetch: leaves `PeerPool::acquire`'s fresh-discovery fallback
+/// room to resolve a stale or flapped hint.
+const MESH_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// Fetches a bundle from the mesh peers (leader or already-synced nodes), re-sealing the key under
+/// this node's own key. Queries ALL peers and keeps the NEWEST bundle (highest `issued_ms`), never
+/// the first responder: a peer still serving a stale bundle would otherwise win the sync and a SAN
+/// change never propagate.
 async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle> {
     let peers: Vec<(String, String)> = cloud
         .registry
@@ -2158,20 +1904,19 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         .filter(|n| !n.is_self && n.healthy)
         .filter_map(|n| Some((n.peer_id?, n.iroh_addr?)))
         .collect();
-    // Query ALL peers and keep the NEWEST bundle (highest issued_ms), not the
-    // first responder. The old first-wins behavior let a peer still serving a
-    // STALE bundle (e.g. after the leader adds a SAN like relay./discovery. and
-    // re-issues) win the sync over the leader's freshly-issued newer one — so
-    // the SAN change never propagated and relay-cert probe churn persisted
-    // fleet-wide. Newest-wins guarantees convergence on the issuer's latest
-    // bundle regardless of which peer answers first.
     let mut best: Option<CertBundle> = None;
     for (id, addr) in peers {
         let path = format!("/v1/tls/bundle?name={bundle}");
-        // Bumped from 10s: give `PeerPool::acquire`'s fresh-discovery fallback room
-        // to resolve a stale/flapped hint instead of being cut off by this timeout.
-        if let Some(bytes) =
-            crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &path, &[], 15).await
+        if let Some(bytes) = crate::gossip::request_to(
+            cloud,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_GET,
+            &path,
+            &[],
+            MESH_FETCH_TIMEOUT_SECS,
+        )
+        .await
         {
             if bytes.is_empty() {
                 continue;
@@ -2201,7 +1946,22 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
     best
 }
 
-/// The two bundles: (name, SANs, DNS zone the challenge records live in).
+/// Every bundle this fleet issues, as (name, SANs, DNS zone the challenge records live in):
+///
+/// - `apps`: `*.{apps_domain}` + apex.
+/// - `platform`: explicit SANs only, no wildcard: `api.`, `admin.`, `webhook.`, `sms.`, the dashboard
+///   apex and `www.`, one `api-<region>.` per registry region (matching the records the reconciler
+///   publishes: a name that resolves but fails TLS is not usable) and, with
+///   `HIVE_ACME_PLATFORM_EXTRA=1`, `relay.` and `discovery.` (they terminate their own TLS through
+///   iroh). Regions are sorted so the SAN list is deterministic: a flapping order would defeat the
+///   superset check that triggers reissue, and a region joining grows the wanted set, so the next
+///   pass reissues on its own.
+/// - `db`: `*.{db_domain}` + apex, only with the DB gateway enabled (`HIVE_DB_DOMAIN`): the
+///   certificate the Postgres/Redis/HTTP proxy presents for every `<db>.{db_domain}`.
+/// - `deploy`: `*.{deploy_zone}` + apex, only when `HIVE_DEPLOY_ZONE` names a zone delegated to this
+///   fleet's nameservers. The PREVIEW namespace: one wildcard covers every preview label ever
+///   minted, where a wildcard per project would need one certificate each against Let's Encrypt's
+///   per-domain cap.
 fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
     let mut v = vec![
         (
@@ -2214,32 +1974,17 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
         ),
         (
             "platform".to_string(),
-            // api (developer/API-key surface) + admin (ops/admin console surface)
-            // + webhook (incoming GitOps/OpenEdge build-notification receiver,
-            // OPENEDGE_WEBHOOK_URL) + the dashboard hosts (apex/www — self-hosted
-            // on-node, no external tunnel). There is no `*.{platform_domain}`
-            // wildcard — each host is an explicit SAN.
             vec![
                 format!("api.{}", cloud.platform_domain),
                 format!("admin.{}", cloud.platform_domain),
                 format!("webhook.{}", cloud.platform_domain),
                 cloud.platform_domain.clone(),
                 format!("www.{}", cloud.platform_domain),
-                // Self-hosted SMS-fallback service (platform-deployed app the
-                // edge routes by Host alias) — needs a real SAN like every
-                // other explicit platform host (no *.{platform_domain}).
                 format!("sms.{}", cloud.platform_domain),
             ],
             cloud.platform_domain.clone(),
         ),
     ];
-    // Per-region API hosts (`api-<region>.<platform>`), matching the DNS records
-    // the reconciler publishes for them — a name that resolves but fails TLS is
-    // not usable, which is exactly what shipping the DNS half alone produced.
-    // Regions come from the registry; sorted so the SAN list is deterministic
-    // across passes (an order-flapping list would defeat the superset check that
-    // triggers reissue). A region joining later grows the wanted set, the cached
-    // bundle stops covering it, and the next ACME pass reissues automatically.
     {
         let mut regions: Vec<String> = cloud
             .registry
@@ -2254,7 +1999,6 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
             v[1].1.push(format!("api-{r}.{}", cloud.platform_domain));
         }
     }
-    // relay/discovery terminate their own TLS (iroh) — only add on request.
     if std::env::var("HIVE_ACME_PLATFORM_EXTRA")
         .map(|x| x == "1")
         .unwrap_or(false)
@@ -2262,9 +2006,6 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
         v[1].1.push(format!("relay.{}", cloud.platform_domain));
         v[1].1.push(format!("discovery.{}", cloud.platform_domain));
     }
-    // Per-tenant DB gateway wildcard (`*.{db_domain}` + apex) — the SNI cert the
-    // Postgres/Redis/HTTP proxy presents for every `<db>.{db_domain}` endpoint.
-    // Only when the gateway is enabled (HIVE_DB_DOMAIN set).
     if !cloud.db_domain.is_empty() {
         v.push((
             "db".to_string(),
@@ -2272,15 +2013,6 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
             cloud.db_domain.clone(),
         ));
     }
-    // Fleet-served deploy zone (`*.{deploy_zone}` + apex) — the PREVIEW
-    // namespace, and the reason this platform can scale past a third-party
-    // zone: ONE wildcard covers every preview label it will ever mint, so a
-    // preview costs zero DNS records and zero extra certificates. The
-    // alternative (a wildcard per project namespace) needs one certificate per
-    // project and Let's Encrypt caps those at ~50/week per registered domain.
-    // Only when HIVE_DEPLOY_ZONE is set, i.e. the zone really is delegated to
-    // this fleet's nameservers (DNS-01 then answers from the challenge store
-    // via `dnsserver`'s `_acme-challenge` path).
     if let Some(dz) = crate::dnsserver::deploy_zone() {
         v.push((
             "deploy".to_string(),
@@ -2291,12 +2023,9 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
     v
 }
 
-/// True once a certificate covering `zone` is installed on this node.
-///
-/// `state::deploy_url` gates preview URLs on this: a preview is only minted
-/// under the deploy zone when this node can actually terminate TLS for it, so a
-/// failed or slow issuance degrades to the apps domain instead of handing out
-/// URLs that fail the handshake.
+/// True once a certificate covering `zone` is installed on this node; `state::deploy_url` gates
+/// preview URLs on it, so a failed or slow issuance degrades to the apps domain instead of URLs
+/// that fail the handshake.
 pub fn zone_tls_ready(zone: &str) -> bool {
     installed_zones().iter().any(|z| z == zone)
 }
