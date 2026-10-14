@@ -1,5 +1,121 @@
 # Changelog
 
+## 2026-10-13 — a model download never blocks the reconcile loop, is bounded in time and disk, and leaves no partial or orphaned file (c43d864248)
+
+`fluid.json`'s `inference.model` is tenant input that reaches a real network fetch, and `reconcile_local`
+awaited `ensure_model` inline in the serial reconcile loop. One slow-drip URL (a byte every few seconds
+never trips a stall and never ends) stopped every other project's endpoint on the coordinator; the
+download had no time bound; the only size bound was the 200 GiB cap, with no check that the volume could
+hold it; and the partial file leaked on an error mid-transfer while the retired `fnv(url)`-named blobs and
+the content blobs no pointer names were never reclaimed. `inference::model_state` now never awaits a
+download: a cached blob returns at once, otherwise the download runs in its own task (one per URL, shared
+by every project naming it; a failed URL is remembered for 300 s) and the loop moves on. `ensure_model` is
+bounded in time (`HIVE_INFERENCE_MODEL_STALL_SECS` 60 s without a byte, which also bounds connect and
+headers; `HIVE_INFERENCE_MODEL_TOTAL_SECS` 2 h) and in disk (`HIVE_INFERENCE_MODEL_DISK_RESERVE_BYTES`
+2 GiB kept free, checked against the declared length up front and every 256 MiB), its partial file is a
+Drop guard deleted on every exit, and `sweep_orphans` removes, on every download, partial files untouched
+for 15 minutes plus retired `hive-<16 hex>.gguf` blobs and unreferenced `<64 hex>.gguf` blobs older than an
+hour (never a blob a `*.ref.json` names). Witnessed on a real node (`HIVE_GPUS` so it coordinates, five
+projects deployed from `file://` repos naming models on a hostile loopback host, orphans seeded;
+`scratch2/work/secfix-model.sh`): a slow drip blocked the loop before (3 of 4 healthy projects never got a
+status) and ended at the 40 s total limit after with every healthy project advanced on the first tick; a
+stalled transfer never ended before and failed at 6 s after; a declared length above the free space started
+writing before and was refused at once after; a connection reset at 200 KB left a 200000-byte `.part`
+before and nothing after; the seeded orphans were untouched before and removed after. Operator note: a
+model larger than the free space minus 2 GiB now fails its own endpoint ("insufficient disk space for the
+model") instead of filling the volume, and legacy `hive-<16 hex>.gguf` files in `HIVE_MODELS_DIR` older
+than an hour are deleted (nothing has read them since the cache became content-addressed). Not rolled.
+
+## 2026-10-13 — the pre-roll key audit repeats the boot parser; a set-but-empty HIVE_SECRET_KEY is named at boot and failed by the audit (d059b1f297)
+
+`scripts/audit-secret-keys.sh` approximated `secrets.rs::hex_to_32` instead of repeating it. A
+`HIVE_SECRET_KEY=` line (set but EMPTY, which the node refuses to boot on) was reported as absent and
+passed; an uppercase, mixed-case or whitespace-padded 64-hex value (which the node boots on) failed; the
+check script was written as root to a predictable path under `/tmp` on the audited host; an ssh session
+that died after the first lines read as a clean host; and when systemd gave no MainPID the script audited
+whichever `pgrep -x hive-cloud` returned first (fc-orlando also runs DevHub's hive-cloud), so a stopped or
+crash-looping hive-node passed. The key check is now exactly what the boot parser accepts, a set-but-empty
+value is a FAIL worded like the boot error (which now says "set but EMPTY (a `HIVE_SECRET_KEY=` line with
+no value)"), the process is `hive-node.service`'s MainPID and no MainPID is a FAIL, the check travels as
+`sh -c "<script>"` (no file on the host), and every host's output ends with an `END` sentinel whose
+absence is a FAIL. Witnessed against a real hive-cloud boot per input (`scratch2/work/secfix-audit3.sh`):
+of 11 values the old script disagreed with the node on 5 (EMPTY passed; upper, mixed, padded and `+digit`
+failed), the new one on 0; over a stub ssh/systemctl/pgrep and a fake `/proc` an empty key on the real
+MainPID, a stopped service beside a DevHub hive-cloud and an output cut after one line were each `clean`
+(exit 0) before and FAIL (exit 1) after. Operator note: an `Environment=HIVE_SECRET_KEY=` line in a unit
+or drop-in has always stopped the node at boot and is now a FAIL in the audit too (unset it or give it 64
+hex characters); a value the audit used to reject for case or padding is no longer a finding. Not rolled.
+
+## 2026-10-13 — a queue consumer's delivery URL is built from the one label its ownership check resolved (f05c7a0540)
+
+`consumer_target_owned` validated and resolved only the first dot-label of a consumer's `script_name`,
+while `CloudState::deploy_url` formats the WHOLE alias under `HIVE_INGRESS=ngrok` and the push loop
+handed it the tenant's whole string, then POSTed through the unfiltered internal client.
+`own-app.localhost:PORT`, `own-app.x@localhost:PORT` and even `own-app.localhost` (valid labels only, no
+port) registered as the tenant's own app and the platform connected to whatever followed the first label.
+`queues::delivery_label` (the first label, lowercased) is now the one value the ownership check resolves
+and the delivery URL is built from, and every label is validated at registration so a malformed tail is
+refused instead of silently ignored. Witnessed on a real node with ngrok ingress and TLS ClientHello spies
+on loopback (`scratch2/work/secfix-queue-ngrok.sh`): before, all three registered 200 and the platform
+opened 2 connections to the spy for each; with label validation alone the valid-label tail still
+connected; after, the port and userinfo tails are 403, the valid-label tail registers but nothing reaches
+the host it names, and `own-app` and `own-app.shadw.app` still register (a dns-ingress node still
+delivers to the tenant's own app). Operator note: a consumer registered earlier with a dotted
+`script_name` now delivers to its first label only (`HIVE_INGRESS=ngrok` is retired fleet-wide, and dns
+ingress already ignored the tail). Not changed: `CloudState::deploy_url` still formats the whole alias
+under ngrok for its other callers (gateway-generated single-label aliases; `world::deliver_orphan_job`
+passes a project NAME, and a project named `own-app.attacker.example` can be claimed, but that request
+goes through the `hive-outbound` guarded client). Not rolled.
+
+## 2026-10-13 — the DB gateway bounds a connection before it is established, never while it is (c85a293c54)
+
+The accept bounding of the previous wave spliced the two streams with a `select!` over two copies and a
+10-minute no-bytes limit. An ESTABLISHED session was cut after 10 idle minutes (a pooled idle
+Postgres/Redis connection, `LISTEN`/`SUBSCRIBE` and a long statement all carry nothing for hours), the
+first direction to finish ended the other (a client that half-closed after its request lost the reply),
+the backend was connected right after the handshake (a client that handshook and then sent nothing held a
+Postgres connection slot at no cost), and the pending cap was global only (one source address could fill
+it and lock every other client out). The preamble read, the TLS handshake, the first client byte and the
+backend connect now run under `HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS`, the first byte is read before the
+backend is touched, and a `PendingGuard` (global `HIVE_DB_GATEWAY_PENDING_MAX` 512 plus per source
+`HIVE_DB_GATEWAY_PENDING_PER_IP_MAX` 32, an IPv6 source counted as its /64) is released once that byte is
+forwarded. An established session has no idle bound at all: TCP keepalive (60 s + 15 s) finds a vanished
+peer and `copy_bidirectional` copies each direction on its own, so a half-closing client still gets the
+whole reply and a `close_notify`. Witnessed on a real node with a seeded `*.db.witness.test` bundle (a real
+TLS handshake, SNI routing to a real database record, a stand-in engine on its `local_port`;
+`scratch2/work/secfix-dbgw2.sh`): an idle established session was dropped after 600.2 s before and was
+alive after 660 s idle with a second round trip after; a half-closed request got no reply before and the
+whole reply plus a clean `close_notify` after; a silent post-handshake client cost the engine 1 connection
+before and 0 after; with a global cap of 6 and a per-source cap of 4, one address's 10 silent connections
+locked a second address out before and left it connecting after (4 held, 6 closed at once). Operator note:
+`HIVE_DB_GATEWAY_IDLE_MS` no longer exists; the keepalive options themselves are not proven live (a vanished
+peer cannot be simulated on loopback). Not rolled.
+
+## 2026-10-13 — a team role floor on a mutation honors an unenforced node (971ed250ae)
+
+The role floor `a705fe33c3` put on project env put/delete and API-key revoke was `require_team(...)`, which
+has no unenforced escape: a dev node (no `HIVE_JWT_SECRET`) has only anonymous callers, so those three
+calls went from 200 to 403, while every other role gate (`operator_allowed`, `require_auth_read`) lets an
+unenforced node stay as open as it is for every other mutation. `admin::require_team_floor` wraps it: with
+`auth::enforced()` false it returns the caller's tenant and applies no floor; with auth enforced it is
+exactly `require_team`. Witnessed on real throwaway nodes (`scratch2/work/secfix-devteam.sh`): dev node,
+anonymous env put, env delete and key revoke 403/403/403 before and 200/200/200 after; enforced node
+identical before and after (anonymous 401; viewer 403 on env put, env delete and key revoke; member 403 on
+key revoke, 200 on env put; admin 200 on key revoke). Not rolled.
+
+## 2026-10-13 — world reads take the loopback sidecar endpoint from the project's own database record, never from tenant env (bef14c9026)
+
+The world client's loopback exemption (`c6bcee01ed`, so a node can reach its own managed Redis REST shim)
+accepted ANY loopback `http://127.0.0.1:PORT` a project's `UPSTASH_REDIS_REST_URL`/`WORKFLOW_REDIS_REST_URL`
+named, so a tenant could aim the node's world client at any other service on the node's loopback.
+`world::world_config` now accepts a loopback URL only when it equals
+`DatabaseStore::local_redis_rest_url(project, team, node)`: the REST URL of THIS project's own Redis
+record, same tenant, hosted on this node (`is_platform_loopback_shim` stays as a shape check, never the
+gate). Witnessed on a real node with a recorder on the managed database's port and another on an arbitrary
+loopback port (`scratch2/work/secfix-worldshim.sh`): before, a tenant-set `http://127.0.0.1:9582` received
+the world client's POST (ZRANGE with the tenant-chosen bearer); after, 0 requests, while the managed
+database's own endpoint is still reached (1 request before and after). Not rolled.
+
 ## 2026-10-13 — an amount from a request body can no longer wrap into a credit: every cents input is bounded (0342ebc567)
 
 `POST /v1/billing/charge` debits the caller's own account by `cents`, a `u64` straight from the request
