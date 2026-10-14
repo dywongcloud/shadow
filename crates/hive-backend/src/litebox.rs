@@ -311,6 +311,8 @@ const GUEST_LOCAL_CONNECT_PERMITS: usize = 1;
 /// Archive hashing slower than this is logged: a cold start pays it once per deployment, node and
 /// TTL instead of once per launch.
 const SLOW_ARCHIVE_VERIFY_MS: u128 = 50;
+/// `tar` flag that stores what a symlink points at: a SONAME is very often a symlink.
+const TAR_DEREFERENCE_FLAG: &str = "-h";
 
 /// Guest-side half of the artifact handshake, run before tenant code in Node and Bun: it exits with
 /// `RUNTIME_GUARD_EXIT_CODE` unless the mounted marker matches the host's protocol, id and content
@@ -1651,9 +1653,8 @@ impl LiteboxBackend {
         Ok(reference)
     }
 
-    /// Publish the image's application binding exactly once. A retry may observe
-    /// runtime-closure metadata added by a prior cold start, but it can never
-    /// replace the immutable application/identity/workdir/package binding.
+    /// Publish the image's application binding exactly once; a retry may see runtime-closure
+    /// metadata a prior cold start added, but never a different immutable binding.
     async fn write_image_reference_locked(
         &self,
         directories: &ArtifactDirectories,
@@ -1704,10 +1705,9 @@ impl LiteboxBackend {
         Ok(())
     }
 
-    /// Replace only lazily-derived runtime-closure metadata after re-proving
-    /// that the durable application binding is byte-for-byte the same one the
-    /// cold start loaded. Cancellation before the rename leaves only a private
-    /// Drop-cleaned temp; no different application can reach this path.
+    /// Replace only the lazily derived runtime-closure metadata, after re-proving that the durable
+    /// application binding is the one the cold start loaded; cancellation before the rename leaves
+    /// only a Drop-cleaned private temp.
     async fn write_runtime_reference_locked(
         &self,
         directories: &ArtifactDirectories,
@@ -1865,29 +1865,7 @@ impl LiteboxBackend {
         reference: &mut LiteboxImageReference,
     ) -> anyhow::Result<File> {
         let mut deps = ldd_closure(bin).await?;
-        // Modern glibc merged libpthread/libdl/librt/libutil into libc, so the
-        // runtime binary's own closure never names them — but native addons in
-        // the application tree (e.g. @next/swc-linux-x64-gnu) still declare
-        // those legacy sonames as NEEDED, and the guest's dlopen fails with
-        // "cannot open shared object file" for stubs every glibc host actually
-        // ships. Stage the compat stubs (a few KB each) whenever they exist;
-        // absent ones are skipped, not errors.
-        for stub in [
-            "/lib64/libpthread.so.0",
-            "/lib64/libdl.so.2",
-            "/lib64/librt.so.1",
-            "/lib64/libutil.so.1",
-        ] {
-            let path = PathBuf::from(stub);
-            if !deps.contains(&path)
-                && std::path::Path::new(stub)
-                    .metadata()
-                    .map(|metadata| metadata.is_file())
-                    .unwrap_or(false)
-            {
-                deps.push(path);
-            }
-        }
+        add_glibc_compat_stubs(&mut deps);
         deps.sort();
         deps.dedup();
         let source_sha256 = runtime_source_sha256(
@@ -1910,11 +1888,6 @@ impl LiteboxBackend {
                 {
                     Ok(file) => return Ok(file),
                     Err(error) => {
-                        // Loud, not silent: a cached runtime archive that fails
-                        // its own hash means the on-disk bytes changed after
-                        // publication. Rebuilding below is the right recovery,
-                        // but it used to happen with no trace at all, so a
-                        // corrupted or tampered cache looked like a slow build.
                         tracing::warn!(
                             runtime_key = %runtime_key,
                             archive_sha256 = %cached.archive_sha256,
@@ -1994,6 +1967,12 @@ impl LiteboxBackend {
         Ok(archive)
     }
 
+    /// Reap archives no reference names, plus stale temp and staging entries, under blast-radius
+    /// guards: an empty keep set, an entry younger than the grace age
+    /// (`HIVE_LITEBOX_ARTIFACT_GC_GRACE_SECS`) and a reaped fraction over the cap
+    /// (`HIVE_LITEBOX_ARTIFACT_GC_MAX_REAP_FRACTION`) are all refused. Referenced archives are
+    /// checked for presence only, never hashed (hashing them under `artifact_lock` queued every
+    /// cold start behind it); content is verified where it is used.
     async fn gc_artifacts_locked(&self, directories: &ArtifactDirectories) -> anyhow::Result<()> {
         directories.verify_bindings()?;
         let mut keep_apps = BTreeSet::new();
@@ -2017,13 +1996,6 @@ impl LiteboxBackend {
                 "litebox artifact GC refuses a reference with a mismatched filename: {}",
                 name.to_string_lossy()
             );
-            // Presence, never content: this loop used to SHA-256 every archive
-            // every reference names, on every publish, under `artifact_lock` --
-            // ~125 references x ~400 MB = ~50 GB, measured at ~163 s per publish
-            // on fc-sanjose (2026-09-20), so a shim change (which invalidates
-            // every app's runtime archive) queued each app's cold start behind
-            // ~2.7 minutes of hashing apiece. Content is verified where it is
-            // USED (`verify_immutable_open` at launch and at publication).
             let app_name = Self::app_archive_name(&reference.app_archive_sha256);
             directories.apps.open_regular(&app_name).with_context(|| {
                 format!(
@@ -2118,10 +2090,9 @@ impl LiteboxBackend {
         Ok(())
     }
 
-    /// Retire one exact platform-issued image reference. The backend trait has
-    /// no deployment-deletion hook yet; its eventual caller must invoke this
-    /// only after the image is absent from live platform state. Archive GC keeps
-    /// its empty-set, age and maximum-fraction blast-radius guards unchanged.
+    /// Retire one exact platform-issued image reference. The backend trait has no
+    /// deployment-deletion hook yet: its eventual caller must invoke this only after the image is
+    /// absent from live platform state.
     pub async fn retire_image_reference(&self, image: &str) -> anyhow::Result<bool> {
         anyhow::ensure!(
             valid_identity_id(image),
@@ -2148,31 +2119,14 @@ impl LiteboxBackend {
         Ok(true)
     }
 
-    /// Tier 2: REAL functional proof, TWO checks.
-    ///
-    /// **(a) Rewriter check** — runs a trivial dynamically-linked program
-    /// (`/bin/echo`, staged with its real `ldd` closure — see module doc's
-    /// "Guest filesystem" section) through the live rewriter and checks it
-    /// produced the exact expected output via the sandboxed process's real
-    /// stdout.
-    ///
-    /// **(b) Network check** — sets up a real, throwaway per-cell TUN device
-    /// (the exact `LiteboxNet` machinery `provision`/`start_function` use),
-    /// runs a real Node HTTP server through the FULL pipeline (patched
-    /// litebox + bind-rewrite shim), and makes a real HTTP round trip from
-    /// the host. A PASS here is what actually licenses `HIVE_LITEBOX_VERIFIED=1`
-    /// — see the module doc's "Networking" section for exactly what this
-    /// closes and what it still doesn't cover (Bun/Python bind-rewrite,
-    /// sustained concurrency under real load).
-    ///
-    /// **Bring-up only. Never call this against a node already carrying live
-    /// traffic** — mirrors `pvm_run_smoke_test`'s gating in `AGENTS.md`
-    /// exactly: a smoke test that itself exercises an unproven isolation
-    /// path (here: creates a real network namespace + iptables rules) is
-    /// the kind of check that can wedge the very host serving traffic. The
-    /// verdict here is NOT auto-applied to backend selection; an operator
-    /// runs this once via the `--litebox-probe` CLI flag during bring-up —
-    /// see `main.rs`'s backend-selection chain.
+    /// Tier 2: functional proof in three checks. (a) Rewriter: `/bin/echo`, staged with its `ldd`
+    /// closure, must print a marker through the live rewriter. (b) Network: a throwaway TUN link
+    /// carries a real HTTP round trip to a Node server (wildcard bind, the case `networking.patch`
+    /// fixes) through the patched litebox and the bind shim. (c) Writable workdir: that guest
+    /// creates, overwrites and renames files inside a read-only tar-layer directory before it
+    /// listens. A PASS licenses `HIVE_LITEBOX_VERIFIED=1` but is never applied automatically, and
+    /// it does not cover Bun, Python or load. Bring-up only: it creates a real TUN device and NAT
+    /// rules, so never run it (`--litebox-probe`) against a node carrying live traffic.
     pub async fn smoke_test(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.is_supported(),
@@ -2193,9 +2147,7 @@ impl LiteboxBackend {
         }
         if !deps.is_empty() {
             let mut cmd = Command::new("tar");
-            // `-h`/`--dereference`: see the identical comment in
-            // `ensure_combined_tar` — a SONAME is very often a symlink.
-            cmd.arg("-h")
+            cmd.arg(TAR_DEREFERENCE_FLAG)
                 .arg("--absolute-names")
                 .arg("-cf")
                 .arg(&tar_path);
@@ -2255,7 +2207,14 @@ impl LiteboxBackend {
     }
 
     async fn network_smoke_test_inner(&self, net: &LiteboxNet) -> anyhow::Result<()> {
+        /// Wildcard-bound by the probe's server (`.listen(PROBE_PORT)`, no host): the case
+        /// `networking.patch` fixes natively, so a PASS proves the patch and not only the TUN
+        /// plumbing. The bind shim is preloaded too, a no-op here that proves the shim did not break.
         const PROBE_PORT: u16 = 18080;
+        /// Ceiling on the HTTP round trip: litebox's userspace TCP stack has no kernel socket behind
+        /// it, so a guest that dies mid-response never sends a FIN and `read_to_end` would wait
+        /// forever.
+        const ROUND_TRIP_DEADLINE: Duration = Duration::from_secs(10);
 
         let node_bin = resolve_bin("node").await;
         anyhow::ensure!(
@@ -2267,13 +2226,10 @@ impl LiteboxBackend {
         let _publication = self.artifact_lock.clone().lock_owned().await;
         let directories = self.prepare_artifact_dirs()?;
         let archive = self.allocate_temp_file(&directories.temporary, "network-smoke", ".tar")?;
-        // Always build the tar (never conditional on `deps` being non-empty
-        // — it always needs at least the bind shim) and always pass
-        // `--initial-files`, so the guest can find it.
         let mut tar = Command::new("tar");
         let archive_path = crate::runtime_artifact::inherit_file_path(&mut tar, &archive.file)?;
         let out = tar
-            .arg("-h")
+            .arg(TAR_DEREFERENCE_FLAG)
             .arg("--absolute-names")
             .arg("-cf")
             .arg(archive_path)
@@ -2291,31 +2247,6 @@ impl LiteboxBackend {
         archive.file.sync_all()?;
 
         let marker = format!("litebox-net-smoke-{}", now_ms());
-        // A wildcard bind (`.listen(PROBE_PORT)`, no host) is the exact case
-        // `networking.patch` fixes natively — this proves the patch, not
-        // just the TUN plumbing around it. The bind-rewrite shim is ALSO
-        // preloaded (harmless no-op for this wildcard case, but proves the
-        // shim mechanism itself didn't break — see `LiteboxBackend`'s
-        // module doc, "Networking").
-        // (c) Writable-workdir check — added 2026-09-09 after every deployment
-        // that creates a file at runtime died at launch on the day fc-sanjose
-        // became Litebox (`EACCES: permission denied, mkdir '/workspace/
-        // server/data'`): the guest runs as one fixed non-root uid, and a
-        // fork-side regression made every directory that came from the
-        // read-only tar layer — the application's own cwd — unwritable. The
-        // two checks above never wrote a byte, so the runner PASSED while the
-        // fleet's own workloads could not start. The guest now mkdirs, creates
-        // and reads back a file inside a tar-layer directory before it ever
-        // listens; a failure there exits before listening, and the existing
-        // "exited before listening" refusal carries the guest's own errno.
-        // Four writes, each a distinct guest-filesystem path that has broken
-        // on this fleet: (1) mkdir + create in a tar-layer directory (the
-        // 2026-09-09 EACCES launch failure), (2) overwrite a file that
-        // shipped 0o444 in the tar (copy-up used to kill the runner,
-        // `layered.rs:377`), (3) write-tmp-then-`rename()` over a shipped file
-        // (the atomic-save idiom; the renamed target used to answer ENOENT),
-        // (4) read every result back. The token the guest serves is the
-        // concatenation, so the host check cannot pass on a partial success.
         let write_dir = format!("{PROBE_WRITE_DIR}/data");
         let write_token = format!("write-ok-{}", now_ms());
         let script = format!(
@@ -2357,11 +2288,6 @@ impl LiteboxBackend {
             .env("HOME", "/")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            // Node honours this regardless of OpenSSL's compiled-in default
-            // path, which is what the planted bundle at
-            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
-            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
-            // 226 KiB bundle present, measured 2026-10-08).
             .envs(guest_ca_env())
             .env("NODE_OPTIONS", format!("--require {GUEST_BIND_SHIM_PATH}"))
             .stdin(Stdio::null())
@@ -2371,9 +2297,6 @@ impl LiteboxBackend {
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!("failed to spawn litebox runner for the network smoke test: {e}")
         })?;
-        // Drain both pipes concurrently in the background so a chatty guest
-        // can never fill the pipe buffer and deadlock the process — captured
-        // for the failure message below, not printed live.
         use tokio::io::AsyncReadExt;
         let mut stdout_pipe = child.stdout.take().expect("piped stdout");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -2404,12 +2327,7 @@ impl LiteboxBackend {
         drop(initial_files_alias);
 
         use tokio::io::AsyncWriteExt;
-        // Bounded: an unresponsive guest must fail loudly, not hang this
-        // probe forever. litebox's own userspace TCP stack has no kernel
-        // socket behind it — if the guest process dies mid-response without
-        // a chance to send a real FIN over the TUN link, `read_to_end` would
-        // otherwise wait for an EOF that can never arrive.
-        let round_trip = tokio::time::timeout(Duration::from_secs(10), async {
+        let round_trip = tokio::time::timeout(ROUND_TRIP_DEADLINE, async {
             let mut stream = tokio::net::TcpStream::connect(&addr).await?;
             stream
                 .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -2460,10 +2378,8 @@ fn sha256_parts(parts: &[&[u8]]) -> String {
     hex_sha256(&hasher.finalize())
 }
 
-/// Undoes the kernel's `" (deleted)"` annotation on a `/proc/<pid>/exe`
-/// readlink target whose backing inode was unlinked while still mapped —
-/// see `reap_orphaned_runners`'s doc comment for why this fires on every
-/// ordinary runner-binary deploy, not just a crash.
+/// Undoes the kernel's `" (deleted)"` annotation on a `/proc/<pid>/exe` target whose inode was
+/// unlinked while still mapped, which every runner-binary deploy causes, not only a crash.
 #[cfg(target_os = "linux")]
 fn strip_deleted_exe_suffix(path: &Path) -> PathBuf {
     const SUFFIX: &str = " (deleted)";
@@ -3478,6 +3394,32 @@ async fn ldd_closure(bin: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Legacy sonames modern glibc folded into libc: native addons in the application tree (such as
+/// `@next/swc-linux-x64-gnu`) and coreutils builds linked against the split libraries still list
+/// them as NEEDED, so the guest's `dlopen` fails unless the compat stubs the host ships are staged
+/// with the closure.
+const GLIBC_COMPAT_STUBS: [&str; 4] = [
+    "/lib64/libpthread.so.0",
+    "/lib64/libdl.so.2",
+    "/lib64/librt.so.1",
+    "/lib64/libutil.so.1",
+];
+
+/// Adds the compat stubs this host ships to a closure; an absent stub is skipped, never an error.
+fn add_glibc_compat_stubs(deps: &mut Vec<PathBuf>) {
+    for stub in GLIBC_COMPAT_STUBS {
+        let path = PathBuf::from(stub);
+        if !deps.contains(&path)
+            && std::path::Path::new(stub)
+                .metadata()
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        {
+            deps.push(path);
+        }
+    }
+}
+
 /// Approved library directories for LDD closure paths. Defense-in-depth:
 /// shared-library paths from ldd output must resolve to one of these
 /// directories. Paths outside the allowlist are rejected before they ever
@@ -4490,26 +4432,7 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     for program in extra {
         stage_guest_program(&program, &mut programs, &mut deps, &mut copies).await;
     }
-    // Same legacy-soname compat stubs `ensure_combined_tar_locked` stages —
-    // a coreutils build linked against a split libpthread/libdl/librt/libutil
-    // (rare on a modern glibc host, but the failure mode if it happens is a
-    // guest-side dlopen ENOENT with no useful error) gets them for free.
-    for stub in [
-        "/lib64/libpthread.so.0",
-        "/lib64/libdl.so.2",
-        "/lib64/librt.so.1",
-        "/lib64/libutil.so.1",
-    ] {
-        let path = PathBuf::from(stub);
-        if !deps.contains(&path)
-            && std::path::Path::new(stub)
-                .metadata()
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-        {
-            deps.push(path);
-        }
-    }
+    add_glibc_compat_stubs(&mut deps);
     programs.append(&mut deps);
     programs.sort();
     programs.dedup();
