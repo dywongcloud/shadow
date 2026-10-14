@@ -1,5 +1,55 @@
 # Changelog
 
+## 2026-10-14 — a model download is bounded by throughput and by tenant, so one tenant's slow-drip URLs cannot hold the node's download slots for hours (914a82e577)
+
+A slow drip (a byte every few seconds) delivers data often enough that the stall timeout of `a21318ab2c` never fires,
+so a tenant whose projects named two such URLs held both of the node's two download slots for the whole 2 h total
+timeout and no other tenant's healthy model could start. `ensure_model` now ends a transfer whose bytes over a whole
+rate window (`HIVE_INFERENCE_MODEL_RATE_WINDOW_SECS`, 30 s) fall under `HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC`
+(64 KiB/s; 0 disables) with "model download too slow", and the stall default drops from 60 s to 30 s, so a trickle
+holds a slot for one window, not for the total timeout. `TenantSlot` caps a tenant at
+`HIVE_INFERENCE_MODEL_DOWNLOADS_PER_TENANT` (1) running download, taken before the node-wide slot and released with
+it on every exit of the download task; the tenant is `record_tenant(team_of(project))`, so every untagged project
+shares the fail-closed sentinel's one place. Witnessed on a real unenforced dev node that coordinates
+(`HIVE_GPUS`), two tenants and a stand-in model host (`scratch2/work/secfix-model3.sh`, `secfix-model4.sh`): before,
+alpha's two drip projects held both slots and beta's healthy 4 KiB model started only when the 60 s total timeout
+cut them, 58 s after it was deployed; after, alpha holds one slot (the second drip was requested only after the
+first was cut), beta's model downloaded 3 s after it was deployed and each drip was cut with "model download too
+slow" after one 6 s window. A healthy but slow 3 MiB model at 256 KiB/s still completed and a steady 16 KiB/s
+transfer was cut. Operator note: a model host that serves under 64 KiB/s needs
+`HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC` lowered (0 turns the floor off). Left open on purpose: as many colluding
+tenants as there are node-wide slots (`HIVE_INFERENCE_MODEL_DOWNLOADS_MAX`, 2) can still occupy all of them for one
+window at a time. Not rolled.
+
+## 2026-10-14 — a DB-gateway session is proven only once its database accepts authentication, and a full pending budget evicts its oldest stuck connection instead of starving everyone else (d051d5fd50)
+
+The gateway of `a67a44b67a` counted a session as proven on ANY backend reply. A Redis with a password answers `-NOAUTH`
+to everything but `AUTH`/`HELLO`/`QUIT`/`RESET` (and `+RESET` to a client that never authenticated) and a Postgres
+backend answers a StartupMessage with an authentication request, so one byte answered `-NOAUTH` released the session
+from every bound: it stayed open for as long as the client liked (still open at 12 s with the knobs at 3 s), costing
+the gateway two sockets and the database a connection slot. `AuthProof` now proves a session only when authentication
+was ACCEPTED (a Postgres `AuthenticationOk`; a Redis `+OK` to `AUTH` or the map/array `HELLO` answers when the
+database has a password, any non-error reply when it has none; errors and `+RESET` prove nothing). Until then the
+session has `HIVE_DB_GATEWAY_AUTH_DEADLINE_MS` (30 s, absolute from the first forwarded byte; it replaces
+`HIVE_DB_GATEWAY_FIRST_REPLY_MS`, which was never rolled), and an authenticated idle session keeps no bound at all.
+The pending budget, taken at accept before TLS, was 2048 global and 256 per address: a few addresses' half-open
+connections filled it and every other client was reset, and 800 legitimate clients restarting behind ONE NAT address
+had 544 turned away. It is now a `PendingTable` (global 4096, `HIVE_DB_GATEWAY_PENDING_MAX`; per address 1024,
+`HIVE_DB_GATEWAY_PENDING_PER_IP_MAX`, an IPv6 source as its /64): a full budget evicts the oldest connection that has
+sat unproven for `HIVE_DB_GATEWAY_PENDING_STUCK_MS` (2 s; the source's own oldest when the source is at its cap, the
+globally oldest when the table is full) and refuses a newcomer only when nothing in it is stuck. The failure WARN goes
+through a `Throttle` (one line per 10 s with the suppressed count; `debug` shows every one). Witnessed on a real node
+running the gateway with a seeded self-signed `*.db.witness.test` bundle and a stand-in engine speaking Redis and
+Postgres (`scratch2/work/secfix-dbgw4.sh`): before, the `-NOAUTH`, `+RESET` and Postgres-request sessions were all
+still open at 12 s, two addresses holding 10 half-open connections each starved a third address and an address at its
+cap, an 800-client burst from one address had 544 turned away and 300 failed connections wrote 300 WARNs; after, those
+three sessions are cut at 3.0 s (knob 3 s) while an authenticated Redis session, a pipelined PING+AUTH session and a
+full Postgres password exchange stay open (the authenticated one for 150 s at the default knobs), both clients get in
+during the flood, 800 of 800 authenticate and 300 failures write 1 WARN. The bound that remains: a burst of more than
+1024 simultaneous connections from ONE address has its excess refused at once and reconnects; raise the per-address
+knob for a larger NAT (`LimitNOFILE` is 1048576 on a platform node, so 4096 pending connections cost no descriptors
+worth counting). Not rolled.
+
 ## 2026-10-14 — the dashboard's nameserver card shows only measured or user-entered nameservers (01aaf526de)
 
 The DNS-only domain card's "Restore Original" button PUT the literal `ns1.openedge-dns.com` /
