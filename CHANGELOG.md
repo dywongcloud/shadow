@@ -1,5 +1,105 @@
 # Changelog
 
+## 2026-10-14 — a DNS-only domain record claims no nameservers the platform never measured (71d29ab090)
+
+`dns::default_domain` seeded every record with nameservers `ns1.openedge-dns.com` and
+`ns2.openedge-dns.com`: no such zone is delegated or measured, and the dashboard's Nameservers card showed
+them as the domain's. A new record now carries none, and `DomainStore::load` empties a record whose
+nameservers are ONLY that invented pair (written by an earlier build or replicated from a peer on one); a
+tenant's own nameservers, or any list with a non-invented name in it, are kept as set. The key stays (an
+older node parses `state.json` and snapshots with `nameservers` required): an empty list is what a record
+that has set none carries. Witnessed on a real node (`scratch2/work/secfix3-small.sh`): before, a fresh
+record served the invented pair and a persisted record kept serving it after a restart; after, a fresh
+record serves `[]` and the persisted pair is scrubbed on load, while `custom.example`'s own nameservers and
+a mixed list survive the load. The dashboard's "Restore Original" button still writes the invented pair from
+a literal in `ui/` (outside this change). Not rolled.
+
+## 2026-10-14 — the SAML ACS role gate steps aside on an unenforced dev node like every other role gate (42e5d703fa)
+
+`c45cbe1508` gated the SAML ACS with plain `admin::require_team(..., [owner, admin])`. With no
+`HIVE_JWT_SECRET` there are no verified claims and so no roles: every dev-node caller got 403, where every
+other role gate steps aside (`operator_allowed`, `require_team_floor`, the env and key floors). It now uses
+`require_team_floor`: unchanged with auth enforced (anonymous 401, another team's caller 403, a plain member
+403, the team's own owner or admin passes), open on an unenforced node. Witnessed on real nodes
+(`secfix3-small.sh`): before, the dev-node ACS POST answered 403 and provisioned nothing; after, 307 to the
+dashboard with the NameID on the roster; the enforced matrix is identical before and after and the earlier
+`secfix2-saml-scim.sh` still passes. Not rolled.
+
+## 2026-10-14 — a Stripe checkout is paid when Stripe says its payment_status is paid, in the read-back and in the signed webhook (8d1a8377bf)
+
+After `fb3b773810` the batch-3 review found, live: `stripe_verify_session` (the `POST /v1/billing/confirm`
+read-back) treated `status == "complete"` as paid whatever `payment_status` said, and the
+`checkout.session.completed` webhook arm never read `payment_status`: a signed UNPAID completion credited the
+account and set the enterprise plan. A delayed payment method (a bank debit) completes the session while
+`payment_status` is still `unpaid`: the money has not arrived and can still fail. Both now ask
+`billing::session_paid` (`payment_status == "paid"`). `no_payment_required` is refused too: this platform
+creates no zero-amount session (a free plan or a $0 addon is applied directly and never reaches Stripe), so
+it could only mean a trial or coupon nobody configured. A delayed payment still completes: confirm succeeds
+once Stripe reports it paid and the webhook now also handles `checkout.session.async_payment_succeeded`
+(`async_payment_failed` is logged, nothing applied); a paid event applies through `confirm_checkout`, which
+consumes the record, so a replayed delivery is a no-op. To witness the Stripe paths on a real node the Stripe
+API base is now `STRIPE_API_BASE` (default `https://api.stripe.com`; only `https://`, or `http://` to a
+loopback host, is honoured because the secret key rides every request as basic auth; anything else is logged
+and ignored). Witnessed on a real enforced node pointed at a loopback fake of the two Stripe endpoints, with
+signed payloads through `POST /v1/billing/webhook` (`scratch2/work/secfix3-payment.sh`, guard in
+`secfix3-knob.sh`): before, 4 defects (an unpaid-but-complete session confirmed and credited,
+`no_payment_required` credited, an UNPAID completed event credited the account, an unpaid completed event set
+the enterprise plan); after, none: 402 or ignored with balance and plan unchanged, while a paid session, a
+paid completed event and a delayed payment reported paid (confirm and `async_payment_succeeded`) all apply, a
+replay is a no-op, and a wrong secret or a stale timestamp is 401. The success path against real Stripe is
+unchanged and unwitnessed here. Operator note: a delayed-method purchase now waits for the webhook (set
+`STRIPE_WEBHOOK_SECRET`) or a later confirm. Not rolled.
+
+## 2026-10-14 — SCIM is managed by a team owner or admin, and a directory sync never changes or removes the people who run the team (73fa118212)
+
+After `c45cbe1508` opened the SCIM routes the batch-3 review found, live: `POST` and `DELETE
+/v1/enterprise/scim` had no role gate (a viewer or member minted the IdP bearer, and re-minting 401s the IdP's
+current token, or disabled directory sync); `scim_users_create` added members with `TeamStore::add_member`,
+which overwrites an existing member's role, so provisioning the owner's email demoted the owner to member, the
+admin's too, and a viewer's promoted the viewer; SCIM PATCH `active:false` and DELETE removed whatever roster
+member carried the SCIM user's `userName`, an admin or the owner included. Enable and disable now need owner
+or admin (`admin::require_team_floor`, which steps aside on an unenforced node). The directory adds through the
+new primitive `TeamStore::add_member_if_absent` (atomic: an existing member keeps its role) and removes through
+`TeamStore::remove_plain_member` (an Owner or Admin is left in place and the deprovisioning answers 403 in
+SCIM's error envelope with nothing changed, so the IdP sees the refusal). The same add-if-absent primitive now
+backs the SAML ACS auto-provision and `identity_sync`'s Clerk org mirror (which had an inline is-member
+check). Witnessed on a real enforced node (`scratch2/work/secfix3-scim.sh`): before, 9 defects (viewer and
+member minted the bearer and disabled SCIM, the IdP locked out, owner and admin demoted and a viewer promoted
+by provisioning, PATCH removed the admin, DELETE removed the owner); after, none: 403 for viewer and member,
+the IdP bearer untouched, roles unchanged, 403 on the owner/admin deprovisioning with the roster intact, while
+a new email is still added as a member and a plain member is still deprovisioned by PATCH and DELETE (the
+earlier `secfix2-saml-scim.sh` still passes). Not rolled.
+
+## 2026-10-14 — the preview unlock cookie is Secure on every host but a loopback dev one (127269cc21)
+
+`zkauth::issue_cookie` set `Path=/; HttpOnly; SameSite=Lax; Max-Age` with no `Secure`. It now carries
+`HttpOnly; Secure; SameSite=Lax` except where the host is `localhost`, `*.localhost` or a loopback address
+(a browser on plain `http://<project>.localhost:<port>`, the local dev flow, would not keep a Secure cookie
+in every browser); the scheme of the unlock request is not visible to `bootstrap` (`edge.rs` passes the host),
+so the host decides. `issue_cookie` also refuses to issue a cookie it could not seal (`secrets::encrypt`
+hands its input back unsealed on a failure and `cookie_access` accepts only sealed values): `bootstrap`
+answers 500. Witnessed (`scratch2/work/secfix3-zkcookie.sh`): before, the cookie of host
+`victimproj.witness.test` read `Path=/; HttpOnly; SameSite=Lax; Max-Age=3600`; after, `Path=/; HttpOnly;
+Secure; SameSite=Lax; Max-Age=3600`, while `victimproj.localhost` still issues it without Secure. Not
+rolled.
+
+## 2026-10-14 — a cookie or stored password is checked against a value some key actually opened, never against whatever string was sent (51dd177a1c)
+
+`secrets::decrypt` is a passthrough: it returns its input unchanged when the input is not an `enc:v1:` value
+or no key opens it. `zkauth::cookie_access` read the visitor's `shadw_zk` cookie through it, so a plaintext
+`Cookie: shadw_zk=<project>|99999999999999` (never issued by the node) parsed as a valid unexpired unlock and
+opened every team-private preview and Standard-protected deployment (zkauth is default-on in fleet builds).
+`enterprise::password_matches` had the same shape in its legacy `enc:v1:` branch: an envelope no key opens (a
+key change without `HIVE_SECRET_KEY_OLD`) compared equal to itself, so the ciphertext submitted as the
+password unlocked the deployment. Both use `secrets::try_decrypt` and fail closed; a value that does open
+still works. The other `decrypt()` callers were swept and left (env vars, sandbox env, TLS key PEMs, webhook
+signing keys and SIEM tokens are handed to the owner's own workload, none decides access) and `decrypt`'s doc
+now forbids letting its result decide access. Witnessed on a real enforced node
+(`scratch2/work/secfix3-zkcookie.sh`): before, forged cookies `victimproj|99999999999999` and
+`victimproj|<now+1h>` answered 200 on the private preview and the ciphertext submitted as the password
+unlocked (307 password-unlocked); after, 401 each, while the node's own sealed cookie unlocks (also after a
+restart) and the legacy sealed password still verifies. Not rolled.
+
 ## 2026-10-13 — the dashboard's Plan card buys an upgrade through checkout and explains a refusal instead of alerting a raw 403 (691cf48a67)
 
 `f00b3ebe32` made raising a plan a purchase or an operator grant: `PUT /v1/teams/:slug/plan` keeps or
