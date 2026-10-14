@@ -27,7 +27,15 @@ use crate::state::CloudState;
 const DEPLOY_ZIP_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEPLOY_ZIP_BODY_LIMIT_BYTES: usize = DEPLOY_ZIP_MAX_BYTES + 2 * 1024 * 1024;
 
+/// Per-peer budget for GUESSES at the internal token (a mint that fails `mint_allowed`).
 const MINT_ATTEMPTS_PER_WINDOW: u32 = 20;
+/// Per-user budget for legitimate mints (`HIVE_MINT_USER_PER_MIN`): a session mints about every
+/// 15 minutes, so this is a runaway-client bound, never a pacing one.
+const MINT_USER_PER_WINDOW_DEFAULT: u32 = 30;
+/// Peer-wide backstop for legitimate mints, every user together (`HIVE_MINT_BACKSTOP_PER_MIN`): the
+/// dashboard server is the peer of every user, and the admin router's own per-peer budget is the same
+/// order.
+const MINT_BACKSTOP_PER_WINDOW_DEFAULT: u32 = 600;
 const ADMIN_REQUESTS_PER_WINDOW: u32 = 600;
 const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 const MINTED_TOKEN_TTL_SECS: i64 = 60 * 60;
@@ -426,12 +434,51 @@ fn mint_allowed(headers: &HeaderMap) -> bool {
     }
 }
 
-/// Throttles `/v1/token` guesses at `HIVE_INTERNAL_TOKEN` independently of every other route (the
-/// tenant edge limiter never fronts the admin router).
+/// Throttles `/v1/token` GUESSES at `HIVE_INTERNAL_TOKEN` independently of every other route (the
+/// tenant edge limiter never fronts the admin router). Only a request that fails `mint_allowed`
+/// spends it, so guessing never starves the dashboard server's legitimate mints and those mints
+/// never loosen the guess budget. `tls_bundle_mesh` counts every request against it.
 fn mint_rate_limiter() -> &'static hive_edge::RateLimiter {
     static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
     LIMITER
         .get_or_init(|| hive_edge::RateLimiter::new(MINT_ATTEMPTS_PER_WINDOW, RATE_LIMIT_WINDOW_MS))
+}
+
+/// A positive per-window limit from the environment, else `default`.
+fn mint_window_limit(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// The legitimate mints one USER (`sub`) may make per window: every session of the fleet reaches this
+/// route through the one dashboard server, so a per-peer budget alone made all users share it (about
+/// 300 org sessions saturated 20 per minute) and let one runaway client starve the rest.
+fn mint_user_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        hive_edge::RateLimiter::new(
+            mint_window_limit("HIVE_MINT_USER_PER_MIN", MINT_USER_PER_WINDOW_DEFAULT),
+            RATE_LIMIT_WINDOW_MS,
+        )
+    })
+}
+
+/// The legitimate mints one peer address may make per window, all users together: the bound on a
+/// compromised or runaway caller that holds the internal token.
+fn mint_backstop_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        hive_edge::RateLimiter::new(
+            mint_window_limit(
+                "HIVE_MINT_BACKSTOP_PER_MIN",
+                MINT_BACKSTOP_PER_WINDOW_DEFAULT,
+            ),
+            RATE_LIMIT_WINDOW_MS,
+        )
+    })
 }
 
 /// Per-client-IP budget for the whole admin router, which the tenant edge limiter never fronts;
@@ -520,16 +567,28 @@ async fn mint_token(
     Json(req): Json<TokenReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let peer_ip = peer.ip().to_string();
-    if !mint_rate_limiter().check(&peer_ip, hive_core::now_ms()) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many token requests".into(),
-        ));
-    }
+    let now = hive_core::now_ms();
     if !mint_allowed(&headers) {
+        // A request that cannot present the internal token is a guess at it: it alone spends the strict
+        // per-peer budget.
+        if !mint_rate_limiter().check(&peer_ip, now) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many token requests".into(),
+            ));
+        }
         return Err((
             StatusCode::FORBIDDEN,
             "token minting is server-only (x-hive-internal required)".into(),
+        ));
+    }
+    // The dashboard server minting for a user: a budget per user under a peer-wide backstop.
+    if !mint_user_limiter().check(req.sub.trim(), now)
+        || !mint_backstop_limiter().check(&peer_ip, now)
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many token requests".into(),
         ));
     }
     let email = req.email.trim();
