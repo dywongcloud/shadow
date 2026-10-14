@@ -838,6 +838,19 @@ fn valid_script_label(label: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// The ONLY part of a consumer's `script_name` that may reach [`crate::state::CloudState::deploy_url`]:
+/// its first label, the one [`consumer_target_owned`] resolves to a project and checks the owner of.
+/// `deploy_url` formats the WHOLE alias under `HIVE_INGRESS=ngrok`, so handing it the tenant's string
+/// let `own-app.<any-host>` choose the delivery host (the unfiltered internal client then connects to
+/// it) while the ownership check had read only `own-app`. Check and use read this one value.
+fn delivery_label(script_name: &str) -> String {
+    script_name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 /// Whether `script_name` addresses an app of `tenant`, requiring POSITIVE evidence. A push
 /// consumer's batches are POSTed to `cloud.deploy_url(script_name)`, i.e. the host label
 /// `<script_name's first label>.{apps_domain}` of whatever project or deployment alias that label
@@ -854,14 +867,17 @@ pub fn consumer_target_owned(
     tenant: &str,
     script_name: &str,
 ) -> bool {
-    let label = script_name
+    // A malformed name is refused outright, tail labels included: a port, a userinfo or an empty
+    // label after the first dot is never a project name, and refusing it here keeps a typo from
+    // registering as if it worked (delivery reads only `delivery_label`, never the tail).
+    if !script_name
+        .to_ascii_lowercase()
         .split('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !valid_script_label(&label) {
+        .all(valid_script_label)
+    {
         return false;
     }
+    let label = delivery_label(script_name);
     let project = label_project(cloud, &label);
     let owner = cloud.projects.team_of(&project);
     if crate::admin::norm(&owner) == tenant {
@@ -951,15 +967,16 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                 if due.is_empty() {
                     continue;
                 }
-                // The destination host is already hardened and whitelisted (`deploy_url` via
-                // `host_scoped_https_url`, `consumer_target_owned`'s label+ownership check just
-                // above): this is the platform's OWN apps-domain namespace, never an arbitrary
-                // tenant-supplied URL, so the full `hive_outbound` SSRF guard (which would also
-                // refuse a dev node whose apps domain is itself a loopback/internal name) does not
-                // apply here — only the no-redirect client does.
+                // The destination host is built from the ONE label `consumer_target_owned` just
+                // resolved and ownership-checked (`delivery_label`, then `deploy_url` via
+                // `host_scoped_https_url`), never from the tenant's whole `script_name`: this is the
+                // platform's OWN apps-domain namespace, never an arbitrary tenant-supplied host, so
+                // the full `hive_outbound` SSRF guard (which would also refuse a dev node whose apps
+                // domain is itself a loopback/internal name) does not apply here — only the
+                // no-redirect client does.
                 let target = format!(
                     "{}/__hive_queue_consumer",
-                    cloud.deploy_url(&consumer.script_name)
+                    cloud.deploy_url(&delivery_label(&consumer.script_name))
                 );
                 let batch_json: Vec<serde_json::Value> = due
                     .iter()
