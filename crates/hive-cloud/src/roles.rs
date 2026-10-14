@@ -16,10 +16,13 @@
 //!   is `admin` (the dashboard mints `owner` only for a personal namespace), so an owner floor on a
 //!   project action would lock every org out of it: project delete and transfer sit at admin.
 //!
-//! A platform operator (`platform_admin`) acts as an owner everywhere. A `service` claim (a fleet
-//! delegation, a workload's queue client) is not a team role and is judged by its own handler. An
-//! unenforced dev node has no verified roles and stays open: `require_auth` returns before it asks.
-//! A role this table does not know is the lowest (viewer), never an implicit member.
+//! A platform operator (`platform_admin`) acts as an owner everywhere. A `service` claim is not a
+//! team role: a FLEET token (`auth::is_fleet_service`, subject AND role) passes and is judged by its
+//! own handler; the workflow World's queue client token (`auth::is_queue_client`), which sits in a
+//! tenant's project env, may call only [`QUEUE_CLIENT_ROUTES`]; any other `service` claim is refused
+//! (`auth::verify` never yields one). An unenforced dev node has no verified roles and stays open:
+//! `require_auth` returns before it asks. A role this table does not know is the lowest (viewer),
+//! never an implicit member.
 //!
 //! A route that needs more than member MUST be listed in [`RULES`]: the matrix is the only place a
 //! role is decided, so a handler never re-decides one (it may still bind the tenant to a path slug,
@@ -101,6 +104,13 @@ const RULES: &[Rule] = &[
     rule(DELETE, "/v1/teams/:slug", Role::Owner),
 ];
 
+/// The routes the workflow World's queue client token may call: enqueue a delayed callback for its
+/// own team, and read the queue's counters. Nothing else.
+const QUEUE_CLIENT_ROUTES: &[Rule] = &[
+    rule(POST, "/v1/wqueue/enqueue", Role::Member),
+    rule(GET, "/v1/wqueue/stats", Role::Viewer),
+];
+
 /// Whether `path` matches `pattern` segment by segment (a trailing slash is ignored).
 fn matches(pattern: &str, path: &str) -> bool {
     let mut want = pattern.trim_matches('/').split('/');
@@ -165,44 +175,70 @@ fn name(role: Role) -> &'static str {
     }
 }
 
-/// Why [`gate`] refused a request: the caller's role claim is below the matrix's floor for it.
-pub struct Refusal {
-    role: Role,
-    needs: Role,
+/// Why [`gate`] refused a request.
+pub enum Refusal {
+    /// The caller's role claim is below the matrix's floor for it.
+    Role { role: Role, needs: Role },
+    /// A `service` claim that is not a fleet token asked for more than its own routes.
+    Service,
 }
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        let what = if self.role == Role::Viewer {
-            "a viewer is read-only"
-        } else {
-            "your team role is too low for this change"
+        let message = match self {
+            Refusal::Role { role, needs } => {
+                let what = if role == Role::Viewer {
+                    "a viewer is read-only"
+                } else {
+                    "your team role is too low for this change"
+                };
+                format!(
+                    "insufficient team role: {what}; this needs {} or above",
+                    name(needs)
+                )
+            }
+            Refusal::Service => {
+                "a service token may call only its own routes (the workflow queue client: POST /v1/wqueue/enqueue)"
+                    .to_string()
+            }
         };
-        (
-            StatusCode::FORBIDDEN,
-            format!(
-                "insufficient team role: {what}; this needs {} or above",
-                name(self.needs)
-            ),
-        )
-            .into_response()
+        (StatusCode::FORBIDDEN, message).into_response()
     }
 }
 
-/// The matrix check for one authenticated request: `Ok` for an operator or a `service` claim, for
-/// a role at or above the request's floor; otherwise the [`Refusal`]. Runs for every platform JWT
-/// or API-key request on an enforced node (see `auth::require_auth`).
+/// The matrix check for one authenticated request: `Ok` for an operator or a fleet token, for the
+/// queue client on its own routes, for a role at or above the request's floor; otherwise the
+/// [`Refusal`]. Runs for every authenticated request on an enforced node (see `auth::require_auth`).
 pub fn gate(claims: &Claims, method: &Method, path: &str) -> Result<(), Refusal> {
-    if claims.platform_admin || claims.role == MESH_SERVICE_ROLE {
+    if claims.platform_admin || crate::auth::is_fleet_service(claims) {
         return Ok(());
+    }
+    if claims.role == MESH_SERVICE_ROLE {
+        return if crate::auth::is_queue_client(claims) && queue_client_may(method, path) {
+            Ok(())
+        } else {
+            Err(Refusal::Service)
+        };
     }
     let needs = floor(method, path);
     let role = role_of(&claims.role);
     if role.rank() >= needs.rank() {
         Ok(())
     } else {
-        Err(Refusal { role, needs })
+        Err(Refusal::Role { role, needs })
     }
+}
+
+/// Whether the queue client token may make this request ([`QUEUE_CLIENT_ROUTES`]).
+fn queue_client_may(method: &Method, path: &str) -> bool {
+    let verb = if *method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    QUEUE_CLIENT_ROUTES
+        .iter()
+        .any(|row| row.methods.contains(&verb) && matches(row.pattern, path))
 }
 
 /// The role a request acts WITH: a platform operator is an owner, an unenforced dev node (no

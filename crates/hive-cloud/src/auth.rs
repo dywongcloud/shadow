@@ -25,8 +25,9 @@ pub struct Claims {
     /// Tenant: the org/team id that scopes the token (multi-tenancy).
     pub tenant: String,
     /// TENANT-scoped role: `owner` | `admin` | `member` | `viewer` (`apikeys::MINTABLE_ROLES`);
-    /// `service` only on a mesh delegation token ([`is_mesh_internal`]). Never a platform-operator
-    /// signal (see `platform_admin`).
+    /// `service` only on a fleet token ([`is_fleet_service`]) or the workflow World's queue client
+    /// token ([`is_queue_client`]), and never a team role. Never a platform-operator signal (see
+    /// `platform_admin`).
     pub role: String,
     /// Expiry, unix seconds.
     pub exp: usize,
@@ -52,6 +53,30 @@ pub const MESH_SERVICE_ROLE: &str = "service";
 /// fleet-internal gate asks this one question.
 pub fn is_mesh_internal(claims: &Claims) -> bool {
     claims.sub == MESH_INTERNAL_SUB && claims.role == MESH_SERVICE_ROLE
+}
+
+/// Subject prefix of a runtime-artifact-transfer token (`mesh-node:<coordinator>`): a fleet node
+/// acting for one transfer, minted through `issue` with [`MESH_SERVICE_ROLE`]
+/// (`runtime_artifact_transfer` checks the coordinator and tenant inside).
+pub const MESH_NODE_SUB_PREFIX: &str = "mesh-node:";
+
+/// Subject of the workflow World's queue client token ([`issue_queue_client_token`]): the one
+/// `service` claim that reaches a TENANT's workload (it sits in the project's env as
+/// `HIVE_QUEUE_TOKEN`), so it is verified apart from the fleet's ([`verify_queue_client`]) and
+/// the role matrix lets it call the queue and nothing else.
+pub const QUEUE_CLIENT_SUB: &str = "world-queue-client";
+
+/// "This caller is a fleet node": a mesh delegation or a transfer token, subject AND role. These are
+/// the ONLY `service` claims [`verify`] accepts, so a `service` role string alone (data a tenant's
+/// workload can carry around) opens nothing: the role matrix passes exactly these through.
+pub fn is_fleet_service(claims: &Claims) -> bool {
+    claims.role == MESH_SERVICE_ROLE
+        && (claims.sub == MESH_INTERNAL_SUB || claims.sub.starts_with(MESH_NODE_SUB_PREFIX))
+}
+
+/// "This caller is a tenant workload's queue client": subject AND role of [`issue_queue_client_token`].
+pub fn is_queue_client(claims: &Claims) -> bool {
+    claims.sub == QUEUE_CLIENT_SUB && claims.role == MESH_SERVICE_ROLE
 }
 
 /// `raw` when it is a path on THIS origin, otherwise `fallback`: the only way a caller-supplied
@@ -129,14 +154,89 @@ pub fn verify(token: &str) -> anyhow::Result<Claims> {
     verify_with_secret(token, &key)
 }
 
-/// `verify` with an explicit secret (no env read) — the deterministic core.
+/// `verify` with an explicit secret (no env read) — the deterministic core. A `service` claim is
+/// accepted only for a FLEET identity ([`is_fleet_service`]): the queue client token and any other
+/// `service` claim fail here, at the one decode every generic verification site shares (the preview
+/// gate, the browser resolver, the mirror token, the ingress), so none of them can mistake it for a
+/// tenant. [`verify_queue_client`] is the only way in for the queue client.
 pub fn verify_with_secret(token: &str, key: &str) -> anyhow::Result<Claims> {
+    let claims = decode_claims(token, key, true)?;
+    if claims.role == MESH_SERVICE_ROLE && !is_fleet_service(&claims) {
+        anyhow::bail!("a service claim is accepted only for a fleet identity");
+    }
+    Ok(claims)
+}
+
+fn decode_claims(token: &str, key: &str, check_expiry: bool) -> anyhow::Result<Claims> {
+    let mut validation = Validation::default();
+    validation.validate_exp = check_expiry;
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(key.as_bytes()),
-        &Validation::default(),
+        &validation,
     )?;
     Ok(data.claims)
+}
+
+const QUEUE_TOKEN_MAX_AGE_DEFAULT_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a queue client token may be used, counted from its `iat`: `HIVE_QUEUE_TOKEN_MAX_AGE_SECS`
+/// (default 30 days, clamped to 1 h..=365 d), and also the lifetime it is issued with. A cap on the
+/// AGE, not on `exp`, so the 365-day tokens issued before the cap are retired too.
+pub fn queue_token_max_age_secs() -> i64 {
+    std::env::var("HIVE_QUEUE_TOKEN_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|secs| secs.clamp(3600, 365 * 24 * 3600))
+        .unwrap_or(QUEUE_TOKEN_MAX_AGE_DEFAULT_SECS)
+}
+
+/// The workflow World's queue client token for `team`'s projects (`HIVE_QUEUE_TOKEN`): a `service`
+/// claim the role matrix confines to `POST /v1/wqueue/enqueue`, valid for
+/// [`queue_token_max_age_secs`] and re-issued by every workflow build and by the node's rotation of
+/// live deployments (`world_queue::rotate_queue_tokens`).
+pub fn issue_queue_client_token(team: &str) -> anyhow::Result<String> {
+    issue(
+        QUEUE_CLIENT_SUB,
+        team,
+        MESH_SERVICE_ROLE,
+        false,
+        queue_token_max_age_secs(),
+    )
+}
+
+/// The claims of a queue client token that is still young enough to use: signature, `exp`, subject
+/// AND role, never an operator, and an `iat` no older than [`queue_token_max_age_secs`]. `None` for
+/// anything else.
+pub fn verify_queue_client(token: &str) -> Option<Claims> {
+    let key = secret()?;
+    let claims = decode_claims(token, &key, true).ok()?;
+    let now = chrono::Utc::now().timestamp();
+    let issued = claims.iat as i64;
+    (is_queue_client(&claims)
+        && !claims.platform_admin
+        && issued <= now + 60
+        && now - issued <= queue_token_max_age_secs())
+    .then_some(claims)
+}
+
+/// The claims of a queue client token THIS platform signed, whatever its age or expiry: what the
+/// rotation asks of a token already sitting in a deployment's env. `None` for anything that is not
+/// a validly signed queue client token.
+pub fn queue_token_claims_ignoring_age(token: &str) -> Option<Claims> {
+    let key = secret()?;
+    let claims = decode_claims(token, &key, false).ok()?;
+    (is_queue_client(&claims) && !claims.platform_admin).then_some(claims)
+}
+
+/// The authenticated principal of a bearer: a platform JWT, a dashboard API key, or the queue
+/// client token. `require_auth` and the regional ingress (`main::admin_ingress`) both ask it, so
+/// the ingress cannot accept a credential the node would refuse, or the reverse.
+pub fn principal(state: &crate::state::CloudState, token: &str) -> Option<Claims> {
+    verify(token)
+        .ok()
+        .or_else(|| api_key_claims(state, token))
+        .or_else(|| verify_queue_client(token))
 }
 
 /// Extract a platform JWT: `Authorization: Bearer` first, else the `hive_jwt` cookie, which lets
@@ -227,7 +327,9 @@ pub fn is_open_route(path: &str) -> bool {
 /// closed in its own handler.
 ///
 /// Every other authenticated request, a read included, then meets the team-role matrix
-/// ([`crate::roles::gate`]): this is the ONE place a role is decided, so no handler can forget it.
+/// ([`crate::roles::gate`]): this is the ONE place a role is decided, so no handler can forget it
+/// (a fleet token passes it, the workload's queue client token is confined to the queue, any other
+/// `service` claim is refused).
 ///
 /// A GET/HEAD is never rejected for missing auth, but an unauthenticated one on a non-exempt route
 /// resolves to `admin::ANON_TENANT` (a namespace that owns nothing) and is stamped `x-hive-anon:
@@ -238,8 +340,7 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let claims = extract_token(req.headers())
-        .and_then(|t| verify(&t).ok().or_else(|| api_key_claims(&state, &t)));
+    let claims = extract_token(req.headers()).and_then(|t| principal(&state, &t));
     let authed = claims.is_some();
     if let Some(c) = &claims {
         req.extensions_mut().insert(c.clone());

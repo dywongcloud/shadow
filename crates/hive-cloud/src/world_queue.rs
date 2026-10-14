@@ -329,3 +329,99 @@ pub async fn run_delivery_loop(cloud: Arc<CloudState>, queue: Arc<WorldQueue>) {
         }
     }
 }
+
+/// Whether a deployment function's `HIVE_QUEUE_TOKEN` is the PLATFORM's and due for a fresh one: a
+/// queue client token this platform signed that is past half its allowed age, expired, or issued with
+/// a lifetime beyond the age cap (the 365-day tokens of earlier builds), or the sealed `enc:v1:` form
+/// an earlier build copied into the env (no bearer at all). A value that is neither (a tenant's own
+/// token for its own queue) is never touched.
+fn queue_token_due(value: &str, now: i64, max_age: i64) -> bool {
+    if value.starts_with("enc:v1:") {
+        return true;
+    }
+    match crate::auth::queue_token_claims_ignoring_age(value) {
+        Some(claims) => {
+            let issued = claims.iat as i64;
+            let expires = claims.exp as i64;
+            now - issued > max_age / 2 || expires - issued > max_age || expires <= now
+        }
+        None => false,
+    }
+}
+
+/// Re-issues the queue client token in the function env of every deployment THIS node holds whose
+/// token is due ([`queue_token_due`]): a token is capped by its age (`auth::queue_token_max_age_secs`),
+/// and a deployment's env is baked at build, so a workflow app that is not rebuilt would otherwise lose
+/// its queue when the token ages out. The new token reaches every FUTURE instance launch
+/// (`Gateway::update_manifest` syncs the pool config, it never orphans a live instance); a running
+/// instance keeps the one it started with until it recycles. Node-local and stateless: every node
+/// rotates its own deployments with a token of its own. Returns how many deployments were rotated.
+pub fn rotate_queue_tokens(cloud: &Arc<CloudState>) -> usize {
+    if !crate::auth::enforced() {
+        return 0;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let max_age = crate::auth::queue_token_max_age_secs();
+    let due = |function: &fluid_core::FunctionConfig| {
+        function
+            .env
+            .get("HIVE_QUEUE_TOKEN")
+            .is_some_and(|value| queue_token_due(value, now, max_age))
+    };
+    let mut rotated = 0usize;
+    for record in cloud.gw.deployment_records() {
+        if !record.manifest.functions.iter().any(due) {
+            continue;
+        }
+        let team = crate::admin::record_tenant(&record.tenant).to_string();
+        if team == crate::admin::UNTAGGED_TENANT {
+            continue;
+        }
+        let Ok(token) = crate::auth::issue_queue_client_token(&team) else {
+            continue;
+        };
+        let swapped = cloud.gw.update_manifest(&record.id, |manifest| {
+            for function in manifest.functions.iter_mut().filter(|f| due(f)) {
+                function
+                    .env
+                    .insert("HIVE_QUEUE_TOKEN".into(), token.clone());
+            }
+        });
+        if swapped.is_some() {
+            tracing::info!(
+                deployment = %record.id,
+                project = %record.project,
+                "queue client token rotated in the deployment's function env"
+            );
+            rotated += 1;
+        }
+    }
+    if rotated > 0 {
+        crate::persist::persist(cloud);
+    }
+    rotated
+}
+
+fn rotation_interval_secs() -> u64 {
+    std::env::var("HIVE_QUEUE_TOKEN_ROTATE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.max(5))
+        .unwrap_or(6 * 3600)
+}
+
+/// Every node, periodic: the first pass runs shortly after boot (so a freshly rolled node retires the
+/// old 365-day tokens at once), then every `HIVE_QUEUE_TOKEN_ROTATE_SECS` (default 6 h).
+pub fn spawn_token_rotation(cloud: Arc<CloudState>) {
+    tokio::spawn(async move {
+        let interval = rotation_interval_secs();
+        tokio::time::sleep(std::time::Duration::from_secs(interval.min(90))).await;
+        loop {
+            let rotated = rotate_queue_tokens(&cloud);
+            if rotated > 0 {
+                tracing::info!(rotated, "queue client token rotation: pass complete");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    });
+}

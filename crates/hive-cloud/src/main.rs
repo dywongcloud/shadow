@@ -1590,6 +1590,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     meshwatch::spawn(cloud.clone(), controlled_restart.clone());
     tenancy_reconcile::spawn(cloud.clone());
+    world_queue::spawn_token_rotation(cloud.clone());
     listener_audit::spawn(cloud.clone(), |c| {
         leadership::may_act(c, leadership::Job::ListenerAudit)
     });
@@ -2101,10 +2102,7 @@ async fn admin_ingress(
         let open = crate::auth::is_open_route(req.uri().path());
         if is_mutation && !open {
             let ok = crate::auth::extract_token(req.headers())
-                .map(|t| {
-                    crate::auth::verify(&t).is_ok()
-                        || crate::auth::api_key_claims(&cloud, &t).is_some()
-                })
+                .map(|t| crate::auth::principal(&cloud, &t).is_some())
                 .unwrap_or(false);
             if !ok {
                 return (
