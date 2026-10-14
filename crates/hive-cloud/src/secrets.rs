@@ -4,7 +4,8 @@
 //! `enc:v1:<base64>`.
 //!
 //! Key management (self-hosted, no external KMS), in order:
-//! 1. `HIVE_SECRET_KEY` (64 hex chars = 32 bytes), if set;
+//! 1. `HIVE_SECRET_KEY` (64 hex chars = 32 bytes), if set (a set-but-EMPTY value counts as set, and
+//!    as malformed: it never means "use the file key");
 //! 2. `$HIVE_DATA/secret.key` (generated once, persisted, chmod 600);
 //! 3. a fresh random key written to that file.
 //!
@@ -213,12 +214,24 @@ fn load_or_create_key() -> Result<[u8; 32], String> {
     let data_dir = crate::persist::data_dir();
     if let Ok(h) = std::env::var("HIVE_SECRET_KEY") {
         return hex_to_32(&h).ok_or_else(|| {
-            format!(
-                "HIVE_SECRET_KEY is set but is not 64 hex characters ({} chars) — refusing to fall \
-                 back to this node's own {}/secret.key, which the rest of the fleet does not share",
-                h.trim().len(),
-                data_dir.display()
-            )
+            if h.trim().is_empty() {
+                // A unit/drop-in line `Environment=HIVE_SECRET_KEY=` (or an empty/blank value) SETS
+                // the variable: it is not "absent", so it can never mean "use the file key".
+                format!(
+                    "HIVE_SECRET_KEY is set but EMPTY (a `HIVE_SECRET_KEY=` line with no value) — \
+                     unset it, or give it exactly 64 hex characters; refusing to fall back to this \
+                     node's own {}/secret.key, which the rest of the fleet does not share",
+                    data_dir.display()
+                )
+            } else {
+                format!(
+                    "HIVE_SECRET_KEY is set but is not 64 hex characters ({} chars) — refusing to \
+                     fall back to this node's own {}/secret.key, which the rest of the fleet does \
+                     not share",
+                    h.trim().len(),
+                    data_dir.display()
+                )
+            }
         });
     }
     let path = data_dir.join("secret.key");
