@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-14 — only the dashboard server writes the identity mirror's email, so a browser-originated sync can no longer pose as a team's admin or owner (26674b3fa7)
+
+`POST /v1/identity/sync` wrote the body's user email into the identity mirror for ANY authenticated caller: the dashboard's
+topnav calls it from the browser (its own cookie, no `x-hive-internal`) with a body the caller controls. The mirror feeds
+authorization: `team_create` takes the new team's owner email from it, and the project-transfer rule (`413287e85e`,
+`caller_administers`) takes the caller's roster identity from it. So an admin of one team could post the destination
+team's admin email and then move a project into a team it does not administer (a bypass of that rule, found while
+witnessing it), and any signed-in user could create a team whose owner row is a victim's email. The email is now set only
+when the request is the dashboard SERVER's (`mint_allowed`: `x-hive-internal`, the Clerk-verified email its mint route posts
+after every mint; an unenforced dev node stays open). A browser-originated sync still records the user and answers
+`is_owner` and the tenant, and never sets or changes an email, so the topnav call is unaffected (it only reads `is_owner`).
+Witnessed on a real enforced node (`scratch2/work/secfix5-identity.sh`): before, 3 defects (the mirror email rewritten, the
+transfer into dest accepted, a team created with the victim as owner); after, 0 (the mirror keeps the verified email, the
+transfer is 403, the team creation 412 for a user with no verified email) while the server-side sync still records the email
+and the legitimate team creation under it works. Rows already written from a browser body before this change are not
+repaired: the next server-side sync (every mint) overwrites the email with the verified one. Not rolled.
+
 ## 2026-10-14 — the roles a Clerk org assigns get a 15-minute token, so a demoted or removed member stops carrying the old role within minutes (9e464c496d)
 
 A minted token carries its role for its whole life and nothing consults the roster per request (the dashboard takes the
@@ -89,7 +106,9 @@ delete (the buttons are still shown); `shadw` webhook and project-delete command
 deploys, sets env, attaches domains and creates keys); a member's webhook list shows the hooks without their signing secrets.
 Witnessed on a real enforced node with JWT and API-key roles (`scratch2/work/secfix5-matrix.sh`): before, 47 defects; after,
 0 with every day-to-day and self-service flow, the operator, the service claim and the dev node still passing (65 PASS, 0
-FAIL); the reviewer's `t_projteam`, `t_viewerops` and `t_entcfg` agree. Not rolled.
+FAIL); the reviewer's `t_projteam`, `t_viewerops` and `t_entcfg` agree, and so does the real `shadw` CLI against API keys of
+each role (`secfix5-cli.sh`: before, a viewer key deleted a project and a default key created a webhook; after, both are
+refused with "this needs admin or above" while env, listings and an admin key's delete and webhook still work). Not rolled.
 
 ## 2026-10-14 — a model download is bounded by throughput and by tenant, so one tenant's slow-drip URLs cannot hold the node's download slots for hours (914a82e577)
 
