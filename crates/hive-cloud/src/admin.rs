@@ -10454,11 +10454,8 @@ pub(crate) async fn wf_runs(
             }
         }
     };
-    // STALE-WHILE-REVALIDATE: with a computation already in flight, a recent
-    // last-known-good answer beats blocking this poll on the aggregation — the
-    // dashboard polls every few seconds, so it picks the fresh rows up on the
-    // next tick from the cache the detached task writes. Only the genuinely
-    // FIRST poll (nothing known yet) waits out the computation.
+    // Stale-while-revalidate: with a computation in flight, a recent last-known-good answer beats
+    // blocking this poll; only the FIRST poll (nothing known yet) waits it out.
     {
         let g = wf_last_good().lock();
         if let Some((at, v)) = g.get(&cache_key) {
@@ -10472,28 +10469,16 @@ pub(crate) async fn wf_runs(
             return Json(v);
         }
         if rx.changed().await.is_err() {
-            // Compute task died (panic) — degrade to the collector inline.
             return Json(wf_runs_collect(c, team, q).await);
         }
     }
 }
 
-/// The actual aggregation `wf_runs` serves — local workflow store + per-project
-/// Upstash world reads + peer fan-out, each slow phase under its OWN budget so
-/// the worst case stays inside the dashboard's 20s client abort (the phases'
-/// dial-resilience budgets — 10s HTTP + 20s iroh per peer, 20s per world read —
-/// are correct for one-shot control operations and structurally wrong for a
-/// polled read: this endpoint is re-asked every few seconds, so a phase that
-/// misses one poll's budget simply contributes to the next poll). Writes the
-/// LAST-KNOWN-GOOD belt (and consults it for empties) itself, so completion —
-/// not the HTTP caller's patience — is what populates it.
-/// Per-project world-read circuit breaker. A project whose world store does
-/// not answer (dead/expired Upstash endpoint, which is tenant configuration no
-/// node can repair) used to cost every poll its full read budget, forever —
-/// six of nine projects on the busiest tenant were in exactly that state, so
-/// the console paid ~2.5 s per poll for rows that never arrive. After a
-/// timeout the project's world is skipped for [`WORLD_COOLDOWN`] and retried
-/// when it lapses, so recovery is automatic and the steady state stays fast.
+/// Per-project world-read circuit breaker: a project whose world store does not answer (a dead or
+/// expired Upstash endpoint, tenant configuration no node can repair) used to cost every poll its
+/// full read budget forever (six of nine projects on the busiest tenant were in that state, about
+/// 2.5 s per poll for rows that never arrive). After a timeout the project's world is skipped for
+/// this long and retried when it lapses, so recovery is automatic and the steady state stays fast.
 const WORLD_COOLDOWN: Duration = Duration::from_secs(60);
 
 fn world_cooldowns(
@@ -10504,6 +10489,24 @@ fn world_cooldowns(
     M.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// The actual aggregation `wf_runs` serves: the local workflow store, per-project Upstash world
+/// reads and the peer fan-out, each slow phase under its OWN budget so the worst case stays inside
+/// the dashboard's 20 s client abort (the dial-resilience budgets, 10 s HTTP and 20 s iroh per peer
+/// and 20 s per world read, are right for one-shot control operations and wrong for a polled read:
+/// a phase that misses one poll's budget simply contributes to the next). World reads run
+/// concurrently and are budgeted PER PROJECT, peer fetches PER PEER, never as one timeout over the
+/// whole join: one dead world or peer used to burn the phase budget and discard every healthy
+/// project's or peer's rows, so the runs table came back empty or incomplete (and the incomplete
+/// result overwrote last-known-good). A tenant-owned project with a world config is read directly
+/// on EVERY node (the env is gossiped and the world answers over its own REST URL), never only
+/// through the mesh forward, which returned a false `[]` on any fan-out hiccup (the "rows load then
+/// flicker and disappear" report); a best-effort deduplicated host merge still adds the host's
+/// engine-local rows. `?summary=1` strips each step's `output` (the table renders
+/// name/status/duration; the full detail is `/v1/workflows/runs/:id`). The LAST-KNOWN-GOOD belt is
+/// written here and consulted for empties, so completion, not the HTTP caller's patience, populates
+/// it: a poll that comes up empty while a recent one had rows serves those rows (a transient outage
+/// degrades to seconds-stale, never false-empty, and genuine emptiness wins once
+/// `WF_LAST_GOOD_TTL_MS` expires).
 async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value {
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
@@ -10514,18 +10517,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     /// One phase's budget: generous for a healthy fleet, and small enough that
     /// world-read + fan-out in sequence still complete under the client abort.
     const PHASE_BUDGET: Duration = Duration::from_secs(8);
-    /// One project's world read budget. The world store is an EXTERNAL REST
-    /// endpoint, so a hung one must not be allowed to eat the caller's whole
-    /// deadline — and (see the read loop) must never take the healthy
-    /// projects' rows down with it.
+    /// One project's world read budget: the world store is an EXTERNAL REST endpoint, so a hung one
+    /// must not eat the caller's whole deadline or take the healthy projects' rows down with it.
     const WORLD_READ_BUDGET: Duration = Duration::from_millis(2_500);
-    // Scoped request for a project with a locally-readable, tenant-owned WORLD
-    // (env is gossiped, so this is true on EVERY node): never depend on the
-    // mesh forward for the world rows — the forward path returned a false-[]
-    // on any fan-out hiccup, live-witnessed as the project tab's runs table
-    // flickering to empty mid-poll even after the unscoped fix. The direct
-    // local world read below covers it; a best-effort host merge (dedup'd)
-    // still picks up the host's engine-local rows when reachable.
     let scoped_world_local = q
         .project
         .as_deref()
@@ -10558,15 +10552,8 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
         .filter(|r| q.project.as_deref().map(|p| p == r.project).unwrap_or(true))
         .map(|r| json!(r))
         .collect();
-    // Append the REAL runs the deployed app executed, read from its WDK "world"
-    // store. Only for projects HOSTED on THIS node (env_map decrypts locally); the
-    // coordinator gets these via the per-project / `local=true` proxy paths above.
     {
         let mut locals: Vec<String> = match q.project.as_deref() {
-            // Direct world read whenever this node CAN (local deployment
-            // record OR gossiped world env + ownership) — see
-            // scoped_world_local above for why the mesh must not be the only
-            // source of a scoped table's rows.
             Some(p) if c.gw.git_for_project(p).is_some() || scoped_world_local => {
                 vec![p.to_string()]
             }
@@ -10574,24 +10561,10 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for d in c.gw.list() {
-                    // The deployment record's own tenant tag is authoritative and
-                    // present (local record); the project row is node-local and
-                    // UNTAGGED on nodes that never ran this deploy.
                     if record_tenant(&d.tenant) == team {
                         s.insert(d.project);
                     }
                 }
-                // ALSO every tenant-owned project from the GOSSIPED settings
-                // store whose env carries a world config. World reads go over
-                // the project's own REST URL, which works from ANY node — but
-                // deriving the list from node-local deployment records alone
-                // meant only the node(s) that ran the deploy read the world
-                // directly; every other node answered the console's poll from
-                // the iroh fan-out, and one mesh hiccup turned a populated
-                // runs table into a false-[] on the next poll. Live-witnessed
-                // as the "rows load then flicker and disappear" report:
-                // local=true returned 8 rows on the leader and 0 on all six
-                // other public-serving nodes.
                 for (name, _) in c.projects.snapshot() {
                     if !s.contains(&name)
                         && crate::world::has_world(&c, &name)
@@ -10604,11 +10577,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         };
         if q.worlds == Some(false) {
-            // Inner fleet hop: the aggregating node already read these worlds.
             locals.clear();
         }
         locals.retain(|p| crate::world::has_world(&c, p));
-        // Drop projects still inside their cooldown (see `world_cooldowns`).
         {
             let mut cd = world_cooldowns().lock();
             let now = std::time::Instant::now();
@@ -10632,20 +10603,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
                 );
             }
         }
-        // Per-project Upstash world reads run CONCURRENTLY — a tenant with many
-        // projects previously paid one Upstash round-trip per project, one at a
-        // time (this function's own doc/comment history calls it "the most
-        // expensive read on the dashboard"). join_all bounds the added latency to
-        // the slowest single project's read instead of the sum of every project.
-        // Budgeted: a single slow/hung Upstash world must cost this POLL its
-        // rows for that project, never the whole endpoint its deadline.
-        // Budgeted PER PROJECT, never as one timeout over the whole join — the
-        // same lesson the peer fan-out below already learned. A single project
-        // with a dead/slow world previously burned the entire 8 s phase budget
-        // and the outer timeout then discarded EVERY OTHER project's rows too,
-        // so the dashboard's runs table came back empty after 8 s even though
-        // most worlds answered in single-digit milliseconds. Per-project, one
-        // bad world costs only its own rows.
         let world_start = std::time::Instant::now();
         let world_reads: Vec<Value> = futures::future::join_all(locals.iter().map(|p| {
             let c = c.clone();
@@ -10692,12 +10649,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
-        // Budgeted PER PEER, never as one timeout over the whole join: a
-        // single dark peer used to trip the outer budget and silently discard
-        // every HEALTHY peer's rows too — fast but permanently incomplete,
-        // and the incomplete (non-empty) result then overwrote last-known-
-        // good. Per-peer budgets bound the wall clock to one budget (the
-        // fetches run concurrently) while each healthy peer's rows land.
         let peer_results: Vec<Value> = futures::future::join_all(peers.iter().map(|node| {
             let c = c.clone();
             let team = team.clone();
@@ -10727,12 +10678,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     } else if let Some(project) = q.project.as_deref() {
-        // Scoped read served by the DIRECT local world (scoped_world_local)
-        // on a node with no local deployment record: the host node's
-        // engine-local rows for this project aren't in `runs` yet. Merge them
-        // best-effort (dedup'd) — a mesh miss here degrades to world-rows-only
-        // (still populated), never to an empty table, which is the whole
-        // point of the scoped-flicker fix.
         if scoped_world_local
             && !q.local.unwrap_or(false)
             && c.gw.git_for_project(project).is_none()
@@ -10764,11 +10709,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     }
-    // LIST-shape trim (`?summary=1`, sent by the dashboard's runs table): strip
-    // each step's `output` payload — the table renders name/status/duration
-    // only, but every poll was shipping full per-step output text for every
-    // run (the single biggest bytes item on the workflows page). The full
-    // detail stays on `/v1/workflows/runs/:id`.
     if q.summary.unwrap_or(false) {
         for r in runs.iter_mut() {
             if let Some(steps) = r.get_mut("steps").and_then(|s| s.as_array_mut()) {
@@ -10780,15 +10720,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     }
-    // LAST-KNOWN-GOOD belt: the console polls this endpoint and REPLACES its
-    // table with whatever comes back, so a single transiently-failed world
-    // read (downstash hiccup, mesh fan-out miss, provider timeout — all
-    // swallowed into an empty vec upstream) rendered as rows-flicker-then-
-    // disappear. If THIS poll came up empty but a recent poll for the same
-    // cache key had rows, serve those instead: a transient outage degrades to
-    // seconds-stale, never to false-empty. Genuine emptiness still wins once
-    // the hold expires (WF_LAST_GOOD_TTL), so a truly-cleared world shows
-    // empty within a minute rather than pinning stale rows forever.
     if is_top_level {
         if runs.is_empty() {
             let g = wf_last_good().lock();
@@ -10806,10 +10737,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     json!(runs)
 }
 
-/// One run with full step detail (for the trace timeline / Gantt). Resolves from
-/// our engine first, else from the project's WDK "world" store — proxied to the
-/// hosting node when the project lives on a peer (the world env is decrypted
-/// there). `?project=` is required to locate a world run.
+/// One run with full step detail (for the trace timeline / Gantt): resolved from our engine first,
+/// else from the project's WDK "world" store, proxied to the hosting node when the project lives on
+/// a peer (the world env is decrypted there); `?project=` is required to locate a world run.
 pub(crate) async fn wf_run_detail(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10819,19 +10749,12 @@ pub(crate) async fn wf_run_detail(
 ) -> Result<Json<Value>, StatusCode> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(r) = c.workflows.run(&id) {
-        // This fast path (a run hosted on THIS node) used to skip the team
-        // check every other lookup branch below performs — any authenticated
-        // tenant who learned/guessed a run id could read a different
-        // tenant's full workflow step output.
         if wf_in_team(&c, &r.project, &team) {
             return Ok(Json(json!(r)));
         }
         return Err(StatusCode::NOT_FOUND);
     }
     let found = |v: &Value| v.get("run").map(|r| !r.is_null()).unwrap_or(false);
-    // 1) Explicit project (proxy to its host node over iroh if remote, else local).
-    // Candidate hosts queried CONCURRENTLY — a project hosted on the LAST
-    // candidate used to cost one sequential hop per candidate before this fix.
     if let Some(project) = q.project.as_deref() {
         if !q.local.unwrap_or(false) {
             let hosts = host_nodes_for_project(&c, project);
@@ -10850,12 +10773,9 @@ pub(crate) async fn wf_run_detail(
             }
         }
     }
-    // 2) Auto-resolve: no (or wrong) project given — scan this node's world
-    // projects for the run (lets a bare /workflows/runs/<id> URL resolve).
     let locals: Vec<String> = {
         let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
         for d in c.gw.list() {
-            // Authoritative record tag, not the node-local project row.
             if record_tenant(&d.tenant) == team {
                 s.insert(d.project);
             }
@@ -10866,8 +10786,6 @@ pub(crate) async fn wf_run_detail(
         .into_iter()
         .filter(|p| crate::world::has_world(&c, p))
         .collect();
-    // Concurrent per-project Upstash world reads (was one sequential hop per
-    // locally-hosted project — same "most expensive read" class as wf_runs).
     let details = futures::future::join_all(
         world_locals
             .iter()
@@ -10877,7 +10795,6 @@ pub(crate) async fn wf_run_detail(
     if let Some(detail) = details.into_iter().flatten().find(|d| found(d)) {
         return Ok(Json(detail));
     }
-    // 3) Fleet: ask peers hosting this tenant's projects to resolve it (over iroh), concurrently.
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
         let path = format!("/v1/workflows/runs/{id}?local=true");
@@ -10913,7 +10830,7 @@ pub(crate) async fn wf_summary(
             r.project.clone()
         };
         let e = agg.entry(proj).or_insert((0, 0, 0, 0));
-        e.0 += 1; // created
+        e.0 += 1;
         match r.status {
             hive_edge::workflows::RunStatus::Succeeded => e.1 += 1,
             hive_edge::workflows::RunStatus::Failed => e.2 += 1,
@@ -10923,8 +10840,6 @@ pub(crate) async fn wf_summary(
             _ => {}
         }
     }
-    // Merge peer rollups (the tenant's projects placed on other nodes). A project
-    // lives on one host, so per-project rows don't overlap; sum defensively.
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
         for v in fan_out_peers_polled(&c, &peers, &team, "/v1/workflows/summary?local=true").await {
@@ -10954,12 +10869,11 @@ pub(crate) async fn wf_summary(
     Json(json!(rows))
 }
 
-/// List workflow HOOKS for the observability console's Hooks tab. Hooks live ONLY
-/// in the deployed app's WDK "world" store (there's no engine-side source the way
-/// runs have one), so this reads them from every project HOSTED on this node and
-/// fans out to the peers hosting this tenant's other projects — the same
-/// tenant-scoping / project-filtering / `?local=` fleet-merge shape as `wf_runs`.
-/// `?runId=` scopes the read to a single run.
+/// Lists workflow HOOKS for the observability console's Hooks tab. Hooks live ONLY in the deployed
+/// app's WDK "world" store, so this reads them from every project hosted on this node and fans out
+/// to the peers hosting the tenant's other projects, with the same tenant scoping, project
+/// filtering, short-TTL collapse and `?local=` fleet merge as `wf_runs`; `?runId=` scopes the read
+/// to one run.
 pub(crate) async fn wf_hooks(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10967,8 +10881,6 @@ pub(crate) async fn wf_hooks(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Same short-TTL collapse as wf_runs (fleet fan-out + per-project Upstash world
-    // reads). Never cache the inner `local=true` hop.
     let is_top_level = !q.local.unwrap_or(false);
     let run_id = q.run_id.as_deref();
     let cache_key = format!(
@@ -10982,8 +10894,6 @@ pub(crate) async fn wf_hooks(
         }
     }
     let rid_q = run_id.map(|r| format!("&runId={r}")).unwrap_or_default();
-    // Cross-region project: proxy to the node that HOSTS it — its world env is
-    // decrypted there (same per-project `local=true` proxy path as wf_runs).
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
             if let Some(node) = host_node_for_project(&c, project) {
@@ -10997,8 +10907,6 @@ pub(crate) async fn wf_hooks(
             }
         }
     }
-    // Hooks from the WDK world of each project hosted on THIS node (env_map decrypts
-    // locally); the coordinator gets remote ones via the proxy / fan-out paths.
     let mut hooks: Vec<Value> = Vec::new();
     {
         let locals: Vec<String> = match q.project.as_deref() {
@@ -11007,7 +10915,6 @@ pub(crate) async fn wf_hooks(
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for d in c.gw.list() {
-                    // Authoritative deployment-record tag, not the node-local project row.
                     if record_tenant(&d.tenant) == team {
                         s.insert(d.project);
                     }
@@ -11019,8 +10926,6 @@ pub(crate) async fn wf_hooks(
             .into_iter()
             .filter(|p| crate::world::has_world(&c, p))
             .collect();
-        // Per-project Upstash world reads run CONCURRENTLY (same "most expensive
-        // read" class as wf_runs) — bound the added latency to the slowest project.
         for whooks in futures::future::join_all(
             world_locals
                 .iter()
@@ -11059,7 +10964,6 @@ pub(crate) async fn wf_hooks(
             }
         }
     }
-    // Newest-first across the merged fleet view.
     hooks.sort_by(|a, b| {
         let am = a.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let bm = b.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -11078,7 +10982,6 @@ async fn wf_run(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Only the owning team may trigger a workflow run.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(def) = c.workflows.defs().into_iter().find(|d| d.id == id) {
         if !wf_in_team(&c, &def.project, &t) {
@@ -11094,8 +10997,6 @@ async fn wf_run(
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
-
-// ---- Sandbox (run arbitrary code in an isolated cell) ----
 
 #[derive(Deserialize)]
 struct SandboxReq {
@@ -11137,7 +11038,6 @@ async fn sandbox(
         .build();
     let id = c.hive.submit(job);
 
-    // Wait for completion (bounded).
     let mut state = JobState::Queued;
     for _ in 0..(req.timeout_secs.max(5) * 20) {
         if let Some(v) = c.hive.job_view(&id) {
@@ -11163,20 +11063,15 @@ async fn sandbox(
     })
 }
 
-// ============================ Teams ============================
-
 #[derive(Deserialize)]
 struct CreateTeam {
     name: String,
     #[serde(default = "default_plan")]
     plan: String,
-    /// Optional EXACT tenant slug (e.g. a Clerk-org-derived id/slug already in use
-    /// by existing tenant-scoped data — projects/deployments/billing accounts
-    /// that predate this team row and are tagged with a specific string). When
-    /// absent/empty, falls back to the original slugify(name)+uniqueness-suffix
-    /// behavior (unchanged for every existing caller). When present, the team is
-    /// created with exactly this slug so it lines up with data that already
-    /// exists under that tenant id — never silently re-derived.
+    /// Optional EXACT tenant slug (e.g. a Clerk-org-derived id already used by existing
+    /// tenant-scoped data that predates this team row). Absent or empty falls back to slugify(name)
+    /// plus a uniqueness suffix; present, the team is created with exactly this slug and never
+    /// silently re-derived. Operator-only (see `team_create`).
     #[serde(default)]
     slug: String,
 }
@@ -11227,10 +11122,6 @@ async fn team_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // An exact-slug creation targets a specific pre-existing tenant id (e.g. one
-    // already used by real projects/billing) — that's an operator-level action,
-    // not the normal self-serve "create my own org" flow every signed-in user can
-    // do, so gate it the same way every other cross-tenant admin write is gated.
     if !b.slug.trim().is_empty() {
         require_operator(claims.as_ref().map(|e| &e.0))?;
     }
@@ -11277,9 +11168,6 @@ async fn team_create(
                 format!("team slug '{slug}' already exists"),
             ))?
     };
-    // Tier lives in both TeamStore and BillingStore. Creation is not a special
-    // third write path: initialize the billing half through the same helper every
-    // later upgrade/downgrade uses.
     apply_plan_everywhere(&c, &t.slug, &plan);
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
@@ -11299,9 +11187,6 @@ async fn team_add_member(
         &slug,
         &["owner", "admin"],
     )?;
-    // Only an Owner-rank caller may grant Owner to someone else — an Admin
-    // adding/promoting a member to Owner would be a lateral privilege
-    // escalation within the team.
     if matches!(b.role, crate::teams::Role::Owner) {
         let is_owner_caller = claims
             .as_ref()
@@ -11314,8 +11199,6 @@ async fn team_add_member(
             ));
         }
     }
-    // Seat quota (business locking): block adding a NEW member past the plan's seat
-    // limit. Updating an existing member's role is always allowed.
     let team = c
         .teams
         .get(&slug)
@@ -11342,6 +11225,14 @@ async fn team_add_member(
     Ok(Json(json!(t)))
 }
 
+/// Removes a team member. The ex-member's push/SMS registrations for THIS team are purged (email
+/// resolved to a Clerk user id through the identity mirror), because the rows capture the tenant at
+/// registration and the dispatcher would otherwise keep fanning the team's notifications to them.
+/// The membership change and purge are persisted BEFORE the first await (a client cancelled during
+/// the relay revocation must not restore the removed member on the next restart); then the team's
+/// browser grants are revoked fail-closed (membership is keyed by email and grants by subject id,
+/// so remaining members renew from a fresh platform session while the removed member loses service
+/// now), and the revocation's own persisted state is saved again.
 async fn team_remove_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11359,11 +11250,6 @@ async fn team_remove_member(
         .teams
         .remove_member(&slug, &email)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
-    // Revoke the ex-member's push/SMS registrations for THIS team so they stop
-    // receiving its notifications immediately (rows capture the tenant at
-    // registration and the dispatcher would otherwise keep fanning to them
-    // forever — see push.rs). Resolve email -> Clerk user id via the identity
-    // mirror (push rows are keyed by user id, members by email).
     if let Some(uid) = c
         .identity
         .users()
@@ -11376,51 +11262,35 @@ async fn team_remove_member(
             tracing::info!(team = %slug, user = %uid, purged, "revoked ex-member push/SMS registrations");
         }
     }
-    // Commit the membership and notification purge before the first await.
-    // Client cancellation while relay revocation is in flight must not restore
-    // the removed member on the next process restart.
     crate::persist::persist(&c);
-    // TeamStore membership is email-keyed while browser grants are subject-id
-    // keyed. Revoke the whole team fail-closed; remaining members renew from a
-    // fresh platform session, while the removed member loses service now.
     crate::browser_admission::revoke_team(&c, &slug).await;
-    // Revocation mutates its own persisted admission state after the first save.
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
 
-/// Apply a tier change to a tenant EVERYWHERE it is stored.
-///
-/// A tenant's tier lives in two places that are read for different things:
-/// `c.teams` (feature gating via `team_plan()`) and `c.billing` (project/seat
-/// quotas, the `can_deploy` credit lock, and everything the billing UI shows).
-/// Four separate call sites used to write only the billing half — the free-plan
-/// checkout shortcut, Stripe `customer.subscription.deleted`, the operator
-/// grant, and checkout confirmation — so the two drifted apart silently and a
-/// tenant could read Enterprise for features while being quota-limited as
-/// Hobby. Every tier change goes through here so that cannot happen again.
-///
-/// `teams.set_plan` returning `None` is normal, not an error: personal
-/// namespaces (`personal`, `u_<uid>`) have a billing account but no team row.
+/// Applies a tier change to a tenant EVERYWHERE it is stored: `c.teams` (feature gating via
+/// `team_plan()`) and `c.billing` (project/seat quotas, the `can_deploy` credit lock, everything
+/// the billing UI shows). Four call sites used to write only the billing half (the free-plan
+/// checkout shortcut, Stripe `customer.subscription.deleted`, the operator grant, checkout
+/// confirmation), so a tenant could read Enterprise for features while quota-limited as Hobby;
+/// every tier change goes through here. `teams.set_plan` returning `None` is normal: personal
+/// namespaces (`personal`, `u_<uid>`) have a billing account but no team row. A downgrade drops
+/// Enterprise-only SSO, matching `team_set_plan`.
 pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &str) {
     c.teams.set_plan(tenant, plan);
     c.billing.set_plan(tenant, plan);
-    // Downgrades drop Enterprise-only SSO, matching `team_set_plan`.
     if !crate::billing::plan_allows_sso(plan) {
         c.teams.set_sso(tenant, false);
     }
 }
 
-/// Lock a platform-admin's tenant at enterprise, permanently. Wraps
-/// `apply_plan_everywhere` (both halves) with an unbypassable tier FLOOR via
-/// `set_tier_lock` so no automatic downgrade path (free-plan checkout, Stripe
-/// `customer.subscription.deleted`) can drop it back below enterprise — the
-/// "no matter what" the admin-always-enterprise feature requires. Called from
-/// `mint_token`, on the billing writer only and idempotent (see its guards).
+/// Locks a platform-admin's tenant at enterprise permanently: `apply_plan_everywhere` plus an
+/// unbypassable tier FLOOR (`set_tier_lock`, which `billing.rs`'s `set_plan` honors, so the next
+/// downgrade cannot undo it) that no automatic downgrade path (free-plan checkout, Stripe
+/// `customer.subscription.deleted`) can drop. Called from `mint_token` on the billing writer only,
+/// and idempotent.
 pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
     apply_plan_everywhere(c, tenant, "enterprise");
-    // The FLOOR is what makes it durable: set_plan alone is overwritten by the
-    // next downgrade, the lock is not (billing.rs set_plan honors it).
     c.billing.set_tier_lock(tenant, Some("enterprise"));
     crate::persist::persist(c);
     tracing::info!(tenant, "platform admin tenant locked to enterprise");
@@ -11464,18 +11334,13 @@ struct SetSso {
     enabled: bool,
 }
 
-/// Delete a team. Owner-only, and deliberately refuses in the cases where
-/// deleting would strand resources or break the caller's own identity:
-///
-/// * a PERSONAL namespace (`personal`, `u_<uid>`) is a user's own space, not a
-///   team someone chose to create — removing it would leave that user with no
-///   tenant at all;
-/// * a team that still owns projects, because project records carry the team
-///   slug and would be orphaned (delete or move the projects first).
-///
-/// The billing account is cleared alongside the team record so a deleted team
-/// cannot leave a stray tier/quota row behind — the same
-/// both-halves-or-neither rule `apply_plan_everywhere` exists to enforce.
+/// Deletes a team. Owner-only, and refuses where deleting would strand resources or break the
+/// caller's identity: a PERSONAL namespace (`personal`, `u_<uid>`) is a user's own space (removing
+/// it would leave that user with no tenant), and a team that still owns projects would orphan
+/// records that carry its slug (delete or move the projects first). The billing account is cleared
+/// with the team record so no stray tier or quota row remains, the same both-halves-or-neither rule
+/// as `apply_plan_everywhere`. Like `team_remove_member`, it persists BEFORE awaiting the
+/// browser-grant revocation (a cancelled request must not resurrect the team) and again after.
 async fn team_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11507,13 +11372,10 @@ async fn team_delete(
         .remove(&s)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
     c.billing.remove_account(&s);
-    // The row+tombstone and billing removal are the authoritative deletion.
-    // Persist before relay revocation can suspend and the request be cancelled.
     crate::persist::persist(&c);
     crate::browser_admission::revoke_team(&c, &s).await;
     c.audit
         .record(&s, "user", "team_delete", "team", &s, "team deleted");
-    // Capture the admission revocation and audit append as a second generation.
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true, "deleted": s })))
 }
@@ -11561,23 +11423,14 @@ fn default_true_b() -> bool {
     true
 }
 
-/// Whether `project` belongs to NOBODY: its own tag is `__untagged__` AND no
-/// deployment record anywhere names a real tenant either.
-///
-/// This state is a trap, not a curiosity. `require_project` matches the owner
-/// tag against the caller's tenant and `__untagged__` matches none, while
-/// `project_owned_by`'s optimistic fallback only applies when the project has NO
-/// deployments at all — so an untagged project that HAS untagged deployments is
-/// claimable by no account in existence. It stays invisible in every project
-/// list while still holding its name platform-wide, which is exactly how
-/// creating a project can fail on a duplicate name its owner cannot find
-/// anywhere. Six projects sat in that state on 2026-08-08 (ctest,
-/// internet-structure, mien-kamp, silly-cat-test, smsrelay, tokenhun) — one of
-/// them proven the owner's by a database tagged `personal` under it.
-///
-/// Deliberately strict: if ANY deployment names a real tenant, that tenant owns
-/// the project and this returns false, so adoption can never take a project away
-/// from a live account.
+/// Whether `project` belongs to NOBODY: its own tag is `__untagged__` AND no deployment record
+/// anywhere names a real tenant. That state is a trap: `require_project` matches the owner tag
+/// against the caller's tenant and `__untagged__` matches none, while `project_owned_by`'s
+/// optimistic fallback applies only when the project has NO deployments, so an untagged project
+/// WITH untagged deployments is claimable by no account and invisible in every list while still
+/// holding its name platform-wide (creating a project then fails on a duplicate name its owner
+/// cannot find). Deliberately strict: if ANY deployment names a real tenant, that tenant owns the
+/// project and this returns false, so adoption can never take a project from a live account.
 fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     if record_tenant(&c.projects.team_of(project)) != UNTAGGED_TENANT {
         return false;
@@ -11591,6 +11444,10 @@ fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     local_clean && peer_clean
 }
 
+/// Moves a project to another team (or changes its protection): only the CURRENT owning team may,
+/// EXCEPT that a platform operator may adopt an UNOWNED project (`project_unowned`, which refuses
+/// the moment any deployment names a real tenant); without that exception an orphaned project is
+/// frozen forever, since no tenant matches `__untagged__`.
 async fn project_team_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11598,12 +11455,6 @@ async fn project_team_put(
     Path(project): Path<String>,
     Json(b): Json<ProjectTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Only the CURRENT owning team may move a project (or change its protection)
-    // — EXCEPT that an UNOWNED project may be adopted by a platform operator.
-    // Without that exception an orphaned project is frozen forever: no tenant
-    // matches `__untagged__`, so no caller can pass the check that would let
-    // them fix it. See `project_unowned`, which refuses the moment any
-    // deployment names a real tenant.
     let adopting_orphan =
         project_unowned(&c, &project) && require_operator(claims.as_ref().map(|e| &e.0)).is_ok();
     if !adopting_orphan {
@@ -11622,8 +11473,6 @@ async fn project_team_put(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-// ============================ API keys ============================
-
 #[derive(Deserialize)]
 struct CreateApiKey {
     name: String,
@@ -11631,24 +11480,18 @@ struct CreateApiKey {
     role: String,
 }
 
+/// Lists the caller's API keys. `apikeys` is NODE-LOCAL state while `admin_ingress` forwards
+/// mutations to the leader and serves GETs locally, so a key created from the dashboard was stored
+/// on the leader and read back from whichever node round-robin DNS picked ("generating an API key
+/// doesn't work"): a non-leader reads the leader's authoritative copy, the same shape as
+/// `project_settings_get`, falling back to local only when the leader is unreachable (a read local
+/// state can answer must never fail).
 async fn apikeys_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // `apikeys` is NODE-LOCAL state (an in-process `RwLock<Vec<ApiKey>>`), and
-    // `admin_ingress` forwards MUTATIONS to the control-plane leader while
-    // serving GETs locally — so creating a key from the dashboard stored it on
-    // the leader and then read it back from whichever node round-robin DNS
-    // picked, which had never seen it: "generating an API key doesn't work"
-    // (reproduced: POST then GET on a follower returned 5 keys, the new one
-    // absent; on the leader, 6 and present).
-    //
-    // Same shape as `project_settings_get`: a non-leader reads the leader's
-    // authoritative copy, falling back to local only when the leader is
-    // unreachable, because a read local state can answer must never fail. The
-    // leader serves local (no self-loop).
     if !c.is_control_plane_leader() {
         if let Some(leader) = c.leader_forward_target() {
             if let Some(v) = fetch_from_host(&c, &leader, "/v1/apikeys", &t).await {
@@ -11690,13 +11533,6 @@ async fn apikey_revoke(
     crate::persist::persist(&c);
     Json(json!({ "revoked": ok, "id": id }))
 }
-
-// ---- Connected integrations ----
-//
-// The team's linked third-party integrations as consumable resources. Every
-// endpoint is tenant-scoped, so a `hive_…` platform key (Authorization: Bearer)
-// transparently scopes the Vercel-compatible SDK to that key's team. The list/get
-// views are redacted; `/credentials` returns the secret token/connection.
 
 async fn integrations_list(
     State(c): State<Arc<CloudState>>,
@@ -11780,13 +11616,6 @@ async fn integration_delete(
     Json(json!({ "deleted": ok, "id": id }))
 }
 
-// ---- Intelligent service graph (Issue #2) ----
-//
-// The algorithmically-derived graph of services actually consumed by a deployment
-// (app/framework, bundled front+back nodes, workspace packages, databases). Scanned
-// async on build AND lazily on-demand (below) so EXISTING + FAILED deployments —
-// which predate the async scan — are backfilled the first time they're viewed.
-
 /// Scan a hosted deployment's on-disk source tree and store its service graph.
 /// Works for existing/failed deployments (the checkout is kept for live ones).
 async fn scan_root_graph(
@@ -11838,9 +11667,6 @@ pub(crate) async fn local_project_graph(
     if let Some(g) = c.svcgraph.latest_for_project(project) {
         return Some(g);
     }
-    // Try records newest-first, scanning the first whose checkout still exists on
-    // disk (a failed/newer redeploy may have a GC'd root while an older LIVE one
-    // is still present + serving).
     let mut recs: Vec<_> =
         c.gw.deployment_records()
             .into_iter()
@@ -11852,9 +11678,6 @@ pub(crate) async fn local_project_graph(
             return Some(g);
         }
     }
-    // No usable deployment RECORD here (e.g. a CONTAINER deploy: the record lives on
-    // the coordinator, but the container + source run on THIS lease-owner node). Fall
-    // back to the newest on-disk source checkout for the project.
     if let Some(dir) = crate::git::newest_deploy_dir(project) {
         return scan_root_graph(c, project, project, &dir.to_string_lossy()).await;
     }
@@ -11881,8 +11704,6 @@ pub(crate) async fn deployment_service_graph(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Locally hosted? Return the stored graph, or scan its source on-demand (backfill
-    // for existing/failed deployments), team-checked.
     if c.gw.deployment_records().iter().any(|r| r.id == id) {
         if let Some(g) = local_deployment_graph(&c, &id).await {
             if project_owned_by(&c, &g.project, norm(&t)) {
@@ -11890,7 +11711,6 @@ pub(crate) async fn deployment_service_graph(
             }
         }
     }
-    // Not here — proxy to the node that hosts the deployment.
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) = fetch_from_host(
             &c,
@@ -11913,26 +11733,12 @@ async fn project_service_graph(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Fleet-aware ownership: `team_of` is UNTAGGED (never empty) on a node that
-    // doesn't host this project, so the old `!known.is_empty()` guard never
-    // relaxed and 404'd a member's own service graph everywhere but the host.
-    // project_owned_by trusts the deployment tenant tags and stays permissive
-    // for a fleet-unknown project (so the on-demand scan / host proxy below run).
     if !project_owned_by(&c, &project, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
-    // Stored, or scanned on-demand from a locally-hosted deployment (backfills
-    // existing/failed projects deployed here before the async scan existed).
     if let Some(g) = local_project_graph(&c, &project).await {
         return Ok(Json(json!(g)));
     }
-    // Not hosted here — the graph (or the source to scan) lives on whichever node
-    // built the project. Fan out to every OTHER reachable peer CONCURRENTLY and
-    // return the first that has it (each answers from its LOCAL store/scan +
-    // team-checks → no re-proxy loop, no cross-tenant leak). Registry is the
-    // reliable peer set (trunk-warmed). Concurrent rather than the old
-    // first-match-wins sequential loop — a project hosted on the LAST-checked
-    // node used to cost N sequential hops; now it costs one concurrent round.
     let self_name = c.node_name.clone();
     let peers: Vec<String> = c
         .registry
@@ -11952,8 +11758,6 @@ async fn project_service_graph(
     Err(StatusCode::NOT_FOUND)
 }
 
-// ============================ Webhooks ============================
-
 async fn webhook_events() -> Json<Value> {
     Json(json!(crate::webhooks::ALL_EVENTS))
 }
@@ -11963,8 +11767,7 @@ async fn webhooks_all(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
-    // Only the caller's own webhooks (the payload includes signing secrets, so
-    // this must be tenant-scoped).
+    // Tenant-scoped: the payload includes signing secrets.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let list: Vec<_> = c
         .webhooks
@@ -12022,7 +11825,6 @@ async fn webhooks_for_project(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Don't expose another tenant's project webhooks (incl. their secrets).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
@@ -12050,7 +11852,6 @@ async fn webhook_create(
     Path(project): Path<String>,
     Json(b): Json<CreateWebhook>,
 ) -> Result<Json<Value>, StatusCode> {
-    // A webhook may only be attached to a project the caller owns.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Err(StatusCode::NOT_FOUND);
@@ -12086,6 +11887,11 @@ async fn webhook_delete(
     Ok(Json(json!({ "removed": id })))
 }
 
+/// Webhook delivery log. The delivery ring is in-process and NOT replicated, and dispatches fire
+/// both from the leader (promote/delete/database/incident mutations) and from whichever node ran a
+/// build, so one node's view is a slice (an operator saw an empty panel and concluded webhooks were
+/// broken when they had delivered); the top-level read merges every healthy peer's ring
+/// (`local=true` stops the recursion).
 async fn webhook_deliveries(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -12098,11 +11904,6 @@ async fn webhook_deliveries(
         .into_iter()
         .map(|d| json!(d))
         .collect();
-    // The delivery ring is in-process and NOT replicated, and dispatches fire
-    // both from the leader (promote/delete/database/incident mutations) and
-    // from whichever node ran a build (git.rs). So a single node's view is a
-    // slice: the operator saw an empty panel and concluded webhooks were
-    // broken when they had in fact delivered. `local=true` stops the recursion.
     if q.local != Some(true) {
         let peers = all_healthy_peers(&c);
         for v in fan_out_peers_polled(&c, &peers, "", "/v1/webhooks/deliveries?local=true").await {
@@ -12126,21 +11927,15 @@ async fn webhook_deliveries(
     Ok(Json(json!(all)))
 }
 
-// ============================ Databases ============================
-
-/// The leader's answer for a tenant-scoped databases path, or `None` when this
-/// node IS the leader (so there is nothing above it to ask, and no recursion).
-///
-/// Database records are replicated, but replication is neither instantaneous nor
-/// — measured live — always complete. A SQLite database created through the
-/// leader was present on 6 of 11 nodes and ABSENT on the other 5 well after
-/// creation; the five missing it were the nodes that had been restarting or
-/// OOM-thrashing, and nothing backfilled them. Because `admin_ingress` serves
-/// every GET **locally** while the public host is round-robin DNS, that made a
-/// real, ready database 404 on roughly half of all requests — including its
-/// `/credentials`, i.e. the connection string was simply unobtainable about half
-/// the time. That is exactly the round-robin-reads-vs-leader-writes split
-/// AGENTS.md names, and this is its documented owner/leader fallback.
+/// The leader's answer for a tenant-scoped databases path, or `None` when this node IS the leader
+/// (nothing above it to ask, no recursion). Database records are replicated, but not
+/// instantaneously or always completely (measured: a SQLite database created through the leader was
+/// present on 6 of 11 nodes and absent on the rest long after, the nodes that had been restarting
+/// or OOM-thrashing, with nothing to backfill them), and `admin_ingress` serves every GET locally
+/// while the public host is round-robin DNS, so a real, ready database 404'd on about half of all
+/// requests, `/credentials` (the ONLY way to obtain the connection string) included. This is the
+/// documented owner/leader fallback for that round-robin-reads-vs-leader-writes split; the leader
+/// re-runs its own tenant check before answering, so proxying can never widen access.
 async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     if c.is_control_plane_leader() {
         return None;
@@ -12149,6 +11944,10 @@ async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> O
     fetch_from_host(c, &leader, path, team).await
 }
 
+/// Lists the caller's databases: the local view MERGED with the leader's (never replaced, and never
+/// short-circuited on "local is non-empty", which would serve a short list that reads as "my
+/// database was deleted" instead of the replication gap it is), in a deterministic order so a
+/// re-poll never reshuffles the rendered list.
 async fn databases_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12162,10 +11961,6 @@ async fn databases_list(
         .filter(|d| record_tenant(&d.team) == t)
         .collect();
 
-    // MERGE the leader's view rather than replacing or short-circuiting on
-    // "local is non-empty": a node holding SOME of the tenant's databases would
-    // otherwise silently serve a short list, which reads as "my database was
-    // deleted" rather than as the replication gap it is.
     if let Some(v) = databases_from_leader(&c, "/v1/databases", &t).await {
         if let Ok(remote) = serde_json::from_value::<Vec<crate::databases::Database>>(v) {
             let have: std::collections::HashSet<String> =
@@ -12177,7 +11972,6 @@ async fn databases_list(
             }
         }
     }
-    // Deterministic order so a re-poll never reshuffles the rendered list.
     list.sort_by(|a, b| {
         b.created_ms
             .cmp(&a.created_ms)
@@ -12202,7 +11996,6 @@ async fn databases_for_project(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Only expose databases for a project the caller's tenant actually owns.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
@@ -12229,8 +12022,6 @@ async fn database_get(
         }
         return Ok(Json(json!(d)));
     }
-    // Absent HERE is not absent everywhere — see `databases_from_leader`. The
-    // leader re-runs its own tenant check, so this can never widen access.
     if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}"), &t).await {
         return Ok(Json(v));
     }
@@ -12243,7 +12034,7 @@ async fn database_credentials(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Returns unmasked connection secrets — must be strictly tenant-scoped.
+    // Unmasked connection secrets: strictly tenant-scoped.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.databases.credentials(&id) {
         if record_tenant(&d.team) != t {
@@ -12251,11 +12042,6 @@ async fn database_credentials(
         }
         return Ok(Json(json!(d)));
     }
-    // Same fallback as `database_get`, and it matters most here: this is the ONLY
-    // way to obtain a database's connection string, so a replication gap made the
-    // DSN unobtainable on any node that had not caught up. The leader applies the
-    // identical tenant check before answering — the `proxy_to_owner` re-check
-    // precedent — so proxying cannot leak another tenant's secrets.
     if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
     {
         return Ok(Json(v));
@@ -12263,10 +12049,10 @@ async fn database_credentials(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// One-click "Open Studio" for a managed Supabase database: mint a short-lived,
-/// nonce-bearing login ticket. The ticket is returned only in a no-store JSON
-/// body; the dashboard POSTs it to the reserved database-host exchange path, so
-/// no bearer enters a URL, history, referrer, or upstream Studio request.
+/// One-click "Open Studio" for a managed Supabase database: mints a short-lived, nonce-bearing
+/// login ticket, returned only in a no-store JSON body; the dashboard POSTs it to the reserved
+/// database-host exchange path, so no bearer enters a URL, history, referrer or upstream Studio
+/// request.
 async fn database_studio_open(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12291,8 +12077,6 @@ async fn database_studio_open(
         } else if let Some(v) =
             databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
         {
-            // Replication-gap fallback: the leader applied the identical
-            // fail-closed tenant check before returning the record.
             let conn = v.get("connection").cloned().unwrap_or_default();
             let g = |k: &str| {
                 conn.get(k)
@@ -12339,11 +12123,11 @@ async fn database_studio_open(
     ))
 }
 
-/// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning
-/// project so deployments reach it automatically — canonical names (DATABASE_URL,
-/// REDIS_URL, …) for the common single-DB case PLUS name-prefixed copies that are
-/// collision-free when a project has several DBs of the same kind. Pure — no side
-/// effects — so create (apply) and delete (remove by key) agree on the key set.
+/// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning project so
+/// deployments reach it automatically: canonical names (DATABASE_URL, REDIS_URL, ...) for the
+/// common single-DB case plus name-prefixed copies that stay collision-free when a project has
+/// several DBs of one kind. Pure, so create (apply) and delete (remove by key) agree on the key
+/// set.
 fn db_egress_pairs(
     c: &Arc<CloudState>,
     d: &crate::databases::Database,
@@ -12382,35 +12166,28 @@ pub(crate) fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Databas
     }
 }
 
-/// NON-SECRET directory of gateway-addressable DBs hosted on this node — the
-/// same payload as the `/v1/db-directory` gossip arm (routing metadata only:
-/// {id, db_host, host_node, kind}). The DNS leader fans this out to publish
-/// per-DB A records for DBs provisioned on other nodes.
+/// NON-SECRET directory of gateway-addressable DBs hosted on this node (routing metadata only:
+/// `{id, db_host, host_node, kind}`), the same payload as the `/v1/db-directory` gossip arm; the
+/// DNS leader fans it out to publish per-DB A records for DBs provisioned on other nodes. Only this
+/// HTTP path is operator-gated (it stops a direct internet client using it as cross-tenant DB-id
+/// recon, a stepping stone to the `database_replica` finding); the gossip fan-out has its own
+/// inline arm in `gossip.rs` that never calls this handler.
 async fn db_directory(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Gating the HTTP path only — the iroh gossip fan-out this feeds
-    // (vercel_dns.rs's DNS reconciler, via `fetch_from_host`) has its own
-    // separate inline arm in gossip.rs that never calls this handler, so this
-    // does not break that legitimate mesh-internal use; it only stops a direct
-    // internet client from using this as cross-tenant DB-id recon (a stepping
-    // stone toward the `database_replica` finding).
     require_operator(claims.as_ref().map(|e| &e.0))?;
     Ok(Json(json!(c.databases.directory())))
 }
 
 const DATABASE_INCARNATION_PROVIDER_PREFIX: &str = "__hive_internal_project_incarnation_v1__:";
 
-/// Carry lifecycle authority through the existing `ProvisionReq` mesh ABI.
-///
-/// The iroh dispatch arm deserializes the body into `ProvisionReq` before it
-/// calls this module, so an additive top-level field would be discarded there.
-/// `provider` is cosmetic and optional; a capability-gated internal sender
-/// temporarily wraps its original value here, and the receiver restores it
-/// before the record is created. Public callers can never make this marker
-/// authoritative: only the internal provision handler decodes it, after its
-/// peer/operator gate has passed.
+/// Carries lifecycle authority through the existing `ProvisionReq` mesh ABI: the iroh dispatch arm
+/// deserializes the body into `ProvisionReq` before calling this module, so an additive top-level
+/// field would be dropped there. `provider` is cosmetic and optional, so a capability-gated
+/// internal sender temporarily wraps its original value in this marker and the receiver restores it
+/// before the record is created. Public callers can never make the marker authoritative: only the
+/// internal provision handler decodes it, after its peer/operator gate has passed.
 fn database_internal_provision(
     mut req: crate::databases::ProvisionReq,
     incarnation: fluid_core::ProjectIncarnation,
@@ -12626,6 +12403,30 @@ fn database_ready_callback(
     }
 }
 
+/// Creates a managed database. The tenant is ALWAYS the server-resolved one (a client-supplied
+/// `team` used to be trusted whenever non-empty, letting any caller register a database and
+/// auto-inject its connection env under a DIFFERENT tenant). Admission is a project-lifecycle
+/// mutation: the record is inserted while holding the writer project deletion owns (an empty
+/// project is unbound storage with no lifetime to serialize against), ownership is enforced only
+/// for an ALREADY registered project (provisioning for a brand-new name before its first deploy is
+/// a normal flow), and the identity is persisted before dispatch so the internal target can
+/// validate it even if the request is cancelled. The create is idempotent: a same-tenant,
+/// same-project, same-name, same-kind, non-error database already existing means this is a retry (a
+/// double-click once produced three identical blob databases), so it is returned, unmasked and with
+/// usable credentials, instead of minting another. Placement is region-aware (`schedule::place`,
+/// only when a region was requested and a healthy, reachable, public candidate exists; any miss
+/// falls through to this node, never failing the create) and must be ADMISSIBLE
+/// (`databases::db_host_admissible`): a database born on a node that cannot publish a public
+/// address (NAT'd, a macOS launchd node, or one that left the registry) is unreachable from
+/// creation while still advertising `ready`, so such a node is replaced by one that can, and with
+/// none in the registry the database is hosted here and the gap is logged loudly. A PEER host gets
+/// the provisioning work dispatched to it (`database_provision_local`; podman containers only run
+/// where the process that spawns them lives, so relabeling `host_node` alone would create a record
+/// claiming containers that never existed); its record is adopted into this node's store
+/// immediately (`upsert_replica`), because a delete arriving back here before the replication tick
+/// found nothing and answered `removed: true` while the remote container leaked. When dispatch
+/// fails, provisioning locally beats no database, and the requested region is dropped so the record
+/// does not claim a region its bytes do not live in.
 async fn database_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12633,24 +12434,13 @@ async fn database_create(
     Json(mut req): Json<crate::databases::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let cloud = c.clone();
-    // Always the server-resolved tenant — a client-supplied `team` used to be
-    // trusted outright whenever non-empty, letting any caller register a
-    // database (and auto-inject its connection env) under a DIFFERENT tenant.
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let project = req.project.clone();
-    // Database admission is a project-lifecycle mutation: mint/resolve the
-    // lifetime and insert the provisioning record while holding the same writer
-    // project deletion owns. An empty project is deliberately unbound storage
-    // and has no project lifetime to serialize against.
     let _lifecycle = if project.is_empty() {
         None
     } else {
         Some(crate::project_settings::lifecycle_write(&project).await)
     };
-    // Only enforce project ownership when the project is ALREADY registered
-    // (has a team of record) — provisioning a database for a brand-new
-    // project name before its first deploy is a normal flow and must keep
-    // working. An EXISTING project owned by a different tenant is rejected.
     if !project.is_empty() && c.projects.snapshot().contains_key(&project) {
         require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     }
@@ -12661,18 +12451,8 @@ async fn database_create(
         .map(|settings| settings.owned_database_ids.into_iter().collect())
         .unwrap_or_default();
     if incarnation.is_some() {
-        // The internal target must be able to validate this exact identity even
-        // if the request is cancelled before provisioning finishes.
         crate::persist::persist(&c);
     }
-    // Idempotency: provision() itself always mints a fresh id with no dedup
-    // check, so a client double-submit (double-click, a retry racing a slow
-    // response) silently created exact duplicate databases — witnessed live,
-    // three identical blob databases under one project, ~90s apart. A
-    // same-tenant, same-project, same-name, same-kind, non-error database
-    // already existing means this create is a retry of one that already
-    // landed: return that database (unmasked, so the caller still gets
-    // usable connection credentials) instead of minting another.
     if let Some(existing_id) = c
         .databases
         .list(Some(&project))
@@ -12690,29 +12470,6 @@ async fn database_create(
             return Ok(Json(json!(existing)));
         }
     }
-    // Region-aware placement: `provision()` used to always run on THIS node
-    // (whichever one the admin request happened to land on after leader-
-    // forwarding), so a tenant requesting `region=sao-paulo` from anywhere
-    // got a database really provisioned wherever the control-plane leader
-    // currently was — measured live: every Supabase database on the fleet
-    // landed on `fc-sanjose` regardless of its requested region. Reuses
-    // `schedule::place`'s existing health/region/reachability picker (the
-    // same one function deploys already go through). Only overrides when a
-    // region was actually requested and a healthy, reachable, public
-    // candidate exists there; any miss (unknown region, nothing eligible)
-    // falls through to self — this must never turn an empty placement into
-    // a failed database create, only an occasionally-suboptimal one.
-    //
-    // ADMISSIBILITY is checked on top of that pick and is the whole point of
-    // this block. `schedule::place` filters on health/region/reachability but
-    // never on "this node can publish a public address", and the no-region
-    // path pinned the host to `c.node_name` unconditionally — so a database
-    // could be born on a node that has since left the registry (or that never
-    // had a public IP) and be unreachable from the moment it was created,
-    // still advertising `status: ready`. Measured 2026-10-09: 4 of 18
-    // databases were stranded that way, each behind an A record pointing at
-    // an IP its provider has since re-issued to another customer. See
-    // `databases::db_host_admissible`.
     let requested_region = req
         .region
         .as_deref()
@@ -12739,15 +12496,9 @@ async fn database_create(
                  host that can"
             );
         }
-        // Pre-existing default: this node. Kept only when this node can
-        // actually publish the record.
         if admissible(&c.node_name) {
             host_node = Some(c.node_name.clone());
         } else {
-            // This node advertises no public address (NAT'd, or one of the
-            // macOS launchd nodes where `public_ip` is None by construction),
-            // so a database hosted here would be stranded on creation. Any
-            // reachable, capable node that CAN publish beats that.
             host_node =
                 crate::schedule::place(&c, &[], true, true, false, false, false, false, None)
                     .into_iter()
@@ -12763,10 +12514,6 @@ async fn database_create(
         }
     }
     let host_node = host_node.unwrap_or_else(|| {
-        // Nothing in the registry can publish an address (single-node fleet,
-        // or every node still NAT'd). Hosting here is the only way to honour
-        // the create at all; say so loudly rather than letting the record
-        // look healthy.
         tracing::warn!(
             node = %c.node_name,
             "database create: NO node in the registry advertises a public address; hosting here \
@@ -12774,24 +12521,9 @@ async fn database_create(
         );
         c.node_name.clone()
     });
-    // `provision()` takes ownership of the request. Keep a mutable copy so the
-    // local-provisioning fallback below can drop `region` when the requested
-    // one was not honoured, instead of the record claiming it anyway.
     let mut local_req = req.clone();
 
     if host_node != c.node_name {
-        // The chosen node is a PEER, never this node: dispatch the actual
-        // provisioning work there (podman containers only ever run where the
-        // process that spawns them lives — relabeling `host_node` alone
-        // without also routing the work there would create a record
-        // claiming to live on a node that never actually got any
-        // containers). Mirrors the `post_body_to_host` pattern this file
-        // already uses for run-event forwarding. The target's own
-        // `database_provision_local` handler does provisioning +
-        // egress/replication/persist/webhooks locally and its result
-        // replicates back fleet-wide through the existing `databases`
-        // store-sync path (the same one that already carries every other
-        // node's database records into this node's own `state.json`).
         let remote_req = match incarnation {
             Some(expected) if database_incarnation_capable(&c, &host_node).await => {
                 Some(database_internal_provision(req.clone(), expected))
@@ -12820,16 +12552,6 @@ async fn database_create(
                 if let Some(error) = v.get("error").and_then(Value::as_str) {
                     return Err((StatusCode::CONFLICT, error.to_string()));
                 }
-                // Adopt the authoritative record into THIS node's own local store
-                // immediately, rather than waiting on `store_sync`'s replication
-                // tick — otherwise a delete that arrives back on THIS node (the one
-                // the client actually talks to) moments later finds nothing in
-                // `c.databases` yet and silently no-ops while still reporting
-                // `removed: true`, leaking the remote container. Witnessed live:
-                // create dispatched sj->bkk, immediate delete issued on sj, bkk
-                // container survived with no warn logged at all — the outer lookup
-                // itself was returning `None`. `upsert_replica` is the existing
-                // insert-or-replace-by-id primitive for exactly this shape.
                 let db = serde_json::from_value::<crate::databases::Database>(v.clone()).map_err(
                     |error| {
                         (
@@ -12848,22 +12570,6 @@ async fn database_create(
                 return Ok(Json(v));
             }
         }
-        // Dispatch failed (node unreachable over both HTTP admin and mesh) —
-        // fall through to local provisioning rather than failing the create
-        // outright. A database on the WRONG node beats no database at all;
-        // the same "admit and let the floor catch it" direction placement
-        // already takes elsewhere in this codebase (AGENTS.md's disk-floor
-        // section).
-        //
-        // The requested region was NOT honoured, though — and `provision()`
-        // writes `req.region` straight into `Database::region`, so leaving it
-        // set stamped a record claiming a region its bytes do not live in.
-        // That silent lie is the second half of the stranding: the operator
-        // reads `region: sao-paulo` on a record whose container runs wherever
-        // the control-plane leader happened to be, and has no signal that the
-        // request was downgraded. The backing really runs on `c.node_name`, so
-        // drop the claim and let `provision()` fall back to this node's own
-        // region.
         tracing::warn!(
             node = %host_node,
             requested_region = %requested_region.as_deref().unwrap_or_default(),
@@ -12903,16 +12609,15 @@ async fn database_create(
     Ok(Json(json!(db)))
 }
 
-/// Internal-only mirror of [`database_create`]'s local-provisioning tail,
-/// reached via [`post_body_to_host`] when that handler's own region-aware
-/// placement chose a DIFFERENT node than the one that received the client's
-/// request. Runs the exact same `provision()` + egress/replication/persist/
-/// webhooks sequence, just always locally (never re-dispatches — the caller
-/// already resolved placement, and re-resolving here on a `req.region` this
-/// node might interpret differently would risk a dispatch loop). Gated by
-/// [`require_operator_or_internal`]: the forwarded hop carries
-/// `x-hive-internal`, never the original caller's Authorization header,
-/// mirroring every other internal node-to-node forward in this file.
+/// Internal-only mirror of [`database_create`]'s local-provisioning tail, reached via
+/// [`post_body_to_host`] when that handler's region-aware placement chose a DIFFERENT node than the
+/// one that received the client's request: the same `provision()` +
+/// egress/replication/persist/webhooks sequence, always local (never re-dispatching: placement is
+/// already resolved, and re-resolving on a `req.region` this node might interpret differently risks
+/// a dispatch loop). Gated by [`require_operator_or_internal`]: the forwarded hop carries
+/// `x-hive-internal`, never the original caller's Authorization header. A cancelled coordinator
+/// request can be retried after this node already admitted the first copy, so it deduplicates under
+/// the same lifecycle writer.
 pub(crate) async fn database_provision_local(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12942,9 +12647,6 @@ pub(crate) async fn database_provision_local(
         crate::persist::persist(&c);
     }
 
-    // A cancelled coordinator request can be retried after this node already
-    // admitted the first copy. Deduplicate under the same lifecycle writer so
-    // the retry cannot mint a second database in this incarnation.
     if let Some(existing) = c
         .databases
         .list(Some(&project))
@@ -12991,35 +12693,24 @@ pub(crate) async fn database_provision_local(
     Ok(Json(json!(db)))
 }
 
-/// Best-effort teardown of a database's backing containers/volume/SQLite
-/// file — the part of delete that only means anything ON THE NODE THAT
-/// ACTUALLY HOSTS THEM. Split out of `database_delete` so it can run either
-/// locally (the common case: this node IS `d.host_node`) or be dispatched to
-/// the real owner over the mesh (`database_teardown_local`) when it isn't —
-/// the exact gap `database_create`'s region-aware placement opened: before
-/// that change every database's `host_node` was always the node handling the
-/// request, so local-only teardown was correct by construction; a database
-/// now genuinely living on a peer node would otherwise leak its containers
-/// and (for Supabase) its data volume forever, since a podman `rm` for a
-/// name that doesn't exist locally just silently no-ops — witnessed live the
-/// first time this fix was tested: a deleted database's container kept
-/// running on its real host node with no error anywhere.
+/// Best-effort teardown of a database's backing containers, volume and SQLite file: the part of
+/// delete that only means something ON THE NODE THAT HOSTS THEM, split out so it runs locally (this
+/// node IS `host_node`) or is dispatched to the real owner over the mesh
+/// (`database_teardown_local`). Region-aware placement made that necessary: a database living on a
+/// peer would otherwise leak its containers and (for Supabase) its data volume forever, since a
+/// podman `rm` of a name that does not exist locally silently no-ops.
 async fn teardown_db_backing(d: &crate::databases::Database) {
     let id = &d.id;
     crate::databases::note_teardown_request(id);
-    // Managed SQLite: no container, so the teardown is its own. Streams
-    // first (each holds a pooled connection, and one mid-`BEGIN` holds the
-    // file's write lock), then the pool, then the file — in that order, or
-    // the unlink races a live writer.
+    // Order matters: close the streams (one mid-BEGIN holds the write lock), then the pool, then
+    // unlink the file, or the unlink races a live writer.
     if d.kind == crate::databases::DbKind::Sqlite {
         crate::hrana::close_streams(id);
         crate::sqlite_pool::close(id);
-        // Both engines' files, because a database may have been migrated and
-        // rolled back: whichever files exist get removed, and a `.musq` left
-        // behind would be served as a live database by the sidecar after its
-        // record is gone. musql keeps `.musq` plus a 0-byte `.musq.lock` and,
-        // transiently, a `.musq.delta`; SQLite keeps `-wal`/`-shm`. Missing
-        // files are expected, not an error.
+        // Both engines' files, because a database may have been migrated and rolled back: whichever
+        // exist are removed (a `.musq` left behind would be served as a live database by the
+        // sidecar after its record is gone); musql keeps `.musq`, a 0-byte `.musq.lock` and
+        // transiently a `.musq.delta`, SQLite `-wal`/`-shm`; missing files are expected.
         for suffix in ["", "-wal", "-shm"] {
             if let Some(p) = crate::databases::sqlite_file_path(id) {
                 let p = if suffix.is_empty() {
@@ -13049,14 +12740,10 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
             }
         }
     }
-    // Best-effort teardown of the backing container(s): the record's
-    // comma-joined `container` field when set (a Supabase record carries its
-    // whole stack db,meta,studio), else the platform-templated names by kind —
-    // a delete that races an IN-FLIGHT provision reads `container` while it is
-    // still None, and skipping there leaks the container the provision starts
-    // seconds later (witnessed live: redis on fc-bangkok outlived its catalog
-    // entry). `-v` is the podman lock-pool rule (anonymous volumes leak locks
-    // forever); the stack's NAMED data volume is removed explicitly below.
+    // The record's comma-joined `container` field (a Supabase record carries its whole stack), else
+    // the platform-templated names by kind: a delete racing an in-flight provision reads
+    // `container` while it is still None and would leak the container the provision starts seconds
+    // later. `-v` is the podman lock-pool rule.
     let short = &id[3..11.min(id.len())];
     let names: Vec<String> = match d.container.as_deref() {
         Some(container) => container
@@ -13093,10 +12780,8 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
             .await;
     }
     if d.kind == crate::databases::DbKind::Supabase {
-        // Deleting the database IS deleting its data — the stack's named
-        // volumes (engine + storage-api buckets) are platform-templated
-        // (`hive-vol-supa[st]-<id8>`), never tenant-named, so this cannot
-        // touch another volume.
+        // The stack's named volumes are platform-templated (`hive-vol-supa[st]-<id8>`), never
+        // tenant-named, so this cannot touch another volume.
         for vol in [
             format!("hive-vol-supa-{short}"),
             format!("hive-vol-supast-{short}"),
@@ -13118,10 +12803,10 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
     }
 }
 
-/// Record-free teardown by platform template: kind is unknowable without the
-/// catalog record, so cover both naming families (single-container
-/// `hive-db-<id8>` and the Supabase trio + its named volume). Every removal is
-/// idempotent best-effort; a name that never existed is a no-op.
+/// Record-free teardown by platform template: the kind is unknowable without the catalog record, so
+/// both naming families are covered (single-container `hive-db-<id8>` and the Supabase trio plus
+/// its named volume). Every removal is idempotent best-effort; a name that never existed is a
+/// no-op.
 async fn teardown_db_backing_blind(id: &str) {
     if id.len() <= 3 {
         return;
@@ -13163,10 +12848,11 @@ async fn teardown_db_backing_blind(id: &str) {
     }
 }
 
-/// Internal-only: run [`teardown_db_backing`] for `id` on THIS node. Reached
-/// via [`post_body_to_host`] from `database_delete` when the record's
-/// `host_node` is a peer. Gated by [`require_operator_or_internal`], same as
-/// [`database_provision_local`].
+/// Internal-only: runs [`teardown_db_backing`] for `id` on THIS node, reached via
+/// [`post_body_to_host`] from `database_delete` when the record's `host_node` is a peer; gated by
+/// [`require_operator_or_internal`] like [`database_provision_local`]. With no local record (the
+/// catalog delete's store_sync can beat this dispatch) it tears down by platform template instead
+/// of removing nothing and still answering `torn_down`.
 pub(crate) async fn database_teardown_local(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13191,6 +12877,16 @@ pub(crate) async fn database_teardown_local(
     Ok(Json(json!({ "torn_down": id })))
 }
 
+/// Deletes a database: removes the auto-injected egress env vars from the owning project, tears
+/// down cross-region replicas, and tears down the backing locally when this node is `host_node`,
+/// else dispatches to the owner (`database_teardown_local`), best-effort: an unreachable peer must
+/// not block the catalog delete (a stranded container is caught by the orphan-reap sweep, the
+/// customer asked for the database gone). Replication lag is retried (3 x 400 ms), both for the
+/// record itself (a database created on a peer via `database_provision_local` may not have
+/// replicated here yet, and a no-op on an unknown id used to answer `removed: true` while the
+/// container ran on forever) and for an unset `host_node`, which is NEVER read as "must be local":
+/// an unknown host is logged loudly (the backing was NOT torn down, the catalog entry is removed
+/// regardless) so an operator can find it through the orphan sweep.
 async fn database_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
