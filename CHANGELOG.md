@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-13 — the preview unlock binds the proof's team to the project's owner and `next` cannot leave the origin (f8ad2eadbb)
+
+`zkauth::bootstrap` (`GET /_shadw/zk` on a preview host) verified a membership proof against whichever
+team ring the visitor-supplied `t` named and never compared `t` with the project's owner, so a proof
+minted over any team's roster for scope `preview:<project>` unlocked that project's private preview
+(302 plus the `shadw_zk` cookie); the dashboard's `/api/preview-unlock` was the only enforcement. Its
+`next` filter (`starts_with('/') && !starts_with("//")`) also admitted `/\evil.example` and
+`/<TAB>/evil.example`, which the WHATWG URL parser resolves to `https://evil.example/` (an open
+redirect on the trusted preview host). Now `bootstrap` requires `t` to be the ring allowed to unlock
+the project, taken from the node's own state (`zkauth::local_owning_team`: the settings row, else the
+newest deployment record's tenant, one function shared with `/v1/zkauth/project-team`; an UNOWNED
+project unlocks only from the legacy `personal` ring, the dashboard's own mapping) and answers the same
+opaque 401 as a bad proof, and `next` goes through `auth::same_origin_path`, the Rust twin of
+`ui/lib/same-origin-path.ts`. Witnessed on a real enforced throwaway node
+(`scratch2/work/secfix2-zkauth.sh`, proofs minted through the internal endpoints exactly as the
+dashboard route does): before, 7 attacks worked (a proof over the attacker team's ring unlocked the
+victim's preview and its content was served; three hostile `next` values redirected off-origin; the
+attacker ring unlocked a project whose owner lives only in the deployment record and an unowned one;
+the victim ring unlocked the unowned one); after, 0, while a same-team proof, the legacy personal
+unlock of an unowned project, deep links with a query string, the cookie and the no-`next` default
+still work, and a `next` carrying LF/CR now falls back to `/` instead of answering 500. Operator note:
+the relational mirror is deliberately not consulted on this unauthenticated path, so a project just
+transferred between teams whose new owner has not reached the serving node's settings row fails closed
+(401) until it does. Not rolled.
+
 ## 2026-10-13 — a queue consumer's script_name can no longer redirect delivery to another tenant's app or an arbitrary host
 
 An independent adversarial review found a live bypass of the same-session queue-consumer fix
