@@ -657,7 +657,7 @@ fn placement_blocker(
             "no public address (a container is served from the node's own host)".to_string(),
         );
     }
-    if !eligible(n) && !is_mock_backend(n) {
+    if !eligible(n) && n.backend != "mock" {
         if n.mem_total_mb < MEM_FLOOR_MB {
             return Some(format!(
                 "below the {} MiB placement memory floor ({} MiB)",
