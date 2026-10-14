@@ -861,7 +861,10 @@ fn delivery_label(script_name: &str) -> String {
 /// name becomes real later is if SOME tenant deploys it, and an attacker who predicts or squats it
 /// would then receive the batches a trusting victim's queue was already addressed there. Checked
 /// when a consumer is registered AND before every delivery pass (ownership, and existence, can both
-/// change after registration).
+/// change after registration). The project's settings row decides alone whenever it carries a real
+/// tag (`admin::row_holder`), so a project transferred to another team stops receiving the old
+/// team's batches at once, while a host's deployment tags are still the old team's; the tags are the
+/// evidence only for a row with no tag.
 pub fn consumer_target_owned(
     cloud: &Arc<crate::state::CloudState>,
     tenant: &str,
@@ -879,9 +882,8 @@ pub fn consumer_target_owned(
     }
     let label = delivery_label(script_name);
     let project = label_project(cloud, &label);
-    let owner = cloud.projects.team_of(&project);
-    if crate::admin::norm(&owner) == tenant {
-        return true;
+    if let Some(holder) = crate::admin::row_holder(cloud, &project) {
+        return holder == tenant;
     }
     cloud.gw.deployment_records().iter().any(|r| {
         r.project.eq_ignore_ascii_case(&project) && crate::admin::record_tenant(&r.tenant) == tenant

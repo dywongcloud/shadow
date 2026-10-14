@@ -1904,6 +1904,35 @@ impl ProjectStore {
         }
     }
 
+    /// Compare-and-set ownership for a settings write that may have just materialized the row: an
+    /// untagged row is claimed for `team`, the owner's own claim is a no-op, a row another tenant
+    /// holds is REFUSED. Never a move: [`Self::set_team`] is the unconditional setter (a transfer),
+    /// and a claim that used it took a transferred project back for its old team.
+    pub fn claim_team(&self, project: &str, team: &str) -> Result<(), ProjectClaimError> {
+        let (root_dir, updated_ms) = {
+            let mut map = self.map.write();
+            match map.get(project).map(|row| row.team.trim()) {
+                Some(current) if current == team => return Ok(()),
+                Some(current)
+                    if !current.is_empty() && current != crate::admin::UNTAGGED_TENANT =>
+                {
+                    return Err(ProjectClaimError::OwnedByOther);
+                }
+                _ => {}
+            }
+            let row = self.touch(&mut map, project);
+            row.team = team.to_string();
+            (row.build.root_dir.clone(), row.updated_ms)
+        };
+        let (project, team) = (project.to_string(), team.to_string());
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                crate::relational::set_project_team(&project, &team, &root_dir, updated_ms).await
+            });
+        }
+        Ok(())
+    }
+
     /// Rows a tenant owns, by the stored tag alone (`record_tenant` semantics:
     /// an untagged row belongs to nobody), cloned under one read lock.
     pub fn rows_for_tenant(&self, tenant: &str) -> Vec<(String, ProjectSettings)> {

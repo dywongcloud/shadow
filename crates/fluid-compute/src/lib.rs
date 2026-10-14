@@ -971,6 +971,15 @@ impl Fluid {
         }
     }
 
+    /// Re-label a pool's owning tenant IN PLACE (the project was transferred to another team): its
+    /// per-tenant quotas and the cells launched from now on follow the new tenant, live instances
+    /// keep running. No-op if unknown.
+    pub fn set_tenant(&self, key: &str, tenant: &str) {
+        if let Some(p) = self.registry.lock().get_mut(key) {
+            p.tenant = norm_tenant(tenant.to_string());
+        }
+    }
+
     /// Set a pool's keep-warm floor; 0 lets the autoscaler drain it to zero (superseded deployments)
     /// while a cold start stays possible. No-op if unknown.
     pub fn set_min_instances(&self, key: &str, n: u32) {

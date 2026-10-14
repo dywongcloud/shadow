@@ -1795,6 +1795,32 @@ impl Gateway {
         Some(info)
     }
 
+    /// Re-tag every deployment of `project` this gateway holds with `tenant` (empty = "personal") and
+    /// re-label each function pool to match ([`Fluid::set_tenant`]): a project TRANSFERRED to another
+    /// team moves with its deployments, so the old team's tenant-scoped views, controls and quotas no
+    /// longer see them. Returns how many deployments changed. Lock order: state, then fluid registry.
+    pub fn retag_project(&self, project: &str, tenant: &str) -> usize {
+        let tenant = if tenant.trim().is_empty() {
+            "personal".to_string()
+        } else {
+            tenant.trim().to_string()
+        };
+        let mut st = self.state.lock();
+        let mut changed = 0usize;
+        for dep in st.deployments.values_mut() {
+            if !dep.project.eq_ignore_ascii_case(project) || dep.tenant == tenant {
+                continue;
+            }
+            dep.tenant = tenant.clone();
+            for f in &dep.manifest.functions {
+                self.fluid
+                    .set_tenant(&func_key(dep.id.as_str(), &f.name), &tenant);
+            }
+            changed += 1;
+        }
+        changed
+    }
+
     /// Keep-warm reconciliation: only each project's PRODUCTION deployment keeps `min_instances` warm,
     /// every superseded deployment drains to zero. Idempotent.
     pub fn reconcile_keepwarm(&self) {

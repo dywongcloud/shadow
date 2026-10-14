@@ -1813,8 +1813,7 @@ pub(crate) async fn deployment_resources(
         }
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     };
-    let rec_owner = record_tenant(&rec.tenant);
-    if rec_owner != t && norm(&c.projects.team_of(&rec.project)) != t {
+    if deployment_tenant(&c, &rec.project, &rec.tenant) != t {
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     }
     let functions: Vec<Value> = rec
@@ -2892,21 +2891,24 @@ pub(crate) async fn build_get(
     Ok(Json(json!(b)))
 }
 
-/// Whether tenant `t` owns build `b`: the project row's team, else the tenant tag of the build's
-/// deployment record (local `gw` or gossiped peer copy), since `Build` carries no tenant tag of its
-/// own. Shared by `build_get` and `build_cancel`.
+/// Whether tenant `t` owns build `b`: the project row's team (`row_holder`, which alone decides when
+/// the row carries a real tag), else the tenant tag of the build's deployment record (local `gw` or
+/// gossiped peer copy), since `Build` carries no tenant tag of its own. Shared by `build_get` and
+/// `build_cancel`.
 fn build_owned_by(c: &Arc<CloudState>, b: &crate::git::Build, t: &str) -> bool {
-    norm(&c.projects.team_of(&b.project)) == norm(t)
-        || b.deployment_id.as_deref().is_some_and(|did| {
-            c.gw.deployment_records()
-                .iter()
-                .any(|r| r.id == did && record_tenant(&r.tenant) == norm(t))
-                || c.peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(t))
-        })
+    if let Some(holder) = row_holder(c, &b.project) {
+        return holder == norm(t);
+    }
+    b.deployment_id.as_deref().is_some_and(|did| {
+        c.gw.deployment_records()
+            .iter()
+            .any(|r| r.id == did && record_tenant(&r.tenant) == norm(t))
+            || c.peer_deployments
+                .read()
+                .values()
+                .flatten()
+                .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(t))
+    })
 }
 
 /// Cancels an in-flight build: kills the ACTUAL OS process (clone/install/build, or a remote fanout
@@ -2991,9 +2993,9 @@ pub(crate) async fn deployment_build(
                     .find(|d| d.id.as_str() == id)
                     .map(|d| record_tenant(&d.tenant).to_string())
             });
-    let team_ok = |b: &crate::git::Build| {
-        norm(&c.projects.team_of(&b.project)) == norm(&t)
-            || dep_record_tenant.as_deref() == Some(norm(&t))
+    let team_ok = |b: &crate::git::Build| match row_holder(&c, &b.project) {
+        Some(holder) => holder == norm(&t),
+        None => dep_record_tenant.as_deref() == Some(norm(&t)),
     };
     let mut builds: Vec<_> = c
         .builds
@@ -3360,7 +3362,10 @@ fn renamed_away_refusal(name: &str, renamed_to: &str) -> (StatusCode, String) {
 }
 
 /// `require_project`, then claims the row a settings write may have just materialized: left unclaimed it
-/// stays `UNTAGGED_TENANT` for good when no deploy follows. A no-op when the row is already owned.
+/// stays `UNTAGGED_TENANT` for good when no deploy follows. The claim is a compare-and-set
+/// (`ProjectStore::claim_team`): an untagged row is claimed, the owner's own claim is a no-op, and a
+/// row another team holds is never taken (a claim used to `set_team` unconditionally, so a team a
+/// project had been transferred away from took it back with its next env write).
 fn require_project_claiming_row(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3368,19 +3373,45 @@ fn require_project_claiming_row(
     project: &str,
 ) -> Result<String, (StatusCode, String)> {
     let t = require_project(c, h, claims, project)?;
-    c.projects.set_team(project, &t);
+    c.projects.claim_team(project, &t).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            "project belongs to a different team".into(),
+        )
+    })?;
     Ok(t)
 }
 
-/// Whether `project` belongs to tenant `t`, judged fleet-aware. Order of evidence: the local
-/// settings row; any deployment record (local gateway or gossiped peer copy) carrying the tenant
-/// tag; else, with no row AND no deployment evidence anywhere in view, the caller's verified tenant
-/// is trusted optimistically (never ANON_TENANT, which owns nothing). A visible deployment record
-/// keeps it strict, so a wrong-team caller probing a real project still fails.
-pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> bool {
+/// The team a project's settings row names when the row carries a REAL tag, else `None`. That row is
+/// the owner of record: a transfer rewrites it, while a deployment's tag, a peer's gossiped copy and
+/// the relational replica are denormalized copies that converge later (`tenancy_reconcile`). Wherever
+/// a holder exists it ALONE decides who may act on the project, so a project moved to another team
+/// stays unreachable for the old one on every node the row has reached, however stale that node's
+/// deployment tags still are; the copies are evidence only for a row with no tag.
+pub(crate) fn row_holder(c: &CloudState, project: &str) -> Option<String> {
     let owner = c.projects.team_of(project);
-    if norm(&owner) == t {
-        return true;
+    (record_tenant(&owner) != UNTAGGED_TENANT).then_some(owner)
+}
+
+/// The tenant a DEPLOYMENT record belongs to as of now: its project's row holder when there is one,
+/// else the record's own tag (`record_tenant`, so an untagged record stays `UNTAGGED_TENANT`). Every
+/// gate that decides from a deployment's tag goes through here, never `record_tenant(&d.tenant)`
+/// alone.
+pub(crate) fn deployment_tenant(c: &CloudState, project: &str, tag: &str) -> String {
+    row_holder(c, project).unwrap_or_else(|| record_tenant(tag).to_string())
+}
+
+/// Whether `project` belongs to tenant `t`, judged fleet-aware. Order of evidence: the local
+/// settings row, which is the owner of record whenever it carries a REAL tag (`row_holder`: a
+/// transferred project belongs to its new team even while some host still tags its deployments with
+/// the old one); only for a row with no tag (never set, or lost) any deployment record (local gateway
+/// or gossiped peer copy) carrying the tenant tag; else, with no row AND no deployment evidence
+/// anywhere in view, the caller's verified tenant is trusted optimistically (never ANON_TENANT, which
+/// owns nothing). A visible deployment record keeps it strict, so a wrong-team caller probing a real
+/// project still fails.
+pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> bool {
+    if let Some(holder) = row_holder(c, project) {
+        return holder == t;
     }
     let mut dep_seen = false;
     for r in c.gw.deployment_records() {
@@ -3402,7 +3433,7 @@ pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> b
     if t == ANON_TENANT {
         return false;
     }
-    record_tenant(&owner) == UNTAGGED_TENANT && !dep_seen
+    !dep_seen
 }
 
 /// Ownership guard for TEAM-level resources: the caller's tenant must equal `slug` (a platform
@@ -3739,15 +3770,7 @@ async fn dep_list(
     let mut list: Vec<_> =
         c.gw.list()
             .into_iter()
-            .filter(|d| {
-                let record_tag = record_tenant(&d.tenant);
-                let effective_owner = if record_tag == UNTAGGED_TENANT {
-                    record_tenant(&c.projects.team_of(&d.project)).to_string()
-                } else {
-                    record_tag.to_string()
-                };
-                effective_owner == t
-            })
+            .filter(|d| deployment_tenant(&c, &d.project, &d.tenant) == t)
             .collect();
     for d in &list {
         host_regions
@@ -3760,7 +3783,7 @@ async fn dep_list(
     for (node, deps) in c.peer_deployments.read().iter() {
         let nr = node_region.get(node);
         for d in deps {
-            if record_tenant(&d.tenant) != t {
+            if deployment_tenant(&c, &d.project, &d.tenant) != t {
                 continue;
             }
             if let Some(r) = nr {
@@ -4128,7 +4151,7 @@ pub(crate) async fn dep_promote(
 ) -> Result<Json<Value>, StatusCode> {
     let t0 = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        if record_tenant(&d.tenant) != t0 && !project_owned_by(&c, &d.project, &t0) {
+        if !project_owned_by(&c, &d.project, &t0) {
             return Err(StatusCode::NOT_FOUND);
         }
         let project = d.project.clone();
@@ -4368,7 +4391,7 @@ async fn dep_delete(
     else {
         return Ok(Json(json!({ "removed": id, "project": null })));
     };
-    if record_tenant(&initial.tenant) != team && !project_owned_by(&c, &initial.project, &team) {
+    if !project_owned_by(&c, &initial.project, &team) {
         return Err(StatusCode::NOT_FOUND);
     }
     let project = initial.project.clone();
@@ -4385,10 +4408,7 @@ async fn dep_delete(
             .into_iter()
             .find(|deployment| deployment.id.0 == id2)
             .ok_or(StatusCode::NOT_FOUND)?;
-        if selected.project != project2
-            || (record_tenant(&selected.tenant) != team2
-                && !project_owned_by(&c2, &project2, &team2))
-        {
+        if selected.project != project2 || !project_owned_by(&c2, &project2, &team2) {
             return Err(StatusCode::NOT_FOUND);
         }
         let incarnation = authorize_local_deployment_incarnation(
@@ -5121,24 +5141,31 @@ async fn project_delete(
         return Err(StatusCode::BAD_REQUEST);
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let authorized = c
-        .projects
-        .get_if_set(&project)
-        .map(|s| norm(&s.team) == t)
-        .unwrap_or(false)
-        || c.gw
-            .list()
-            .iter()
-            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || c.peer_deployments
-            .read()
-            .values()
-            .flatten()
-            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || crate::relational::projects_for_team(&t)
-            .await
-            .iter()
-            .any(|p| p == &project);
+    // The row names the owner of record: another team is refused here, never cascaded to the fleet and
+    // never put through the relational tier (`row_holder`); the evidence below is for a row with no tag.
+    let authorized = match row_holder(&c, &project) {
+        Some(holder) if holder == t => true,
+        Some(_) => return Err(StatusCode::NOT_FOUND),
+        None => {
+            c.projects
+                .get_if_set(&project)
+                .map(|s| norm(&s.team) == t)
+                .unwrap_or(false)
+                || c.gw
+                    .list()
+                    .iter()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || c.peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || crate::relational::projects_for_team(&t)
+                    .await
+                    .iter()
+                    .any(|p| p == &project)
+        }
+    };
     if !authorized {
         if cascade {
             let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
@@ -5662,24 +5689,35 @@ async fn project_rename(
             ),
         ));
     }
-    let authorized = c
-        .projects
-        .get_if_set(&project)
-        .map(|s| norm(&s.team) == t)
-        .unwrap_or(false)
-        || c.gw
-            .list()
-            .iter()
-            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || c.peer_deployments
-            .read()
-            .values()
-            .flatten()
-            .any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        || crate::relational::projects_for_team(&t)
-            .await
-            .iter()
-            .any(|p| p == &project);
+    // Same rule as the delete: the row's holder decides alone, another team is refused outright.
+    let authorized = match row_holder(&c, &project) {
+        Some(holder) if holder == t => true,
+        Some(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no project by that name is owned by this tenant here".into(),
+            ))
+        }
+        None => {
+            c.projects
+                .get_if_set(&project)
+                .map(|s| norm(&s.team) == t)
+                .unwrap_or(false)
+                || c.gw
+                    .list()
+                    .iter()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || c.peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || crate::relational::projects_for_team(&t)
+                    .await
+                    .iter()
+                    .any(|p| p == &project)
+        }
+    };
     if !authorized {
         if !cascade {
             return Err((
@@ -7328,7 +7366,8 @@ pub(crate) async fn gitops_projects(
     }
     for (_node, deps) in c.peer_deployments.read().iter() {
         for d in deps {
-            if record_tenant(&d.tenant) != t || !seen.insert(d.project.clone()) {
+            if deployment_tenant(&c, &d.project, &d.tenant) != t || !seen.insert(d.project.clone())
+            {
                 continue;
             }
             out.push(json!({
@@ -11834,6 +11873,12 @@ async fn project_team_put(
     c.projects.set_team(&project, dest);
     c.projects
         .set_preview_protection(&project, b.preview_protection);
+    if !same_team {
+        // The project MOVES with its deployments: this node's records and pools take the new tenant
+        // now, every other host re-tags its own from the project row (`tenancy_reconcile`).
+        let retagged = c.gw.retag_project(&project, dest);
+        tracing::info!(%project, %dest, retagged, "project transferred: local deployments re-tagged");
+    }
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }

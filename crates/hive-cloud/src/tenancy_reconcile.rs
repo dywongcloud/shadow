@@ -17,6 +17,14 @@
 //! records (a stopped game server between sessions);
 //! 2. The newest TAGGED deployment record, local or gossiped (`peer_deployments`): covers a project
 //! actively serving somewhere even if the relational replica is cold on this node.
+//!
+//! The other direction, [`retag_deployments_to_rows`]: once a project row carries a REAL tag it is the
+//! owner of record, so the deployments THIS node hosts follow it. A project transferred to another
+//! team re-tags the deployments of the node that served the transfer at once
+//! (`Gateway::retag_project`); every other host converges here as the row reaches it, within
+//! `HIVE_DEPLOYMENT_RETAG_SECS` (15), so the old team's tenant-scoped views stop listing the project
+//! everywhere (`HIVE_DEPLOYMENT_RETAG=0` disables). Until a host has converged its deployment tags
+//! are only a stale copy: every access gate asks the row first (`admin::row_holder`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +37,14 @@ fn interval_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300)
+}
+
+fn retag_interval_secs() -> u64 {
+    std::env::var("HIVE_DEPLOYMENT_RETAG_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(15)
 }
 
 /// One repair pass. Returns how many project rows were repaired.
@@ -104,17 +120,77 @@ pub async fn reconcile_once(cloud: &Arc<CloudState>) -> usize {
     repaired
 }
 
+/// Re-tags the deployments THIS node hosts to the tenant their project row names, for every project
+/// whose row carries a real tag and disagrees: the row is the owner of record (it is what access
+/// checks, the preview gate and a transfer all use), the deployment tag a denormalized copy that a
+/// transfer must move. Never touches a row, never a project without a real-tagged row (a deleted
+/// project has none; a recreated one has its own). Returns how many deployments changed.
+pub fn retag_deployments_to_rows(cloud: &Arc<CloudState>) -> usize {
+    if std::env::var("HIVE_DEPLOYMENT_RETAG").is_ok_and(|v| v.trim() == "0") {
+        return 0;
+    }
+    let mut tenants_of: HashMap<String, Vec<String>> = HashMap::new();
+    for d in cloud.gw.list() {
+        tenants_of
+            .entry(d.project.clone())
+            .or_default()
+            .push(d.tenant.clone());
+    }
+    let mut retagged = 0usize;
+    for (project, tenants) in tenants_of {
+        let Some(owner) = crate::admin::row_holder(cloud, &project) else {
+            continue;
+        };
+        if tenants
+            .iter()
+            .all(|tenant| crate::admin::record_tenant(tenant) == owner)
+        {
+            continue;
+        }
+        let changed = cloud.gw.retag_project(&project, &owner);
+        if changed > 0 {
+            tracing::warn!(
+                project,
+                team = %owner,
+                changed,
+                "tenancy reconcile: re-tagged deployments to their project's team (the project was transferred)"
+            );
+            retagged += changed;
+        }
+    }
+    if retagged > 0 {
+        crate::persist::persist(cloud);
+    }
+    retagged
+}
+
 /// Every node, periodic. The first pass runs ~60 s after boot so gossip and the GuardianDB replica
-/// have warmed; then every `HIVE_TENANCY_RECONCILE_SECS` (default 300).
+/// have warmed; then the tag repair every `HIVE_TENANCY_RECONCILE_SECS` (default 300) and, on its own
+/// short cadence because it reads only local state, the deployments' re-tag every
+/// `HIVE_DEPLOYMENT_RETAG_SECS` (default 15).
 pub fn spawn(cloud: Arc<CloudState>) {
+    let repair_cloud = cloud.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            let n = reconcile_once(&cloud).await;
+            let n = reconcile_once(&repair_cloud).await;
             if n > 0 {
                 tracing::info!(repaired = n, "tenancy reconcile: pass complete");
             }
             tokio::time::sleep(Duration::from_secs(interval_secs())).await;
+        }
+    });
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let moved = retag_deployments_to_rows(&cloud);
+            if moved > 0 {
+                tracing::info!(
+                    retagged = moved,
+                    "tenancy reconcile: deployments follow their project rows"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(retag_interval_secs())).await;
         }
     });
 }
