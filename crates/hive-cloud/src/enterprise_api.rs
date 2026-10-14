@@ -354,10 +354,12 @@ struct AcsForm {
 /// the handler checks only that SAML is enabled for the team and extracts the subject, so it trusts
 /// any `NameID` posted to it (with `auto_provision`, that email becomes a team Member). Signature
 /// verification is the open hardening item, so until it exists the ACS is not a public endpoint:
-/// the platform gate refuses an anonymous POST and `require_team` lets only the team's own owner or
-/// admin (who can already add members) through, so a signed-in caller of ANOTHER team, or a plain
-/// member of this one, can no longer forge an assertion into the roster. Consequence: an IdP's
-/// browser POST (no platform JWT) cannot complete a sign-in on an enforced platform.
+/// the platform gate refuses an anonymous POST and `require_team_floor` lets only the team's own
+/// owner or admin (who can already add members) through, so a signed-in caller of ANOTHER team, or
+/// a plain member of this one, can no longer forge an assertion into the roster. On an UNENFORCED
+/// dev node (no `HIVE_JWT_SECRET`, so no verified roles) the floor steps aside like every other
+/// role gate. Consequence: an IdP's browser POST (no platform JWT) cannot complete a sign-in on an
+/// enforced platform.
 async fn saml_acs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -365,7 +367,7 @@ async fn saml_acs(
     Path(team): Path<String>,
     axum::extract::Form(form): axum::extract::Form<AcsForm>,
 ) -> Response {
-    if let Err((status, message)) = crate::admin::require_team(
+    if let Err((status, message)) = crate::admin::require_team_floor(
         &c,
         &headers,
         claims.as_ref().map(|e| &e.0),
