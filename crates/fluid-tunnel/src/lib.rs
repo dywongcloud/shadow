@@ -13,7 +13,7 @@ pub use server::{set_local_connect_permits, TunnelServer};
 
 use serde::{Deserialize, Serialize};
 
-/// Request metadata (the body follows in the same REQUEST frame payload).
+/// Request metadata (the body follows in the same [`FrameKind::Request`] frame payload).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReqMeta {
     pub method: String,
@@ -22,7 +22,8 @@ pub struct ReqMeta {
     pub body_len: u32,
 }
 
-/// Response metadata, sent in a RESP_HEAD frame; body follows in RESP_BODY.
+/// Response metadata, sent in a [`FrameKind::RespHead`] frame; the body follows in
+/// [`FrameKind::RespBody`] frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RespMeta {
     pub status: u16,

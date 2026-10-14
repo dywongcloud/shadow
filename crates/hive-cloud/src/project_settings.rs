@@ -158,7 +158,7 @@ pub struct FunctionSettings {
     pub gpu: bool,
     /// Whether this project's functions use its paid dedicated public IPv4
     /// ([`ProjectSettings::dedicated_ipv4`]). Unlike `gpu`, `git.rs` ASSIGNS it over a function's
-    /// own fluid.json `dedicatedIpv4` instead of OR-merging, so a manifest cannot self-grant it.
+    /// own fluid.json `dedicated_ipv4` instead of OR-merging, so a manifest cannot self-grant it.
     #[serde(default)]
     pub dedicated_ipv4: bool,
 }

@@ -59,9 +59,8 @@ pub mod fault {
     /// cells against (for Firecracker, the GUEST rootfs). Operator remedy: provision it; not app
     /// breakage, not host exhaustion. Placement (`schedule::wasm_capable`/`bun_capable`) should
     /// make it unreachable, so reaching it means the capability probe and the real filesystem
-    /// disagree (a rootfs replaced under a running node, a stale gossiped record,
-    /// `HIVE_WASM_RUNTIME=1` without the binary): a node fault, never `CAPACITY_EXHAUSTED` or
-    /// advice to debug the entrypoint.
+    /// disagree (a rootfs replaced under a running node, a stale gossiped record): a node fault,
+    /// never `CAPACITY_EXHAUSTED` or advice to debug the entrypoint.
     pub const NODE_RUNTIME_MISSING: &str = "NodeRuntimeMissing";
     /// The DEPLOYMENT's own process never reached a listening state (it exited, or never bound its
     /// port within the start budget): an app fault (bad entrypoint, missing env, a crash on boot).

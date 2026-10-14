@@ -1,7 +1,7 @@
 //! The Fluid pool ("serverless servers"): per function, a pool of long-lived instances with
 //! in-function concurrency (`max_concurrency`), least-loaded reuse before provisioning, cold start
 //! only on saturation (up to `max_instances`), keep-warm (`min_instances`), scale-to-zero after
-//! `idle_ttl`, `waitUntil` lease holds, and active-CPU + provisioned-memory metering. One
+//! `idle_ttl_secs`, `waitUntil` lease holds, and active-CPU + provisioned-memory metering. One
 //! `parking_lot::Mutex` over the registry, never held across an `.await`.
 
 use fluid_core::FunctionConfig;
@@ -1322,7 +1322,8 @@ impl Fluid {
     /// Speculatively bring one instance of `key` up AHEAD of any request — the ONE warming entry point
     /// shared by keep-warm and prewarm hints, so they share the crash-loop circuit, backoff and
     /// reservation semantics. Refuses without a reservation when the pool is warm, starting, saturated,
-    /// in backoff, circuited or shutting down; a wrong guess costs one idle instance for `idle_ttl`.
+    /// in backoff, circuited or shutting down; a wrong guess costs one idle instance for
+    /// `idle_ttl_secs`.
     pub async fn warm(self: &Arc<Self>, key: &str) -> anyhow::Result<WarmVerdict> {
         let now = now_ms();
         {

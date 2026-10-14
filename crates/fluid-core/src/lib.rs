@@ -1,6 +1,6 @@
 //! The deployment model for the serving layer: a [`Deployment`] is static assets plus zero or more
 //! [`FunctionConfig`]s, with [`Route`]s mapping paths to either; the function config carries the
-//! Fluid knobs (`max_concurrency`, `min_instances`, `max_instances`, `idle_ttl`).
+//! Fluid knobs (`max_concurrency`, `min_instances`, `max_instances`, `idle_ttl_secs`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

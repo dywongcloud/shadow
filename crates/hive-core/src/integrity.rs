@@ -138,9 +138,8 @@ impl IntegrityEntryKind {
 /// hex(SHA-256) chain root over `entries`, the exact-shape analog of
 /// `hive-cloud::billing::compute_ledger_checkpoint`: a versioned, deployment-scoped genesis hash,
 /// then one SHA-256 fold per entry in `seq` ascending order. Callers MUST pass entries already
-/// sorted by `seq` (this function does not sort), so it works identically on the full history or a
-/// bounded window (verification recomputes from a known starting point, e.g. a previous known-good
-/// `chain_head`).
+/// sorted by `seq` (this function does not sort). It always starts from the genesis, so a window of
+/// entries yields a root over that window alone, never the chain head of the full history.
 pub fn fold_integrity_chain(deployment_id: &str, entries: &[IntegrityEntry]) -> String {
     let mut chain = Sha256::new();
     chain.update(b"hive-integrity-chain-v1");

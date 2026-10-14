@@ -42,8 +42,9 @@ pub struct Claims {
 /// Subject of a mesh delegation token: a fleet node acting on the mesh's behalf, minted through
 /// `issue` with [`MESH_SERVICE_ROLE`].
 pub const MESH_INTERNAL_SUB: &str = "mesh-internal";
-/// Role reserved for [`MESH_INTERNAL_SUB`] delegations. A tenant never carries it: `tenant_role`
-/// refuses it on an API key and `api_key_claims` never emits it.
+/// Role reserved for [`MESH_INTERNAL_SUB`] delegations. A tenant never carries it:
+/// `apikeys::check_new_role` refuses to mint it and `api_key_claims` demotes a stored one through
+/// `apikeys::effective_role`.
 pub const MESH_SERVICE_ROLE: &str = "service";
 
 /// THE predicate for "this caller is a fleet node", never a tenant: subject AND role of a mesh

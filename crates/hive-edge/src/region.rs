@@ -93,20 +93,23 @@ pub struct NodeInfo {
     /// back to the reservation estimate.
     #[serde(default)]
     pub gpu_free_mb: Option<u64>,
-    /// Isolation backend: "firecracker" (microVMs) or "mock" (sandboxed processes); placement only
-    /// auto-targets firecracker nodes.
+    /// Isolation backend: "firecracker" (microVMs), "litebox" (userspace Linux ABI) or "mock"
+    /// (sandboxed processes); `schedule::eligible`/`capable` in hive-cloud decide which nodes
+    /// placement targets.
     #[serde(default)]
     pub backend: String,
     /// GPUs present AND driver-visible (`detect_gpus`); `0` for GPU-less and pre-upgrade peers.
     /// Placement requires `gpu_count > 0` for GPU functions.
     #[serde(default)]
     pub gpu_count: u32,
-    /// Whether `wasmer` exists on the filesystem the cell execs against (`detect_wasm_runtime`);
-    /// `None` = NOT CAPABLE, never unknown-so-admit.
+    /// Whether `wasmer` exists on the filesystem the cell execs against
+    /// (`resources::RuntimeCapabilitySource` in hive-cloud); `None` = NOT CAPABLE, never
+    /// unknown-so-admit.
     #[serde(default)]
     pub wasm_runtime: Option<bool>,
-    /// Whether `bun` exists on the filesystem the cell execs against (`detect_bun_runtime`; litebox
-    /// always `false`); `None` = NOT CAPABLE.
+    /// Whether `bun` exists on the filesystem the cell execs against
+    /// (`resources::RuntimeCapabilitySource` in hive-cloud; litebox always `false`); `None` = NOT
+    /// CAPABLE.
     #[serde(default)]
     pub bun_runtime: Option<bool>,
     /// Toolchains the BUILD lane can exec, in `resources::BUILD_TOOLCHAINS` order (host PATH for
