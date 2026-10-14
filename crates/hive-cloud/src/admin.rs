@@ -15654,12 +15654,8 @@ async fn identity_sync(
         &req.user.id,
         body_email_is_owner,
     );
-    // Only the dashboard SERVER writes the mirror (the users and orgs the operator's data view and
-    // `caller_administers` read, and the roster below): its sync alone carries `x-hive-internal` and a
-    // profile Clerk verified. A browser-originated sync is a body the caller wrote, so it records
-    // nothing: a signed-in user cannot rename, re-image or re-tenant ANY user id, nor rewrite its own
-    // org. It still answers `tenant` and `is_owner`, which the client reads.
-    if mint_allowed(&headers) {
+    let sync_is_from_the_dashboard_server = mint_allowed(&headers);
+    if sync_is_from_the_dashboard_server {
         if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
             c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
         }
@@ -15673,11 +15669,6 @@ async fn identity_sync(
                         .map(|o| o.name.trim())
                         .filter(|s| !s.is_empty())
                         .unwrap_or(slug.as_str());
-                    // Hobby, the plan `team_create` gives a non-operator: a tier is RAISED only
-                    // through `apply_plan_everywhere` (a paid checkout or an operator), and the
-                    // billing account of a new tenant is Hobby, so both halves agree. Created at
-                    // "pro" the record read Pro while billing read Hobby, and every org reached
-                    // Pro-gated features free.
                     let _ = c
                         .teams
                         .create_with_slug(slug, name, "hobby", &c.owner_email);
@@ -16366,10 +16357,6 @@ async fn billing_webhook(
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
             if !crate::billing::session_paid(&obj) {
-                // A delayed payment method (a bank debit) completes the session before the money
-                // arrives: nothing is applied until Stripe says it is paid (this event again, or
-                // `checkout.session.async_payment_succeeded`), because a payment that can still fail
-                // must not already have bought the credits or the plan.
                 tracing::info!(
                     event = event_type,
                     checkout = checkout_id,
@@ -16418,8 +16405,6 @@ async fn billing_webhook(
             }
         }
         "checkout.session.async_payment_failed" => {
-            // The delayed payment never arrived: the checkout stays unapplied (it expires with the
-            // 24 h retention) and the buyer opens a new one.
             tracing::warn!(
                 checkout = obj
                     .get("metadata")
@@ -17023,11 +17008,6 @@ pub(crate) async fn project_preview(
             "alias": alias,
         }));
     }
-    // The fetch targets this node's OWN gateway, but the app (sandboxed tenant code) controls the
-    // RESPONSE, including any redirect: a bare client following it server-side would let a tenant's
-    // own app hand the preview path a result read from wherever it points (loopback admin ports,
-    // the VPC) with the body echoed back as "preview" to that caller. `same_origin_client` follows
-    // only a redirect that stays on this exact origin.
     let base = c.public_base.clone();
     let resp = hive_outbound::same_origin_client()
         .get(format!("{base}/"))
