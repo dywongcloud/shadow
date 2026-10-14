@@ -100,6 +100,27 @@ fn check_roster_change(
     Ok(())
 }
 
+/// [`check_roster_change`] for a REMOVAL, which may delete several rows (one person stored twice: a
+/// ghost row an older build left beside the real member): every row it deletes is authorised, never
+/// just the first. `removed` holds the role of each row about to go: nobody removes a member above
+/// their own role, and the last Owner is never removed (the rows removed may not include every
+/// Owner the team has).
+fn check_roster_removal(team: &Team, actor: Role, removed: &[Role]) -> Result<(), RosterRefusal> {
+    if removed.iter().any(|role| role.rank() > actor.rank()) {
+        return Err(RosterRefusal::AboveActor);
+    }
+    let owners = team
+        .members
+        .iter()
+        .filter(|member| member.role == Role::Owner)
+        .count();
+    let owners_removed = removed.iter().filter(|role| **role == Role::Owner).count();
+    if owners_removed > 0 && owners <= owners_removed {
+        return Err(RosterRefusal::LastOwner);
+    }
+    Ok(())
+}
+
 /// What [`TeamStore::remove_checked`] did to a member that passed the rule.
 enum Removal {
     Removed,
@@ -621,10 +642,12 @@ impl TeamStore {
         }
     }
 
-    /// The one removal path: look the member up, apply [`check_roster_change`], drop the row. The
-    /// email is matched as [`same_person`], except that a row stored under EXACTLY this string (case
-    /// aside) wins: a ghost row an older build stored with a stray space or no email can still be
-    /// removed on its own, without taking the real member beside it.
+    /// The one removal path: look the member up, authorise EVERY row it will delete
+    /// ([`check_roster_removal`]), drop them. The email is matched as [`same_person`], except that a
+    /// row stored under EXACTLY this string (case aside) wins: a ghost row an older build stored with
+    /// a stray space or no email can still be removed on its own, without taking the real member
+    /// beside it, and a request that matches two rows (the ghost AND the Owner) must pass the rule
+    /// for both.
     fn remove_checked(
         &self,
         slug: &str,
@@ -649,15 +672,16 @@ impl TeamStore {
                 same_person(&member.email, email)
             }
         };
-        let Some(current) = team
+        let targets: Vec<Role> = team
             .members
             .iter()
-            .find(|member| is_target(member))
+            .filter(|member| is_target(member))
             .map(|member| member.role)
-        else {
+            .collect();
+        if targets.is_empty() {
             return Ok((team.clone(), Removal::Absent));
-        };
-        check_roster_change(team, actor, Some(current), None)?;
+        }
+        check_roster_removal(team, actor, &targets)?;
         team.members.retain(|member| !is_target(member));
         team.synthetic_seed = false;
         team.updated_ms = next_version(team.updated_ms, tombstone);
