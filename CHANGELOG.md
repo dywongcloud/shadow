@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-10-13 — `/api/tv/hls` decodes a gzip body an origin sends despite `accept-encoding: identity`, and a key is decided by its URI role
+
+The route asks for `accept-encoding: identity`, but an origin that ignores it (nginx
+`gzip_static always`, a CDN that gzips every playlist) answered with a `content-encoding`
+the proxy never decoded: a gzip playlist failed the `#EXTM3U` check and answered 415, a gzip
+AES key labelled `mpegurl` was served as the compressed blob (a wrong key: hls.js died on
+`fragParsingError` instead of an error that names the cause) and a gzip segment streamed
+compressed under the origin's wire `content-length`. A key a server labels `text/plain` or
+`text/html` also answered 415 (the previous fix covered only a key labelled as a playlist).
+`safe-fetch.ts` `boundedSource`, behind `readBounded` and `boundedBody`, now decodes ONE
+`gzip`, `x-gzip` or `deflate` coding with the cap on both the encoded and the decoded bytes:
+a bomb ends at the decoded cap and the decoder never runs ahead of the reader (a 4 GiB bomb
+pulled 258 KiB of its 4.1 MiB), while an endless run of empty gzip members or an unterminated
+gzip header decodes to nothing and would never reach a decoded-only cap, so the encoded side
+ends it; either tears the upstream down. A 206 in a coding is a 502 (a partial gzip cannot be
+decoded); brotli (a 16 MiB window per request on an anonymous route), zstd and chained
+codings are a 415; a decoded body is forwarded without `content-length` or range headers. The
+playlist rewrite now marks the URI of every `#EXT-X-KEY` and `#EXT-X-SESSION-KEY` `&role=key`,
+and a `role=key` fetch is at most 4096 bytes of `application/octet-stream` whatever the origin
+labels it (empty or larger is a 502), so a key labelled `text/plain` or `text/html` plays when
+it is reached through a rewritten playlist; a direct hit keeps the label rule and still
+refuses it. Witnessed with a synthetic origin behind a cloudflared quick tunnel, the previous
+route (HEAD) served on one port and this code on another (the quick tunnel's edge decodes
+gzip, deflate and br for an `accept-encoding: identity` client and rewrites the header of a
+coding it does not know, so over the wire the coding is `x-gzip`, which it leaves alone): 27
+over-the-wire checks, 20 failed before and none after (the `x-gzip` playlist, key and segment,
+both mislabelled keys, a 206 in a coding, 64 MiB and 256 MiB bombs, a corrupt and a truncated
+stream, an endless run of empty members and an endless header, each ended by the encoded cap
+with the origin connection closed); 48 module-level checks with real zlib streams (every
+spelling of the coding, exact caps, damaged streams, cancel, the plain 64 MiB cut); real
+hls.js in headless Chrome playing AES-128 HLS streams through the route, where a key labelled
+`text/plain`, an `x-gzip` playlist and an `x-gzip` key failed before (`keyLoadError` 415,
+`manifestLoadError` 415, `fragParsingError`) and all six variants play after (320x180, key
+loaded, fragments parsed, no errors); the 47-row hostile-URL table (0 recorded connections),
+the 10-row key table and 52 of 53 bound checks hold (the remaining one, a 64 MiB endless
+stream, cannot finish inside the route's 25 s deadline at the tunnel's current 0.6 MiB/s and
+ends identically on the previous route); 300 real catalog channels answer the same playlist
+status before and after. Not rolled.
+
+## 2026-10-13 — a malformed `team` for ZK enrollment is a 400, and the unlock page never calls a server fault "Access denied"
+
+Two follow-ups from the round-2 review of the preview-unlock commits. `POST /api/zk-enroll`
+passed the request body's `team` to `teamAccess` before checking it was a string, so an
+object, a number, an array or `true` threw `team.startsWith is not a function` and answered
+500; it now answers 400 (`team must be a string`), while an absent, null or empty `team` still
+means `personal`. The unlock interstitial (`ui/app/preview-unlock/page.tsx`) rendered every
+failed answer, including the retryable 503 and 502 the route sends when a Clerk or node
+lookup cannot be answered, as "Access denied" with no retry and ignored `Retry-After`, so a
+visitor with a valid membership was told they were refused. "Access denied" is now only a 4xx
+refusal; a 5xx or no answer shows "Temporarily unavailable" and a "Try again" button that is
+disabled for `Retry-After` seconds (at least 1, at most 60, 5 when absent) and re-runs the
+unlock. Witnessed on the real zk-enroll handler against a throwaway node (12 request bodies:
+4 threw a 500 before and none after, the 4 malformed ones are 400 and the other 8 answer as
+before), and on the page in a production build of a scratch app with a stub unlock API driven
+by headless Chrome (strict mode runs mount effects twice in dev): before, a 503 with
+`Retry-After: 3`, a 503 without it, a 502, a 403 and a flaky 503-then-200 all showed "Access
+denied" with no button; after, the 503 with `Retry-After: 3` shows "Temporarily unavailable"
+and a disabled "Try again in 2s" that ignores a click until the delay has passed (one API
+call, not two), then the click re-runs the unlock and the visitor enters, a 503 without the
+header and the 502 count down 5 s, and the 403 still shows "Access denied" with no retry.
+Not rolled.
+
 ## 2026-10-13 — the DB-gateway listener bounds every accepted connection and idles out a silent one
 
 The Postgres/Redis wire listener (`db_gateway.rs`) spawned one unbounded task per accept with no
