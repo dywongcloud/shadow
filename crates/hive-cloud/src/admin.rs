@@ -15244,28 +15244,20 @@ pub(crate) async fn billing_get(
     }))
 }
 
-/// Invoices for the tenant (finalized periods + current draft, newest first).
+/// Invoices for the tenant (finalized periods plus the current draft, newest first). The read order
+/// is deliberate: (1) the LOCAL fleet-replicated relational mirror, bounded by
+/// `relational::billing_read_budget()`: no network hop, and the only source of finalized invoice
+/// history that exists on EVERY node; (2) the HTTP/mesh proxy to the billing authority, bounded by
+/// `billing_proxy_budget()`; (3) this node's own in-process `BillingStore` (instant, never fails).
 ///
-/// Read order, deliberately:
-///   1. the LOCAL fleet-replicated relational mirror, bounded by
-///      `relational::billing_read_budget()` — no network hop, and the only
-///      source of finalized invoice history that exists on EVERY node;
-///   2. the HTTP/mesh proxy to the billing authority, bounded by
-///      `billing_proxy_budget()`;
-///   3. this node's own in-process `BillingStore` (instant, never fails).
-///
-/// (2) before (3) is load-bearing, not a latency preference: `BillingStore`'s
-/// invoices are NOT part of the `store_sync` `billing` snapshot (which carries
-/// accounts + ledger only — see `store_sync::REGISTRY`), so a non-authority
-/// node's local `invoices` map holds finalized invoices for nobody. Serving it
-/// before the authority hop would replace a tenant's real invoice history with
-/// a lone draft for the whole duration of any mirror outage. The authority's
-/// own store DOES hold it (and its mirror read is bounded by the same budget,
-/// so the hop terminates there instead of hanging), which is what makes (2)
-/// both more correct than (3) and now fast.
-///
-/// Worst case is therefore bounded: budget + budget + instant, instead of the
-/// live `SQL_OP_TIMEOUT` (10 s) plus an unbounded proxy hop.
+/// Putting (2) before (3) is load-bearing, not a latency preference: `BillingStore`'s invoices are
+/// NOT part of the `store_sync` `billing` snapshot (accounts and ledger only, see
+/// `store_sync::REGISTRY`), so a non-authority node's local `invoices` map holds finalized invoices
+/// for nobody, and serving it before the authority hop would replace a tenant's real invoice
+/// history with a lone draft for the whole duration of any mirror outage. The authority's own store
+/// DOES hold it (and its mirror read is bounded by the same budget, so the hop terminates there
+/// instead of hanging). The worst case is therefore bounded: budget + budget + instant, instead of
+/// the live `SQL_OP_TIMEOUT` (10 s) plus an unbounded proxy hop.
 pub(crate) async fn billing_invoices(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15281,19 +15273,15 @@ pub(crate) async fn billing_invoices(
     Json(json!(c.billing.invoices(&t)))
 }
 
-/// The mirror half of `billing_invoices`, or `None` when the mirror cannot
-/// answer for this tenant (not mirrored here, or the read missed its budget) —
-/// the caller falls through to the authority, never to a fabricated empty list.
-///
-/// Equivalence with `BillingStore::invoices` (the last-resort answer in
-/// `billing_invoices`): that method returns the stored FINALIZED invoices plus
-/// `current_invoice` (the in-progress period's draft), sorted newest-first by
-/// `period_start_ms`. The mirror only ever holds finalized invoices (drafts are
-/// never persisted — see `relational::upsert_billing`'s doc comment), so the
-/// draft is appended here and the array re-sorted on the same key. No
-/// double-count is possible: `billing::build_invoice` mints a fresh random id
-/// for every draft, so the appended one can never be an invoice the mirror
-/// already holds.
+/// The mirror half of `billing_invoices`, or `None` when the mirror cannot answer for this tenant
+/// (not mirrored here, or the read missed its budget): the caller falls through to the authority,
+/// never to a fabricated empty list. It is equivalent to `BillingStore::invoices` (the last-resort
+/// answer in `billing_invoices`), which returns the stored FINALIZED invoices plus
+/// `current_invoice` (the in-progress period's draft) sorted newest-first by `period_start_ms`: the
+/// mirror only ever holds finalized invoices (drafts are never persisted, see
+/// `relational::upsert_billing`), so the draft is appended here and the array re-sorted on the same
+/// key. No double-count is possible: `billing::build_invoice` mints a fresh random id for every
+/// draft, so the appended one can never be an invoice the mirror already holds.
 async fn billing_invoices_from_mirror(c: &Arc<CloudState>, t: &str) -> Option<Value> {
     let invoices_json = match crate::relational::billing_snapshot(t).await {
         crate::relational::BillingSnapshot::Mirrored {
@@ -15365,22 +15353,19 @@ fn default_kind() -> String {
     "plan".into()
 }
 
-/// Which purchasable addons this fleet can actually deliver, and when it
-/// cannot, WHY. The dashboard reads this to render a disabled control with the
-/// operator's remedy instead of a Buy button that answers with an HTTP error
-/// only after the user clicks it. Tenant-authed (same read bar as billing).
+/// Which purchasable addons this fleet can actually deliver and, when it cannot, WHY: the dashboard
+/// renders a disabled control with the operator's remedy instead of a Buy button that answers with
+/// an HTTP error only after the user clicks it. Tenant-authed (same read bar as billing).
 ///
-/// GETs are served node-local (see `main.rs`'s admin_ingress dispatch doc) —
-/// correct for gossip-replicated tenant state, wrong here: Tencent
-/// credentials are NODE-LOCAL infrastructure config, so different nodes give
-/// genuinely different (not just eventually-consistent) answers. A tenant
-/// landing on a non-Tencent or not-yet-configured node saw "not available"
-/// even on a fleet where the purchase path (leader-forwarded, always a
-/// credentialed node per `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a
-/// local preflight failure, ask the leader's own view before answering
-/// "unavailable" — the leader is always Tencent-credentialed by the same
-/// invariant `provision_from_checkout` already relies on. Fail OPEN toward
-/// the local answer if the leader can't be reached, never hang the endpoint.
+/// GETs are served node-local (see the `admin_ingress` dispatch doc in `main.rs`), which is correct
+/// for gossip-replicated tenant state and wrong here: Tencent credentials are NODE-LOCAL
+/// infrastructure config, so different nodes give genuinely different (not eventually-consistent)
+/// answers, and a tenant landing on a non-Tencent or not-yet-configured node saw "not available"
+/// even on a fleet where the purchase path (leader-forwarded, always a credentialed node per
+/// `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a local preflight failure it therefore asks the
+/// leader's own view before answering "unavailable" (the leader is always Tencent-credentialed by
+/// the same invariant `provision_from_checkout` relies on), failing OPEN toward the local answer if
+/// the leader cannot be reached: it never hangs the endpoint.
 async fn billing_addons(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15415,18 +15400,30 @@ async fn billing_addons(
     })))
 }
 
+/// Opens a checkout for a plan, credits or an addon (`req.kind`). Errors carry their REASON: every
+/// arm used to return a bare StatusCode, so the dashboard's Buy button could only render "POST
+/// /v1/billing/checkout -> 502", indistinguishable from a platform bug when the cause was usually
+/// "this fleet has no Tencent credentials configured"; `apiSend` surfaces the response body
+/// verbatim, so a sentence here is a sentence in the UI. An addon is PREFLIGHTED before any
+/// checkout record exists (discovering missing config after confirming a checkout left a confirmed
+/// purchase with no address and told the buyer nothing), and because it is scoped to a project
+/// (e.g. dedicated_ipv4) Stripe lands the buyer back on that project's network settings rather than
+/// the unrelated billing overview.
+///
+/// A free plan (Hobby, or any future $0 tier) has nothing to charge (Stripe Checkout rejects a $0
+/// payment or subscription outright), so it is applied immediately, as the mock path always did.
+/// The same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`, an operator-set
+/// testing price, never assumed permanent) goes through the SAME `open_checkout_full` ->
+/// `confirm_checkout` -> `provision_from_checkout` sequence the paid path uses, just without the
+/// Stripe session a $0 amount could never produce; `provision_from_checkout` is idempotent on
+/// `ProjectSettings::dedicated_ipv4`, so hitting it more than once for the same project is safe.
+/// Otherwise it opens a real Stripe Checkout when configured and the local mock checkout when not.
 async fn billing_checkout(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<CheckoutReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Errors carry their REASON. Every arm below used to return a bare
-    // StatusCode, so the dashboard's Buy button could only render
-    // "POST /v1/billing/checkout -> 502" — indistinguishable from a platform
-    // bug, when the actual cause was usually "this fleet has no Tencent
-    // credentials configured". `apiSend` surfaces the response body verbatim,
-    // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
     let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
@@ -15465,9 +15462,6 @@ async fn billing_checkout(
                         format!("project {target:?} is not owned by your team"),
                     ));
                 }
-                // PREFLIGHT before any checkout record exists: discovering
-                // missing config after confirming a checkout left a confirmed
-                // purchase with no address, and told the buyer nothing.
                 if let Err(why) = crate::tencent_eip::preflight() {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -15496,10 +15490,6 @@ async fn billing_checkout(
                 )
             }
         };
-    // A free plan (Hobby, or any future $0 tier) has nothing to charge —
-    // Stripe Checkout rejects a $0 payment/subscription outright, and there's
-    // no reason to round-trip it at all. Apply immediately, same as the mock
-    // path always did for this case.
     if amount == 0 && req.kind != "addon" {
         apply_plan_everywhere(&c, &t, &plan);
         let acc = c.billing.account(&t);
@@ -15516,13 +15506,6 @@ async fn billing_checkout(
             json!({ "url": "", "mock": false, "applied": true, "account": acc }),
         ));
     }
-    // Same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`,
-    // an operator-set testing price, never assumed permanent): route through
-    // the SAME `open_checkout_full` -> `confirm_checkout` -> `provision_from_checkout`
-    // sequence the paid path uses below, just without the Stripe session that
-    // a $0 amount could never produce anyway. `provision_from_checkout` is
-    // already idempotent on `ProjectSettings::dedicated_ipv4` (see its own doc
-    // comment), so this is safe to hit more than once for the same project.
     if amount == 0 && req.kind == "addon" {
         let co = c.billing.open_checkout_full(
             &t,
@@ -15569,12 +15552,8 @@ async fn billing_checkout(
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
-    // Real Stripe Checkout when configured; otherwise the local mock checkout.
     if crate::billing::stripe_configured() {
         let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-        // An addon purchase is scoped to a project (e.g. dedicated_ipv4) --
-        // land the buyer back where they bought it, not on the unrelated
-        // billing overview page, which has nothing to show for it.
         let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
             let enc =
                 percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
@@ -15615,6 +15594,11 @@ async fn billing_checkout(
     ))
 }
 
+/// Reads a checkout by id. Checkouts live in an in-process map on whichever node opened them, and
+/// `POST /v1/billing/checkout` is a mutation, so it always runs on the billing authority, while the
+/// browser's follow-up GET (`/billing/checkout?session=<id>`) round-robins: a local miss therefore
+/// proxies to the authority like the sibling billing reads, or the upgrade flow would dead-end with
+/// "Checkout session not found".
 pub(crate) async fn billing_checkout_get(
     State(c): State<Arc<CloudState>>,
     Path(id): Path<String>,
@@ -15622,12 +15606,6 @@ pub(crate) async fn billing_checkout_get(
     if let Some(co) = c.billing.get_checkout(&id) {
         return Ok(Json(json!(co)));
     }
-    // Checkouts live in an in-process map on whichever node opened them, and
-    // `POST /v1/billing/checkout` is a mutation so it always runs on the billing
-    // authority. The browser then navigates to /billing/checkout?session=<id>,
-    // whose GET round-robins — landing anywhere else it 404'd and the upgrade
-    // flow dead-ended with "Checkout session not found". The sibling billing
-    // reads already proxy this way; this one was missed.
     if let Some(v) = proxy_billing_read(&c, &format!("/v1/billing/checkout/{id}"), "").await {
         return Ok(Json(v));
     }
@@ -15639,6 +15617,17 @@ struct ConfirmReq {
     session: String,
 }
 
+/// Confirms a checkout and applies its effect. Only the SAME tenant that opened a checkout may
+/// confirm it (otherwise any authenticated caller who learns or guesses another tenant's checkout
+/// id could force-complete or grief it). For a REAL Stripe checkout the payment is verified with
+/// Stripe before anything is applied: the client hitting this endpoint (the redirect back from
+/// Stripe, or a direct call) is not proof of payment, and without the check anyone could open a
+/// checkout and confirm it without ever paying. `confirm_checkout` only moves the billing half; the
+/// effect of a completed "plan"/"addon" checkout is dispatched here, never inside
+/// `confirm_checkout` itself (the same single-writer split as the "credits" branch). A provisioning
+/// failure after payment is surfaced as `addon_error` rather than failing the request: the payment
+/// already succeeded and the checkout is consumed, so an error status would read as "you weren't
+/// charged"; the caller can retry or contact support.
 async fn billing_confirm(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15650,17 +15639,9 @@ async fn billing_confirm(
         .billing
         .get_checkout(&req.session)
         .ok_or(StatusCode::NOT_FOUND)?;
-    // A checkout may only be confirmed by the SAME tenant that opened it —
-    // without this, any authenticated caller who learns/guesses another
-    // tenant's checkout id could force-complete or grief it.
     if norm(&co.tenant) != t {
         return Err(StatusCode::FORBIDDEN);
     }
-    // When this was a REAL Stripe checkout, verify actual payment with Stripe
-    // before applying anything — the client hitting this endpoint (a redirect
-    // back from Stripe, or a direct call) is NOT proof of payment on its own;
-    // without this check, anyone could open a checkout and immediately call
-    // confirm without ever paying, and receive the plan/credits for free.
     let mut stripe_customer = String::new();
     let mut stripe_subscription = String::new();
     if !co.stripe_session_id.is_empty() {
@@ -15677,19 +15658,11 @@ async fn billing_confirm(
         .billing
         .confirm_checkout(&req.session)
         .ok_or(StatusCode::NOT_FOUND)?;
-    // `confirm_checkout` only moves the billing half; the effect for a
-    // completed "plan"/"addon" checkout is dispatched here — never inside
-    // `confirm_checkout` itself, same single-writer split as the "credits"
-    // branch it already draws.
     let mut addon_error: Option<String> = None;
     match co.kind.as_str() {
         "credits" => {}
         "addon" => {
             if let Err(e) = crate::tencent_eip::provision_from_checkout(&c, &co).await {
-                // Payment already succeeded (verified above) and the checkout
-                // is already consumed — never fail this request over a
-                // provisioning error, which would read as "you weren't
-                // charged." Surface it instead so the caller can retry/support.
                 tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed after payment confirmed");
                 addon_error = Some(e);
             }
@@ -15719,19 +15692,28 @@ async fn billing_confirm(
     ))
 }
 
-/// Stripe's server-to-server notification of billing events — the
-/// authoritative sync path (unlike `billing_confirm`, which only fires when a
-/// user's browser happens to be present for the redirect back). Handles the
-/// checkout completing (in case the user closes the tab before that redirect)
-/// and subscription cancellation/renewal so a tenant's plan stays correct even
-/// when nobody is watching.
+/// Stripe's server-to-server notification of billing events: the authoritative sync path (unlike
+/// `billing_confirm`, which only fires when a user's browser happens to be present for the redirect
+/// back). It handles the checkout completing (in case the user closes the tab before that redirect)
+/// and subscription cancellation/renewal, so a tenant's plan stays correct even when nobody is
+/// watching.
 ///
-/// Auth: this route is in `auth::require_auth`'s `open` allowlist (Stripe
-/// can't present a platform JWT — it's authenticated by its own HMAC
-/// signature, verified below). Deliberately FAILS CLOSED when
-/// `STRIPE_WEBHOOK_SECRET` is unset — unlike `git_webhook`'s dev-open
-/// default, an unverifiable delivery must never be allowed to mutate a
-/// tenant's billing state.
+/// Auth: this route is in `auth::require_auth`'s `open` allowlist (Stripe cannot present a platform
+/// JWT; it is authenticated by its own HMAC signature, verified below), and it deliberately FAILS
+/// CLOSED when `STRIPE_WEBHOOK_SECRET` is unset, unlike `git_webhook`'s dev-open default: an
+/// unverifiable delivery must never be allowed to mutate a tenant's billing state.
+///
+/// `checkout.session.completed` is the primary confirmation path and mirrors `billing_confirm`'s
+/// apply logic, keyed by the `checkout_id` stamped into the session's metadata (see
+/// `stripe_checkout`) rather than a tenant header, since Stripe is the caller; a checkout already
+/// confirmed through `billing_confirm` (the common case, the user's browser is usually still
+/// present) is a no-op, because `confirm_checkout` is idempotent (it removes on first success).
+/// `customer.subscription.deleted` (immediate or end-of-period cancellation, depending on Stripe
+/// settings) downgrades to Hobby, so quotas and business-locks re-engage even if nobody visits the
+/// dashboard again. `customer.subscription.updated` only logs: a renewal failure (card declined
+/// etc.) surfaces as the subscription moving to past_due/unpaid, and there is no automatic
+/// downgrade on a transient failure (Stripe's own retry schedule and dunning emails run first, and
+/// `customer.subscription.deleted` is still the terminal signal once retries are exhausted).
 async fn billing_webhook(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15758,10 +15740,6 @@ async fn billing_webhook(
         .unwrap_or_else(|| json!({}));
 
     match event_type {
-        // Primary confirmation path — mirrors `billing_confirm`'s apply logic,
-        // keyed by the `checkout_id` we stamped into the session's metadata
-        // (see `stripe_checkout`) rather than a tenant header, since Stripe is
-        // the caller here, not an authenticated user.
         "checkout.session.completed" => {
             let checkout_id = obj
                 .get("metadata")
@@ -15799,15 +15777,8 @@ async fn billing_webhook(
                     );
                     crate::persist::persist(&c);
                 }
-                // Already confirmed via `billing_confirm` (the common case,
-                // since the user's browser is usually still present) —
-                // `confirm_checkout` is idempotent (removes on first success),
-                // so a `None` here just means nothing left to do.
             }
         }
-        // Cancellation (immediate or end-of-period, depending on Stripe
-        // dashboard/API settings) — downgrade to Hobby so quotas/business-locks
-        // re-engage even if nobody visits the dashboard again.
         "customer.subscription.deleted" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
             if let Some(tenant) = (!sub_id.is_empty())
@@ -15826,11 +15797,6 @@ async fn billing_webhook(
                 crate::persist::persist(&c);
             }
         }
-        // A renewal failure (card declined etc.) surfaces as the subscription
-        // moving to "past_due"/"unpaid" — logged for now (no automatic
-        // downgrade on a transient failure; Stripe's own retry schedule and
-        // dunning emails run first, and `customer.subscription.deleted` is
-        // still the terminal signal once retries are exhausted).
         "customer.subscription.updated" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
             let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
@@ -15893,27 +15859,31 @@ struct BillingGrantReq {
     plan: String,
     #[serde(default)]
     note: String,
-    /// Pin this tenant's tier FLOOR so no automatic path can downgrade below it.
-    /// `"enterprise"` locks at enterprise; `""` clears the lock; omitted leaves
-    /// any existing lock untouched.
-    ///
-    /// A grant without this is not durable, and that is not hypothetical: the
-    /// 2026-07-18 owner grant of `enterprise` was silently reverted to `hobby`
-    /// by a user-initiated free-plan checkout on 2026-07-25, and the 2026-07-29
-    /// remediation passed `plan=""` so the `!req.plan.is_empty()` guard below
-    /// skipped `apply_plan_everywhere` entirely — credits were added and the
-    /// tier was never restored, leaving the account quota-locked.
+    /// Pin this tenant's tier FLOOR so no automatic path can downgrade below it: `"enterprise"`
+    /// locks at enterprise, `""` clears the lock, omitted leaves any existing lock untouched. A
+    /// grant without this is not durable: a free-plan checkout silently reverted an owner grant of
+    /// `enterprise` to `hobby`, and a remediation that passed `plan=""` skipped
+    /// `apply_plan_everywhere` entirely (credits were added and the tier was never restored,
+    /// leaving the account quota-locked).
     #[serde(default)]
     lock_tier: Option<String>,
 }
 
-/// Operator-only: comp an account with prepaid credits and/or switch its plan
-/// directly, bypassing Stripe entirely — a support/goodwill grant (refunds,
-/// promotions, platform-owner self-testing). Distinct from the self-service
-/// `/v1/billing/charge` path (which only ever acts on the CALLER's own tenant,
-/// no operator gate needed since it can't touch anyone else's account): this
-/// targets an explicit `tenant` chosen by the caller, so it is hard-gated to
-/// `require_operator` the same way every other platform-wide admin mutation is.
+/// Operator-only: comps an account with prepaid credits and/or switches its plan directly,
+/// bypassing Stripe entirely: a support/goodwill grant (refunds, promotions, platform-owner
+/// self-testing). Distinct from the self-service `/v1/billing/charge` path, which only ever acts on
+/// the CALLER's own tenant and needs no operator gate since it cannot touch anyone else's account:
+/// this one targets an explicit `tenant` chosen by the caller, so it is hard-gated to
+/// `require_operator` like every other platform-wide admin mutation.
+///
+/// An unknown plan id is rejected up front: `plan_spec()` falls back to Hobby (`PLANS[0]`) for an
+/// unrecognized id rather than erroring, so the resolved spec's own id is compared back against
+/// what was asked for. The tier lock is applied AFTER any plan change, so a grant that both
+/// switches the plan and locks it lands in the right order; `set_tier_lock` also raises the live
+/// plan to the floor, which repairs an account whose stored plan was downgraded before the lock
+/// existed, and the teams half is kept in step with it (the two halves must never disagree: that
+/// split is what produced a tenant reading `enterprise` for features while quota-capped as
+/// `hobby`).
 async fn billing_grant(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -15924,9 +15894,6 @@ async fn billing_grant(
     if t.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tenant is required".into()));
     }
-    // plan_spec() falls back to Hobby (PLANS[0]) for an unrecognized id rather
-    // than erroring, so an unknown id must be caught here by comparing the
-    // resolved spec's own id back against what was asked for.
     if !req.plan.is_empty() && crate::billing::plan_spec(&req.plan).id != req.plan {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -15941,10 +15908,6 @@ async fn billing_grant(
     if !req.plan.is_empty() {
         apply_plan_everywhere(&c, t, &req.plan);
     }
-    // Apply the tier lock AFTER any plan change, so a grant that both switches
-    // the plan and locks it lands in the right order. `set_tier_lock` also
-    // raises the live plan to the floor, which is what repairs an account whose
-    // stored plan was downgraded before the lock existed.
     if let Some(lock) = req.lock_tier.as_deref() {
         let floor = lock.trim();
         if !floor.is_empty() && crate::billing::plan_spec(floor).id != floor {
@@ -15955,10 +15918,6 @@ async fn billing_grant(
         }
         let floor_opt = if floor.is_empty() { None } else { Some(floor) };
         c.billing.set_tier_lock(t, floor_opt);
-        // Keep the teams half in step: the lock raises the billing plan, and
-        // the two halves must never disagree (that split is what produced a
-        // tenant reading `enterprise` for features while quota-capped as
-        // `hobby`).
         if let Some(f) = floor_opt {
             apply_plan_everywhere(&c, t, f);
         }
@@ -15992,20 +15951,17 @@ struct BillingBackfillReq {
     force: bool,
 }
 
-/// ADMIN-ONLY, ONE-SHOT (idempotent) billing schema backfill: normalize the
-/// pre-migration JSON-blob billing rows (`billing_accounts.account_json` /
-/// `billing_ledger_snapshot.ledger_json` / `billing_invoices_snapshot.invoices_json`)
-/// into the new normalized per-row tables (`billing_accounts`'s new scalar
-/// columns, `billing_ledger`, `billing_invoices` + `billing_invoice_lines`).
-/// See `relational::backfill_billing_normalize`'s doc comment for the full
-/// write/verify contract and the critical `billing_accounts` table-name-
-/// collision finding it exists to handle.
+/// ADMIN-ONLY, ONE-SHOT (idempotent) billing schema backfill: normalizes the pre-migration
+/// JSON-blob billing rows (`billing_accounts.account_json`, `billing_ledger_snapshot.ledger_json`,
+/// `billing_invoices_snapshot.invoices_json`) into the normalized per-row tables
+/// (`billing_accounts`'s new scalar columns, `billing_ledger`, `billing_invoices` +
+/// `billing_invoice_lines`). See `relational::backfill_billing_normalize` for the full write/verify
+/// contract and the `billing_accounts` table-name collision it exists to handle.
 ///
-/// NOT wired to run automatically anywhere — must be explicitly POSTed by a
-/// platform operator, and even then only after the separate production-data
-/// approval gate this migration's rollout plan calls for (this endpoint
-/// performs REAL writes against REAL billing data the moment it's called; it
-/// does not itself ask for confirmation — that gate lives outside this code).
+/// NOT wired to run automatically anywhere: a platform operator must POST it explicitly, and only
+/// after the separate production-data approval gate this migration's rollout plan calls for (it
+/// performs REAL writes against REAL billing data the moment it is called and does not itself ask
+/// for confirmation).
 async fn billing_backfill_run(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(body): Json<BillingBackfillReq>,
@@ -16017,13 +15973,16 @@ async fn billing_backfill_run(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
-// ============================ Ops data browser ============================
-//
-// Exposes the platform's own data — the persisted PlatformSnapshot collections
-// plus live in-memory stores — so the owner can query/view/explore the state
-// that rides the iroh/guardian-db replication mesh.
-
-/// All collections the platform stores, with row data. Ordered for the UI.
+/// All collections the platform stores, with row data, ordered for the UI: the persisted
+/// `PlatformSnapshot` collections plus live in-memory stores, so the owner can query and explore
+/// the state that rides the iroh/guardian-db replication mesh. Deployments are fleet-aggregated:
+/// this operator data browser runs on ONE node, but the placement scheduler hosts a project's
+/// deployments on peer nodes, so a bare `c.gw.list()` (locally hosted only) showed "0 deployments"
+/// here while every deployment lived on a peer; the gossiped `peer_deployments` are merged (deduped
+/// by id) exactly as the tenant-facing `dep_list` does, and the ops view spans ALL tenants
+/// (operator-only). The databases collection is MASKED: this feeds the ops-console data browser,
+/// and even an operator should not see raw credentials here (a real "reveal" affordance, if ever
+/// added, should be its own explicit, individually audited action).
 fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
     let mut projects: Vec<Value> = c
         .projects
@@ -16042,19 +16001,10 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
     let wf_defs: Vec<Value> = c.workflows.defs().into_iter().map(|d| json!(d)).collect();
 
     vec![
-        // Fleet-aggregated: this operator data browser runs on ONE node, but the
-        // placement scheduler hosts a project's deployments on peer nodes, so a
-        // bare `c.gw.list()` (locally-hosted only) showed "0 deployments" here
-        // while every deployment lived on a peer. Merge the gossiped
-        // peer_deployments (deduped by id) exactly as the tenant-facing
-        // `dep_list` does — the ops view spans ALL tenants (operator-only).
         ("deployments", fleet_deployments_all(c)),
         ("projects", projects),
         ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
         ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
-        // MASKED — this feeds the ops-console data browser; even an operator
-        // should not see raw credentials here (a real "reveal" affordance, if
-        // ever added, should be its own explicit, individually-audited action).
         ("databases", c.databases.list(None).into_iter().map(|d| json!(d)).collect()),
         ("domains", c.domains.snapshot().into_iter().map(|d| json!(d)).collect()),
         ("secure_links", c.securelinks.all().into_iter().map(|l| json!(l)).collect()),
@@ -16113,7 +16063,6 @@ async fn guardian_status(
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let mut keys = crate::guardian::keys().await;
     keys.sort();
-    // Round-trip the first key to prove reads come back from GuardianDB itself.
     let sample = match keys.first() {
         Some(k) => crate::guardian::get(k)
             .await
@@ -16141,7 +16090,6 @@ async fn data_collections(
         .into_iter()
         .map(|(name, rows)| json!({ "name": name, "count": rows.len(), "editable": false }))
         .collect();
-    // Editable document collections (full CRUD).
     for (name, count) in c.docs.collections() {
         cols.push(json!({ "name": name, "count": count, "editable": true }));
     }
@@ -16203,7 +16151,6 @@ async fn data_create(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Don't let custom docs shadow a typed platform collection.
     if all_collections(&c).iter().any(|(n, _)| *n == collection) {
         return Err((StatusCode::CONFLICT, format!("'{collection}' is a managed collection — create custom docs in a new collection name")));
     }
@@ -16234,7 +16181,10 @@ async fn data_patch(
     Ok(Json(json!(doc)))
 }
 
-/// Delete a row: a custom document, or a typed entry via its owning store.
+/// Deletes a row: a custom document, or a typed entry via its owning store. A deployment row
+/// releases the project's raw ports when it was the project's last deployment, as `dep_delete`
+/// does; a database row purges its queue/vector namespaces under the RECORD's own owning team (not
+/// the operator's tenant), so the purge targets the correct tenant.
 async fn data_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16252,7 +16202,6 @@ async fn data_delete(
     let ok = match collection.as_str() {
         "deployments" => match c.gw.remove(&id).await {
             Some(p) => {
-                // Same last-deployment raw-port release as `dep_delete`.
                 if !c.gw.list().iter().any(|d| d.project == p) {
                     let _ = crate::raw_ports::release_raw_ports_coordinated(&c, &p).await;
                 }
@@ -16261,8 +16210,6 @@ async fn data_delete(
             None => false,
         },
         "databases" => {
-            // Use the RECORD's own owning team (not the operator's `t`) so the
-            // queue/vector namespace purge targets the correct tenant.
             let owner = c
                 .databases
                 .get_raw(&id)
@@ -16294,16 +16241,13 @@ async fn data_delete(
     Ok(Json(json!({ "deleted": id })))
 }
 
-// ============================ Data Browser: "view as PostgreSQL" ============================
-// An alternative, READ-ONLY view of the relational mirror built on guardian-db's
-// native SQL layer (crates/hive-cloud/src/relational.rs) — real typed tables
-// (project_teams, billing_*) instead of the document-collection JSON browsing
-// above. Deliberately a separate, narrower surface: no PUT/POST/DELETE here at
-// all (see relational::reject_unless_readonly) — mutations to this data still
-// only ever happen through the normal typed stores (ProjectStore/BillingStore),
-// never through this admin query box.
-
-/// List the known relational tables + their columns.
+/// Lists the known relational tables and their columns. The "view as PostgreSQL" data browser is an
+/// alternative, READ-ONLY view of the relational mirror built on guardian-db's native SQL layer
+/// (`relational.rs`): real typed tables (`project_teams`, `billing_*`) instead of the
+/// document-collection JSON browsing above. It is deliberately a separate, narrower surface with no
+/// PUT/POST/DELETE at all (see `relational::reject_unless_readonly`): mutations to this data still
+/// only happen through the normal typed stores (ProjectStore/BillingStore), never through this
+/// admin query box.
 async fn sql_tables(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -16321,10 +16265,11 @@ struct SqlQueryBody {
     table: Option<String>,
 }
 
-/// Run a read-only query against the relational mirror: either a caller-typed
-/// `sql` (SELECT/read-only WITH only — enforced in relational.rs, not just
-/// here), or a `table` name for the default `SELECT * FROM <table> LIMIT 200`
-/// the table-browser view uses. Exactly one of the two is expected.
+/// Runs a read-only query against the relational mirror: either a caller-typed `sql`
+/// (SELECT/read-only WITH only, enforced in `relational.rs`, not just here) or a `table` name for
+/// the default `SELECT * FROM <table> LIMIT 200` the table-browser view uses. Exactly one of the
+/// two is expected. A statement that does not finish inside the mirror's budget answers a retryable
+/// 503 (it was accepted and validated), never a 400.
 async fn sql_query(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(body): Json<SqlQueryBody>,
@@ -16350,9 +16295,6 @@ async fn sql_query(
         .await
         .map(Json)
         .map_err(|e| {
-            // A slow mirror read is a retryable capacity/refusal condition, not
-            // a malformed request: the statement was accepted and validated, it
-            // just did not finish inside the mirror's budget.
             if e.contains("timed out") {
                 (StatusCode::SERVICE_UNAVAILABLE, e)
             } else {
@@ -16361,17 +16303,18 @@ async fn sql_query(
         })
 }
 
-// ============================ Deployment preview / thumbnail ============================
-
-/// Preview metadata for a project's production deployment: a site thumbnail for
-/// frontends, or the JSON/text body for backend services.
+/// Preview metadata for a project's production deployment: a site thumbnail for frontends, or the
+/// JSON/text body for backend services (fetched from "/" through the gateway). Another tenant's app
+/// content is never rendered as a preview. `c.gw.list()` is LOCALLY-hosted deployments only and
+/// most projects are placed on a peer, so with no local deployment it proxies to the hosting node
+/// like the sibling deployment reads, or the project page would show a permanently empty preview
+/// card on every node but the host.
 pub(crate) async fn project_preview(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Don't render another tenant's app content as a preview.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!({ "kind": "none" }));
@@ -16382,10 +16325,6 @@ pub(crate) async fn project_preview(
             .find(|d| d.project == project && d.production)
             .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
-        // `c.gw.list()` is LOCALLY-hosted deployments only. Most projects are
-        // placed on a peer, so without this the project page showed a
-        // permanently empty preview card on every node but the host. Sibling
-        // deployment reads here already proxy the same way.
         if let Some(node) = host_node_for_project(&c, &project) {
             if let Some(v) = fetch_from_host(
                 &c,
@@ -16409,7 +16348,6 @@ pub(crate) async fn project_preview(
             "alias": alias,
         }));
     }
-    // Backend service: fetch "/" through the gateway and return the body.
     let base = c.public_base.clone();
     let resp = c
         .http
@@ -16458,8 +16396,13 @@ pub(crate) fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// A PNG thumbnail of the deployed site, captured with headless Chrome and
-/// cached per deployment. Falls back to a generated SVG card if capture fails.
+/// A PNG thumbnail of the deployed site, captured with headless Chrome and cached per deployment;
+/// it falls back to a generated SVG card if capture fails. It mirrors `project_preview`'s ownership
+/// check (another tenant's app content is never rendered as a preview; this handler independently
+/// captures and serves the image bytes, and once had no check at all, which also bypassed
+/// `preview_protection` for a password-gated project). Like the preview it only sees locally hosted
+/// deployments and the PNG cache lives under this node's own data dir, so a remotely placed project
+/// proxies the bytes from the hosting node instead of 404ing on every node but the host.
 async fn project_thumbnail(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16467,10 +16410,6 @@ async fn project_thumbnail(
     Path(project): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Don't render another tenant's app content as a preview — mirrors the
-    // check `project_preview` already performs; this handler independently
-    // captures/serves the actual image bytes and previously had no check at
-    // all (also bypassing `preview_protection` for a password-gated project).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return (StatusCode::NOT_FOUND, "no deployment").into_response();
@@ -16481,9 +16420,6 @@ async fn project_thumbnail(
             .find(|d| d.project == project && d.production)
             .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
-        // Locally-hosted deployments only (see `project_preview`), and the PNG
-        // cache below lives under this node's own data dir — so a remotely
-        // placed project 404'd its thumbnail on every node but the host.
         if let Some(node) = host_node_for_project(&c, &project) {
             let path = format!("/v1/projects/{}/thumbnail", urlencode(&project));
             if let Some(b) = fetch_bytes_from_host(&c, &node, &path, &t).await {
@@ -16516,16 +16452,18 @@ async fn project_thumbnail(
         )
             .into_response();
     }
-    // Fallback: a simple SVG placeholder card.
     let svg = thumbnail_placeholder(&project);
     ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
 }
 
+/// Gateway port the thumbnail capture dials when `HIVE_PUBLIC_PORT` is unset: the default of the
+/// local mesh.
+const THUMBNAIL_GATEWAY_PORT_DEFAULT: &str = "8787";
+
 /// Capture a screenshot of `http://<alias>:<gateway-port>/` with headless Chrome.
 async fn capture_thumbnail(alias: &str, out: &std::path::Path) -> anyhow::Result<()> {
-    // The gateway serves on the public port; derive it from public_base later if
-    // needed — default 8787 for the local mesh.
-    let port = std::env::var("HIVE_PUBLIC_PORT").unwrap_or_else(|_| "8787".into());
+    let port =
+        std::env::var("HIVE_PUBLIC_PORT").unwrap_or_else(|_| THUMBNAIL_GATEWAY_PORT_DEFAULT.into());
     let url = format!("http://{alias}:{port}/");
     let chrome = chrome_path();
     let status = tokio::time::timeout(
