@@ -1872,7 +1872,7 @@ pub(crate) async fn deployment_resources(
         }
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     };
-    if deployment_tenant(&c, &rec.project, &rec.tenant) != t {
+    if !deployment_owned_by(&c, &rec.project, &id, &t) {
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     }
     let functions: Vec<Value> = rec
@@ -2950,24 +2950,15 @@ pub(crate) async fn build_get(
     Ok(Json(json!(b)))
 }
 
-/// Whether tenant `t` owns build `b`: the project row's team (`row_holder`, which alone decides when
-/// the row carries a real tag), else the tenant tag of the build's deployment record (local `gw` or
-/// gossiped peer copy), since `Build` carries no tenant tag of its own. Shared by `build_get` and
-/// `build_cancel`.
+/// Whether tenant `t` owns build `b`: `deployment_owned_by` for a build that produced a deployment
+/// (the project row decides, else that deployment's own tag), else the project row alone, since
+/// `Build` carries no tenant tag of its own and a build in flight or failed has no record to speak
+/// for it. Shared by `build_get` and `build_cancel`.
 fn build_owned_by(c: &Arc<CloudState>, b: &crate::git::Build, t: &str) -> bool {
-    if let Some(holder) = row_holder(c, &b.project) {
-        return holder == norm(t);
+    match b.deployment_id.as_deref() {
+        Some(did) => deployment_owned_by(c, &b.project, did, t),
+        None => row_holder(c, &b.project).is_some_and(|holder| holder == norm(t)),
     }
-    b.deployment_id.as_deref().is_some_and(|did| {
-        c.gw.deployment_records()
-            .iter()
-            .any(|r| r.id == did && record_tenant(&r.tenant) == norm(t))
-            || c.peer_deployments
-                .read()
-                .values()
-                .flatten()
-                .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(t))
-    })
 }
 
 /// Cancels an in-flight build: kills the ACTUAL OS process (clone/install/build, or a remote fanout
@@ -3031,7 +3022,7 @@ pub(crate) async fn build_cancel(
 }
 
 /// The build behind a deployment (status, timing, full log lines, a failed build's error); the
-/// newest matching build wins, scoped to the requesting team.
+/// newest matching build wins, scoped to the requesting team (`deployment_owned_by`).
 pub(crate) async fn deployment_build(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3039,29 +3030,12 @@ pub(crate) async fn deployment_build(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let dep_record_tenant: Option<String> =
-        c.gw.deployment_records()
-            .into_iter()
-            .find(|r| r.id == id)
-            .map(|r| record_tenant(&r.tenant).to_string())
-            .or_else(|| {
-                c.peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .find(|d| d.id.as_str() == id)
-                    .map(|d| record_tenant(&d.tenant).to_string())
-            });
-    let team_ok = |b: &crate::git::Build| match row_holder(&c, &b.project) {
-        Some(holder) => holder == norm(&t),
-        None => dep_record_tenant.as_deref() == Some(norm(&t)),
-    };
     let mut builds: Vec<_> = c
         .builds
         .list()
         .into_iter()
         .filter(|b| b.deployment_id.as_deref() == Some(id.as_str()))
-        .filter(team_ok)
+        .filter(|b| deployment_owned_by(&c, &b.project, &id, &t))
         .collect();
     builds.sort_by_key(|b| b.started_ms);
     if let Some(b) = builds.pop() {
@@ -3080,7 +3054,8 @@ pub(crate) async fn deployment_build(
 /// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`): each entry's fold is hashed into
 /// `chain_head_sha256`, signed by this node's per-node key (`integrity_signer.rs`); a caller
 /// re-derives the head with `hive_core::fold_integrity_chain` and checks `public_key_hex`.
-/// Tamper-evidence, never tamper-prevention (see the module doc).
+/// Tamper-evidence, never tamper-prevention (see the module doc). Served only to the team that owns
+/// the deployment (`deployment_owned_by`); a foreign id answers the same 404 as an unknown one.
 pub(crate) async fn deployment_integrity(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3089,9 +3064,7 @@ pub(crate) async fn deployment_integrity(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(acceptance) = c.deployment_ledger.acceptance(&id) {
-        let team_ok = norm(&c.projects.team_of(&acceptance.input.project)) == norm(&t)
-            || norm(&record_tenant(&acceptance.input.project)) == norm(&t);
-        if !team_ok {
+        if !deployment_owned_by(&c, &acceptance.input.project, &id, &t) {
             return Err(StatusCode::NOT_FOUND);
         }
         let chain_head_sha256 = hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
@@ -3458,6 +3431,46 @@ pub(crate) fn row_holder(c: &CloudState, project: &str) -> Option<String> {
 /// alone.
 pub(crate) fn deployment_tenant(c: &CloudState, project: &str, tag: &str) -> String {
     row_holder(c, project).unwrap_or_else(|| record_tenant(tag).to_string())
+}
+
+/// The tag on deployment `id`'s own record: this node's gateway first, then a gossiped peer copy. A
+/// copy whose tag was lost (`UNTAGGED_TENANT`) is skipped, so a tagged copy elsewhere still speaks
+/// for the deployment.
+fn deployment_record_tag(c: &CloudState, id: &str) -> Option<String> {
+    c.gw.deployment_records()
+        .into_iter()
+        .find(|r| r.id == id && record_tenant(&r.tenant) != UNTAGGED_TENANT)
+        .map(|r| r.tenant)
+        .or_else(|| {
+            c.peer_deployments
+                .read()
+                .values()
+                .flatten()
+                .find(|d| d.id.as_str() == id && record_tenant(&d.tenant) != UNTAGGED_TENANT)
+                .map(|d| d.tenant.clone())
+        })
+}
+
+/// Whether tenant `t` may see deployment `deployment_id` of `project`: the ONE gate for a read keyed
+/// by a deployment id (`deployment_build`, `deployment_integrity`, `deployment_resources`, and
+/// `build_owned_by` for a build that produced one). The project row's holder decides when the row
+/// carries a real tag, else the deployment record's own tag (`deployment_tenant`). Never optimistic,
+/// unlike `project_owned_by`: reading one specific entry of a project with no tagged row and no
+/// tagged record of that deployment is nobody's to read, and the sentinel tenants own nothing. `t` is
+/// compared with a tenant TAG only: a project NAME is not one (read as a tag it made any team whose
+/// slug equals the name the project's owner, and a slug is chosen by whoever creates the team).
+pub(crate) fn deployment_owned_by(
+    c: &CloudState,
+    project: &str,
+    deployment_id: &str,
+    t: &str,
+) -> bool {
+    let t = norm(t);
+    if t == ANON_TENANT || t == UNTAGGED_TENANT {
+        return false;
+    }
+    let tag = deployment_record_tag(c, deployment_id).unwrap_or_default();
+    deployment_tenant(c, project, &tag) == t
 }
 
 /// Whether `project` belongs to tenant `t`, judged fleet-aware. Order of evidence: the local
