@@ -1004,7 +1004,7 @@ async fn project_env_put(
     // vars can hold secrets and change what a deployment does, so writing/removing one needs at
     // least `member` — a bare `viewer` could otherwise set or clear them (confirmed live by an
     // adversarial review).
-    require_team(
+    require_team_floor(
         &c,
         &headers,
         claims.as_ref().map(|e| &e.0),
@@ -1023,7 +1023,7 @@ async fn project_env_delete(
     Path((project, key)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    require_team(
+    require_team_floor(
         &c,
         &headers,
         claims.as_ref().map(|e| &e.0),
@@ -3441,6 +3441,26 @@ pub(crate) fn require_team(
         }
     }
     Ok(t)
+}
+
+/// [`require_team`] for a handler that gates a team-scoped MUTATION by role. On an UNENFORCED node
+/// (`auth::enforced()` false: no `HIVE_JWT_SECRET`) there are no verified identities to rank, so —
+/// like every other role gate here (`operator_allowed`, `require_auth_read`) — the floor does not
+/// apply and the node stays as open as it is for every other mutation (a role floor added without
+/// this turned anonymous env writes and key revokes on a dev node from 200 into 403). With auth
+/// enforced the floor is exactly `require_team`'s: a viewer, a member below the floor, or an
+/// anonymous caller is 403.
+pub(crate) fn require_team_floor(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    slug: &str,
+    min_role: &[&str],
+) -> Result<String, (StatusCode, String)> {
+    if !crate::auth::enforced() {
+        return Ok(tenant(c, h, claims));
+    }
+    require_team(c, h, claims, slug, min_role)
 }
 
 /// Ownership guard for DOMAIN resources: get-or-create the record (the first registrant claims it,
@@ -11785,7 +11805,7 @@ async fn apikey_revoke(
     // a role at least as elevated as minting one conceptually requires — unlike `put_env`'s
     // `member` floor, `viewer` AND `member` are both refused here (confirmed live: a viewer key
     // revoked the owner key with no gate at all before this).
-    require_team(
+    require_team_floor(
         &c,
         &headers,
         claims.as_ref().map(|e| &e.0),
