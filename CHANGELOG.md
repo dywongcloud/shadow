@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-13 — the DB-gateway listener bounds every accepted connection and idles out a silent one
+
+The Postgres/Redis wire listener (`db_gateway.rs`) spawned one unbounded task per accept with no
+deadline on the preamble read, the TLS handshake or the backend connect, and no idle timeout on
+the splice: a client that connects and sends nothing holds a task and fds forever, and enough of
+them exhaust the node's fds, taking every other listener on the host down too. `accept_deadline()`
+(`HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS`, default 15s) now wraps the preamble read, the TLS handshake
+and the backend connect; a `PendingGuard` cap (`HIVE_DB_GATEWAY_PENDING_MAX`, default 512) bounds
+concurrent connections still inside that window and releases the instant the backend connects, so
+it never limits an established session; `splice_with_idle_timeout`
+(`HIVE_DB_GATEWAY_IDLE_MS`, default 10 min) closes a spliced session carrying zero bytes in both
+directions for that long. Witnessed on a throwaway node with a tightened cap/deadline
+(`scratch2/work/secfix-dbgw.sh`): before, 10 silent client-held connections all stayed ESTABLISHED
+indefinitely; after, only the cap's share were even accepted and all were dropped by the server
+within the deadline despite the client never closing or sending a byte, while a normal client, the
+unrelated admin listener and the redis wire are unaffected. Operator note: the three new env vars
+are defaulted generously; raise `HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS` if a legitimate client's TLS
+handshake legitimately takes longer than 15s. Not rolled.
+
 ## 2026-10-13 — at-rest key resolution fails closed instead of silently regenerating or running memory-only
 
 `secrets::load_or_create_key` ignored a malformed `HIVE_SECRET_KEY` with a WARN and fell back to
