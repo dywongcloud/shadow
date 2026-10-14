@@ -1219,11 +1219,18 @@ impl Drop for IssuingGuard<'_> {
     }
 }
 
-/// The SAN set an HTTP-01 order can validate THIS pass: `www.{domain}` is kept only when a DoH A
-/// lookup shows it resolving to a current fleet edge address, because Let's Encrypt fails the WHOLE
+/// The SAN set an HTTP-01 order can validate THIS pass: `www.{domain}` is kept only when the public
+/// internet resolves it to a current fleet edge address, because Let's Encrypt fails the WHOLE
 /// order when any SAN fails (a tenant who pointed only their apex would never get even the apex
 /// certificate). The narrowed set feeds the freshness check, so a later `www` arrival re-issues
 /// with full coverage.
+///
+/// The proof is asked of [`crate::dns_quorum::VANTAGES`] — several independent public resolvers, a
+/// majority of the answering ones required — and NOT of one resolver: a single resolver's cache can
+/// lag a delegation for the whole life of the old answer, and on its stale "no" alone this function
+/// used to drop `www` from the order of a domain the platform did serve (`geniee.site` answered a
+/// TLS error on `https://www.` for exactly this). One resolver erroring is an abstention, never a
+/// "no"; see the module docs for why a majority and not unanimity, and why Seer is not a vantage.
 async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String> {
     if names.len() != 2 {
         return names.to_vec();
@@ -1235,41 +1242,22 @@ async fn effective_sans(cloud: &Arc<CloudState>, names: &[String]) -> Vec<String
             .into_iter()
             .collect()
     };
-    let url = format!("https://cloudflare-dns.com/dns-query?name={www}&type=A");
-    let resolved: Option<Vec<String>> = async {
-        let resp = cloud
-            .http
-            .get(&url)
-            .header("accept", "application/dns-json")
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-            .ok()?;
-        let v = resp.json::<serde_json::Value>().await.ok()?;
-        Some(
-            v.get("Answer")
-                .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter(|x| x.get("type").and_then(|t| t.as_u64()) == Some(1))
-                        .filter_map(|x| {
-                            x.get("data")
-                                .and_then(|d| d.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-        )
+    let answers = crate::dns_probe::public_answers(&cloud.http, www, 1).await;
+    let votes = crate::dns_quorum::operator_votes(answers, |ip| edge.contains(ip));
+    let tally = crate::dns_quorum::tally(&votes);
+    if tally.admits() {
+        return names.to_vec();
     }
-    .await;
-    match resolved {
-        Some(ips) if ips.iter().any(|ip| edge.contains(ip)) => names.to_vec(),
-        _ => {
-            tracing::warn!(%apex, %www, "custom-domain www does not resolve to the fleet — ordering apex-only SAN this pass (the whole order would fail otherwise)");
-            vec![apex.clone()]
-        }
-    }
+    tracing::warn!(
+        %apex,
+        %www,
+        yes = tally.yes,
+        no = tally.no,
+        abstain = tally.abstain,
+        votes = %crate::dns_quorum::render(&votes),
+        "custom-domain www not confirmed by a majority of public resolvers — ordering apex-only SAN this pass (the whole order would fail otherwise)"
+    );
+    vec![apex.clone()]
 }
 
 /// Installs a custom bundle BEFORE its DomainRecord may claim issuance: the record's metadata is a

@@ -1075,49 +1075,39 @@ async fn project_domain_add(
     })))
 }
 
-/// DoH TXT lookup: does `_hive-verify.<domain>` currently answer `want`? Returns (matched,
+/// Public TXT lookup: does `_hive-verify.<domain>` currently answer `want`? Returns (matched,
 /// human-readable outcome for the record's last_probe).
+///
+/// Asked of every [`crate::dns_quorum::Vantage`] and decided by a majority of the ones that answer,
+/// never by one resolver: a single resolver's cache lagging the tenant's new TXT record used to
+/// strand verification on a domain the internet had already published (the same single-vantage
+/// defect as the dropped `www` SAN). Majority here is also the STRICTER rule, not a looser one:
+/// today's one-resolver proof is replaced by a requirement that several independent operators see
+/// the exact minted value, so no vantage is trusted alone and none can veto alone.
 async fn doh_txt_match(c: &Arc<CloudState>, qname: &str, want: &str) -> (bool, String) {
-    let url = format!("https://cloudflare-dns.com/dns-query?name={qname}&type=TXT");
-    let resp = c
-        .http
-        .get(&url)
-        .header("accept", "application/dns-json")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    let Ok(resp) = resp else {
-        return (false, "resolver error (no answer from public DoH)".into());
-    };
-    let Ok(v) = resp.json::<Value>().await else {
-        return (false, "resolver error (bad DoH response)".into());
-    };
-    let status = v.get("Status").and_then(|s| s.as_u64()).unwrap_or(0);
-    let Some(ans) = v.get("Answer").and_then(|a| a.as_array()) else {
+    let answers = crate::dns_probe::public_answers(&c.http, qname, 16).await;
+    let votes = crate::dns_quorum::operator_votes(answers, |v| v.trim_matches('"').trim() == want);
+    let tally = crate::dns_quorum::tally(&votes);
+    let rendered = crate::dns_quorum::render(&votes);
+    if tally.admits() {
+        return (true, format!("TXT matched ({rendered})"));
+    }
+    if tally.yes > 0 {
         return (
             false,
-            if status == 3 {
-                "NXDOMAIN".into()
-            } else {
-                "no TXT answer yet".into()
-            },
+            format!("only {}/{} public resolvers see the record yet ({rendered})", tally.yes, tally.yes + tally.no),
         );
-    };
-    for a in ans {
-        if a.get("type").and_then(|t| t.as_u64()) != Some(16) {
-            continue;
-        }
-        let data = a
-            .get("data")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .trim_matches('"')
-            .trim();
-        if data == want {
-            return (true, "TXT matched".into());
-        }
     }
-    (false, "TXT present but value does not match".into())
+    if tally.abstain > 0 && tally.no == 0 {
+        return (
+            false,
+            format!("resolver error (no public resolver answered) ({rendered})"),
+        );
+    }
+    (
+        false,
+        format!("TXT present but value does not match ({rendered})"),
+    )
 }
 
 /// Runs the custom-cert pass now (internally leader-gated), so TLS lands within seconds rather than

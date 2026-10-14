@@ -37,6 +37,7 @@ mod discovery;
 mod dns;
 mod dns_geo;
 mod dns_probe;
+mod dns_quorum;
 mod dnsserver;
 mod docstore;
 mod drive_api;

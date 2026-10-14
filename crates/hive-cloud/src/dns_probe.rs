@@ -200,6 +200,20 @@ pub async fn txt_values(
     qname: &str,
     timeout: Duration,
 ) -> Result<Vec<String>, String> {
+    rr_values(target, qname, 16, timeout, true).await
+}
+
+/// Answers of `qtype` that `target` returns for `qname`. `require_aa` is what separates the two
+/// callers: a fleet nameserver is being asked whether it SERVES the zone (a non-authoritative reply
+/// proves nothing, so it is rejected), while a public RECURSIVE resolver answers with `AA` clear by
+/// design and its answer is still the public internet's answer.
+pub async fn rr_values(
+    target: SocketAddr,
+    qname: &str,
+    qtype: u16,
+    timeout: Duration,
+    require_aa: bool,
+) -> Result<Vec<String>, String> {
     let bind: SocketAddr = if target.is_ipv6() {
         "[::]:0".parse().unwrap()
     } else {
@@ -212,7 +226,7 @@ pub async fn txt_values(
         .await
         .map_err(|e| format!("connect: {e}"))?;
     let id = uuid::Uuid::new_v4().as_u128() as u16;
-    let msg = build_query(id, qname, 16, None);
+    let msg = build_query(id, qname, qtype, None);
     sock.send(&msg).await.map_err(|e| format!("send: {e}"))?;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 1500];
@@ -222,18 +236,24 @@ pub async fn txt_values(
             Ok(Err(e)) => return Err(format!("recv: {e}")),
             Ok(Ok(n)) => n,
         };
-        match parse_txt(id, &buf[..n]) {
+        match parse_rr(id, &buf[..n], qtype, require_aa) {
             Err(e) if e == "id-mismatch" => continue,
             other => return other,
         }
     }
 }
 
-/// Parse the TXT answers of a response, rejecting anything a real resolver
-/// would reject: id mismatch, non-authoritative, non-zero rcode, truncation.
-/// TXT rdata is one or more `<length><bytes>` strings (RFC 1035), concatenated into one value per
-/// record.
-fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
+/// Parse the answers of `qtype` in a response, rejecting anything a real resolver would reject:
+/// id mismatch, non-zero rcode, truncation. `require_aa` additionally rejects a non-authoritative
+/// reply ([`rr_values`] explains which caller needs that). TXT rdata is one or more
+/// `<length><bytes>` strings (RFC 1035), concatenated into one value per record; A rdata is 4 bytes,
+/// rendered dotted-quad so a caller can compare it against the addresses it already knows.
+fn parse_rr(
+    id: u16,
+    msg: &[u8],
+    qtype: u16,
+    require_aa: bool,
+) -> Result<Vec<String>, String> {
     let bad = |s: &str| Err(s.to_string());
     if msg.len() < 12 {
         return bad("short-response");
@@ -244,7 +264,12 @@ fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
     if msg[2] & 0x80 == 0 {
         return bad("not-a-response");
     }
-    if msg[2] & 0x04 == 0 {
+    if msg[2] & 0x02 != 0 {
+        // Truncated: the useful records may be the ones that did not fit, so the reply is not
+        // evidence either way and the caller must treat this vantage as having no opinion.
+        return bad("truncated");
+    }
+    if require_aa && msg[2] & 0x04 == 0 {
         return bad("not-authoritative");
     }
     let rcode = msg[3] & 0x0F;
@@ -294,23 +319,118 @@ fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
         if start + rdlen > msg.len() {
             return bad("truncated-rdata");
         }
-        if rtype == 16 {
-            let mut i = 0usize;
-            let mut v = String::new();
-            while i < rdlen {
-                let l = msg[start + i] as usize;
-                i += 1;
-                if i + l > rdlen {
-                    break;
+        if rtype == qtype {
+            match qtype {
+                1 if rdlen == 4 => out.push(format!(
+                    "{}.{}.{}.{}",
+                    msg[start],
+                    msg[start + 1],
+                    msg[start + 2],
+                    msg[start + 3]
+                )),
+                16 => {
+                    let mut i = 0usize;
+                    let mut v = String::new();
+                    while i < rdlen {
+                        let l = msg[start + i] as usize;
+                        i += 1;
+                        if i + l > rdlen {
+                            break;
+                        }
+                        v.push_str(&String::from_utf8_lossy(&msg[start + i..start + i + l]));
+                        i += l;
+                    }
+                    out.push(v);
                 }
-                v.push_str(&String::from_utf8_lossy(&msg[start + i..start + i + l]));
-                i += l;
+                _ => {}
             }
-            out.push(v);
         }
         off = start + rdlen;
     }
     Ok(out)
+}
+
+/// Asks EVERY [`crate::dns_quorum::Vantage`] for `qname`, in parallel, and returns what each
+/// OPERATOR said. Parallel, because one resolver's latency or black hole must not be added to
+/// another's; bounded, because each vantage carries its own deadline, so the SLOWEST vantage bounds
+/// the answer rather than the sum of them.
+///
+/// The classification in here is the whole reason the caller can trust the tally: NXDOMAIN is an
+/// ANSWER (the internet really does not have the name — a genuine "no", not silence), while a
+/// timeout, SERVFAIL, REFUSED or truncated reply is this vantage having NO opinion and therefore
+/// abstaining. Counting the second kind as a "no" is what let one resolver's bad minute silently
+/// drop a SAN from every order.
+pub async fn public_answers(
+    http: &reqwest::Client,
+    qname: &str,
+    qtype: u16,
+) -> Vec<(&'static str, crate::dns_quorum::Answer)> {
+    use crate::dns_quorum::{Answer, Endpoint};
+    let udp_timeout = Duration::from_secs(3);
+    futures::future::join_all(crate::dns_quorum::VANTAGES.iter().map(|v| async move {
+        let answer = match v.endpoint {
+            Endpoint::Https(url) => doh_answer(http, url, qname, qtype).await,
+            Endpoint::Udp(ip) => {
+                let Some(addr) = ip
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|a| SocketAddr::new(a, 53))
+                else {
+                    return (v.operator, Answer::Unavailable);
+                };
+                match rr_values(addr, qname, qtype, udp_timeout, false).await {
+                    Ok(vals) => Answer::Records(vals),
+                    Err(e) if e == "rcode=NXDOMAIN" => Answer::Records(Vec::new()),
+                    Err(_) => Answer::Unavailable,
+                }
+            }
+        };
+        (v.operator, answer)
+    }))
+    .await
+}
+
+/// One JSON-DoH vantage. The name is passed through `.query()` rather than `format!`-ed into the
+/// URL: it is a tenant-influenced string, and interpolating it would let a crafted one add a second
+/// parameter to somebody else's resolver query.
+async fn doh_answer(
+    http: &reqwest::Client,
+    url: &str,
+    qname: &str,
+    qtype: u16,
+) -> crate::dns_quorum::Answer {
+    use crate::dns_quorum::Answer;
+    let qtype_s = qtype.to_string();
+    let Ok(resp) = http
+        .get(url)
+        .query(&[("name", qname), ("type", qtype_s.as_str())])
+        .header("accept", "application/dns-json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        return Answer::Unavailable;
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Answer::Unavailable;
+    };
+    match v.get("Status").and_then(|s| s.as_u64()).unwrap_or(0) {
+        0 => {}
+        3 => return Answer::Records(Vec::new()),
+        _ => return Answer::Unavailable,
+    }
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("Answer").and_then(|a| a.as_array()) {
+        for rec in arr {
+            if rec.get("type").and_then(|t| t.as_u64()) != Some(qtype as u64) {
+                continue;
+            }
+            if let Some(d) = rec.get("data").and_then(|d| d.as_str()) {
+                out.push(d.to_string());
+            }
+        }
+    }
+    Answer::Records(out)
 }
 
 /// Sends ONE query to `target` and reports the usable answer count, or why not. Late or stray
