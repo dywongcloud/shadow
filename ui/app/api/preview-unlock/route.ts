@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { sameOriginPath } from "@/lib/same-origin-path";
+import { ownerEmails } from "@/lib/owner-emails";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
@@ -45,17 +46,6 @@ function nodeFetch(path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`${ADMIN}${path}`, { ...init, signal: AbortSignal.timeout(NODE_TIMEOUT_MS) });
 }
 
-/** The configured platform owner(s): HIVE_OWNER_EMAIL is a COMMA-SEPARATED list, parsed into a set exactly like `/api/token` does. */
-function ownerEmails(): Set<string> {
-  return new Set(
-    (process.env.HIVE_OWNER_EMAIL || "")
-      .toLowerCase()
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-}
-
 async function clerkUsers() {
   return (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient).users as any;
 }
@@ -66,11 +56,11 @@ async function clerkUsers() {
 async function personalAccess(team: string, userId: string): Promise<Access> {
   if (team.startsWith("u_")) return team === `u_${userId}` ? "granted" : "denied";
   const owners = ownerEmails();
-  if (owners.size === 0) return process.env.NODE_ENV !== "production" ? "granted" : "denied";
+  if (owners.length === 0) return process.env.NODE_ENV !== "production" ? "granted" : "denied";
   try {
     const u = await (await clerkUsers()).getUser(userId);
     const emails: string[] = (u?.emailAddresses ?? []).map((e: any) => String(e?.emailAddress || "").toLowerCase());
-    return emails.some((e) => owners.has(e)) ? "granted" : "denied";
+    return emails.some((e) => owners.includes(e)) ? "granted" : "denied";
   } catch {
     return "unavailable";
   }

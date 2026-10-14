@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-13 — HIVE_OWNER_EMAIL is parsed in one place on the dashboard server
+
+The dashboard server parsed `HIVE_OWNER_EMAIL` (a comma-separated list) at four sites with
+two semantics: a lowercased, trimmed set with empty entries dropped in `/api/token`'s owner
+check and in the preview unlock route's personal-namespace check, and the raw text before
+the first comma in `/api/token`'s dev mint, `lib/ops-data.ts` and the integrations catalog
+route (found by the ui comment sweep). One server-only helper, `lib/owner-emails.ts`
+(`ownerEmails`, `isOwnerEmail`, `primaryOwnerEmail`), parses it exactly like `/api/token`'s
+set and all four sites use it. Witnessed over 13 `HIVE_OWNER_EMAIL` values (unset, empty,
+one address, upper case, lists with spaces and empty entries): the set semantics are
+identical for all 13, and the single address sent in a mint claim is identical for every
+value but five, three of which differ only by case (now lower case; the node compares the
+claim with `eq_ignore_ascii_case`, and a dev mint against a node with
+`HIVE_OWNER_EMAIL="Mixed.Case@Example.COM, second@example.com"` is `platform_admin: true`
+before and after) and two where the first entry is empty (`",a@x.y"`), which now yields
+`a@x.y`, the address the owner check already accepts, instead of no claim. `lib/owner.tsx`
+(the client-bundled operator list) and `proxy.ts`'s own list are untouched. Not rolled.
+
 ## 2026-10-13 — the logs page resets its page with the filter, not a render later
 
 `project-logs-client.tsx` reset the page to 0 in an effect keyed on every filter, which is

@@ -1,16 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
+import { isOwnerEmail, primaryOwnerEmail } from "@/lib/owner-emails";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
-const OWNER_EMAILS = new Set(
-  (process.env.HIVE_OWNER_EMAIL || "")
-    .toLowerCase()
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
 
 /** Reads the `platform_admin` claim from the JWT the backend just minted (unverified: this server trusts its own backend);
  *  `null` = undecodable or absent = UNKNOWN, never "not an operator". */
@@ -55,11 +49,10 @@ export async function POST(req: NextRequest) {
       if (t && t !== "__pending__") team = t;
     } catch {}
     try {
-      const firstOwnerEmail = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
       const r = await fetch(`${ADMIN}/v1/token`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: firstOwnerEmail }),
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: primaryOwnerEmail() }),
         cache: "no-store",
       });
       if (!r.ok) {
@@ -161,7 +154,7 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
     } catch {}
   }
 
-  const isOwner = !!email && OWNER_EMAILS.has(email.toLowerCase());
+  const isOwner = isOwnerEmail(email);
   const personalTenant = isOwner ? "personal" : `u_${userId}`;
 
   let tenant = personalTenant;

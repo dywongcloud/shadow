@@ -1,12 +1,12 @@
 import "server-only";
 import { cookies } from "next/headers";
+import { primaryOwnerEmail } from "@/lib/owner-emails";
 
 // Server-side counterpart to lib/api.ts's opsGet for admin server components: an initial paint of live ops data without a client round trip, reading
 // the SAME env vars as next.config.mjs's ADMIN_OPS rewrite so it hits exactly what the browser's /ops proxy would.
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
-const FIRST_OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
 const OPS_REQUEST_TIMEOUT_MS = 10_000;
 const TOKEN_TTL_FALLBACK_SECS = 3600;
 const RETIRE_BEFORE_EXPIRY_SECS = 120;
@@ -31,7 +31,7 @@ async function mintOpsBearer(): Promise<string | null> {
         sub: "ui-ops-server",
         tenant: "personal",
         role: "owner",
-        email: FIRST_OWNER_EMAIL || undefined,
+        email: primaryOwnerEmail() || undefined,
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(OPS_REQUEST_TIMEOUT_MS),

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { composioConfigured, listToolkits } from "@/lib/composio";
+import { primaryOwnerEmail } from "@/lib/owner-emails";
 
 // Shared integrations-catalog cache: the backend admin-data collection `integration_index` (reported as source "guardian-db") plus the response header
 // `Cache-Control: public, s-maxage=3600` (edge CDN + browser). The route stays dynamic (it reads the index per request and issues no-store fetches, which
@@ -7,9 +8,6 @@ import { composioConfigured, listToolkits } from "@/lib/composio";
 // loads read the index.
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
-/** The index collection is operator-gated for reads and writes, so the `_global` mint carries the owner email: ONE address, because the backend matches
- *  the claim against a single `admin_emails` entry while HIVE_OWNER_EMAIL is a comma-separated list. */
-const FIRST_OWNER_EMAIL = (process.env.HIVE_OWNER_EMAIL || "").split(",")[0].trim();
 const INDEX = "integration_index";
 
 let _globalJwt: { token: string; expires: number } | null = null;
@@ -20,7 +18,7 @@ async function globalJwt(): Promise<string | null> {
     const r = await fetch(`${ADMIN}/v1/token`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-hive-internal": INTERNAL },
-      body: JSON.stringify({ sub: "system", tenant: "_global", role: "admin", email: FIRST_OWNER_EMAIL }),
+      body: JSON.stringify({ sub: "system", tenant: "_global", role: "admin", email: primaryOwnerEmail() }),
       cache: "no-store",
     });
     if (!r.ok) return null;
