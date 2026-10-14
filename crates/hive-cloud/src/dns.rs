@@ -317,16 +317,10 @@ impl DomainStore {
     /// by `custom_cert_pass`, not this node's current SNI cache.
     pub fn load(&self, mut list: Vec<DomainRecord>) {
         for d in &mut list {
-            // Records written (here or by a peer on an earlier build) when `default_domain` still
-            // seeded "OpenEdge", "$13 per year", auto_renew=true and a one-year expiry carry values
-            // nobody measured: scrubbed on every load, boot and snapshot adoption alike.
             d.registrar.clear();
             d.renewal_price.clear();
             d.auto_renew = false;
             d.expires_ms = 0;
-            // Likewise the nameserver pair `default_domain` once seeded: no such zone is delegated or
-            // measured, so a record carrying ONLY those names is emptied. A tenant's own nameservers
-            // (`set_nameservers`), or any list with one of them in it, are kept as set.
             if !d.nameservers.is_empty()
                 && d.nameservers.iter().all(|ns| {
                     INVENTED_NAMESERVERS.contains(&ns.trim().to_ascii_lowercase().as_str())

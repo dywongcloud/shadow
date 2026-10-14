@@ -274,8 +274,6 @@ fn parse_rr(id: u16, msg: &[u8], qtype: u16, require_aa: bool) -> Result<Vec<Str
         return bad("not-a-response");
     }
     if msg[2] & 0x02 != 0 {
-        // Truncated: the useful records may be the ones that did not fit, so the reply is not
-        // evidence either way and the caller must treat this vantage as having no opinion.
         return bad("truncated");
     }
     if require_aa && msg[2] & 0x04 == 0 {
@@ -387,11 +385,18 @@ pub async fn public_answers(
                 else {
                     return (v.operator, Answer::Unavailable);
                 };
-                // `rd = true`: every UDP vantage here is a public recursive resolver, and a
-                // non-recursive question to one of those is SERVFAIL/REFUSED unless the name is
-                // already cached — which it never is for the freshly delegated domain this
-                // question exists to decide.
-                match rr_values(addr, qname, qtype, udp_timeout, false, true).await {
+                let require_aa = false;
+                let recursion_desired = true;
+                match rr_values(
+                    addr,
+                    qname,
+                    qtype,
+                    udp_timeout,
+                    require_aa,
+                    recursion_desired,
+                )
+                .await
+                {
                     Ok(vals) => Answer::Records(vals),
                     Err(e) if e == "rcode=NXDOMAIN" => Answer::Records(Vec::new()),
                     Err(_) => Answer::Unavailable,
@@ -424,10 +429,6 @@ async fn doh_answer(
     else {
         return Answer::Unavailable;
     };
-    // An HTTP error is this vantage having no opinion, whatever its body says. Without this the
-    // body is parsed anyway, and one that is valid JSON with no `Status` reads as "answered, zero
-    // records" — an erroring resolver casting a veto instead of an abstention, the exact failure
-    // the quorum exists to prevent.
     if !resp.status().is_success() {
         return Answer::Unavailable;
     }
