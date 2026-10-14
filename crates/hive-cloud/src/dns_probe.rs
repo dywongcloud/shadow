@@ -82,13 +82,24 @@ const ECS_SAMPLE: usize = 3;
 /// client in `ecs`. The header is the id, flags 0 (a standard QUERY with `RD=0`), QDCOUNT 1,
 /// ANCOUNT 0, NSCOUNT 0 and ARCOUNT 1 when the OPT RR follows the question (QCLASS IN).
 ///
-/// `RD=0` deliberately: this is a direct question to a server that must be AUTHORITATIVE for the
-/// name, and asking with recursion desired would let a node that is not serving the zone at all
-/// still look healthy by fetching the answer from somewhere else.
-fn build_query(id: u16, qname: &str, qtype: u16, ecs: Option<ClientSubnet>) -> Vec<u8> {
+/// `RD` (recursion desired) is a property of WHO is being asked, never of the name.
+///
+/// * An AUTHORITATIVE nameserver — `probe_query`, the nameserver-attestation path — is asked with
+///   `rd = false`. This is a direct question to a server that must be authoritative for the name,
+///   and asking with recursion desired would let a node that is not serving the zone at all still
+///   look healthy by fetching the answer from somewhere else.
+/// * A public RECURSIVE resolver (Cloudflare, Google, Quad9 — the [`crate::dns_quorum::VANTAGES`])
+///   must be asked with `rd = true`. Without it the resolver will not chase the delegation: it
+///   answers only if the name happens to sit in its cache, and otherwise returns SERVFAIL/REFUSED.
+///   A freshly delegated tenant domain is exactly the case where the cache is cold, so a
+///   non-recursive question to a recursive resolver abstains precisely when the answer matters —
+///   every UDP vantage silently drops out of the quorum and the decision falls back to whichever
+///   single resolver still answers, which is the one-vantage defect the quorum exists to remove.
+fn build_query(id: u16, qname: &str, qtype: u16, ecs: Option<ClientSubnet>, rd: bool) -> Vec<u8> {
     let mut m = Vec::with_capacity(64);
     m.extend_from_slice(&id.to_be_bytes());
-    m.extend_from_slice(&0u16.to_be_bytes());
+    let flags: u16 = if rd { 0x0100 } else { 0 };
+    m.extend_from_slice(&flags.to_be_bytes());
     m.extend_from_slice(&1u16.to_be_bytes());
     m.extend_from_slice(&0u16.to_be_bytes());
     m.extend_from_slice(&0u16.to_be_bytes());
@@ -200,19 +211,22 @@ pub async fn txt_values(
     qname: &str,
     timeout: Duration,
 ) -> Result<Vec<String>, String> {
-    rr_values(target, qname, 16, timeout, true).await
+    rr_values(target, qname, 16, timeout, true, false).await
 }
 
 /// Answers of `qtype` that `target` returns for `qname`. `require_aa` is what separates the two
 /// callers: a fleet nameserver is being asked whether it SERVES the zone (a non-authoritative reply
 /// proves nothing, so it is rejected), while a public RECURSIVE resolver answers with `AA` clear by
-/// design and its answer is still the public internet's answer.
+/// design and its answer is still the public internet's answer. `rd` is RECURSION DESIRED and is a
+/// property of the target, not of the name: a recursive resolver needs it set (see `build_query`),
+/// a fleet nameserver does not.
 pub async fn rr_values(
     target: SocketAddr,
     qname: &str,
     qtype: u16,
     timeout: Duration,
     require_aa: bool,
+    rd: bool,
 ) -> Result<Vec<String>, String> {
     let bind: SocketAddr = if target.is_ipv6() {
         "[::]:0".parse().unwrap()
@@ -226,7 +240,7 @@ pub async fn rr_values(
         .await
         .map_err(|e| format!("connect: {e}"))?;
     let id = uuid::Uuid::new_v4().as_u128() as u16;
-    let msg = build_query(id, qname, qtype, None);
+    let msg = build_query(id, qname, qtype, None, rd);
     sock.send(&msg).await.map_err(|e| format!("send: {e}"))?;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 1500];
@@ -248,12 +262,7 @@ pub async fn rr_values(
 /// reply ([`rr_values`] explains which caller needs that). TXT rdata is one or more
 /// `<length><bytes>` strings (RFC 1035), concatenated into one value per record; A rdata is 4 bytes,
 /// rendered dotted-quad so a caller can compare it against the addresses it already knows.
-fn parse_rr(
-    id: u16,
-    msg: &[u8],
-    qtype: u16,
-    require_aa: bool,
-) -> Result<Vec<String>, String> {
+fn parse_rr(id: u16, msg: &[u8], qtype: u16, require_aa: bool) -> Result<Vec<String>, String> {
     let bad = |s: &str| Err(s.to_string());
     if msg.len() < 12 {
         return bad("short-response");
@@ -378,7 +387,11 @@ pub async fn public_answers(
                 else {
                     return (v.operator, Answer::Unavailable);
                 };
-                match rr_values(addr, qname, qtype, udp_timeout, false).await {
+                // `rd = true`: every UDP vantage here is a public recursive resolver, and a
+                // non-recursive question to one of those is SERVFAIL/REFUSED unless the name is
+                // already cached — which it never is for the freshly delegated domain this
+                // question exists to decide.
+                match rr_values(addr, qname, qtype, udp_timeout, false, true).await {
                     Ok(vals) => Answer::Records(vals),
                     Err(e) if e == "rcode=NXDOMAIN" => Answer::Records(Vec::new()),
                     Err(_) => Answer::Unavailable,
@@ -463,7 +476,7 @@ pub async fn probe_query(
         .await
         .map_err(|e| format!("connect: {e}"))?;
     let id = uuid::Uuid::new_v4().as_u128() as u16;
-    let msg = build_query(id, qname, qtype, ecs);
+    let msg = build_query(id, qname, qtype, ecs, false);
     sock.send(&msg).await.map_err(|e| format!("send: {e}"))?;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 1500];
