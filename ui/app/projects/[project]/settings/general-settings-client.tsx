@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { Button, Input, SettingCard, Badge } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiGet, apiSend, type Deployment, type ProjectSettings } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
@@ -16,16 +17,18 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const [dep, setDep] = useState<Deployment | null>(null);
   const [prodBranch, setProdBranch] = useState<string>("");
   const [deleting, setDeleting] = useState(false);
+  const [deleteErr, setDeleteErr] = useState("");
 
   async function deleteProject() {
     if (deleting) return;
     if (!confirm(`Delete the entire "${project}" project and ALL its deployments? This cannot be undone.`)) return;
     setDeleting(true);
+    setDeleteErr("");
     try {
       await apiSend("DELETE", `/v1/projects/${encodeURIComponent(project)}`);
       router.push("/projects");
     } catch (e) {
-      alert(String(e));
+      setDeleteErr(e instanceof Error ? e.message : String(e));
       setDeleting(false);
     }
   }
@@ -77,6 +80,7 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
         <Link href={`/projects/${encodeURIComponent(project)}/settings/build`}><Button variant="outline">Build & Development →</Button></Link>
       </div>
 
+      <RoleGate action="project.delete" note>
       <div className="rounded-xl border border-red-500/30 bg-red-500/[0.03] p-5">
         <h3 className="text-base font-semibold text-red-600 dark:text-red-400">Delete Project</h3>
         <p className="mt-1 text-sm text-secondary">Permanently remove this project and all its deployments. This cannot be undone.</p>
@@ -84,8 +88,10 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
           <Button variant="danger" onClick={deleteProject} disabled={deleting}>
             {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Delete Project
           </Button>
+          {deleteErr ? <p className="mt-3 text-sm text-red-500">{deleteErr}</p> : null}
         </div>
       </div>
+      </RoleGate>
     </div>
   );
 }

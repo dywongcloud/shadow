@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { can, roleRefusalSentence, teamRoleOf, type TeamAction, type TeamRole } from "@/lib/team-role";
 
 const BASE = "/cloud";
 
@@ -55,6 +56,49 @@ export function usePlatformAdmin(): boolean | null {
   return v;
 }
 
+const TEAM_ROLE_KEY = "hive_role";
+
+/** The team role of this session (the minted JWT's `role` claim, mirrored to `hive_role` at every mint): `null` = unknown (no mint yet, an unenforced node, a role the table does not name), which callers
+ *  must treat as "offer the control, the server answers", never as the lowest role. */
+export function useTeamRole(): TeamRole | null {
+  const [role, setRole] = useState<TeamRole | null>(null);
+  useEffect(() => {
+    const read = () => setRole(teamRoleOf(localStorage.getItem(TEAM_ROLE_KEY)));
+    read();
+    window.addEventListener("hive-session-changed", read);
+    window.addEventListener("storage", read);
+    return () => {
+      window.removeEventListener("hive-session-changed", read);
+      window.removeEventListener("storage", read);
+    };
+  }, []);
+  return role;
+}
+
+/** `can(action)` for this session, mirroring the backend matrix (`ui/lib/team-role.ts`): a platform operator acts as an owner, an unknown role may (the server decides). */
+export function useCan(): (action: TeamAction) => boolean {
+  const role = useTeamRole();
+  const operator = usePlatformAdmin();
+  return useCallback((action) => operator === true || can(role, action), [role, operator]);
+}
+
+/** Mirrors the claims a mint answered with: operator status and team role (an unenforced node has no roles, so a stale one is dropped). */
+function mirrorSession(d: { enforced?: boolean; platform_admin?: boolean; role?: string }) {
+  let changed = false;
+  if (typeof d.platform_admin === "boolean") {
+    localStorage.setItem("hive_platform_admin", d.platform_admin ? "1" : "0");
+    changed = true;
+  }
+  if (typeof d.role === "string") {
+    localStorage.setItem(TEAM_ROLE_KEY, d.role);
+    changed = true;
+  } else if (d.enforced === false) {
+    localStorage.removeItem(TEAM_ROLE_KEY);
+    changed = true;
+  }
+  if (changed) window.dispatchEvent(new Event("hive-session-changed"));
+}
+
 function teamHeaders(): Record<string, string> {
   return { "x-hive-team": currentTeam() };
 }
@@ -100,12 +144,9 @@ async function mintOnce(team?: string): Promise<string | null> {
       console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
       return null;
     }
-    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean } | null;
+    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean; role?: string } | null;
     if (!d?.ok) return null;
-    if (typeof d.platform_admin === "boolean") {
-      localStorage.setItem("hive_platform_admin", d.platform_admin ? "1" : "0");
-      window.dispatchEvent(new Event("hive-session-changed"));
-    }
+    mirrorSession(d);
     const backendUnenforced = d.enforced === false;
     if (backendUnenforced) return t;
     return d.tenant ?? t;
@@ -290,7 +331,10 @@ export async function apiGet<T>(path: string, opts?: { fresh?: boolean }): Promi
   if (!opts?.fresh && hit && Date.now() - hit.at < pathTtl(path)) return hit.data as T;
   const req = (async () => {
     const r = await fetchWithTimeout(`${BASE}${path}`, { cache: "no-store", headers: teamHeaders() }, 20_000);
-    if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
+    if (!r.ok) {
+      const refusal = r.status === 403 ? roleRefusalSentence(await r.text().catch(() => "")) : null;
+      throw refusal ? new ApiError(403, refusal, ROLE_REFUSED) : new Error(`GET ${path} -> ${r.status}`);
+    }
     const data = (await r.json()) as T;
     getCache.set(key, { at: Date.now(), data });
     return data;
@@ -305,6 +349,9 @@ export async function apiGet<T>(path: string, opts?: { fresh?: boolean }): Promi
 const CONFIG_PATHS =
   /^\/v1\/(projects\/(?![^/]+\/sandboxes(?:\/|$))|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy|deploy\/(image|zip)|enterprise\/|routing|webhooks|domains|cron)/;
 const GITOPS_BADGE = "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
+
+/** The `ApiError.code` of a role-matrix refusal (`roles.rs`): its `message` is already the sentence to show ("Your role can't do this. Ask a team admin."), never the raw 403 body. */
+export const ROLE_REFUSED = "ROLE_REFUSED";
 
 /** A server refusal: `status` and the node's own sentence as `message` (what `apiSend` throws, so a caller can tell a 403 from a 502), plus the typed error envelope's `code` such as "PLAN_UPGRADE_REQUIRED" when the API sent one. */
 export class ApiError extends Error {
@@ -351,7 +398,8 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
   }, 30_000);
   if (!r.ok) {
     const detail = await r.text().catch(() => "");
-    throw new ApiError(r.status, detail?.trim() ? detail.trim() : `${method} ${path} -> ${r.status}`);
+    const refusal = r.status === 403 ? roleRefusalSentence(detail) : null;
+    throw refusal ? new ApiError(403, refusal, ROLE_REFUSED) : new ApiError(r.status, detail?.trim() ? detail.trim() : `${method} ${path} -> ${r.status}`);
   }
   const isMutation = method !== "GET" && method !== "HEAD";
   if (isMutation) invalidateApiCache();

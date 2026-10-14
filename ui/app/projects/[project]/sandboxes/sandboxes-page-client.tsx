@@ -1,5 +1,7 @@
 "use client";
 
+import { reportError } from "@/components/toast";
+
 import { useState, use } from "react";
 import Link from "next/link";
 import { Box, Plus, X, Loader2 } from "lucide-react";
@@ -129,7 +131,7 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/start`);
       onChanged();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
@@ -140,7 +142,7 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/stop`);
       onChanged();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
@@ -151,7 +153,7 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/restart`);
       onChanged();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
@@ -162,7 +164,7 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}/snapshots`, {});
       onChanged();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
@@ -174,7 +176,7 @@ function RowActions({ project, sandbox, onChanged }: { project: string; sandbox:
       await apiSend("DELETE", `/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandbox.id}`);
       onChanged();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }

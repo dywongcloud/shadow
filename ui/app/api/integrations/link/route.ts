@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, toolkitStatus, connectionCredentials, composioConfigured } from "@/lib/composio";
 import { authTokenFrom, backend } from "@/lib/gitops-server";
+import { roleRefusalSentence } from "@/lib/team-role";
 
 /** Toolkit slug + credential key -> ENV var name, e.g. ("google-sheets", "api_key") -> "GOOGLE_SHEETS_API_KEY". */
 function envName(slug: string, key: string): string {
@@ -48,10 +49,12 @@ export async function POST(req: NextRequest) {
 
   const cred = await connectionCredentials(entity, slug);
   if (!cred || Object.keys(cred.credentials).length === 0) {
-    await backend("/v1/integrations", team, authToken, {
+    const bare = await backend("/v1/integrations", team, authToken, {
       method: "POST",
       body: JSON.stringify({ provider: slug, name, kind: cred?.kind || "oauth", entity, credentials: {}, env: {} }),
-    }).catch(() => {});
+    }).catch(() => null);
+    const bareRefusal = bare?.status === 403 ? roleRefusalSentence(await bare.text().catch(() => "")) : null;
+    if (bareRefusal) return NextResponse.json({ ok: false, error: bareRefusal }, { status: 403 });
     return NextResponse.json({ ok: true, provider: slug, env: [], injected: 0, note: "connected; no extractable credentials" });
   }
 
@@ -62,7 +65,8 @@ export async function POST(req: NextRequest) {
     body: JSON.stringify({ provider: slug, name, kind: cred.kind, entity, credentials: cred.credentials, env }),
   });
   if (!regRes.ok) {
-    return NextResponse.json({ ok: false, error: `register failed (${regRes.status})` }, { status: 502 });
+    const refusal = regRes.status === 403 ? roleRefusalSentence(await regRes.text().catch(() => "")) : null;
+    return NextResponse.json({ ok: false, error: refusal ?? `register failed (${regRes.status})` }, { status: refusal ? 403 : 502 });
   }
   const resource = await regRes.json().catch(() => ({}));
 

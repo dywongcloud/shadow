@@ -3,7 +3,9 @@
 import { useState, use } from "react";
 import { Webhook as WebhookIcon, Plus, Trash2, Check, X } from "lucide-react";
 import { Badge, Button, Input, SettingCard } from "@/components/ui";
-import { apiSend, usePoll, type Webhook, type Delivery } from "@/lib/api";
+import { RoleGate } from "@/components/role-gate";
+import { apiSend, useCan, usePoll, type Webhook, type Delivery } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 import { timeAgo } from "@/lib/utils";
 
 export function WebhooksSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
@@ -15,24 +17,38 @@ export function WebhooksSettings({ paramsPromise }: { paramsPromise: Promise<{ p
 
   const [url, setUrl] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const [err, setErr] = useState("");
+  const can = useCan();
+  const mayWrite = can("webhooks.write");
 
   function toggle(ev: string) {
     setSelected((s) => (s.includes(ev) ? s.filter((x) => x !== ev) : [...s, ev]));
   }
   async function create() {
     if (!url.trim()) return;
-    await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/webhooks`, { url, events: selected });
-    setUrl("");
-    setSelected([]);
-    refresh();
+    setErr("");
+    try {
+      await apiSend("POST", `/v1/projects/${encodeURIComponent(project)}/webhooks`, { url, events: selected });
+      setUrl("");
+      setSelected([]);
+      refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
   }
   async function remove(id: string) {
-    await apiSend("DELETE", `/v1/webhooks/${id}`);
-    refresh();
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/webhooks/${id}`);
+      refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
   }
 
   return (
     <div className="space-y-6">
+      <RoleGate action="webhooks.write" note>
       <SettingCard
         title="Webhooks"
         desc="Send a signed HTTP POST to your services when platform events happen — deployment status, database provisioning and more. Verify the X-OpenEdge-Signature (HMAC-SHA256) header with the webhook secret."
@@ -58,8 +74,10 @@ export function WebhooksSettings({ paramsPromise }: { paramsPromise: Promise<{ p
             </div>
           </div>
           <Button onClick={create}><Plus className="h-4 w-4" /> Create Webhook</Button>
+          {err ? <p className="text-sm text-red-500">{err}</p> : null}
         </div>
       </SettingCard>
+      </RoleGate>
 
       {!!hooks?.length && (
         <div className="space-y-3">
@@ -71,9 +89,15 @@ export function WebhooksSettings({ paramsPromise }: { paramsPromise: Promise<{ p
                 <div className="mt-1.5 flex flex-wrap gap-1">
                   {h.events.length ? h.events.map((e) => <Badge key={e}>{e}</Badge>) : <Badge tone="blue">all events</Badge>}
                 </div>
-                <div className="mt-2 font-mono text-[11px] text-muted">secret: {h.secret}</div>
+                <div className="mt-2 font-mono text-[11px] text-muted">{h.secret ? `secret: ${h.secret}` : "signing secret: visible to team admins"}</div>
               </div>
-              <button onClick={() => remove(h.id)} className="shrink-0 text-muted hover:text-red-500"><Trash2 className="h-4 w-4" /></button>
+              <button
+                onClick={() => remove(h.id)}
+                disabled={!mayWrite}
+                title={mayWrite ? undefined : roleHint("webhooks.write")}
+                aria-label="Delete webhook"
+                className="shrink-0 text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"
+              ><Trash2 className="h-4 w-4" /></button>
             </div>
           ))}
         </div>

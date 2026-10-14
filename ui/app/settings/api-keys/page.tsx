@@ -4,7 +4,9 @@ import { useState } from "react";
 import Link from "next/link";
 import { KeyRound, Plus, Trash2, Copy, Check, ArrowLeft, TriangleAlert } from "lucide-react";
 import { Badge, Button, Card } from "@/components/ui";
-import { apiGet, apiSend, currentTeam, usePoll, type ApiKey } from "@/lib/api";
+import { RoleGate } from "@/components/role-gate";
+import { apiGet, apiSend, currentTeam, useCan, useTeamRole, usePoll, type ApiKey } from "@/lib/api";
+import { roleHint, rolesUpTo } from "@/lib/team-role";
 import { timeAgo } from "@/lib/utils";
 
 export default function ApiKeysPage() {
@@ -14,21 +16,29 @@ export default function ApiKeysPage() {
   const [created, setCreated] = useState<ApiKey | null>(null);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const can = useCan();
+  const mayRevoke = can("apikey.revoke");
+  const keyRoles = rolesUpTo(useTeamRole());
 
   async function create() {
     if (!name.trim()) return;
     setBusy(true);
+    setErr("");
     try {
       const key = await apiSend<ApiKey>("POST", "/v1/apikeys", { name, role });
       setCreated(key);
       setName("");
       refresh();
-    } catch (e) { alert(String(e)); } finally { setBusy(false); }
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
   }
   async function revoke(id: string) {
     if (!confirm("Revoke this API key? Any client using it will lose access.")) return;
-    await apiSend("DELETE", `/v1/apikeys/${id}`);
-    refresh();
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/apikeys/${id}`);
+      refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
   }
   function copyToken() {
     if (created?.token) {
@@ -61,6 +71,7 @@ export default function ApiKeysPage() {
         </Card>
       )}
 
+      <RoleGate action="work" note>
       <Card className="mb-6">
         <div className="mb-3 text-sm font-medium">Create API Key</div>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -71,14 +82,16 @@ export default function ApiKeysPage() {
           <div>
             <label className="mb-1 block text-xs font-medium text-secondary">Role</label>
             <select value={role} onChange={(e) => setRole(e.target.value)} className="rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none">
-              <option value="owner">Owner</option>
-              <option value="member">Member</option>
-              <option value="viewer">Viewer</option>
+              {keyRoles.includes("owner") ? <option value="owner">Owner</option> : null}
+              {keyRoles.includes("member") ? <option value="member">Member</option> : null}
+              {keyRoles.includes("viewer") ? <option value="viewer">Viewer</option> : null}
             </select>
           </div>
           <Button onClick={create} disabled={busy}><Plus className="h-4 w-4" /> Create Key</Button>
         </div>
       </Card>
+      </RoleGate>
+      {err ? <p className="-mt-3 mb-6 text-sm text-red-500">{err}</p> : null}
 
       {keys?.length ? (
         <div className="divide-y divide-border rounded-xl border border-border bg-card">
@@ -91,7 +104,13 @@ export default function ApiKeysPage() {
                   <div className="font-mono text-xs text-muted">{k.prefix} · {k.last_used_ms ? `last used ${timeAgo(k.last_used_ms)}` : "never used"}</div>
                 </div>
               </div>
-              <button onClick={() => revoke(k.id)} className="text-muted hover:text-red-500"><Trash2 className="h-4 w-4" /></button>
+              <button
+                onClick={() => revoke(k.id)}
+                disabled={!mayRevoke}
+                title={mayRevoke ? undefined : roleHint("apikey.revoke")}
+                aria-label="Revoke API key"
+                className="text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"
+              ><Trash2 className="h-4 w-4" /></button>
             </div>
           ))}
         </div>

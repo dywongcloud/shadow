@@ -48,11 +48,12 @@ export async function POST(req: NextRequest) {
       const t = String(((await req.json()) as { team?: unknown })?.team ?? "").trim();
       if (t && t !== "__pending__") team = t;
     } catch {}
+    const devRole = process.env.HIVE_DEV_ROLE?.trim() || "owner";
     try {
       const r = await fetch(`${ADMIN}/v1/token`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: primaryOwnerEmail() }),
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: devRole, email: primaryOwnerEmail() }),
         cache: "no-store",
       });
       if (!r.ok) {
@@ -64,7 +65,7 @@ export async function POST(req: NextRequest) {
       if (!token) {
         return NextResponse.json({ ok: true, tenant: team, enforced: false });
       }
-      const res = NextResponse.json({ ok: true, tenant: team, role: "owner", dev: true, platform_admin: jwtPlatformAdmin(token) ?? true });
+      const res = NextResponse.json({ ok: true, tenant: team, role: devRole, dev: true, platform_admin: jwtPlatformAdmin(token) ?? true });
       res.cookies.set("hive_jwt", token, {
         httpOnly: true,
         secure: false,

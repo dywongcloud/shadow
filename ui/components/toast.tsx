@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
+import { ApiError, ROLE_REFUSED } from "@/lib/api";
 
 export type ToastTone = "blue" | "default";
 
@@ -25,6 +26,12 @@ export function toast(message: string, opts: { tone?: ToastTone; duration?: numb
     duration: opts.duration ?? DEFAULT_TOAST_MS,
   };
   window.dispatchEvent(new CustomEvent("hive-toast", { detail }));
+}
+
+/** How a failed action is shown where there is no inline slot for it: a role-matrix refusal is a toast with its sentence ("Your role can't do this. Ask a team admin."), anything else keeps the browser alert. */
+export function reportError(e: unknown) {
+  if (e instanceof ApiError && e.code === ROLE_REFUSED) toast(e.message, { tone: "default" });
+  else alert(String(e));
 }
 
 interface ToastItem extends ToastDetail {

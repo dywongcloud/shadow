@@ -290,7 +290,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     const prev = localStorage.getItem("hive_uid");
     const firstIdentity = prev !== identity.id;
     if (prev && firstIdentity) {
-      for (const k of ["hive_team", "hive_is_owner", "hive_platform_admin", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
+      for (const k of ["hive_team", "hive_is_owner", "hive_platform_admin", "hive_role", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed", "hive_pending_builds"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;

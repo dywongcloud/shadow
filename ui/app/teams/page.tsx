@@ -9,7 +9,9 @@ import {
 import { Users, Plus, Trash2, Crown, Shield, User as UserIcon, Eye } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader } from "@/components/ui";
 import { useClerkAppearance } from "@/components/clerk-appearance";
-import { apiSend, usePoll, type Team, type Role } from "@/lib/api";
+import { RoleGate } from "@/components/role-gate";
+import { apiSend, useCan, usePoll, type Team, type Role } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
@@ -110,16 +112,28 @@ function LocalTeams() {
 function TeamCard({ team, onChange }: { team: Team; onChange: () => void }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Role>("member");
+  const [err, setErr] = useState("");
+  const mayManage = useCan()("team.members");
 
   async function addMember() {
     if (!email.trim()) return;
-    await apiSend("POST", `/v1/teams/${team.slug}/members`, { email, role });
-    setEmail("");
-    onChange();
+    setErr("");
+    try {
+      await apiSend("POST", `/v1/teams/${team.slug}/members`, { email, role });
+      setEmail("");
+      onChange();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
   }
   async function removeMember(e: string) {
-    await apiSend("DELETE", `/v1/teams/${team.slug}/members/${encodeURIComponent(e)}`);
-    onChange();
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/teams/${team.slug}/members/${encodeURIComponent(e)}`);
+      onChange();
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : String(error));
+    }
   }
 
   return (
@@ -147,25 +161,36 @@ function TeamCard({ team, onChange }: { team: Team; onChange: () => void }) {
             <div className="flex items-center gap-2">
               <Badge tone={ROLE_META[m.role]?.tone ?? "default"}>{ROLE_META[m.role]?.icon} {m.role}</Badge>
               {m.role !== "owner" && (
-                <button onClick={() => removeMember(m.email)} className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
+                <button
+                  onClick={() => removeMember(m.email)}
+                  disabled={!mayManage}
+                  title={mayManage ? undefined : roleHint("team.members")}
+                  aria-label="Remove member"
+                  className="text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"
+                ><Trash2 className="h-3.5 w-3.5" /></button>
               )}
             </div>
           </div>
         ))}
       </div>
 
-      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
-        <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="teammate@company.com" className="flex-1" />
-        <select
-          value={role}
-          onChange={(e) => setRole(e.target.value as Role)}
-          className="rounded-md border border-border bg-card px-3 py-2 text-sm text-fg focus:outline-none"
-        >
-          <option value="admin">Admin</option>
-          <option value="member">Member</option>
-          <option value="viewer">Viewer</option>
-        </select>
-        <Button onClick={addMember}><Plus className="h-4 w-4" /> Invite</Button>
+      <div className="mt-4">
+        <RoleGate action="team.members" note>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="teammate@company.com" className="flex-1" />
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value as Role)}
+              className="rounded-md border border-border bg-card px-3 py-2 text-sm text-fg focus:outline-none"
+            >
+              <option value="admin">Admin</option>
+              <option value="member">Member</option>
+              <option value="viewer">Viewer</option>
+            </select>
+            <Button onClick={addMember}><Plus className="h-4 w-4" /> Invite</Button>
+          </div>
+        </RoleGate>
+        {err ? <p className="mt-2 text-sm text-red-500">{err}</p> : null}
       </div>
     </Card>
   );

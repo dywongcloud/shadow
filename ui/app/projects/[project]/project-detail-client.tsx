@@ -39,7 +39,9 @@ const ServiceGraph = dynamic(
     ),
   }
 );
-import { apiGet, apiSend, usePoll, currentTeam, type Deployment, type Metrics, type Overview } from "@/lib/api";
+import { reportError, toast } from "@/components/toast";
+import { apiGet, apiSend, useCan, usePoll, currentTeam, type Deployment, type Metrics, type Overview } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 import { usePendingBuilds, removePendingBuild, mergePending, addPendingBuild } from "@/lib/pending-builds";
 import { SUMMARY_PATH, type ProjectSummary } from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
@@ -77,6 +79,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [retryError, setRetryError] = useState("");
+  const mayDelete = useCan()("project.delete");
   const rawPending = usePendingBuilds({ project: name });
 
   const mine = (deps ?? []).filter((d) => d.project === name);
@@ -102,13 +105,13 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   async function promote(id: string) {
     setBusy(id);
     try { await apiSend("POST", `/v1/deployments/${id}/promote`); await refresh(); }
-    catch (e) { alert(String(e)); } finally { setBusy(""); }
+    catch (e) { reportError(e); } finally { setBusy(""); }
   }
   async function removeDeployment(id: string) {
     if (!confirm(`Delete deployment ${id}?`)) return;
     setBusy(id);
     try { await apiSend("DELETE", `/v1/deployments/${id}`); await refresh(); }
-    catch (e) { alert(String(e)); } finally { setBusy(""); }
+    catch (e) { reportError(e); } finally { setBusy(""); }
   }
   /** Cancels an IN-FLIGHT build by its BUILD id (the key `/deploy/:id` and `/v1/builds/:id` use). A real deployment row's failure is
    *  surfaced and `refresh()` re-reads the server state; an optimistic localStorage row may not be server-registered yet (a 404 is
@@ -119,7 +122,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     try {
       await apiSend("POST", `/v1/builds/${encodeURIComponent(id)}/cancel`);
     } catch (e) {
-      if (!optimistic) { alert(String(e)); setBusy(""); return; }
+      if (!optimistic) { reportError(e); setBusy(""); return; }
     }
     if (optimistic) removePendingBuild(id);
     try { await refresh(); } finally { setBusy(""); }
@@ -128,7 +131,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     if (!confirm(`Delete the entire "${name}" project and ALL its deployments? This cannot be undone.`)) return;
     setBusy("project");
     try { await apiSend("DELETE", `/v1/projects/${encodeURIComponent(name)}`); router.push("/projects"); }
-    catch (e) { alert(String(e)); setBusy(""); }
+    catch (e) { toast(e instanceof Error ? e.message : String(e), { tone: "default" }); setBusy(""); }
   }
   /** Rebuild a project that has no deployment from its last build's source
    *  (the backend's redeploy falls back to that source for exactly this case). */
@@ -193,7 +196,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
             <RotateCcw className="h-4 w-4" /> Instant Rollback
           </Button>
-          <Button variant="danger" onClick={deleteProject} disabled={busy === "project"}>
+          <Button variant="danger" onClick={deleteProject} disabled={busy === "project" || !mayDelete} title={mayDelete ? undefined : roleHint("project.delete")}>
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
           {prod && (
@@ -483,6 +486,7 @@ function EmptyProjectCard({ name, summary, retrySource, busy, retryError, onRetr
   onRetry: () => void;
   onDelete: () => void;
 }) {
+  const mayDelete = useCan()("project.delete");
   const last = summary?.last_build ?? null;
   const building = summary?.building ?? null;
   const settings = `/projects/${encodeURIComponent(name)}/settings`;
@@ -494,7 +498,7 @@ function EmptyProjectCard({ name, summary, retrySource, busy, retryError, onRetr
           <Button variant="outline" onClick={onRetry} disabled={!retrySource || !!busy || !!building}>
             {busy === "retry" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Retry build
           </Button>
-          <Button variant="danger" onClick={onDelete} disabled={busy === "project"}>
+          <Button variant="danger" onClick={onDelete} disabled={busy === "project" || !mayDelete} title={mayDelete ? undefined : roleHint("project.delete")}>
             <Trash2 className="h-4 w-4" /> Delete project
           </Button>
         </div>

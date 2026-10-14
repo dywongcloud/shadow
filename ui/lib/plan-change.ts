@@ -1,4 +1,4 @@
-import { ApiError, apiSend } from "@/lib/api";
+import { ApiError, ROLE_REFUSED, apiSend } from "@/lib/api";
 
 /** The tiers in rising order, as `billing::plan_rank` ranks them. */
 export const PLAN_TIERS = ["hobby", "pro", "enterprise"] as const;
@@ -36,6 +36,7 @@ export function followCheckout(url: string): void {
  *  body or anything long is never echoed. */
 export function planRefusal(error: unknown): string {
   if (!(error instanceof ApiError)) return GENERIC_REFUSAL;
+  if (error.code === ROLE_REFUSED) return error.message;
   if (error.status === 403) return PERMISSION_REFUSAL;
   if (error.status === 404) return NO_TEAM_REFUSAL;
   const sentence = error.message.trim();

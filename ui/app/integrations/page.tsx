@@ -5,7 +5,8 @@ import Link from "next/link";
 import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check, AlertTriangle, RefreshCw, Building2, GitBranch } from "lucide-react";
 import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/ui";
 import { cachedJson, invalidate } from "@/lib/cache";
-import { currentTeam } from "@/lib/api";
+import { currentTeam, useCan } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 
 const TOOLKIT_CATALOG_TTL_MS = 60 * 60_000;
 
@@ -75,11 +76,12 @@ function ToolkitLogo({ tk }: { tk: Toolkit }) {
   );
 }
 
-function ToolkitCard({ tk, configured, onConnect, connecting }: { tk: Toolkit; configured: boolean; onConnect: (s: string) => void; connecting: boolean }) {
+function ToolkitCard({ tk, configured, onConnect, connecting, locked }: { tk: Toolkit; configured: boolean; onConnect: (s: string) => void; connecting: boolean; locked: boolean }) {
   return (
     <button
-      onClick={() => configured && !connecting && onConnect(tk.slug)}
-      disabled={!configured || connecting}
+      onClick={() => configured && !connecting && !locked && onConnect(tk.slug)}
+      disabled={!configured || connecting || locked}
+      title={locked ? roleHint("integrations.write") : undefined}
       className="group relative flex h-44 w-full flex-col rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-border-strong hover:bg-subtle/40 disabled:cursor-default"
     >
       <span className="self-start rounded-md bg-subtle px-2 py-0.5 text-[11px] font-medium capitalize text-secondary">
@@ -114,6 +116,7 @@ function MarketplaceArtCard({ count }: { count: number }) {
 }
 
 export default function IntegrationsPage() {
+  const mayLink = useCan()("integrations.write");
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [ghOrgs, setGhOrgs] = useState<GhOrg[]>([]);
 
@@ -320,7 +323,7 @@ export default function IntegrationsPage() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {safePage === 0 && !q && <MarketplaceArtCard count={toolkits.length} />}
             {shown.map((tk) => (
-              <ToolkitCard key={tk.slug} tk={tk} configured={tkConfigured} connecting={connecting === tk.slug} onConnect={connectToolkit} />
+              <ToolkitCard key={tk.slug} tk={tk} configured={tkConfigured} connecting={connecting === tk.slug} onConnect={connectToolkit} locked={!mayLink} />
             ))}
           </div>
           <div className="mt-6 flex items-center justify-between text-sm">

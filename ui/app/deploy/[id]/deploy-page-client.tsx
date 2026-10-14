@@ -1,5 +1,7 @@
 "use client";
 
+import { reportError } from "@/components/toast";
+
 import { useEffect, useRef, useState, use } from "react";
 import Link from "next/link";
 import {
@@ -211,7 +213,7 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
       const b = await cancelBuild(id);
       setBuild(b);
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setCancelling(false);
     }

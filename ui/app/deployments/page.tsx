@@ -1,5 +1,7 @@
 "use client";
 
+import { reportError } from "@/components/toast";
+
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -23,7 +25,7 @@ export default function DeploymentsPage() {
     try {
       await apiSend("POST", `/v1/deployments/${d.id}/promote`);
       await refresh();
-    } catch (e) { alert(String(e)); } finally { setBusy(""); }
+    } catch (e) { reportError(e); } finally { setBusy(""); }
   }
   async function remove(d: Deployment) {
     if (!confirm(`Delete deployment ${d.id}? This cannot be undone.`)) return;
@@ -31,7 +33,7 @@ export default function DeploymentsPage() {
     try {
       await apiSend("DELETE", `/v1/deployments/${d.id}`);
       await refresh();
-    } catch (e) { alert(String(e)); } finally { setBusy(""); }
+    } catch (e) { reportError(e); } finally { setBusy(""); }
   }
   async function cancelPending(buildId: string) {
     setBusy(buildId);
@@ -39,7 +41,7 @@ export default function DeploymentsPage() {
       await cancelBuild(buildId);
       removePendingBuild(buildId);
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy("");
     }

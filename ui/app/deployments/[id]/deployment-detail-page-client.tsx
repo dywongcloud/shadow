@@ -1,5 +1,7 @@
 "use client";
 
+import { reportError } from "@/components/toast";
+
 import { Suspense, useMemo, useState, use } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -83,7 +85,7 @@ function DeploymentDetail({ id }: { id: string }) {
       await apiSend("POST", `/v1/deployments/${dep.id}/promote`);
       await refresh();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
@@ -97,7 +99,7 @@ function DeploymentDetail({ id }: { id: string }) {
       await cancelBuild(build.id);
       await refresh();
     } catch (e) {
-      alert(String(e));
+      reportError(e);
     } finally {
       setBusy(false);
     }
