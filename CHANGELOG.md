@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-14 — billing, DNS, database delete, edge security, the SMS provider and the repository link are offered to an admin only, and the link refuses a member before it creates a repository (979c91b7b1)
+
+`roles.rs` (`3e737fa9c6`) made a write nobody lists ADMIN and named every member route, so billing checkout, confirm and
+charge, DNS records, import, nameservers and certificate renewal, database delete and rotation, WAF, rate-limit and bot rules,
+the SMS delivery providers and the repository link (`PUT`/`DELETE /v1/gitops`) now need admin, while `ui/lib/team-role.ts` still
+listed checkout as member work and every one of those controls was drawn for a member. The table mirrors each changed row
+(`billing.pay`, `dns.write`, `database.destroy`, `edge.security`, `sms.provider`, `repo.link`), `RoleGate` or a disabled button
+covers the billing plan and credit buttons, the mock checkout's Pay, Buy Dedicated IPv4, the plan chips, the DNS record form and
+its edit/delete, zone import and scan, nameserver edits, the database Delete, the firewall page, the rate-limit card, the SMS
+provider key and the repository link, and every handler that had no `catch` (firewall, DNS, database delete) now shows the
+sentence inline or as a toast. `POST /api/gitops/init` created the GitHub repository first and ignored the backend's answer to
+`PUT /v1/gitops`, so a member was told "Repository created & pushed" for a link the backend had refused: it now reads the role
+claim of the caller's own JWT (`claimedRole`, unverified, only to refuse early) and refuses a member before creating anything,
+and answers the backend's refusal as the sentence (403), never as success. Witnessed in headless Chrome on `next dev` plus a
+throwaway enforced node against a copy of the HEAD sources: member on billing, firewall, network, a domain, a database and the
+plan chips, before every control enabled and a click ended in a 403 with an unhandled rejection and nothing shown or an
+`Error: ...` banner, after disabled with "Needs a team admin" and no request, admin enabled, viewer disabled, an unknown role
+keeps every control and shows the sentence after one 403 (0 unhandled rejections); the real route against a stubbed GitHub and
+backend, a member's link before 200 with a repository created and a refused PUT reported as success, after 403 with neither
+(10 checks); the drift witness against the new table, 23 checks (94 rows, an unlisted write is admin, every route of every
+action, and each of the dashboard's 44 admin-floor write calls is in the table and in a gated file). Not changed: the WAF
+rules, the managed ruleset, the rate limit and the SMS key still answer a non-operator, an owner included, 403 ("platform-level
+change requires a platform operator"; the SMS key "platform operator only"; the bot rules take an admin), so an admin sees
+those controls and the server refuses them; a database credential rotation has no dashboard control. Not rolled.
+
 ## 2026-10-14 — the token mint is limited per user with a peer-wide backstop, and only guesses at the internal token spend the strict per-peer budget (0f4187d92b)
 
 Every session of the fleet reaches `POST /v1/token` through ONE dashboard server, so the single per-peer budget (20 per minute)
