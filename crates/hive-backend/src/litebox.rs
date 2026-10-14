@@ -1,247 +1,46 @@
-//! Litebox cell backend — a cell is a single host process run under
-//! Microsoft's LiteBox (<https://github.com/microsoft/litebox>), an
-//! unprivileged Linux syscall-interception sandbox. Exists for nodes where
-//! neither real Firecracker microVMs nor the software-virtualized PVM
-//! fallback can safely run (`AGENTS.md`'s "PVM kernels" section: a microVM
-//! *boot* can hard-reset a PVM host even after `KVM_CREATE_VM` succeeds —
-//! that is exactly the state fc-frankfurt is in today, pinned to
-//! `HIVE_FORCE_MOCK=1`, i.e. **zero** isolation). Litebox is a real, measured
-//! improvement over that specific baseline — see the security posture note
-//! below for what it is not.
+//! Litebox cell backend: a cell is one host process run under Microsoft's LiteBox, an unprivileged
+//! Linux syscall-interception sandbox. It serves nodes where neither Firecracker nor the PVM
+//! fallback can run; an operator opts a node in (`HIVE_LITEBOX_VERIFIED`, licensed by a passing
+//! [`LiteboxBackend::smoke_test`]), it is never detected.
 //!
-//! **Status as of 2026-08-08: `--litebox-probe` PASSES for real on
-//! fc-frankfurt, both checks — the syscall rewriter, and a full HTTP round
-//! trip through the real per-cell-TUN + patched-litebox + bind-shim
-//! pipeline. Beyond the probe, a full `provision` -> `deliver_build` ->
-//! `start_function` deployment (a real app with a local `require()`, the
-//! exact production code path, not the probe's own inline server) was run
-//! live and answered a real `curl` with the correct app-specific response.
-//! `HIVE_LITEBOX_VERIFIED` is still NOT set on any node — enabling it for
-//! real tenant traffic is a separate, deliberate decision from proving the
-//! mechanism works, and this backend still is not Firecracker/gVisor-grade
-//! isolation (see "Security posture" below) regardless of how well the
-//! mechanics now work.**
+//! ## Scope
+//!
+//! `start_function` and the sandbox `exec_command`/`exec_pty` paths run inside litebox. `run_build`
+//! is a plain host process (`crate::mock::run_build_process`), and `__container__` cells bypass
+//! litebox for host podman (`crate::podman_run_container`).
 //!
 //! ## Mechanism
 //!
-//! Guest and host share ONE process/address space. The default (and only
-//! mechanism this backend uses) is litebox's AOT syscall rewriter: before
-//! exec, every `syscall` opcode in the target ELF is statically rewritten to
-//! trap into litebox's own dispatcher, which validates/mediates the call
-//! before (conditionally) issuing it for real, backstopped by an
-//! unprivileged seccomp-bpf allowlist at the actual kernel boundary. This
-//! backend shells out to the prebuilt `litebox_runner_linux_userland` CLI
-//! binary (`-Z --rewrite-syscalls --forward-env`) rather than linking
-//! litebox's Rust crates in-process — the same "depend on a separate binary,
-//! not a Cargo dependency" shape [`FirecrackerBackend`] uses for the
-//! `firecracker` binary, and it sidesteps needing litebox's still-churning
-//! Provider-trait API surface as a compile-time dependency of this crate at
-//! all. See `ansible/roles/litebox` for how that binary gets built + staged
-//! (litebox ships no releases; it's built from a pinned commit on the host).
+//! The runner `litebox_runner_linux_userland` is a separate binary (`-Z --rewrite-syscalls
+//! --forward-env`), never a Cargo dependency; `ansible/roles/litebox` builds it with the patches
+//! described in `files/PATCHES.md`. Guest and runner are one process: every `syscall` opcode in the
+//! target ELF is rewritten ahead of exec to trap into litebox's dispatcher, with a seccomp-bpf
+//! allowlist at the kernel boundary.
 //!
-//! ## Guest filesystem — verified live, not inferred
+//! ## Guest filesystem
 //!
-//! **The guest sees NOTHING of the host filesystem except what is
-//! explicitly staged.** This was proven directly on fc-frankfurt
-//! (2026-08-08): a bare invocation of the CLI against a real, existing
-//! dynamically-linked binary (`/bin/echo`) failed with "failed to open the
-//! ELF file: ENOENT" — not because the program was missing, but because its
-//! OWN shared-library dependencies (`ld-linux-x86-64.so.2`, `libc.so.6`)
-//! were nowhere in the guest's filesystem and the CLI does not resolve them
-//! automatically. A second probe confirmed there is no passthrough at all:
-//! a sandboxed `cat` could not read an unstaged file that genuinely existed
-//! on the host at the exact same path. The fix, also proven live: pass
-//! `--initial-files=<tar>` containing (a) the target's full `ldd` closure at
-//! their absolute paths and (b) the deployment's own file tree under
-//! `/workspace`. The runner's guest cwd is `/` and exposes no cwd option, so
-//! `start_function` validates each Node/Bun main entry against the immutable
-//! app archive and passes its exact absolute `/workspace[/app]/...` path; the
-//! preload then changes the application cwd to the validated guest workdir
-//! before tenant module bytes execute. [`LiteboxBackend::deliver_build`]/
-//! `start_function` implement this; there is no compile-cache directory across
-//! cold starts for the same reason (the guest fs is a fresh in-memory snapshot
-//! every process, nothing persists back to the host).
+//! The guest sees nothing of the host except what `--initial-files=<tar>` stages: the program's
+//! `ldd` closure and the delivered application tree under `/workspace`. The runner's cwd is `/` and
+//! cannot be set, so `start_function` passes each main entry as an absolute guest path validated
+//! against the immutable app archive, and the preload changes into the validated workdir before
+//! tenant code runs.
 //!
 //! ## Networking
 //!
-//! Three real constraints, discovered live on fc-frankfurt (2026-08-08) and
-//! confirmed by reading litebox's own source, shape everything below:
+//! A TUN link cannot carry loopback and litebox's guest address was compiled in, so every runner
+//! owns a TUN device with its own `/30` ([`LiteboxNet`]): the runner is told the pair through
+//! `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` (`networking.patch`) and the function tunnel dials the
+//! guest address directly, with no NAT or namespace. A wildcard bind is reachable as is;
+//! `litebox-bind-shim.js` (preloaded through `NODE_OPTIONS=--require`, Node's `net.Server` only)
+//! rewrites an explicit loopback bind to the guest address.
 //!
-//! 1. **`127.0.0.1` loopback is architecturally impossible over a TUN
-//!    device.** A TUN device is a real point-to-point IP link, not a
-//!    loopback interface — this is true of any TUN-isolated stack, not a
-//!    litebox defect, and no litebox patch can change it. Confirmed live: a
-//!    sandboxed process reported itself listening on `127.0.0.1`; the
-//!    host's connection attempt got an immediate ECONNREFUSED with no
-//!    guest-side syscall ever observed.
-//! 2. **The guest only accepted connections to an EXPLICIT bind address —
-//!    litebox's own bug, not a smoltcp limitation.** `litebox/src/net/
-//!    mod.rs`'s `bind()`/`listen()` unconditionally built
-//!    `smoltcp::wire::IpListenEndpoint { addr: Some(addr), .. }`, even for a
-//!    wildcard/omitted-host bind (what real Node/Express apps do by
-//!    default). smoltcp itself already fully supports wildcard listening
-//!    (`IpListenEndpoint.addr: Option<Address>`, `None` = "any address",
-//!    confirmed against smoltcp 0.12.0 — litebox's own exact pinned
-//!    version) — litebox's integration code simply never used the sentinel
-//!    it was already given the means to use.
-//! 3. **The guest's IP and gateway were HARDCODED at compile time, not
-//!    configurable per instance** — `litebox/src/net/mod.rs`:
-//!    `const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);` /
-//!    `const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);`, both
-//!    already marked `// TODO: Make this configurable` by litebox's own
-//!    authors. Every concurrent litebox process therefore claimed the
-//!    identical guest address.
+//! ## Security posture
 //!
-//! **Constraints 2 and 3 are fixed with a small, forked patch to litebox
-//! itself** (`ansible/roles/litebox/files/networking.patch`, applied by the
-//! ansible role right after cloning, before build — see that directory's
-//! `PATCHES.md` for the full rationale and exactly what upstream commit
-//! it's diffed against): the wildcard-bind sites now map an unspecified
-//! address to smoltcp's `None` sentinel instead of `Some(0.0.0.0)`, and
-//! `Network::new`/`LinuxShimBuilder::build` gained an additive
-//! `_with_addrs`/`_with_net_config` sibling that
-//! `litebox_runner_linux_userland` calls, reading `LITEBOX_GUEST_IP`/
-//! `LITEBOX_GATEWAY_IP` from the environment (unset = byte-identical to
-//! upstream's hardcoded defaults, so every other caller — including
-//! litebox's own test suite — needs no changes at all).
-//!
-//! **With constraint 3 fixed, constraint 1's real solution falls out for
-//! free: every cell just gets its own real, directly-routable TUN address,
-//! the exact same pattern `FirecrackerBackend::setup_cell_net` already uses
-//! for microVMs** (a per-cell `/30`, `net_idx`-allocated — `mode=tun`
-//! instead of `mode=tap`, no kernel `ip=` cmdline since litebox reads the
-//! two env vars directly instead). No network namespace, veth pair, or
-//! DNAT/iptables rule is needed at all — a TUN device is a real
-//! point-to-point link, so the moment this host assigns itself the `/30`'s
-//! other half, the kernel routes to the guest's address directly:
-//!
-//! - `provision` allocates a fresh TUN device (`setup_cell_net`,
-//!   [`LiteboxNet`]'s doc) with a unique `/30` (e.g. host `10.88.0.1`,
-//!   guest `10.88.0.2`).
-//! - `start_function` launches the runner directly (no wrapper process)
-//!   with `--tun-device-name=<tun>` plus `LITEBOX_GUEST_IP`/
-//!   `LITEBOX_GATEWAY_IP` set to this cell's own pair, and the tunnel this
-//!   backend fronts the function with dials `net.guest_ip:<port>` directly
-//!   — entirely encapsulated here; no other subsystem needs to know a
-//!   litebox cell's address scheme differs from `127.0.0.1`.
-//! - `terminate` deletes the TUN device; nothing else to clean up.
-//!
-//! **Loopback (constraint 1) still needs a narrow fix for the minority of
-//! apps that explicitly hardcode it** (`.listen(port, '127.0.0.1')` — a
-//! wildcard-bind app is already reachable at the guest's real address once
-//! the litebox patch is applied, with no shim needed at all).
-//! `litebox-bind-shim.js` (embedded via `include_str!`, written fresh
-//! before every launch) monkey-patches Node's `net.Server.prototype.
-//! _listen2` — the internal, POST-overload-normalization method every real
-//! `.listen()` call shape funnels into, a deliberately preserved
-//! monkeypatch seam per Node's own source comment, stable across Node
-//! v10–v24, and the same technique New Relic's Node agent has run in
-//! production since ~2012 — so an explicit loopback (or, belt-and-suspenders,
-//! wildcard) bind transparently becomes this cell's real guest address.
-//! Zero tenant code changes, preloaded via `NODE_OPTIONS=--require`.
-//! Verified against every real `.listen()` shape (options-object form,
-//! callback-as-second-arg, unix sockets and fd handles correctly left
-//! untouched) with a standalone local test harness before shipping — see
-//! that file's own doc comment. **Not yet extended to Python** (the
-//! ecosystem is far more heterogeneous — most real Python servers run
-//! behind a WSGI/ASGI server like gunicorn/uvicorn, each with its own bind
-//! mechanism, unlike Node's tight convergence on `net.Server`) — a Python
-//! deployment on this backend will not be reachable until that's built.
-//!
-//! **Do not wait for litebox's own in-flight rewrite instead of the above.**
-//! An unreleased, actively-churning litebox branch (`ulitebox`, not `main`)
-//! replaces the whole smoltcp/TUN stack with a broker process issuing real
-//! host socket syscalls — genuinely fixing loopback (a real host socket
-//! *is* reachable at `127.0.0.1`) — but its own access-control policy
-//! (`litebox_broker_core::policy::authorize_socket_bind`) hard-DENIES
-//! wildcard binds by design, confirmed by its own unit test. Constraint 2's
-//! fix is therefore permanent regardless of which litebox architecture is
-//! eventually used, and the branch itself is unstable/undocumented — not a
-//! dependency to take today.
-//!
-//! **Proven live on fc-frankfurt (2026-08-08), not just compiled.**
-//! `smoke_test`'s network phase (a real TUN device, the patched litebox, a
-//! real Node HTTP server, a real host-side TCP round trip) PASSES, and
-//! separately, a full `provision`/`deliver_build`/`start_function`
-//! deployment of a real app answered a real `curl` correctly. Getting there
-//! took three real bugs found and fixed by live testing, not design review
-//! — `setup_cell_net`'s `set -e` aborting on a harmless `ip link del`,
-//! litebox's own `SIGINT`/`SIGALRM` disposition assertion tripping under a
-//! parent with no controlling terminal, and `wait_tcp_ready`'s per-loop (not
-//! per-attempt) deadline check letting one slow `connect()` blow the whole
-//! budget — see this crate's git history for the exact fixes. Two of these
-//! (the signal assertion, the connect timeout) are general hazards for ANY
-//! process this crate spawns over a real network path, not litebox-specific
-//! quirks — worth remembering if this pattern gets reused elsewhere.
-//!
-//! ## Scope: `start_function` only, never `run_build`
-//!
-//! [`run_build`](LiteboxBackend::run_build) deliberately runs as a **plain,
-//! unsandboxed host process** — identical to [`crate::mock::MockBackend`],
-//! via the shared `crate::mock::run_build_process`. A build script is
-//! fork/exec-heavy (`git clone` forks+execs `git`; `npm install` forks+execs
-//! dozens of children), and litebox's own `sys_clone` handler does not
-//! support `fork` yet (confirmed directly in upstream source,
-//! `litebox_shim_linux/src/syscalls/process.rs`: "exit_signal is ignored
-//! because we don't support fork yet; we just validate it"). Wrapping the
-//! build shell in litebox today would simply fail on the first forked
-//! subprocess. Litebox's isolation is scoped to
-//! [`start_function`](LiteboxBackend::start_function)'s single long-lived
-//! process instead — the case litebox's own test suite actually exercises
-//! (`litebox_runner_linux_userland/tests/loader.rs`'s
-//! `test_load_exec_dynamic`/`test_syscall_rewriter`, both confirmed passing
-//! on fc-frankfurt's exact kernel) and the one where sandboxing tenant code
-//! matters most (it is the process handling live request bytes for the
-//! deployment's whole lifetime). A tenant function that itself shells out or
-//! calls `child_process.fork()` will fail to start under this backend for
-//! the same underlying reason — that surfaces as an ordinary
-//! `DEPLOYMENT_START_FAILED` / crash-loop, the existing fault class, not a
-//! new failure mode.
-//!
-//! CONTAINER cells (`func.start_cmd[0] == "__container__"`) bypass litebox
-//! entirely and run via host podman (`crate::podman_run_container`, the
-//! exact helper [`FirecrackerBackend`] calls) — the platform's existing
-//! container path (optionally gVisor `runsc`-sandboxed) is already
-//! stronger isolation than litebox provides, so there is nothing to gain by
-//! routing it through litebox and a real reason not to (see below).
-//!
-//! ## Security posture — read before enabling on a node carrying real traffic
-//!
-//! This is a genuine, measured improvement over `MockBackend` on a node that
-//! has no other option: syscalls outside an explicit allowlist are denied at
-//! the real kernel boundary (seccomp-bpf), which `MockBackend` does not do at
-//! all (it is a bare host process with best-effort `rlimit`s only). It is
-//! **not** a substitute for Firecracker/KVM-grade or gVisor-grade isolation,
-//! and that is not a hedge — it is upstream's own stated position:
-//!
-//! - Guest and enforcement code share one address space; there is no
-//!   hardware or namespace boundary. Litebox's own doc comment on the
-//!   rewriter technique says outright it "should not be considered a
-//!   security boundary."
-//! - A full sandbox escape was found and fixed very recently upstream
-//!   (litebox issue #1006 / PR #1007): `mmap(RW, ANON)` → write a raw
-//!   `syscall` opcode into that memory → `mprotect(RX)` → jump to it ran
-//!   **unmediated on the host**, because the AOT rewriter only rewrites
-//!   opcodes present in the ELF at load time, not ones constructed at
-//!   runtime. The same PR fixed a control-flow hijack via `rt_sigreturn`
-//!   and an integer-overflow `mremap` giving arbitrary host `munmap`.
-//! - Litebox's own stated non-goal: **dynamically generated (e.g.
-//!   JIT-emitted) syscalls are not supported** — the rewriter can only
-//!   rewrite what's on disk at rewrite time. This is directly relevant to
-//!   the actual workload this backend runs: Node.js is built on V8, a JIT.
-//!   If V8 ever emits a raw `syscall` opcode as part of its own normal
-//!   operation, that instruction executes outside the rewriter's mediation;
-//!   the seccomp-bpf allowlist is the only remaining backstop, and it
-//!   filters by syscall *number*, not by whether litebox's own
-//!   fd/memory-accounting was informed of the call.
-//!
-//! Consequently this backend must never be silently substituted for
-//! Firecracker capability, and selecting it is a deliberate, manual,
-//! per-node operator decision — never automatic detection. See
-//! `crates/hive-cloud/src/main.rs`'s backend-selection chain and
-//! [`LiteboxBackend::smoke_test`]'s doc comment for the two-tier
-//! verification this mirrors from the PVM precedent (`AGENTS.md` "PVM
-//! kernels (KVM without hardware virt)").
+//! Guest and enforcement share one address space, so this is not Firecracker or gVisor isolation:
+//! upstream does not treat the rewriter as a security boundary, and syscalls generated at runtime
+//! (V8's JIT) escape it, leaving the seccomp-bpf allowlist as the only backstop. Never substitute
+//! it silently for Firecracker capability: selecting it stays a deliberate per-node operator
+//! decision.
 
 use crate::{
     CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
@@ -270,24 +69,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
-/// Backend config knobs.
 #[derive(Clone, Debug)]
 pub struct LiteboxConfig {
-    /// Path to the prebuilt `litebox_runner_linux_userland` binary. Defaults
-    /// to `HIVE_LITEBOX_RUNNER_BIN` if set, else `/usr/local/bin/litebox-runner`
-    /// (where `ansible/roles/litebox` installs it).
+    /// Prebuilt `litebox_runner_linux_userland` binary.
     pub runner_bin: PathBuf,
-    /// Ephemeral base directory for per-cell runtime scratch and bring-up
-    /// probe files. Durable application/runtime archives live under
-    /// `cache_root`, never here.
+    /// Ephemeral per-cell scratch and probe files; durable archives live under `cache_root`, never
+    /// here.
     pub root: PathBuf,
-    /// Shared build cache root, passed through to the same
-    /// `crate::mock::run_build_process` build pipeline `MockBackend` uses.
+    /// Durable artifact store (`litebox-images-v1`: app and runtime archives, image references) and
+    /// build output: a reboot or tmp sweep must not delete what the replicated deployment record
+    /// still names.
     pub cache_root: PathBuf,
-    /// Simulated boot latency for a cold provision, matching `MockConfig`'s
-    /// shape (warm pools pay this ahead of time). Litebox's real provision
-    /// cost is a directory create, not a boot — this exists only so the pool
-    /// accounting behaves the same as every other backend; default is 0.
+    /// Simulated cold-provision latency, as in `MockConfig`; the real provision cost is a directory
+    /// create (default 0).
     pub provision_latency: Duration,
 }
 
@@ -298,20 +92,7 @@ impl Default for LiteboxConfig {
             .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/litebox-runner"));
         LiteboxConfig {
             runner_bin,
-            // `root` is per-cell RUNTIME scratch, recreated on every provision
-            // and removed on terminate — temp is correct for it.
             root: std::env::temp_dir().join("hive-litebox-cells"),
-            // `cache_root` is NOT scratch: it holds the DELIVERED build tar,
-            // the one artifact `start_function` cannot run without
-            // (`ensure_combined_tar_locked` bails when it is missing). Under
-            // `temp_dir()` a reboot or a tmp sweep deletes it while the
-            // replicated deployment RECORD survives, so the node then refuses
-            // to start a deployment it still believes it hosts — the exact
-            // failure AGENTS.md records for `git::deploy_root()`, which was
-            // moved off `$TMPDIR` for this reason after it 404'd a live
-            // deployment. Same rule, same fix: durable by default, under the
-            // node's data dir alongside firecracker's `/var/lib/hive/rootfs`,
-            // with an env override for local dev.
             cache_root: std::env::var("HIVE_LITEBOX_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
@@ -325,28 +106,16 @@ impl Default for LiteboxConfig {
     }
 }
 
-/// Per-cell TUN device + real, distinct guest IP. litebox's guest IP/gateway
-/// used to be HARDCODED at compile time (`litebox/src/net/mod.rs`:
-/// `INTERFACE_IP_ADDR = 10.0.0.2`, `GATEWAY_IP_ADDR = 10.0.0.1`) — every
-/// concurrent cell would otherwise claim the identical guest address.
-/// `ansible/roles/litebox/files/networking.patch` fixes this at the source
-/// (adds `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` env-var overrides, additive
-/// and backward-compatible — see that patch's own doc, `files/PATCHES.md`),
-/// so each cell can simply be handed its own real `/30` directly, no network
-/// namespace or veth pair needed at all — the exact same allocator shape
-/// `FirecrackerBackend::setup_cell_net` already uses for microVMs (a per-cell
-/// `/30` + TAP device instead of TUN, `net_idx`-derived).
+/// One runner's TUN link: a device plus its own `/30` out of `10.88.0.0/16`. The host routes to the
+/// guest end directly (no NAT or namespace); the runner learns the pair from
+/// `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP`, which `networking.patch` adds.
 #[derive(Clone)]
 struct LiteboxNet {
-    /// TUN device name, unique per cell.
     tun_dev: String,
-    /// This host's end of the point-to-point link (what the guest's default
-    /// route points at).
+    /// Host end of the link: the guest's gateway (`LITEBOX_GATEWAY_IP`).
     host_ip: String,
-    /// The guest's own IP on that link — what `start_function`'s tunnel
-    /// dials directly; reachable from the host with zero NAT/forwarding,
-    /// since a TUN device is a real point-to-point link and the kernel
-    /// routes to it the moment `host_ip` is assigned.
+    /// Guest end of the link: what the function tunnel dials, routable from the host as is
+    /// (`LITEBOX_GUEST_IP`).
     guest_ip: String,
 }
 
@@ -441,26 +210,17 @@ async fn delete_litebox_link(tun_dev: &str) {
         .await;
 }
 
+/// A function cell's runner: guest and runner are one host process, killed on `terminate`.
 struct LiteboxFunctionProcess {
     child: tokio::process::Child,
-    // Keep the exact immutable archive open in the parent for the runner's
-    // whole lifetime. The child also inherits its own duplicate, but this
-    // prevents parent-side descriptor reuse before termination/wait and makes
-    // ownership explicit beside the process that consumes it.
+    /// Held open until the runner is reaped: keeps the archive descriptor the child inherited from
+    /// being reused parent-side.
     _initial_files: File,
 }
 
-/// One in-flight `exec_command` (Sandboxes): the runner was spawned as the
-/// LEADER of its own process group, so `pgid` names the whole guest process
-/// tree — the runner plus whatever the guest forks — and `kill_exec` (and
-/// `terminate`) end all of it with one `killpg`. On the runner build the
-/// fleet runs today a guest `fork()` is NOT a host fork: gdb on a live hang
-/// showed the "child" as a second THREAD of the runner (`pgrep -P` empty), so
-/// the group is really one process, but the group kill is what stays correct
-/// if the emulation ever does become a host fork (the peer's vfork/shared-MM
-/// work), and it costs nothing now. Interactive shells are tracked here too,
-/// keyed by their session id. Removed by the waiter task the moment the
-/// runner is reaped, so a late kill is a no-op.
+/// One in-flight sandbox exec or interactive shell. The runner leads its own process group, so one
+/// `killpg(pgid)` (from `kill_exec` or `terminate`) ends the whole guest tree; the waiter task
+/// removes the entry when the runner is reaped, so a late kill is a no-op.
 #[derive(Clone)]
 struct LiteboxExec {
     cell: CellId,
@@ -476,45 +236,26 @@ pub struct LiteboxBackend {
     execs: Arc<AsyncMutex<HashMap<String, LiteboxExec>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
-    /// Per-cell host-container ownership. Container cells bypass litebox and run
-    /// through the shared owned launch path.
+    /// Container cells bypass litebox and run through the shared owned launch path.
     containers: Arc<AsyncMutex<HashMap<CellId, crate::ContainerLaunch>>>,
-    /// Per-cell TUN device state — see [`LiteboxNet`]. Set
-    /// up in `provision` (before the port is known), torn down in
-    /// `terminate`. Absent for CONTAINER cells, which never touch this path.
+    /// Set up in `provision`, torn down in `terminate`; absent for container cells.
     cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
-    /// Monotonic allocator for the per-cell veth `/30` (mirrors
-    /// `FirecrackerBackend::net_idx` exactly — same derivation, same 16384
-    /// slot space, wraps rather than errors since a wrapped slot is only a
-    /// real collision if an old cell at that index is somehow still alive,
-    /// which `terminate` prevents).
+    /// Monotonic allocator of `/30` link slots (same derivation as `FirecrackerBackend::net_idx`);
+    /// it wraps, since a slot only collides with a link that is somehow still alive.
     net_idx: Arc<std::sync::atomic::AtomicUsize>,
-    /// Serializes every reference/artifact publication in this process. A
-    /// delivery and a cold start must never write or reap the same immutable
-    /// generation concurrently; request-driven acquisition stays outside it.
+    /// Serializes artifact and reference publication and reaping, so one immutable generation is
+    /// never written and reaped at once; request-driven acquisition stays outside it.
     artifact_lock: Arc<AsyncMutex<()>>,
-    /// Memo of app archives whose bytes were ALREADY hash-verified against the
-    /// committed identity, keyed by image. A cold start used to hash the whole
-    /// archive (hundreds of MB) up to three times — once in
-    /// `runtime_artifact_identity`, again in `provision_runtime`'s re-derive,
-    /// again while staging the runtime tar — and every one of them sat under
-    /// `artifact_lock`, serializing the node's cold starts. The hash result is
-    /// invariant for as long as the reference and the archive file are the same
-    /// bytes, so it is remembered instead of recomputed. See
-    /// [`VerifiedArchive`] for what makes a hit safe.
+    /// Memo of app archives already hash-verified against their committed identity, keyed by image;
+    /// [`VerifiedArchive`] says what makes a hit safe.
     verified_archives: Arc<std::sync::Mutex<HashMap<String, VerifiedArchive>>>,
     sampler: Arc<crate::CpuSampler>,
 }
 
-/// Proof that an app archive's bytes matched its committed SHA-256, plus the
-/// file identity that proof was taken against.
-///
-/// A hit requires ALL of: the same reference JSON bytes, the same archive file
-/// (dev/ino/len/mtime — exactly what `sha256_open_file` re-validates around its
-/// own hash), the same expected SHA, and a verification younger than
-/// [`VERIFIED_ARCHIVE_TTL_MS`]. Any change to the reference or to the archive
-/// file forces a re-hash; the TTL bounds staleness if a writer ever restores
-/// metadata. The content comparison is never skipped — it is remembered.
+/// Proof that an app archive's bytes matched its committed SHA-256, taken against one file
+/// identity: a hit needs the same reference bytes, the same dev/ino/len/mtime, the same expected
+/// SHA and an age under [`VERIFIED_ARCHIVE_TTL_MS`]. The content comparison is remembered, never
+/// skipped.
 struct VerifiedArchive {
     reference_sha256: String,
     dev: u64,
@@ -525,28 +266,17 @@ struct VerifiedArchive {
     verified_at_ms: u64,
 }
 
-/// How long a verified archive stays trusted before its hash is redone.
 const VERIFIED_ARCHIVE_TTL_MS: u64 = 300_000;
 
-/// The Node bind-rewrite shim's source, embedded at compile time so the
-/// runtime binary is fully self-contained (no separate ansible deploy step
-/// to keep in sync) — see `stage_bind_shim`'s doc.
+/// Node bind-rewrite shim, embedded so the runtime binary needs no separate deploy step;
+/// `stage_bind_shim` writes it into the guest tar.
 const NODE_BIND_SHIM_JS: &str = include_str!("litebox-bind-shim.js");
-/// Where `NODE_OPTIONS=--require` finds the shim INSIDE the guest — a plain
-/// filename with no leading path landing at the tar's root when staged
-/// (proven live: this is exactly how `deliver_build`'s app tar entries
-/// resolve, e.g. `hello.txt` -> guest `/hello.txt`). This is a GUEST path,
-/// deliberately distinct from the HOST scratch path `stage_bind_shim` writes
-/// the same content to before tar-ing it in — the guest cannot see the host
-/// path at all (see module doc, "Guest filesystem"), confirmed live: an
-/// earlier version of this code pointed `NODE_OPTIONS` at the host path and
-/// every launch failed with `Cannot find module
-/// '/tmp/hive-litebox-cells/hive-litebox-bind-shim.js'`.
+/// Where `NODE_OPTIONS=--require` finds the shim inside the guest (the tar root); the host scratch
+/// path is invisible to the guest.
 const GUEST_BIND_SHIM_PATH: &str = "/hive-litebox-bind-shim.js";
-/// Tar-layer directory the Tier-2 probe's guest must be able to write into
-/// (`network_smoke_test_inner`, check (c)). Under `/workspace` on purpose:
-/// that is the delivered workdir every real function gets, so the probe
-/// exercises the exact path shape an application's own `mkdir` uses.
+/// Tar-layer directory the probe's guest must be able to write into, under the delivered workdir so
+/// it exercises the path shape of an application's own `mkdir` (`network_smoke_test_inner`, check
+/// (c)).
 const PROBE_WRITE_DIR: &str = "/workspace/hive-write-probe";
 const GUEST_RUNTIME_GUARD_PATH: &str = "/hive-litebox-runtime-guard.js";
 const INITIAL_FILES_ALIAS_NAME: &str = "initial-files.tar";
@@ -561,10 +291,9 @@ const MAX_GUEST_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_ARTIFACT_GC_GRACE_SECS: u64 = 600;
 const DEFAULT_ARTIFACT_GC_MAX_REAP_FRACTION: f64 = 0.5;
 
-/// Runs before tenant code in both Node and Bun. The host has already verified
-/// the archive hash; this is the guest-side half of the handshake, proving that
-/// litebox actually mounted the same protocol/id/content marker before the bind
-/// shim changes cwd or any repository byte executes.
+/// Guest-side half of the artifact handshake, run before tenant code in Node and Bun: it exits with
+/// `RUNTIME_GUARD_EXIT_CODE` unless the mounted marker matches the host's protocol, id and content
+/// hash.
 const RUNTIME_GUARD_JS: &str = r#"'use strict';
 const fs = require('fs');
 function refuse(message) {
@@ -1157,7 +886,9 @@ fn remember_verified_archive(
     expected: &str,
     now_ms: u64,
 ) {
-    let Some((dev, ino, len, mtime_ns)) = stamp else { return };
+    let Some((dev, ino, len, mtime_ns)) = stamp else {
+        return;
+    };
     if let Ok(mut m) = memo.lock() {
         // Bounded: one entry per image a node has actually launched.
         m.insert(
@@ -2414,14 +2145,23 @@ impl LiteboxBackend {
             // USED (`verify_immutable_open` at launch and at publication).
             let app_name = Self::app_archive_name(&reference.app_archive_sha256);
             directories.apps.open_regular(&app_name).with_context(|| {
-                format!("litebox artifact GC: referenced app archive missing for {}", reference.image)
+                format!(
+                    "litebox artifact GC: referenced app archive missing for {}",
+                    reference.image
+                )
             })?;
             keep_apps.insert(app_name);
             for runtime in reference.runtimes.values() {
                 let runtime_name = Self::runtime_archive_name(&runtime.archive_sha256);
-                directories.runtimes.open_regular(&runtime_name).with_context(|| {
-                    format!("litebox artifact GC: referenced runtime archive missing for {}", reference.image)
-                })?;
+                directories
+                    .runtimes
+                    .open_regular(&runtime_name)
+                    .with_context(|| {
+                        format!(
+                            "litebox artifact GC: referenced runtime archive missing for {}",
+                            reference.image
+                        )
+                    })?;
                 keep_runtimes.insert(runtime_name);
             }
         }
@@ -3996,7 +3736,10 @@ const GUEST_CA_PATHS: [&str; 3] = [
 /// 2026-10-08), so require both a BEGIN CERTIFICATE marker and a realistic
 /// size rather than trusting non-emptiness.
 fn is_real_ca_bundle(bytes: &[u8]) -> bool {
-    bytes.len() > 16 * 1024 && bytes.windows(27).any(|w| w == *b"-----BEGIN CERTIFICATE-----")
+    bytes.len() > 16 * 1024
+        && bytes
+            .windows(27)
+            .any(|w| w == *b"-----BEGIN CERTIFICATE-----")
 }
 
 fn host_ca_bundle() -> Option<Vec<u8>> {
@@ -4522,7 +4265,10 @@ fn shebang_interpreter(path: &Path) -> Option<Vec<String>> {
     if !bytes.starts_with(b"#!") {
         return None;
     }
-    let end = bytes.iter().position(|b| *b == b'\n').unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .unwrap_or(bytes.len());
     let line = std::str::from_utf8(&bytes[2..end]).ok()?;
     let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
     if parts.is_empty() || !parts[0].starts_with('/') {
@@ -4821,7 +4567,10 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     for program in SHELL_GUEST_OPTIONAL_PROGRAMS {
         let path = PathBuf::from(program);
         if !path.is_file() {
-            tracing::debug!(program, "litebox guest tar: optional tool absent on this host; skipped");
+            tracing::debug!(
+                program,
+                "litebox guest tar: optional tool absent on this host; skipped"
+            );
             continue;
         }
         match ldd_closure(&path).await {
@@ -4842,7 +4591,10 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
     for tool in SHELL_GUEST_TOOL_PROGRAMS {
         let path = PathBuf::from(tool);
         if !path.is_file() {
-            tracing::debug!(tool, "litebox guest tar: sandbox tool absent on this host; skipped");
+            tracing::debug!(
+                tool,
+                "litebox guest tar: sandbox tool absent on this host; skipped"
+            );
             continue;
         }
         stage_guest_program(&path, &mut programs, &mut deps, &mut copies).await;
@@ -5034,7 +4786,6 @@ async fn stage_guest_program(
     programs.push(staged);
 }
 
-
 #[cfg(target_os = "linux")]
 fn build_shell_tar_blocking(
     archive: File,
@@ -5152,16 +4903,21 @@ fn build_shell_tar_blocking(
                 .and_then(|line| std::str::from_utf8(line).ok())
                 .and_then(|line| line.split_whitespace().next())
                 .unwrap_or("/bin/sh");
-            let wrapper = format!("#!/bin/sh\nexec {interpreter} {host} \"$@\"\n", host = host_path.display());
+            let wrapper = format!(
+                "#!/bin/sh\nexec {interpreter} {host} \"$@\"\n",
+                host = host_path.display()
+            );
             let mut header = litebox_tar_header(wrapper.len() as u64, 0o755)?;
             let mut slice: &[u8] = wrapper.as_bytes();
-            builder.append_data(&mut header, relative, &mut slice).with_context(|| {
-                format!(
-                    "append shell guest wrapper {} -> {}",
-                    guest_path.display(),
-                    host_path.display()
-                )
-            })?;
+            builder
+                .append_data(&mut header, relative, &mut slice)
+                .with_context(|| {
+                    format!(
+                        "append shell guest wrapper {} -> {}",
+                        guest_path.display(),
+                        host_path.display()
+                    )
+                })?;
             continue;
         }
         let mode = std::fs::metadata(host_path)
@@ -5169,13 +4925,15 @@ fn build_shell_tar_blocking(
             .unwrap_or(0o755);
         let mut header = litebox_tar_header(bytes.len() as u64, mode)?;
         let mut slice: &[u8] = &bytes;
-        builder.append_data(&mut header, relative, &mut slice).with_context(|| {
-            format!(
-                "append shell guest copy {} (bytes of {})",
-                guest_path.display(),
-                host_path.display()
-            )
-        })?;
+        builder
+            .append_data(&mut header, relative, &mut slice)
+            .with_context(|| {
+                format!(
+                    "append shell guest copy {} (bytes of {})",
+                    guest_path.display(),
+                    host_path.display()
+                )
+            })?;
     }
 
     // Guest `/etc`. This tar is a SEPARATE archive from the runtime
@@ -5188,7 +4946,11 @@ fn build_shell_tar_blocking(
     // guest has TCP egress but no UDP one, so a UDP resolver would time out
     // even with the file present. Guest `execve` handles shebangs and symlinks
     // fine, so nothing else is needed for these to take effect.
-    append_platform_tar_entry(&mut builder, Path::new("etc/resolv.conf"), GUEST_RESOLV_CONF)?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/resolv.conf"),
+        GUEST_RESOLV_CONF,
+    )?;
     append_platform_tar_entry(
         &mut builder,
         Path::new("etc/nsswitch.conf"),
@@ -5208,9 +4970,7 @@ fn build_shell_tar_blocking(
         SHELL_RC_BYTES,
     )?;
 
-    builder
-        .finish()
-        .context("finish litebox shell guest tar")?;
+    builder.finish().context("finish litebox shell guest tar")?;
     let archive = builder
         .into_inner()
         .context("close litebox shell guest tar writer")?;
@@ -6501,7 +6261,11 @@ fn open_pty_pair(cols: u16, rows: u16) -> anyhow::Result<(std::fs::File, std::fs
             &winsize,
         )
     };
-    anyhow::ensure!(rc == 0, "openpty failed: {}", std::io::Error::last_os_error());
+    anyhow::ensure!(
+        rc == 0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: both fds were just returned by a successful openpty() call
     // above and are not owned anywhere else yet.
     let master = unsafe { std::fs::File::from_raw_fd(master) };
