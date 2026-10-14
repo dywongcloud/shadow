@@ -46,6 +46,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hmac = "0.12"
 sha2 = "0.10"
 blake3 = "1"
+socket2 = { version = "0.6", features = ["all"] }
 # Memory-hard password KDF for deployment password-protection (replaces the
 # brute-forceable sha256(project:password) hash). PHC-string output embeds the
 # random salt + params, so a hash computed once on the owner node stays
