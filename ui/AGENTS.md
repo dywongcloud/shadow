@@ -12,28 +12,37 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   auth-enforced node answers an anonymous GET `200`, empty, `x-hive-anon: 1`. A server prefetch treats that
   header as 401 (`fetchAndValidate`), never as data, and seeds nothing without a token. `/api/git/deploy`
   and `/api/projects/:project/redeploy` forward the platform JWT AND the GitHub clone token as
-  `body.git_token` (looked up within `GITHUB_TOKEN_LOOKUP_DEADLINE_MS`, never returned to the browser; the
-  backend uses it only for an `https://github.com/` clone).
-- Browser side (`ui/lib/api.ts`): every `/cloud` + `/ops` call awaits ONE shared session mint
-  (`ensureSessionMinted`) and treats 401, 403 AND `x-hive-anon: 1` as an invalid session: one re-mint +
-  retry, at most once per `AUTO_MINT_COOLDOWN_MS` (30 s); automatic mints share a failure budget
-  (`MINT_MAX_CONSECUTIVE_FAILURES` 4, then terminal `failed`) so a browser that can never persist the cookie
-  stops POSTing `/api/token`; explicit mints (team switch, identity sync) always fire. GET-cache keys are
-  tenant-scoped (`tenantScopedKey`) and any mutation clears the cache; a mutation that bypasses `apiSend`
-  (the zip upload) must call `invalidateApiCache()` itself.
+  `body.git_token` (never returned to the browser; the backend uses it only for an `https://github.com/`
+  clone).
+- Browser side (`ui/lib/api.ts`, `session-clock.ts`, `session-keeper.ts`): `/api/token` echoes the cookie's
+  lifetime as `expires_in`, every mint records it in a clock the browser's tabs share
+  (`hive_session_clock`), and ONE keeper per tab (`startSessionKeeper`) re-mints at ~70% of it: a hidden tab
+  never mints, a tab that turns visible with under 20% left mints at once, failures follow the budget
+  (`MINT_MAX_CONSECUTIVE_FAILURES`, then one attempt per period). Mints run one at a time per tab
+  (`mintSessionToken`; a team switch or an identity sync always fires). A request waits for a mint only when
+  no session exists or it is lapsing (`ensureSessionMinted`); a 401 or `x-hive-anon: 1` is retried after at
+  most one re-mint per `AUTO_MINT_COOLDOWN_MS`, but a 403 on a session KNOWN valid for the team (role
+  matrix, operator-only route) never re-mints: the dashboard server is the one `/v1/token` peer of every
+  user. GET-cache keys are tenant-scoped (`tenantScopedKey`), any mutation clears the cache, and one that
+  bypasses `apiSend` calls `invalidateApiCache()` itself.
+- The dashboard mirrors the backend role matrix (`crates/hive-cloud/src/roles.rs` `RULES`) in ONE table,
+  `ui/lib/team-role.ts` `TEAM_ACTIONS` (action -> floor role + covered routes: a `RULES` change is a diff
+  against it), read through `can`, `useTeamRole` and `useCan`. The role is the mint answer's `role`
+  (mirrored to `hive_role`); `null` = unknown and OFFERS every control, because the server is the authority.
+  A control the role cannot use is disabled with a reason (`RoleGate`, or `disabled` + `roleHint`), and a
+  403 `insufficient team role` becomes an `ApiError` coded `ROLE_REFUSED` whose message is the sentence:
+  show it inline or via `reportError`, never `alert(String(e))`.
 - The mint (`ui/app/api/token/route.ts`) derives the tenant SERVER-SIDE from the verified Clerk session: an
   org slug only after a membership check, else `u_<uid>`, and the legacy `personal` only for a
   `HIVE_OWNER_EMAIL` account; a client-sent `team` is a request, never a grant. The backend trusts it only
   because the call carries `x-hive-internal`, and re-derives `platform_admin` itself from the forwarded
   email. `HIVE_OWNER_EMAIL` is read on the server only through `ui/lib/owner-emails.ts`; `ADMIN_EMAILS`
   exists TWICE (`ui/proxy.ts` enforces `/admin` + `/ops`, client-bundled `ui/lib/owner.tsx` gates display)
-  and the node's `platform_admin` list is a third: edit them together. Client owner gating (`hive_is_owner`,
-  `usePlatformAdmin()`) only decides what the UI SHOWS.
+  and the node's `platform_admin` list is a third: edit them together.
 - The `hive_jwt` cookie is httpOnly with the parent-domain `Domain` taken from `x-forwarded-host` FIRST
   (behind hive-node's dashboard proxy the Next server's Host is the loopback upstream), so it also rides the
   `wss://api.<domain>` sandbox-shell handshake; a host-only cookie makes that upgrade anonymous (403,
-  "WebSocket connection failed"), and the mint expires a legacy host-only variant. Diagnose with
-  `GET /v1/admin/audit` first: a refused upgrade leaves no handler log line.
+  "WebSocket connection failed"), and the mint expires a legacy host-only variant.
 - Every tenant change goes through `switchTeam` (persist, RE-MINT `hive_jwt`, THEN `hive-team-changed`): a
   raw `setItem` + dispatch leaves the previous account's cookie authenticating pollers as the OLD tenant
   with valid 200s. The personal namespace is `u_<uid>` (legacy `personal` only when the backend marks the
@@ -51,46 +60,44 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   answer refuses the target; IPv4-mapped/NAT64 unwrapped), redirects are followed by hand (<= 3, every hop
   re-validated), bodies are size- and type-bounded; never a pre-check followed by `fetch` (DNS rebinding).
   `/api/tv/hls` stays an anonymous public relay (owner decision), so its bounds are its only protection:
-  `role=key` is CLIENT-SUPPLIED and no authorization (it only relabels at most `KEY_MAX_BYTES` of a public
-  body as inert `application/octet-stream`), and gzip/deflate bodies are decoded (`boundedSource`) under
-  caps on the encoded AND decoded bytes (br, zstd and chained codings 415, a 206 in a coding 502).
+  `role=key` is CLIENT-SUPPLIED and no authorization (it relabels at most `KEY_MAX_BYTES` of a public body
+  as inert `application/octet-stream`), and gzip/deflate bodies are decoded (`boundedSource`) under caps on
+  encoded AND decoded bytes (br, zstd, chained codings 415; a 206 in a coding 502).
 - A request-derived redirect target or return path passes `ui/lib/same-origin-path.ts` `sameOriginPath`
   (`startsWith("/")` accepts `//evil.example`, `/\evil.example`, `/<TAB>/evil.example`). A host that flows
   into a URL is validated as a bare hostname before any suffix test.
 - `ui/app/api/preview-unlock` authorizes only from the node's `/v1/zkauth/project-team` answer plus the
-  Clerk identity (`teamAccess` in `ui/lib/preview-access.ts`, also behind `/api/zk-enroll`), never `?team=`
-  (it travels through the visitor's browser), failing closed: a node or Clerk lookup that cannot answer is a
-  retryable 503 (`Retry-After`; the unlock page says "unavailable", not "denied"), a non-member 403;
-  `zkauth::bootstrap` independently binds the ring to the project's owner. The proof URL is built only for a
-  platform-issued host (`isKnownDeploymentHost`), `http` only for `localhost`.
+  Clerk identity (`teamAccess` in `ui/lib/preview-access.ts`, also behind `/api/zk-enroll`), never `?team=`,
+  failing closed: a node or Clerk lookup that cannot answer is a retryable 503 (`Retry-After`; the unlock
+  page says "unavailable", not "denied"), a non-member 403; `zkauth::bootstrap` independently binds the ring
+  to the project's owner. The proof URL is built only for a platform-issued host (`isKnownDeploymentHost`),
+  `http` only for `localhost`.
 - GitHub connect state (`githubConnectionDetail`): only a token GitHub itself just answered for may report
   `connected`; the GLOBAL `GET /app/installations` list spans every customer and is never evidence for THIS
   browser's user. The App user token lives ENCRYPTED in an httpOnly cookie and `getGithubAppToken()` is
-  called ONLY from a Route Handler (GitHub rotates refresh tokens single-use: a refresh from a Server
-  Component burns the token). The OAuth `state` signs `returnTo` + the Clerk uid and a 10-min nonce cookie
-  binds it; the callback always consumes the nonce.
+  called ONLY from a Route Handler (a refresh from a Server Component burns GitHub's single-use refresh
+  token). The OAuth `state` signs `returnTo` + the Clerk uid and a 10-min nonce cookie binds it; the
+  callback always consumes the nonce.
 - Committed GitOps artifacts never carry secrets (`databaseNode` is an explicit field allowlist,
   `projectNode` serializes env KEYS only). `composio.commitFiles` and `github-rest.ghCommitFiles` are ONE
-  contract with TWO implementations (atomic Git Data commit; `managedPrefixes` tombstones stale paths; a
-  branch whose tree cannot be resolved REFUSES: a tree without `base_tree` would delete the repo); callers
-  refuse to commit while `buildOrgArtifacts` reports `failures`.
+  contract with TWO implementations (a branch whose tree cannot be resolved REFUSES: a tree without
+  `base_tree` would delete the repo); callers refuse to commit while `buildOrgArtifacts` reports `failures`.
 
 ## Data sources and polling
 
 - Every project picker uses `useProjectNames()`/`useProjects()` (`ui/lib/projects.ts`: the deployment list
   merged with the backend inventory `SUMMARY_PATH`), never `deployments.map(d => d.project)`: a project
   whose builds all failed has no deployment yet stays listed and actionable (`hasNoDeployment`:
-  Retry/Delete); a failed build's page links to the PROJECT page, never the new-project form.
+  Retry/Delete).
 - `usePoll` and `useOpsPoll` share one loop (`usePollWith`): a hidden tab never polls and catches up on
   `visibilitychange`; a new polling hook binds a fetcher, never copies the body. Polls of the fan-out reads
   (`/v1/functions`, `/v1/metrics`, `/v1/admin/overview`) stay at or under the backend's 15 s polled-response
   cache TTL (`OVERVIEW_POLL_MS`, `FUNCTIONS_POLL_MS`).
 - Dashboard numbers are measured or absent, never invented: tenant counters come from `/v1/metrics` and
-  `/v1/functions` (a non-operator's `/v1/overview` is topology only), usage prices only from the billing
-  API's `rate_card`, and a value the node did not measure renders as absent (the node serves
-  `DomainRecord`'s `registrar`/`renewal_price`/`auto_renew`/`expires_ms` EMPTIED for older nodes:
-  `ui/lib/api.ts` declares none, and the dashboard rolls BEFORE or WITH the nodes). The cron row label
-  (`ui/lib/cron-schedule.ts`) states only schedules it describes exactly.
+  `/v1/functions` , usage prices only from the billing API's `rate_card`, and a value the node did not
+  measure renders as absent (the node serves `DomainRecord`'s
+  `registrar`/`renewal_price`/`auto_renew`/`expires_ms` EMPTIED for older nodes: `ui/lib/api.ts` declares
+  none, and the dashboard rolls BEFORE or WITH the nodes).
 - A value that differs between server and client render (`window.location`, `localStorage`) never seeds a
   `useState` initializer (React #418): pass it from the server or read it in a post-mount effect.
 - The public `/status` board reads `PUBLIC_INCIDENTS_PATH` (`/v1/status/incidents`:
@@ -102,11 +109,11 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
 ## Proxy, CSP, caching
 
 - `ui/proxy.ts`: `/ops(.*)` is the privileged admin backend proxy and shares `/admin(.*)`'s owner gate
-  (`isAdminRoute`); `/wfc(.*)` is public to Clerk (a 307 to /sign-in feeds sign-in HTML to the console's
-  CBOR decoder; its data-plane auth is the `hive_jwt` cookie); `isClerkFree` routes skip `clerkMiddleware`
-  and are enumerated positively; `HIVE_AUTH_BYPASS=1` is honored only when `NODE_ENV !== "production"`.
-  `/cloud/v1/zkauth/*` is blocked at the public rewrite (enroll and proof mint run server-to-server through
-  `/api/preview-unlock` and `/api/zk-enroll`); the matcher keeps excluding `.wasm`/`.mjs`.
+  (`isAdminRoute`); `/wfc(.*)` is public to Clerk (its data-plane auth is the `hive_jwt` cookie);
+  `isClerkFree` routes skip `clerkMiddleware` and are enumerated positively; `HIVE_AUTH_BYPASS=1` is honored
+  only when `NODE_ENV !== "production"`. `/cloud/v1/zkauth/*` is blocked at the public rewrite (enroll and
+  proof mint run server-to-server through `/api/preview-unlock` and `/api/zk-enroll`); the matcher keeps
+  excluding `.wasm`/`.mjs`.
 - Self-hosted `next start`: an `x-middleware-rewrite` to the request's own URL loops over the network
   forever, so `neutralizeClerkSelfRewrite` downgrades it and `auth().protect()` must pass
   `unauthenticatedUrl`; the sign-in return URL comes from `x-forwarded-host`/`-proto`, never `req.url`.
@@ -116,8 +123,8 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   listed LAST so it beats the catch-all); settings/deployments/network/billing/admin/`/workflows` are
   `no-store`. The CSP is enforcing: `script-src` keeps `'unsafe-inline'` (no nonce pipeline) and
   `'wasm-unsafe-eval'` (run-node), `'unsafe-eval'` only outside production, `connect-src` adds
-  `wss://*.shadw.cloud` (Next rewrites never proxy a WebSocket Upgrade), a LIVE Clerk key drops the
-  `*.clerk.accounts.dev` wildcard, and `Permissions-Policy` keeps `geolocation=(self)`.
+  `wss://*.shadw.cloud` (Next rewrites never proxy a WebSocket Upgrade); a LIVE Clerk key drops the
+  `*.clerk.accounts.dev` wildcard.
 
 ## Browser lane and workflow console
 
@@ -126,20 +133,19 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   bumping both, never by asking users to close tabs. Neither worker context has `RTCPeerConnection`, a
   service worker or a `Worker` constructor, so the PAGE brokers four lanes (`dbWorker`, `meshPeer`,
   `syncFsRegister`, `nodeWorker`); without SharedWorker exactly one tab wins the `shadw-run-node-owner` Web
-  Lock. Presence is published from the `useRunNode` hook (mounted app-wide) every `PRESENCE_REFRESH_MS` 45 s
-  against the server's 90 s TTL. `ui/scripts/sync-browser-node.mjs` must list every hand-written
-  `crates/hive-browser/www/` module the worker imports at RUNTIME (a missing one fails no build and 404s
-  only on the fleet); `sw.js`/`sw-handler.js` land under `/browser-node/node-worker/`.
+  Lock. `ui/scripts/sync-browser-node.mjs` must list every hand-written `crates/hive-browser/www/` module
+  the worker imports at RUNTIME (a missing one fails no build and 404s only on the fleet);
+  `sw.js`/`sw-handler.js` land under `/browser-node/node-worker/`.
 - While the session mint is in backoff, `/deployments` answers a real 200 scoped to an anonymous tenant
   (`[]`): the picker judges a persisted selection only when `sessionMintStatus().state` is `"ok"` or
   `"unattempted"`.
 - Workflow console embed: `ui/scripts/patch-wf-console.mjs` applies idempotent sentinel-guarded patches to
   the compiled `@workflow/web` bundles (anchors target the PRISTINE package: `no-anchor` means reinstall it
   fresh); `ui/lib/wf-console/hive-world.mjs` is its `WORKFLOW_TARGET_WORLD` (`HIVE_WF_TIMEOUT_MS` must
-  exceed the backend's summed `/v1/workflows/runs` budgets); the iframe mounts only after the first
-  `hive_jwt` mint (a cookie-less first rpc settles the runs table on a false "No workflow runs found") and
-  re-mints every `REMINT_INTERVAL_MS`. `ui/app/wf-console/[[...slug]]/route.ts` keeps
-  `import "@workflow/web/server"` so Next traces the package: never delete it as unused.
+  exceed its `/v1/workflows/runs` budgets); the iframe mounts only after the first `hive_jwt` mint (a
+  cookie-less first rpc settles the runs table on a false "No workflow runs found") .
+  `ui/app/wf-console/[[...slug]]/route.ts` keeps `import "@workflow/web/server"` so Next traces the package:
+  never delete it as unused.
 
 ## Build, deploy, witness
 
@@ -153,10 +159,7 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   `NEXT_PUBLIC_HIVE_DEV_MINT=1` mints a LOCAL JWT so the real mint -> cookie -> tenant path runs. `next dev`
   rewrites `ui/next-env.d.ts` (`git_checkout paths:["ui/next-env.d.ts"]`, never commit it) and can miss
   rapid edits to a route handler (restart it before measuring); time client behaviour in a production build,
-  because strict mode runs mount effects twice in dev. Witness an SSRF or redirect fix with recording
-  listeners behind a `cloudflared` quick tunnel. The sandbox shell
-  (`GET /v1/projects/:project/sandboxes/:sandbox_id/shell`, a WebSocket on the admin port) needs a raw
-  stdlib client to witness (WHATWG `WebSocket` cannot send `Authorization`): hit a NON-owner node and
-  compare it with the owner.
+  because strict mode runs mount effects twice in dev. The sandbox-shell WebSocket needs a raw stdlib client
+  (WHATWG `WebSocket` cannot send `Authorization`): witness a NON-owner node against the owner.
 - Checks run from `ui/`: `npx tsc --noEmit` and `npm run lint`. Never dispatch gm from `ui/` as the cwd: it
   hits `ui/.gm`, a separate graph.
