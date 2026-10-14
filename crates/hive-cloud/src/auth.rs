@@ -226,6 +226,9 @@ pub fn is_open_route(path: &str) -> bool {
 /// Routes carrying their OWN credential skip the mutation gate ([`is_open_route`]) and each fails
 /// closed in its own handler.
 ///
+/// Every other authenticated request, a read included, then meets the team-role matrix
+/// ([`crate::roles::gate`]): this is the ONE place a role is decided, so no handler can forget it.
+///
 /// A GET/HEAD is never rejected for missing auth, but an unauthenticated one on a non-exempt route
 /// resolves to `admin::ANON_TENANT` (a namespace that owns nothing) and is stamped `x-hive-anon:
 /// 1`, which `ui/lib/api.ts` treats like a 401/403: a real 200 with an empty body would otherwise
@@ -238,8 +241,8 @@ pub async fn require_auth(
     let claims = extract_token(req.headers())
         .and_then(|t| verify(&t).ok().or_else(|| api_key_claims(&state, &t)));
     let authed = claims.is_some();
-    if let Some(c) = claims {
-        req.extensions_mut().insert(c);
+    if let Some(c) = &claims {
+        req.extensions_mut().insert(c.clone());
     }
     if !enforced() {
         return next.run(req).await;
@@ -247,6 +250,11 @@ pub async fn require_auth(
     let method = req.method().clone();
     let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
     let open = is_open_route(req.uri().path());
+    if let Some(c) = claims.as_ref().filter(|_| !open) {
+        if let Err(refusal) = crate::roles::gate(c, &method, req.uri().path()) {
+            return refusal.into_response();
+        }
+    }
     if !is_mutation || open {
         let mut resp = next.run(req).await;
         if !authed && !open {

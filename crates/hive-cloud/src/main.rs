@@ -95,6 +95,7 @@ mod resp;
 mod resp_cache;
 mod restart_audit;
 mod retry;
+mod roles;
 mod runtime_artifact_transfer;
 mod runtime_artifact_transfer_fs;
 mod runtime_artifact_transfer_sender;

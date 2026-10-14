@@ -999,18 +999,9 @@ async fn project_env_put(
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // `require_project*` only proves TENANCY (the caller is some member of the owning team); env
-    // vars can hold secrets and change what a deployment does, so writing/removing one needs at
-    // least `member` — a bare `viewer` could otherwise set or clear them (confirmed live by an
-    // adversarial review).
-    require_team_floor(
-        &c,
-        &headers,
-        claims.as_ref().map(|e| &e.0),
-        &t,
-        &["owner", "admin", "member"],
-    )?;
+    // `require_project*` proves TENANCY (the caller is some member of the owning team); the role
+    // (env vars can hold secrets, so writing one needs member or above) is `roles`' matrix.
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -1022,14 +1013,7 @@ async fn project_env_delete(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((project, key)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    require_team_floor(
-        &c,
-        &headers,
-        claims.as_ref().map(|e| &e.0),
-        &t,
-        &["owner", "admin", "member"],
-    )?;
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.delete_env(&project, &key);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -11340,25 +11324,6 @@ async fn team_create(
     Ok(Json(json!(t)))
 }
 
-/// The role a roster change is made WITH: a platform operator acts as Owner, an unenforced dev
-/// node (no verified roles) is open (Owner), otherwise the caller's verified team role from the
-/// JWT claim, an unrecognized one as the lowest (Viewer). `TeamStore::set_member_role` and
-/// `remove_member_as` apply the one roster rule to it.
-fn roster_actor(claims: Option<&crate::auth::Claims>) -> crate::teams::Role {
-    use crate::teams::Role;
-    match claims {
-        Some(cl) if cl.platform_admin => Role::Owner,
-        Some(cl) => match cl.role.as_str() {
-            "owner" => Role::Owner,
-            "admin" => Role::Admin,
-            "member" => Role::Member,
-            _ => Role::Viewer,
-        },
-        None if !crate::auth::enforced() => Role::Owner,
-        None => Role::Viewer,
-    }
-}
-
 /// The HTTP answer to a refused roster change.
 fn roster_refusal(refusal: crate::teams::RosterRefusal) -> (StatusCode, String) {
     use crate::teams::RosterRefusal;
@@ -11375,9 +11340,10 @@ fn roster_refusal(refusal: crate::teams::RosterRefusal) -> (StatusCode, String) 
     }
 }
 
-/// Adds a member or changes a member's role. The roster rule lives in `TeamStore::set_member_role`:
-/// nobody changes a member above their own role or grants a role above it (an admin may change an
-/// admin, never the owner, and never grant Owner), and the last owner stays.
+/// Adds a member or changes a member's role. The roster rule lives in `TeamStore::set_member_role`
+/// (the actor's rank is `roles::actor`): nobody changes a member above their own role or grants a
+/// role above it (an admin may change an admin, never the owner, and never grant Owner), and the
+/// last owner stays.
 async fn team_add_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11392,7 +11358,7 @@ async fn team_add_member(
         &slug,
         &["owner", "admin"],
     )?;
-    let actor = roster_actor(claims.as_ref().map(|e| &e.0));
+    let actor = crate::roles::actor(claims.as_ref().map(|e| &e.0));
     let team = c
         .teams
         .get(&slug)
@@ -11444,7 +11410,11 @@ async fn team_remove_member(
     )?;
     let t = c
         .teams
-        .remove_member_as(&slug, roster_actor(claims.as_ref().map(|e| &e.0)), &email)
+        .remove_member_as(
+            &slug,
+            crate::roles::actor(claims.as_ref().map(|e| &e.0)),
+            &email,
+        )
         .map_err(roster_refusal)?;
     if let Some(uid) = c
         .identity
@@ -11819,22 +11789,13 @@ async fn apikey_revoke(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> Json<Value> {
+    // Revoking is credential management (it can destroy the team's OWN owner-role key): the matrix
+    // (`roles`) puts it at admin, so a viewer or member never reaches this point.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Revoking is credential management (it can destroy the team's OWN owner-role key), so it needs
-    // a role at least as elevated as minting one conceptually requires — unlike `put_env`'s
-    // `member` floor, `viewer` AND `member` are both refused here (confirmed live: a viewer key
-    // revoked the owner key with no gate at all before this).
-    require_team_floor(
-        &c,
-        &headers,
-        claims.as_ref().map(|e| &e.0),
-        &t,
-        &["owner", "admin"],
-    )?;
     let ok = c.apikeys.revoke(&id, &t);
     crate::persist::persist(&c);
-    Ok(Json(json!({ "revoked": ok, "id": id })))
+    Json(json!({ "revoked": ok, "id": id }))
 }
 
 async fn integrations_list(
@@ -12065,18 +12026,35 @@ async fn webhook_events() -> Json<Value> {
     Json(json!(crate::webhooks::ALL_EVENTS))
 }
 
+/// A webhook as the caller may see it: the signing secret (what verifies a delivery, and so what
+/// forges one) only for an admin or above, who manage the team's webhooks; a member or viewer sees
+/// the hook without it.
+fn webhook_view(
+    w: crate::webhooks::Webhook,
+    claims: Option<&crate::auth::Claims>,
+) -> crate::webhooks::Webhook {
+    if crate::roles::at_least(claims, crate::teams::Role::Admin) {
+        w.decrypted()
+    } else {
+        crate::webhooks::Webhook {
+            secret: String::new(),
+            ..w
+        }
+    }
+}
+
 async fn webhooks_all(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
-    // Tenant-scoped: the payload includes signing secrets.
+    // Tenant-scoped: the payload includes signing secrets, for an admin (`webhook_view`).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let list: Vec<_> = c
         .webhooks
         .list(crate::webhooks::Scope::Team(&t), None)
         .into_iter()
-        .map(|w| w.decrypted())
+        .map(|w| webhook_view(w, claims.as_ref().map(|e| &e.0)))
         .collect();
     Json(json!(list))
 }
@@ -12151,7 +12129,7 @@ async fn webhooks_for_project(
         .webhooks
         .list(crate::webhooks::Scope::Team(&t), Some(&project))
         .into_iter()
-        .map(|w| w.decrypted())
+        .map(|w| webhook_view(w, claims.as_ref().map(|e| &e.0)))
         .collect();
     Json(json!(list))
 }
