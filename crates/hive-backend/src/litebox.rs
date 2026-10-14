@@ -216,10 +216,10 @@ async fn delete_litebox_link(tun_dev: &str) {
 fn create_link_script(tun_dev: &str, host_ip: &str) -> String {
     format!(
         "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
-         ip link del {tun_dev} 2>/dev/null; \
-         ip tuntap add dev {tun_dev} mode tun && \
-         ip addr add {host_ip}/30 dev {tun_dev} && \
-         ip link set {tun_dev} up"
+             ip link del {tun_dev} 2>/dev/null; \
+             ip tuntap add dev {tun_dev} mode tun && \
+             ip addr add {host_ip}/30 dev {tun_dev} && \
+             ip link set {tun_dev} up"
     )
 }
 
@@ -302,8 +302,9 @@ const MAX_PACKAGE_SCRIPT_BYTES: usize = 16 * 1024;
 const MAX_GUEST_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_ARTIFACT_GC_GRACE_SECS: u64 = 600;
 const DEFAULT_ARTIFACT_GC_MAX_REAP_FRACTION: f64 = 0.5;
-/// `/30` links in `10.88.0.0/16`: the slot space `allocate_link` wraps within.
-const LINK_SLOTS: usize = (1 << 16) / 4;
+/// `/30` links in `10.88.0.0/16` (65536 addresses, four per link): the slot space `allocate_link`
+/// wraps within.
+const LINK_SLOTS: usize = 16384;
 /// Concurrent local connects per guest address, process-wide (`fluid_tunnel`): the guest's network
 /// stack re-arms one listener serially, so connects queue at the tunnel instead of being
 /// accept-closed by the guest.
@@ -2807,35 +2808,13 @@ fn expand_package_manager(
     Ok(direct)
 }
 
-/// Joins a relative entry onto `guest_workdir`, normalizing `..` lexically on the JOINED path. The
-/// entry is already the resolved physical path of a package manager's symlinked `.bin/<tool>`
-/// launcher, which legitimately climbs out of the app directory into a shared store inside the
-/// artifact (pnpm: `../../node_modules/next/dist/bin/next`). Seeding with the workdir makes `pop()`
-/// step out of a real directory and fail only above the artifact root; the caller re-checks the
-/// result with `validate_guest_workdir`.
-fn join_entry_under_workdir(path: &Path, guest_workdir: &str) -> anyhow::Result<PathBuf> {
-    let mut absolute = PathBuf::from(guest_workdir);
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => absolute.push(value),
-            Component::ParentDir => {
-                anyhow::ensure!(
-                    absolute.pop(),
-                    "{}",
-                    launch_refusal("the direct runtime entry escapes the validated artifact")
-                );
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(launch_refusal(
-                    "the direct runtime entry is not artifact-relative",
-                ))
-            }
-        }
-    }
-    Ok(absolute)
-}
-
+/// Validates one direct runtime entry and returns it as an absolute guest path. A relative entry is
+/// joined onto `guest_workdir` and `..` is normalized lexically on the JOINED path: the entry is
+/// already the resolved physical path of a package manager's symlinked `.bin/<tool>` launcher,
+/// which legitimately climbs out of the app directory into a shared store inside the artifact
+/// (pnpm: `../../node_modules/next/dist/bin/next`), and seeding with the workdir makes `pop()` step
+/// out of a real directory and fail only above the artifact root. `validate_guest_workdir` then
+/// re-checks the result.
 fn validated_direct_entry(
     runtime: DirectRuntime,
     entry: &str,
@@ -2880,7 +2859,26 @@ fn validated_direct_entry(
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        join_entry_under_workdir(path, guest_workdir)?
+        let mut absolute = PathBuf::from(guest_workdir);
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(value) => absolute.push(value),
+                Component::ParentDir => {
+                    anyhow::ensure!(
+                        absolute.pop(),
+                        "{}",
+                        launch_refusal("the direct runtime entry escapes the validated artifact")
+                    );
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(launch_refusal(
+                        "the direct runtime entry is not artifact-relative",
+                    ))
+                }
+            }
+        }
+        absolute
     };
     let absolute = absolute.to_str().ok_or_else(|| {
         launch_refusal("the direct runtime entry is not valid UTF-8 after normalization")
@@ -3462,17 +3460,14 @@ const GUEST_CA_PATHS: [&str; 3] = [
     "etc/pki/tls/cert.pem",
 ];
 
-const PEM_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+const PEM_CERTIFICATE_MARKER: &[u8; 27] = b"-----BEGIN CERTIFICATE-----";
 const MIN_CA_BUNDLE_BYTES: usize = 16 * 1024;
 
 /// A real bundle holds many PEM certificates; the 49-byte stubs some images leave at the well-known
 /// paths do not. Non-emptiness shipped such a stub into every guest and the certificate error
 /// persisted, so require a BEGIN CERTIFICATE marker and a realistic size.
 fn is_real_ca_bundle(bytes: &[u8]) -> bool {
-    bytes.len() > MIN_CA_BUNDLE_BYTES
-        && bytes
-            .windows(PEM_CERTIFICATE_MARKER.len())
-            .any(|w| w == PEM_CERTIFICATE_MARKER)
+    bytes.len() > MIN_CA_BUNDLE_BYTES && bytes.windows(27).any(|w| w == *PEM_CERTIFICATE_MARKER)
 }
 
 /// Host CA bundle candidates, best first: the assembled RHEL/TencentOS trust store, then the compat
@@ -3519,11 +3514,8 @@ const TAR_BLOCK_BYTES: u64 = 512;
 #[cfg(target_os = "linux")]
 const TAR_END_MARKER_BLOCKS: u64 = 2;
 
-/// Block index where the trailing run of zero blocks starts. `tar -cf` pads the whole archive out
-/// to its blocking factor after the two-block terminator, so the real terminator is not "the last
-/// 1024 bytes": cutting at a fixed offset would leave the true end marker before the appended
-/// entries, and every reader (GNU tar, Python's `tarfile`, litebox's guest extractor) would stop
-/// there and never see them.
+/// Start of the trailing zero run: `tar -cf` pads to its blocking factor, so the true terminator is
+/// not the last 1024 bytes.
 #[cfg(target_os = "linux")]
 fn trailing_zero_run_start(archive: &mut File, total_blocks: u64) -> anyhow::Result<u64> {
     let mut zero_block = [0_u8; TAR_BLOCK_BYTES as usize];
@@ -3540,22 +3532,6 @@ fn trailing_zero_run_start(archive: &mut File, total_blocks: u64) -> anyhow::Res
         index = candidate;
     }
     Ok(start_block)
-}
-
-/// Plants the guest's resolver, lookup-order and CA files (`/etc/resolv.conf`, `/etc/nsswitch.conf`
-/// and the CA bundle at every `GUEST_CA_PATHS` spelling). Every guest tar needs them: a guest has
-/// no `/etc` beyond what its tar carries, and a tar without them leaves a typed `curl` with neither
-/// a resolver nor CA roots.
-#[cfg(target_os = "linux")]
-fn append_guest_network_files(builder: &mut tar::Builder<File>) -> anyhow::Result<()> {
-    append_platform_tar_entry(builder, Path::new("etc/resolv.conf"), GUEST_RESOLV_CONF)?;
-    append_platform_tar_entry(builder, Path::new("etc/nsswitch.conf"), GUEST_NSSWITCH_CONF)?;
-    if let Some(bundle) = host_ca_bundle() {
-        for path in GUEST_CA_PATHS {
-            append_platform_tar_entry(builder, Path::new(path), &bundle)?;
-        }
-    }
-    Ok(())
 }
 
 /// Appends the runtime layer to a canonical tar and re-terminates it: the `ldd` closure and the
@@ -3711,7 +3687,21 @@ fn append_litebox_runtime_augmentation_blocking(
     for (path, bytes) in extra_entries {
         append_platform_tar_entry(&mut builder, path, bytes)?;
     }
-    append_guest_network_files(&mut builder)?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/resolv.conf"),
+        GUEST_RESOLV_CONF,
+    )?;
+    append_platform_tar_entry(
+        &mut builder,
+        Path::new("etc/nsswitch.conf"),
+        GUEST_NSSWITCH_CONF,
+    )?;
+    if let Some(ca) = host_ca_bundle() {
+        for path in GUEST_CA_PATHS {
+            append_platform_tar_entry(&mut builder, Path::new(path), &ca)?;
+        }
+    }
     append_platform_tar_entry(
         &mut builder,
         Path::new(GUEST_BIND_SHIM_PATH.trim_start_matches('/')),
@@ -3931,8 +3921,12 @@ fn resolve_guest_argv(cmd: &str, args: &[String]) -> anyhow::Result<(PathBuf, Ve
     };
     let mut argv = Vec::with_capacity(interpreter.len() + args.len() + 1);
     argv.extend(interpreter);
-    let canonical_script = canonical_target(&program).unwrap_or_else(|| program.clone());
-    argv.push(canonical_script.display().to_string());
+    argv.push(
+        canonical_target(&program)
+            .unwrap_or_else(|| program.clone())
+            .display()
+            .to_string(),
+    );
     argv.extend(args.iter().cloned());
     Ok((PathBuf::from(&argv[0]), argv[1..].to_vec()))
 }
@@ -4014,21 +4008,16 @@ struct SupportPlan {
     entry_points: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Where a `python3.x` standard library lives, first existing wins. `/usr/lib64` comes first: on
-/// RHEL-family hosts `/usr/lib/python3.x` holds site-packages only (no `os.py`, no `encodings/`), so
-/// staging it instead would leave the interpreter unable to boot; `/usr/lib` is the fallback for
-/// distros with no lib64 split.
-const PYTHON_STDLIB_PARENT_DIRS: [&str; 2] = ["/usr/lib64", "/usr/lib"];
-
-/// Node's bundled npm tree: `npm` and `npx` are scripts under it (`npm/bin/*-cli.js`), not separate
-/// binaries, so staging `node` alone leaves `npm install` not found; one walk also covers npm's
-/// vendored `node_modules/`.
-const NODE_NPM_TREE: &str = "/usr/lib/node_modules_22";
-
 /// Support trees a resolved `extra` program needs beyond its `ldd` closure: `node` and `python3`
 /// are interpreters whose standard library is a tree of plain files. Keyed by the resolved
 /// program's file NAME (`resolve_guest_program` already turned `node` into `/usr/bin/node`); a tree
-/// the host lacks is skipped harmlessly (see `walk_support_tree`).
+/// the host lacks is skipped harmlessly (see `walk_support_tree`). `git` brings its helpers and
+/// templates, with `git-remote-https` (a symlink the walk skips) as an explicit entry point.
+/// `python3.x` takes the first existing of `/usr/lib64/python3.x` and `/usr/lib/python3.x`: lib64
+/// comes first because on RHEL-family hosts `/usr/lib/python3.x` holds site-packages only (no
+/// `os.py`, no `encodings/`), which would leave the interpreter unable to boot. `node` takes the
+/// bundled npm tree, since `npm` and `npx` are scripts under it (`npm/bin/*-cli.js`), not binaries:
+/// staging `node` alone leaves `npm install` not found.
 fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
     let name = resolved.file_name().and_then(|n| n.to_str())?;
     if name == "git" {
@@ -4045,27 +4034,29 @@ fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
     }
     if let Some(version) = name.strip_prefix("python") {
         if version.starts_with('3') {
-            return PYTHON_STDLIB_PARENT_DIRS
-                .iter()
-                .map(|parent| PathBuf::from(format!("{parent}/python{version}")))
-                .find(|dir| dir.is_dir())
-                .map(|dir| SupportPlan {
-                    trees: vec![dir],
-                    entry_points: Vec::new(),
-                });
+            return [
+                PathBuf::from(format!("/usr/lib64/python{version}")),
+                PathBuf::from(format!("/usr/lib/python{version}")),
+            ]
+            .into_iter()
+            .find(|dir| dir.is_dir())
+            .map(|dir| SupportPlan {
+                trees: vec![dir],
+                entry_points: Vec::new(),
+            });
         }
     }
     match name {
         "node" | "node-22" | "node-24" | "node-26" => Some(SupportPlan {
-            trees: vec![PathBuf::from(NODE_NPM_TREE)],
+            trees: vec![PathBuf::from("/usr/lib/node_modules_22")],
             entry_points: vec![
                 (
                     PathBuf::from("/usr/bin/npm"),
-                    Path::new(NODE_NPM_TREE).join("npm/bin/npm-cli.js"),
+                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npm-cli.js"),
                 ),
                 (
                     PathBuf::from("/usr/bin/npx"),
-                    Path::new(NODE_NPM_TREE).join("npm/bin/npx-cli.js"),
+                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npx-cli.js"),
                 ),
             ],
         }),
