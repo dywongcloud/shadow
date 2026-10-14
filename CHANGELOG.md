@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-14 — the session cookie is re-minted from its own lifetime, once per browser, and an authorization 403 never re-mints (cf7298c6d5)
+
+Org tokens live 900 s (`9e464c496d`) but the dashboard re-minted on a fixed 50-minute timer, so the `hive_jwt` cookie lapsed
+under every poller and the only heal was the first anonymous reply (`x-hive-anon`), one mint per `AUTO_MINT_COOLDOWN_MS`:
+pollers that saw the lapse in the same instant took the anonymous 200 and rendered it. The same primitive fed three more
+mints into the backend's limiter (20/min per peer, and the dashboard server is the peer of every user): every 403 re-minted
+(a member's webhooks page polls the operator-only `GET /v1/webhooks/deliveries` every 5 s: one mint per 30 s per tab), the
+workflow console frame minted every 4 minutes and on every `visibilitychange`, and nothing kept two mints from running at
+once in a tab. `/api/token` now echoes the cookie lifetime as `expires_in`, and each mint records `{issued, at, life, team}`
+in a clock the tabs of a browser share (`ui/lib/session-clock.ts`: module state mirrored to localStorage
+`hive_session_clock`, moved by `storage` events). One keeper per tab (`ui/lib/session-keeper.ts`, started by `SessionToken`)
+re-mints at 70% of the lifetime +-5% jitter (the hour when a route predates the field), and a mint in any tab moves every
+tab's mark, so one tab per browser mints per cycle; a hidden tab never mints, and a tab that becomes visible with under 20%
+of the lifetime left, or past its mark, mints at once; a failed mint follows the existing budget (ladder 2/8/30 s,
+`MINT_MAX_CONSECUTIVE_FAILURES`, then one attempt per period). `mintSessionToken` runs ONE mint at a time per tab with a 20 s
+timeout (explicit mints, a team switch or an identity sync, still always fire, queued) and `renewSession` joins the one under
+way. `ensureSessionMinted` makes a request wait only when no session exists or the credential is lapsing, so a woken tab
+sends nothing anonymous and a proactive re-mint never holds requests. A rejection is retried without a mint when the cookie
+was replaced after the request left, joins the mint under way, else re-mints once per cooldown as before; a 403 on a session
+known valid for the tenant (role matrix, operator-only routes) never mints. Witnessed in headless Chrome on `next dev` plus
+a throwaway enforced node with `HIVE_ORG_TOKEN_TTL_SECS=30` (the backend clamps it to 60 s), a member dev mint, 270 s of
+polling `/settings/api-keys` (`scratch2/uifix/cdp-session-lapse.mjs`): before, one tab 5 mints and 4 anonymous replies (one
+per lapse), three tabs 8 mints, 5 anonymous replies and two tabs minting in the same instant, a tab back after 100 s hidden 3
+anonymous replies and the API-key list blank for 24.6 s; after, 0 anonymous replies and 0 401s throughout, mints every 39-45
+s, three tabs = 3 load mints plus one per cycle, a hidden tab 0 mints while hidden and 1 within 3 s of visible and 0 s blank,
+an outage keeps the budget (the suspend warning on the 4th failure, then one attempt per period, recovered 26 s after it
+ended), and a refused role action costs 1 request and 0 mints (was 2 and 1). The real `api.ts`, `session-clock.ts` and
+`session-keeper.ts` on a virtual clock against a fake browser and server: 55 checks (cadence, jitter bounds, one mint at a
+time, hidden and visible, two tabs, failure ladder, gate, heal). Not changed: the webhooks page still polls the
+operator-only deliveries route as a non-operator (a 403 every 5 s, now free of mints), and a workflow console in a hidden
+tab is no longer kept alive by its own timer. Not rolled.
+
 ## 2026-10-14 — the dashboard offers only what the team role can do, and a role refusal reads as a sentence (8a7a6844b0)
 
 The role matrix (`d79bc7c1f0`) refuses a viewer's or member's write with 403 `insufficient team role`, but every settings
