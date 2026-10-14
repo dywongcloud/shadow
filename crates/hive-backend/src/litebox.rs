@@ -3364,10 +3364,8 @@ fn add_glibc_compat_stubs(deps: &mut Vec<PathBuf>) {
     }
 }
 
-/// Approved library directories for LDD closure paths. Defense-in-depth:
-/// shared-library paths from ldd output must resolve to one of these
-/// directories. Paths outside the allowlist are rejected before they ever
-/// reach a filesystem operation.
+/// Directories an `ldd`-reported library must resolve into; anything else is rejected before it
+/// reaches a filesystem operation (defense in depth).
 const ALLOWED_LIBRARY_DIRS: &[&str] = &[
     "/usr/lib/",
     "/lib/",
@@ -3413,24 +3411,11 @@ async fn append_litebox_runtime_augmentation(
     .context("litebox runtime tar augmentation task failed")?
 }
 
+/// A ustar header, never GNU: litebox's tar reader understands the ustar `prefix`+`name` split for
+/// paths past 100 bytes (up to 100+155) but not GNU's long-name extension entry, which it misparses
+/// as a file.
 #[cfg(target_os = "linux")]
 fn litebox_tar_header(length: u64, mode: u32) -> anyhow::Result<tar::Header> {
-    // ustar, NOT GNU: litebox's own reader (`litebox/src/fs/tar_ro.rs`) reads
-    // the POSIX ustar `prefix`+`name` split for a long path — its own source
-    // comment names `usr/lib/node_modules/npm/node_modules/...` as exactly
-    // the case that split exists for — but has no arm for the GNU-specific
-    // long-name extension entry (`typeflag='L'`). The `tar` crate only takes
-    // the ustar prefix/name split path when the header itself is ustar
-    // (`Header::as_ustar_mut()` returns `None` for a GNU header, a different
-    // byte layout at the same offset); a GNU header whose path exceeds the
-    // 100-byte `name` field falls straight to the `L`-entry extension
-    // instead, which the reader misparses as a real file and panics on
-    // (`tar_ro.rs:522`, `ParseInt`, reading the extension payload as if it
-    // were a mode field). Every previously-staged program had a short path,
-    // so this was latent until the npm/Python support trees (2026-09-03,
-    // `support_tree_for`) staged paths past 100 bytes for the first time.
-    // ustar's own limit is 100+155 bytes (prefix/name combined) — real
-    // enough for every path either tree contains.
     let mut header = tar::Header::new_ustar();
     header.set_uid(0);
     header.set_gid(0);
@@ -3457,68 +3442,54 @@ fn append_platform_tar_entry(
     Ok(())
 }
 
-/// Guest resolver config. `use-vc` forces glibc onto TCP, which is the whole
-/// point: a litebox guest has no UDP egress. Measured 2026-10-08 with a probe
-/// app inside a live guest — `net.connect(443, '1.1.1.1')` returned OK (so the
-/// route and NAT are fine) while `dns.lookup` returned EAI_AGAIN, i.e. TCP out
-/// works and UDP does not. PATCHES.md:138 describes litebox's UDP support as a
-/// `bind()` concern, not an outbound one. Without `use-vc` this config is
-/// present and correct and still unusable.
+/// Guest resolver config, planted because the tar otherwise ships none and every `getaddrinfo`
+/// fails with EAI_AGAIN. Two public resolvers, reachable once `ensure_guest_nat` has installed the
+/// masquerade (the guest has none of its own and the host runs none on the `10.88/16` link).
+/// `use-vc` forces glibc onto TCP: a litebox guest has no UDP egress, so without it this config is
+/// correct and still unusable.
 const GUEST_RESOLV_CONF: &[u8] =
     b"nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 use-vc\n";
 /// Explicit lookup order so it is identical on every base image: `files` first,
 /// so /etc/hosts still wins, then `dns`.
 const GUEST_NSSWITCH_CONF: &[u8] = b"hosts: files dns\n";
 
-/// Where the guest expects CA roots. Both spellings are planted because distros
-/// disagree and Node/OpenSSL use the compiled-in path, not ours.
+/// Where the guest's TLS stacks look for CA roots; distros disagree and OpenSSL uses its
+/// compiled-in path, not ours, so the bundle is planted at every spelling. The last is the
+/// compiled-in default of RHEL-family OpenSSL, which Python's `ssl` reads.
 const GUEST_CA_PATHS: [&str; 3] = [
     "etc/ssl/certs/ca-certificates.crt",
     "etc/pki/tls/certs/ca-bundle.crt",
-    // OpenSSL's compiled-in default CA *file* on RHEL/Rocky, and therefore
-    // the one Python's `ssl` module reads: measured 2026-10-13 inside a
-    // litebox guest, `ssl.get_default_verify_paths()` reported
-    // `openssl_cafile=/etc/pki/tls/cert.pem` while only the two paths above
-    // were planted, so `urllib.request.urlopen('https://…')` failed with
-    // `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`
-    // even though `curl` (which reads `/etc/pki/tls/certs/ca-bundle.crt`) got
-    // HTTP 200 on the same URL.
     "etc/pki/tls/cert.pem",
 ];
 
-/// The host's CA bundle, best-effort.
-///
-/// Without roots in the guest, Node cannot validate ANY server certificate:
-/// measured 2026-10-08 inside a live litebox guest, `https.get` to both
-/// `api.clerk.com` and the app's own Clerk Frontend API failed with
-/// `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. That is fatal for server-side auth
-/// (`auth()` -> Backend API) and for any HTTPS a tenant app makes, and it was
-/// hidden behind the DNS failure until `use-vc` cleared that.
-///
-/// `None` is not an error — the guest simply keeps whatever roots its base
-/// image has.
-/// A real bundle holds many PEM certs; the 49-byte stubs some images leave at
-/// the well-known paths do not. Accepting a non-empty file shipped one of those
-/// into every guest and the cert error persisted unchanged (measured
-/// 2026-10-08), so require both a BEGIN CERTIFICATE marker and a realistic
-/// size rather than trusting non-emptiness.
+const PEM_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+const MIN_CA_BUNDLE_BYTES: usize = 16 * 1024;
+
+/// A real bundle holds many PEM certificates; the 49-byte stubs some images leave at the well-known
+/// paths do not. Non-emptiness shipped such a stub into every guest and the certificate error
+/// persisted, so require a BEGIN CERTIFICATE marker and a realistic size.
 fn is_real_ca_bundle(bytes: &[u8]) -> bool {
-    bytes.len() > 16 * 1024
+    bytes.len() > MIN_CA_BUNDLE_BYTES
         && bytes
-            .windows(27)
-            .any(|w| w == *b"-----BEGIN CERTIFICATE-----")
+            .windows(PEM_CERTIFICATE_MARKER.len())
+            .any(|w| w == PEM_CERTIFICATE_MARKER)
 }
 
+/// Host CA bundle candidates, best first: the assembled RHEL/TencentOS trust store, then the compat
+/// stubs that can be near-empty.
+const HOST_CA_BUNDLE_PATHS: [&str; 5] = [
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/cert.pem",
+    "/etc/ssl/cert.pem",
+];
+
+/// The host's CA bundle, best-effort: without roots in the guest Node cannot validate any server
+/// certificate (`UNABLE_TO_GET_ISSUER_CERT_LOCALLY`), which breaks server-side auth and every HTTPS
+/// call a tenant app makes. `None` is not an error: the guest keeps the roots its base image has.
 fn host_ca_bundle() -> Option<Vec<u8>> {
-    for path in [
-        // First on RHEL/TencentOS: the assembled trust store. The paths below
-        // are the compat stubs that can be near-empty.
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/cert.pem",
-        "/etc/ssl/cert.pem",
-    ] {
+    for path in HOST_CA_BUNDLE_PATHS {
         if let Ok(bytes) = std::fs::read(path) {
             if is_real_ca_bundle(&bytes) {
                 return Some(bytes);
@@ -3531,12 +3502,9 @@ fn host_ca_bundle() -> Option<Vec<u8>> {
 /// Absolute path of the bundle inside the guest, for `NODE_EXTRA_CA_CERTS`.
 const GUEST_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
 
-/// `Some((key, value))` when a real bundle gets planted, else `None`.
-///
-/// `Option` is `IntoIterator`, so callers pass this straight to `.envs()`:
-/// it adds the variable when present and adds nothing when not — which keeps
-/// hosts with no readable trust store from pointing Node at a file that
-/// doesn't exist.
+/// `Some(("NODE_EXTRA_CA_CERTS", path))` when a real bundle gets planted, else `None`. Node reads
+/// the variable whatever OpenSSL's compiled-in default path is, and `.envs()` adds nothing for
+/// `None`, so a host without a readable trust store never points Node at a missing file.
 fn guest_ca_env() -> Option<(String, String)> {
     host_ca_bundle().map(|_| {
         (
@@ -3547,66 +3515,78 @@ fn guest_ca_env() -> Option<(String, String)> {
 }
 
 #[cfg(target_os = "linux")]
+const TAR_BLOCK_BYTES: u64 = 512;
+#[cfg(target_os = "linux")]
+const TAR_END_MARKER_BLOCKS: u64 = 2;
+
+/// Block index where the trailing run of zero blocks starts. `tar -cf` pads the whole archive out
+/// to its blocking factor after the two-block terminator, so the real terminator is not "the last
+/// 1024 bytes": cutting at a fixed offset would leave the true end marker before the appended
+/// entries, and every reader (GNU tar, Python's `tarfile`, litebox's guest extractor) would stop
+/// there and never see them.
+#[cfg(target_os = "linux")]
+fn trailing_zero_run_start(archive: &mut File, total_blocks: u64) -> anyhow::Result<u64> {
+    let mut zero_block = [0_u8; TAR_BLOCK_BYTES as usize];
+    let mut start_block = total_blocks;
+    let mut index = total_blocks;
+    while index > 0 {
+        let candidate = index - 1;
+        archive.seek(SeekFrom::Start(candidate * TAR_BLOCK_BYTES))?;
+        archive.read_exact(&mut zero_block)?;
+        if zero_block.iter().any(|byte| *byte != 0) {
+            break;
+        }
+        start_block = candidate;
+        index = candidate;
+    }
+    Ok(start_block)
+}
+
+/// Plants the guest's resolver, lookup-order and CA files (`/etc/resolv.conf`, `/etc/nsswitch.conf`
+/// and the CA bundle at every `GUEST_CA_PATHS` spelling). Every guest tar needs them: a guest has
+/// no `/etc` beyond what its tar carries, and a tar without them leaves a typed `curl` with neither
+/// a resolver nor CA roots.
+#[cfg(target_os = "linux")]
+fn append_guest_network_files(builder: &mut tar::Builder<File>) -> anyhow::Result<()> {
+    append_platform_tar_entry(builder, Path::new("etc/resolv.conf"), GUEST_RESOLV_CONF)?;
+    append_platform_tar_entry(builder, Path::new("etc/nsswitch.conf"), GUEST_NSSWITCH_CONF)?;
+    if let Some(bundle) = host_ca_bundle() {
+        for path in GUEST_CA_PATHS {
+            append_platform_tar_entry(builder, Path::new(path), &bundle)?;
+        }
+    }
+    Ok(())
+}
+
+/// Appends the runtime layer to a canonical tar and re-terminates it: the `ldd` closure and the
+/// runtime binary (opened `openat2` beneath `/`, no magic links, re-stat'd after the copy), the
+/// artifact marker, `extra_entries` (guest path relative to `/`, bytes, 0o444; the probe plants a
+/// tar-layer directory its guest then writes into), the resolver and CA files and the two preloads.
+/// The runtime binary goes in at its exact launch path because a guest-side `execve` (Next.js
+/// spawning its worker, an app re-execing `process.execPath`) resolves through the guest
+/// filesystem; unlike libraries it is exempt from the library allowlist.
+#[cfg(target_os = "linux")]
 fn append_litebox_runtime_augmentation_blocking(
     mut archive: File,
     deps: &[PathBuf],
     identity: Option<&RuntimeArtifactIdentity>,
     runtime_bin: Option<&Path>,
-    // Caller-supplied platform files (guest path relative to `/`, bytes),
-    // staged 0o444 like every other platform entry. Used by the Tier-2 probe
-    // to plant a directory in the read-only tar layer that its guest program
-    // then has to write INTO — see `network_smoke_test_inner`, check (c).
     extra_entries: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<()> {
-    const BLOCK_BYTES: u64 = 512;
-    const END_MARKER_BLOCKS: u64 = 2;
     let metadata = archive.metadata()?;
     anyhow::ensure!(
         metadata.is_file()
-            && metadata.len() >= END_MARKER_BLOCKS * BLOCK_BYTES
-            && metadata.len() % BLOCK_BYTES == 0,
+            && metadata.len() >= TAR_END_MARKER_BLOCKS * TAR_BLOCK_BYTES
+            && metadata.len() % TAR_BLOCK_BYTES == 0,
         "litebox application authority is not a canonical block-aligned tar"
     );
-    // GNU tar's real end-of-archive marker is the minimal two-block
-    // (1024-byte) zero terminator required by the format, but `tar -cf`
-    // additionally zero-pads the WHOLE archive out to its own blocking
-    // factor (a full 20-block/10240-byte record by default) — that extra
-    // padding is itself all zero, so a fixed "the terminator is exactly the
-    // last 1024 bytes" assumption reads real trailing padding instead of the
-    // true terminator whenever the archive's length is not already a
-    // multiple of 10240. Truncating at that wrong offset leaves the ACTUAL
-    // double-zero-block sitting a few blocks before wherever this function's
-    // new entries get appended — every standard reader (GNU tar, Python's
-    // `tarfile`, and litebox's own guest-side extractor) stops at that real
-    // terminator and never sees the entries appended after it, so the guest
-    // silently never gets the bind shim it needs.
-    //
-    // Reproduced live on fc-sanjose-3 AND fc-phoenix (`--litebox-probe`
-    // failing on both with `Cannot find module '/hive-litebox-bind-shim.js'`
-    // despite `append_litebox_runtime_augmentation_blocking` returning `Ok`
-    // and genuinely growing the file — the new headers were real bytes on
-    // disk, just placed after the archive's true EOF marker). Fixed by
-    // scanning backward from the end in 512-byte blocks for the actual start
-    // of the trailing zero run, rather than trusting a fixed offset.
-    let total_blocks = metadata.len() / BLOCK_BYTES;
-    let mut zero_block = [0_u8; BLOCK_BYTES as usize];
-    let mut terminator_start_block = total_blocks;
-    let mut index = total_blocks;
-    while index > 0 {
-        let candidate = index - 1;
-        archive.seek(SeekFrom::Start(candidate * BLOCK_BYTES))?;
-        archive.read_exact(&mut zero_block)?;
-        if zero_block.iter().any(|byte| *byte != 0) {
-            break;
-        }
-        terminator_start_block = candidate;
-        index = candidate;
-    }
+    let total_blocks = metadata.len() / TAR_BLOCK_BYTES;
+    let terminator_start_block = trailing_zero_run_start(&mut archive, total_blocks)?;
     anyhow::ensure!(
-        total_blocks - terminator_start_block >= END_MARKER_BLOCKS,
+        total_blocks - terminator_start_block >= TAR_END_MARKER_BLOCKS,
         "litebox application authority has no exact two-block tar terminator"
     );
-    let prefix_bytes = terminator_start_block * BLOCK_BYTES;
+    let prefix_bytes = terminator_start_block * TAR_BLOCK_BYTES;
     archive.set_len(prefix_bytes)?;
     archive.seek(SeekFrom::Start(prefix_bytes))?;
 
@@ -3676,19 +3656,6 @@ fn append_litebox_runtime_augmentation_blocking(
         );
     }
 
-    // The runner loads the INITIAL program ELF from the host, so a
-    // single-process guest (the network smoke test's `node -e`) runs without
-    // the binary staged — but a guest-side `execve` (Next.js `next start`
-    // spawning its server worker, any app child process re-execing
-    // `process.execPath`) resolves the executable through the GUEST
-    // filesystem, which is fully separate from the host by design. Without
-    // the runtime binary staged at its exact launch path, every such spawn
-    // died with the runner's bare "failed to open the ELF file: ENOENT" —
-    // witnessed live on nodes-wtf (Next 16). Same openat2/no-follow staging
-    // discipline as the library closure above; the executable is exempt from
-    // the library-directory allowlist (it legitimately lives in /usr/bin,
-    // /usr/local/bin, or a version-manager prefix) but must still be a real
-    // regular file reached without following a magic link.
     if let Some(bin) = runtime_bin {
         let relative = bin
             .strip_prefix("/")
@@ -3744,32 +3711,7 @@ fn append_litebox_runtime_augmentation_blocking(
     for (path, bytes) in extra_entries {
         append_platform_tar_entry(&mut builder, path, bytes)?;
     }
-    // Guest DNS. The guest tar ships no resolv.conf at all, so glibc has
-    // nothing to resolve against and every outbound call a tenant app makes —
-    // a Turso/libSQL database, any external API — fails at `getaddrinfo
-    // EAI_AGAIN` before it ever opens a socket. Two public resolvers, ordered:
-    // the guest has no resolver of its own and the host does not run one on
-    // the 10.88/16 link, and these are reachable the moment `ensure_guest_nat`
-    // has installed the masquerade.
-    //
-    // `nsswitch.conf` is spelled out rather than left to glibc's built-in
-    // default so the lookup order is explicit and identical on every base
-    // image: `files` first (so /etc/hosts still wins), then `dns`.
-    append_platform_tar_entry(
-        &mut builder,
-        Path::new("etc/resolv.conf"),
-        GUEST_RESOLV_CONF,
-    )?;
-    append_platform_tar_entry(
-        &mut builder,
-        Path::new("etc/nsswitch.conf"),
-        GUEST_NSSWITCH_CONF,
-    )?;
-    if let Some(ca) = host_ca_bundle() {
-        for path in GUEST_CA_PATHS {
-            append_platform_tar_entry(&mut builder, Path::new(path), &ca)?;
-        }
-    }
+    append_guest_network_files(&mut builder)?;
     append_platform_tar_entry(
         &mut builder,
         Path::new(GUEST_BIND_SHIM_PATH.trim_start_matches('/')),
@@ -3801,19 +3743,11 @@ fn append_litebox_runtime_augmentation_blocking(
     anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
 }
 
-/// The interactive-shell binary plus a small, fixed coreutils set — every
-/// program the SHELL ITSELF might `exec()` inside the guest (`fork()`+`exec()`
-/// each, on the `AnEntrypoint/litebox` base this platform tracks: see
-/// `ansible/roles/litebox/files/PATCHES.md`'s "litebox fork tracking"
-/// section) must be staged into the guest tar with its exact host path,
-/// same as `append_litebox_runtime_augmentation_blocking`'s own comment on
-/// `runtime_bin` explains: only the FIRST exec'd binary loads from the host
-/// directly, every later exec (from inside the now-separate guest
-/// filesystem) resolves through what's actually staged here. Deliberately
-/// small and fixed rather than "whatever's on $PATH" — a sandbox shell that
-/// can't find `grep` fails loudly and obviously; one that can silently run
-/// anything the host happens to have installed is a much larger, unaudited
-/// surface for a tenant-facing feature.
+/// The fixed set of programs the interactive shell itself may `exec()` in the guest, each staged
+/// with its exact host path and `ldd` closure: only the first exec loads from the host, and later
+/// guest-side execs resolve through the staged tar. Deliberately small and closed, never "whatever
+/// is on `$PATH`": a missing `grep` fails loudly, while silently running anything the host has
+/// installed would be a large unaudited surface.
 const SHELL_GUEST_PROGRAMS: &[&str] = &[
     "/bin/sh",
     "/usr/bin/ls",
@@ -3832,54 +3766,28 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
     "/usr/bin/env",
 ];
 
-/// Staged only where the host has them — an absent one is skipped with a
-/// debug line, never an exec failure (the fixed set above stays strict): the
-/// rest of the POSIX tool set a shell one-liner reaches for. Still a closed,
-/// audited list, never "whatever is on `$PATH`". This is hang-avoidance as
-/// much as convenience: under the litebox fork emulation a command the guest
-/// cannot find is the WORST case, not a harmless "not found" — the forked
-/// child that would print the error touches glibc state the fork copied
-/// wrongly and can spin forever (`litebox-fork-child-corruption`; measured:
-/// `sh -c 'uname -a; id'` with neither staged = a runner at 100% CPU until
-/// killed). Every entry is a real file or a symlink the staging `openat2`
-/// dereferences (Rocky's alternatives-managed `awk`), staged under its
-/// `/usr/bin` path.
-/// The interactive shell's rc file, staged into every shell tar and named by
-/// `ENV` (read by bash-as-sh, dash and ksh for an interactive shell AFTER
-/// job-control setup). Its one line moves the shell's stderr onto the pty:
-/// the runner is spawned with stderr as a PIPE because a stderr that IS the
-/// pty kills it at job-control init (`exec_pty`), but a pipe and a pty are
-/// two channels read by two tasks, so the next prompt (stderr) routinely
-/// overtook the previous command's output (stdout) and the terminal showed
-/// `sh-5.2$ TERM_OK_42` — measured through the public host 2026-09-02. Once
-/// the shell is past init the redirect is harmless (job control is already
-/// off) and prompt, output and command stderr share ONE ordered channel with
-/// the pty's own CRLF translation; the pipe keeps carrying the runner's own
-/// messages and the two pre-rc warnings the pump filters.
-///
-/// The path is deliberately NOT under `$HOME`: a tar entry implicitly creates
-/// its parent directory, and a `/root` that exists but is not writable by the
-/// guest uid is worse than none — the shell's history write at `exit` then
-/// hits a permission check litebox UNWRAPS (`layered.rs:683 NoWritePerms`,
-/// runner exit 101, measured 2026-09-02) instead of the silent ENOENT a
-/// missing directory gives. `HISTFILE` is cleared for the same reason.
+/// The interactive shell's rc file path, named by `ENV` (bash-as-sh, dash and ksh read it for an
+/// interactive shell after job-control setup). Deliberately NOT under `$HOME`: a tar entry
+/// implicitly creates its parent, and a `/root` the guest uid cannot write makes the history write
+/// at `exit` hit a permission check litebox unwraps (runner exit 101), where a missing directory
+/// gives a silent ENOENT; `HISTFILE` is cleared for the same reason.
 const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
-/// `litebox-shellrc.sh`: the stderr move above PLUS a no-fork "command not
-/// found" guard. Interactive bash forks BEFORE it looks a command up (so the
-/// error can be redirected), and under the litebox fork emulation that child
-/// dies `Fatal error: glibc detected an invalid stdio handle`, after which the
-/// session prints nothing (witnessed 2026-09-22 with `ifconfig` in a dashboard
-/// sandbox terminal on fc-sanjose). The rc installs an `extdebug` DEBUG trap
-/// that checks the command word with `command -v` in the PARENT and answers
-/// `sh: <cmd>: command not found` there. Known limits, all deliberate: a
-/// skipped command leaves `$?` at 0 (`extdebug` semantics), commands whose
-/// first word is quoted/expanded (`"$x"`, `$EDITOR`) are not checked, and it
-/// does nothing for `sh -c` runs (no rc is read) or for any second EXTERNAL
-/// command that DOES exist (the separate fork bug in `litebox-fork-child-
-/// corruption`).
+/// `litebox-shellrc.sh`: its `exec 2>&1` moves the shell's stderr onto the pty (the runner's own
+/// stderr must stay a pipe, since a pty stderr kills it at job-control init, and a separate pipe
+/// and pty are read by two tasks, so the next prompt overtook the previous command's output), and a
+/// no-fork "command not found" guard: interactive bash forks before it looks a command up, which
+/// under the fork emulation kills the child and silences the session, so an `extdebug` DEBUG trap
+/// checks the command word with `command -v` in the parent. Limits: a skipped command leaves `$?`
+/// at 0, a quoted or expanded first word is not checked, and `sh -c` runs read no rc.
 #[cfg(target_os = "linux")]
 const SHELL_RC_BYTES: &[u8] = include_bytes!("litebox-shellrc.sh");
 
+/// Staged only where the host has them (an absent one is skipped with a debug line, never an exec
+/// failure; the fixed set above stays strict): the rest of the POSIX tool set a shell one-liner
+/// reaches for, still a closed list. Completeness is hang-avoidance as much as convenience, because
+/// a command the guest cannot find is dangerous under the fork emulation (see `SHELL_RC_BYTES`).
+/// Entries may be symlinks the staging `openat2` dereferences (Rocky's alternatives-managed `awk`),
+/// staged under their `/usr/bin` path.
 const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",
     "/usr/bin/id",
@@ -3919,43 +3827,13 @@ const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/gzip",
 ];
 
-/// The toolchain a sandbox shell (and a `shell: true` exec) is expected to
-/// offer: `python3`, `git`, `curl` and `wget`. `npx` rides the node support
-/// tree (`SHELL_GUEST_PROGRAMS`'s `extra` path) and is therefore tied to a
-/// node runtime, see below.
-///
-/// Closed and explicit for the same reason as the two lists above, and staged
-/// OPTIONALLY (a host without one is skipped with a debug line, never a
-/// failure) because a base image missing `wget` must still boot a shell. They
-/// cannot simply be appended to `SHELL_GUEST_OPTIONAL_PROGRAMS`, because that
-/// list stages an `ldd` closure and nothing else — and `ldd` only reports an
-/// ELF's own `NEEDED` entries, saying nothing about the data these programs
-/// load at RUNTIME. Measured on the fleet 2026-10-13 (fc-sanjose and
-/// fc-phoenix agree):
-///   * `python3` is a 16 KiB ELF; its standard library is
-///     `/usr/lib64/python3.12` (841 files / 63 MiB) and its
-///     `lib-dynload/*.so` C extensions pull 19 further shared objects that
-///     `ldd` of the interpreter never names (libssl, libffi, liblzma,
-///     libexpat, libbz2, libgdbm, libmpdec, libncursesw, libtinfo, libpanelw,
-///     libreadline, libcrypt, libuuid — 3.0 MiB of distinct libraries by
-///     measurement, not the 60 MiB a whole-`/usr/lib` guess would cost).
-///     Without them `import ssl`, `import sqlite3` and `import ctypes` all
-///     fail with a bare `ImportError: libssl.so.3: cannot open shared object
-///     file`, and `urllib` cannot speak https at all.
-///   * `git` execs helpers out of `/usr/libexec/git-core` (44 real files) and
-///     reads its templates from `/usr/share/git-core`. `git-remote-https` is
-///     itself a symlink to the real `git-remote-http` ELF, so it is staged as
-///     an entry point rather than discovered by the tree walk (which skips
-///     symlinks). Without them `git clone https://…` answers
-///     `git: 'remote-https' is not a git command`.
-///   * `curl`/`wget` are ordinary ELFs — their `ldd` closure really is enough.
-///
-/// A host symlink here is staged as the REAL file under its canonical path
-/// plus a matching symlink entry (`/usr/bin/node` -> `/usr/bin/node-22`).
-/// That is what makes `npx` work at all: `/usr/lib/node_modules_22/npm/bin/
-/// npx-cli.js` carries a `#!/usr/bin/node-22` shebang and only
-/// `/usr/bin/node` used to be staged, so the interpreter in the shebang did
-/// not exist in the guest.
+/// The toolchain a sandbox shell (and a `shell: true` exec) offers: `python3`, `git`, `curl` and
+/// `wget`; `npx` rides the node support tree. Closed like the lists above and staged optionally, so
+/// a base image missing `wget` still boots a shell. Unlike them these load runtime data that `ldd`
+/// never names, which `support_plan_for` stages (python's stdlib and `lib-dynload` closure, git's
+/// helpers and templates); `curl` and `wget` are ordinary ELFs. A host symlink is staged as the
+/// real file under its canonical path plus a matching symlink entry (`/usr/bin/node` ->
+/// `/usr/bin/node-22`), so a shebang naming the real interpreter resolves.
 const SHELL_GUEST_TOOL_PROGRAMS: &[&str] = &[
     "/usr/bin/python3",
     "/usr/bin/git",
@@ -3963,34 +3841,29 @@ const SHELL_GUEST_TOOL_PROGRAMS: &[&str] = &[
     "/usr/bin/wget",
 ];
 
-/// Shared objects glibc `dlopen`s out of `getaddrinfo` at RUNTIME, so no `ldd`
-/// output names them: even with `/etc/resolv.conf` planted, anything resolving
-/// through libc (`curl`, `wget`, `python3`'s `socket`, `git`) found no
-/// resolver in the guest. Closed list, staged only where the host has it.
+/// Shared objects glibc `dlopen`s out of `getaddrinfo`, which no `ldd` output names: without them
+/// nothing resolving through libc (`curl`, `wget`, python's `socket`, `git`) finds a resolver in
+/// the guest. Staged only where the host has them.
 const GUEST_NSS_LIBS: &[&str] = &[
     "/lib64/libnss_files.so.2",
     "/lib64/libnss_dns.so.2",
     "/lib64/libresolv.so.2",
 ];
 
-/// Host directories a bare `exec_command` name (`node`, `ls`, `python3`) is
-/// resolved against — the guest `PATH` this backend hands the runner, plus
-/// `/usr/local/bin` for operator-installed runtimes. The resolved binary is
-/// STAGED into the guest tar (with its `ldd` closure) exactly like the fixed
-/// shell set, so a command that exists on the host runs in the guest; one
-/// that does not fails loudly at start, never mid-run with a bare ENOENT.
+/// Host directories a bare `exec_command` name is resolved against: the guest `PATH` plus
+/// `/usr/local/bin` for operator-installed runtimes. The resolved binary is staged with its `ldd`
+/// closure like the fixed shell set, so a command the host has runs in the guest and one it lacks
+/// fails loudly at start, never mid-run with a bare ENOENT.
 const EXEC_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin"];
 
-/// Upper bound on one `ExecOutput` line's bytes before it is truncated (the
-/// provider bounds again at 16 KiB); keeps a newline-free firehose from
-/// growing the pump's buffer without limit.
+/// Bound on one `ExecOutput` line's bytes before truncation (the provider bounds again at 16 KiB),
+/// so a newline-free firehose cannot grow the pump's buffer without limit.
 const EXEC_MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// Resolve the program a sandbox `exec_command` names to the HOST binary the
-/// runner will load (the first exec'd ELF loads from the host; every later
-/// guest-side `execve` resolves through the staged tar, which is why the
-/// caller stages this same path). A relative path is refused: the guest's
-/// cwd and the host's are different filesystems by design.
+/// Resolves the program a sandbox `exec_command` names to the HOST binary the runner loads (only
+/// the first exec loads from the host; later guest-side `execve`s resolve through the staged tar,
+/// which is why the caller stages this same path). A relative path is refused: the guest's cwd and
+/// the host's are different filesystems.
 fn resolve_guest_program(cmd: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
         !cmd.trim().is_empty() && !cmd.contains('\0'),
@@ -4020,12 +3893,13 @@ fn resolve_guest_program(cmd: &str) -> anyhow::Result<PathBuf> {
     )
 }
 
-/// The interpreter a file's shebang line names, split into the program and its
-/// optional single argument (`#!/usr/bin/env node` -> `["/usr/bin/env",
-/// "node"]`). `None` when `path` is not a `#!/…` script. Files over 1 MiB are
-/// not read at all, so naming something huge costs nothing.
+const SHEBANG_SCAN_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The interpreter a file's shebang names, as the program plus its optional single argument
+/// (`#!/usr/bin/env node` -> `["/usr/bin/env", "node"]`); `None` unless `path` is a `#!/…` script.
+/// A file over `SHEBANG_SCAN_MAX_BYTES` is never read.
 fn shebang_interpreter(path: &Path) -> Option<Vec<String>> {
-    if std::fs::metadata(path).ok()?.len() > 1024 * 1024 {
+    if std::fs::metadata(path).ok()?.len() > SHEBANG_SCAN_MAX_BYTES {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
@@ -4044,18 +3918,12 @@ fn shebang_interpreter(path: &Path) -> Option<Vec<String>> {
     Some(parts)
 }
 
-/// Resolve a NON-shell `exec_command` to the `(program, argv)` the runner is
-/// spawned with.
-///
-/// The runner's AOT rewriter accepts only an ELF as the program it first execs
-/// (`--rewrite-syscalls` rewrites that one binary up front; a `#!/…` script
-/// there fails with `failed to rewrite …: Unknown file magic`, measured
-/// 2026-10-12), while the GUEST's own `execve` honours shebangs perfectly well
-/// (measured 2026-10-13: a staged `#!/bin/sh` script ran and printed its
-/// output). So a command naming a shebang script — `npx`, `npm` — is started
-/// as `<interpreter> [<arg>] <script> <args>`, exactly what the kernel's own
-/// shebang handling would have done, rather than failing before the guest ever
-/// runs.
+/// Resolves a NON-shell `exec_command` to the `(program, argv)` the runner is spawned with. The
+/// runner's rewriter accepts only an ELF as the first program (a `#!/…` script fails with `Unknown
+/// file magic`) while the guest's own `execve` honours shebangs, so a shebang script (`npx`, `npm`)
+/// starts as `<interpreter> [<arg>] <script> <args>`, as the kernel would have. The script is
+/// passed by its canonical path: the guest's `/usr/bin/npx` is the synthesized exec wrapper
+/// (`build_shell_tar_blocking`'s `copies`), which node would parse as JavaScript.
 fn resolve_guest_argv(cmd: &str, args: &[String]) -> anyhow::Result<(PathBuf, Vec<String>)> {
     let program = resolve_guest_program(cmd)?;
     let Some(interpreter) = shebang_interpreter(&program) else {
@@ -4063,26 +3931,16 @@ fn resolve_guest_argv(cmd: &str, args: &[String]) -> anyhow::Result<(PathBuf, Ve
     };
     let mut argv = Vec::with_capacity(interpreter.len() + args.len() + 1);
     argv.extend(interpreter);
-    // The script's CANONICAL path, not the name it was found under: on the
-    // host `/usr/bin/npx` is a symlink whose bytes are `npx-cli.js`, but what
-    // the guest gets at `/usr/bin/npx` is the exec-wrapper `build_shell_tar_
-    // blocking` synthesizes (`copies`) — hand that to node and it parses shell
-    // as JavaScript (`SyntaxError: Unexpected string` at line 2, measured
-    // 2026-10-13 on fc-phoenix). The canonical file is always staged.
-    argv.push(
-        canonical_target(&program)
-            .unwrap_or_else(|| program.clone())
-            .display()
-            .to_string(),
-    );
+    let canonical_script = canonical_target(&program).unwrap_or_else(|| program.clone());
+    argv.push(canonical_script.display().to_string());
     argv.extend(args.iter().cloned());
     Ok((PathBuf::from(&argv[0]), argv[1..].to_vec()))
 }
 
-/// Pump one exec pipe into `ExecOutput` events, one per line, each bounded
-/// to `EXEC_MAX_LINE_BYTES`. Keeps DRAINING (discarding) after the receiver
-/// goes away: a guest blocked on a full pipe would otherwise never exit and
-/// never be reaped, leaking the runner until `kill_exec`/`terminate`.
+/// Pumps one exec pipe into `ExecOutput` events, one per line, each bounded to
+/// `EXEC_MAX_LINE_BYTES`. Keeps DRAINING (discarding) after the receiver goes away: a guest blocked
+/// on a full pipe would otherwise never exit and never be reaped, leaking the runner until
+/// `kill_exec`/`terminate`.
 async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
     reader: Option<R>,
     stream: hive_core::LogStream,
@@ -4144,40 +4002,35 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// A support tree, plus the `$PATH`-visible entry points that make its
-/// commands reachable by name. Staging the tree's files alone is not
-/// enough: the guest shell resolves a typed command (`npm`) through
-/// `PATH=/usr/bin:/bin` (see `exec_pty`'s `.env("PATH", ...)`), and on the
-/// host `/usr/bin/npm` is a SYMLINK into the tree
-/// (`-> ../lib/node_modules_22/npm/bin/npm-cli.js`) — without an entry at
-/// `/usr/bin/npm`, `PATH` search finds nothing there even though the real
-/// file is staged elsewhere in the tree, and a not-found command is fatal
-/// under litebox's fork emulation rather than a clean error (see the module's
-/// fork-corruption notes). `(guest_path, real_target)`: `real_target` is
-/// host-absolute and must already be one of the paths this walk stages (it
-/// is just the symlink's own on-host target). The entry is written as a REAL
-/// FILE carrying `real_target`'s bytes, not as a symlink — see
-/// `build_shell_tar_blocking`'s `copies` for why a symlink entry point is
-/// invisible to the guest's own `PATH` search.
+/// A support tree plus the `$PATH`-visible entry points that make its commands reachable by name:
+/// the guest shell resolves a typed `npm` through `PATH=/usr/bin:/bin`, and on the host
+/// `/usr/bin/npm` is a symlink into the tree (one the walk skips), so without an entry at
+/// `/usr/bin/npm` the search finds nothing. `entry_points` are `(guest_path, real_target)`,
+/// `real_target` being a path the walk already stages; the entry is written as a REAL FILE carrying
+/// its bytes, because a symlink entry point is invisible to the guest's `PATH` search
+/// (`build_shell_tar_blocking`'s `copies`).
 struct SupportPlan {
     trees: Vec<PathBuf>,
     entry_points: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Support trees a resolved `extra` program needs beyond its own `ldd`
-/// closure — the closure only covers a real ELF's shared-library deps, but
-/// `node`/`python3` are interpreters whose OWN standard library is a tree of
-/// plain files (JS modules, `.py`/`.pyc`, no `ldd` output at all). Keyed by
-/// the resolved program path's file NAME, not by the requested string,
-/// because `resolve_guest_program` already turned e.g. `"node"` into
-/// `/usr/bin/node`. Skipped harmlessly if the host doesn't have the tree
-/// (an older base image, a stripped-down build) — see `walk_support_tree`'s
-/// doc.
+/// Where a `python3.x` standard library lives, first existing wins. `/usr/lib64` comes first: on
+/// RHEL-family hosts `/usr/lib/python3.x` holds site-packages only (no `os.py`, no `encodings/`), so
+/// staging it instead would leave the interpreter unable to boot; `/usr/lib` is the fallback for
+/// distros with no lib64 split.
+const PYTHON_STDLIB_PARENT_DIRS: [&str; 2] = ["/usr/lib64", "/usr/lib"];
+
+/// Node's bundled npm tree: `npm` and `npx` are scripts under it (`npm/bin/*-cli.js`), not separate
+/// binaries, so staging `node` alone leaves `npm install` not found; one walk also covers npm's
+/// vendored `node_modules/`.
+const NODE_NPM_TREE: &str = "/usr/lib/node_modules_22";
+
+/// Support trees a resolved `extra` program needs beyond its `ldd` closure: `node` and `python3`
+/// are interpreters whose standard library is a tree of plain files. Keyed by the resolved
+/// program's file NAME (`resolve_guest_program` already turned `node` into `/usr/bin/node`); a tree
+/// the host lacks is skipped harmlessly (see `walk_support_tree`).
 fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
     let name = resolved.file_name().and_then(|n| n.to_str())?;
-    // `git`: helpers plus templates. `git-remote-https` is a symlink to the
-    // real `git-remote-http` ELF, so the walk (which skips symlinks) can
-    // never produce it — it is an explicit entry point instead.
     if name == "git" {
         return Some(SupportPlan {
             trees: vec![
@@ -4190,46 +4043,29 @@ fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
             )],
         });
     }
-    // `python3`: the stdlib directory is named by the interpreter's own
-    // version, and the caller hands us the CANONICAL binary (a host `python3`
-    // symlink has already become `python3.12`), so there is no version list
-    // to maintain here and no cross-version guess. `/usr/lib64` is tried
-    // first: on this fleet `/usr/lib/python3.12` holds site-packages ONLY
-    // (verified: no `os.py`, no `encodings/`), so staging it instead would
-    // add 20 MiB and still leave the interpreter unable to boot. `/usr/lib`
-    // is the fallback for distros with no lib64 split. First existing wins.
     if let Some(version) = name.strip_prefix("python") {
         if version.starts_with('3') {
-            return [
-                PathBuf::from(format!("/usr/lib64/python{version}")),
-                PathBuf::from(format!("/usr/lib/python{version}")),
-            ]
-            .into_iter()
-            .find(|dir| dir.is_dir())
-            .map(|dir| SupportPlan {
-                trees: vec![dir],
-                entry_points: Vec::new(),
-            });
+            return PYTHON_STDLIB_PARENT_DIRS
+                .iter()
+                .map(|parent| PathBuf::from(format!("{parent}/python{version}")))
+                .find(|dir| dir.is_dir())
+                .map(|dir| SupportPlan {
+                    trees: vec![dir],
+                    entry_points: Vec::new(),
+                });
         }
     }
     match name {
-        // npm/npx are scripts under this tree (`bin/npm-cli.js`), not
-        // separate binaries — staging `node` alone leaves `npm install`
-        // a not-found. The tree also carries npm's own vendored
-        // dependencies (its `node_modules/`), so one walk covers both;
-        // `/usr/bin/npm`+`/usr/bin/npx` are the `$PATH` entry points a
-        // typed `npm ...`/`npx ...` actually resolves through — real
-        // symlinks on the host, mirrored as real symlinks in the guest.
         "node" | "node-22" | "node-24" | "node-26" => Some(SupportPlan {
-            trees: vec![PathBuf::from("/usr/lib/node_modules_22")],
+            trees: vec![PathBuf::from(NODE_NPM_TREE)],
             entry_points: vec![
                 (
                     PathBuf::from("/usr/bin/npm"),
-                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npm-cli.js"),
+                    Path::new(NODE_NPM_TREE).join("npm/bin/npm-cli.js"),
                 ),
                 (
                     PathBuf::from("/usr/bin/npx"),
-                    PathBuf::from("/usr/lib/node_modules_22/npm/bin/npx-cli.js"),
+                    Path::new(NODE_NPM_TREE).join("npm/bin/npx-cli.js"),
                 ),
             ],
         }),
@@ -4237,18 +4073,14 @@ fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
     }
 }
 
-/// Bound on how many of a support tree's own shared objects get their `ldd`
-/// closure resolved. Real trees carry 59 (`python3.12`'s `lib-dynload`, the
-/// only one that matters — 19 distinct libraries / 3.0 MiB); the bound keeps a
-/// tree that somehow grew thousands of `.so` files from turning one shell
-/// start into thousands of `ldd` spawns.
+/// Bound on how many of a support tree's own shared objects get their `ldd` closure resolved
+/// (python's `lib-dynload` holds 59): a tree that grew thousands of `.so` files must not turn one
+/// shell start into thousands of `ldd` spawns.
 const SUPPORT_TREE_SO_CLOSURE_MAX: usize = 128;
 
-/// Upper bound on one duplicated `$PATH` entry point (`build_shell_tar_
-/// blocking`'s `copies`). Real ones are interpreters and CLI shims — 16 KiB
-/// (`python3.12`), 28 KiB (`node-22`), 2.9 KiB (`npx-cli.js`) — and the whole
-/// point of the copy is that it is small: the megabytes behind them (closure
-/// libraries, stdlib, the npm tree) are staged once and shared by inode.
+/// Upper bound on one duplicated `$PATH` entry point (`build_shell_tar_blocking`'s `copies`): real
+/// ones are interpreters and CLI shims of a few KiB, because the megabytes behind them are staged
+/// once and shared by inode.
 const GUEST_COPY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Bound on any one support-tree walk — real trees here are ~15-60 MiB /
