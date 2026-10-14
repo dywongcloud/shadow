@@ -11249,10 +11249,8 @@ async fn sandbox(
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
     }
-    // A Mock backend runs every command on the HOST's own /bin/sh with no isolation at all
-    // (hive_backend::mock); `/v1/sandbox` exists to run TENANT-supplied shell commands, so it must
-    // never be reachable where the node cannot actually isolate them.
-    if c.gw.backend_name() == "mock" {
+    let backend_runs_on_the_host_shell = c.gw.backend_name() == "mock";
+    if backend_runs_on_the_host_shell {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "this node's isolation backend cannot run sandbox commands".into(),
@@ -11285,18 +11283,12 @@ async fn sandbox(
     c.audit
         .record(&t, "user", "run", "sandbox", &id.to_string(), "");
 
-    // The slot is charged to the JOB, not to this HTTP request: a client that disconnects mid-run
-    // drops this future (and would drop a request-held guard with it) while the submitted cell keeps
-    // running to its own timeout regardless, so a tenant that fires six requests and disconnects
-    // each after one second used to free six slots for six still-live cells. Ownership of `slot`
-    // moves into a detached watcher that releases it only once the job itself reaches a terminal
-    // state (or vanishes), bounded by the job's own timeout plus margin so a stuck state can never
-    // hold a slot forever either.
     let watch_cloud = c.clone();
     let watch_id = id.clone();
+    let max_watch_polls = timeout_secs * 20 + 100;
     tokio::spawn(async move {
-        let _slot = slot;
-        for _ in 0..(timeout_secs * 20 + 100) {
+        let _slot_held_by_the_job = slot;
+        for _ in 0..max_watch_polls {
             match watch_cloud.hive.job_view(&watch_id) {
                 Some(v) if v.state.is_terminal() => break,
                 Some(_) => {}
@@ -11936,8 +11928,6 @@ async fn project_team_put(
     c.projects
         .set_preview_protection(&project, b.preview_protection);
     if !same_team {
-        // The project MOVES with its deployments: this node's records and pools take the new tenant
-        // now, every other host re-tags its own from the project row (`tenancy_reconcile`).
         let retagged = c.gw.retag_project(&project, dest);
         tracing::info!(%project, %dest, retagged, "project transferred: local deployments re-tagged");
     }
@@ -12020,8 +12010,6 @@ async fn apikey_revoke(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Json<Value> {
-    // Revoking is credential management (it can destroy the team's OWN owner-role key): the matrix
-    // (`roles`) puts it at admin, so a viewer or member never reaches this point.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let ok = c.apikeys.revoke(&id, &t);
     crate::persist::persist(&c);
@@ -12278,7 +12266,6 @@ async fn webhooks_all(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
-    // Tenant-scoped: the payload includes signing secrets, for an admin (`webhook_view`).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let list: Vec<_> = c
         .webhooks
