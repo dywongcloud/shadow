@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-10-14 — the dashboard's nameserver card shows only measured or user-entered nameservers (01aaf526de)
+
+The DNS-only domain card's "Restore Original" button PUT the literal `ns1.openedge-dns.com` /
+`ns2.openedge-dns.com` (a pair no node serves; `71d29ab090` stopped the node seeding it and empties it on load),
+under a description that said OpenEdge propagates its nameservers by default, so a tenant who clicked it recorded
+two nameservers that do not exist. A DNS-only domain now shows the platform roster the nodes measured
+(`fetchNsRoster`, listed only once `delegation_ready`, otherwise "still converging") in the same Nameservers
+section an attached domain uses, plus a "Custom nameservers" section holding only what the tenant typed; the reset
+button is "Clear" (writes `[]`, shown only when there is something to clear) and the literal is gone from `ui/`.
+Witnessed with headless Chrome over CDP against `next dev` and a throwaway dev node
+(`scratch2/work/secfix4-ui-ns.sh`): before, clicking "Restore Original" on a domain with its own nameservers wrote
+`["ns1.openedge-dns.com","ns2.openedge-dns.com"]` and one ui source file carried the literal; after, the rendered
+page has no occurrence, "Clear" writes `[]` and no ui source names it; `npx tsc --noEmit` and `npm run lint` are
+clean. Operator note: the dashboard rolls separately (`scripts/deploy-ui-fleet.sh`); until it does, the old button
+keeps writing the pair, which a node only empties when it next loads its domain store. Not rolled.
+
+## 2026-10-14 — nobody changes or removes a team member above their own role, and the last owner can never be removed or demoted (557f3687a8)
+
+`POST /v1/teams/:slug/members` overwrote an existing member's role and `DELETE /v1/teams/:slug/members/:email`
+removed any row, both gated only by owner/admin: an ADMIN demoted or removed the team's owner (the only check was
+that an admin cannot GRANT Owner), an owner or a platform operator removed or demoted the LAST owner and left the
+team ownerless, and an admin demoted one of two owners. The rule now lives in the team store as the one primitive
+every roster change obeys (`check_roster_change`): nobody changes or removes a member of a higher role than their
+own, nobody grants a role above their own, equal rank is allowed (an admin may change an admin), and the last
+Owner is never removed or demoted, the owner themselves and a platform operator included.
+`TeamStore::set_member_role` and `remove_member_as` replace the unchecked `add_member`/`remove_member` (deleted, so
+no path can bypass the rule); `remove_plain_member` (SCIM deprovisioning) is the same rule with a Member as the
+actor, so an owner or admin stays out of a directory sync's reach by the same code. The HTTP layer maps the actor
+from the verified JWT role (a platform operator acts as Owner, an unenforced node is open), answers 403 for an
+above-actor change or grant and 409 for the last owner, and returns before anything is purged or revoked.
+Witnessed on a real enforced node (`scratch2/work/secfix4-roster.sh`): before, 7 defects (an admin demoted the
+owner, an admin removed the owner, the sole owner demoted and removed themselves, a platform operator removed the
+last owner, the remaining owner of two stepped down, an admin demoted one of two owners); after, 0: 403 and 409
+with the roster unchanged, while admin-vs-admin (demote, remove), an admin promoting a member to admin and removing
+a viewer, owner-vs-admin (demote, remove), granting Owner, a second owner, stepping down with two owners and
+removing one of two owners all still answer 200. Operator note: a team that was already left with no owner by the
+old routes is not repaired here (the rule only protects an owner who is still there); list teams with
+`GET /v1/teams` and grant one deliberately. Not rolled.
+
+## 2026-10-14 — a team's enterprise configuration is written by an owner or admin, never by a viewer or member (e2ff4bc20d)
+
+IP blocks (add, delete), the SIEM sink and its test event, the SAML config and deployment protection were
+`tenant()` plus a plan gate with no role gate, so any team VIEWER or MEMBER reconfigured the team's security:
+pointed the audit stream at their own SIEM endpoint, added or deleted IP blocks, switched deployment protection
+off, rewrote the SAML IdP; the SCIM gate of `73fa118212` was the same hole closed for one route. One helper,
+`require_config_admin` (`require_team_floor` with owner and admin), now fronts every one of those writes and
+SCIM's (it replaces the SCIM-only `require_scim_admin`); reads stay open to every member and an unenforced dev
+node, with no verified roles, stays open like every other role gate. The dashboard's enterprise settings page and
+the project protection card write through the user's own JWT (an admin or owner keeps working; a viewer or member
+now sees the 403 body); the GitOps export only reads and no CLI calls these routes. Witnessed on a real enforced
+node (`scratch2/work/secfix4-entcfg.sh`, team on enterprise, JWT roles owner/admin/member/viewer): before, a viewer
+and a member could do all six writes (12 defects, 200 each); after, viewer and member get 403 on all six, admin
+and owner get 200 on all six, every member (viewer included) still reads all five GET routes, and an unenforced
+dev node answers 200 on all six. Left open on purpose: microfrontend groups and the conformance policy
+(project-level config a member may legitimately edit). Not rolled.
+
 ## 2026-10-14 — a Clerk org's team is created at Hobby, so its record and its billing account agree and no org reaches Pro for free (d57615ef87)
 
 `identity_sync` mirrors a Clerk org into the teams store with `create_with_slug(slug, name, "pro", ..)`,
