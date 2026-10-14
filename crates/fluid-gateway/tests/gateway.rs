@@ -808,11 +808,12 @@ async fn promote_is_alias_reassignment() {
     );
 }
 
-/// The build `target` (environment) is IMMUTABLE: a production build that gets
-/// superseded by a newer production deploy keeps target="production" even though
-/// it is no longer the promoted deployment (Vercel separates env from promotion).
+/// `production` is authoritative on read (`view_of`): a production build superseded by a newer
+/// production deploy is no longer live production, so it reads target="preview" and the edge preview
+/// gate (which classifies by `target`) protects its URLs, while the build that superseded it reads
+/// target="production".
 #[tokio::test]
-async fn target_environment_is_immutable_across_promotion() {
+async fn superseded_production_build_reads_as_preview() {
     let gw = test_gw();
     let old = gw.deploy_full(
         "/nonexistent".into(),
@@ -826,7 +827,7 @@ async fn target_environment_is_immutable_across_promotion() {
         fluid_core::DeployState::Ready,
         "personal".into(),
     );
-    let _new = gw.deploy_full(
+    let new = gw.deploy_full(
         "/nonexistent".into(),
         Manifest {
             project: "app".into(),
@@ -839,6 +840,7 @@ async fn target_environment_is_immutable_across_promotion() {
         "personal".into(),
     );
     let old_id = old.id.to_string();
+    let new_id = new.id.to_string();
 
     let list = gw.list();
     let old_view = list.iter().find(|d| d.id.to_string() == old_id).unwrap();
@@ -847,9 +849,12 @@ async fn target_environment_is_immutable_across_promotion() {
         "superseded build is no longer promoted"
     );
     assert_eq!(
-        old_view.target, "production",
-        "but its build environment stays production"
+        old_view.target, "preview",
+        "a build that is not live production reads as preview"
     );
+    let new_view = list.iter().find(|d| d.id.to_string() == new_id).unwrap();
+    assert!(new_view.production, "the newer build is live production");
+    assert_eq!(new_view.target, "production");
 }
 
 /// Regression: the preview gate must key on a deployment's ACTUAL target, so
