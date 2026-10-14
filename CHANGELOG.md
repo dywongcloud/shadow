@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-13 — the operator pages stop polling in a background tab
+
+`useOpsPoll` (`lib/api.ts`, behind every `/admin` page) was a hand copy of `usePoll` minus
+two behaviours that make `usePoll` well behaved: it ticked on its interval whatever the
+tab's visibility, so a background admin tab kept polling every endpoint for as long as it
+stayed open, and it had no visibility catch-up, so returning to the tab showed data up to
+one interval old (found by the ui comment sweep; its own doc claimed "identical semantics
+to usePoll"). The loop now exists once, `usePollWith(fetcher, …)`, and `usePoll` and
+`useOpsPoll` are one-line bindings of `apiGet` and `opsGet`, so they cannot drift again.
+Witnessed in headless Chrome (the page's `document.visibilityState` toggled exactly as the
+hook reads it) counting the requests of `/admin/audit` (4 s interval): visible for 9 s 3
+requests before and after; hidden for 14 s 3 requests before and 0 after; and after
+becoming visible the first request came 1262 ms later before (the next tick) and 1 ms
+later after; the `usePoll` control on `/deployments` is unchanged (3, 0, 2 ms). Not rolled.
+
 ## 2026-10-13 — the DNS-only domain page and the preview unlock page no longer show invented data
 
 A DNS-only domain's detail page (`app/domains/[domain]/domain-detail-page-client.tsx`)

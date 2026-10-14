@@ -414,9 +414,11 @@ export async function apiDeployViaServerRoute<T>(routePath: string, body: Record
   return r.json();
 }
 
-/** Polls `path` every `intervalMs`: `{data, error, refresh, loading}`. `active=false` fetches once (plus on team change)
- *  and skips the recurring tick; `initial` seeds the first paint from a server component's prefetch. */
-export function usePoll<T>(path: string, intervalMs = 3000, active = true, initial: T | null = null) {
+type Fetcher = <T>(path: string, opts?: { fresh?: boolean }) => Promise<T>;
+
+/** The polling loop behind `usePoll` and `useOpsPoll`, which differ only in the fetcher: `{data, error, refresh, loading}`. `active=false` fetches once (plus on team change)
+ *  and skips the recurring tick; a hidden tab never polls and catches up the moment it is visible again; `initial` seeds the first paint from a server component's prefetch. */
+function usePollWith<T>(fetcher: Fetcher, path: string, intervalMs: number, active: boolean, initial: T | null) {
   const [data, setData] = useState<T | null>(initial);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(initial === null);
@@ -425,7 +427,7 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true, initi
     const requestTenant = currentTeam();
     if (requestTenant === PENDING_TENANT) return;
     try {
-      const d = await apiGet<T>(path, fresh ? { fresh: true } : undefined);
+      const d = await fetcher<T>(path, fresh ? { fresh: true } : undefined);
       if (currentTeam() !== requestTenant) return;
       setData(d);
       setError(null);
@@ -435,7 +437,7 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true, initi
     } finally {
       if (currentTeam() === requestTenant) setLoading(false);
     }
-  }, [path]);
+  }, [fetcher, path]);
   const refresh = useCallback(() => load(false), [load]);
 
   useEffect(() => {
@@ -467,6 +469,11 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true, initi
   return { data, error, loading, refresh };
 }
 
+/** Polls `path` every `intervalMs`: `{data, error, refresh, loading}`. */
+export function usePoll<T>(path: string, intervalMs = 3000, active = true, initial: T | null = null) {
+  return usePollWith<T>(apiGet, path, intervalMs, active, initial);
+}
+
 const OPS_BASE = "/ops";
 
 export async function opsGet<T>(path: string, opts?: { fresh?: boolean }): Promise<T> {
@@ -486,43 +493,9 @@ export async function opsGet<T>(path: string, opts?: { fresh?: boolean }): Promi
   return req;
 }
 
-/** usePoll against the ops console host (`/ops` → admin.shadw.cloud). Identical
- *  semantics to [`usePoll`]; use it for the operator `/admin` pages. */
+/** usePoll against the ops console host (`/ops` → admin.shadw.cloud), the same loop with a different fetcher; use it for the operator `/admin` pages. */
 export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true, initial: T | null = null) {
-  const [data, setData] = useState<T | null>(initial);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(initial === null);
-
-  const load = useCallback(async (fresh: boolean) => {
-    const requestTenant = currentTeam();
-    if (requestTenant === PENDING_TENANT) return;
-    try {
-      const d = await opsGet<T>(path, fresh ? { fresh: true } : undefined);
-      if (currentTeam() !== requestTenant) return;
-      setData(d);
-      setError(null);
-    } catch (e) {
-      if (currentTeam() !== requestTenant) return;
-      setError(String(e));
-    } finally {
-      if (currentTeam() === requestTenant) setLoading(false);
-    }
-  }, [path]);
-  const refresh = useCallback(() => load(false), [load]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(false);
-    const id = active ? setInterval(() => load(false), intervalMs) : null;
-    const onTeam = () => { setData(null); setError(null); setLoading(true); load(true); };
-    if (typeof window !== "undefined") window.addEventListener("hive-team-changed", onTeam);
-    return () => {
-      if (id) clearInterval(id);
-      if (typeof window !== "undefined") window.removeEventListener("hive-team-changed", onTeam);
-    };
-  }, [load, intervalMs, active]);
-
-  return { data, error, loading, refresh };
+  return usePollWith<T>(opsGet, path, intervalMs, active, initial);
 }
 
 /** apiSend against the ops console host (`/ops` → admin.shadw.cloud). */
