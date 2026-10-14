@@ -3106,6 +3106,23 @@ fn spawn_container_lock_sweep() {
     });
 }
 
+/// Warn at most once an hour per skipped job id: an orphan fires on every schedule, and one log
+/// line per fire is the exact flood the skip exists to remove.
+fn orphan_cron_warn_allowed(job_id: &str) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    let now = now_ms();
+    let mut warned = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if now.saturating_sub(warned.get(job_id).copied().unwrap_or(0)) < 3_600_000 {
+        return false;
+    }
+    warned.insert(job_id.to_string(), now);
+    true
+}
+
 /// Ticks the cron scheduler every second and fires each due job as its own task. A project's cron
 /// kill switch only stops the firing: the schedule keeps advancing, so jobs are still created,
 /// updated and deleted on deploy, matching Vercel's semantics.
@@ -3114,8 +3131,47 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let due = cloud.cron.tick(now_ms());
+            if due.is_empty() {
+                continue;
+            }
+            // Orphan guard: a job whose project has no deployment record in this node's
+            // (replicated) deployment view can never be served, so `invoke` would resolve it to
+            // 503 `no-deployment` / `deployment-not-ready` on every single fire, forever — the
+            // `shoomoo` orphan. Skip it instead of recording that noise; the schedule still
+            // advances, so a project that regains a deployment resumes firing untouched.
+            //
+            // Skipping is deliberately NOT deletion: a node that has just booted has not adopted
+            // the deployment store yet, so its view is legitimately empty for a while and dropping
+            // jobs here would wipe a valid set. Removal belongs to the project-delete path, which
+            // is authoritative.
+            let live: std::collections::HashSet<String> = cloud
+                .gw
+                .list()
+                .iter()
+                .map(|d| d.project.to_ascii_lowercase())
+                .chain(
+                    cloud
+                        .peer_deployments
+                        .read()
+                        .values()
+                        .flatten()
+                        .map(|d| d.project.to_ascii_lowercase()),
+                )
+                .collect();
             for job in due {
                 if !cloud.projects.cron_enabled(&job.deployment) {
+                    continue;
+                }
+                let orphan = !live.contains(&job.deployment.to_ascii_lowercase());
+                if orphan && orphan_cron_warn_allowed(&job.id) {
+                    tracing::warn!(
+                        job = %job.id,
+                        project = %job.deployment,
+                        path = %job.path,
+                        "cron fire skipped: project has no deployment record, nothing can serve it"
+                    );
+                }
+                if orphan {
                     continue;
                 }
                 let cloud = cloud.clone();

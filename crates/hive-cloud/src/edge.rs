@@ -300,6 +300,36 @@ async fn edge_pipeline_inner(
         return crate::zkauth::bootstrap(&cloud, &host, &query);
     }
 
+    // Platform liveness on the PUBLIC listener. A daemon or load-balancer probe reaching this port
+    // with a Host the platform does not admit — an IP literal (`127.0.0.1:8787`) or a bare
+    // infrastructure name — is exactly the request that falls into the `host-rejected` branch
+    // below, so it 404s once per probe and swamps the request log. `/healthz` is not a tenant
+    // route anywhere in the tree (the public router is a bare fallback), so no admission-rule
+    // change could ever make it answer: it has to be served here.
+    //
+    // Safe by construction, and unchanged for everything else: the guard is the host gate's own
+    // predicate, so a Host the platform DOES admit keeps its existing pipeline byte-for-byte; the
+    // body is the constant "ok"; no host-derived lookup runs, no deployment is reached, and the
+    // preview gate further down is never consulted — so nothing tenant-owned, no deployment
+    // content and no preview decision is reachable through it.
+    if path == "/healthz"
+        && (method == "GET" || method == "HEAD")
+        && !host.is_empty()
+        && !cloud.host_allowed(&host)
+    {
+        let ev = cloud.event(&region, &method, &host, &path, 200, "health", &host);
+        cloud.record(ev);
+        return (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "ok",
+        )
+            .into_response();
+    }
+
     let rid = hget(&req, "x-hive-request-id")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());

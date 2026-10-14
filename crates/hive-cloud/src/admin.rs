@@ -265,7 +265,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/databases",
             get(databases_for_project),
         )
-        .route("/v1/databases/replica", post(database_replica))
+        .route("/v1/databases/replica", post(database_replica_public))
         .route("/v1/storage/blob/:bucket", get(blob_list_keys))
         .route("/v1/storage/blob/:bucket/:key", get(blob_get).put(blob_put))
         .route(
@@ -3628,6 +3628,32 @@ pub(crate) fn require_operator_or_internal(
     ))
 }
 
+/// Gate for a node-to-node RPC that the public admin router also mounts (database-replica control,
+/// node announce, SMS egress relays). `auth::require_auth` only proves "some valid token", so an
+/// ordinary tenant JWT or platform API key reaches the handler unless this runs first: it admits a
+/// platform operator, the fleet's `x-hive-internal` secret, or a `mesh-internal` service delegation
+/// (`auth::is_mesh_internal`). `team` names the tenant the RPC acts for: a delegation must then be
+/// minted for exactly that tenant, so a hop can never act for a tenant its credential was not minted
+/// for; `None` takes any delegation. The mesh dispatch arms call the inner handler directly, behind
+/// the transport's own signer and trust gate, so a wrapper never changes the mesh path.
+pub(crate) fn require_mesh_rpc(
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    team: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if require_operator_or_internal(headers, claims).is_ok() {
+        return Ok(());
+    }
+    let minted_for_team = |cl: &crate::auth::Claims| team.map_or(true, |t| norm(&cl.tenant) == norm(t));
+    if claims.is_some_and(|cl| crate::auth::is_mesh_internal(cl) && minted_for_team(cl)) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "node-to-node RPC requires a platform operator or a fleet service credential".into(),
+    ))
+}
+
 /// Authenticated-READ guard for the topology views every signed-in user sees: any verified claims
 /// pass (the handler picks the operator or the sanitized tenant view). Missing claims while
 /// enforced is 401, not 403, because the dashboard's transparent cookie re-mint keys on 401.
@@ -5139,6 +5165,9 @@ async fn project_delete(
             }
             c.projects.apply_delete(&project, delete_ms);
             c.git_index.remove_project(&project);
+            // Same node-local cron drop: this coordinator never hosted the project, but its own
+            // cron set can still hold jobs for it, and those would keep firing here.
+            c.cron.remove_project(&project);
             crate::persist::persist(&c);
             if !unreached.is_empty() {
                 let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
@@ -6320,6 +6349,14 @@ async fn delete_project_owned(
 
     c.git_index.remove_project(&project);
     c.production_deployments.remove(&project);
+    // Cron is NODE-LOCAL: each node drops its own copy as part of this delete, never through
+    // store_sync. Without this the jobs survive in memory AND in the persisted snapshot (which
+    // `persist.rs` restores with `replace_all` on every boot), so a deleted project's cron keeps
+    // firing a 503 `no-deployment` forever — the `shoomoo` orphan.
+    let purged_crons = c.cron.remove_project(&project);
+    if purged_crons > 0 {
+        tracing::info!(project, purged_crons, "dropped cron jobs on project delete");
+    }
     let preserved_domains: std::collections::HashSet<String> = c
         .projects
         .all_domains()
@@ -12985,12 +13022,31 @@ async fn database_rotate(
     Ok(Json(json!(rotated)))
 }
 
-/// Mesh-internal: register or remove a cross-region REPLICA of a database on this
-/// node. Called by the primary node's replication fanout (peer-authenticated over
-/// the mesh, or via the loopback+firewalled admin API). On register we record the
-/// database locally as a `replica` in THIS node's region, auto-inject its egress
-/// env into the owning project (so in-region deployments reach it), and — for
-/// Postgres/Redis — provision a real in-region backing container.
+/// HTTP mount of [`database_replica`]: a replica register/remove rewrites the owning project's env
+/// and can stop a container, so only a platform operator, the fleet's `x-hive-internal` secret or a
+/// `mesh-internal` delegation minted for the replicated database's own team may call it
+/// ([`require_mesh_rpc`]). The gossip arm calls the inner handler directly, behind the transport's
+/// signer and trust gate.
+async fn database_replica_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = body.pointer("/db/team").and_then(Value::as_str).unwrap_or("");
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some(team))?;
+    database_replica(State(c), Json(body)).await
+}
+
+/// Mesh-internal: register or remove a cross-region REPLICA of a database on this node. Called by
+/// the primary node's replication fanout (the iroh gossip arm, or [`database_replica_public`] over
+/// HTTP). On register we record the database locally as a `replica` in THIS node's region,
+/// auto-inject its egress env into the owning project (so in-region deployments reach it), and, for
+/// Postgres/Redis, provision a real in-region backing container.
+///
+/// The body is peer-supplied, so the record it names is trusted only as far as THIS node's own
+/// state confirms it: an existing record must belong to the claimed team, and the project whose env
+/// it feeds or strips must belong to that team too.
 pub(crate) async fn database_replica(
     State(c): State<Arc<CloudState>>,
     Json(body): Json<Value>,
@@ -12999,16 +13055,6 @@ pub(crate) async fn database_replica(
     let mut db: crate::databases::Database =
         serde_json::from_value(body.get("db").cloned().unwrap_or(Value::Null))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad db payload: {e}")))?;
-    // This RPC is reachable both over the (currently unauthenticated) mesh
-    // path and directly on the public HTTP admin router, and it used to fully
-    // trust a client-supplied `db` body — so a caller with no relationship to
-    // the target database could force-destroy or re-register it. Real
-    // mesh-peer authentication for this path is tracked separately (the
-    // gossip/peer-trust hardening work); as an immediate, scoped fix: when
-    // `db.id` already names an EXISTING record, require the request's team
-    // to match the REAL owning team on record before mutating it. A brand-new
-    // id (the normal "replicate to a new peer" case) has nothing to compare
-    // against yet and is unaffected.
     if !db.id.trim().is_empty() {
         if let Some(existing) = c.databases.get_raw(&db.id) {
             if record_tenant(&existing.team) != norm(&db.team) {
@@ -13018,6 +13064,12 @@ pub(crate) async fn database_replica(
                 ));
             }
         }
+    }
+    if !db.project.is_empty() && !project_owned_by(&c, &db.project, norm(&db.team)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "db project belongs to a different team".into(),
+        ));
     }
     match op {
         "register" => {

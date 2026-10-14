@@ -62,6 +62,16 @@ impl CronScheduler {
         self.jobs.write().retain(|j| j.id != id);
     }
 
+    /// Drop every job targeting `project` (case-insensitive). `deployment` is the owning project
+    /// name, so a deleted project's jobs are unreachable and would otherwise keep firing — and
+    /// keep being restored from the snapshot — forever. Returns the number removed.
+    pub fn remove_project(&self, project: &str) -> usize {
+        let mut g = self.jobs.write();
+        let before = g.len();
+        g.retain(|j| !j.deployment.eq_ignore_ascii_case(project));
+        before - g.len()
+    }
+
     /// Replace the jobs of a `(deployment, source)` pair, computing each first run; invalid
     /// expressions are skipped. Returns the number registered.
     pub fn set_source_jobs(&self, deployment: &str, source: &str, jobs: Vec<CronJob>) -> usize {

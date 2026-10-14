@@ -88,7 +88,8 @@ pub async fn probe(
 /// (which — for a peer only ever learned second/third-hand — may be stale or
 /// simply absent). Preference (see `hive_edge::select_relay_hint`): the target's
 /// OWN gossiped `relay_url` > the geographically nearest OTHER healthy peer's
-/// `relay_url` > the central `relay.shadw.cloud` backstop. Every caller of
+/// `relay_url` > the central [`hive_edge::CENTRAL_RELAY_URL`] backstop (a real
+/// `https://<node>.relay.shadw.app:3343` relay, never a port-less name). Every caller of
 /// `request_to`/`fetch` below inherits this automatically (including
 /// `admin::fetch_from_host`, `acme.rs`, `db_replicate.rs`, `git.rs`'s mesh
 /// fanout — every one of them dials by `(node_id, addr_json)` through these two

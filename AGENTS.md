@@ -114,7 +114,12 @@ memories whose durable content was absorbed.
   re-walks every `HIVE_RELATIONAL_REFRESH_SECS` (120); `index_ready()` gates
   `init_schema` and `ensure_table_exists` (verified via
   `information_schema.tables`, never `SELECT 1 FROM t`). Cron is NODE-LOCAL
-  (restore via `CronScheduler::replace_all`, never `add()`).
+  (restore via `CronScheduler::replace_all`, never `add()`), so every node purges
+  its OWN copy on project delete (`CronScheduler::remove_project`) and never
+  through store_sync — an unpurged job survives in the snapshot and fires a 503
+  forever. `spawn_cron_loop` SKIPS a due job whose project has no deployment
+  record rather than deleting it: a node that has just booted has not adopted the
+  deployment store yet, so its view is legitimately empty for a while.
 
 ## Mesh transport, discovery, watchdogs
 
