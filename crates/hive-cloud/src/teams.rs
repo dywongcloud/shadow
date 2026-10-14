@@ -45,6 +45,51 @@ pub enum MemberRemoval {
     Privileged,
 }
 
+/// Why a roster change was refused ([`TeamStore::set_member_role`],
+/// [`TeamStore::remove_member_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterRefusal {
+    /// The change touches a member whose role is above the actor's, or grants a role above it.
+    AboveActor,
+    /// The change would remove or demote the team's last Owner.
+    LastOwner,
+    /// No such team.
+    NoTeam,
+}
+
+/// The one rule every roster change obeys, whoever makes it: nobody changes or removes a member of
+/// a higher role than their own, nobody grants a role above their own, and the last Owner is never
+/// removed or demoted (by an owner, by themselves or by a platform operator). `current` is the
+/// target's role now (`None` for a new member), `new` its role afterwards (`None` for a removal).
+/// Equal rank is allowed: an admin may change another admin.
+fn check_roster_change(
+    team: &Team,
+    actor: Role,
+    current: Option<Role>,
+    new: Option<Role>,
+) -> Result<(), RosterRefusal> {
+    if current.is_some_and(|role| role.rank() > actor.rank())
+        || new.is_some_and(|role| role.rank() > actor.rank())
+    {
+        return Err(RosterRefusal::AboveActor);
+    }
+    let owners = team
+        .members
+        .iter()
+        .filter(|member| member.role == Role::Owner)
+        .count();
+    if current == Some(Role::Owner) && new != Some(Role::Owner) && owners <= 1 {
+        return Err(RosterRefusal::LastOwner);
+    }
+    Ok(())
+}
+
+/// What [`TeamStore::remove_checked`] did to a member that passed the rule.
+enum Removal {
+    Removed,
+    Absent,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub email: String,
@@ -447,10 +492,24 @@ impl TeamStore {
         Some(team)
     }
 
-    pub fn add_member(&self, slug: &str, email: &str, role: Role) -> Option<Team> {
+    /// Sets `email`'s role to `role`, adding the member when absent, on behalf of a person acting
+    /// as `actor`, under one lock and under [`check_roster_change`]: an actor may not change a
+    /// member above their own role or grant a role above it, and the last Owner stays. An unchanged
+    /// role is a no-op. This and [`Self::remove_member_as`] are the ONLY roster writes a person's
+    /// request reaches (there is no unchecked `add_member`/`remove_member`), so every membership
+    /// mutation path obeys the one rule.
+    pub fn set_member_role(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+        role: Role,
+    ) -> Result<Team, RosterRefusal> {
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
-        let team = state.teams.get_mut(slug)?;
+        let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
+        let current = team.member(email).map(|member| member.role);
+        check_roster_change(team, actor, current, Some(role))?;
         let email_lower = email.to_lowercase();
         let mut changed = false;
         if let Some(existing) = team
@@ -475,13 +534,13 @@ impl TeamStore {
             team.synthetic_seed = false;
             team.updated_ms = next_version(team.updated_ms, tombstone);
         }
-        Some(team.clone())
+        Ok(team.clone())
     }
 
     /// Adds `email` as `role` ONLY when nobody on the roster has it (case-insensitive), under one
     /// lock, and returns the team plus whether a member was added. An existing member keeps its role.
-    /// [`Self::add_member`] OVERWRITES an existing member's role: right for an owner's explicit role
-    /// change, wrong for a routine sync. Everything that mirrors an external directory into the
+    /// [`Self::set_member_role`] OVERWRITES an existing member's role: right for an explicit change
+    /// by a person, wrong for a routine sync. Everything that mirrors an external directory into the
     /// roster (SCIM provisioning, SAML auto-provision, the Clerk org mirror in `identity_sync`) adds
     /// through this, so a directory entry can never demote an owner or admin or promote a viewer.
     pub fn add_member_if_absent(
@@ -507,41 +566,55 @@ impl TeamStore {
         Some((team.clone(), true))
     }
 
-    /// Removes `email` ONLY when it is a plain member (Member or Viewer), under one lock. An Owner or
-    /// Admin is left in place ([`MemberRemoval::Privileged`]): a directory deprovisioning (SCIM
-    /// PATCH/DELETE) must never strip the people who run the team, that takes a person
-    /// (`team_remove_member`). `None` when the team does not exist.
+    /// Removes `email` on behalf of a person acting as `actor`, under one lock and under
+    /// [`check_roster_change`] (nobody removes a member above their own role, and the last Owner
+    /// stays). A non-member is a no-op that returns the team unchanged.
+    pub fn remove_member_as(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+    ) -> Result<Team, RosterRefusal> {
+        self.remove_checked(slug, actor, email)
+            .map(|(team, _)| team)
+    }
+
+    /// Removes `email` ONLY when it is a plain member (Member or Viewer): the same rule as
+    /// [`Self::remove_member_as`] with a Member as the actor, so an Owner or Admin is left in place
+    /// ([`MemberRemoval::Privileged`]). A directory deprovisioning (SCIM PATCH/DELETE) must never
+    /// strip the people who run the team, that takes a person (`team_remove_member`). `None` when
+    /// the team does not exist.
     pub fn remove_plain_member(&self, slug: &str, email: &str) -> Option<MemberRemoval> {
+        match self.remove_checked(slug, Role::Member, email) {
+            Ok((_, Removal::Removed)) => Some(MemberRemoval::Removed),
+            Ok((_, Removal::Absent)) => Some(MemberRemoval::Absent),
+            Err(RosterRefusal::NoTeam) => None,
+            Err(RosterRefusal::AboveActor | RosterRefusal::LastOwner) => {
+                Some(MemberRemoval::Privileged)
+            }
+        }
+    }
+
+    /// The one removal path: look the member up, apply [`check_roster_change`], drop the row.
+    fn remove_checked(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+    ) -> Result<(Team, Removal), RosterRefusal> {
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
-        let team = state.teams.get_mut(slug)?;
-        let Some(member) = team.member(email) else {
-            return Some(MemberRemoval::Absent);
+        let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
+        let Some(current) = team.member(email).map(|member| member.role) else {
+            return Ok((team.clone(), Removal::Absent));
         };
-        if member.role.rank() >= Role::Admin.rank() {
-            return Some(MemberRemoval::Privileged);
-        }
+        check_roster_change(team, actor, Some(current), None)?;
         let email_lower = email.to_lowercase();
         team.members
             .retain(|member| member.email.to_lowercase() != email_lower);
         team.synthetic_seed = false;
         team.updated_ms = next_version(team.updated_ms, tombstone);
-        Some(MemberRemoval::Removed)
-    }
-
-    pub fn remove_member(&self, slug: &str, email: &str) -> Option<Team> {
-        let mut state = self.state.write();
-        let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
-        let team = state.teams.get_mut(slug)?;
-        let email_lower = email.to_lowercase();
-        let before = team.members.len();
-        team.members
-            .retain(|member| member.email.to_lowercase() != email_lower);
-        if team.members.len() != before {
-            team.synthetic_seed = false;
-            team.updated_ms = next_version(team.updated_ms, tombstone);
-        }
-        Some(team.clone())
+        Ok((team.clone(), Removal::Removed))
     }
 
     /// Is `email` a member of `slug` (for preview access control)?

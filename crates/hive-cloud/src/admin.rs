@@ -11340,6 +11340,44 @@ async fn team_create(
     Ok(Json(json!(t)))
 }
 
+/// The role a roster change is made WITH: a platform operator acts as Owner, an unenforced dev
+/// node (no verified roles) is open (Owner), otherwise the caller's verified team role from the
+/// JWT claim, an unrecognized one as the lowest (Viewer). `TeamStore::set_member_role` and
+/// `remove_member_as` apply the one roster rule to it.
+fn roster_actor(claims: Option<&crate::auth::Claims>) -> crate::teams::Role {
+    use crate::teams::Role;
+    match claims {
+        Some(cl) if cl.platform_admin => Role::Owner,
+        Some(cl) => match cl.role.as_str() {
+            "owner" => Role::Owner,
+            "admin" => Role::Admin,
+            "member" => Role::Member,
+            _ => Role::Viewer,
+        },
+        None if !crate::auth::enforced() => Role::Owner,
+        None => Role::Viewer,
+    }
+}
+
+/// The HTTP answer to a refused roster change.
+fn roster_refusal(refusal: crate::teams::RosterRefusal) -> (StatusCode, String) {
+    use crate::teams::RosterRefusal;
+    match refusal {
+        RosterRefusal::AboveActor => (
+            StatusCode::FORBIDDEN,
+            "you cannot change or remove a member whose role is above yours, or grant a role above yours".into(),
+        ),
+        RosterRefusal::LastOwner => (
+            StatusCode::CONFLICT,
+            "a team must keep at least one owner: make someone else an owner first".into(),
+        ),
+        RosterRefusal::NoTeam => (StatusCode::NOT_FOUND, "team not found".into()),
+    }
+}
+
+/// Adds a member or changes a member's role. The roster rule lives in `TeamStore::set_member_role`:
+/// nobody changes a member above their own role or grants a role above it (an admin may change an
+/// admin, never the owner, and never grant Owner), and the last owner stays.
 async fn team_add_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11354,18 +11392,7 @@ async fn team_add_member(
         &slug,
         &["owner", "admin"],
     )?;
-    if matches!(b.role, crate::teams::Role::Owner) {
-        let is_owner_caller = claims
-            .as_ref()
-            .map(|e| e.0.platform_admin || e.0.role == "owner")
-            .unwrap_or(false);
-        if !is_owner_caller {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "only an Owner may grant the Owner role".into(),
-            ));
-        }
-    }
+    let actor = roster_actor(claims.as_ref().map(|e| &e.0));
     let team = c
         .teams
         .get(&slug)
@@ -11386,8 +11413,8 @@ async fn team_add_member(
     }
     let t = c
         .teams
-        .add_member(&slug, &b.email, b.role)
-        .ok_or((StatusCode::NOT_FOUND, "team not found".into()))?;
+        .set_member_role(&slug, actor, &b.email, b.role)
+        .map_err(roster_refusal)?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -11399,7 +11426,9 @@ async fn team_add_member(
 /// the relay revocation must not restore the removed member on the next restart); then the team's
 /// browser grants are revoked fail-closed (membership is keyed by email and grants by subject id,
 /// so remaining members renew from a fresh platform session while the removed member loses service
-/// now), and the revocation's own persisted state is saved again.
+/// now), and the revocation's own persisted state is saved again. The roster rule lives in
+/// `TeamStore::remove_member_as`: nobody removes a member above their own role, and the last owner
+/// stays (a refusal returns before anything is purged or revoked).
 async fn team_remove_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11415,8 +11444,8 @@ async fn team_remove_member(
     )?;
     let t = c
         .teams
-        .remove_member(&slug, &email)
-        .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+        .remove_member_as(&slug, roster_actor(claims.as_ref().map(|e| &e.0)), &email)
+        .map_err(roster_refusal)?;
     if let Some(uid) = c
         .identity
         .users()
