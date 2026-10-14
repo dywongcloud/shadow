@@ -15574,11 +15574,12 @@ fn resolve_identity_sync(
 /// directory sync uses: `add_member` overwrites an existing member's role, and a manually granted
 /// Owner/Admin must never be demoted by a routine sync).
 ///
-/// The mirror's EMAIL feeds authorization (`team_create` takes the new team's owner from it,
-/// `caller_administers` takes the caller's roster identity from it), so only the dashboard SERVER
-/// writes it: its sync carries `x-hive-internal` and the Clerk-verified email. A browser-originated
-/// sync (the topnav's own `/cloud/v1/identity/sync`) carries a body the caller wrote: it still
-/// records the user, and answers `is_owner`, but never sets or changes an email.
+/// The mirror feeds authorization (`team_create` takes the new team's owner from its email,
+/// `caller_administers` takes the caller's roster identity from it) and is what the operator's data
+/// view and the dashboard's member lists show, so only the dashboard SERVER writes it: its sync
+/// carries `x-hive-internal` and the Clerk-verified profile. A browser-originated sync (the topnav's
+/// own `/cloud/v1/identity/sync`) carries a body the caller wrote: it records NOTHING, no email, name,
+/// image, tenant or org, and only answers `tenant` and `is_owner`.
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15607,52 +15608,52 @@ async fn identity_sync(
         &req.user.id,
         body_email_is_owner,
     );
-    if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
-        c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
-    }
-    if let Some(slug) = &org_slug {
-        let email = req.user.email.trim();
-        if !email.is_empty()
-            && mint_allowed(&headers)
-            && !email.eq_ignore_ascii_case(c.owner_email.trim())
-        {
-            if c.teams.get(slug).is_none() {
-                let name = req
-                    .org
-                    .as_ref()
-                    .map(|o| o.name.trim())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(slug.as_str());
-                // Hobby, the plan `team_create` gives a non-operator: a tier is RAISED only through
-                // `apply_plan_everywhere` (a paid checkout or an operator), and the billing account
-                // of a new tenant is Hobby, so both halves agree. Created at "pro" the record read
-                // Pro while billing read Hobby, and every org reached Pro-gated features free.
-                let _ = c
-                    .teams
-                    .create_with_slug(slug, name, "hobby", &c.owner_email);
-            }
-            let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
-                crate::teams::Role::Admin
-            } else {
-                crate::teams::Role::Member
-            };
-            c.teams.add_member_if_absent(slug, email, role);
+    // Only the dashboard SERVER writes the mirror (the users and orgs the operator's data view and
+    // `caller_administers` read, and the roster below): its sync alone carries `x-hive-internal` and a
+    // profile Clerk verified. A browser-originated sync is a body the caller wrote, so it records
+    // nothing: a signed-in user cannot rename, re-image or re-tenant ANY user id, nor rewrite its own
+    // org. It still answers `tenant` and `is_owner`, which the client reads.
+    if mint_allowed(&headers) {
+        if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
+            c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
         }
+        if let Some(slug) = &org_slug {
+            let email = req.user.email.trim();
+            if !email.is_empty() && !email.eq_ignore_ascii_case(c.owner_email.trim()) {
+                if c.teams.get(slug).is_none() {
+                    let name = req
+                        .org
+                        .as_ref()
+                        .map(|o| o.name.trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(slug.as_str());
+                    // Hobby, the plan `team_create` gives a non-operator: a tier is RAISED only
+                    // through `apply_plan_everywhere` (a paid checkout or an operator), and the
+                    // billing account of a new tenant is Hobby, so both halves agree. Created at
+                    // "pro" the record read Pro while billing read Hobby, and every org reached
+                    // Pro-gated features free.
+                    let _ = c
+                        .teams
+                        .create_with_slug(slug, name, "hobby", &c.owner_email);
+                }
+                let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
+                    crate::teams::Role::Admin
+                } else {
+                    crate::teams::Role::Member
+                };
+                c.teams.add_member_if_absent(slug, email, role);
+            }
+        }
+        c.identity.upsert_user(
+            &req.user.id,
+            req.user.email.as_str(),
+            &req.user.name,
+            &req.user.image_url,
+            &tenant,
+            org_slug.as_deref(),
+        );
+        crate::persist::persist(&c);
     }
-    let verified_email = if mint_allowed(&headers) {
-        req.user.email.as_str()
-    } else {
-        ""
-    };
-    c.identity.upsert_user(
-        &req.user.id,
-        verified_email,
-        &req.user.name,
-        &req.user.image_url,
-        &tenant,
-        org_slug.as_deref(),
-    );
-    crate::persist::persist(&c);
     Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
