@@ -1000,7 +1000,18 @@ async fn project_env_put(
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // `require_project*` only proves TENANCY (the caller is some member of the owning team); env
+    // vars can hold secrets and change what a deployment does, so writing/removing one needs at
+    // least `member` — a bare `viewer` could otherwise set or clear them (confirmed live by an
+    // adversarial review).
+    require_team(
+        &c,
+        &headers,
+        claims.as_ref().map(|e| &e.0),
+        &t,
+        &["owner", "admin", "member"],
+    )?;
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -1012,7 +1023,14 @@ async fn project_env_delete(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((project, key)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    require_team(
+        &c,
+        &headers,
+        claims.as_ref().map(|e| &e.0),
+        &t,
+        &["owner", "admin", "member"],
+    )?;
     c.projects.delete_env(&project, &key);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -7768,7 +7786,10 @@ async fn node_announce_public(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    // A fleet-wide RPC with no per-tenant meaning: a delegation minted for ANY team still satisfies
+    // `is_mesh_internal` alone, so `Some("mesh")` (never `None`) closes that a tenant's own
+    // delegation, however it was obtained, can never reach this route.
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(node_announce(State(c), Json(node)).await)
 }
 
@@ -11131,6 +11152,15 @@ async fn sandbox(
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
     }
+    // A Mock backend runs every command on the HOST's own /bin/sh with no isolation at all
+    // (hive_backend::mock); `/v1/sandbox` exists to run TENANT-supplied shell commands, so it must
+    // never be reachable where the node cannot actually isolate them.
+    if c.gw.backend_name() == "mock" {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node's isolation backend cannot run sandbox commands".into(),
+        ));
+    }
     if req.image != default_image() {
         require_operator(claims).map_err(|_| {
             (
@@ -11139,7 +11169,7 @@ async fn sandbox(
             )
         })?;
     }
-    let _slot = SandboxSlot::acquire(&t).ok_or((
+    let slot = SandboxSlot::acquire(&t).ok_or((
         StatusCode::TOO_MANY_REQUESTS,
         format!("at most {SANDBOX_TENANT_MAX_JOBS} sandboxes may run at once"),
     ))?;
@@ -11157,6 +11187,27 @@ async fn sandbox(
     let id = c.hive.submit(job);
     c.audit
         .record(&t, "user", "run", "sandbox", &id.to_string(), "");
+
+    // The slot is charged to the JOB, not to this HTTP request: a client that disconnects mid-run
+    // drops this future (and would drop a request-held guard with it) while the submitted cell keeps
+    // running to its own timeout regardless, so a tenant that fires six requests and disconnects
+    // each after one second used to free six slots for six still-live cells. Ownership of `slot`
+    // moves into a detached watcher that releases it only once the job itself reaches a terminal
+    // state (or vanishes), bounded by the job's own timeout plus margin so a stuck state can never
+    // hold a slot forever either.
+    let watch_cloud = c.clone();
+    let watch_id = id.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        for _ in 0..(timeout_secs * 20 + 100) {
+            match watch_cloud.hive.job_view(&watch_id) {
+                Some(v) if v.state.is_terminal() => break,
+                Some(_) => {}
+                None => break,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
 
     let mut state = JobState::Queued;
     for _ in 0..(timeout_secs * 20) {
@@ -11667,11 +11718,22 @@ async fn apikey_revoke(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Revoking is credential management (it can destroy the team's OWN owner-role key), so it needs
+    // a role at least as elevated as minting one conceptually requires — unlike `put_env`'s
+    // `member` floor, `viewer` AND `member` are both refused here (confirmed live: a viewer key
+    // revoked the owner key with no gate at all before this).
+    require_team(
+        &c,
+        &headers,
+        claims.as_ref().map(|e| &e.0),
+        &t,
+        &["owner", "admin"],
+    )?;
     let ok = c.apikeys.revoke(&id, &t);
     crate::persist::persist(&c);
-    Json(json!({ "revoked": ok, "id": id }))
+    Ok(Json(json!({ "revoked": ok, "id": id })))
 }
 
 async fn integrations_list(
@@ -14269,7 +14331,9 @@ async fn push_sms_relay(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    // See `node_announce_public`: a fleet-wide RPC, `Some("mesh")` so a delegation minted for any
+    // one tenant's own team can never reach it.
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(Json(crate::push::sms_relay_exec(&c, v).await))
 }
 
@@ -14282,7 +14346,8 @@ async fn push_sms_direct_mx(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    // See `node_announce_public`.
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(Json(crate::push::sms_direct_mx_exec(v).await))
 }
 
@@ -16536,9 +16601,13 @@ pub(crate) async fn project_preview(
             "alias": alias,
         }));
     }
+    // The fetch targets this node's OWN gateway, but the app (sandboxed tenant code) controls the
+    // RESPONSE, including any redirect: a bare client following it server-side would let a tenant's
+    // own app hand the preview path a result read from wherever it points (loopback admin ports,
+    // the VPC) with the body echoed back as "preview" to that caller. `same_origin_client` follows
+    // only a redirect that stays on this exact origin.
     let base = c.public_base.clone();
-    let resp = c
-        .http
+    let resp = hive_outbound::same_origin_client()
         .get(format!("{base}/"))
         .header("host", &alias)
         .send()
