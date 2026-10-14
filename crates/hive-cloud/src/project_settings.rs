@@ -116,7 +116,7 @@ pub struct BuildConfig {
     pub root_dir: String,
     /// Explicit runtime override ("nodejs"/"bun"/empty = infer from the detected start command).
     /// Independent of package-manager detection: a `bun.lock` selects `bun install`, never the Bun
-    /// RUNTIME.
+    /// RUNTIME; only this field, `vercel.json`'s `runtime` or its `bunVersion` does.
     #[serde(default)]
     pub runtime: String,
     /// True when `framework` came from build-time auto-detection, not an explicit user choice: an
