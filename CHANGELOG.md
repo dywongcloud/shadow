@@ -1,5 +1,96 @@
 # Changelog
 
+## 2026-10-14 — the roles a Clerk org assigns get a 15-minute token, so a demoted or removed member stops carrying the old role within minutes (9e464c496d)
+
+A minted token carries its role for its whole life and nothing consults the roster per request (the dashboard takes the
+role from Clerk when it mints), so an org admin demoted or removed in Clerk kept its admin JWT, and with it every
+admin-floor action of the role matrix (`d79bc7c1f0`), for the full 3600 s. `mint_token` now asks `minted_token_ttl`:
+`admin`, `member` and `viewer` live `HIVE_ORG_TOKEN_TTL_SECS` (default 900 s, clamped to 60..3600, an unparsable value
+falls back to 900), while `owner` (the dashboard mints it only for a personal namespace), a platform operator (the
+composio/system admin token, the ops console) and every other role, the `service` claim included, keep the hour. The
+dashboard already honours `expires_in` wherever it mints (the `hive_jwt` cookie `maxAge`, the composio and ops server
+tokens) and re-mints from the live Clerk session when the cookie lapses. The remaining window is the lifetime PLUS the
+verifier's 60 s clock-skew leeway (`jsonwebtoken`'s default): about 16 minutes instead of 61. Witnessed on a real
+enforced node (`scratch2/work/secfix5-ttl.sh`): before, an org admin, member and viewer token lived 3600 s; after, 900 s
+(`expires_in` 900), owner, the operator (also with the role claim admin) and a service claim 3600 s, the knob clamps 10 to
+60 and 99999 to 3600, and with a 60 s lifetime the admin token creates a webhook while valid, is refused 401 once the
+lifetime and the leeway have passed, and the same user re-minted as a member is refused the admin action (403) while
+day-to-day work still passes. Operator note: set `HIVE_ORG_TOKEN_TTL_SECS` shorter (60 is the floor) to tighten the
+window or `3600` to restore the old one; to cut a session NOW rotate `HIVE_JWT_SECRET` (every token ends); a Clerk
+sign-in was read, not run (no Clerk instance). Not rolled.
+
+## 2026-10-14 — a roster email is trimmed and matched case-insensitively at the store, an unusable one is no member, and removing nobody purges and revokes nothing (e62c368781)
+
+`TeamStore` matched emails by lowercase only, so `" own@vt.test"` (a leading space) added a GHOST row beside
+`own@vt.test` instead of reaching its owner protection, `"  new@vt.test "` was stored with its spaces and the clean address
+then made a duplicate, an empty or blank email was accepted and took a seat, and removing an email nobody had still ran the
+push purge and revoked every browser grant of the team. `roster_email` now trims and refuses an empty, over-320-byte or
+control-character email (`RosterRefusal::BadEmail`, 400, checked before the seat limit) and `same_person` is the one
+comparison `Team::member`, `set_member_role` and the removal use, so a padded or upper-cased address is the same person and
+reaches the owner and last-owner rules (an admin's padded removal of the owner is 403). `add_member_if_absent` (SCIM, SAML
+auto-provision, the Clerk mirror) ignores an unusable email; `remove_member_as` returns `Ok(None)` for a non-member and
+`team_remove_member` answers 404 before any purge or revoke. A ghost row an older build stored stays removable on its own (a
+removal matches the row stored under exactly that string first, a blank one targets blank-email rows), and rows are not
+rewritten at boot, because a load-time rewrite would not converge with older peers still replicating them. Witnessed on a
+real enforced node (`scratch2/work/secfix5-roster.sh`): before, 10 defects (the ghost row, a padded address stored raw, a
+padded plus clean duplicate, a case-variant duplicate, three unusable emails taking three seats, removal of nobody 200);
+after, 0, including the legacy leg on the same data dir (an older build writes `" mem@vt.test"` and an empty-email row, the
+new build removes each on its own and leaves `mem@vt.test` a member); the reviewer's `t_roster2` and `t_roster3` agree. Not
+rolled.
+
+## 2026-10-14 — a project moves to another team only into a tenant the caller administers, or by the operator into a team that exists (413287e85e)
+
+`PUT /v1/projects/:p/team` wrote the body's team string straight into the project row: with the role floor of the matrix an
+admin of one team could still hand a project, its settings and its env to a tenant of their choosing (`"attacker"`), park it
+in a tenant that does not exist, or store a sentinel (the empty team, which `norm` reads as the OPERATOR's `personal`,
+`__anon__`, `__untagged__`, `mesh`) or a path-like name. The handler now decides where the project may go. The owning team can
+always save itself again (the dashboard's preview-protection toggle). A move to ANOTHER tenant needs the platform operator,
+into a team that exists (404 otherwise; the unvalidated repair route stays `POST /v1/admin/projects/:p/team`), or a
+destination the caller administers: its own personal namespace (`u_<uid>`), or a team whose roster lists the caller's
+verified identity (the identity mirror maps the JWT subject to its email) at admin or above, 403 otherwise; an API key is no
+user and administers nothing. The destination must be a tenant slug for everyone (400), a transfer is on the audit log, and an
+unenforced dev node stays open apart from the slug shape. Witnessed on a real enforced node
+(`scratch2/work/secfix5-transfer.sh`): before, 12 defects (an admin moved a project to the attacker tenant, which then read
+its settings and wrote its env, an owner moved one into a team it is not on, empty, `__anon__`, `__untagged__`, `mesh` and
+path-like destinations accepted, the operator parked projects in tenants that do not exist); after, 0, with the same-team
+toggle, a move into the admin's own namespace, into a team where its verified email is an admin and the operator's move into
+an existing team all still 200. A transfer does not re-tag the project's deployments, so the previous team still reaches the
+project through them (`project_owned_by` is deployment-aware): unchanged. Not rolled.
+
+## 2026-10-14 — the team-role matrix is defined once and enforced at the one gate every request passes, so a viewer is read-only and webhooks, integrations, project ownership and project delete need an admin (d79bc7c1f0)
+
+The role model had no single rule: each handler re-decided its own floor and some never did, so `e2ff4bc20d` closed eight
+enterprise routes and left their siblings open. A viewer (a viewer API key, or a viewer JWT) deployed, deleted projects and
+every deployment in them, wrote webhooks, integrations, microfrontend groups and the conformance policy, read an
+integration's plaintext credentials, and moved a project to another tenant with preview protection off; a member did the
+admin-only writes too. `crates/hive-cloud/src/roles.rs` now holds the matrix and `auth::require_auth` asks it for every
+authenticated request on an enforced node, reads included. A role is the verified `role` claim of the JWT or API key,
+`viewer < member < admin < owner`; the first matching row of `RULES` wins, and a request no row matches needs viewer to read
+and member to change anything:
+
+- **viewer** reads. Its only mutations are the self-service rows: its own notifications, push and SMS delivery, the browser
+  node lane, the profile sync (`/v1/identity/sync`) and a vector query. (`POST /v1/token` is an open route.)
+- **member** does the day-to-day project work, the floor of every mutation no row raises: deploys, env, domains, databases,
+  storage, queues, sandboxes, cron, workflows, microfrontend groups, the conformance policy, creating a key no higher than its
+  own role. Reads that hand out a way to write or run code are member too: database credentials, a sandbox shell, a realtime room.
+- **admin** runs the team: webhooks (and the signing secrets in their list), integrations and their credentials, API-key
+  revocation, `PUT /v1/projects/:p/team` (protection and ownership), `DELETE /v1/projects/:p`, the rest of the enterprise
+  configuration (IP blocks, SIEM, SAML, SCIM, deployment protection), team settings and membership below its own rank.
+- **owner** does everything an admin may, plus deletes the team.
+
+One deliberate deviation from "owner for project delete and transfer": the dashboard mints `owner` only for a personal
+namespace and a Clerk org's highest JWT role is `admin`, so an owner floor would lock every org out of both; they sit at admin.
+A platform operator acts as an owner; a `service` claim (a fleet delegation, the workflow queue client) is not a team role and
+is judged by its own handler; an unknown role is the lowest, never an implicit member; an unenforced dev node has no verified
+roles and stays fully open (`require_auth` returns before it asks). The duplicates are gone (`require_config_admin`, the env
+and API-key-revoke floors, `roster_actor`, which is `roles::actor` now); `admin::require_team` still binds a path slug to the
+tenant. Operator and CI notes: a dashboard member now sees a 403 on webhooks, integrations, the owning-team Save and project
+delete (the buttons are still shown); `shadw` webhook and project-delete commands need an admin key (a default-role key still
+deploys, sets env, attaches domains and creates keys); a member's webhook list shows the hooks without their signing secrets.
+Witnessed on a real enforced node with JWT and API-key roles (`scratch2/work/secfix5-matrix.sh`): before, 47 defects; after,
+0 with every day-to-day and self-service flow, the operator, the service claim and the dev node still passing (65 PASS, 0
+FAIL); the reviewer's `t_projteam`, `t_viewerops` and `t_entcfg` agree. Not rolled.
+
 ## 2026-10-14 — a model download is bounded by throughput and by tenant, so one tenant's slow-drip URLs cannot hold the node's download slots for hours (914a82e577)
 
 A slow drip (a byte every few seconds) delivers data often enough that the stall timeout of `a21318ab2c` never fires,
